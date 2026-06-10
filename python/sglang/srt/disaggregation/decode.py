@@ -65,6 +65,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     EvictParams,
 )
 from sglang.srt.mem_cache.common import (
@@ -352,6 +353,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
+    # SWA caches make the flat size accessors raise and expose full-pool sizes
+    # via full_*() instead; pick the full-pool view for SWA, flat otherwise.
+    def _radix_full_evictable(self) -> int:
+        if self.scheduler.tp_worker.is_hybrid_swa:
+            return self.tree_cache.full_evictable_size()
+        return self.tree_cache.evictable_size()
+
+    def _radix_full_protected(self) -> int:
+        if self.scheduler.tp_worker.is_hybrid_swa:
+            return self.tree_cache.full_protected_size()
+        return self.tree_cache.protected_size()
+
+    def _radix_full_available(self) -> int:
+        if self.scheduler.tp_worker.is_hybrid_swa:
+            return self.token_to_kv_pool_allocator.full_available_size()
+        return self.token_to_kv_pool_allocator.available_size()
+
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
             return max(seq_len, 0)
@@ -512,8 +530,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
         )
-        # Always lock to match aggregated scheduling behavior
-        self.tree_cache.inc_lock_ref(result.last_device_node)
+        # Always lock to match aggregated scheduling behavior. SWA locks only
+        # span the sliding window and return a boundary uuid; store it so the
+        # matching dec_lock_ref stops there instead of underflowing toward root.
+        lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
+        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
@@ -887,6 +908,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len = prefix_match.decode_prefix_len
 
                 fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
+
+                # Cap full-attention prefix reuse at the sliding-window start so
+                # the SWA window lands entirely in the fresh delta, keeping
+                # alloc_extend_swa_tail's tail->full mapping in range. Costs reuse
+                # of only the last ~window_size full-attention tokens.
+                if uses_swa_tail_prealloc and prefix_len > 0:
+                    swa_prefix_cap = fill_len - self._swa_tail_len(fill_len)
+                    if prefix_len > swa_prefix_cap:
+                        prefix_len = swa_prefix_cap
+                        prefix_indices = prefix_indices[:prefix_len]
+                        # Cap the prefill-committed prefix too: tokens past the
+                        # cap are neither device-resident nor HiCache-restored,
+                        # so prefill must transfer them.
+                        total_prefix_len = prefix_len
+
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
                 )
@@ -923,11 +959,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 > full_allocatable_tokens
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self.tree_cache.dec_lock_ref(
+                        decode_req.req.last_node,
+                        DecLockRefParams(
+                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
+                        ),
+                    )
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self.tree_cache.dec_lock_ref(
+                        decode_req.req.last_node,
+                        DecLockRefParams(
+                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
+                        ),
+                    )
                 break
 
             if uses_swa_tail_prealloc:
@@ -945,7 +991,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     > swa_allocatable_tokens
                 ):
                     if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        self.tree_cache.dec_lock_ref(
+                            decode_req.req.last_node,
+                            DecLockRefParams(
+                                swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock
+                            ),
+                        )
                     break
 
             dst_kv_indices = self._pre_alloc(
@@ -1181,13 +1232,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
-                available_size += self.tree_cache.evictable_size()
+                available_size += self._radix_full_evictable()
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
             # can be freed on demand before allocation.
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
-                available_size += self.tree_cache.evictable_size()
+                available_size += self._radix_full_evictable()
         allocatable_tokens = available_size - max(
             reserved_tokens, need_space_for_single_req
         )
@@ -1331,19 +1382,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Evict cached entries if the pool doesn't have enough free pages.
         if (
             self.scheduler.server_args.disaggregation_decode_enable_radix_cache
-            and self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens
+            and self._radix_full_available() < required_alloc_tokens
         ):
-            num_to_evict = (
-                required_alloc_tokens - self.token_to_kv_pool_allocator.available_size()
-            )
+            num_to_evict = required_alloc_tokens - self._radix_full_available()
             result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
-            if self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens:
+            if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
-                    f"available {self.token_to_kv_pool_allocator.available_size()} "
+                    f"available {self._radix_full_available()} "
                     f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
-                    f"evictable_size={self.tree_cache.evictable_size()}, "
-                    f"protected_size={self.tree_cache.protected_size()}, "
+                    f"evictable_size={self._radix_full_evictable()}, "
+                    f"protected_size={self._radix_full_protected()}, "
                     f"fill_len={fill_len}, prefix_len={prefix_len}, "
                     f"total_prefix_len={total_prefix_len}, delta_len={delta_len}, "
                     f"page_size={self.token_to_kv_pool_allocator.page_size}, "
@@ -1385,19 +1434,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_len > 0
                 else torch.tensor([-1], dtype=torch.int64, device=device)
             )
-            if self._uses_swa_tail_prealloc() and prefix_len == 0:
-                # Tail-only SWA allocation: only valid when prefix_len == 0.
-                # When prefix_len > 0 (radix cache hit), we fall back to
-                # alloc_extend which allocates SWA at full page count; the
-                # SWA budget in that case may slightly under-estimate.
+            if self._uses_swa_tail_prealloc():
+                # Full-attention layers extend from the (reused) prefix; SWA
+                # layers allocate only the window tail.
+                swa_tail_len = self._swa_tail_len(fill_len)
+                # Tokens before the window have no SWA slot, so mark them
+                # SWA-evicted: cache_(un)finished_req inserts them as tombstones
+                # instead of phantom swa_evictable tokens (else the SWA pool
+                # leaks). window_start (fill_len - swa_tail_len) is page-aligned.
+                req.swa_evicted_seqlen = max(
+                    req.swa_evicted_seqlen, fill_len - swa_tail_len
+                )
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    prefix_lens=torch.tensor(
+                        [prefix_len], dtype=torch.int64, device=device
+                    ),
+                    prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
                     seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                     last_loc=last_loc,
-                    extend_num_tokens=fill_len,
-                    swa_tail_len=self._swa_tail_len(fill_len),
+                    extend_num_tokens=delta_len,
+                    swa_tail_len=swa_tail_len,
                 )
                 req.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
             else:
@@ -1414,9 +1471,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         assert kv_loc is not None, (
             f"KV cache is full! Bug in memory estimation. "
-            f"available={self.token_to_kv_pool_allocator.available_size()}, "
-            f"evictable={self.tree_cache.evictable_size()}, "
-            f"protected={self.tree_cache.protected_size()}, "
+            f"available={self._radix_full_available()}, "
+            f"evictable={self._radix_full_evictable()}, "
+            f"protected={self._radix_full_protected()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
             f"page_size={self.token_to_kv_pool_allocator.page_size}, "
