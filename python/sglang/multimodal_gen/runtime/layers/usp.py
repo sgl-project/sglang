@@ -154,6 +154,14 @@ def _usp_input_all_to_all_varlen(
         len(seq_lens) == world_size
     ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
 
+    # Fast path: when every rank holds the same local sequence length, the
+    # variable-length all-to-all degenerates to a fixed-size one. The fixed-size
+    # path avoids the per-rank ``.contiguous()`` slice loop and the two
+    # ``torch.cat`` calls below, cutting the number of layout-copy kernels
+    # (``direct_copy``) launched per attention layer by ~3x. Output is identical.
+    if len(set(seq_lens)) == 1:
+        return _usp_input_all_to_all(x, head_dim=head_dim)
+
     rank = get_ulysses_parallel_rank()
 
     # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
@@ -286,6 +294,12 @@ def _usp_output_all_to_all_varlen(
     assert (
         len(seq_lens) == world_size
     ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+
+    # Fast path: equal local sequence lengths -> the fixed-size inverse all-to-all
+    # is identical and avoids the per-rank slice/contiguous loop + torch.cat. See
+    # the matching note in ``_usp_input_all_to_all_varlen``.
+    if len(set(seq_lens)) == 1:
+        return _usp_output_all_to_all(x, head_dim=head_dim)
 
     rank = get_ulysses_parallel_rank()
 
