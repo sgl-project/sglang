@@ -395,10 +395,6 @@ class Compressor(nn.Module):
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-        if _use_aiter:
-            self.ape.data = self.ape.data.to(torch.bfloat16)
-            self.norm.weight.data = self.norm.weight.data.to(torch.bfloat16)
-
     def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
