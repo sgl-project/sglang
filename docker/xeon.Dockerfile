@@ -42,8 +42,7 @@ RUN source $HOME/.local/bin/env && \
     uv pip install . && \
     cd ../sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
-    uv pip install . && \
-    uv pip install apache-tvm-ffi==0.1.11
+    uv pip install .
 
 ENV SGLANG_USE_CPU_ENGINE=1
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4:/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:/opt/.venv/lib/libiomp5.so
