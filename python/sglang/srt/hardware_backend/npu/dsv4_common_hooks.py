@@ -299,6 +299,38 @@ def maybe_evict_dsv4_state(batch: "ScheduleBatch", req: "Req", pre_len: int) -> 
     )
 
 
+def maybe_evict_dsv4_state_on_swa(
+    batch: "ScheduleBatch", req: "Req", new_swa_evicted_seqlen: int
+) -> None:
+    """Free compress-state slots that ride along with SWA eviction.
+
+    State at raw positions < ``swa_evicted_seqlen`` is no longer readable (the
+    compressor only reads the trailing ``2*ratio`` window) and is returned to
+    its paged allocator to keep the small state pool from exhausting on long
+    generations. Mirrors reference chunk_cache state eviction. No-op when the
+    DSV4-NPU state allocators are absent.
+
+    This path is needed for small-sliding-window models where
+    ``sliding_window < retention`` (e.g. c128 retention 192 > window 128):
+    in that case the watermark-based eviction alone may not free slots
+    fast enough, and the SWA-ride eviction is the primary reclaim mechanism.
+    For typical large-window models (DS-V4 with window >> 192), the
+    watermark eviction always runs first, making this path a no-op.
+  """
+    allocator = batch.token_to_kv_pool_allocator
+    pool = batch.req_to_token_pool
+    if not hasattr(allocator, "c4_state_attn_allocator"):
+        return
+    _free_state_range(
+        allocator.c4_state_attn_allocator, pool, "req_to_token_c4_state",
+        req, "c4_state_alloc_offset", new_swa_evicted_seqlen,
+    )
+    _free_state_range(
+        allocator.c128_state_attn_allocator, pool, "req_to_token_c128_state",
+        req, "c128_state_alloc_offset", new_swa_evicted_seqlen,
+    )
+
+
 def _free_state_range(
     state_allocator,
     pool,

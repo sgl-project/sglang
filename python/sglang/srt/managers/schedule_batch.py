@@ -2752,6 +2752,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
+
+            # DSV4-NPU only (no-op elsewhere): compress-state slots at raw
+            # positions < swa_evicted_seqlen ride along with SWA eviction.
+            # For small-window models where sliding_window < c128 retention (192),
+            # this is the primary reclaim mechanism (the watermark-based eviction
+            # alone can't free fast enough). No-op on CUDA / non-V4 paths.
+            # See hardware_backend/npu/dsv4_common_hooks.py.
+            from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
+                maybe_evict_dsv4_state_on_swa,
+            )
+
+            maybe_evict_dsv4_state_on_swa(self, req, new_swa_evicted_seqlen)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def __str__(self):
