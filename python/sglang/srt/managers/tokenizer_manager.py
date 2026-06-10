@@ -1455,9 +1455,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.time_stats.get_response_sent_to_client_realtime()
+                # In incremental streaming, `out` carries only the final
+                # delta text; log the full accumulated response so the finish
+                # log matches non-streaming behavior instead of showing the
+                # last chunk only.
+                if incremental_stream and out.get("text") is not None:
+                    log_out = {**out, "text": state.get_text()}
+                else:
+                    log_out = out
                 self.request_logger.log_finished_request(
                     obj,
-                    out,
+                    log_out,
                     request=request,
                 )
 
