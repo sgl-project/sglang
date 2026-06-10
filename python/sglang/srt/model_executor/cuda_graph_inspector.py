@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import tempfile
+import weakref
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,10 +56,9 @@ def _check_cuda_bindings():
 # ---------------------------------------------------------------------------
 class CUGraphNodeType(IntEnum):
     """cudaGraphNodeType enum values."""
-
     KERNEL = 0
     MEMCPY = 1
-    MEMSET = 2  # cudaGraphNodeTypeMemset
+    MEMSET = 2    # cudaGraphNodeTypeMemset
     HOST = 3
     MEMCPY_FROM_SYMBOL = 4
     MEMCPY_TO_SYMBOL = 5
@@ -66,8 +66,8 @@ class CUGraphNodeType(IntEnum):
     EVENT_WAIT = 7
     EXT_SEMAS_SIGNAL = 8
     EXT_SEMAS_WAIT = 9
-    COND = 10  # cudaGraphNodeTypeConditional
-    WHILE_LOOP = 11  # cudaGraphNodeTypeWhileLoop
+    COND = 10       # cudaGraphNodeTypeConditional
+    WHILE_LOOP = 11 # cudaGraphNodeTypeWhileLoop
     CHILD_GRAPH = 12
     MEMORY_ALLOC = 13
     MEMORY_FREE = 14
@@ -75,7 +75,6 @@ class CUGraphNodeType(IntEnum):
 
 class CUPointerAttribute(IntEnum):
     """CU_POINTER_ATTRIBUTE enum values for cuPointerGetAttribute."""
-
     MEMORY_TYPE = 0
     DEVICE_POINTER = 1
     HOST_POINTER = 2
@@ -96,10 +95,9 @@ class CUPointerAttribute(IntEnum):
 # ---------------------------------------------------------------------------
 class PointerCategory(str, Enum):
     """Category of a device pointer found in kernel arguments."""
-
     INPUT_BUFFER = "input_buffer"
     MODEL_WEIGHT = "model_weight"
-    INTERMEDIATE = "intermediate"  # Pool-allocated scratch tensor
+    INTERMEDIATE = "intermediate"       # Pool-allocated scratch tensor
     ATTENTION_METADATA = "attn_metadata"
     UNKNOWN = "unknown"
 
@@ -107,31 +105,27 @@ class PointerCategory(str, Enum):
 @dataclass
 class KernelParamInfo:
     """Metadata for a single kernel parameter."""
-
     index: int
     is_device_pointer: bool
-    raw_value: int  # The 8-byte value as uint64
+    raw_value: int                         # The 8-byte value as uint64
     # For device pointers:
     category: PointerCategory = PointerCategory.UNKNOWN
-    symbolic_name: str = (
-        ""  # e.g. "buffers.input_ids" or "model.layers.0.q_proj.weight"
-    )
-    offset: int = 0  # Offset within the named buffer
-    base_addr: int = 0  # Base address of the containing allocation
-    alloc_size: int = 0  # Size of the containing allocation
+    symbolic_name: str = ""                # e.g. "buffers.input_ids" or "model.layers.0.q_proj.weight"
+    offset: int = 0                        # Offset within the named buffer
+    base_addr: int = 0                     # Base address of the containing allocation
+    alloc_size: int = 0                    # Size of the containing allocation
     # For scalars:
-    scalar_type: str = ""  # e.g. "int32", "float32"
+    scalar_type: str = ""                  # e.g. "int32", "float32"
     scalar_value: Any = None
 
 
 @dataclass
 class KernelNodeInfo:
     """Metadata for a single kernel node in a CUDA graph."""
-
     node_index: int
-    func_ptr: int  # CUfunction as int
-    kernel_name: str = ""  # Resolved kernel name (may be empty)
-    module_hash: str = ""  # Hash of the module containing this kernel
+    func_ptr: int                          # CUfunction as int
+    kernel_name: str = ""                  # Resolved kernel name (may be empty)
+    module_hash: str = ""                  # Hash of the module containing this kernel
     grid_dim: Tuple[int, int, int] = (0, 0, 0)
     block_dim: Tuple[int, int, int] = (0, 0, 0)
     shared_mem_bytes: int = 0
@@ -142,7 +136,6 @@ class KernelNodeInfo:
 @dataclass
 class MemcpyNodeInfo:
     """Metadata for a memcpy node."""
-
     node_index: int
     src_ptr: int
     dst_ptr: int
@@ -153,7 +146,6 @@ class MemcpyNodeInfo:
 @dataclass
 class MemsetNodeInfo:
     """Metadata for a memset node."""
-
     node_index: int
     dst_ptr: int
     value: int
@@ -164,10 +156,7 @@ class MemsetNodeInfo:
 @dataclass
 class GraphMetadata:
     """Complete metadata for a CUDA graph, sufficient for reconstruction."""
-
-    nodes: List[Any] = field(
-        default_factory=list
-    )  # KernelNodeInfo | MemcpyNodeInfo | MemsetNodeInfo
+    nodes: List[Any] = field(default_factory=list)  # KernelNodeInfo | MemcpyNodeInfo | MemsetNodeInfo
     num_nodes: int = 0
     # Buffer address mapping at capture time: data_ptr -> (symbolic_name, offset)
     buffer_map: Dict[int, Tuple[str, int]] = field(default_factory=dict)
@@ -199,13 +188,9 @@ class CUFunctionRegistry:
     """
 
     def __init__(self):
-        self._func_to_name: Dict[int, Tuple[str, str]] = (
-            {}
-        )  # CUfunction -> (module_id, func_name)
-        self._module_to_funcs: Dict[int, List[Tuple[str, int]]] = (
-            {}
-        )  # CUmodule -> [(name, CUfunction)]
-        self._module_hash_to_module: Dict[str, int] = {}  # module_hash -> CUmodule
+        self._func_to_name: Dict[int, Tuple[str, str]] = {}   # CUfunction -> (module_id, func_name)
+        self._module_to_funcs: Dict[int, List[Tuple[str, int]]] = {}  # CUmodule -> [(name, CUfunction)]
+        self._module_hash_to_module: Dict[str, int] = {}       # module_hash -> CUmodule
         self._hooked: bool = False
 
     def hook_module_loading(self):
@@ -306,9 +291,7 @@ class CUFunctionRegistry:
 
         # Strategy 3: Try cuModuleEnumerateFunctions on all known modules
         # (available since CUDA 12.4)
-        if hasattr(cu, "cuModuleGetFunctionCount") and hasattr(
-            cu, "cuModuleEnumerateFunctions"
-        ):
+        if hasattr(cu, 'cuModuleGetFunctionCount') and hasattr(cu, 'cuModuleEnumerateFunctions'):
             for mod_ptr in list(self._module_to_funcs.keys()):
                 try:
                     # Get function count
@@ -318,9 +301,7 @@ class CUFunctionRegistry:
                     func_count = int(count_result[1])
 
                     # Enumerate functions
-                    enum_result = cu.cuModuleEnumerateFunctions(
-                        cu.CUmodule(mod_ptr), func_count
-                    )
+                    enum_result = cu.cuModuleEnumerateFunctions(cu.CUmodule(mod_ptr), func_count)
                     if enum_result[0] != cu.CUresult.CUDA_SUCCESS:
                         continue
 
@@ -333,7 +314,7 @@ class CUFunctionRegistry:
                         if name_result[0] == cu.CUresult.CUDA_SUCCESS:
                             name = name_result[1]
                             if isinstance(name, bytes):
-                                name = name.decode("utf-8", "replace")
+                                name = name.decode('utf-8', 'replace')
                             # Register this function
                             if func_ptr_new not in self._func_to_name:
                                 self._func_to_name[func_ptr_new] = (module_id, name)
@@ -361,6 +342,7 @@ class CUFunctionRegistry:
         2. Find PyTorch-loaded CUDA modules via torch.cuda internals
         3. Walk CUDA context for loaded modules (if supported)
         """
+        import gc
 
         _check_cuda_bindings()
 
@@ -456,9 +438,7 @@ class CUFunctionRegistry:
                     except Exception:
                         continue
 
-                    module_id = (
-                        f"triton_{module_handle:x}" if module_handle else "triton"
-                    )
+                    module_id = f"triton_{module_handle:x}" if module_handle else "triton"
                     self._func_to_name[func_handle] = (module_id, func_name)
                     if module_handle and module_handle not in seen_modules:
                         seen_modules.add(module_handle)
@@ -471,9 +451,7 @@ class CUFunctionRegistry:
                 continue
 
         if count > 0:
-            logger.debug(
-                f"Scanned {count} Triton kernel functions from CompiledKernel instances"
-            )
+            logger.debug(f"Scanned {count} Triton kernel functions from CompiledKernel instances")
 
     def _scan_pytorch_kernels(self):
         """Find PyTorch-compiled kernels and register their CUfunction handles.
@@ -481,6 +459,7 @@ class CUFunctionRegistry:
         PyTorch stores compiled kernel caches internally. This method
         attempts to find them via gc.get_objects().
         """
+        import gc
 
         # PyTorch CUDAGraph and compiled functions store kernel info
         # but not in a way that's easily accessible from Python.
@@ -518,13 +497,13 @@ def get_kernel_name(func_ptr: int) -> Optional[str]:
     _check_cuda_bindings()
 
     # Try cuFuncGetName first (available since CUDA 12.4)
-    if hasattr(cu, "cuFuncGetName"):
+    if hasattr(cu, 'cuFuncGetName'):
         try:
             result = cu.cuFuncGetName(cu.CUfunction(func_ptr))
             if result[0] == cu.CUresult.CUDA_SUCCESS:
                 name = result[1]
                 if isinstance(name, bytes):
-                    name = name.decode("utf-8", "replace")
+                    name = name.decode('utf-8', 'replace')
                 return name
         except Exception:
             pass
@@ -545,7 +524,7 @@ def get_kernel_module(func_ptr: int) -> Optional[int]:
     """
     _check_cuda_bindings()
 
-    if hasattr(cu, "cuFuncGetModule"):
+    if hasattr(cu, 'cuFuncGetModule'):
         try:
             result = cu.cuFuncGetModule(cu.CUfunction(func_ptr))
             if result[0] == cu.CUresult.CUDA_SUCCESS:
@@ -639,19 +618,14 @@ def get_kernel_names_from_graph(
             pass
 
     # Parse kernel names from DOT output
-    pattern = re.compile(r'N(?:ode)?(\d+)\s*\[label="([^"\\]+)')
+    pattern = re.compile(
+        r'N(?:ode)?(\d+)\s*\[label="([^"\\]+)'
+    )
     for match in pattern.finditer(dot_content):
         node_idx = int(match.group(1))
         label = match.group(2).strip()
-        if label and label not in (
-            "Memcpy",
-            "Memset",
-            "Host",
-            "EventRecord",
-            "EventWait",
-            "MemoryAlloc",
-            "MemoryFree",
-        ):
+        if label and label not in ("Memcpy", "Memset", "Host", "EventRecord",
+                                    "EventWait", "MemoryAlloc", "MemoryFree"):
             kernel_names[node_idx] = label
 
     return kernel_names
@@ -739,16 +713,12 @@ def inspect_cuda_graph(
         node_type_val = int(type_result[1])
 
         if node_type_val == CUGraphNodeType.KERNEL:
-            node_info = _inspect_kernel_node(
-                i, node, known_buffers, known_weights, registry
-            )
+            node_info = _inspect_kernel_node(i, node, known_buffers, known_weights, registry)
             # Override kernel name with DOT dump if available (more reliable)
             if i in kernel_names:
                 node_info.kernel_name = kernel_names[i]
                 # Register the kernel name in the registry for future lookups
-                if node_info.func_ptr and not registry.resolve_function(
-                    node_info.func_ptr
-                ):
+                if node_info.func_ptr and not registry.resolve_function(node_info.func_ptr):
                     registry.register_function(
                         node_info.func_ptr, "graph_kernel", kernel_names[i]
                     )
@@ -770,7 +740,7 @@ def inspect_cuda_graph(
     for i in range(num_nodes):
         node = node_array[i]
         deps = _get_node_dependencies(node, node_array, num_nodes)
-        if i < len(metadata.nodes) and hasattr(metadata.nodes[i], "dependency_indices"):
+        if i < len(metadata.nodes) and hasattr(metadata.nodes[i], 'dependency_indices'):
             metadata.nodes[i].dependency_indices = deps
 
     # Detect pool base address from the first intermediate tensor found.
@@ -903,7 +873,7 @@ def _parse_kernel_params(
                     ptr_bytes = mem_fd.read(ptr_size)
                     if len(ptr_bytes) < ptr_size:
                         break
-                    param_ptr = struct.unpack("<Q", ptr_bytes)[0]
+                    param_ptr = struct.unpack('<Q', ptr_bytes)[0]
                     if param_ptr == 0:
                         break
 
@@ -911,7 +881,7 @@ def _parse_kernel_params(
                     val_bytes = mem_fd.read(8)
                     if len(val_bytes) < 8:
                         break
-                    value = struct.unpack("<Q", val_bytes)[0]
+                    value = struct.unpack('<Q', val_bytes)[0]
                 else:
                     # Fallback: use ctypes (may segfault if we read past the end)
                     param_ptr_ptr = kernel_params_ptr + i * ptr_size
@@ -958,18 +928,16 @@ def _parse_kernel_params(
                 else:
                     category = PointerCategory.INTERMEDIATE
 
-            params.append(
-                KernelParamInfo(
-                    index=i,
-                    is_device_pointer=is_device_ptr,
-                    raw_value=value,
-                    category=category,
-                    symbolic_name=symbolic_name,
-                    offset=offset,
-                    base_addr=base_addr,
-                    alloc_size=alloc_size,
-                )
-            )
+            params.append(KernelParamInfo(
+                index=i,
+                is_device_pointer=is_device_ptr,
+                raw_value=value,
+                category=category,
+                symbolic_name=symbolic_name,
+                offset=offset,
+                base_addr=base_addr,
+                alloc_size=alloc_size,
+            ))
 
     finally:
         if mem_fd is not None:
@@ -1026,9 +994,9 @@ def _inspect_memcpy_node(index: int, node) -> MemcpyNodeInfo:
         params = result[1]
         # CUmemcpy3DParms has srcPos, dstPos, extent, srcPtr, dstPtr
         # Extract source and destination pointers and copy size
-        src_ptr = int(params.srcPtr) if hasattr(params, "srcPtr") else 0
-        dst_ptr = int(params.dstPtr) if hasattr(params, "dstPtr") else 0
-        copy_size = int(params.extent.width) if hasattr(params, "extent") else 0
+        src_ptr = int(params.srcPtr) if hasattr(params, 'srcPtr') else 0
+        dst_ptr = int(params.dstPtr) if hasattr(params, 'dstPtr') else 0
+        copy_size = int(params.extent.width) if hasattr(params, 'extent') else 0
         return MemcpyNodeInfo(
             node_index=index,
             src_ptr=src_ptr,
@@ -1047,9 +1015,9 @@ def _inspect_memset_node(index: int, node) -> MemsetNodeInfo:
         if result[0] != cu.CUresult.CUDA_SUCCESS:
             return MemsetNodeInfo(node_index=index, dst_ptr=0, value=0, size=0)
         params = result[1]
-        dst_ptr = int(params.dst) if hasattr(params, "dst") else 0
-        value = int(params.value) if hasattr(params, "value") else 0
-        size = int(params.pitch) if hasattr(params, "pitch") else 0
+        dst_ptr = int(params.dst) if hasattr(params, 'dst') else 0
+        value = int(params.value) if hasattr(params, 'value') else 0
+        size = int(params.pitch) if hasattr(params, 'pitch') else 0
         return MemsetNodeInfo(
             node_index=index,
             dst_ptr=dst_ptr,
@@ -1179,7 +1147,9 @@ class BufferAddressRegistry:
                 translation[old_ptr] = new_by_name[name]
 
         # Translate model weights
-        old_weights_by_name = {name: ptr for ptr, name in old_registry._weights.items()}
+        old_weights_by_name = {
+            name: ptr for ptr, name in old_registry._weights.items()
+        }
         new_weights_by_name = {name: ptr for ptr, name in self._weights.items()}
         for name, old_ptr in old_weights_by_name.items():
             if name in new_weights_by_name:

@@ -42,10 +42,6 @@ from typing import (
     Union,
 )
 
-from sglang.srt.utils.network import NetworkAddress
-from sglang.srt.weight_cache.daemon import run_weight_cache_daemon
-from sglang.srt.weight_cache.protocol import get_ready_path
-
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -587,6 +583,13 @@ class Engine(EngineScoreMixin, EngineBase):
         TP-sharded model loading works correctly. Each daemon holds its
         rank's weight shard in GPU memory and serves IPC handles.
         """
+        import multiprocessing as mp
+
+        from sglang.srt.utils.network import NetworkAddress
+
+        from sglang.srt.weight_cache.daemon import run_weight_cache_daemon
+        from sglang.srt.weight_cache.protocol import get_ready_path
+
         tp_size = server_args.tp_size
         gpu_ids = list(range(tp_size))
 

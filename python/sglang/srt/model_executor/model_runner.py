@@ -1313,7 +1313,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # custom socket, derive it from the actual GPU ID.
             if self.load_config.weight_cache_socket is None:
                 from sglang.srt.weight_cache.protocol import get_socket_path
-
                 self.load_config.weight_cache_socket = get_socket_path(
                     gpu_id=self.gpu_id
                 )

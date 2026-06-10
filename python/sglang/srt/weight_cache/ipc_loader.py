@@ -10,7 +10,6 @@ Two modes:
 """
 
 import logging
-import socket as socket_mod
 import time
 from typing import Optional
 
@@ -20,29 +19,21 @@ import torch.nn as nn
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     BaseModelLoader,
-    _get_quantization_config,
     _initialize_model,
     _post_load_weights,
-    device_loading_context,
 )
-from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
     get_quant_method_name,
+    get_socket_path,
     hash_quant_config,
     recv_msg,
     send_msg,
 )
 
 logger = logging.getLogger(__name__)
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.model_loader.loader import DefaultModelLoader
 
 
 class IpcModelLoader(BaseModelLoader):
@@ -110,24 +101,24 @@ class IpcModelLoader(BaseModelLoader):
             f"in {time.perf_counter() - tic:.2f}s"
         )
 
+        from sglang.srt.model_loader.loader import (
+            _get_quantization_config,
+            device_loading_context,
+        )
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
+
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
         if self.copy_mode:
             model = self._load_copy_mode(
-                model_config,
-                device_config,
-                entries,
-                target_device,
-                quant_config,
+                model_config, device_config, entries,
+                target_device, quant_config,
             )
         else:
             model = self._load_zero_copy_mode(
-                model_config,
-                device_config,
-                entries,
-                target_device,
-                quant_config,
+                model_config, device_config, entries,
+                target_device, quant_config,
             )
 
         # Post-load hooks (e.g., model-specific finalization)
@@ -162,7 +153,9 @@ class IpcModelLoader(BaseModelLoader):
         if is_param:
             existing = getattr(obj, leaf_name, None)
             if isinstance(existing, nn.Parameter):
-                new_param = nn.Parameter(tensor, requires_grad=existing.requires_grad)
+                new_param = nn.Parameter(
+                    tensor, requires_grad=existing.requires_grad
+                )
             else:
                 new_param = nn.Parameter(tensor, requires_grad=False)
             setattr(obj, leaf_name, new_param)
@@ -170,12 +163,7 @@ class IpcModelLoader(BaseModelLoader):
             obj.register_buffer(leaf_name, tensor)
 
     def _load_zero_copy_mode(
-        self,
-        model_config,
-        device_config,
-        entries,
-        target_device,
-        quant_config,
+        self, model_config, device_config, entries, target_device, quant_config,
     ) -> nn.Module:
         """Zero-copy load: map IPC tensors directly as param.data.
 
@@ -184,6 +172,7 @@ class IpcModelLoader(BaseModelLoader):
         This avoids the 2x GPU memory overhead of copy mode — the engine and
         daemon share the same physical GPU memory via CUDA IPC.
         """
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
 
         # Initialize model on meta device to avoid any GPU/CPU memory allocation.
         # This creates the model structure with the correct parameter shapes/dtypes
@@ -191,9 +180,7 @@ class IpcModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with torch.device("meta"):
                 model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                    quant_config,
+                    model_config, self.load_config, quant_config,
                 )
 
         # Build lookup dicts of existing parameter/buffer names in the
@@ -227,10 +214,7 @@ class IpcModelLoader(BaseModelLoader):
                     ref_param = existing_params[name]
                 else:
                     ref_param = existing_buffers[name]
-                if (
-                    imported_tensor.shape != ref_param.shape
-                    or imported_tensor.dtype != ref_param.dtype
-                ):
+                if imported_tensor.shape != ref_param.shape or imported_tensor.dtype != ref_param.dtype:
                     logger.warning(
                         f"[IpcModelLoader] Shape/dtype mismatch for {name}: "
                         f"IPC={imported_tensor.shape}/{imported_tensor.dtype} "
@@ -319,12 +303,7 @@ class IpcModelLoader(BaseModelLoader):
         return model
 
     def _load_copy_mode(
-        self,
-        model_config,
-        device_config,
-        entries,
-        target_device,
-        quant_config,
+        self, model_config, device_config, entries, target_device, quant_config,
     ) -> nn.Module:
         """Copy mode: initialize model on GPU, then copy IPC weights over.
 
@@ -332,13 +311,12 @@ class IpcModelLoader(BaseModelLoader):
         the engine's model during the copy phase. After copying, the daemon
         can release its GPU memory.
         """
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
 
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                    quant_config,
+                    model_config, self.load_config, quant_config,
                 )
                 # Run quant post-processing to create parameters like weight_scale
                 for _, module in model.named_modules():
@@ -377,6 +355,7 @@ class IpcModelLoader(BaseModelLoader):
 
     def _notify_daemon_release(self):
         """Tell the daemon to release its GPU memory after copy-mode load."""
+        import socket as socket_mod
 
         try:
             sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
@@ -394,6 +373,7 @@ class IpcModelLoader(BaseModelLoader):
 
     def _fetch_from_cache(self, model_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles."""
+        import socket as socket_mod
 
         try:
             sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
@@ -420,6 +400,10 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
 
             try:
                 tp_size = get_tensor_model_parallel_world_size()
@@ -439,11 +423,9 @@ class IpcModelLoader(BaseModelLoader):
 
             engine_config = CacheConfig(
                 model_path=model_config.model_path,
-                model_arch=(
-                    model_config.hf_config.architectures[0]
-                    if model_config.hf_config.architectures
-                    else ""
-                ),
+                model_arch=model_config.hf_config.architectures[0]
+                if model_config.hf_config.architectures
+                else "",
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 dp_size=1,  # TODO: get actual dp_size
@@ -487,6 +469,8 @@ class IpcModelLoader(BaseModelLoader):
 
     def _fallback_load(self, model_config, device_config) -> nn.Module:
         """Fall back to DefaultModelLoader for disk-based loading."""
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.model_loader.loader import DefaultModelLoader
 
         # Build a new LoadConfig with the original load_format (not IPC_CACHE),
         # since DefaultModelLoader doesn't know how to handle IPC_CACHE.
@@ -498,9 +482,7 @@ class IpcModelLoader(BaseModelLoader):
         )
         loader_cls = self._fallback_loader_cls or DefaultModelLoader
         fallback = loader_cls(fallback_config)
-        return fallback.load_model(
-            model_config=model_config, device_config=device_config
-        )
+        return fallback.load_model(model_config=model_config, device_config=device_config)
 
     def download_model(self, model_config) -> None:
         """No-op: daemon handles its own model downloading."""
