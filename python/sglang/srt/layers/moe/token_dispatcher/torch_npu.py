@@ -97,7 +97,7 @@ class TorchNpuDispatcher(BaseDispatcher):
 
         # group_list_type is always 1 for both modes – kept as instance attribute
         # for readability instead of hardcoding in dispatch().
-        self.group_list_type = 0
+        self.group_list_type = 1
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
