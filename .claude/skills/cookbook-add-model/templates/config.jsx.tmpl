@@ -142,8 +142,9 @@ sgl-eval run gsm8k \\
     mi355x: "lmsysorg/sglang:dev-rocm720-mi35x",
   },
 
-  // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
-  // Must match that dropdown's value (usually `<hf-org>/<model-slug>`).
+  // Prefills the issue template's free-form `model` field on "Submit verified cell".
+  // Use the HF id (`<hf-org>/<model-slug>`). Do NOT delete this block when pruning —
+  // without it the engine falls back to "deepseek-ai/deepseek-v4" and mislabels submissions.
   github: {
     cookbookModel: "__HF_ORG__/__MODEL_SLUG__",
   },
