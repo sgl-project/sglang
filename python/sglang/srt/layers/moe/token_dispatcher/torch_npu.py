@@ -83,12 +83,13 @@ class TorchNpuDispatcher(BaseDispatcher):
         if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
             self.init = NPUMoEInitRouting_v2(quant_mode=-1)
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
-
+            self.group_list_type = 1
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
             #self.init = NPUMoEInitRouting_v2(quant_mode=1)
             #self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.init = NPUMoEInitRouting_v1()
             self.finalize = NPUFinalizeRouting(drop_pad_mode=0)
+            self.group_list_type = 0
 
         else:
             raise ValueError(
@@ -97,7 +98,7 @@ class TorchNpuDispatcher(BaseDispatcher):
 
         # group_list_type is always 1 for both modes – kept as instance attribute
         # for readability instead of hardcoding in dispatch().
-        self.group_list_type = 1
+        #self.group_list_type = 1
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
