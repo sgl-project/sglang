@@ -126,11 +126,8 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import (
-        shuffle_scale_a16w4,
-        shuffle_weight,
-        shuffle_weight_a16w4,
-    )
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.utility.fp4_utils import e8m0_shuffle
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -1226,10 +1223,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
                 scale = getattr(layer, scale_name)
                 num_experts, num_rows, _ = scale.shape
-                # a8w4: aiter flydsl scale layout
-                is_w13_scale = scale_name == "w13_weight_scale_inv"
-                scale.data = shuffle_scale_a16w4(
-                    scale.view(num_experts * num_rows, -1), num_experts, is_w13_scale
+                scale.data = e8m0_shuffle(scale.view(num_experts * num_rows, -1)).view(
+                    num_experts, num_rows, -1
                 )
 
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
@@ -1237,12 +1232,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             is_shuffled = _is_shuffle_moe_mxfp4
             if is_shuffled:
-                # a8w4: aiter flydsl weight layout
-                layer.w13_weight.data = shuffle_weight_a16w4(
-                    layer.w13_weight.contiguous(), 16, True
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
                 )
-                layer.w2_weight.data = shuffle_weight_a16w4(
-                    layer.w2_weight.contiguous(), 16, False
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
                 )
             layer.w13_weight.is_shuffled = is_shuffled
             layer.w2_weight.is_shuffled = is_shuffled
@@ -1325,7 +1319,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     build_mega_moe_experts_weights(layer)
                     return
 
-                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
+                if (
+                    will_use_deepgemm
+                    and deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0
+                ):
                     from deep_gemm import transform_sf_into_required_layout
 
                     for scale_param, weight_param in [
@@ -1334,7 +1331,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     ]:
                         num_experts, n, _ = scale_param.data.shape
                         k = weight_param.shape[2] * 2
-                        scale_param.data = transform_sf_into_required_layout(
+                        tma_aligned_n_e8m0 = ((n + 15) // 16) * 16
+                        scale_data = transform_sf_into_required_layout(
                             scale_param.data,
                             mn=n,
                             k=k,
@@ -1342,6 +1340,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             num_groups=num_experts,
                             disable_ue8m0_cast=False,
                         )
+                        e8m0_scale_data = torch.empty_strided(
+                            scale_data.shape,
+                            (
+                                tma_aligned_n_e8m0 * scale_data.shape[2],
+                                1,
+                                tma_aligned_n_e8m0,
+                            ),
+                            device=scale_data.device,
+                            dtype=torch.uint8,
+                        )
+                        e8m0_scale_data.copy_(
+                            (torch.floor(torch.log2(scale_data.float())) + 127).to(
+                                torch.uint8
+                            )
+                        )
+                        scale_param.scale_e8m0_data = e8m0_scale_data
+                        scale_param.data = scale_data
                     layer.w13_weight_scale_inv.format_ue8m0 = True
                     layer.w2_weight_scale_inv.format_ue8m0 = True
 
@@ -1964,6 +1979,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
+                w13_scale_e8m0=getattr(w13_scale, "scale_e8m0_data", None),
+                w2_scale_e8m0=getattr(w2_scale, "scale_e8m0_data", None),
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
             )
@@ -1983,10 +2000,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 get_activation_type,
             )
 
-            activation_type = get_activation_type(
-                self.moe_runner_config.activation,
-                is_gated=self.moe_runner_config.is_gated,
-            )
+            activation_type = get_activation_type(self.moe_runner_config.activation)
 
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -2128,7 +2142,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_scale=w13_scale,
             w2_scale=w2_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
-            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
         )
 
 

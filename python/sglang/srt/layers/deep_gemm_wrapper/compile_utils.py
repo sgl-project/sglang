@@ -13,7 +13,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     restore_symmetric_memory_context,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+    DEEPGEMM_FP4_SCALE_B_UE8M0,
+    ENABLE_JIT_DEEPGEMM,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
@@ -98,6 +101,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
+    GROUPED_GEMM_NT_F8FP4BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
     GROUPED_GEMM_NT_BF16_MASKED = auto()
     GROUPED_GEMM_NT_BF16_CONTIG = auto()
@@ -233,6 +237,7 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED: _GroupedMaskedFp8Fp4WarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
@@ -257,6 +262,15 @@ class _BaseWarmupExecutor:
             return (
                 num_groups * max_m * k
                 + num_groups * n * k
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED:
+            rhs_scale_bytes = 4 + (1 if DEEPGEMM_FP4_SCALE_B_UE8M0 else 0)
+            return (
+                num_groups * max_m * k
+                + num_groups * n * ceil_div(k, 2)
+                + num_groups * n * ceil_div(k, 32) * rhs_scale_bytes
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
@@ -370,6 +384,50 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             masked_m=self.masked_m,
             # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
+        )
+
+
+class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.max_m = max_m
+        self.n = n
+        self.k = k
+        self.num_groups = num_groups
+        self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
+        self.rhs_q = torch.empty(
+            (num_groups, n, ceil_div(k, 2)), device="cuda", dtype=torch.int8
+        )
+        rhs_s_k = ceil_div(k, 32)
+        self.rhs_s = torch.empty(
+            (num_groups, n, rhs_s_k), device="cuda", dtype=torch.float32
+        )
+        self.rhs_s_e8m0 = None
+        if DEEPGEMM_FP4_SCALE_B_UE8M0:
+            tma_aligned_n = ceil_div(n, 16) * 16
+            self.rhs_s_e8m0 = torch.empty_strided(
+                (num_groups, n, rhs_s_k),
+                (tma_aligned_n * rhs_s_k, 1, tma_aligned_n),
+                device="cuda",
+                dtype=torch.uint8,
+            )
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        rhs_s = self.rhs_s
+        if self.rhs_s_e8m0 is not None:
+            rhs_s = self.rhs_s_e8m0
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, rhs_s),
+            self.out,
+            masked_m=self.masked_m,
+            expected_m=m,
+            gran_k=128,
+            gran_k_a=128,
+            gran_k_b=32,
         )
 
 

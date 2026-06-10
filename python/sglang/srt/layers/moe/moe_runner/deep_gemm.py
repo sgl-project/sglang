@@ -61,6 +61,17 @@ _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
+def _fp4_e8m0_scale_supported(
+    _expected_m: int,
+    _num_groups: int,
+    _m: int,
+    _n: int,
+    _k: int,
+    _masked_m_max_hint: Optional[int] = None,
+) -> bool:
+    return deep_gemm_wrapper.DEEPGEMM_FP4_SCALE_B_UE8M0
+
+
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
@@ -93,6 +104,9 @@ class DeepGemmRunnerInput(RunnerInput):
     use_masked_gemm: bool
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
+    masked_m_max_hint: Optional[int] = None
+    masked_m_sum_hint: Optional[int] = None
+    active_expert_count_hint: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
 
     @property
@@ -116,6 +130,8 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     use_fp8: bool
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
+    w13_scale_e8m0: Optional[torch.Tensor] = None
+    w2_scale_e8m0: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
@@ -167,7 +183,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.jit_kernel.deepseek_v4 import silu_and_mul_contig_post_quant
         from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
         from sglang.srt.layers.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -371,11 +387,21 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
         expected_m = runner_input.expected_m
+        is_fp4_experts = quant_info.is_fp4_experts
 
         w13_weight = quant_info.w13_weight
         w2_weight = quant_info.w2_weight
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
+
+        num_groups, m, k = hidden_states.shape
+        gemm_expected_m = expected_m
+        if is_fp4_experts:
+            # Keep the original expected_m hint, matching the FP8 masked path.
+            # Correctness-sensitive scheduler choices must be guarded in the
+            # DeepGEMM host heuristic because CUDA graph capture forbids reading
+            # masked_m.max().item() here.
+            gemm_expected_m = expected_m
 
         recipe_a, recipe_b = (
             ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
@@ -384,7 +410,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
 
         # GroupGemm-0
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and not is_fp4_experts:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
                 assert (
@@ -393,25 +419,46 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif (
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            and not is_fp4_experts
+        ):
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
             )
 
-        num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (hidden_states, hidden_states_scale),
-            (w13_weight, w13_scale),
-            gateup_output,
-            masked_m,
-            expected_m,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if is_fp4_experts:
+            if quant_info.w13_scale_e8m0 is not None and _fp4_e8m0_scale_supported(
+                gemm_expected_m, num_groups, m, n, k, runner_input.masked_m_max_hint
+            ):
+                w13_scale_for_gemm = quant_info.w13_scale_e8m0
+            else:
+                w13_scale_for_gemm = w13_scale
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale_for_gemm),
+                gateup_output,
+                masked_m,
+                gemm_expected_m,
+                gran_k_a=128,
+                gran_k_b=32,
+                masked_m_max_hint=runner_input.masked_m_max_hint,
+                active_groups_hint=runner_input.active_expert_count_hint,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                gateup_output,
+                masked_m,
+                gemm_expected_m,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -453,7 +500,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if (
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            and not is_fp4_experts
+        ):
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
@@ -463,6 +513,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
 
         down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
+        if down_gemm_overlap_args is not None and is_fp4_experts:
+            raise RuntimeError(
+                "SM90 FP8xFP4 masked DeepGEMM does not support down-GEMM overlap yet. "
+                "Please disable overlap scheduling for this path."
+            )
         if down_gemm_overlap_args is None:
             gemm_overlap_args_dict = {}
         else:
@@ -475,16 +530,41 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (down_input, down_input_scale),
-            (w2_weight, w2_scale),
-            down_output,
-            masked_m,
-            expected_m,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-            **gemm_overlap_args_dict,
-        )
+        if is_fp4_experts:
+            down_k = down_input.shape[2]
+            if quant_info.w2_scale_e8m0 is not None and _fp4_e8m0_scale_supported(
+                gemm_expected_m,
+                num_groups,
+                m,
+                n,
+                down_k,
+                runner_input.masked_m_max_hint,
+            ):
+                w2_scale_for_gemm = quant_info.w2_scale_e8m0
+            else:
+                w2_scale_for_gemm = w2_scale
+            deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
+                (down_input, down_input_scale),
+                (w2_weight, w2_scale_for_gemm),
+                down_output,
+                masked_m,
+                gemm_expected_m,
+                gran_k_a=128,
+                gran_k_b=32,
+                masked_m_max_hint=runner_input.masked_m_max_hint,
+                active_groups_hint=runner_input.active_expert_count_hint,
+            )
+        else:
+            deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (down_input, down_input_scale),
+                (w2_weight, w2_scale),
+                down_output,
+                masked_m,
+                gemm_expected_m,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+                **gemm_overlap_args_dict,
+            )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         # Returns (block_m, threshold) only with down-gemm overlap, else None;
         # meta_overlap_args may be set without overlap, so guard the unpack.
@@ -618,6 +698,11 @@ def pre_permute_standard_to_deep_gemm(
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
+        masked_m_max_hint=getattr(dispatch_output, "masked_m_max_hint", None),
+        masked_m_sum_hint=getattr(dispatch_output, "masked_m_sum_hint", None),
+        active_expert_count_hint=getattr(
+            dispatch_output, "active_expert_count_hint", None
+        ),
     )
 
 
@@ -685,6 +770,11 @@ def pre_permute_deepep_ll_to_deep_gemm(
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
+        masked_m_max_hint=getattr(dispatch_output, "masked_m_max_hint", None),
+        masked_m_sum_hint=getattr(dispatch_output, "masked_m_sum_hint", None),
+        active_expert_count_hint=getattr(
+            dispatch_output, "active_expert_count_hint", None
+        ),
     )
 
 
@@ -871,11 +961,8 @@ def _varlen_deep_gemm_silu_mul_quant(
         dtype=torch.float8_e4m3fn,
     )
 
-    use_jit_ep_activation = envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-    if N % 4 != 0 or G % 4 != 0:
-        use_jit_ep_activation = False
-
-    if use_jit_ep_activation:
+    if envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
+        assert N % 4 == 0 and G % 4 == 0
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         down_input_scale = torch.empty(
             (E, G // 4, N) if packed_ue8m0 else (E, N, G),
