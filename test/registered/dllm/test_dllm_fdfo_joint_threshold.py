@@ -47,8 +47,8 @@ class TestBatchingFDFOJointThreshold(CustomTestCase):
             "--cuda-graph-bs",
             "1",
         ]
-        if fdfo:
-            other_args.append("--dllm-fdfo")
+        # FDFO is the default; the sync arm must opt out explicitly.
+        other_args.append("--dllm-fdfo" if fdfo else "--no-dllm-fdfo")
 
         process = popen_launch_server(
             self.model,
