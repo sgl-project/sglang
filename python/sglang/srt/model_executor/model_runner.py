@@ -117,6 +117,11 @@ from sglang.srt.layers.attention.attention_registry import (
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.cp.utils import (
+    is_mla_prefill_cp_enabled,
+    maybe_cp_split_before_forward,
+    maybe_prepare_cp_forward,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_group,
@@ -132,7 +137,6 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
@@ -3306,6 +3310,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 self.model.prepare_forward_batch(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
+        maybe_prepare_cp_forward(
+            forward_batch,
+            self.attn_backend,
+            input_embeds=kwargs.get("input_embeds"),
+        )
+        maybe_cp_split_before_forward(self.model, forward_batch, kwargs)
 
         ctx = (
             self.device_timer.wrap(metadata={"category": "extend"})
@@ -3522,11 +3532,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.prepare_attn_tp_scatter_input(self)
 
             # Normalize num_token_non_padded to be local to this attention TP rank if needed.
-            # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
-            # flavors already feed a zigzag-split rank-local layout whose token count
-            # should not be further divided by attn_tp_size. MHA-arch prefill CP
-            # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
-            # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
+            # The skip is scoped to per-layer attn-CP flavors (DSA, MLA):
+            # those already feed a CP rank-local layout whose token count
+            # should not be further divided by attn_tp_size. MHA-arch
+            # prefill CP (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout
+            # and wants the adjustment to run.
             if (
                 forward_batch.num_token_non_padded is not None
                 and forward_batch.global_num_tokens_gpu is not None

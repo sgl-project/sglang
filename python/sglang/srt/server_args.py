@@ -1086,6 +1086,10 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
+        from sglang.srt.layers.cp.strategy import init_cp_strategy
+
+        init_cp_strategy(self)
+
     def _maybe_download_model_for_runai(self):
         if is_runai_obj_uri(self.model_path):
             ObjectStorageModel.download_and_get_path(self.model_path)
@@ -2030,12 +2034,18 @@ class ServerArgs:
                         "shared layers would run sparse attention without indices."
                     )
 
+                self._is_dsa_model_arch = True
                 if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_prefill_cp:
                         logger.warning(
                             "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                         )
-                        self.enable_dp_attention = True
+                        # Kernel-level requirements that *must* hold for the
+                        # DSA-CP path to compile / be correct. These are real
+                        # constraints, not CP-shape policy:
+                        #   - moe_dense_tp_size == 1 (dense layers are CP-replicated)
+                        #   - tp_size <= 8 (cross-machine has precision issues)
+                        # zigzag additionally needs the DeepEP A2A backend.
                         self.moe_dense_tp_size = 1
                         if self.cp_strategy == "zigzag":
                             self.moe_a2a_backend = "deepep"
@@ -2044,16 +2054,13 @@ class ServerArgs:
                                 "zigzag DSA CP requires moe_dense_tp_size=1, "
                                 "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
                             )
-                        else:
-                            assert (
-                                self.dp_size == 1
-                            ), "interleave DSA CP does not support DP attention."
                         assert (
                             self.tp_size <= 8
                         ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                         # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                        # DSACPLayerCommunicator does not all-reduce attention-TP
-                        # partial o_proj outputs before replicated dense FFNs.
+                        # The attn-CP communicator path does not all-reduce
+                        # attention-TP partial o_proj outputs before
+                        # replicated dense FFNs.
                         self.attn_cp_size = self.tp_size // self.dp_size
                         self.cuda_graph_config.prefill.backend = Backend.DISABLED
                         logger.warning(
@@ -2137,8 +2144,9 @@ class ServerArgs:
                         "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
                     )
                     # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
-                    # DSACPLayerCommunicator does not all-reduce attention-TP
-                    # partial o_proj outputs before replicated dense FFNs.
+                    # The attn-CP communicator path does not all-reduce
+                    # attention-TP partial o_proj outputs before replicated
+                    # dense FFNs.
                     self.attn_cp_size = self.tp_size // self.dp_size
                     self.cuda_graph_config.prefill.backend = Backend.DISABLED
                     logger.warning(
@@ -7208,6 +7216,35 @@ class ServerArgs:
             action="store_true",
             help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
         )
+        # ── Unified CP CLI (canonical) ────────────────────────────────────
+        # --enable-prefill-cp + --cp-strategy {zigzag,interleave} subsumes
+        # the four older flags below. The old flags still parse, but they
+        # forward into enable_prefill_cp/cp_strategy and emit a deprecation
+        # warning via DeprecatedStoreTrueAction / DeprecatedAliasStoreAction.
+        parser.add_argument(
+            "--enable-prefill-cp",
+            dest="enable_prefill_cp",
+            action="store_true",
+            help=(
+                "Enable context parallelism for the prefill phase. Strategy is "
+                "selected via --cp-strategy. Replaces --enable-prefill-context-parallel "
+                "and --enable-dsa-prefill-context-parallel."
+            ),
+        )
+        parser.add_argument(
+            "--cp-strategy",
+            dest="cp_strategy",
+            type=str,
+            default=ServerArgs.cp_strategy,
+            choices=("zigzag", "interleave"),
+            help=(
+                "Sharding strategy for prefill CP. 'zigzag' = causal-balanced "
+                "two-half split (former in-seq-split / former DSA in-seq-split). "
+                "'interleave' = strided token_idx %% cp_size split (former "
+                "round-robin-split). Defaults to 'zigzag'."
+            ),
+        )
+        # ── Deprecated CP aliases ─────────────────────────────────────────
         parser.add_argument(
             "--enable-prefill-cp",
             dest="enable_prefill_cp",
@@ -7672,7 +7709,9 @@ class ServerArgs:
 
         # Some dataclass fields (e.g. stat_loggers) intentionally have no CLI
         # surface and won't appear on the argparse Namespace. Skip them so the
-        # dataclass default applies.
+        # dataclass default applies. Deprecated CLI flags whose argparse dest
+        # now points at a canonical field are likewise absent and fall back to
+        # their dataclass default here.
         attrs = [
             attr.name for attr in dataclasses.fields(cls) if hasattr(args, attr.name)
         ]

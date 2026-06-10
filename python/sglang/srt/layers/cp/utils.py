@@ -1,13 +1,43 @@
-from dataclasses import dataclass
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""Context-parallel free functions and per-forward metadata.
+
+This module is the relocated home of the pre-strategy ``layers/utils/cp_utils.py``
+(it carries the MLA-prefill-CP and batch>1 logic merged in #23292 / #23269,
+verbatim). The :class:`ContextParallelStrategy` classes in ``cp/strategy.py``
+delegate to these functions, and the per-layer communicator + attention
+backends call them directly.
+
+``ContextParallelMetadata`` is re-exported here for compatibility; the
+strategy-specific metadata dataclasses live with their concrete strategies.
+"""
+
 from itertools import accumulate
-from typing import Callable, List
+from typing import TYPE_CHECKING, Callable, List
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.cp.collectives import (
+    cp_all_gather_reorganized_into_tensor,
+    cp_all_gather_reorganized_into_tensor_kv_cache,
+)
+from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
+from sglang.srt.layers.cp.zigzag import ContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     get_attention_cp_group,
@@ -20,44 +50,8 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.server_args import get_global_server_args
 
-
-@dataclass
-class ContextParallelMetadata:
-    # Layout lists have length bs * cp_segment_num (= bs * 2 * cp_size).
-    split_list: List[int] = None
-    zigzag_index: List[int] = None
-    cp_reverse_index: List[int] = None
-    reverse_split_len: List[int] = None
-
-    # Per-rank-aggregate lists have length cp_size.
-    # max_rank_len is a list of cp_size copies of max(per_rank_actual_token),
-    # kept as a list for torch.split() bucket sizes.
-    per_rank_actual_token: List[int] = None
-    max_rank_len: List[int] = None
-
-    # Per-sequence FlashAttention tensors (shape [bs] or [bs+1]).
-    kv_len_prev_tensor: torch.Tensor = None  # [bs] int32 CUDA
-    kv_len_next_tensor: torch.Tensor = None  # [bs] int32 CUDA
-    actual_seq_q_prev_tensor: torch.Tensor = None  # [bs] int32 CUDA
-    actual_seq_q_next_tensor: torch.Tensor = None  # [bs] int32 CUDA
-    cu_seqlens_q_prev_tensor: torch.Tensor = None  # [bs+1] int32 CUDA
-    cu_seqlens_q_next_tensor: torch.Tensor = None  # [bs+1] int32 CUDA
-
-    # Scalars derived from the per-sequence lists above.
-    total_q_prev_tokens: int = 0
-    total_q_next_tokens: int = 0
-    max_seqlen_q_prev: int = 0
-    max_seqlen_q_next: int = 0
-
-    # Per-seq CPU lists (useful for NSA indexer and diagnostics).
-    kv_len_prev_list: List[int] = None
-    kv_len_next_list: List[int] = None
-    actual_seq_q_prev_list: List[int] = None
-    actual_seq_q_next_list: List[int] = None
-
-    # Aggregate sum of extend_seq_lens across the batch.
-    total_seq_lens: int = 0
-    bs: int = 1
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def is_prefill_context_parallel_enabled():
@@ -89,6 +83,50 @@ def get_cp_padding_align_size() -> int:
 def is_mla_prefill_cp_enabled() -> bool:
     sa = get_global_server_args()
     return sa.enable_prefill_context_parallel and sa.use_mla_backend
+
+
+def is_dsa_enable_prefill_cp():
+    """True when DSA prefill CP is enabled through the normalized server args."""
+    from sglang.srt.layers.cp.strategy import is_cp_enabled
+
+    try:
+        sa = get_global_server_args()
+    except ValueError:
+        return False
+    return is_cp_enabled() and bool(getattr(sa, "_is_dsa_model_arch", False))
+
+
+def is_dsa_prefill_cp_in_seq_split():
+    from sglang.srt.layers.cp.strategy import is_zigzag
+
+    return is_dsa_enable_prefill_cp() and is_zigzag()
+
+
+def is_dsa_prefill_cp_round_robin_split():
+    from sglang.srt.layers.cp.strategy import is_interleave
+
+    return is_dsa_enable_prefill_cp() and is_interleave()
+
+
+def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
+    from sglang.srt.layers.cp.strategy import _get_cp_strategy, is_interleave
+
+    if not is_dsa_enable_prefill_cp() or not is_interleave():
+        return False
+    strategy = _get_cp_strategy()
+    if strategy is None:
+        return False
+    # ForwardBatch.prepare_mlp_sync_batch pads input_ids/out_cache_loc/positions
+    # to the CP-aligned token count before attention metadata is built. Use that
+    # padded count so DSA metadata makes the same split/no-split decision as the
+    # model-entry CP path.
+    input_ids = getattr(forward_batch, "input_ids", None)
+    num_tokens = (
+        len(input_ids)
+        if input_ids is not None
+        else sum(forward_batch.extend_seq_lens_cpu)
+    )
+    return strategy.can_apply(num_tokens, forward_batch)
 
 
 def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
@@ -143,11 +181,83 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     return True
 
 
-def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    from sglang.srt.layers.attention.dsa.utils import (
-        dsa_cp_round_robin_split_data,
-        is_dsa_prefill_cp_round_robin_split,
+def maybe_prepare_cp_forward(
+    forward_batch,
+    attn_backend,
+    input_embeds: torch.Tensor | None = None,
+) -> None:
+    from sglang.srt.layers.cp.strategy import get_cp_strategy
+
+    strategy = get_cp_strategy()
+    if strategy is None or not forward_batch.forward_mode.is_context_parallel_extend():
+        return
+
+    token_source = (
+        forward_batch.input_ids if forward_batch.input_ids is not None else input_embeds
     )
+    if token_source is None:
+        return
+
+    num_tokens = len(token_source)
+    if not strategy.can_apply(num_tokens, forward_batch):
+        forward_batch.attn_cp_metadata = None
+        return
+
+    seqs_len = forward_batch.seq_lens_cpu
+    if hasattr(seqs_len, "tolist"):
+        seqs_len = seqs_len.tolist()
+    extend_seqs_len = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if hasattr(extend_seqs_len, "tolist"):
+        extend_seqs_len = extend_seqs_len.tolist()
+    forward_batch.attn_cp_metadata = strategy.build_metadata(
+        num_tokens, seqs_len, extend_seqs_len
+    )
+
+    metadata = getattr(attn_backend, "forward_metadata", None)
+    core_meta = getattr(metadata, "core_attn_metadata", None)
+    if core_meta is None:
+        return
+    strategy.reindex_attn_metadata(core_meta)
+    if getattr(metadata, "indexer_metadata", None) is not None and hasattr(
+        attn_backend, "init_forward_metadata_indexer"
+    ):
+        metadata.indexer_metadata = attn_backend.init_forward_metadata_indexer(
+            core_meta
+        )
+
+
+def maybe_cp_split_before_forward(model, forward_batch, kwargs: dict) -> None:
+    from sglang.srt.layers.cp.strategy import get_cp_strategy
+
+    strategy = get_cp_strategy()
+    if (
+        strategy is None
+        or forward_batch.attn_cp_metadata is None
+        or not getattr(model, "use_cp_v2_model_runner_split", False)
+    ):
+        return
+
+    input_embeds = kwargs.get("input_embeds")
+    if (
+        input_embeds is None
+        and forward_batch.input_ids is not None
+        and hasattr(model, "get_input_embeddings")
+    ):
+        embed_layer = model.get_input_embeddings()
+        input_embeds = embed_layer(forward_batch.input_ids)
+
+    sharded_input_embeds = strategy.split_before_forward(
+        forward_batch,
+        forward_batch.input_ids,
+        forward_batch.positions,
+        input_embeds,
+    )
+    if sharded_input_embeds is not None:
+        kwargs["input_embeds"] = sharded_input_embeds
+
+
+def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
+    from sglang.srt.layers.attention.dsa.utils import dsa_cp_round_robin_split_data
 
     if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
@@ -161,15 +271,15 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     )
     result = torch.cat(
         [input_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index], dim=0
-    ).view(-1, input_.shape[-1])
+    )
+    if input_.ndim == 1:
+        return result.contiguous()
+    result = result.view(-1, input_.shape[-1])
     return result
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
-    from sglang.srt.layers.attention.dsa.utils import (
-        dsa_cp_round_robin_split_data,
-        is_dsa_prefill_cp_round_robin_split,
-    )
+    from sglang.srt.layers.attention.dsa.utils import dsa_cp_round_robin_split_data
 
     if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
@@ -213,101 +323,6 @@ def cp_round_robin_input_ids(input_ids):
     return input_ids
 
 
-def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, stream):
-    """
-    Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
-    This implementation mainly consists of three parts:
-    Step 1, padding the input shape to unify the shape for allgather communication (the shape must be the same).
-    Step 2, allgather communication(async).
-    Step 3, removing the padding and reassembling the data according to the actual tokens.
-    """
-    max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
-    pad_size = max_len - input_tensor.shape[0]
-    if pad_size > 0:
-        input_tensor = F.pad(
-            input_tensor, (0, 0, 0, pad_size), mode="constant", value=0
-        )
-    with use_symmetric_memory(
-        get_attention_cp_group(), disabled=not is_allocation_symmetric()
-    ):
-        input_tensor_full = torch.empty(
-            max_len * cp_size,
-            input_tensor.shape[1],
-            device=input_tensor.device,
-            dtype=input_tensor.dtype,
-        )
-
-    get_attention_cp_group().cp_all_gather_into_tensor_async(
-        input_tensor_full, input_tensor, stream
-    )
-
-    outputs_list_max = list(
-        torch.split(
-            input_tensor_full, forward_batch.attn_cp_metadata.max_rank_len, dim=0
-        )
-    )
-    outputs = torch.cat(
-        [
-            outputs_list_max[index][:per_rank_len]
-            for index, per_rank_len in enumerate(
-                forward_batch.attn_cp_metadata.per_rank_actual_token
-            )
-        ],
-        dim=0,
-    )
-
-    return outputs
-
-
-def cp_all_gather_reorganized_into_tensor_kv_cache(
-    input_tensor, cp_size, forward_batch, stream
-):
-    """
-    Allgather communication for context_parallel KV cache.
-    Handles multi-dimensional tensors (e.g., [seq_len, num_heads, head_dim]).
-    """
-    max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
-    pad_size = max_len - input_tensor.shape[0]
-    if pad_size > 0:
-        # Pad the first dimension (seq_len). F.pad expects padding in reverse dimension order.
-        # For n dimensional tensor, we need 2*n values: (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right)
-        # To pad only the first dimension: [0, 0] * (ndim - 1) + [0, pad_size]
-        padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_size]
-        input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
-
-    # Create output tensor with proper shape for all dimensions
-    with use_symmetric_memory(
-        get_attention_cp_group(), disabled=not is_allocation_symmetric()
-    ):
-        input_tensor_full = torch.empty(
-            max_len * cp_size,
-            *input_tensor.shape[1:],
-            device=input_tensor.device,
-            dtype=input_tensor.dtype,
-        )
-
-    get_attention_cp_group().cp_all_gather_into_tensor_async(
-        input_tensor_full, input_tensor, stream
-    )
-
-    outputs_list_max = list(
-        torch.split(
-            input_tensor_full, forward_batch.attn_cp_metadata.max_rank_len, dim=0
-        )
-    )
-    outputs = torch.cat(
-        [
-            outputs_list_max[index][:per_rank_len]
-            for index, per_rank_len in enumerate(
-                forward_batch.attn_cp_metadata.per_rank_actual_token
-            )
-        ],
-        dim=0,
-    )
-
-    return outputs
-
-
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
     # for in-seq-split
@@ -335,10 +350,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |   +-------------------------+
     """
-    from sglang.srt.layers.attention.dsa.utils import (
-        is_dsa_prefill_cp_round_robin_split,
-    )
-
     if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
             get_attention_cp_group(), disabled=not is_allocation_symmetric()
@@ -499,12 +510,11 @@ def prepare_context_parallel_metadata(
     extend_seqs_len=None,
     device="cuda",
 ):
-    from sglang.srt.layers.attention.dsa.utils import (
-        is_dsa_prefill_cp_round_robin_split,
-    )
-
     if is_dsa_prefill_cp_round_robin_split():
-        return ContextParallelMetadata()
+        return InterleaveContextParallelMetadata(
+            total_seq_lens=int(kv_len),
+            bs=len(extend_seqs_len) if extend_seqs_len is not None else 1,
+        )
 
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4, single sequence):
@@ -613,8 +623,6 @@ def prepare_context_parallel_metadata(
     # Per-sequence cumulatives used for FA cache_seqlens.
     #   kv_len_prev[s] = sum of seq s's blocks [0..cp_rank] (inclusive).
     #   kv_len_next[s] = sum of seq s's blocks [0..cp_segment_num-cp_rank-1] (inclusive).
-    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-
     nsa_mode = is_dsa_enable_prefill_cp()
     kv_len_prev_list: List[int] = []
     kv_len_next_list: List[int] = []

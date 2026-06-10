@@ -45,10 +45,18 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
-from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.communicator_dsa_cp import (
+from sglang.srt.layers.communicator import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
+    get_attn_tp_context,
+)
+from sglang.srt.layers.cp.strategy import cp_active, get_cp_strategy, use_cp_v2
+from sglang.srt.layers.cp.utils import (
+    cp_all_gather_rerange_output,
+    cp_round_robin_input_ids,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
@@ -74,13 +82,6 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_round_robin_input_ids,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    prepare_context_parallel_metadata,
-)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -116,9 +117,7 @@ from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 
 if not _is_hip:
-    from sglang.srt.layers.utils.cp_utils import (
-        prepare_context_parallel_metadata,
-    )
+    pass
 
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -782,7 +781,12 @@ class MQALayer(nn.Module):
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 
-        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        use_legacy_cp = (
+            not use_cp_v2()
+            and self.dsa_enable_prefill_cp
+            and dsa_use_prefill_cp(forward_batch)
+        )
+        use_cp = cp_active(forward_batch) or use_legacy_cp
         kv: Optional[torch.Tensor]
 
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -864,12 +868,19 @@ class MQALayer(nn.Module):
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
-                    kv.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                if use_cp_v2():
+                    kv = get_cp_strategy().gather_kv_cache(
+                        kv.contiguous(),
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                else:
+                    kv = cp_all_gather_rerange_output(
+                        kv.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
@@ -881,12 +892,19 @@ class MQALayer(nn.Module):
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
-                    kv.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                if use_cp_v2():
+                    kv = get_cp_strategy().gather_kv_cache(
+                        kv.contiguous(),
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                else:
+                    kv = cp_all_gather_rerange_output(
+                        kv.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
                     swa_k=kv,
@@ -1692,7 +1710,10 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
@@ -1714,7 +1735,11 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if dsa_use_prefill_cp(forward_batch):
+        if cp_active(forward_batch):
+            input_ids = getattr(forward_batch, "cp_v2_input_ids", input_ids)
+            if not get_moe_a2a_backend().is_none():
+                input_ids_global = input_ids
+        elif dsa_use_prefill_cp(forward_batch):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -1754,13 +1779,20 @@ class DeepseekV4Model(nn.Module):
             )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
+        if self.pp_group.is_last_rank:
+            if cp_active(forward_batch):
+                hidden_states = get_cp_strategy().gather_tokens(
+                    hidden_states,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            elif dsa_use_prefill_cp(forward_batch):
+                hidden_states = cp_all_gather_rerange_output(
+                    hidden_states,
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
@@ -1807,6 +1839,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+        self.use_cp_v2_model_runner_split = True
         get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
@@ -1831,6 +1864,9 @@ class DeepseekV4ForCausalLM(nn.Module):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
@@ -1869,7 +1905,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp:
+        if not use_cp_v2() and self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

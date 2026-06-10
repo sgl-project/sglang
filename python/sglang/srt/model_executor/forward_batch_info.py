@@ -44,6 +44,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
+from sglang.srt.layers.cp.utils import ContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
@@ -66,8 +67,8 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.cp.utils import ContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -1077,7 +1078,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
         # Local import: a module-level cp_utils import here is circular (#27014).
-        from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+        from sglang.srt.layers.cp.utils import get_cp_padding_align_size
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None

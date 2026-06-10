@@ -10,6 +10,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    try_cached_model,
     write_github_step_summary,
 )
 
@@ -29,7 +30,7 @@ class TestDeepseekV3CPInSeqSplit(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_V3_MODEL_PATH
+        cls.model = try_cached_model(DEEPSEEK_V3_MODEL_PATH)
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",

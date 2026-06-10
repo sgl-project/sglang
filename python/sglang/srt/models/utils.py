@@ -26,8 +26,8 @@ import triton.language as tl
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import is_prefill_context_parallel_enabled
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool

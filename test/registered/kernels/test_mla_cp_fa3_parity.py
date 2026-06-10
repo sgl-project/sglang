@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.utils.cp_utils import (
+from sglang.srt.layers.cp.utils import (
     ContextParallelMetadata,
     cp_attn_forward_extend,
 )

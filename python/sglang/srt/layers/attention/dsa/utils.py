@@ -6,13 +6,22 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import (
+    can_dsa_prefill_cp_round_robin_split,
+    is_dsa_enable_prefill_cp,
+)
+from sglang.srt.layers.cp.utils import (
+    is_dsa_prefill_cp_in_seq_split as is_dsa_prefill_cp_in_seq_split,
+)
+from sglang.srt.layers.cp.utils import (
+    is_dsa_prefill_cp_round_robin_split,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
@@ -64,37 +73,6 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
-def is_dsa_enable_prefill_cp():
-    return get_global_server_args().enable_dsa_prefill_context_parallel
-
-
-def is_dsa_prefill_cp_in_seq_split():
-    return (
-        is_dsa_enable_prefill_cp()
-        and get_global_server_args().dsa_prefill_cp_mode == "in-seq-split"
-    )
-
-
-def is_dsa_prefill_cp_round_robin_split():
-    return (
-        is_dsa_enable_prefill_cp()
-        and get_global_server_args().dsa_prefill_cp_mode == "round-robin-split"
-    )
-
-
-def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
-    if not forward_batch.forward_mode.is_context_parallel_extend():
-        return False
-    cp_size = get_attention_cp_size()
-    seq_len = sum(forward_batch.extend_seq_lens_cpu)
-    return (
-        is_dsa_prefill_cp_round_robin_split()
-        and seq_len > 0
-        and seq_len >= cp_size
-        and cp_size > 1
-    )
-
-
 def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     """
     # for round-robin-split, split the tokens evenly according to the rule of token_idx % cp_size.
@@ -110,9 +88,10 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     """
     cp_size = get_attention_cp_size()
     cp_rank = get_attention_cp_rank()
-    if isinstance(input_, (tuple, list)):
-        indices = range(cp_rank, len(input_), cp_size)
-        return input_[indices]
+    if isinstance(input_, tuple):
+        return tuple(input_[i] for i in range(cp_rank, len(input_), cp_size))
+    if isinstance(input_, list):
+        return [input_[i] for i in range(cp_rank, len(input_), cp_size)]
 
     tokens = len(input_)
     if tokens % cp_size != 0:
@@ -129,7 +108,7 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
-    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+    from sglang.srt.layers.cp.utils import get_cp_padding_align_size
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)

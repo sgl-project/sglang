@@ -240,6 +240,14 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    # CP V2: when False (default) all CP runtime dispatch matches origin/main
+    # (legacy server_args fields, no strategy singleton). When True, route
+    # mode-dispatch through the ContextParallelStrategy singleton in
+    # ``layers/cp/strategy.py``. Transitional flag; the default flip and
+    # eventual removal will follow once the new path has soaked in CI.
+    SGLANG_ENABLE_CP_V2 = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_REFACTOR_CP"
+    )
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)

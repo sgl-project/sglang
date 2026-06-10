@@ -33,6 +33,16 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.layers.cp.strategy import cp_active, get_cp_strategy, use_cp_v2
+from sglang.srt.layers.cp.utils import (
+    can_cp_split,
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    is_mla_prefill_cp_enabled,
+    mla_use_prefill_cp,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -42,15 +52,6 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils.cp_utils import (
-    can_cp_split,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    is_mla_prefill_cp_enabled,
-    mla_use_prefill_cp,
-    prepare_context_parallel_metadata,
-)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -71,7 +72,6 @@ _is_npu = is_npu()
 
 
 class DeepseekModelNextN(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -217,9 +217,11 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
 
-            if dsa_use_prefill_cp(
-                forward_batch, self.dsa_enable_prefill_cp
-            ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
+            use_legacy_cp = not cp_active(forward_batch) and (
+                dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+                or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+            )
+            if use_legacy_cp:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
@@ -245,9 +247,13 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
 
-                if dsa_use_prefill_cp(
-                    forward_batch, self.dsa_enable_prefill_cp
-                ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
+                if cp_active(forward_batch):
+                    hidden_states = get_cp_strategy().gather_tokens(
+                        hidden_states,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                elif use_legacy_cp:
                     # allgather + rerrange
                     hidden_states = cp_all_gather_rerange_output(
                         hidden_states,
@@ -262,7 +268,6 @@ class DeepseekModelNextN(nn.Module):
 
 
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
-
     # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
     # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
     # https://huggingface.co/amd/DeepSeek-R1-0528-MXFP4/blob/main/config.json
@@ -318,6 +323,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.use_cp_v2_model_runner_split = True
 
     @torch.no_grad()
     def forward(
@@ -325,9 +331,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
-        if self.dsa_enable_prefill_cp:
+        if not use_cp_v2() and self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(
                 len(input_ids), self.cp_size, self.use_dsa, forward_batch
             ):
@@ -338,7 +345,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     forward_batch.seq_lens_cpu.tolist(),
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
-        elif self.mla_enable_prefill_cp:
+        elif not use_cp_v2() and self.mla_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
@@ -347,7 +354,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     forward_batch.seq_lens_cpu.tolist(),
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

@@ -48,6 +48,13 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
+from sglang.srt.layers.cp.strategy import cp_active, get_cp_strategy
+from sglang.srt.layers.cp.utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    is_prefill_context_parallel_enabled,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -77,12 +84,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    is_prefill_context_parallel_enabled,
-)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -850,7 +851,8 @@ class Qwen2MoeModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         if (
-            is_prefill_context_parallel_enabled()
+            not cp_active(forward_batch)
+            and is_prefill_context_parallel_enabled()
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
         ):
@@ -904,7 +906,13 @@ class Qwen2MoeModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if (
+        if self.pp_group.is_last_rank and cp_active(forward_batch):
+            hidden_states = get_cp_strategy().gather_tokens(
+                hidden_states,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+        elif (
             self.pp_group.is_last_rank
             and is_prefill_context_parallel_enabled()
             and forward_batch.forward_mode.is_context_parallel_extend()
@@ -951,6 +959,7 @@ class Qwen2MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.use_cp_v2_model_runner_split = True
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 

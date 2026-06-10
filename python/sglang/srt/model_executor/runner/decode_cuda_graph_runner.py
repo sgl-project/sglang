@@ -45,6 +45,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.cp.utils import is_mla_prefill_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
@@ -53,7 +54,6 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
@@ -338,12 +338,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-        # True if a DSACPLayerCommunicator-style prefill-CP flavor is active
-        # (DSA or MLA). These flavors feed a zigzag-split rank-local layout
-        # into the runner; MHA-arch prefill CP (Qwen3/Qwen2 MoE via PR
-        # #18233) uses the plain LayerCommunicator with an attn_tp-replicated
-        # layout and is intentionally excluded so the attn_tp-local
-        # num_token_non_padded adjustment still runs for it.
+        # True if a per-layer attn-CP prefill flavor is active (DSA or MLA).
+        # These flavors feed a zigzag-split rank-local layout into the runner;
+        # MHA-arch prefill CP (Qwen3/Qwen2 MoE via PR #18233) uses the plain
+        # LayerCommunicator with an attn_tp-replicated layout and is
+        # intentionally excluded so the attn_tp-local num_token_non_padded
+        # adjustment still runs for it.
         self.enable_prefill_cp = (
             is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
         )

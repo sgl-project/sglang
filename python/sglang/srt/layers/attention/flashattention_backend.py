@@ -13,11 +13,12 @@ from sglang.srt.layers.attention.triton_ops.metadata import (
     prepare_swa_spec_page_table_triton,
 )
 from sglang.srt.layers.attention.utils import assert_buffer_fits
-from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import (
+from sglang.srt.layers.cp.strategy import get_cp_strategy
+from sglang.srt.layers.cp.utils import (
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
 )
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -806,18 +807,25 @@ class FlashAttentionBackend(AttentionBackend):
                 elif is_cp_mode:
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
-                    cp_allgather_and_save_kv_cache(
-                        forward_batch,
-                        layer,
-                        k,
-                        v,
-                        self.attn_cp_size,
-                        swa_loc=(
-                            self.forward_metadata.swa_out_cache_loc
-                            if self.use_sliding_window_kv_pool
-                            else None
-                        ),
+                    swa_loc = (
+                        self.forward_metadata.swa_out_cache_loc
+                        if self.use_sliding_window_kv_pool
+                        else None
                     )
+                    strategy = get_cp_strategy()
+                    if strategy is not None:
+                        strategy.materialize_full_kv(
+                            forward_batch, layer, k, v, swa_loc=swa_loc
+                        )
+                    else:
+                        cp_allgather_and_save_kv_cache(
+                            forward_batch,
+                            layer,
+                            k,
+                            v,
+                            self.attn_cp_size,
+                            swa_loc=swa_loc,
+                        )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
@@ -962,12 +970,19 @@ class FlashAttentionBackend(AttentionBackend):
                         **kwargs,
                     )
 
-                result = cp_attn_forward_extend(
-                    forward_batch,
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.device,
-                    _fa_cp_attn,
-                )
+                q_cp = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                strategy = get_cp_strategy()
+                if strategy is not None:
+                    result = strategy.run_attention(
+                        q_cp, forward_batch, self.device, _fa_cp_attn
+                    )
+                else:
+                    result = cp_attn_forward_extend(
+                        forward_batch,
+                        q_cp,
+                        self.device,
+                        _fa_cp_attn,
+                    )
             elif self.fa_skip_kv_cache:
                 # Embedding mode: skip KV cache read and use raw K/V tensors
                 # directly via flash_attn_varlen_func. The KV cache write is
@@ -2974,10 +2989,9 @@ def make_local_attention_virtual_batches(
     #   k_seqstarts_absolute = [0, 4, 4, 8, 12, 16, 4, 8]
     block_starts = k_seqstarts_absolute // page_size
 
-    assert attn_chunk_size % page_size == 0, (
-        f"attn_chunk_size {attn_chunk_size} is not "
-        f"divisible by page_size {page_size}"
-    )
+    assert (
+        attn_chunk_size % page_size == 0
+    ), f"attn_chunk_size {attn_chunk_size} is not divisible by page_size {page_size}"
     pages_per_local_batch = attn_chunk_size // page_size
 
     # Create a block_table for the local attention blocks
