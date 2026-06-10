@@ -28,7 +28,7 @@ import sys
 import time
 from array import array
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -220,9 +220,10 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
-        # Session tag: the session_id whose request last extended this node to a
-        # leaf. release_session(id) seeds from these leaves. None for plain nodes.
-        self.session_id: Optional[str] = None
+        # Session holders: the set of session_ids whose requests extended this node
+        # to a leaf. release_session(id) drops id and frees the node only once the
+        # set empties (last holder). None for plain (non-session) nodes; LRU-neutral.
+        self.session_ids: Optional[Set[str]] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
