@@ -406,9 +406,9 @@ class Compressor(nn.Module):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        if _tgemm is not None:
-            # linear_bf16_fp32 uses tgemm.mm + .float(); skip the .float() cast
-            # because downstream Triton kernels promote bf16→fp32 internally.
+        if _tgemm is not None and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+            # v1 compress goes through fused_compress_triton, which promotes
+            # bf16->fp32 internally, so skip the .float() cast.
             kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
         else:
             kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
