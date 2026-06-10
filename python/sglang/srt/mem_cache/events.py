@@ -53,6 +53,14 @@ class KVCacheEventMixin:
                 ):
                     parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
 
+            # ``extra_key`` (cache salt and/or LoRA id) namespaces the whole
+            # subtree but is not folded into the block hash, so surface it on the
+            # sequence's first block (the node rooted at the tree root). Later
+            # blocks are not namespaced in the hash, so consumers propagate it
+            # along the parent_block_hash links they reconstruct.
+            extra_key = node.key.extra_key
+            is_first_block_node = node.parent is None or node.parent == self.root_node
+
             page_index = 0
             logical_len = len(node.key)
             is_bigram = node.key.is_bigram
@@ -69,6 +77,10 @@ class KVCacheEventMixin:
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
+                extra_keys = None
+                if extra_key and is_first_block_node and page_index == 0:
+                    extra_keys = [(extra_key,)]
+
                 self.kv_event_queue.append(
                     BlockStored(
                         block_hashes=[block_hash],
@@ -77,6 +89,7 @@ class KVCacheEventMixin:
                         block_size=len(page_tokens),
                         lora_id=None,
                         medium=medium,
+                        extra_keys=extra_keys,
                     )
                 )
 
