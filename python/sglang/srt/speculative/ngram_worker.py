@@ -36,6 +36,10 @@ USE_FULL_MASK = True
 
 class NGRAMWorker(BaseSpecWorker):
     def alloc_memory_pool(self, **kwargs):
+        # The target memory pool does not exist yet when __init__ runs.
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            self._target_worker.get_memory_pool()
+        )
         self.max_batch_size = self.model_runner.max_running_requests
         self._init_preallocated_tensors()
 
@@ -62,10 +66,8 @@ class NGRAMWorker(BaseSpecWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
+        # req_to_token_pool / token_to_kv_pool_allocator are set in
+        # alloc_memory_pool(), after the target pools are allocated.
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
 
         self.adaptive_controller = None
