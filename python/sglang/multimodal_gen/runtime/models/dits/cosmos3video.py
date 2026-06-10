@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.srt.breakable_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )

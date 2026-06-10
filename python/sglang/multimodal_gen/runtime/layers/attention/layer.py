@@ -50,7 +50,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
-from sglang.srt.breakable_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
@@ -653,15 +653,9 @@ class USPAttention(nn.Module):
 
         sp_size = get_ulysses_parallel_world_size()
         if (
-            sum(
-                bool(n)
-                for n in (
-                    num_replicated_prefix,
-                    num_replicated_suffix,
-                    num_replicated_kv_prefix,
-                )
-            )
-            > 1
+            (num_replicated_prefix > 0 and num_replicated_suffix > 0)
+            or (num_replicated_prefix > 0 and num_replicated_kv_prefix > 0)
+            or (num_replicated_suffix > 0 and num_replicated_kv_prefix > 0)
         ):
             raise ValueError(
                 "USPAttention supports at most one replicated-token mode per call."

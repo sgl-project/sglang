@@ -31,7 +31,7 @@ per-timestep attention metadata (e.g. sparse-video-attention masks) is also
 picked up correctly on replay.
 
 This runner shares the model-agnostic BCG primitives in
-:mod:`sglang.srt.breakable_cuda_graph` with the LLM runtime.
+:mod:`sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph` with the LLM runtime.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from sglang.srt.breakable_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
     enable_breakable_cuda_graph,
