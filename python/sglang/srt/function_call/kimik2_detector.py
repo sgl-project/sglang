@@ -356,7 +356,7 @@ class KimiK2Detector(BaseFormatDetector):
         return False
 
     def _reset_streaming_state(self) -> None:
-        """Clear the buffer and the per-call streaming cursor at a tool-call
+        """Clear the buffer and the per-call streaming state at a tool-call
         section boundary so the next call (or a subsequent section) parses
         cleanly.
 

@@ -287,8 +287,8 @@ class TestKimiK2DetectorStreaming(unittest.TestCase):
         self.assertEqual(tool_calls[1]["name"], "get_weather")
         self.assertEqual(json.loads(tool_calls[1]["parameters"]), {"city": "Paris"})
 
-    def test_reset_streaming_state_clears_cursor_keeps_id(self):
-        """_reset_streaming_state clears the buffer and per-call cursor but
+    def test_reset_streaming_state_clears_per_call_state_keeps_id(self):
+        """_reset_streaming_state clears the buffer and per-call state but
         keeps current_tool_id monotonic."""
         detector = KimiK2FuncDetector()
         detector.current_tool_id = 2
