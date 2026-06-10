@@ -13,10 +13,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.srt.speculative.eagle_info_v2 import move_accept_tokens_to_target_kvcache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
+    move_accept_tokens_to_target_kvcache,
     record_stream_each,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
@@ -422,7 +422,6 @@ class NGRAMWorker:
                 accept_index,
                 num_correct_drafts_per_req,
                 self.token_to_kv_pool_allocator,
-                self.draft_token_num,
             )
             if batch.return_logprob:
                 # The last arg is the accept_index row width minus 1. NGRAM's

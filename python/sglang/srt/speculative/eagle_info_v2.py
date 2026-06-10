@@ -16,7 +16,6 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     set_mamba_track_indices_from_reqs,
 )
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -41,18 +40,11 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_draft_cache_locs_contiguous as assign_draft_cache_locs_contiguous,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
-)
-from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
 )
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
 )
-from sglang.srt.utils import next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu
 
@@ -609,57 +601,3 @@ class EagleVerifyInputV2Mixin:
         # tensor includes the trailing/bonus token via out-of-place +1 so the
         # name no longer flips semantics mid-function (naming doc C2).
         return predict, num_correct_drafts + 1, accept_index
-
-
-def move_accept_tokens_to_target_kvcache(
-    batch: ScheduleBatch,
-    accept_index: torch.Tensor,
-    num_correct_drafts: torch.Tensor,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    speculative_num_draft_tokens: int,
-):
-    """
-    Move accepted tokens (drafts + bonus) to the target KV cache.
-
-    Args:
-        batch: The batch to run.
-        accept_index: The index of the accepted tokens (incl. bonus).
-        num_correct_drafts: Per-req count of correct drafts (excludes bonus);
-            seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
-    """
-    bs = len(batch.seq_lens)
-    size = bs * speculative_num_draft_tokens
-    device = batch.seq_lens.device
-
-    # fill_accept_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
-    maybe_detect_oob(
-        accept_index,
-        -1,
-        batch.out_cache_loc.size(0),
-        "eagle v2 move_accept_tokens accept_index",
-    )
-
-    tgt_cache_loc = torch.zeros(
-        size,
-        dtype=torch.int64,
-        device=device,
-    )
-    accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    assign_extend_cache_locs[(bs,)](
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        batch.seq_lens,
-        batch.seq_lens + num_correct_drafts + 1,
-        tgt_cache_loc,
-        batch.req_to_token_pool.req_to_token.shape[1],
-        next_power_of_2(bs),
-    )
-    fill_accept_out_cache_loc[(size,)](
-        accept_index,
-        batch.out_cache_loc,
-        accept_out_cache_loc,
-        next_power_of_2(size),
-    )
-    token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-        tgt_cache_loc, accept_out_cache_loc
-    )
