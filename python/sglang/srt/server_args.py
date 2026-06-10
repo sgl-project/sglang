@@ -152,6 +152,7 @@ QUANTIZATION_CHOICES = [
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
+    "nvfp4_online",
     "modelopt_mixed",
     "petit_nvfp4",
     "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
@@ -3477,6 +3478,23 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
+        if self.quantization == "nvfp4_online":
+            if not is_sm100_supported():
+                raise ValueError(
+                    "--quantization nvfp4_online is supported only on "
+                    "NVIDIA Blackwell SM100/SM103 GPUs."
+                )
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_trtllm"
+            elif self.moe_runner_backend not in [
+                "flashinfer_trtllm",
+                "flashinfer_trtllm_routed",
+            ]:
+                raise ValueError(
+                    "--quantization nvfp4_online supports only "
+                    "--moe-runner-backend flashinfer_trtllm or "
+                    "flashinfer_trtllm_routed."
+                )
         if self.quantization == "mxfp8":
             if self.moe_runner_backend == "auto":
                 self.moe_runner_backend = "flashinfer_trtllm"
@@ -3539,13 +3557,14 @@ class ServerArgs:
         if self.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert self.quantization in [
                 "modelopt_fp4",
+                "nvfp4_online",
                 "fp8",
                 "mxfp8",
                 "modelopt_fp8",
                 "modelopt_mixed",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -3556,8 +3575,9 @@ class ServerArgs:
                 "fp8",
                 "mxfp8",
                 "modelopt_fp4",
+                "nvfp4_online",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
