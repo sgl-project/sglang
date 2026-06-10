@@ -44,8 +44,8 @@ jobs:
 
       - name: Build and push miles image to rocm/sgl-dev
         run: |
-          rolling="miles-${{ matrix.rocm_tag }}"
-          dated="${rolling}-${{ env.DATE }}"
+          base="miles-${{ matrix.rocm_tag }}"
+          dated="${base}-${{ env.DATE }}"
           echo "IMAGE_TAG=${dated}" >> $GITHUB_ENV
           echo "Building rocm/sgl-dev:${dated} from miles main @ ${{ steps.miles.outputs.sha }}"
           docker build . \
@@ -54,10 +54,8 @@ jobs:
             --build-arg SGLANG_IMAGE_TAG=${{ matrix.sglang_image_tag }} \
             --build-arg MILES_COMMIT=${{ steps.miles.outputs.sha }} \
             -t rocm/sgl-dev:${dated} \
-            -t rocm/sgl-dev:${rolling} \
             --no-cache
           docker push rocm/sgl-dev:${dated}
-          docker push rocm/sgl-dev:${rolling}
 
       - name: Save published image tag
         run: |
