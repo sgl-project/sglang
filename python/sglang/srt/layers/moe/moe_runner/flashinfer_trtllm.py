@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextvars
-import functools
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generator, cast
@@ -69,11 +68,6 @@ def flashinfer_trtllm_deferred_finalize_context(
         _deferred_finalize_enabled.reset(token)
 
 
-@functools.lru_cache(None)
-def _log_deferred_finalize_enabled() -> None:
-    logger.info("FlashInfer TRTLLM MoE deferred finalize is enabled.")
-
-
 def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: torch.Tensor,
@@ -81,7 +75,6 @@ def finalize_flashinfer_trtllm_deferred_output(
     from sglang.jit_kernel.moe_finalize_fuse_shared import moe_finalize_fuse_shared
     from sglang.jit_kernel.utils import is_arch_support_pdl
 
-    _log_deferred_finalize_enabled()
     return moe_finalize_fuse_shared(
         deferred_output.gemm2_out,
         deferred_output.expanded_idx_to_permuted_idx,
