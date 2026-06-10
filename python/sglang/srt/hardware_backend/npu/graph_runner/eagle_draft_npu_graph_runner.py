@@ -77,21 +77,53 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             out = run_once_fn()
         return out
 
+    def _is_dense_mha(self):
+        # Only dense MHA models have a per-layer context_lens updatable op in the
+        # captured draft graph (so the replay update must be expanded per layer).
+        # MLA and hybrid (mamba/linear-attention) models keep the original single
+        # actual_seq_lengths_kv update that covers all layers.
+        mc = self.model_runner.model_config
+        return (
+            mc.attention_arch == AttentionArch.MHA
+            and getattr(self.model_runner, "mambaish_config", None) is None
+        )
+
     def _get_update_attr_name(self):
-        return self.attr_name[AttentionArch.MLA]
+        arch = AttentionArch.MHA if self._is_dense_mha() else AttentionArch.MLA
+        return self.attr_name[arch]
 
     def _get_update_attr_type(self):
-        return self.attr_type[AttentionArch.MLA]
+        arch = AttentionArch.MHA if self._is_dense_mha() else AttentionArch.MLA
+        return self.attr_type[arch]
 
     def _replay_update(self, seq_lens_list):
-        if isinstance(self.update_attr_type, torch.Tensor):
-            seq_lens = torch.from_numpy(np.array(seq_lens_list).astype(np.int32))
+        # The captured draft graph records one seq-len updatable op per executed
+        # full-attention layer per draft step. That count isn't reliably derivable
+        # from the (base) model config (a full-size duplicate draft has one per
+        # layer; a 1-layer MTP module has one; MLA layers may build two attn
+        # submodules but execute one), so read the exact number straight from the
+        # graph's recorded ops. Records are in step-outer / layer-inner order, so
+        # repeat each step's seq_lens `per_step` times.
+        #
+        # graph_dispatch_mode / graph_dispatch_records are torch_npu internals;
+        # access them defensively and fall back to one update per step (the
+        # single-shared-op case) if a future torch_npu version changes them.
+        steps = len(seq_lens_list)
+        per_step = 1
+        if steps:
+            dispatch_mode = getattr(self.graphs[self.bs], "graph_dispatch_mode", None)
+            records = getattr(dispatch_mode, "graph_dispatch_records", None)
+            if records is not None:
+                per_step = max(1, len(records) // steps)
 
-        self.graphs[self.bs].update(
-            cpu_update_input=[
-                {self.update_attr_name: seq_lens} for seq_lens in seq_lens_list
-            ]
-        )
+        cpu_update_input = []
+        for seq_lens in seq_lens_list:
+            if isinstance(self.update_attr_type, torch.Tensor):
+                seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+            for _ in range(per_step):
+                cpu_update_input.append({self.update_attr_name: seq_lens})
+
+        self.graphs[self.bs].update(cpu_update_input=cpu_update_input)
 
     def _replay(self, forward_batch: ForwardBatch):
         self.update_attr_name = self._get_update_attr_name()

@@ -261,6 +261,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             dst_indices_tensor,
             src_indices_tensor,
             last_steps,
+            h_block_size=1,
         )
 
         draft_token_num = intermediate_state_cache.shape[2]
