@@ -79,9 +79,7 @@ QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3_6_35BA3B_1P_In128k_Out1k_Prefix90_50ms(
-    TestNpuPerformanceTestCaseBase
-):
+class TestNPUQwen3_6_35BA3B_1P_In128k_Out1k_Prefix90_50ms(TestNpuPerformanceTestCaseBase):
     """Test NPU performance for Qwen3.6-35B-A3B 1p in128k out1k prefix90 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT

@@ -89,9 +89,7 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
 ]
 
 
-class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
-    TestNpuPerformanceTestCaseBase
-):
+class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(TestNpuPerformanceTestCaseBase):
     """MiniMax-M2.5-w8a8 4p (4 cards) 64k input 1k output with 90% prefix cache performance test"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT

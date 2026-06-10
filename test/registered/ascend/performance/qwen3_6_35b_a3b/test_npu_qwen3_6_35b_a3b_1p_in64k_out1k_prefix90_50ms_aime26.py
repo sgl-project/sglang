@@ -107,9 +107,7 @@ class TestNPUQwen3_6_35BA3B_1P_AIME2026(TestNpuAccuracyTestCaseBase):
         self.run_accuracy()
 
 
-class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_Prefix90_50ms(
-    TestNpuPerformanceTestCaseBase
-):
+class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_Prefix90_50ms(TestNpuPerformanceTestCaseBase):
     """Test NPU performance for Qwen3.6-35B-A3B 1p in64k out1k prefix90 50ms"""
 
     base_url = DEFAULT_URL_FOR_TEST
