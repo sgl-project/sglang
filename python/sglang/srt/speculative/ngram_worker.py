@@ -15,7 +15,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_info_v2 import move_accept_tokens_to_target_kvcache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     record_stream_each,
@@ -297,7 +296,6 @@ class NGRAMWorker:
                 tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(tree_mask, dim=0)
 
-        batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
         batch.out_cache_loc = assign_extend_cache_locs_func(
