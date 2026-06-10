@@ -49,6 +49,18 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
             custom_mask.device if custom_mask is not None else new_seq_lens.device
         )
 
+    @property
+    def max_tree_depth(self) -> int:
+        # NGRAM trees are node-budgeted with no depth cap: the corpus BFS only
+        # stops on the node budget, so a single long match can chain all
+        # draft_token_num nodes (spec_steps is meaningless for this tree).
+        return self.draft_token_num
+
+    @property
+    def tree_topk(self) -> int:
+        # Irregular tree: per-level branching follows the corpus matches.
+        return -1
+
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
