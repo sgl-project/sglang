@@ -193,10 +193,12 @@ class SchedulerBatchResultProcessor:
         old_force_leaf_creation = getattr(req, "force_radix_leaf_creation", False)
 
         req.fill_ids = prompt_fill_ids
-        req.cache_protected_len = max(old_cache_protected_len, radix_key_len)
         # DSV4 prompt donation only needs a full-attention radix leaf. Mark the
         # whole donated key as SWA-evicted so the SWA component stays tombstoned,
         # but force full leaf creation so later matches can reuse the full prefix.
+        # Do not pre-protect the whole radix key here: when the prefix already
+        # exists, the generic overlap path must free this request's duplicate
+        # prompt pages and repoint it to the existing radix leaf.
         req.swa_evicted_seqlen = radix_key_len
         req.force_radix_leaf_creation = True
         try:

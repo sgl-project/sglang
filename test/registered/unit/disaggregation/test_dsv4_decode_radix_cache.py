@@ -170,6 +170,7 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
         tree_cache.inserted_force_leaf_creation.append(
             inserted_req.force_radix_leaf_creation
         )
+        inserted_req.cache_protected_len = 2
 
     tree_cache.cache_unfinished_req = cache_unfinished_req
     processor = SimpleNamespace(tree_cache=tree_cache)
