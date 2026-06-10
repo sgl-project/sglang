@@ -239,12 +239,17 @@ class DeepEPBuffer:
             # TODO can be false when unneeded
             allow_mnnvl=True,
         )
-        # Use CU_MEM_HANDLE_TYPE_FABRIC for the NVLink arena on hardware that
-        # advertises MNNVL fabric handle support, so cross-pod EP groups
-        # (GB200/GB300) take the cuMemImportFromShareableHandle path instead of
-        # the intra-node-only cudaIpcOpenMemHandle path. See:
-        # https://github.com/deepseek-ai/DeepEP/blob/e0a5b1d9848ab3e7b4a67842bf06f067bfac67f8/csrc/deep_ep.cpp#L101-L114
-        if is_flashinfer_available():
+        # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
+        # support, so cross-pod GB200/GB300 EP groups use
+        # cuMemImportFromShareableHandle instead of intra-node-only
+        # cudaIpcOpenMemHandle. Some DeepEP builds do not expose use_fabric, so
+        # only pass the kwarg when Buffer supports it.
+        init_code = getattr(Buffer.__init__, "__code__", None)
+        if (
+            is_flashinfer_available()
+            and init_code is not None
+            and "use_fabric" in init_code.co_varnames
+        ):
             from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
             if is_mnnvl_fabric_supported(torch.cuda.current_device()):
