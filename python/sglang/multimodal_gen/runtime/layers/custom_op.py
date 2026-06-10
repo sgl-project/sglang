@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.multimodal_gen.runtime.acceleration_policy import (
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
     custom_op_kernel_compile_policy,
     kernel_compile_autotune_config,
     kernel_compile_kwargs,

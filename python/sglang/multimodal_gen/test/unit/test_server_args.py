@@ -33,7 +33,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.registry import _get_config_info
-from sglang.multimodal_gen.runtime.acceleration_policy import (
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
     KERNEL_COMPILE_ITERS_ENV,
     KERNEL_COMPILE_LIVE_MISS_ENV,
     KERNEL_COMPILE_MIN_SPEEDUP_ENV,

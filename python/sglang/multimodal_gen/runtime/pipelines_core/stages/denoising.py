@@ -25,7 +25,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
-from sglang.multimodal_gen.runtime.acceleration_policy import (
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
     torch_compile_autotune_config,
     torch_compile_kwargs,
 )
@@ -61,7 +61,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
-from sglang.multimodal_gen.runtime.compile_autotune import (
+from sglang.multimodal_gen.runtime.optimization.compile_autotune import (
     install_torch_compile_autotune,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend

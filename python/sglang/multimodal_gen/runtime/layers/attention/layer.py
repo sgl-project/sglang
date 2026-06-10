@@ -17,7 +17,7 @@ from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
     fused_scatter_to_padded,
 )
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
-from sglang.multimodal_gen.runtime.acceleration_policy import (
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
     attention_allows_cudnn_sdp,
     attention_autotune_config,
 )

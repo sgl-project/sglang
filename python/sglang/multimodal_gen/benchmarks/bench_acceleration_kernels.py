@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sglang.multimodal_gen.runtime.acceleration_policy import (
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
     KERNEL_COMPILE_OPS_ENV,
     KERNEL_COMPILE_POLICY_ENV,
 )

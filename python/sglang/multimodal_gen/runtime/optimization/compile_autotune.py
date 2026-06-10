@@ -11,7 +11,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.runtime.acceleration_policy import (
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
     TorchCompileAutotuneConfig,
     suppress_kernel_compile_autotune,
 )
