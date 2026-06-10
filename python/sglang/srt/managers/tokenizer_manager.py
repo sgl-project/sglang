@@ -1477,9 +1477,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
                     asyncio.create_task(
-                        self.request_metrics_exporter_manager.write_record(
-                            obj, log_out
-                        )
+                        self.request_metrics_exporter_manager.write_record(obj, log_out)
                     )
 
                 # Check if this was an abort/error created by scheduler
