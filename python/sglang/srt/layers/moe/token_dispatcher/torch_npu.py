@@ -85,7 +85,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type = 1
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
-            self.init = NPUMoEInitRouting_v2(quant_mode=1)
+            self.init = NPUMoEInitRouting_v2(quant_mode=-1)
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type = 1
 
