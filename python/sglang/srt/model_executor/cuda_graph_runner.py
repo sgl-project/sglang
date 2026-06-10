@@ -207,12 +207,20 @@ def _allocate_decode_buffers(
             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
+            # PP hidden states carry one row per *token*
+            # (max_num_token = max_bs * num_tokens_per_bs), not per request.
+            # Normal decode has num_tokens_per_bs == 1 so max_num_token == max_bs
+            # and the old (max_bs, hs) buffer happened to be right-sized; for
+            # SUFFIX/NGRAM verify (num_tokens_per_bs == draft_token_num, e.g. 32)
+            # the buffer must be max_num_token-wide or stage-1 attention sees a
+            # max_bs-token hidden against a max_num_token-token positions tensor
+            # and rotary's view(num_tokens, -1, head_size) crashes.
             pp_proxy_tensors = {
-                "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
             if not is_mhc:
                 pp_proxy_tensors["residual"] = torch.zeros(
-                    (max_bs, hidden_size), dtype=dtype
+                    (max_num_token, hidden_size), dtype=dtype
                 )
         else:
             pp_proxy_tensors = None
@@ -1230,7 +1238,11 @@ class CudaGraphRunner:
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # _PATCH_PP_PROXY_RETURN: PP hidden states have bs*num_tokens_per_bs
+            # rows (one per token); slicing to bs truncates spec verify hidden
+            # to 1 token/req and ships stale hidden for the rest.
+            _pp_ntok = self.bs * self.num_tokens_per_bs
+            return PPProxyTensors({k: v[:_pp_ntok] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

@@ -627,6 +627,11 @@ class ServerArgs:
     speculative_ngram_external_corpus_path: Optional[str] = None
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
+    # SUFFIX speculative decoding (arctic_inference SuffixDecodingCache)
+    speculative_suffix_max_tree_depth: int = 24
+    speculative_suffix_max_cached_requests: int = 10000
+    speculative_suffix_max_spec_factor: float = 1.0
+    speculative_suffix_min_token_prob: float = 0.1
     enable_multi_layer_eagle: bool = False
 
     # Adaptive speculative decoding
@@ -5999,6 +6004,30 @@ class ServerArgs:
             help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
         )
         parser.add_argument(
+            "--speculative-suffix-max-tree-depth",
+            type=int,
+            default=ServerArgs.speculative_suffix_max_tree_depth,
+            help="Max depth of the per-request suffix tree for SUFFIX speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-suffix-max-cached-requests",
+            type=int,
+            default=ServerArgs.speculative_suffix_max_cached_requests,
+            help="Max number of finished requests cached in the shared suffix tree for SUFFIX speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-suffix-max-spec-factor",
+            type=float,
+            default=ServerArgs.speculative_suffix_max_spec_factor,
+            help="SUFFIX max speculation factor: caps draft length relative to the matched suffix score.",
+        )
+        parser.add_argument(
+            "--speculative-suffix-min-token-prob",
+            type=float,
+            default=ServerArgs.speculative_suffix_min_token_prob,
+            help="SUFFIX minimum per-token probability for a draft token to be proposed.",
+        )
+        parser.add_argument(
             "--speculative-adaptive",
             action="store_true",
             help="Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
@@ -7421,9 +7450,20 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
+            # _PATCH_PP_SUFFIX_ASSERT: PP supports SUFFIX speculative decoding
+            # ONLY (CPU-draft NGRAM family, no draft-model forward). EAGLE / EAGLE3
+            # / NEXTN / STANDALONE / HYBRID_SUFFIX_MTP need a draft forward that the
+            # PP deferred-verify path does not implement, so they stay forbidden.
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
+            assert (
+                self.speculative_algorithm is None
+                or self.speculative_algorithm == "SUFFIX"
+            ), (
+                "Pipeline parallelism with speculative decoding supports only "
+                f"SUFFIX (got speculative_algorithm={self.speculative_algorithm})"
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
