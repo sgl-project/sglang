@@ -240,6 +240,7 @@ class DeepEPBuffer:
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
+            use_fabric=get_bool_env_var("SGLANG_DEEPEP_USE_FABRIC"),
         )
         return cls._buffer
 
