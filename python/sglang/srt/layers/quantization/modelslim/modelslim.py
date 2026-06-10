@@ -79,49 +79,6 @@ def npu_wrapper_rmsnorm_forward(func):
 
     return _rmsnorm_forward_oot
 
-def _maybe_normalize_deepseek_v4_keys(
-    quant_config: Dict[str, Any],
-) -> Dict[str, Any]:
-    """If the quant description uses DeepSeek-V4 "raw" module names
-    (``layers.N.attn.*`` / ``.ffn.*`` etc.), rewrite the keys to match the
-    HF/sglang module structure (``model.layers.N.self_attn.*`` / ``.mlp.*``).
-    Mirrors ``DeepseekV4ForCausalLM.remap_weight_name_to_dpsk_hf_format`` so
-    later prefix lookups in ``get_linear_scheme`` / ``get_moe_scheme`` /
-    ``is_layer_skipped`` line up with the names the model registers.
-    """
-    looks_raw = any(
-        isinstance(k, str)
-        and k.startswith("layers.")
-        and (".attn." in k or ".ffn." in k)
-        for k in quant_config.keys()
-    )
-    if not looks_raw:
-        return quant_config
-
-    def _remap(name: str) -> str:
-        if name == "embed.weight":
-            return "model.embed_tokens.weight"
-        if name == "head.weight":
-            return "lm_head.weight"
-        if name == "norm.weight":
-            return "model.norm.weight"
-        if name.startswith("hc_head_"):
-            return "model." + name
-        if name.startswith("layers."):
-            name = "model." + name
-        name = name.replace(".attn.", ".self_attn.")
-        name = name.replace(".ffn.", ".mlp.")
-        name = name.replace(".attn_norm.", ".input_layernorm.")
-        name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
-        name = name.replace(".w1.", ".gate_proj.")
-        name = name.replace(".w2.", ".down_proj.")
-        name = name.replace(".w3.", ".up_proj.")
-        name = name.replace(".gate.tid2eid", ".topk.tid2eid")
-        name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
-        return name
-
-    return {(_remap(k) if isinstance(k, str) else k): v for k, v in quant_config.items()}
-
 
 class ModelSlimConfig(QuantizationConfig):
     """
@@ -130,7 +87,16 @@ class ModelSlimConfig(QuantizationConfig):
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
-        quant_config = _maybe_normalize_deepseek_v4_keys(quant_config)
+        keys = [k for k in quant_config if isinstance(k, str)]
+        is_dsv4 = any(k.startswith("hc_head_")for k in keys)
+        if is_dsv4:
+            from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+            remap = DeepseekV4ForCausalLM.remap_weight_name_to_dpsk_hf_format
+            quant_config = {
+                (remap(k) if isinstance(k, str) else k): v
+                for k, v in quant_config.items()
+            }
+
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
