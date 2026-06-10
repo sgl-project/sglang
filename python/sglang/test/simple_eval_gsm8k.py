@@ -108,14 +108,20 @@ class GSM8KEval(Eval):
         return self._few_shot_prompt
 
     def _chat_prompt_style(self, sampler: SamplerBase) -> Optional[str]:
+        # Only models with a known chat-mode failure get a special prompt;
+        # everyone else keeps the original completion-style prompt and
+        # last-number extraction. The instruction wrapper asks the model to
+        # show its reasoning, which makes thinking models (e.g. GLM-5 served
+        # with --reasoning-parser) burn the token budget inside the reasoning
+        # channel and drops their scores.
         if not isinstance(sampler, ChatCompletionSampler):
             return None
         model = (sampler.model or "").lower()
-        if "gemma" in model:
-            return None
         if "mistral" in model or "mixtral" in model:
             return "explicit_answer"
-        return "wrapped_raw"
+        if "deepseek-coder" in model:
+            return "wrapped_raw"
+        return None
 
     def _build_prompt(self, idx: int, question: str, sampler: SamplerBase) -> str:
         prefix = self._build_prefix(idx)
@@ -141,6 +147,7 @@ class GSM8KEval(Eval):
             question = get_one_example(self._lines, idx, include_answer=False)
             correct_answer = get_answer_value(self._lines[idx]["answer"])
 
+            prompt_style = self._chat_prompt_style(sampler)
             prompt_content = self._build_prompt(idx, question, sampler)
             prompt_messages = [
                 sampler._pack_message(content=prompt_content, role="user")
@@ -151,7 +158,14 @@ class GSM8KEval(Eval):
             except Exception:
                 response_text = ""
 
-            extracted_answer = extract_answer(response_text)
+            # Models on the original prompt keep the original last-number
+            # extraction; the `Answer:` pattern is only reliable when the
+            # prompt explicitly asks for it.
+            extracted_answer = (
+                extract_answer(response_text)
+                if prompt_style
+                else get_answer_value(response_text)
+            )
             score = float(extracted_answer == correct_answer)
 
             html = common.jinja_env.from_string(HTML_JINJA).render(

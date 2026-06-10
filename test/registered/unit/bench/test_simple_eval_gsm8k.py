@@ -101,7 +101,7 @@ class TestSimpleEvalGSM8K(CustomTestCase):
         self.assertFalse(prompt.startswith(CHAT_MODE_INSTRUCTION))
         self.assertTrue(prompt.endswith(question))
 
-    def test_non_gemma_chat_prompt_uses_raw_wrapper(self):
+    def test_deepseek_coder_chat_prompt_uses_raw_wrapper(self):
         evaluator = GSM8KEval(
             num_examples=1,
             num_threads=1,
@@ -116,6 +116,22 @@ class TestSimpleEvalGSM8K(CustomTestCase):
         prompt = evaluator._build_prompt(0, question, sampler)
         self.assertTrue(prompt.startswith(CHAT_MODE_INSTRUCTION))
         self.assertIn("Now solve this problem:", prompt)
+        self.assertTrue(prompt.endswith(question))
+
+    def test_reasoning_model_chat_prompt_keeps_completion_style(self):
+        evaluator = GSM8KEval(
+            num_examples=1,
+            num_threads=1,
+            num_shots=2,
+            data_path=self._data_path,
+        )
+        sampler = ChatCompletionSampler(
+            base_url="http://127.0.0.1:1/v1",
+            model="nvidia/GLM-5-NVFP4",
+        )
+        question = "Question: Synthetic question 2: what is 2 + 2?\nAnswer:"
+        prompt = evaluator._build_prompt(0, question, sampler)
+        self.assertFalse(prompt.startswith(CHAT_MODE_INSTRUCTION))
         self.assertTrue(prompt.endswith(question))
 
 
