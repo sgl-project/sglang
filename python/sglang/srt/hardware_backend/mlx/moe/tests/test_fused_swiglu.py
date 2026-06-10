@@ -187,6 +187,8 @@ def test_patch_falls_back_on_gate_bias():
 def test_fused_matches_unfused_synthetic():
     """Synthetic quantized gate weights: fused kernel vs the unfused
     gather_qmm + silu*x_up path, within the kernel's bf16 bound, plus finiteness."""
+    mx.random.seed(0)
+
     import mlx.nn as nn
 
     from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
