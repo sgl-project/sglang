@@ -1,11 +1,10 @@
 ---
 title: "Progressive Resolution Generation"
 description: "Experimental spectral progressive resolution growing for selected SGLang Diffusion pipelines."
+tag: "approx"
 ---
 
 Progressive resolution growing is an experimental feature for selected SGLang Diffusion pipelines. It runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. On the benchmark setup below, this reduces the quadratic attention cost of the DiT transformer and yields up to **1.63× speedup on FLUX.1**, **1.93× speedup on FLUX.2**, **2.33× speedup on Z-Image**, **2.78× speedup on Wan 2.1 T2V**, and **1.69× speedup on Qwen-Image**.
-
-This page is intentionally not linked from the main documentation navigation while the feature is still experimental.
 
 Based on [Spectral Progressive Diffusion (arXiv 2605.18736)](https://arxiv.org/abs/2605.18736).
 
@@ -13,7 +12,7 @@ Based on [Spectral Progressive Diffusion (arXiv 2605.18736)](https://arxiv.org/a
 
 DiT attention is O(n²) in sequence length. Running the first N denoising steps at half the spatial resolution cuts the attention cost to ~6% for those steps.
 
-The transition point — how many steps to run at each resolution — is computed from the **Bayes-optimal frequency-activation criterion**: frequencies that cannot be resolved at the coarse scale are not denoised there. This makes the speedup lossless by construction.
+The transition point — how many steps to run at each resolution — is computed from the **Bayes-optimal frequency-activation criterion**: frequencies that cannot be resolved at the coarse scale are not denoised there. The method is designed to preserve quality under this criterion, but generated outputs can still differ from the full-resolution baseline.
 
 | Model | Full-res tokens | Half-res tokens | Token-step ratio |
 |-------|----------------|----------------|-----------------|

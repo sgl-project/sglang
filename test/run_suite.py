@@ -29,7 +29,7 @@ HW_MAPPING = {
 # (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
 # pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["base-a-test-cpu", "base-b-test-cpu"],
+    HWBackend.CPU: ["base-a-test-cpu", "base-b-test-cpu", "base-b-test-cpu-arm64"],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -39,6 +39,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
         "jit-kernel-unit-test-amd",
+        "sgl-kernel-unit-test-2-gpu-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
