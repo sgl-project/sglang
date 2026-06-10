@@ -17,29 +17,19 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
+from sglang.jit_kernel.dsv32 import (
+    fused_k_indexer_norm_rope,
+    fused_k_indexer_norm_rope_store,
+)
+from sglang.jit_kernel.fused_store_index_cache import (
+    can_use_dsa_fused_store,
+    fused_store_index_k_cache,
+)
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 
-try:
-    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
-    from sglang.jit_kernel.dsv32 import (
-        fused_k_indexer_norm_rope,
-        fused_k_indexer_norm_rope_store,
-    )
-    from sglang.jit_kernel.fused_store_index_cache import (
-        can_use_dsa_fused_store,
-        fused_store_index_k_cache,
-    )
-
-    HAS_KERNELS = True
-except ImportError:
-    HAS_KERNELS = False
-
-try:
-    from sglang.srt.utils import is_hip
-
-    _is_hip = is_hip()
-except ImportError:
-    _is_hip = False
+_is_hip = is_hip()
 
 register_cuda_ci(est_time=45, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=90, suite="nightly-kernel-1-gpu", nightly=True)
@@ -59,10 +49,6 @@ def _skip_if_unavailable():
         pytest.skip("CUDA required")
     if _is_hip:
         pytest.skip("Indexer fused kernels are CUDA-specific")
-    if not hasattr(torch, "float8_e4m3fn"):
-        pytest.skip("torch.float8_e4m3fn not available")
-    if not HAS_KERNELS:
-        pytest.skip("indexer fused kernels not importable")
 
 
 def _make_inputs(B, seed=0, pos_dtype=torch.int32):
