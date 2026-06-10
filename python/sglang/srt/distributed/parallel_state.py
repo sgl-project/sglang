@@ -43,9 +43,11 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -641,7 +643,7 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
-        elif is_in_piecewise_cuda_graph() and self.pynccl_comm is not None:
+        elif is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
             # For piecewise cuda graph, we use pynccl outplace allreduce
             outplace_all_reduce_method = "pynccl"
         if outplace_all_reduce_method is not None:
@@ -708,7 +710,7 @@ class GroupCoordinator:
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
             and not torch.cuda.is_current_stream_capturing()
-            and is_in_piecewise_cuda_graph()
+            and is_in_tc_piecewise_cuda_graph()
         ):
             if not hasattr(ca_comm, "fused_ar_rms"):
                 return None
@@ -863,7 +865,7 @@ class GroupCoordinator:
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
                     ca_comm.all_gather_reg(input, out=output, dim=0)
-                elif is_in_piecewise_cuda_graph():
+                elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
                     # True CUDA graph warmup: avoid a different host collective.

@@ -68,7 +68,8 @@ export const config = {
   --model {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
-  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --warmup-requests 64`,
     accuracy: {
       gsm8k_pct:
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
@@ -112,7 +113,7 @@ sgl-eval run aime25 \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
       },
     },
-    numPromptsByConc: { 1: 8, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
+    numPromptsByConc: { 1: 32, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
   },
 
   // Per-variant accuracy applied to every cell; per-cell `accuracy` overrides.
@@ -182,21 +183,29 @@ sgl-eval run aime25 \\
         options: [
           { id: null,                label: "Inherited" },
           { id: "deepep",            label: "DeepEP",
-            flags: ["--moe-a2a-backend deepep"],
-            disable: { megamoeOn: [true] },
-            disableReason: "MegaMoE owns the MoE backend — turn MegaMoE off to pick one." },
+            flags: ["--moe-a2a-backend deepep"] },
+          // Blackwell-only; no strategy gate — the Playground allows MegaMoE on any
+          // strategy for experimentation (docs recommend it on high-throughput).
           { id: "megamoe",           label: "MegaMoE",
             flags: ["--moe-a2a-backend megamoe"],
-            disable: { megamoeOn: [true] },
-            disableReason: "MegaMoE owns the MoE backend — turn MegaMoE off to pick one." },
+            requiresHw: ["b200", "b300", "gb200", "gb300"] },
           { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)",
-            flags: ["--moe-runner-backend flashinfer_mxfp4"],
-            disable: { megamoeOn: [true] },
-            disableReason: "MegaMoE owns the MoE backend — turn MegaMoE off to pick one." },
+            flags: ["--moe-runner-backend flashinfer_mxfp4"] },
           { id: "marlin",            label: "Marlin (W4A16)",
-            flags: ["--moe-runner-backend marlin"],
-            disable: { megamoeOn: [true] },
-            disableReason: "MegaMoE owns the MoE backend — turn MegaMoE off to pick one." },
+            flags: ["--moe-runner-backend marlin"] },
+        ],
+      },
+      megamoeQuant: {
+        stripEnv: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"],
+        options: [
+          { id: "w4a8", label: "W4A8",
+            env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
+          { id: "w4a4", label: "W4A4",
+            env: [
+              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+            ] },
         ],
       },
       ep: { label: "EP", values: [
@@ -305,27 +314,6 @@ sgl-eval run aime25 \\
       ],
       defaultHostRatio: 10,
     },
-
-    // ----- Card 8: "MegaMoE" -----
-    // Blackwell-only, high-throughput only (see requiresHw / excludesStrategy).
-    megamoe: {
-      requiresHw: ["b200", "b300", "gb200", "gb300"],
-      excludesStrategy: ["low-latency", "balanced"],
-      stripEnv: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"],
-      options: [
-        { id: "disabled", label: "Disabled" },
-        { id: "w4a8",     label: "W4A8",
-          flags: ["--moe-a2a-backend megamoe"],
-          env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
-        { id: "w4a4",     label: "W4A4",
-          flags: ["--moe-a2a-backend megamoe"],
-          env: [
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
-          ] },
-      ],
-    },
   },
 
   cells: [
@@ -377,8 +365,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -442,8 +428,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -508,8 +492,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -573,8 +555,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -642,8 +622,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -778,8 +756,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -841,8 +817,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
       ],
       flags: [
         "--trust-remote-code",
