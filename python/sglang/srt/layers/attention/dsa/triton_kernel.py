@@ -6,6 +6,7 @@ import triton.language as tl
 
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
+
 # Triton implementation
 @triton.jit
 def _act_quant_kernel(
