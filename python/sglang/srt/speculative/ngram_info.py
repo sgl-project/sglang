@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import ClassVar, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -54,9 +54,6 @@ elif is_hip():
 
 @dataclass
 class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixin):
-    # Constant: alloc length per decode step
-    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
-
     def __init__(
         self,
         server_args: ServerArgs = None,
