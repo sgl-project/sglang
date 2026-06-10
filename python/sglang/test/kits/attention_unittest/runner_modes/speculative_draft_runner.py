@@ -8,13 +8,14 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.cuda_graph_runner import set_global_graph_memory_pool
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
+from sglang.srt.model_executor.runner import set_global_graph_memory_pool
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -29,7 +30,7 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
     FrozenKVMTPDraftInput,
 )
-from sglang.srt.speculative.frozen_kv_mtp_worker import FrozenKVMTPWorker
+from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from ..attention_methods.dense_attention import (
@@ -226,26 +227,26 @@ class _FrozenKVMTPWorkerHarness:
         )
         self.model_runner.forward = model_forward
         self._hidden_size = settings.hidden_size
-        self.draft_forward = MethodType(FrozenKVMTPWorker.draft_forward, self)
+        self.draft_forward = MethodType(FrozenKVMTPDraftWorker.draft_forward, self)
         self._frozen_kv_target_view = MethodType(
-            FrozenKVMTPWorker._frozen_kv_target_view,
+            FrozenKVMTPDraftWorker._frozen_kv_target_view,
             self,
         )
         self._target_kv_pool_view = MethodType(
-            FrozenKVMTPWorker._target_kv_pool_view,
+            FrozenKVMTPDraftWorker._target_kv_pool_view,
             self,
         )
-        self._set_positions = MethodType(FrozenKVMTPWorker._set_positions, self)
+        self._set_positions = MethodType(FrozenKVMTPDraftWorker._set_positions, self)
         self._init_frozen_kv_metadata = MethodType(
-            FrozenKVMTPWorker._init_frozen_kv_metadata,
+            FrozenKVMTPDraftWorker._init_frozen_kv_metadata,
             self,
         )
         self._init_frozen_kv_metadata_capture_cuda_graph = MethodType(
-            FrozenKVMTPWorker._init_frozen_kv_metadata_capture_cuda_graph,
+            FrozenKVMTPDraftWorker._init_frozen_kv_metadata_capture_cuda_graph,
             self,
         )
         self._init_frozen_kv_metadata_replay_cuda_graph = MethodType(
-            FrozenKVMTPWorker._init_frozen_kv_metadata_replay_cuda_graph,
+            FrozenKVMTPDraftWorker._init_frozen_kv_metadata_replay_cuda_graph,
             self,
         )
 
@@ -296,7 +297,12 @@ def _configure_runner_for_eagle_draft(
     server_args = runner.server_args
     updates = {
         "attention_backend": case.backend,
-        "cuda_graph_bs": [settings.capture_batch_size],
+        "cuda_graph_config": CudaGraphConfig(
+            decode=PhaseConfig(
+                bs=[settings.capture_batch_size],
+                max_bs=settings.capture_batch_size,
+            ),
+        ),
         "debug_cuda_graph": False,
         "decode_attention_backend": case.backend,
         "disable_cuda_graph_padding": False,
@@ -424,19 +430,19 @@ def _capture_eagle_draft_graph_runner(
 ) -> EAGLEDraftCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.graph_capture",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_attention_cp_size",
+            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
             lambda: 1,
         ),
     ):
@@ -453,19 +459,15 @@ def _capture_frozen_kv_mtp_graph_runner(
 ) -> FrozenKVMTPCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.graph_capture",
+            "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
-            lambda *args, **kwargs: 0.0,
-        ),
-        patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_attention_cp_size",
+            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
             lambda: 1,
         ),
     ):
