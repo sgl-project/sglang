@@ -1,6 +1,7 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
+from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
@@ -37,6 +38,8 @@ from sglang.srt.configs.step3_vl import (
     Step3VLConfig,
 )
 from sglang.srt.configs.step3p5 import Step3p5Config
+from sglang.srt.configs.step3p7 import Step3p7Config
+from sglang.srt.configs.zaya import ZayaConfig
 
 __all__ = [
     "AfmoeConfig",
@@ -76,5 +79,7 @@ __all__ = [
     "JetNemotronConfig",
     "JetVLMConfig",
     "Step3p5Config",
+    "Step3p7Config",
     "Qwen3ASRConfig",
+    "ZayaConfig",
 ]

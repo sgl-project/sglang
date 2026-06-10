@@ -59,6 +59,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of logical expert IDs per batch when submitting P2P ops during EPLB rebalance on ROCm. Smaller values prevent RCCL GPU-side accumulation hangs but increase overhead.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>32</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FORWARD_UNKNOWN_TOOLS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Forward unknown tool calls to clients instead of dropping them</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code> (drop unknown tools)</td>
@@ -446,6 +451,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When the maximum kv len in current prefill batch exceeds this value, the sparse mla kernel will be applied, else it falls back to dense MHA implementation. Default to the index topk of model (2048 for DeepSeek V3.2). <code>SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD</code> is a deprecated alias.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>2048</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_TOPK_BROADCAST</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental. When enabled, broadcast the finalized NSA/DSA indexer top-k result from attention TP rank 0 to the other attention TP ranks. This can mitigate top-k mismatches in TP attention runs at the cost of some speed.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
@@ -516,6 +526,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_USE_MULTI_STREAM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allocate alt CUDA/HIP stream on ROCm/AITER to overlap shared and routed experts in DeepseekV2 MoE. Requires the HIP env <code>GPU_MAX_HW_QUEUES&gt;=5</code> (default <code>4</code>, the cap on HSA/ROCr HW queues HIP creates) so the alt stream gets its own queue instead of serializing with the main stream. Best paired with <code>--deepep-mode low_latency</code> so Mori's AsyncLL kernel offloads dispatch/combine to copy engines and frees CUs.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MOE_PADDING</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable MoE padding (sets padding size to 128 if value is <code>1</code>, often set to <code>1</code> in Docker builds)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
@@ -566,7 +581,17 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer TRTLLM per-token NVFP4 activation scaling; ignores checkpoint activation FP32 scale by treating it as <code>1</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer TRTLLM NVFP4 per-token activation scaling; ignores checkpoint activation FP32 scale by treating it as <code>1</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>FLASHINFER_NVFP4_4OVER6</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer NVFP4 4over6 scaling for NVFP4 per-token activation and online NVFP4 MoE weight quantization paths</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>FLASHINFER_NVFP4_4OVER6_E4M3_USE_256</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use <code>256</code> as the E4M3 scale maximum for FlashInfer NVFP4 4over6 scaling; otherwise uses <code>448</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
 <tr>
@@ -582,6 +607,11 @@ SGLang supports various environment variables that can be used to configure its 
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FP8_IGNORED_LAYERS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A comma-separated list of layer names to ignore during FP8 quantization. For example: <code>model.layers.0,model.layers.1.,qkv_proj</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FP4_IGNORED_LAYERS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A comma-separated list of layer names to keep out of FP4 online quantization, including <code>nvfp4_online</code>. For example: <code>model.layers.40,model.layers.41</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
 </tbody>
@@ -623,6 +653,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set one visible device per process for distributed computing</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_RAY_BUNDLE_INDICES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated bundle indices for Ray actor placement (e.g., <code>"0,1,2,3"</code>). Must match world_size. Enables fine-grained GPU assignment in custom placement groups.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
   </tbody>
 </table>
@@ -826,6 +861,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode-side incremental KV cache offload stride. Rounded down to a multiple of <code>--page-size</code> (min is <code>--page-size</code>). If unset/invalid/&lt;=0, it falls back to <code>--page-size</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses <code>--page-size</code>)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_NIXL_USE_DIRECT_IO</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable <code>O_DIRECT</code> for any file-based NIXL backend (POSIX, GDS, GDS_MT, 3FS) when opening cache files (bypasses the OS page cache, reducing memory pressure and improving throughput on NVMe). Can also be disabled via <code>{'{"use_direct_io": false}'}</code> in <code>--hicache-storage-backend-extra-config</code>. Falls back to buffered I/O with a warning when <code>O_DIRECT</code> is unavailable on the current OS.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUGEPAGE_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use huge pages for host KV cache allocations (HiCache / disaggregation offload). Valid values: <code>2MB</code> (2 MiB pages via <code>MAP_HUGE_2MB</code>) or <code>1GB</code> (1 GiB pages via <code>MAP_HUGE_1GB</code>). Requires huge pages to be pre-allocated on the host OS (<code>/proc/sys/vm/nr_hugepages</code> or <code>/sys/kernel/mm/hugepages</code>). If the allocation fails, the allocator logs a warning and falls back to regular page-size mmap automatically.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses OS default page size)</td>
     </tr>
   </tbody>
 </table>

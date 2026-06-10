@@ -1,4 +1,4 @@
-ARG CANN_VERSION=8.5.0
+ARG CANN_VERSION=9.0.0
 ARG DEVICE_TYPE=a3
 ARG OS=ubuntu22.04
 ARG PYTHON_VERSION=py3.11
@@ -11,11 +11,13 @@ ARG CANN_VERSION
 ARG DEVICE_TYPE
 ARG PIP_INDEX_URL="https://pypi.org/simple/"
 ARG APTMIRROR=""
-ARG PYTORCH_VERSION="2.8.0"
-ARG TORCHVISION_VERSION="0.23.0"
-ARG TORCHAUDIO_VERSION="2.8.0"
-ARG PTA_URL_ARM64="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.0-pytorch2.8.0/torch_npu-2.8.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl"
-ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.0-pytorch2.8.0/torch_npu-2.8.0.post2-cp311-cp311-manylinux_2_28_x86_64.whl"
+ARG PYTORCH_VERSION="2.10.0"
+ARG TORCHVISION_VERSION="0.25.0"
+ARG TORCHAUDIO_VERSION="2.10.0"
+ARG PTA_URL_ARM64="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/torch_npu-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl"
+ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/torch_npu-2.10.0-cp311-cp311-manylinux_2_28_x86_64.whl"
+ARG TRITON_URL_ARM64="https://gitcode.com/Ascend/triton-ascend/releases/download/v3.2.1/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
+ARG TRITON_URL_AMD64="https://gitcode.com/Ascend/triton-ascend/releases/download/v3.2.1/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=main
@@ -26,9 +28,11 @@ ARG DEVICE_TYPE
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
       echo "Using x86_64 dependencies"; \
       echo "PTA_URL=$PTA_URL_AMD64" >> /etc/environment_new; \
+      echo "TRITON_URL=$TRITON_URL_AMD64" >> /etc/environment_new; \
     elif [ "$TARGETARCH" = "arm64" ]; then \
       echo "Using aarch64 dependencies"; \
       echo "PTA_URL=$PTA_URL_ARM64" >> /etc/environment_new; \
+      echo "TRITON_URL=$TRITON_URL_ARM64" >> /etc/environment_new; \
     else \
       echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1; \
     fi
@@ -72,7 +76,13 @@ ENV LC_ALL=en_US.UTF-8
 
 
 ### Install MemFabric
-RUN ${PIP_INSTALL} memfabric-hybrid==1.0.5
+RUN ${PIP_INSTALL} memfabric-hybrid==1.0.8
+
+### Install zbal
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      ${PIP_INSTALL} memfabric-zbal==1.1.1; \
+    fi
+
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router
 
@@ -84,7 +94,9 @@ RUN . /etc/environment_new && \
 
 
 ## Install triton-ascend
-RUN (${PIP_INSTALL} pybind11 triton-ascend)
+RUN . /etc/environment_new && \
+    (${PIP_INSTALL} pybind11) && \
+    (${PIP_INSTALL} ${TRITON_URL})
 
 # Install SGLang (editable mode to preserve source and git history)
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG /sgl-workspace/sglang && \
@@ -96,8 +108,8 @@ RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG /sgl-wo
 RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
     && mkdir sgl-kernel-npu \
     && cd sgl-kernel-npu \
-    && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.8.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
-    && unzip sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.8.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
+    && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
+    && unzip sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
     && ${PIP_INSTALL} deep_ep*.whl sgl_kernel_npu*.whl \
     && cd .. && rm -rf sgl-kernel-npu \
     && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
