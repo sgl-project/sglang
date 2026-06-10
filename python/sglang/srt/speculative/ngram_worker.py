@@ -13,7 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.srt.speculative.eagle_info_v2 import move_accepted_tokens_to_target_kvcache
+from sglang.srt.speculative.eagle_info_v2 import move_accept_tokens_to_target_kvcache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -194,7 +194,7 @@ class NGRAMWorker:
         stride = self.draft_token_num
 
         prev_token_ids, prev_accept_lens = (
-            batch.spec_info.verified_tokens,
+            batch.spec_info.accept_tokens,
             batch.spec_info.accept_lens,
         )
         if not prev_token_ids.is_cpu:
@@ -412,13 +412,13 @@ class NGRAMWorker:
                 accept_index,
             ) = verify_input.sample(batch, logits_output, vocab_mask)
             new_seq_lens = batch.seq_lens + accept_lens
-            verified_tokens = predict[accept_index].flatten()
-            next_token_ids = verified_tokens
+            accept_tokens = predict[accept_index].flatten()
+            next_token_ids = accept_tokens
 
             # The KV mover expects drafts-only counts. NGRAM's
             # accept_lens includes the bonus token, matching scheduler output.
             num_correct_drafts_per_req = accept_lens - 1
-            move_accepted_tokens_to_target_kvcache(
+            move_accept_tokens_to_target_kvcache(
                 batch,
                 accept_index,
                 num_correct_drafts_per_req,
@@ -459,11 +459,11 @@ class NGRAMWorker:
             )
             new_seq_lens = batch.seq_lens.clone()
 
-            verified_tokens = torch.zeros(
+            accept_tokens = torch.zeros(
                 bs, self.draft_token_num, dtype=torch.int32, device=self.device
             )
-            verified_tokens[:, 0] = predict
-            verified_tokens = verified_tokens.flatten()
+            accept_tokens[:, 0] = predict
+            accept_tokens = accept_tokens.flatten()
             next_token_ids = predict
 
             if on_publish is not None:
@@ -474,7 +474,7 @@ class NGRAMWorker:
             server_args=self.server_args,
             draft_token_num=self.draft_token_num,
             new_seq_lens=new_seq_lens,
-            verified_tokens=verified_tokens,
+            accept_tokens=accept_tokens,
             accept_lens=accept_lens,
         )
         return GenerationBatchResult(

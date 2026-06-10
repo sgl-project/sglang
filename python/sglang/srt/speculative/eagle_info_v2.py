@@ -609,7 +609,7 @@ class EagleVerifyInputV2Mixin:
         return predict, num_correct_drafts + 1, accept_index
 
 
-def move_accepted_tokens_to_target_kvcache(
+def move_accept_tokens_to_target_kvcache(
     batch: ScheduleBatch,
     accept_index: torch.Tensor,
     num_correct_drafts: torch.Tensor,
@@ -634,7 +634,7 @@ def move_accepted_tokens_to_target_kvcache(
         accept_index,
         -1,
         batch.out_cache_loc.size(0),
-        "eagle v2 move_accepted_tokens accept_index",
+        "eagle v2 move_accept_tokens accept_index",
     )
 
     tgt_cache_loc = torch.zeros(
@@ -642,7 +642,7 @@ def move_accepted_tokens_to_target_kvcache(
         dtype=torch.int64,
         device=device,
     )
-    accepted_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
+    accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
     assign_extend_cache_locs[(bs,)](
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,
@@ -655,9 +655,9 @@ def move_accepted_tokens_to_target_kvcache(
     fill_accept_out_cache_loc[(size,)](
         accept_index,
         batch.out_cache_loc,
-        accepted_out_cache_loc,
+        accept_out_cache_loc,
         next_power_of_2(size),
     )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-        tgt_cache_loc, accepted_out_cache_loc
+        tgt_cache_loc, accept_out_cache_loc
     )
