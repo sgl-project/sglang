@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_tr
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -184,8 +185,8 @@ class TritonAttnBackend(AttentionBackend):
             self.use_pdl = False
 
         self.allow_bidirectional_attention_in_extend = (
-            model_runner.server_args.disable_cuda_graph
-            and (model_runner.server_args.chunked_prefill_size == -1)
+            cuda_graph_fully_disabled()
+            and model_runner.server_args.chunked_prefill_size == -1
         )
 
         # Decide whether enable deterministic inference with batch-invariant operations
@@ -332,8 +333,8 @@ class TritonAttnBackend(AttentionBackend):
     ):
         """Fill KV (and SWA) cuda-graph buffers for decode/idle mode.
 
-        Returns ``(kv_indptr, window_kv_indptr, window_kv_lens)`` where
-        ``window_kv_lens`` is ``None`` when sliding-window is disabled.
+        Returns (kv_indptr, window_kv_indptr, window_kv_lens) where
+        window_kv_lens is None when sliding-window is disabled.
         """
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
@@ -431,10 +432,16 @@ class TritonAttnBackend(AttentionBackend):
     ):
         """Fill QO + KV cuda-graph buffers for draft_extend mode.
 
-        Returns ``(qo_indptr, kv_indptr, num_tokens_per_bs)``.
+        Returns (qo_indptr, kv_indptr, num_tokens_per_bs).
         """
         seq_lens = seq_lens[:bs]
-        num_tokens_per_bs = self.speculative_num_steps + 1
+        # V2 draft-extend fills num_draft_tokens per req (the cuda-graph runner's
+        # token layout); num_steps+1 only equals that when topk == 1.
+        num_tokens_per_bs = (
+            self.num_draft_tokens
+            if forward_mode.is_draft_extend_v2()
+            else self.speculative_num_steps + 1
+        )
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
@@ -842,7 +849,7 @@ class TritonAttnBackend(AttentionBackend):
 
         Called by capture after the buffer-update helpers have already run
         (either via replay or directly).  All fields reference the same
-        ``self.cuda_graph_*`` tensors that the captured graph kernels will
+        self.cuda_graph_* tensors that the captured graph kernels will
         read — the Python object is rebuilt each capture, but the underlying
         GPU memory addresses are stable.
         """
@@ -894,7 +901,15 @@ class TritonAttnBackend(AttentionBackend):
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
-                max_extend_len=self.speculative_num_steps + 1,
+                # Must match the per-req query count (num_tokens_per_bs) used to
+                # build qo_indptr above, else the extend kernel grid is too small
+                # for topk > 1 (num_draft_tokens > num_steps+1) and drops query
+                # blocks.
+                max_extend_len=(
+                    self.num_draft_tokens
+                    if forward_mode.is_draft_extend_v2()
+                    else self.speculative_num_steps + 1
+                ),
                 num_kv_splits=None,
                 kv_indptr=self.kv_indptr[: bs + 1],
                 kv_indices=self.cuda_graph_kv_indices,
@@ -1500,9 +1515,9 @@ def update_sliding_window_buffer(
 ):
     """Fill window KV buffers for sliding-window attention.
 
-    Pass ``window_kv_indices`` to write into a pre-allocated buffer (CUDA-graph
-    path); omit it (or pass ``None``) to allocate a fresh tensor (eager path,
-    requires ``device``).
+    Pass window_kv_indices to write into a pre-allocated buffer (CUDA-graph
+    path); omit it (or pass None) to allocate a fresh tensor (eager path,
+    requires device).
     """
     window_kv_lens = torch.minimum(
         seq_lens,

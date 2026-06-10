@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
     _mask_topk_ids_padded_region,
+    _zero_topk_weights_padded_region,
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
@@ -212,9 +213,17 @@ class HashTopK(nn.Module):
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        if is_hip():
+            _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        else:
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
-        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        topk_output = self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        if is_hip():
+            _zero_topk_weights_padded_region(
+                topk_output.topk_weights, num_token_non_padded
+            )
+        return topk_output

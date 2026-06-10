@@ -17,15 +17,25 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    assert_buffer_fits,
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -278,7 +288,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
         fmha_backend = "auto"
         if is_sm100_supported():
-            if not model_runner.server_args.disable_piecewise_cuda_graph:
+            # Disable CUTLASS backend when piecewise cuda graph is enabled
+            # due to TMA descriptor initialization issues on B200
+            if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
                 logger.info(
                     "CUTLASS backend is disabled when piecewise cuda graph is enabled "
                     "due to TMA descriptor initialization issues on SM100 GPUs. "
@@ -589,7 +601,7 @@ class FlashInferAttnBackend(AttentionBackend):
             else:
                 use_ragged = (
                     not self.enable_deterministic
-                    and not is_in_piecewise_cuda_graph()
+                    and not is_in_tc_piecewise_cuda_graph()
                     and not self.use_paged
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
@@ -1587,17 +1599,15 @@ class FlashInferMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        # Fail fast on an undersized kv_indices row: the kernel would otherwise write
-        # OOB and *silently* corrupt memory, only sometimes surfacing as a crash.
         required_kv_indices_len = draft_kv_indices_used_len(
             seq_lens_sum, self.topk, bs, self.speculative_num_steps
         )
-        assert required_kv_indices_len <= kv_indices_buffer.shape[1], (
-            f"EAGLE draft kv_indices row too small: need {required_kv_indices_len} "
-            f"but row width is {kv_indices_buffer.shape[1]} (topk={self.topk}, "
-            f"num_seqs={num_seqs}, seq_lens_sum={seq_lens_sum}, "
-            f"num_steps={self.speculative_num_steps}); the buffer must be sized "
-            f"max_bs * topk * max_context_len."
+        assert_buffer_fits(
+            required_kv_indices_len,
+            kv_indices_buffer.shape[1],
+            "EAGLE draft kv_indices row (size max_bs * topk * max_context_len)",
+            bs=bs,
+            seq_lens_sum=seq_lens_sum,
         )
 
         self.generate_draft_decode_kv_indices[
