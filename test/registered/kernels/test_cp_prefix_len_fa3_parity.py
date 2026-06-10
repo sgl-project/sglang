@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.utils.cp_utils import prepare_context_parallel_metadata
+from sglang.srt.layers.cp.utils import prepare_context_parallel_metadata
 from sglang.srt.utils.common import ceil_align
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
