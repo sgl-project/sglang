@@ -674,6 +674,17 @@ class ModelConfig:
                 self.scaling = compute_mla_mscale_scaling(
                     self.hf_config.rope_scaling, self.scaling
                 )
+        elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
+            if self.head_dim is None:
+                self.head_dim = (
+                    self.hf_text_config.hidden_size
+                    // self.hf_text_config.num_attention_heads
+                )
+            if self.swa_head_dim is None:
+                self.swa_head_dim = self.head_dim
+            self.v_head_dim = self.head_dim
+            self.swa_v_head_dim = self.swa_head_dim
+            self.attention_arch = AttentionArch.MHA
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
