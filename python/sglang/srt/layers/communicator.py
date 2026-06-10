@@ -56,6 +56,7 @@ from sglang.srt.layers.dp_attention import (
     get_moe_cp_size,
     is_allocation_symmetric,
     is_dp_attention_enabled,
+    is_dsv4_moe_rs_to_next_attn_enabled,
     is_enable_moe_cp_allgather,
     moe_cp_all_gather_into_tensor,
 )
@@ -101,7 +102,7 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 def should_use_dsv4_dp_moe_reduce_scatterv() -> bool:
     return (
-        get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0")
+        is_dsv4_moe_rs_to_next_attn_enabled()
         and is_dp_attention_enabled()
         and get_attention_dp_size() > 1
         and get_moe_a2a_backend().is_none()
@@ -713,13 +714,18 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
+        allow_reduce_scatter: Optional[bool] = None,
     ):
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
-            allow_reduce_scatter=self.allow_reduce_scatter,
+            allow_reduce_scatter=(
+                self.allow_reduce_scatter
+                if allow_reduce_scatter is None
+                else allow_reduce_scatter
+            ),
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):

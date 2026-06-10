@@ -65,6 +65,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     get_global_dp_buffer,
     is_dp_attention_enabled,
+    is_dsv4_moe_rs_to_next_attn_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -1548,9 +1549,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_attention_dp_size() > 1
             and get_moe_a2a_backend().is_none()
         )
-        _enable_moe_post_reduce_scatter = get_bool_env_var(
-            "DSV4_MOE_RS_TO_NEXT_ATTN", "0"
-        )
+        _enable_moe_post_reduce_scatter = is_dsv4_moe_rs_to_next_attn_enabled()
         use_reduce_scatter = (
             _use_tp_moe_gather
             and _enable_moe_post_reduce_scatter
@@ -1593,16 +1592,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
-            old_allow_reduce_scatter = self.moe_post_communicator.allow_reduce_scatter
-            self.moe_post_communicator.allow_reduce_scatter = use_reduce_scatter
-            try:
-                hidden_states, residual = self.moe_post_communicator.postprocess_layer(
-                    hidden_states, residual, forward_batch
-                )
-            finally:
-                self.moe_post_communicator.allow_reduce_scatter = (
-                    old_allow_reduce_scatter
-                )
+            hidden_states, residual = self.moe_post_communicator.postprocess_layer(
+                hidden_states,
+                residual,
+                forward_batch,
+                allow_reduce_scatter=use_reduce_scatter,
+            )
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]

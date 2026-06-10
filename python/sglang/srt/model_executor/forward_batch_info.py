@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
+    is_dsv4_moe_rs_to_next_attn_enabled,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -58,7 +59,6 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 from sglang.srt.model_executor.triton_ops.position import compute_position_triton
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cuda,
     is_hip,
     is_npu,
@@ -1105,7 +1105,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.is_extend_in_batch, global_num_tokens
         )
         if (
-            get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0")
+            is_dsv4_moe_rs_to_next_attn_enabled()
             and not self.is_extend_in_batch
             and not self.forward_mode.is_target_verify()
             and not self.forward_mode.is_draft_extend(include_v2=True)
