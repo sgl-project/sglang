@@ -27,7 +27,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
@@ -930,7 +930,7 @@ class FlashInferIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1017,7 +1017,7 @@ class FlashInferIndicesUpdaterDecode:
                 kv_start_idx_tmp = None
 
             use_sliding_window_kv_pool = wrapper_id == 0 and isinstance(
-                self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+                self.token_to_kv_pool, BaseSWAKVPool
             )
 
             self.call_begin_forward(
@@ -1116,7 +1116,7 @@ class FlashInferIndicesUpdaterDecode:
         if use_sliding_window_kv_pool:
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
-                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     kv_indices[:kv_last_index]
                 )
             )
@@ -1197,7 +1197,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
         # Dispatch the update function
@@ -1313,7 +1313,7 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens_sum = seq_lens_sum
                 kv_start_idx = seq_lens - paged_kernel_lens
             use_sliding_window_kv_pool = wrapper_id == 0 and isinstance(
-                self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+                self.token_to_kv_pool, BaseSWAKVPool
             )
 
             self.call_begin_forward(
@@ -1491,7 +1491,7 @@ class FlashInferIndicesUpdaterPrefill:
         if use_sliding_window_kv_pool:
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
-                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     kv_indices[:kv_last_index]
                 )
             )
