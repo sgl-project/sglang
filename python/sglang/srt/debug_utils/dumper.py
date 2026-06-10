@@ -155,6 +155,9 @@ class DumperConfig(_BaseConfig):
     # Fully-qualified Python path "pkg.subpkg.module.fn_name"
     # None -> use the default identity-by-rank fallback in _Grafter._default_transform.
     grafter_transform_path: Optional[str] = None
+    # When True, append parallel-rank tags (pp_rank/tp_rank/...) to dump filenames so
+    # tensors from different ranks do not collide when dumped into a shared directory.
+    include_parallel_rank_in_filename: bool = False
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -312,6 +315,10 @@ class _Dumper:
         **kwargs,
     ) -> None:
         for param_name, param in model.named_parameters():
+            for plugin in _plugins:
+                param_name = (
+                    plugin.transform_model_param_name(model, param_name) or param_name
+                )
             self._dump_inner(
                 name=f"{name_prefix}__{param_name}",
                 value=param,
@@ -567,6 +574,8 @@ class _Dumper:
             dump_index=self._state.dump_index,
             **tags,
         )
+        if self._config.include_parallel_rank_in_filename:
+            full_kwargs.update(_collect_parallel_rank_tags())
         full_filename = _format_tags(full_kwargs) + ".pt"
         path = Path(self._config.dir) / self._config.exp_name / full_filename
 
@@ -1248,6 +1257,26 @@ def _materialize_value(value):
     return value
 
 
+_PARALLEL_RANK_KEYS = ("pp_rank", "tp_rank", "cp_rank", "ep_rank", "etp_rank")
+
+
+def _collect_parallel_rank_tags() -> dict[str, int]:
+    """Collect parallel-rank tags from framework plugins for use in dump filenames.
+
+    Merges the ``_PARALLEL_RANK_KEYS`` reported by each plugin's
+    ``collect_parallel_info()``; the first plugin to report a given key wins.
+    """
+    result: dict[str, int] = {}
+    for plugin in _plugins:
+        info = plugin.collect_parallel_info()
+        if not info:
+            continue
+        for key in _PARALLEL_RANK_KEYS:
+            if key in info and key not in result:
+                result[key] = info[key]
+    return result
+
+
 def _format_tags(kwargs: dict) -> str:
     return "___".join(f"{k}={v}" for k, v in kwargs.items())
 
@@ -1645,6 +1674,16 @@ class _FrameworkPlugin(ABC):
     def detect_recompute_status(self) -> _RecomputeStatus:
         return _RecomputeStatus.DISABLED
 
+    def transform_model_param_name(
+        self, model: "torch.nn.Module", param_name: str
+    ) -> Optional[str]:
+        """Return a rewritten parameter name, or None to keep the original.
+
+        Used by ``dump_model`` to canonicalize parameter names across parallel
+        layouts (e.g. mapping pipeline-local layer indices to global ones).
+        """
+        return None
+
 
 class _SGLangPlugin(_FrameworkPlugin):
     _available = True
@@ -1847,6 +1886,65 @@ class _MegatronPlugin(_FrameworkPlugin):
             return _RecomputeStatus.ORIGINAL
         except (ImportError, AttributeError):
             return _RecomputeStatus.DISABLED
+
+    def transform_model_param_name(
+        self, model: "torch.nn.Module", param_name: str
+    ) -> Optional[str]:
+        """Rewrite pipeline-local layer indices to global ones in a param name.
+
+        With pipeline parallelism, ``model.named_parameters()`` reports layer
+        indices local to the current PP stage (e.g. ``layers.0`` on every stage).
+        Adding the stage's ``get_transformer_layer_offset`` makes the dumped
+        names globally unique and comparable across stages. Returns None (keep the
+        original name) when not applicable.
+        """
+        if not self._available:
+            return None
+
+        try:
+            pp_size = self._mpu.get_pipeline_model_parallel_world_size()
+        except (AttributeError, AssertionError):
+            return None
+        if pp_size <= 1:
+            return None
+
+        config = self._get_model_config(model)
+        if config is None:
+            return None
+
+        offset = self._get_transformer_layer_offset(config)
+        if not offset:
+            return None
+
+        def _add_offset(match: "re.Match") -> str:
+            return f"layers.{int(match.group(1)) + offset}"
+
+        return re.sub(r"layers\.(\d+)", _add_offset, param_name)
+
+    @staticmethod
+    def _get_transformer_layer_offset(config) -> int:
+        """Return the PP-stage layer offset for ``config``, or 0 if unavailable."""
+        try:
+            from megatron.core.transformer.transformer_layer import (
+                get_transformer_layer_offset,
+            )
+
+            return get_transformer_layer_offset(config)
+        except (ImportError, AttributeError, AssertionError):
+            return 0
+
+    @staticmethod
+    def _get_model_config(model: "torch.nn.Module"):
+        """Unwrap nested ``.module`` wrappers to reach the Megatron model config."""
+        inner = model
+        for _ in range(10):
+            if hasattr(inner, "config"):
+                return inner.config
+            if hasattr(inner, "module"):
+                inner = inner.module
+            else:
+                break
+        return None
 
 
 _plugins: list[_FrameworkPlugin] = [_SGLangPlugin(), _MegatronPlugin()]

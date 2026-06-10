@@ -29,15 +29,43 @@ pip install -e . --no-build-isolation
 
 ## Use LMCache
 
-Firstly, setup LMCache config. An example config is set at `example_config.yaml`. For more settings please refer to https://docs.lmcache.ai/api_reference/configurations.html.
+LMCache supports two transport modes. **MP (multi-process, default)** issues a single blocking retrieve over ZMQ to a standalone daemon that owns the KV store and survives SGLang restarts. **IP (in-process)** uses an embedded layerwise connector — the cache lives and dies with the SGLang process. Mode selection is currently a code-level setting in `LMCRadixCache.__init__` (`self._mode`); only MP is reachable by default.
 
-Secondly, setup SGLang serving engine with lmcache:
+### MP mode (default): multi-process daemon
+
+Uses `LMCacheMPConnector`. Daemon host/port come from the LMCache YAML config (`mp_host`, `mp_port`).
+
+Terminal 1 — start the LMCache daemon:
 
 ```bash
-export LMCACHE_USE_EXPERIMENTAL=True
-export LMCACHE_CONFIG_FILE=example_config.yaml
+lmcache server \
+  --host 127.0.0.1 --port 5556 \
+  --l1-size-gb 4 \
+  --eviction-policy LRU
+```
 
+Use the bundled `example_config_mp.yaml` (or any YAML setting `mp_host` / `mp_port`):
+
+Terminal 2 — start SGLang:
+
+```bash
 python -m sglang.launch_server \
   --model-path MODEL \
-  --enable-lmcache
+  --enable-lmcache \
+  --lmcache-config-file example_config_mp.yaml
+```
+
+For full LMCache config options see https://docs.lmcache.ai/api_reference/configurations.html.
+
+### IP mode: in-process
+
+Uses `LMCacheLayerwiseConnector`. KV transfer happens per layer inside the SGLang process; the cache lives and dies with the server. To enable, edit `LMCRadixCache.__init__` and set `self._mode = LMCacheMode.IP`.
+
+The LMCache config still controls chunk_size and storage; `mp_host` / `mp_port` are ignored on this path. Use the bundled `example_config_ip.yaml`:
+
+```bash
+python -m sglang.launch_server \
+  --model-path MODEL \
+  --enable-lmcache \
+  --lmcache-config-file example_config_ip.yaml
 ```

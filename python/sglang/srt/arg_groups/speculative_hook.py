@@ -14,6 +14,7 @@ def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
     trust_remote_code: bool = False,
+    kwargs: Optional[dict] = {},
 ) -> Optional[str]:
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
@@ -22,10 +23,12 @@ def _resolve_speculative_algorithm_alias(
         from sglang.srt.utils.hf_transformers_utils import get_config
 
         cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code
+            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
         )
-        is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
-            getattr(cfg, "architectures", None) or []
+        draft_archs = getattr(cfg, "architectures", None) or []
+        is_gemma4_draft = any(
+            arch in ("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
+            for arch in draft_archs
         )
 
     if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
@@ -60,10 +63,17 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
 
+    kwargs = {}
+
+    override_config_file = server_args.decrypted_draft_config_file
+    if override_config_file and override_config_file.strip():
+        kwargs["_configuration_file"] = override_config_file.strip()
+
     server_args.speculative_algorithm = _resolve_speculative_algorithm_alias(
         server_args.speculative_algorithm,
         server_args.speculative_draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
+        kwargs=kwargs,
     )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
@@ -109,6 +119,15 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
 
     if server_args.speculative_adaptive:
         _maybe_disable_adaptive(server_args)
+        if server_args.speculative_adaptive:
+            from sglang.srt.speculative.adaptive_spec_params import (
+                validate_adaptive_initial_steps,
+            )
+
+            validate_adaptive_initial_steps(
+                server_args.speculative_num_steps,
+                server_args.speculative_adaptive_config,
+            )
 
 
 def _handle_dflash(server_args: "ServerArgs") -> None:
@@ -237,10 +256,13 @@ def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
-    logger.warning(
-        "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
-    )
+    # SGLANG_ENABLE_SPEC_V2=False selects the non-overlap (synchronous) spec v2
+    # path instead of the overlap-scheduled one; both run the V2 worker.
+    if (
+        not envs.SGLANG_ENABLE_SPEC_V2.get()
+        and not server_args.disable_overlap_schedule
+    ):
+        server_args.disable_overlap_schedule = True
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -266,29 +288,22 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    spec_v1_reason = None
+    # SGLANG_ENABLE_SPEC_V2=False selects the non-overlap (synchronous) spec v2
+    # path instead of the overlap-scheduled one; both run the V2 worker.
     if (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk > 1
-        and not server_args.disable_overlap_schedule
-    ):
-        server_args.disable_overlap_schedule = True
-        spec_v1_reason = "spec v2 currently only supports topk = 1"
-    elif (
         not envs.SGLANG_ENABLE_SPEC_V2.get()
         and not server_args.disable_overlap_schedule
     ):
         server_args.disable_overlap_schedule = True
-        spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"
 
     if server_args.disable_overlap_schedule:
         logger.warning(
-            "Spec v1 is used for eagle/eagle3/standalone speculative decoding because %s.",
-            spec_v1_reason or "overlap schedule is disabled",
+            "Non-overlap (synchronous) spec v2 is used for eagle/eagle3/standalone "
+            "speculative decoding."
         )
     else:
         logger.warning(
-            "Spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
+            "Overlap spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
         )
 
     if server_args.enable_mixed_chunk:
@@ -358,13 +373,19 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
         )
         server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
+    # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
+    # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
+    # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
+    _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
     if (
         server_args.speculative_eagle_topk > 1
         and server_args.page_size > 1
-        and server_args.attention_backend not in ["flashinfer", "fa3"]
+        and server_args.attention_backend not in _PAGE_TREE_SPEC_BACKENDS
     ):
         raise ValueError(
-            "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+            f"speculative_eagle_topk > 1 with page_size > 1 is only supported on "
+            f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
+            f"{server_args.attention_backend!r}. Use page_size == 1 or one of those backends."
         )
 
 
@@ -378,7 +399,6 @@ def _handle_ngram(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
     server_args.enable_mixed_chunk = False
     server_args.speculative_eagle_topk = server_args.speculative_ngram_max_bfs_breadth
     if server_args.speculative_num_draft_tokens is None:
@@ -386,6 +406,11 @@ def _handle_ngram(server_args: "ServerArgs") -> None:
         logger.warning(
             "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
             "You can override this by explicitly setting --speculative-num-draft-tokens."
+        )
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = (
+            server_args.speculative_num_draft_tokens
+            // server_args.speculative_eagle_topk
         )
     if server_args.speculative_ngram_external_corpus_path is not None:
         if server_args.speculative_ngram_external_sam_budget <= 0:
@@ -407,7 +432,7 @@ def _handle_ngram(server_args: "ServerArgs") -> None:
                 f"speculative_num_draft_tokens - 1 ({server_args.speculative_num_draft_tokens - 1})."
             )
     logger.warning(
-        "The overlap scheduler and mixed chunked prefill are disabled because of "
+        "The mixed chunked prefill are disabled because of "
         "using ngram speculative decoding."
     )
 
