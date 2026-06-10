@@ -905,11 +905,10 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
     K and V are stored in two independent host buffers (``self.k_buffer`` and
     ``self.v_buffer``) instead of a single ``(2, ...)`` tensor, so each side
-    keeps its native stride. Only the ``io_backend='direct'`` transfer path
-    with ``layout in {page_first, page_first_direct}`` is supported; the
-    AOT/JIT kernel transfer path and the flat-page L3 storage interface both
-    assume a single shared ``item_size`` and would silently corrupt V copies,
-    so they raise ``NotImplementedError``.
+    keeps its native stride. The transfer paths dispatch K and V as independent
+    single-buffer copies so each side uses its own ``item_size``. The flat-page
+    L3 storage interface assumes a single shared ``item_size`` and would
+    silently corrupt V copies, so it raises ``NotImplementedError``.
     """
 
     def get_size_per_token(self):
@@ -974,13 +973,17 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         )
         return (k_buffer, v_buffer)
 
-    def _kernel_path_unsupported(self) -> "NotImplementedError":
-        return NotImplementedError(
-            "Models with head_dim != v_head_dim only support "
-            "io_backend='direct' with layout in {page_first, page_first_direct}; "
-            "the 'kernel' transfer path passes a single item_size and would "
-            "silently corrupt V transfers."
-        )
+    def _k_token_stride_size(self) -> int:
+        return self.head_num * self.head_dim * self.dtype.itemsize
+
+    def _v_token_stride_size(self) -> int:
+        return self.head_num * self.v_head_dim * self.dtype.itemsize
+
+    def _k_layout_dim(self) -> int:
+        return self._k_token_stride_size() * self.layer_num
+
+    def _v_layout_dim(self) -> int:
+        return self._v_token_stride_size() * self.layer_num
 
     def _flat_page_unsupported(self) -> "NotImplementedError":
         return NotImplementedError(
@@ -998,19 +1001,105 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         io_backend,
     ):
         if io_backend == "kernel":
-            raise self._kernel_path_unsupported()
-        return super().load_to_device_per_layer(
-            device_pool, host_indices, device_indices, layer_id, io_backend
-        )
+            if self.layout != "page_first":
+                raise ValueError(
+                    f"Unsupported layout for models with head_dim != v_head_dim "
+                    f"and io_backend='kernel': {self.layout}; expected 'page_first'."
+                )
+            transfer_kv_per_layer_mla_pf_lf(
+                src=self.k_buffer,
+                dst=device_pool.k_buffer[layer_id],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=layer_id,
+                item_size=self._k_token_stride_size(),
+                src_layout_dim=self._k_layout_dim(),
+            )
+            transfer_kv_per_layer_mla_pf_lf(
+                src=self.v_buffer,
+                dst=device_pool.v_buffer[layer_id],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=layer_id,
+                item_size=self._v_token_stride_size(),
+                src_layout_dim=self._v_layout_dim(),
+            )
+        elif io_backend == "direct":
+            if self.layout != "page_first_direct":
+                raise ValueError(
+                    f"Unsupported layout for models with head_dim != v_head_dim "
+                    f"and io_backend='direct': {self.layout}; "
+                    "expected 'page_first_direct'."
+                )
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[self.k_buffer],
+                dst_ptrs=[device_pool.k_buffer[layer_id]],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=layer_id,
+                page_size=self.page_size,
+            )
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[self.v_buffer],
+                dst_ptrs=[device_pool.v_buffer[layer_id]],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=layer_id,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if io_backend == "kernel":
-            raise self._kernel_path_unsupported()
-        return super().backup_from_device_all_layer(
-            device_pool, host_indices, device_indices, io_backend
-        )
+            if self.layout != "page_first":
+                raise ValueError(
+                    f"Unsupported layout for models with head_dim != v_head_dim "
+                    f"and io_backend='kernel': {self.layout}; expected 'page_first'."
+                )
+            transfer_kv_all_layer_mla_lf_pf(
+                src_layers=device_pool.k_data_ptrs,
+                dst=self.k_buffer,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                item_size=self._k_token_stride_size(),
+                dst_layout_dim=self._k_layout_dim(),
+                num_layers=self.layer_num,
+            )
+            transfer_kv_all_layer_mla_lf_pf(
+                src_layers=device_pool.v_data_ptrs,
+                dst=self.v_buffer,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                item_size=self._v_token_stride_size(),
+                dst_layout_dim=self._v_layout_dim(),
+                num_layers=self.layer_num,
+            )
+        elif io_backend == "direct":
+            if self.layout != "page_first_direct":
+                raise ValueError(
+                    f"Unsupported layout for models with head_dim != v_head_dim "
+                    f"and io_backend='direct': {self.layout}; "
+                    "expected 'page_first_direct'."
+                )
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=device_pool.k_buffer,
+                dst_ptrs=[self.k_buffer],
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=device_pool.v_buffer,
+                dst_ptrs=[self.v_buffer],
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         raise self._flat_page_unsupported()
