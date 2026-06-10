@@ -147,6 +147,7 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
         skip_radix_cache_insert=True,
         allow_radix_cache_insert_once=False,
         fill_ids=[1, 2, 3, 4, 5],
+        cache_protected_len=0,
     )
     tree_cache = SimpleNamespace(inserted_fill_ids=[])
 
@@ -161,5 +162,6 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
 
     assert tree_cache.inserted_fill_ids == [[1, 2, 3]]
     assert req.fill_ids == [1, 2, 3, 4, 5]
+    assert req.cache_protected_len == 3
     assert req.allow_radix_cache_insert_once is False
     assert req.dsv4_decode_radix_cache_prompt_once is False

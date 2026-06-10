@@ -160,10 +160,12 @@ class SchedulerBatchResultProcessor:
 
         # process_batch_result_prebuilt() runs before the first real decode
         # forward and the batch still references request-owned prompt pages via
-        # out_cache_loc. Insert only after a decode forward completes so overlap
-        # insertion can safely free duplicate prompt KV. Keep the key bounded to
-        # the prefill-committed prompt snapshot so MTP accepted/draft deltas
-        # never enter the tree.
+        # out_cache_loc. Insert only after a decode forward completes. For DSV4
+        # we donate the prompt pages to radix cache; protect the prompt snapshot
+        # before insertion so the generic overlap path does not free those pages
+        # again, and later request release skips the donated prefix. Keep the key
+        # bounded to the prefill-committed prompt snapshot so MTP accepted/draft
+        # deltas never enter the tree.
         req.dsv4_decode_radix_cache_prompt_once = False
         req.allow_radix_cache_insert_once = True
         prompt_len = getattr(req, "dsv4_decode_radix_cache_prompt_len", None)
@@ -172,7 +174,9 @@ class SchedulerBatchResultProcessor:
             return
 
         old_fill_ids = req.fill_ids
+        old_cache_protected_len = getattr(req, "cache_protected_len", 0)
         req.fill_ids = old_fill_ids[:prompt_len]
+        req.cache_protected_len = max(old_cache_protected_len, prompt_len)
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
             if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
@@ -185,6 +189,8 @@ class SchedulerBatchResultProcessor:
                 )
         finally:
             req.fill_ids = old_fill_ids
+            if req.cache_protected_len < old_cache_protected_len:
+                req.cache_protected_len = old_cache_protected_len
 
     def _maybe_collect_customized_info(
         self,
