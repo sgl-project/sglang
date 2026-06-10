@@ -115,7 +115,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         The phase (prefill vs decode) is inferred from the stream capture state.
         """
         # Determine inference phase and select matching init/finalize kernels
-        if not torch.npu.is_current_stream_capturing():
+        if torch.npu.is_current_stream_capturing():
             self._dispatch = self.init_routing_prefill
             self._combine = self.finalize_routing_prefill
             group_list_type = self.group_list_type_prefill
