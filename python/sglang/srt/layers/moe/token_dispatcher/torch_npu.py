@@ -82,7 +82,7 @@ class TorchNpuDispatcher(BaseDispatcher):
 
         if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
             self.init = NPUMoEInitRouting_v2(quant_mode=-1)
-            self.finalize = NPUMoETokenUnpermute()
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
 
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
             self.init = NPUMoEInitRouting_v2(quant_mode=1)
