@@ -63,11 +63,12 @@ FetchContent_Declare(
 FetchContent_Populate(repo-fmt)
 
 # Triton kernel
-# TEMP: Triton 3.7.1 is published from the release/3.7.x branch, but there is no
-# v3.7.1 source tag yet. Replace this branch tarball with the tag once it exists.
+# TEMP: PyTorch 2.12.1 pins Triton 3.7.1 to this release/3.7.x commit, but
+# there is no v3.7.1 source tag yet. Replace this commit pin once the tag exists.
 FetchContent_Declare(
     repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/refs/heads/release/3.7.x.tar.gz
+    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/5d6048aa0a324e090ada215b609ea76620133845.tar.gz
+    URL_HASH SHA256=073284b0ebd4e4e9d7ecf04ca4a9e7ff70f3c124eadf12c82674c07447230546
 )
 FetchContent_Populate(repo-triton)
 
