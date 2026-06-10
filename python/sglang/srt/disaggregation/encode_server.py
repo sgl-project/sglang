@@ -893,7 +893,7 @@ class MMEncoder:
 
         # Step 3: Rank 0 prefetches cache-hit embeddings and builds fallback_mask.
         fallback_mask = torch.zeros(num_items, dtype=torch.int32)
-        cached_slices = None
+        cached_slices = []
 
         if self.rank == 0:
             if hit_indices:
@@ -959,7 +959,7 @@ class MMEncoder:
                 final_slices[idx] = new_slices[i]
 
             # Fill in successfully loaded cache-hit embeddings
-            if cached_slices is not None:
+            if cached_slices:
                 for i, idx in enumerate(hit_indices):
                     if cached_slices[i] is not None:
                         final_slices[idx] = cached_slices[i]
@@ -974,7 +974,7 @@ class MMEncoder:
             # Release embedding cache references now that torch.cat has
             # copied the data into a new tensor.  This allows the cache
             # entries to be evicted under memory pressure.
-            if cached_slices is not None:
+            if cached_slices:
                 loaded_hashes = [
                     str_mm_hashes[idx]
                     for idx in hit_indices
