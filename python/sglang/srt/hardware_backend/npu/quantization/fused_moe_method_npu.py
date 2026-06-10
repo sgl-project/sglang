@@ -444,6 +444,7 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         # Process scale
+        scale = getattr(layer, f"{weight_prefix}_weight_scale")  # shape [E, N, 1]
         scale = scale.data.transpose(-1, -2).contiguous()  # [E, N, 1] -> [E, 1, N]
         setattr(layer, f"{weight_prefix}_weight_scale",
                 torch.nn.Parameter(scale, requires_grad=False))
