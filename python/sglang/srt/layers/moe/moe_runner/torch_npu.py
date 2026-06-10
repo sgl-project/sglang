@@ -40,7 +40,7 @@ if TYPE_CHECKING:
         TorchNpuCombineInput,
     )
 
-from sglang.srt.layers.moe.utils import (  # fixed import
+from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     get_moe_a2a_backend,
 )
