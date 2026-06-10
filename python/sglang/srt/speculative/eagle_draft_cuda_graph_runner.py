@@ -26,7 +26,7 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
-from sglang.srt.model_executor.runner_backend import FullCudaGraphBackend
+from sglang.srt.model_executor.runner_backend import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -226,11 +226,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.buffers.share_buffers()
 
-        # Backend (Full CUDA graph capture)
-        self.backend = FullCudaGraphBackend(
-            self,
-            enable_memory_saver=model_runner.server_args.enable_memory_saver,
-        )
+        # Backend: resolve per device (NPU -> NPUCudaGraphBackend; CUDA -> Full).
+        self.backend = resolve_decode_backend(self)
 
         # Capture
         try:
