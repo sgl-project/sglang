@@ -6,7 +6,6 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
-from sglang.cli.generate import _has_registered_pipeline_class
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
@@ -33,6 +32,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.entrypoints.cli.generate_routing import (
+    _has_registered_pipeline_class,
+)
 from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
     KERNEL_COMPILE_ITERS_ENV,
     KERNEL_COMPILE_LIVE_MISS_ENV,
