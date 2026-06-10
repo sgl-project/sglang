@@ -571,30 +571,15 @@ class CompressorBackendMixin:
         kv_score_buffer = state_pool.kv_score_buffer.kv_score
         kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
 
-        # DSV4 c4/c128 state buffers are an fp32 architectural constant, while
-        # compute_kv_score returns bf16 via the aiter tgemm path. The JIT
-        # compress kernel (c128_v2.cuh) matches kv_buffer / kv_input / ape
-        # against a single InFloat dtype, so bridge the bf16 inputs up to the
-        # state-buffer dtype here and restore the original dtype afterwards for
-        # the downstream Triton norm/rope + fp8 store.
-        _ks_out_dtype = kv_score_input.dtype
-        _buf_dtype = kv_score_buffer.dtype
-        _ape = compressor.ape.view(-1, head_dim)
-        if _ks_out_dtype != _buf_dtype:
-            kv_score_input = kv_score_input.to(_buf_dtype)
-            _ape = _ape.to(_buf_dtype)
-
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score_input,
-            ape=_ape,
+            ape=compressor.ape.view(-1, head_dim),
             plan=plan,
             compress_ratio=compress_ratio,
             head_dim=head_dim,
             is_online=False,
         )
-        if kv_compressed.dtype != _ks_out_dtype:
-            kv_compressed = kv_compressed.to(_ks_out_dtype)
 
         if kv_compressed.shape[0] == 0:
             return
