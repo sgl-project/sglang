@@ -443,14 +443,10 @@ class NGRAMWorker:
                 on_publish(new_seq_lens)
 
             self._update_ngram_corpus(batch)
-            # Clean up per-request match state for requests that left the
-            # decode batch (finished/retracted). Checking req.finished() here
-            # does not work under overlap scheduling: results are processed one
-            # iteration behind, so the flag is still False inside the forward
-            # and the request is gone from the next batch. Diff against the
-            # previous decode batch instead. Entries of requests that never
-            # come back persist until reset(); this is acceptable because
-            # MatchState is small.
+            # Erase match state of requests that left the decode batch.
+            # req.finished() is unusable here: under overlap it flips at result
+            # processing, one iteration after the request left the batch.
+            # The last batch's entries persist while idle (bounded, small).
             cur_rids = {req.rid for req in batch.reqs}
             departed_rids = self._prev_decode_rids - cur_rids
             if departed_rids:
