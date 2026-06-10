@@ -59,8 +59,6 @@ GLM_5_1_PD_SEP_PREFILL_ARGS = [
     4,
     "--nnodes",
     2,
-    "--node-rank",
-    0,
     "--mem-fraction-static",
     0.72,
     "--attention-backend",
@@ -181,7 +179,7 @@ class TestNPUGLM5_1_W4A8_PD_SEP_In3k5_Out1k5(TestNpuPerfMultiNodePdSepTestCaseBa
 
     model_config = GLM_5_1_PD_SEP_MODEL_CONFIG
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
+    dataset_type = AISBENCHMARK_DATASET_DEFAULT
     dataset_name = "random"
     max_concurrency = 1
     num_prompts = 1

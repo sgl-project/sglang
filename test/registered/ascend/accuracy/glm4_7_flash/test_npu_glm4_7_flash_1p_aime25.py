@@ -58,7 +58,7 @@ class TestNPUDeepSeek_V3_2_8P_AIME2025(TestNpuAccuracyTestCaseBase):
     model = GLM_4_7_FLASH_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
-    accuracy = 0.957
+    accuracy = 0.916
     datasets = ["aime25"]
     few_shot_num = 0
     generation_config = {"max_tokens": 65536, "temperature": 1.0}

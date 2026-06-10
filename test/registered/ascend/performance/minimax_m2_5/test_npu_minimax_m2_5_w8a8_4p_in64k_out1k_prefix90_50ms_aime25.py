@@ -24,47 +24,47 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "TASK_QUEUE_ENABLE": "1",
-    "ASCEND_USE_FIA": "0",
-    "HCCL_BUFFSIZE": "1600",
+    "ASCEND_USE_FIA": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "640",
-    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "64",
-    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
-    "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
     "SGLANG_NPU_FUSED_MOE_MODE": "2",
-    "SGLANG_NPU_DEEPEP_USE_FUSED_MOE_DECODE": "1",
-    "SGLANG_NPU_FUSEEP_DECODE_ONLY": "1",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "140000",
+    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    "HCCL_BUFFSIZE": "1024",
     "SGLANG_EXTERNAL_MODEL_PACKAGE": "custom_eagle3",
     "PYTHONPATH": f"{MINIMAX_M2_5_EAGLE3_MODEL_PATH}:{os.environ.get('PYTHONPATH', '')}",
-    "ENABLE_PROFILING": "0",
-    "PROFILING_BS": "28",
-    "PROFILING_STAGE": "decode",
-    "PROFILING_step": "10",
 }
 
 MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
     "--tp-size",
     8,
-    "--enable-dp-attention",
-    "--prefill-delayer-max-delay-passes",
-    500,
-    "--enable-prefill-delayer",
     "--mem-fraction-static",
-    0.65,
+    0.63,
     "--max-running-requests",
-    36,
+    26,
+    "--reasoning-parser",
+    "minimax-append-think",
+    "--tool-call-parser",
+    "minimax-m2",
+    "--enable-prefill-delayer",
+    "--prefill-max-requests",
+    10,
     "--chunked-prefill-size",
-    -1,
-    "--max-prefill-tokens",
-    150000,
+    67072,
+    "--max-prefill-token",
+    67000,
     "--cuda-graph-bs",
+    2,
+    4,
     8,
+    12,
     16,
+    18,
+    20,
+    22,
     24,
-    32,
-    40,
+    26,
     "--moe-a2a-backend",
     "ascend_fuseep",
     "--deepep-mode",
@@ -86,8 +86,6 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
     "--dtype",
     "bfloat16",
     "--trust-remote-code",
-    "--tokenizer-worker-num",
-    8,
 ]
 
 
@@ -101,14 +99,14 @@ class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
     other_args = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS
     envs = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS
     dataset_name = "generated-shared-prefix"
-    max_concurrency = 36
-    num_prompts = 144
+    max_concurrency = 26
+    num_prompts = 104
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1
     repeat_rate = 0.9
     tpot = 50
-    output_token_throughput = 380.31
+    output_token_throughput = 390.5839
     request_rate = float("inf")
 
     def test_npu_minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms(self):

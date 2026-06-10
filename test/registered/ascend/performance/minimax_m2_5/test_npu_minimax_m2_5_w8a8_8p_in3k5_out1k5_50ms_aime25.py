@@ -25,7 +25,6 @@ MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
-    "HCCL_OP_EXPANSION_MODE": "AIV",
     "TASK_QUEUE_ENABLE": "1",
     "HCCL_BUFFSIZE": "1024",
     "ASCEND_USE_FIA": "1",
@@ -47,22 +46,27 @@ MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS = [
     "--mem-fraction-static",
     0.75,
     "--max-running-requests",
-    480,
+    320,
     "--disable-radix-cache",
+    "--reasoning-parser",
+    "minimax-append-think",
+    "--tool-call-parser",
+    "minimax-m2",
     "--prefill-delayer-max-delay-passes",
     500,
     "--enable-prefill-delayer",
     "--chunked-prefill-size",
     -1,
-    "--max-prefill-tokens",
+    "--max-prefill-token",
     8192,
     "--cuda-graph-bs",
+    1,
+    2,
     4,
-    24,
-    32,
-    48,
-    64,
-    80,
+    8,
+    12,
+    16,
+    20,
     "--moe-a2a-backend",
     "ascend_fuseep",
     "--deepep-mode",
@@ -92,7 +96,7 @@ class TestNPUMiniMaxM2_5_W8A8_8P_In3k5_Out1k5_HighThroughput(
     """Test NPU performance for MiniMax-M2.5-w8a8 8p single node high throughput in3k5 out1k5"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
+    dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = MINIMAX_M2_5_W8A8_MODEL_PATH
     other_args = MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS
     envs = MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS
@@ -103,7 +107,7 @@ class TestNPUMiniMaxM2_5_W8A8_8P_In3k5_Out1k5_HighThroughput(
     output_len = 1500
     random_range_ratio = 1
     tpot = 50
-    output_token_throughput = 5512.52
+    output_token_throughput = 5717.58
 
     def test_npu_minimax_m2_5_w8a8_8p_in3k5_out1k5_high_throughput(self):
         """Run NPU performance test for MiniMax-M2.5-w8a8 high throughput"""

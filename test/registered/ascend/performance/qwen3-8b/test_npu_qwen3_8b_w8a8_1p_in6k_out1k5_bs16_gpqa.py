@@ -94,7 +94,7 @@ class TestQwen8B_gpqa(TestNpuAccuracyTestCaseBase):
     model = QWEN3_8B_W8A8_MODEL_PATH
     envs = QWEN3_8B_ENVS
     other_args = QWEN3_8B_OTHER_ARGS
-    accuracy = 0.327
+    accuracy = 0.4444
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = {"max_tokens": 32768, "temperature": 1.0}

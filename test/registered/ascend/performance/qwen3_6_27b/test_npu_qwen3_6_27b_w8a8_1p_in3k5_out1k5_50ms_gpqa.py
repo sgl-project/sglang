@@ -84,7 +84,7 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_50ms(TestNpuPerformanceTestCaseBase):
     """Test NPU performance for Qwen3.6-27B-w8a8 1p in3k5 out1k5 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
+    dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = QWEN3_6_27B_W8A8_MODEL_PATH
     other_args = QWEN3_6_27B_3K5_1K5_OTHER_ARGS
     envs = QWEN3_6_27B_3K5_1K5_ENVS
