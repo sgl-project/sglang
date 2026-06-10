@@ -1,5 +1,13 @@
 name: Cancel PR Workflows on Close
 
+# Cancels every unfinished workflow run associated with a PR when it is
+# closed (merged or not). Runs are listed repo-wide by head branch rather
+# than per workflow: the previous implementation
+# (styfle/cancel-workflow-action with `workflow_id: all`) fetched only the
+# first page (30) of repo workflows, so runs of any workflow created later
+# (e.g. pr-test-extra.yml) were never cancelled and kept occupying runners
+# after merge.
+
 on:
   pull_request_target:
     types:
@@ -12,10 +20,45 @@ jobs:
   cancel:
     runs-on: ubuntu-latest
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          workflow_id: all
-          access_token: ${{ secrets.GITHUB_TOKEN }}
-          ignore_sha: true
-          pr_number: ${{ github.event.pull_request.number }}
+      - name: Cancel unfinished runs of this PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$HEAD_REPO_ID" ]; then
+            echo "Head repo no longer exists (fork deleted), nothing to match"
+            exit 0
+          fi
+
+          # `branch=` matches run.head_branch, which a fork PR shares with
+          # same-named branches of other forks; filter by head repo id so
+          # only this PR's runs are cancelled. Exclude this run itself --
+          # pull_request_target runs also carry the PR's head branch.
+          run_ids=$(
+            for status in queued in_progress waiting; do
+              gh api -X GET "repos/$REPO/actions/runs" \
+                --paginate \
+                -f branch="$HEAD_BRANCH" \
+                -f status="$status" \
+                -F per_page=100 \
+                --jq ".workflow_runs[]
+                      | select(.head_repository.id == $HEAD_REPO_ID and .id != $GITHUB_RUN_ID)
+                      | .id"
+            done | sort -u
+          )
+
+          if [ -z "$run_ids" ]; then
+            echo "No unfinished runs found"
+            exit 0
+          fi
+
+          for run_id in $run_ids; do
+            echo "Cancelling https://github.com/$REPO/actions/runs/$run_id"
+            gh run cancel "$run_id" --repo "$REPO" \
+              || echo "  cancel failed (run may have just finished)"
+          done
