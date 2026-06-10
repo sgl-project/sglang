@@ -3,6 +3,10 @@ Unit tests for HiCacheFile LRU/eviction logic (max_size cap, free-space
 watermark, MLA owner gating, pre-reservation under concurrency) and the
 CP-aware file-key suffix.
 
+The eviction logic lives in ``LRUFileEvictor`` (mem_cache/storage/file/); these
+tests drive it end-to-end through ``HiCacheFile`` and inspect the wired-up
+evictor via ``backend._evictor``.
+
 These are pure CPU tests; they do not launch a server or need CUDA.
 Run with:
     python3 -m pytest test/registered/unit/mem_cache/test_hicache_file_lru_unit.py -v
@@ -23,11 +27,8 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheFile,
-    HiCacheStorageConfig,
-    _parse_size_to_bytes,
-)
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -164,13 +165,13 @@ class TestEnvDefaults(CustomTestCase):
 class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
     def test_no_config_no_eviction(self):
         b = self.make_backend(max_size="0", min_free="0")
-        self.assertFalse(b._eviction_enabled)
+        self.assertFalse(b._evictor.enabled)
         # Set/get should still work as raw file storage.
         self.assertTrue(b.set("k1", _t(50)))
         self.assertTrue(b.exists("k1"))
         # No tracking happens.
-        self.assertEqual(len(b._lru), 0)
-        self.assertEqual(b._total_bytes, 0)
+        self.assertEqual(len(b._evictor._lru), 0)
+        self.assertEqual(b._evictor._total_bytes, 0)
 
 
 class TestCapBasedEviction(HiCacheFileLRUTestBase):
@@ -179,10 +180,10 @@ class TestCapBasedEviction(HiCacheFileLRUTestBase):
         self.assertTrue(b.set("a", _t(100)))
         self.assertTrue(b.set("b", _t(100)))
         self.assertTrue(b.set("c", _t(100)))
-        self.assertEqual(b._total_bytes, 300)
+        self.assertEqual(b._evictor._total_bytes, 300)
         # Adding "d" forces eviction of "a" (oldest).
         self.assertTrue(b.set("d", _t(100)))
-        self.assertLessEqual(b._total_bytes, 300)
+        self.assertLessEqual(b._evictor._total_bytes, 300)
         self.assertFalse(b.exists("a"))
         for k in ("b", "c", "d"):
             self.assertTrue(b.exists(k), f"{k} should still be present")
@@ -203,36 +204,36 @@ class TestCapBasedEviction(HiCacheFileLRUTestBase):
         b = self.make_backend(max_size="100")
         self.assertFalse(b.set("too_big", _t(200)))
         self.assertFalse(b.exists("too_big"))
-        self.assertEqual(b._total_bytes, 0)
-        self.assertEqual(len(b._lru), 0)
+        self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertEqual(len(b._evictor._lru), 0)
 
     def test_eviction_ratio_drops_to_watermark(self):
         # ratio=0.5 -> evict down to ~50% of the cap before adding.
         b = self.make_backend(max_size="400", eviction_ratio=0.5)
         for k in ("a", "b", "c", "d"):
             b.set(k, _t(100))
-        self.assertEqual(b._total_bytes, 400)
+        self.assertEqual(b._evictor._total_bytes, 400)
         # target = 0.5*400 - 100 = 100, then +100 -> 200.
         b.set("e", _t(100))
-        self.assertLessEqual(b._total_bytes, 200)
+        self.assertLessEqual(b._evictor._total_bytes, 200)
 
     def test_repeated_set_same_key_is_noop(self):
         b = self.make_backend(max_size="300")
         self.assertTrue(b.set("a", _t(100)))
-        self.assertEqual(b._total_bytes, 100)
+        self.assertEqual(b._evictor._total_bytes, 100)
         # Same key, different value -- fast path skips rewrite.
         self.assertTrue(b.set("a", _t(100)))
-        self.assertEqual(b._total_bytes, 100)
-        self.assertEqual(len(b._lru), 1)
+        self.assertEqual(b._evictor._total_bytes, 100)
+        self.assertEqual(len(b._evictor._lru), 1)
 
     def test_clear_resets_state(self):
         b = self.make_backend(max_size="300")
         b.set("a", _t(100))
         b.set("b", _t(100))
-        self.assertEqual(b._total_bytes, 200)
+        self.assertEqual(b._evictor._total_bytes, 200)
         self.assertTrue(b.clear())
-        self.assertEqual(b._total_bytes, 0)
-        self.assertEqual(len(b._lru), 0)
+        self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertEqual(len(b._evictor._lru), 0)
         self.assertFalse(b.exists("a"))
 
 
@@ -257,9 +258,9 @@ class TestScanExistingFiles(HiCacheFileLRUTestBase):
         with open(new_path, "wb") as f:
             f.write(b"y" * 70)
         b = HiCacheFile(cfg, file_path=d)
-        self.assertEqual(b._total_bytes, 50 + 70)
+        self.assertEqual(b._evictor._total_bytes, 50 + 70)
         # First key in _lru should be the oldest (front = LRU).
-        keys = list(b._lru.keys())
+        keys = list(b._evictor._lru.keys())
         self.assertEqual(keys[0], f"old{suffix}")
         self.assertEqual(keys[1], f"new{suffix}")
 
@@ -292,18 +293,18 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):
     def test_mla_rank0_owns_eviction(self):
         b = self.make_backend(max_size="200", is_mla=True, tp_rank=0, tp_size=2)
-        self.assertTrue(b._is_storage_owner)
-        self.assertTrue(b._eviction_enabled)
+        self.assertTrue(b._evictor.is_storage_owner)
+        self.assertTrue(b._evictor.enabled)
 
     def test_mla_rank1_skips_eviction(self):
         b = self.make_backend(max_size="200", is_mla=True, tp_rank=1, tp_size=2)
-        self.assertFalse(b._is_storage_owner)
-        self.assertFalse(b._eviction_enabled)
+        self.assertFalse(b._evictor.is_storage_owner)
+        self.assertFalse(b._evictor.enabled)
         # Non-owner MLA ranks must not create new files when eviction is on.
         self.assertFalse(b.set("a", _t(50)))
         self.assertFalse(b.exists("a"))
-        self.assertEqual(len(b._lru), 0)
-        self.assertEqual(b._total_bytes, 0)
+        self.assertEqual(len(b._evictor._lru), 0)
+        self.assertEqual(b._evictor._total_bytes, 0)
 
     def test_mla_rank1_can_touch_existing_file(self):
         # Non-owner ranks may still touch existing files, just not create new ones.
@@ -313,13 +314,13 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
             f.write(b"x" * 50)
         self.assertTrue(b.set("a", _t(50)))
         self.assertTrue(b.exists("a"))
-        self.assertEqual(len(b._lru), 0)
+        self.assertEqual(len(b._evictor._lru), 0)
 
     def test_non_mla_each_rank_owns_its_files(self):
         # Non-MLA: even rank > 0 is its own owner because suffix isolates files.
         b = self.make_backend(max_size="200", is_mla=False, tp_rank=3, tp_size=4)
-        self.assertTrue(b._is_storage_owner)
-        self.assertTrue(b._eviction_enabled)
+        self.assertTrue(b._evictor.is_storage_owner)
+        self.assertTrue(b._evictor.enabled)
 
 
 class TestTrackOrTouch(HiCacheFileLRUTestBase):
@@ -331,12 +332,12 @@ class TestTrackOrTouch(HiCacheFileLRUTestBase):
         path = os.path.join(b.file_path, f"{suffixed}.bin")
         with open(path, "wb") as f:
             f.write(b"a" * 80)
-        self.assertEqual(b._total_bytes, 0)
-        self.assertNotIn(suffixed, b._lru)
+        self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertNotIn(suffixed, b._evictor._lru)
         # set() should hit the fast path and adopt the file.
         self.assertTrue(b.set("xkey", _t(80)))
-        self.assertIn(suffixed, b._lru)
-        self.assertEqual(b._total_bytes, 80)
+        self.assertIn(suffixed, b._evictor._lru)
+        self.assertEqual(b._evictor._total_bytes, 80)
 
     def test_get_adopts_external_file(self):
         b = self.make_backend(max_size="500")
@@ -347,8 +348,8 @@ class TestTrackOrTouch(HiCacheFileLRUTestBase):
         # get() should return the data and also adopt the file.
         out = b.get("ykey", target_location=_t(64))
         self.assertIsNotNone(out)
-        self.assertIn(suffixed, b._lru)
-        self.assertEqual(b._total_bytes, 64)
+        self.assertIn(suffixed, b._evictor._lru)
+        self.assertEqual(b._evictor._total_bytes, 64)
 
 
 class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
@@ -356,7 +357,7 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
         # Force statvfs to report a tiny free figure so the watermark trips.
         b = self.make_backend(max_size="0", min_free="100")
         # 150B free, writing 100B leaves 50B < 100B watermark -> refuse.
-        b._fs_stats = lambda: (1024, 150)
+        b._evictor._fs_stats = lambda: (1024, 150)
         self.assertFalse(b.set("nope", _t(100)))
         self.assertFalse(b.exists("nope"))
 
@@ -367,8 +368,8 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
         path = os.path.join(b.file_path, f"{suffixed}.bin")
         with open(path, "wb") as f:
             f.write(b"v" * 80)
-        b._lru[suffixed] = 80
-        b._total_bytes = 80
+        b._evictor._lru[suffixed] = 80
+        b._evictor._total_bytes = 80
         # 130 free; +60 write needs evicting the 80B victim to clear the watermark.
         free = [130]
 
@@ -383,9 +384,9 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
                 free[0] += os.path.getsize(p)
             return original_remove(p)
 
-        with mock.patch.object(b, "_fs_stats", side_effect=fake_fs_stats), mock.patch(
-            "os.remove", side_effect=tracked_remove
-        ):
+        with mock.patch.object(
+            b._evictor, "_fs_stats", side_effect=fake_fs_stats
+        ), mock.patch("os.remove", side_effect=tracked_remove):
             self.assertTrue(b.set("newk", _t(60)))
         self.assertFalse(b.exists("victim"))
         self.assertTrue(b.exists("newk"))
@@ -413,25 +414,25 @@ class TestPreReservationConcurrency(HiCacheFileLRUTestBase):
 
         self.assertEqual(errors, [])
         # Invariant 1: _total_bytes equals the sum of tracked LRU sizes.
-        tracked_sum = sum(b._lru.values())
-        self.assertEqual(b._total_bytes, tracked_sum)
+        tracked_sum = sum(b._evictor._lru.values())
+        self.assertEqual(b._evictor._total_bytes, tracked_sum)
         # Invariant 2: _total_bytes does not exceed the cap.
-        self.assertLessEqual(b._total_bytes, 300)
+        self.assertLessEqual(b._evictor._total_bytes, 300)
 
     def test_pre_reservation_visible_during_write(self):
         """An in-flight reservation must not be evicted by a concurrent set()."""
         b = self.make_backend(max_size="100", eviction_ratio=1.0)
         pending = b._get_suffixed_key("A")
-        with b._lock:
-            b._lru[pending] = 60
-            b._pending_writes.add(pending)
-            b._total_bytes = 60
+        with b._evictor._lock:
+            b._evictor._lru[pending] = 60
+            b._evictor._pending_writes.add(pending)
+            b._evictor._total_bytes = 60
 
         self.assertFalse(b.set("B", _t(60)))
-        self.assertIn(pending, b._lru)
-        self.assertIn(pending, b._pending_writes)
-        self.assertEqual(b._total_bytes, sum(b._lru.values()))
-        self.assertLessEqual(b._total_bytes, 100)
+        self.assertIn(pending, b._evictor._lru)
+        self.assertIn(pending, b._evictor._pending_writes)
+        self.assertEqual(b._evictor._total_bytes, sum(b._evictor._lru.values()))
+        self.assertLessEqual(b._evictor._total_bytes, 100)
 
 
 if __name__ == "__main__":
