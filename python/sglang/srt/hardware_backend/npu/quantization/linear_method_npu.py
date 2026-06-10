@@ -2,8 +2,12 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch_npu
 from torch.nn.parameter import Parameter
+
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
