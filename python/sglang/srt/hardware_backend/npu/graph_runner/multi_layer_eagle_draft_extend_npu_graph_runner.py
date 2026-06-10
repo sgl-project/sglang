@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleDraftExtendCudaGraphRunner,
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,

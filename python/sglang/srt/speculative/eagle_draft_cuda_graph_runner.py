@@ -26,10 +26,10 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
+from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
