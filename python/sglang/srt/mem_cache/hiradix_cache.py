@@ -76,28 +76,52 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        prealloc_host_kv_pool = params.prealloc_host_kv_pool
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
+            if isinstance(prealloc_host_kv_pool, MHATokenToKVPoolHost):
+                self.token_to_kv_pool_host = prealloc_host_kv_pool
+            else:
+                if prealloc_host_kv_pool is not None:
+                    raise ValueError(
+                        f"Mismatched HiCache prealloc host pool "
+                        f"{type(prealloc_host_kv_pool).__name__} for MHA KV pool."
+                    )
+                self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            self.token_to_kv_pool_host.wait_kv_buffer_ready()
         elif isinstance(self.kv_cache, DSATokenToKVPool):
+            if prealloc_host_kv_pool is not None:
+                logger.warning(
+                    "Ignoring HiCache prealloc host pool for DSA KV pool; "
+                    "DSA uses the existing synchronous hybrid host pool path."
+                )
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
+            if isinstance(prealloc_host_kv_pool, MLATokenToKVPoolHost):
+                self.token_to_kv_pool_host = prealloc_host_kv_pool
+            else:
+                if prealloc_host_kv_pool is not None:
+                    raise ValueError(
+                        f"Mismatched HiCache prealloc host pool "
+                        f"{type(prealloc_host_kv_pool).__name__} for MLA KV pool."
+                    )
+                self.token_to_kv_pool_host = MLATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            self.token_to_kv_pool_host.wait_kv_buffer_ready()
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
 

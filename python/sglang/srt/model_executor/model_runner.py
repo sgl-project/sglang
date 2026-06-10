@@ -416,6 +416,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.prealloc_host_kv_pool = None
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = getattr(
             model_config, "is_hybrid_swa_compress", False
@@ -831,6 +832,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_attention_backend()
             self.kernel_warmup()
             self._pre_initialize_flashinfer_allreduce_workspace()
+            if self.device == "cuda":
+                self._start_prealloc_host_kv_pool()
             self.init_device_graphs()
         elif self.device == "cpu":
             self.init_attention_backend()
@@ -871,6 +874,65 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
+
+    def _start_prealloc_host_kv_pool(self):
+        server_args = self.server_args
+        if (
+            not server_args.enable_hicache_prealloc
+            or not server_args.enable_hierarchical_cache
+            or self.device != "cuda"
+            or self.is_draft_worker
+            or not self._supports_hicache_host_prealloc()
+        ):
+            return
+
+        if server_args.hicache_storage_backend is not None:
+            logger.warning(
+                "HiCache host prealloc does not support storage backends yet; "
+                "falling back to synchronous host pool allocation."
+            )
+            return
+
+        try:
+            from sglang.srt.mem_cache.memory_pool_host import make_prealloc_host_kv_pool
+
+            self.prealloc_host_kv_pool = make_prealloc_host_kv_pool(
+                device_pool=self.token_to_kv_pool,
+                host_to_device_ratio=server_args.hicache_ratio,
+                host_size=server_args.hicache_size,
+                page_size=self.page_size,
+                layout=server_args.hicache_mem_layout,
+            )
+            self.prealloc_host_kv_pool.start_kv_buffer_allocation()
+            logger.info(
+                "Started async HiCache host KV pool allocation for %s.",
+                type(self.prealloc_host_kv_pool).__name__,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "HiCache host prealloc is unavailable for %s; falling back to "
+                "synchronous host pool allocation. Error: %r",
+                type(getattr(self, "token_to_kv_pool", None)).__name__,
+                e,
+            )
+            self.prealloc_host_kv_pool = None
+
+    def _supports_hicache_host_prealloc(self):
+        spec = self.linear_attn_model_spec
+        registry_uses_mamba = spec.uses_mamba_radix_cache if spec is not None else False
+        return not (
+            self.is_hybrid_swa
+            or self.hybrid_gdn_config is not None
+            or self.mamba2_config is not None
+            or registry_uses_mamba
+            or self.kimi_linear_config is not None
+            or self.hybrid_lightning_config is not None
+        )
+
+    def take_prealloc_host_kv_pool(self):
+        pool = self.prealloc_host_kv_pool
+        self.prealloc_host_kv_pool = None
+        return pool
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:

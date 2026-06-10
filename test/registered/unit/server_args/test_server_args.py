@@ -40,6 +40,23 @@ class TestPrepareServerArgs(CustomTestCase):
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
+    def test_hicache_prealloc_requires_hierarchical_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hicache_prealloc=True,
+        )
+
+        self.assertFalse(server_args.enable_hicache_prealloc)
+
+    def test_hicache_prealloc_kept_with_hierarchical_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hierarchical_cache=True,
+            enable_hicache_prealloc=True,
+        )
+
+        self.assertTrue(server_args.enable_hicache_prealloc)
+
     def test_non_pd_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="null")
         self.assertEqual(server_args.load_balance_method, "round_robin")

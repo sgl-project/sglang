@@ -172,6 +172,10 @@ def build_kv_cache(
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
 
+    prealloc_host_kv_pool = None
+    if enable_hierarchical_cache and server_args.enable_hicache_prealloc:
+        prealloc_host_kv_pool = tp_worker.take_prealloc_host_kv_pool()
+
     disable_radix_cache = server_args.disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
     )
@@ -224,6 +228,7 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        prealloc_host_kv_pool=prealloc_host_kv_pool,
     )
 
     tree_cache = create_tree_cache(

@@ -687,6 +687,7 @@ class ServerArgs:
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
+    enable_hicache_prealloc: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
@@ -917,6 +918,7 @@ class ServerArgs:
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
         self._validate_prefill_only_disable_kv_cache_args()
+        self._handle_hicache_prealloc_flag()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -3764,6 +3766,8 @@ class ServerArgs:
         3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
         4) Re-run step (1) if step (3) changed I/O backend.
         """
+        self._handle_hicache_prealloc_flag()
+
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             self.enable_hierarchical_cache
@@ -3783,6 +3787,14 @@ class ServerArgs:
         # Step 4: Re-normalize layout after io backend changes.
         if io_changed:
             self._resolve_layout_io_compatibility()
+
+    def _handle_hicache_prealloc_flag(self):
+        if self.enable_hicache_prealloc and not self.enable_hierarchical_cache:
+            logger.warning(
+                "--enable-hicache-prealloc only works when "
+                "--enable-hierarchical-cache is enabled. Disabling hicache prealloc."
+            )
+            self.enable_hicache_prealloc = False
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -6273,6 +6285,14 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--enable-hicache-prealloc",
+            action="store_true",
+            help=(
+                "Pre-allocate supported HiCache host KV pools asynchronously "
+                "during startup. Only takes effect when --enable-hierarchical-cache is set."
+            ),
         )
         parser.add_argument(
             "--hicache-ratio",

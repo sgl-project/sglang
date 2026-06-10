@@ -8,6 +8,7 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         TreeComponent,
@@ -47,6 +48,11 @@ class CacheInitParams:
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
+
+    # Optional HiCache host KV pool started by ModelRunner so host allocation
+    # can overlap with CUDA graph capture. Cache initialization owns waiting
+    # for the pool and finalizing post-allocation setup.
+    prealloc_host_kv_pool: Optional["HostKVCache"] = None
 
     tree_components: Optional[tuple[ComponentType, ...]] = None
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
