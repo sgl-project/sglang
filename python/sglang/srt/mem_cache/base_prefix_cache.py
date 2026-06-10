@@ -48,6 +48,10 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # Return the full matched prefix (all full-attention cards) instead of the
+    # SWA-window-safe truncation. For the decode-side dedup/repoint, where cards
+    # are present even when SWA is tombstoned. No effect on non-SWA caches.
+    return_full_match: bool = False
 
 
 @dataclasses.dataclass
