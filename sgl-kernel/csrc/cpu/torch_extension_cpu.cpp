@@ -76,24 +76,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_with_gate_
     int64_t num_head);
 
 // speculative decoding
-at::Tensor assign_draft_cache_locs_cpu(
-    const at::Tensor& req_pool_indices,
-    const at::Tensor& req_to_token,
-    const at::Tensor& seq_lens,
-    const at::Tensor& extend_lens,
-    const at::Tensor& num_new_pages_per_topk,
-    at::Tensor& out_cache_loc,
-    const std::optional<at::Tensor>& source_cache_loc,
-    const std::optional<at::Tensor>& target_cache_loc,
-    const std::optional<at::Tensor>& last_page_lens_cumsum,
-    int64_t duplicate_cache_len,
-    int64_t pool_len,
-    int64_t topk,
-    int64_t speculative_num_steps,
-    int64_t page_size,
-    int64_t bs_upper,
-    int64_t iter_upper);
-
 void verify_tree_greedy_cpu(
     at::Tensor predicts,
     at::Tensor accept_index,
@@ -118,25 +100,6 @@ void build_tree_kernel_efficient_cpu(
     int64_t draft_token_num,
     int64_t tree_mask_mode);
 
-void create_extend_after_decode_spec_info_cpu(
-    const at::Tensor& verified_id,
-    const at::Tensor& seq_lens,
-    const at::Tensor& accept_lens,
-    at::Tensor positions,
-    at::Tensor new_verified_id,
-    int64_t bs_upper);
-
-void align_evict_mask_to_page_size_cpu(
-    const at::Tensor& seq_lens, at::Tensor evict_mask, int64_t page_size, int64_t num_draft_tokens);
-
-void get_target_cache_loc_cpu(
-    at::Tensor tgt_cache_loc,
-    at::Tensor to_free_slots,
-    const at::Tensor& num_correct_drafts,
-    const at::Tensor& to_free_num_slots,
-    const at::Tensor& out_cache_loc,
-    int64_t num_verify_tokens);
-
 void assign_req_to_token_pool_cpu(
     const at::Tensor& req_pool_indices,
     at::Tensor req_to_token,
@@ -144,15 +107,6 @@ void assign_req_to_token_pool_cpu(
     const at::Tensor& end_offset,
     const at::Tensor& out_cache_loc,
     int64_t pool_len);
-
-void create_flashinfer_kv_indices_cpu(
-    const at::Tensor& req_to_token,
-    const at::Tensor& req_pool_indices,
-    const at::Tensor& page_kernel_lens,
-    const at::Tensor& kv_indptr,
-    const std::optional<at::Tensor>& kv_start_idx,
-    at::Tensor kv_indices,
-    int64_t req_to_token_stride);
 
 at::Tensor build_draft_decode_metadata_cpu(
     const at::Tensor& req_to_token,
@@ -191,28 +145,6 @@ void rotate_input_ids_cpu(
     const at::Tensor& extend_seq_lens,
     const at::Tensor& topk_index,
     const c10::optional<at::Tensor>& select_index_opt);
-
-void assign_new_state_cpu(
-    const at::Tensor& next_token_ids,
-    const at::Tensor& old_input_ids,
-    const at::Tensor& old_positions,
-    const at::Tensor& old_out_cache_loc,
-    const at::Tensor& old_extend_seq_lens,
-    const at::Tensor& old_extend_start_loc,
-    at::Tensor input_ids,
-    at::Tensor positions,
-    at::Tensor out_cache_loc,
-    at::Tensor extend_seq_lens,
-    at::Tensor extend_start_loc,
-    const at::Tensor& seq_lens,
-    const at::Tensor& padding_lens,
-    const at::Tensor& req_pool_indices,
-    const at::Tensor& req_to_token,
-    int64_t num_seqs,
-    int64_t step,
-    at::Tensor hidden_states,
-    const at::Tensor& old_hidden_states,
-    const at::Tensor& req_to_hidden_states_pool);
 
 // topk
 std::tuple<at::Tensor, at::Tensor>
@@ -642,15 +574,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // speculative decoding
   m.def(
-      "assign_draft_cache_locs_cpu(Tensor req_pool_indices, Tensor req_to_token, Tensor seq_lens, "
-      "Tensor extend_lens, Tensor num_new_pages_per_topk, Tensor(a!) out_cache_loc, "
-      "Tensor(a!)? source_cache_loc, Tensor(a!)? target_cache_loc, Tensor? last_page_lens_cumsum, "
-      "int duplicate_cache_len, int pool_len, int topk, int speculative_num_steps, "
-      "int page_size, int bs_upper, int iter_upper) -> "
-      "Tensor");
-  m.impl("assign_draft_cache_locs_cpu", torch::kCPU, &assign_draft_cache_locs_cpu);
-
-  m.def(
       "verify_tree_greedy_cpu(Tensor(a!) predicts, Tensor(a!) accept_index, "
       "Tensor(a!) accept_token_num, Tensor candidates, Tensor retrive_index, "
       "Tensor retrive_next_token, Tensor retrive_next_sibling, Tensor target_predict) -> ()");
@@ -665,33 +588,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("build_tree_kernel_efficient_cpu", torch::kCPU, &build_tree_kernel_efficient_cpu);
 
   m.def(
-      "create_extend_after_decode_spec_info_cpu(Tensor verified_id, Tensor seq_lens, "
-      "Tensor accept_lens, Tensor(a!) positions, Tensor(a!) new_verified_id, "
-      "int bs_upper) -> ()");
-  m.impl("create_extend_after_decode_spec_info_cpu", torch::kCPU, &create_extend_after_decode_spec_info_cpu);
-
-  m.def(
-      "align_evict_mask_to_page_size_cpu(Tensor seq_lens, Tensor(a!) evict_mask, "
-      "int page_size, int num_draft_tokens) -> ()");
-  m.impl("align_evict_mask_to_page_size_cpu", torch::kCPU, &align_evict_mask_to_page_size_cpu);
-
-  m.def(
-      "get_target_cache_loc_cpu(Tensor(a!) tgt_cache_loc, Tensor(a!) to_free_slots, "
-      "Tensor num_correct_drafts, Tensor to_free_num_slots, Tensor out_cache_loc, "
-      "int num_verify_tokens) -> ()");
-  m.impl("get_target_cache_loc_cpu", torch::kCPU, &get_target_cache_loc_cpu);
-
-  m.def(
       "assign_req_to_token_pool_cpu(Tensor req_pool_indices, Tensor(a!) req_to_token, "
       "Tensor start_offset, Tensor end_offset, Tensor out_cache_loc, "
       "int pool_len) -> ()");
   m.impl("assign_req_to_token_pool_cpu", torch::kCPU, &assign_req_to_token_pool_cpu);
-
-  m.def(
-      "create_flashinfer_kv_indices_cpu(Tensor req_to_token, Tensor req_pool_indices, "
-      "Tensor page_kernel_lens, Tensor kv_indptr, Tensor? kv_start_idx, "
-      "Tensor(a!) kv_indices, int req_to_token_stride) -> ()");
-  m.impl("create_flashinfer_kv_indices_cpu", torch::kCPU, &create_flashinfer_kv_indices_cpu);
 
   m.def(
       "build_draft_decode_metadata_cpu(Tensor req_to_token, Tensor req_pool_indices, "
@@ -722,19 +622,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotate_input_ids_cpu(Tensor(a!) input_ids, Tensor extend_start_loc, "
       "Tensor extend_seq_lens, Tensor topk_index, Tensor? select_index) -> ()");
   m.impl("rotate_input_ids_cpu", torch::kCPU, &rotate_input_ids_cpu);
-
-  m.def(
-      "assign_new_state_cpu(Tensor next_token_ids, Tensor old_input_ids, "
-      "Tensor old_positions, Tensor old_out_cache_loc, "
-      "Tensor old_extend_seq_lens, Tensor old_extend_start_loc, "
-      "Tensor(a!) input_ids, Tensor(a!) positions, Tensor(a!) out_cache_loc, "
-      "Tensor(a!) extend_seq_lens, Tensor(a!) extend_start_loc, "
-      "Tensor seq_lens, Tensor padding_lens, "
-      "Tensor req_pool_indices, Tensor req_to_token, "
-      "int num_seqs, int step, "
-      "Tensor(a!) hidden_states, Tensor old_hidden_states, "
-      "Tensor req_to_hidden_states_pool) -> ()");
-  m.impl("assign_new_state_cpu", torch::kCPU, &assign_new_state_cpu);
 
   // topk
   m.def("topk_sigmoid_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");
@@ -889,7 +776,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni,"
-      "Tensor? intermediate_conv_window=None, Tensor? intermediate_state_indices=None) -> Tensor");
+      "Tensor(a!)? intermediate_conv_window=None, Tensor? intermediate_state_indices=None) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
 #endif
 
@@ -929,10 +816,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, Tensor cu_seqlens, "
       "bool use_qk_l2norm_in_kernel, float softplus_beta=1.0, float softplus_threshold=20.0, "
       "bool is_kda=False, bool disable_state_update=False, "
-      "Tensor? intermediate_states_buffer=None, Tensor? intermediate_state_indices=None, "
+      "Tensor(a!)? intermediate_states_buffer=None, Tensor? intermediate_state_indices=None, "
       "int cache_steps=0, Tensor? retrieve_parent_token=None) -> Tensor");
   m.impl("fused_sigmoid_gating_delta_rule_update_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_cpu);
-
   // fused_gdn_gating
   m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias) -> (Tensor, Tensor)");
   m.impl("fused_gdn_gating_cpu", torch::kCPU, &fused_gdn_gating_cpu);

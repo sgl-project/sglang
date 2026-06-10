@@ -59,7 +59,6 @@ from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner imp
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.multi_layer_eagle_utils import (
-    assign_hidden_states_pool,
     rotate_input_ids,
     rotate_input_ids_triton,
 )
@@ -191,16 +190,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
         self.init_lm_head()
-
-        self.req_to_hidden_states_pool = torch.empty(
-            (
-                self.req_to_token_pool.req_to_token.shape[0],
-                self.speculative_num_steps - 1,
-                self.model_config.hidden_size,
-            ),
-            dtype=self.model_config.dtype,
-            device=self.device,
-        )
 
     def init_attention_backends(self):
         with (
@@ -517,18 +506,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             if self.use_rejection_sampling and draft_probs_list
             else None
         )
-
-        # Update req_to_hidden_states_pool for KV cache reversion
-        if forward_batch.extend_seq_lens is not None:
-            assign_hidden_states_pool(
-                target_hidden_states,
-                forward_batch.req_pool_indices,
-                self.req_to_hidden_states_pool,
-                self.speculative_num_steps - 1,
-                forward_batch.batch_size,
-                forward_batch.extend_seq_lens,
-                forward_batch.extend_start_loc,
-            )
         return next_draft_input
 
     def _draft_extend_for_decode(
@@ -656,32 +633,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     )
                 ret_topk_p_list.append(ret_topk_p)
                 ret_topk_index_list.append(ret_topk_index)
-
-        # Update req_to_hidden_states_pool for KV cache reversion
-        if (
-            forward_batch.extend_seq_lens is not None
-            and self.cuda_graph_runner_for_draft_extend is not None
-        ):
-            if can_cuda_graph:
-                last_runner = self.cuda_graph_runner_for_draft_extend.get_last_runner()
-                hidden_states = last_runner.buffers.hidden_states
-                req_pool_indices = last_runner.buffers.req_pool_indices
-                extend_seq_lens = last_runner.buffers.extend_seq_lens
-                extend_start_loc = last_runner.buffers.extend_start_loc
-            else:
-                hidden_states = draft_logits_output.logits_output.hidden_states
-                req_pool_indices = forward_batch.req_pool_indices
-                extend_seq_lens = forward_batch.extend_seq_lens
-                extend_start_loc = forward_batch.extend_start_loc
-            assign_hidden_states_pool(
-                hidden_states,
-                req_pool_indices,
-                self.req_to_hidden_states_pool,
-                self.speculative_num_steps - 1,
-                forward_batch.batch_size,
-                extend_seq_lens,
-                extend_start_loc,
-            )
 
         batch_result.next_token_ids = next_token_ids_backup
         # Construct the return values
@@ -855,11 +806,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
     ):
-        fwd_stream = (
-            torch.get_device_module(self.device).current_stream()
-            if not _is_cpu
-            else None
-        )
+        fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
@@ -920,12 +867,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_lens
-
-        if _is_cpu:
-            verify_done = None
-        else:
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]

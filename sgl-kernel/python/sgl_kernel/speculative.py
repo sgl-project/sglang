@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 
@@ -178,56 +180,6 @@ def build_tree_kernel_efficient_cpu(
     )
 
 
-def create_extend_after_decode_spec_info_cpu(
-    verified_id: torch.Tensor,
-    seq_lens: torch.Tensor,
-    accept_lens: torch.Tensor,
-    positions: torch.Tensor,
-    new_verified_id: torch.Tensor,
-    bs_upper: int,
-) -> None:
-    torch.ops.sgl_kernel.create_extend_after_decode_spec_info_cpu(
-        verified_id,
-        seq_lens,
-        accept_lens,
-        positions,
-        new_verified_id,
-        bs_upper,
-    )
-
-
-def align_evict_mask_to_page_size_cpu(
-    seq_lens: torch.Tensor,
-    evict_mask: torch.Tensor,
-    page_size: int,
-    num_draft_tokens: int,
-) -> None:
-    torch.ops.sgl_kernel.align_evict_mask_to_page_size_cpu(
-        seq_lens,
-        evict_mask,
-        page_size,
-        num_draft_tokens,
-    )
-
-
-def get_target_cache_loc_cpu(
-    tgt_cache_loc: torch.Tensor,
-    to_free_slots: torch.Tensor,
-    num_correct_drafts: torch.Tensor,
-    to_free_num_slots: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    num_verify_tokens: int,
-) -> None:
-    torch.ops.sgl_kernel.get_target_cache_loc_cpu(
-        tgt_cache_loc,
-        to_free_slots,
-        num_correct_drafts.to(torch.int64),
-        to_free_num_slots.to(torch.int64),
-        out_cache_loc,
-        num_verify_tokens,
-    )
-
-
 def assign_req_to_token_pool_cpu(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -243,26 +195,6 @@ def assign_req_to_token_pool_cpu(
         end_offset,
         out_cache_loc,
         pool_len,
-    )
-
-
-def create_flashinfer_kv_indices_cpu(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    page_kernel_lens: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_start_idx,
-    kv_indices: torch.Tensor,
-    req_to_token_stride: int,
-) -> None:
-    torch.ops.sgl_kernel.create_flashinfer_kv_indices_cpu(
-        req_to_token,
-        req_pool_indices,
-        page_kernel_lens,
-        kv_indptr,
-        kv_start_idx,
-        kv_indices,
-        req_to_token_stride,
     )
 
 
@@ -355,7 +287,7 @@ def rotate_input_ids_cpu(
     extend_start_loc: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     topk_index: torch.Tensor,
-    select_index=None,
+    select_index: Optional[torch.Tensor] = None,
 ) -> None:
     torch.ops.sgl_kernel.rotate_input_ids_cpu(
         input_ids,
@@ -363,50 +295,4 @@ def rotate_input_ids_cpu(
         extend_seq_lens,
         topk_index,
         select_index,
-    )
-
-
-def assign_new_state_cpu(
-    next_token_ids: torch.Tensor,
-    old_input_ids: torch.Tensor,
-    old_positions: torch.Tensor,
-    old_out_cache_loc: torch.Tensor,
-    old_extend_seq_lens: torch.Tensor,
-    old_extend_start_loc: torch.Tensor,
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    extend_seq_lens: torch.Tensor,
-    extend_start_loc: torch.Tensor,
-    seq_lens: torch.Tensor,
-    padding_lens: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
-    num_seqs: int,
-    step: int,
-    hidden_states: torch.Tensor,
-    old_hidden_states: torch.Tensor,
-    req_to_hidden_states_pool: torch.Tensor,
-) -> None:
-    torch.ops.sgl_kernel.assign_new_state_cpu(
-        next_token_ids,
-        old_input_ids,
-        old_positions,
-        old_out_cache_loc,
-        old_extend_seq_lens,
-        old_extend_start_loc,
-        input_ids,
-        positions,
-        out_cache_loc,
-        extend_seq_lens,
-        extend_start_loc,
-        seq_lens,
-        padding_lens,
-        req_pool_indices,
-        req_to_token,
-        num_seqs,
-        step,
-        hidden_states,
-        old_hidden_states,
-        req_to_hidden_states_pool,
     )

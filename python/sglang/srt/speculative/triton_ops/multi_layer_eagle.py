@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import torch
 import triton
 import triton.language as tl
 
@@ -70,78 +69,3 @@ def rotate_input_ids_triton(
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return input_ids
-
-
-@triton.jit
-def assign_hidden_states_pool_kernel(
-    hidden_states_ptr,
-    req_pool_indices_ptr,
-    req_to_hidden_states_pool_ptr,
-    extend_seq_lens_ptr,
-    extend_start_loc_ptr,
-    stride_hidden_seq,
-    stride_hidden_dim,
-    stride_pool_req,
-    stride_pool_step,
-    stride_pool_dim,
-    HIDDEN_DIM: tl.constexpr,
-    pool_size: tl.constexpr,
-    BLOCK_HID: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    extend_len = tl.load(extend_seq_lens_ptr + pid)
-    start_loc = tl.load(extend_start_loc_ptr + pid)
-    end_loc = start_loc + extend_len
-
-    req_idx = tl.load(req_pool_indices_ptr + pid)
-    pool_vec_offset_base = req_idx * stride_pool_req
-
-    for i in range(pool_size):
-        for off_h in range(0, HIDDEN_DIM, BLOCK_HID):
-            offs_h = off_h + tl.arange(0, BLOCK_HID)
-            mask_h = offs_h < HIDDEN_DIM
-
-            hid_ptr = (
-                hidden_states_ptr
-                + (end_loc - pool_size + i) * stride_hidden_seq
-                + offs_h * stride_hidden_dim
-            )
-            hid_val = tl.load(hid_ptr, mask=mask_h)
-
-            pool_ptr = (
-                req_to_hidden_states_pool_ptr
-                + pool_vec_offset_base
-                + i * stride_pool_step
-                + offs_h * stride_pool_dim
-            )
-            tl.store(pool_ptr, hid_val, mask=mask_h)
-
-
-def assign_hidden_states_pool_triton(
-    hidden_states: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    req_to_hidden_states_pool: torch.Tensor,
-    pool_size: int,
-    num_seqs: int,
-    extend_seq_lens: torch.Tensor,
-    extend_start_loc: torch.Tensor,
-):
-    grid = (num_seqs,)
-    assign_hidden_states_pool_kernel[grid](
-        hidden_states,
-        req_pool_indices,
-        req_to_hidden_states_pool,
-        extend_seq_lens,
-        extend_start_loc,
-        hidden_states.stride(0),
-        hidden_states.stride(1),
-        req_to_hidden_states_pool.stride(0),
-        req_to_hidden_states_pool.stride(1),
-        req_to_hidden_states_pool.stride(2),
-        HIDDEN_DIM=hidden_states.shape[1],
-        pool_size=pool_size,
-        BLOCK_HID=64,
-    )
-
-

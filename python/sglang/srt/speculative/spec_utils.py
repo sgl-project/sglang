@@ -16,6 +16,33 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    assign_extend_cache_locs as assign_extend_cache_locs,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    assign_req_to_token_pool as assign_req_to_token_pool,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    get_target_cache_loc as get_target_cache_loc,
+)
+from sglang.srt.speculative.triton_ops.eagle import (
+    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -27,45 +54,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
-
-if not is_cpu():
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        align_evict_mask_to_page_size as align_evict_mask_to_page_size,
-    )
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        assign_extend_cache_locs as assign_extend_cache_locs,
-    )
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        assign_req_to_token_pool as assign_req_to_token_pool,
-    )
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-    )
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
-    )
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
-    )
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        get_src_tgt_cache_loc as get_src_tgt_cache_loc,
-    )
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        get_target_cache_loc as get_target_cache_loc,
-    )
-    from sglang.srt.speculative.triton_ops.eagle import (
-        fill_accept_out_cache_loc as fill_accept_out_cache_loc,
-    )
-else:
-    align_evict_mask_to_page_size = None
-    assign_extend_cache_locs = None
-    assign_req_to_token_pool = None
-    assign_req_to_token_pool_func = None
-    fill_accept_out_cache_loc = None
-    filter_finished_cache_loc_kernel = None
-    generate_draft_decode_kv_indices = None
-    get_src_tgt_cache_loc = None
-    get_target_cache_loc = None
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
