@@ -114,10 +114,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
 class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
     """Qwen3-30B-A3B-FP8 + HiCache L3 (file backend) + PP + UnifiedRadixCache."""
 
-    gsm8k_threshold = 0.7
-    num_gsm8k_questions = 50
-    gsm8k_parallel = 2
-    mmlu_threshold = 0.7
+    gsm8k_threshold = 0.8
 
     @classmethod
     def setUpClass(cls):
