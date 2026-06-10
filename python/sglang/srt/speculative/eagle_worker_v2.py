@@ -1563,12 +1563,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.speculative_num_draft_tokens,
         )
 
-        if _is_cpu:
-            verify_done = None
-        else:
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
-
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)

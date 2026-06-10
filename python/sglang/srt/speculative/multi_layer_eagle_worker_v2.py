@@ -812,11 +812,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
     ):
-        fwd_stream = (
-            torch.get_device_module(self.device).current_stream()
-            if not _is_cpu
-            else None
-        )
+        fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
@@ -877,12 +873,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_lens
-
-        if _is_cpu:
-            verify_done = None
-        else:
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]

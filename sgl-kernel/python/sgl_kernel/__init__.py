@@ -113,7 +113,6 @@ else:
     from sgl_kernel.speculative import (
         assign_draft_cache_locs_contiguous_cpu,
         assign_extend_cache_locs_cpu,
-        assign_new_state_cpu,
         assign_req_to_token_pool_cpu,
         build_draft_decode_metadata_cpu,
         build_tree_kernel_efficient,

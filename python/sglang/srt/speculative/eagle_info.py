@@ -14,20 +14,6 @@ from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
 
-if is_cuda() or is_musa():
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-        tree_speculative_sampling_target_only,
-    )
-elif _is_cpu:
-    from sgl_kernel import (
-        align_evict_mask_to_page_size_cpu,
-        create_extend_after_decode_spec_info_cpu,
-        create_flashinfer_kv_indices_cpu,
-        get_target_cache_loc_cpu,
-    )
-
 logger = logging.getLogger(__name__)
 
 
@@ -41,91 +27,6 @@ def _draft_runner_of(worker):
     return (
         worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
     )
-
-
-def _create_flashinfer_kv_indices(
-    req_to_token,
-    req_pool_indices,
-    paged_kernel_lens,
-    cum_kv_seq_len,
-    kv_start_idx,
-    kv_indices,
-    req_to_token_stride,
-    batch_size,
-):
-    if _is_cpu:
-        create_flashinfer_kv_indices_cpu(
-            req_to_token,
-            req_pool_indices.to(torch.int32),
-            paged_kernel_lens.to(torch.int32),
-            cum_kv_seq_len.to(torch.int32),
-            kv_start_idx.to(torch.int32) if kv_start_idx is not None else kv_start_idx,
-            kv_indices,
-            req_to_token_stride,
-        )
-    else:
-        create_flashinfer_kv_indices_triton[(batch_size,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            kv_start_idx,
-            kv_indices,
-            req_to_token_stride,
-        )
-
-
-def _create_extend_after_decode_spec_info(
-    input_ids,
-    seq_lens,
-    accept_length,
-    positions,
-    verified_id,
-    bs_upper,
-    batch_size,
-):
-    if _is_cpu:
-        create_extend_after_decode_spec_info_cpu(
-            input_ids.to(torch.int32),
-            seq_lens.to(torch.int32),
-            accept_length.to(torch.int32),
-            positions,
-            verified_id,
-            bs_upper,
-        )
-    else:
-        create_extend_after_decode_spec_info[(batch_size,)](
-            input_ids,
-            seq_lens,
-            accept_length,
-            positions,
-            verified_id,
-            bs_upper,
-        )
-
-
-def _align_evict_mask_to_page_size(
-    seq_lens,
-    evict_mask,
-    page_size: int,
-    num_draft_tokens: int,
-):
-    if _is_cpu:
-        align_evict_mask_to_page_size_cpu(
-            seq_lens.to(torch.int32),
-            evict_mask,
-            page_size,
-            num_draft_tokens,
-        )
-    else:
-        align_evict_mask_to_page_size[(seq_lens.shape[0],)](
-            seq_lens,
-            evict_mask,
-            page_size,
-            num_draft_tokens,
-            next_power_of_2(num_draft_tokens),
-        )
-
 
 
 @dataclass
@@ -225,7 +126,7 @@ class EagleVerifyInput(SpecInput):
             dtype=torch.int32,
             device=device,
         )
-        _create_flashinfer_kv_indices(
+        create_flashinfer_kv_indices_triton[(batch_size,)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
@@ -233,7 +134,6 @@ class EagleVerifyInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
-            batch_size,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -490,7 +390,7 @@ class EagleDraftExtendInput(SpecInput):
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
 
-        _create_flashinfer_kv_indices(
+        create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
@@ -498,6 +398,5 @@ class EagleDraftExtendInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
-            bs,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
