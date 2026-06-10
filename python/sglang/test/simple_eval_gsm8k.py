@@ -34,8 +34,23 @@ def get_one_example(lines, i, include_answer):
     return ret
 
 
+def get_chat_one_example(lines, i):
+    answer = lines[i]["answer"]
+    reasoning = answer.split("####", 1)[0].strip()
+    final_answer = get_answer_value(answer)
+    return (
+        f"Question: {lines[i]['question']}\n"
+        f"Reasoning: {reasoning}\n"
+        f"Answer: {final_answer}\n\n"
+    )
+
+
 def get_few_shot_examples(lines, k):
     return "".join(get_one_example(lines, i, True) + "\n\n" for i in range(k))
+
+
+def get_chat_few_shot_examples(lines, k):
+    return "".join(get_chat_one_example(lines, i) for i in range(k))
 
 
 def get_answer_value(answer_str):
@@ -86,19 +101,26 @@ class GSM8KEval(Eval):
 
     def _setup_prefix_pool(self, all_lines: list, num_shots: int) -> int:
         self._few_shot_prompt = get_few_shot_examples(all_lines, num_shots)
+        self._chat_few_shot_prompt = get_chat_few_shot_examples(all_lines, num_shots)
         return num_shots
 
     def _build_prefix(self, idx: int) -> str:
         return self._few_shot_prompt
 
+    def _use_chat_mode_instruction(self, sampler: SamplerBase) -> bool:
+        if not isinstance(sampler, ChatCompletionSampler):
+            return False
+        model = (sampler.model or "").lower()
+        return "mistral" in model or "mixtral" in model
+
     def _build_prompt(self, idx: int, question: str, sampler: SamplerBase) -> str:
         prefix = self._build_prefix(idx)
-        if isinstance(sampler, ChatCompletionSampler):
+        if self._use_chat_mode_instruction(sampler):
             return (
                 CHAT_MODE_INSTRUCTION
-                + prefix
+                + self._chat_few_shot_prompt
                 + "Now solve this problem:\n\n"
-                + question
+                + f"Question: {self._lines[idx]['question']}"
             )
         return prefix + question
 

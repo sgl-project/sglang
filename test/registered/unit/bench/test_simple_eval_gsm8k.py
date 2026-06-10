@@ -9,6 +9,7 @@ from sglang.test.simple_eval_gsm8k import (
     CHAT_MODE_INSTRUCTION,
     GSM8KEval,
     extract_answer,
+    get_chat_one_example,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -53,7 +54,18 @@ class TestSimpleEvalGSM8K(CustomTestCase):
         )
         self.assertEqual(sampler.stop, ["\nQuestion:", "\n\nQuestion:"])
 
-    def test_gsm8k_chat_prompt_uses_instruction_wrapper(self):
+    def test_chat_few_shot_formats_explicit_final_answer(self):
+        lines = [
+            {
+                "question": "Synthetic question: what is 2 + 2?",
+                "answer": "Add the two numbers. #### 4",
+            }
+        ]
+        example = get_chat_one_example(lines, 0)
+        self.assertIn("Reasoning: Add the two numbers.", example)
+        self.assertIn("Answer: 4", example)
+
+    def test_mistral_chat_prompt_uses_instruction_wrapper(self):
         evaluator = GSM8KEval(
             num_examples=1,
             num_threads=1,
@@ -62,7 +74,7 @@ class TestSimpleEvalGSM8K(CustomTestCase):
         )
         sampler = ChatCompletionSampler(
             base_url="http://127.0.0.1:1/v1",
-            model="test-model",
+            model="mistralai/Mistral-7B-Instruct-v0.3",
         )
         prompt = evaluator._build_prompt(
             0,
@@ -71,6 +83,23 @@ class TestSimpleEvalGSM8K(CustomTestCase):
         )
         self.assertTrue(prompt.startswith(CHAT_MODE_INSTRUCTION))
         self.assertIn("Now solve this problem:", prompt)
+        self.assertIn("Reasoning:", prompt)
+
+    def test_non_mistral_chat_prompt_keeps_completion_style(self):
+        evaluator = GSM8KEval(
+            num_examples=1,
+            num_threads=1,
+            num_shots=2,
+            data_path=self._data_path,
+        )
+        sampler = ChatCompletionSampler(
+            base_url="http://127.0.0.1:1/v1",
+            model="google/gemma-2-27b-it",
+        )
+        question = "Question: Synthetic question 2: what is 2 + 2?\nAnswer:"
+        prompt = evaluator._build_prompt(0, question, sampler)
+        self.assertFalse(prompt.startswith(CHAT_MODE_INSTRUCTION))
+        self.assertTrue(prompt.endswith(question))
 
 
 if __name__ == "__main__":
