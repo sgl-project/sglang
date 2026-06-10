@@ -289,3 +289,143 @@ def test_fused_forward_falls_back_on_dtype_mismatch():
     mx.eval(out_fb)
     max_abs, rel = _max_rel_diff(out_ref, out_fb)
     assert rel < 1e-3, f"fallback != unfused: max_abs={max_abs:.3e} rel={rel:.2%}"
+
+
+# Fallback index contract (synthetic, no model): the fallback must see the
+# untouched flat indices. The sorted path's (M_tok, 1) kernel reshape once
+# leaked into the fallback and broadcast an M_tok x M_tok cross product
+# (PR #26188 review repro).
+def _bf16_quantized_switch_glu(in_dim, hidden, n_experts):
+    """Quantize from bf16 weights so fp16 activations trip the kernel's runtime
+    dtype check while the unfused path tolerates them."""
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    sw = SwitchGLU(in_dim, hidden, n_experts, bias=False)
+    for name in ("up_proj", "gate_proj", "down_proj"):
+        lin = getattr(sw, name)
+        lin.weight = lin.weight.astype(mx.bfloat16)
+        setattr(sw, name, lin.to_quantized(group_size=64, bits=4, mode="affine"))
+    return sw
+
+
+def test_sorted_dtype_mismatch_fallback_matches_reference(monkeypatch):
+    """Reviewer repro: B*T == 64 takes the sorted path, the kernel rejects fp16
+    activations on bf16 params, and the fallback must match the reference in
+    shape and value."""
+    import types
+
+    import sglang.srt.hardware_backend.mlx.moe.fused_swiglu as fused_swiglu
+
+    monkeypatch.setattr(fused_swiglu, "_fallback_warned", False)
+    mx.random.seed(0)
+    in_dim, hidden, n_experts, top_k, B = 512, 64, 4, 4, 16  # 16*4 = 64 -> sorted
+    sw = _bf16_quantized_switch_glu(in_dim, hidden, n_experts)
+
+    x = mx.random.normal((B, in_dim)).astype(mx.float16)
+    indices = mx.random.randint(0, n_experts, shape=(B, top_k)).astype(mx.uint32)
+    out_ref = sw(x, indices)
+    mx.eval(out_ref)
+
+    mlp = types.SimpleNamespace(switch_mlp=sw, top_k=top_k)
+    layer = types.SimpleNamespace(mlp=mlp)
+    model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]))
+    assert fused_swiglu.patch_switch_glu_with_fused_swiglu(model) == 1
+
+    out_fb = sw(x, indices)
+    mx.eval(out_fb)
+    assert out_fb.shape == out_ref.shape
+    max_abs, rel = _max_rel_diff(out_ref, out_fb)
+    # Post fix the fallback runs the same MLX ops as the stock forward, so the
+    # bound only absorbs compiled vs eager elementwise ordering (~1 fp16 ULP).
+    assert bool(
+        mx.allclose(
+            out_fb.astype(mx.float32),
+            out_ref.astype(mx.float32),
+            rtol=2e-3,
+            atol=2e-4,
+        ).item()
+    ), f"sorted fallback != reference: max_abs={max_abs:.3e} rel={rel:.2%}"
+
+
+def test_unsorted_dtype_mismatch_fallback_matches_reference(monkeypatch):
+    """Sibling guard: same dtype mismatch on the unsorted path (B*T < 64)."""
+    import types
+
+    import sglang.srt.hardware_backend.mlx.moe.fused_swiglu as fused_swiglu
+
+    monkeypatch.setattr(fused_swiglu, "_fallback_warned", False)
+    mx.random.seed(0)
+    in_dim, hidden, n_experts, top_k, B = 512, 64, 4, 4, 2  # 2*4 = 8 < 64 -> unsorted
+    sw = _bf16_quantized_switch_glu(in_dim, hidden, n_experts)
+
+    x = mx.random.normal((B, in_dim)).astype(mx.float16)
+    indices = mx.random.randint(0, n_experts, shape=(B, top_k)).astype(mx.uint32)
+    out_ref = sw(x, indices)
+    mx.eval(out_ref)
+
+    mlp = types.SimpleNamespace(switch_mlp=sw, top_k=top_k)
+    layer = types.SimpleNamespace(mlp=mlp)
+    model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]))
+    assert fused_swiglu.patch_switch_glu_with_fused_swiglu(model) == 1
+
+    out_fb = sw(x, indices)
+    mx.eval(out_fb)
+    assert out_fb.shape == out_ref.shape
+    max_abs, rel = _max_rel_diff(out_ref, out_fb)
+    assert bool(
+        mx.allclose(
+            out_fb.astype(mx.float32),
+            out_ref.astype(mx.float32),
+            rtol=2e-3,
+            atol=2e-4,
+        ).item()
+    ), f"unsorted fallback != reference: max_abs={max_abs:.3e} rel={rel:.2%}"
+
+
+def test_forced_kernel_rejection_falls_back_correctly(monkeypatch):
+    """Any ValueError from the fused kernel, not just a dtype mismatch, must
+    take the identical fallback: force one via monkeypatch and check both
+    routing paths against the unpatched module."""
+    import types
+
+    import sglang.srt.hardware_backend.mlx.moe.fused_swiglu as fused_swiglu
+
+    monkeypatch.setattr(fused_swiglu, "_fallback_warned", False)
+    mx.random.seed(0)
+    in_dim, hidden, n_experts, top_k = 512, 64, 4, 4
+    sw = _quantized_switch_glu(in_dim, hidden, n_experts, gate_bias=False)
+
+    cases = []
+    # B=2 -> 8 < 64 -> unsorted; B=16 -> 64 -> sorted.
+    for B, label in [(2, "unsorted"), (16, "sorted")]:
+        x = mx.random.normal((B, in_dim))
+        indices = mx.random.randint(0, n_experts, shape=(B, top_k)).astype(mx.uint32)
+        out_ref = sw(x, indices)
+        mx.eval(out_ref)
+        cases.append((label, x, indices, out_ref))
+
+    mlp = types.SimpleNamespace(switch_mlp=sw, top_k=top_k)
+    layer = types.SimpleNamespace(mlp=mlp)
+    model = types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]))
+    # Patch before installing the raiser: _aot_warm_kernel dispatches the real
+    # kernel at patch time and does not catch ValueError.
+    assert fused_swiglu.patch_switch_glu_with_fused_swiglu(model) == 1
+
+    def raiser(*args, **kwargs):
+        raise ValueError("forced rejection")
+
+    monkeypatch.setattr(fused_swiglu, "fused_gate_qmv_silu_mul", raiser)
+
+    for label, x, indices, out_ref in cases:
+        out_fb = sw(x, indices)
+        mx.eval(out_fb)
+        assert out_fb.shape == out_ref.shape, label
+        max_abs, rel = _max_rel_diff(out_ref, out_fb)
+        assert bool(
+            mx.allclose(
+                out_fb.astype(mx.float32),
+                out_ref.astype(mx.float32),
+                rtol=1e-5,
+                atol=1e-6,
+            ).item()
+        ), f"forced rejection {label}: max_abs={max_abs:.3e} rel={rel:.2%}"

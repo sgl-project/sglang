@@ -430,12 +430,18 @@ def can_fuse(switch_mlp) -> bool:
 _fallback_warned = False
 
 
-def _fused_gate_or_fallback(gate_proj, x, gate_idx, x_up, sorted_indices=False):
+def _fused_gate_or_fallback(gate_proj, x, idx, x_up, sorted_indices=False):
     """silu(gate_qmv(x)) * x_up via the fused kernel; on ValueError fall back to
-    the unfused gather_qmm + silu*x_up. gather_qmm tolerates the activation dtype
-    the fused kernel rejects, which can_fuse cannot pre-check at patch time. Warns
+    the unfused gate projection. gather_qmm tolerates the activation dtype the
+    fused kernel rejects, which can_fuse cannot pre-check at patch time. Warns
     once.
     """
+    # Kernel layout only: the Metal kernel reads T from indices.shape[-1], and
+    # _gather_sort folded top_k into M_tok, so the sorted path needs an explicit
+    # T=1 axis. The fallback must not see it: gather_qmm broadcasts an (M_tok, 1)
+    # index against sorted x's (M_tok,) batch dim into an M_tok x M_tok cross
+    # product.
+    gate_idx = idx.reshape(-1, 1) if sorted_indices else idx
     gw = gate_proj["weight"]
     gs = gate_proj["scales"]
     gb = gate_proj.get("biases")
@@ -450,19 +456,9 @@ def _fused_gate_or_fallback(gate_proj, x, gate_idx, x_up, sorted_indices=False):
                 e,
             )
             _fallback_warned = True
-        x_gate = mx.gather_qmm(
-            x,
-            gw,
-            gs,
-            gb,
-            rhs_indices=gate_idx,
-            transpose=True,
-            group_size=_GROUP_SIZE,
-            bits=_BITS,
-            mode="affine",
-            sorted_indices=sorted_indices,
-        )
-        return nn.silu(x_gate) * x_up
+        # Reference expression by construction: the same projection call with
+        # the same flat idx up_proj/down_proj receive.
+        return nn.silu(gate_proj(x, idx, sorted_indices=sorted_indices)) * x_up
 
 
 class FusedSwitchSwiGLU(nn.Module):
@@ -497,16 +493,8 @@ class FusedSwitchSwiGLU(nn.Module):
 
         x_up = sw.up_proj(x, idx, sorted_indices=do_sort)
 
-        # Common (unsorted/decode) path first; x and x_up are already shaped for
-        # both, only the gate index differs.
-        if not do_sort:
-            gate_idx = idx
-        else:
-            # _gather_sort folded top_k into M_tok, so each row is a
-            # (token, expert) pair: reshape idx to (M_tok, 1) (TOPK=1).
-            gate_idx = idx.reshape(-1, 1)
         swiglu = _fused_gate_or_fallback(
-            sw.gate_proj, x, gate_idx, x_up, sorted_indices=do_sort
+            sw.gate_proj, x, idx, x_up, sorted_indices=do_sort
         )
 
         out = sw.down_proj(swiglu, idx, sorted_indices=do_sort)
