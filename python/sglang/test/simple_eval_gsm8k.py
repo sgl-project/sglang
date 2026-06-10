@@ -7,8 +7,8 @@ from typing import Optional
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
     ANSWER_PATTERN,
-    ChatCompletionSampler,
     HTML_JINJA,
+    ChatCompletionSampler,
     Eval,
     EvalResult,
     SamplerBase,
