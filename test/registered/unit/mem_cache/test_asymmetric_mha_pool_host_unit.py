@@ -67,6 +67,8 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         )
 
     def test_kernel_load_splits_k_and_v_with_separate_strides(self):
+        # Dispatch-only test: the CUDA kernel is mocked; this verifies that K and
+        # V are sent as separate single-buffer calls with their own byte strides.
         host = _make_host("page_first")
         device_pool = _make_device_pool(host)
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
@@ -96,6 +98,8 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         self.assertEqual(v_call.kwargs["src_layout_dim"], 72)
 
     def test_kernel_backup_splits_k_and_v_with_separate_strides(self):
+        # Dispatch-only test: D2H backup must pass separate K/V layer pointer
+        # tables so the single-buffer MLA kernel gets the correct stride per side.
         host = _make_host("page_first")
         device_pool = _make_device_pool(host)
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
@@ -121,6 +125,8 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         self.assertEqual(v_call.kwargs["dst_layout_dim"], 72)
 
     def test_direct_load_uses_single_buffer_calls_for_k_and_v(self):
+        # Direct copies infer single-buffer mode from one-element pointer lists.
+        # This test guards that asymmetric K/V never use the paired K/V form.
         host = _make_host("page_first_direct")
         device_pool = _make_device_pool(host)
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
@@ -150,6 +156,8 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         self.assertIs(v_call.kwargs["dst_ptrs"][0], device_pool.v_buffer[2])
 
     def test_direct_backup_uses_single_buffer_calls_for_k_and_v(self):
+        # Direct D2H similarly uses one destination buffer at a time, avoiding the
+        # paired-copy path that assumes K and V have the same element shape.
         host = _make_host("page_first_direct")
         device_pool = _make_device_pool(host)
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
