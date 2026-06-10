@@ -476,10 +476,22 @@ class Lfm2ForCausalLM(nn.Module):
             return config.hidden_size, _mlp_intermediate_size(config) * 2
         elif module_name == "down_proj":
             return _mlp_intermediate_size(config), config.hidden_size
+        elif module_name == "in_proj":
+            # ShortConv in_proj: hidden -> 3*hidden (B, C, x gates stacked)
+            return config.hidden_size, 3 * config.hidden_size
         else:
             raise NotImplementedError(
                 f"get_hidden_dim not implemented for {module_name}"
             )
+
+    def get_stacked_multiply(self, module_name: str) -> int:
+        if module_name == "in_proj":
+            # ShortConv in_proj packs 3 sub-projections (B, C, x); the
+            # adapter's single shared A is replicated 3x at load time.
+            return 3
+        from sglang.srt.lora.utils import get_stacked_multiply
+
+        return get_stacked_multiply(module_name)
 
     @torch.no_grad()
     def forward(

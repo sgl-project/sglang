@@ -535,6 +535,48 @@ class Lfm2MoeForCausalLM(nn.Module):
     def get_num_kv_cache_layers(self) -> int:
         return self.num_attention_layers
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """Return (input_dim, output_dim) of the module for LoRA buffer sizing."""
+        config = self.config
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        if module_name == "qkv_proj":
+            return config.hidden_size, head_dim * (
+                config.num_attention_heads + config.num_key_value_heads * 2
+            )
+        elif module_name == "out_proj":
+            # Both attention and ShortConv out_proj project back to hidden_size.
+            return head_dim * config.num_attention_heads, config.hidden_size
+        elif module_name == "gate_up_proj":
+            # Dense MLP layers (0..num_dense_layers-1)
+            return config.hidden_size, config.intermediate_size * 2
+        elif module_name == "down_proj":
+            return config.intermediate_size, config.hidden_size
+        elif module_name == "gate_up_proj_moe":
+            return config.hidden_size, config.moe_intermediate_size * 2
+        elif module_name == "down_proj_moe":
+            return config.moe_intermediate_size, config.hidden_size
+        elif module_name == "gate":
+            # MoE router
+            return config.hidden_size, config.num_experts
+        elif module_name == "in_proj":
+            # ShortConv in_proj: hidden -> 3*hidden (B, C, x gates stacked)
+            return config.hidden_size, 3 * config.hidden_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
+
+    def get_stacked_multiply(self, module_name: str) -> int:
+        if module_name == "in_proj":
+            # ShortConv in_proj packs 3 sub-projections (B, C, x); the
+            # adapter's single shared A is replicated 3x at load time.
+            return 3
+        from sglang.srt.lora.utils import get_stacked_multiply
+
+        return get_stacked_multiply(module_name)
+
     @torch.no_grad()
     def forward(
         self,
