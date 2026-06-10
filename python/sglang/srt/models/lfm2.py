@@ -19,12 +19,12 @@ from torch import nn
 
 from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -56,9 +56,7 @@ def _mlp_intermediate_size(config: Lfm2Config) -> int:
     if config.block_auto_adjust_ff_dim:
         intermediate_size = int(2 * intermediate_size / 3)
         if config.block_ffn_dim_multiplier is not None:
-            intermediate_size = int(
-                config.block_ffn_dim_multiplier * intermediate_size
-            )
+            intermediate_size = int(config.block_ffn_dim_multiplier * intermediate_size)
             intermediate_size = config.block_multiple_of * (
                 (intermediate_size + config.block_multiple_of - 1)
                 // config.block_multiple_of
