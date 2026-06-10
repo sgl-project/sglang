@@ -17,10 +17,14 @@
 //! `serving_chat.py`/`encode_messages`: an empty system message is inserted when
 //! the first message isn't a system message, and consecutive user turns are
 //! merged into one (joined with `\n\n`). Tools, tasks, and per-turn reasoning
-//! content are out of scope (a request carrying them still matches on its shared
-//! prefix; the divergence is confined to the trailing block).
+//! content are out of scope: the engine renders tools immediately after the
+//! system content at the front of the prompt, so a tools-carrying request
+//! diverges from the first block and routes by min-load; tasks alter only the
+//! trailing turn transition; reasoning content is never emitted in chat mode,
+//! so it causes no divergence.
 //!
-//! Tokenization does not auto-prepend special tokens (the tokenizer's default;
+//! Tokenization does not auto-prepend special tokens (the `dynamo_tokenizers`
+//! HF wrapper hardcodes `add_special_tokens = false`;
 //! [`super::adapter::encode`] adds none of its own), so the literal marker text
 //! below is what maps to the special token ids. Pinned byte-exact against the
 //! live engine's `/tokenize` (DeepSeek-V4-Flash, snapshot `6976c7ff`):

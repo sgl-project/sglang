@@ -47,8 +47,9 @@ from infra.model_pool import spawn_worker
 from infra.model_specs import get_model_spec
 
 # Disjoint prefixes — share no common content. Under the chat template both
-# render with the same leading role header (BOS + ``<|im_start|>user`` ...), so
-# the first block(s) may hash identically; the disjoint content then diverges
+# render with the same leading role header (``<|im_start|>user`` ...; Qwen3 has
+# no BOS token), so the first block(s) may hash identically; the disjoint
+# content then diverges
 # well within the matched region, making each worker's HashTree contribution
 # uniquely identifying.
 #
@@ -131,7 +132,7 @@ def _direct_warm(worker_url: str, model_id: str, prefix: str) -> None:
 
     Token alignment with the router — the workers run with the model's
     real chat template (no override), so the engine caches blocks keyed
-    on chat-templated tokens (BOS + role markers + generation prompt).
+    on chat-templated tokens (role markers + content + generation prompt).
     ``cache_aware_zmq`` mirrors this: for a chat request on a model that
     ships a chat template, it renders the same template and tokenizes the
     result before hashing, so warm and route hash the same blocks.
@@ -190,8 +191,8 @@ def test_two_routers_route_by_prefix_content(
     # Workers run with the model's REAL chat template (no override): the engine
     # caches chat-templated tokens, and the router renders the same template
     # (loaded from the model's tokenizer_config.json) before hashing. This
-    # exercises the production chat-template tokenization path — the fix that
-    # aligns router query hashes with the engine's templated blocks.
+    # exercises the production chat-template tokenization path, which aligns
+    # router query hashes with the engine's templated blocks.
     try:
         with (
             spawn_worker(

@@ -14,18 +14,39 @@
 //! `tokenizer_config.json` — the HuggingFace built-in template, which is what
 //! the engine uses unless launched with an explicit chat-template override.
 //!
-//! Tokenization does not auto-prepend special tokens (the tokenizer's default;
-//! [`super::adapter::encode`] adds none of its own), so the rendered text must
-//! already contain `bos_token` and the role markers as literal text. That
-//! matches HuggingFace `apply_chat_template(tokenize=True)` semantics, where the
-//! template — not the tokenizer's special-token insertion — is the single source
-//! of the leading specials.
+//! Tokenization does not auto-prepend special tokens (the `dynamo_tokenizers`
+//! HF wrapper hardcodes `add_special_tokens = false`; [`super::adapter::encode`]
+//! adds none of its own), so the rendered text must already contain `bos_token`
+//! and the role markers as literal text. That matches HuggingFace
+//! `apply_chat_template(tokenize=True)` semantics, where the template — not the
+//! tokenizer's special-token insertion — is the single source of the leading
+//! specials.
 
 use anyhow::{Context, Result};
-use minijinja::{context, Environment, Error as JinjaError, ErrorKind as JinjaErrorKind};
+use minijinja::{
+    value::Value as JinjaValue, Environment, Error as JinjaError, ErrorKind as JinjaErrorKind,
+    UndefinedBehavior,
+};
+use std::collections::BTreeMap;
 
 /// Template registered under a fixed name in the per-model environment.
 const TEMPLATE_NAME: &str = "chat";
+
+/// The named special tokens HuggingFace injects into the template context via
+/// `special_tokens_map`. Each is supplied from `tokenizer_config.json`, or as
+/// the empty string when absent — jinja2 renders an undefined name as `""`, so
+/// an absent token must not surface as anything else (minijinja would otherwise
+/// print a `none` value as the literal string "none", silently diverging every
+/// block hash from the engine's).
+const SPECIAL_TOKEN_KEYS: [&str; 7] = [
+    "bos_token",
+    "eos_token",
+    "unk_token",
+    "sep_token",
+    "pad_token",
+    "cls_token",
+    "mask_token",
+];
 
 /// A compiled chat template plus the special-token strings it references.
 ///
@@ -33,15 +54,14 @@ const TEMPLATE_NAME: &str = "chat";
 /// in the [`super::TokenizerRegistry`]. Rendering is read-only and thread-safe.
 pub struct ChatTemplate {
     env: Environment<'static>,
-    bos_token: Option<String>,
-    eos_token: Option<String>,
+    /// `(name, token)` pairs for [`SPECIAL_TOKEN_KEYS`]; absent tokens are `""`.
+    special_tokens: Vec<(&'static str, String)>,
 }
 
 impl std::fmt::Debug for ChatTemplate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatTemplate")
-            .field("bos_token", &self.bos_token)
-            .field("eos_token", &self.eos_token)
+            .field("special_tokens", &self.special_tokens)
             .finish()
     }
 }
@@ -54,14 +74,24 @@ impl ChatTemplate {
         let Some(template_src) = extract_chat_template(cfg) else {
             return Ok(None);
         };
-        let bos_token = extract_token_str(cfg, "bos_token");
-        let eos_token = extract_token_str(cfg, "eos_token");
+        let special_tokens = SPECIAL_TOKEN_KEYS
+            .iter()
+            .map(|&key| (key, extract_token_str(cfg, key).unwrap_or_default()))
+            .collect();
 
         let mut env = Environment::new();
         // HuggingFace compiles chat templates with trim_blocks + lstrip_blocks;
         // mirror that or rendered whitespace (and thus tokens) diverge.
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
+        // Printing a variable the router didn't supply (a custom
+        // `chat_template_kwargs` entry, a date var, ...) must be a render
+        // error so the caller falls back to raw-text hashing — under the
+        // default lenient behavior it would render as `""` and produce a
+        // plausible-but-divergent prompt whose hashes silently never match
+        // the engine's. If-tests and iteration over undefined stay permitted
+        // (`{% if enable_thinking is defined %}`-style guards are common).
+        env.set_undefined_behavior(UndefinedBehavior::SemiStrict);
         // Python str/dict methods used by real templates (.startswith, .items,
         // .strip, ...) that minijinja doesn't implement natively.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -72,8 +102,7 @@ impl ChatTemplate {
 
         Ok(Some(Self {
             env,
-            bos_token,
-            eos_token,
+            special_tokens,
         }))
     }
 
@@ -81,27 +110,31 @@ impl ChatTemplate {
     /// the engine would tokenize, with `add_generation_prompt = true`.
     ///
     /// `messages` is passed through as-is; templates expect string `content`.
-    /// Multimodal content arrays are out of scope (text-only routing): depending
-    /// on the template they either render incorrectly or surface as a render
-    /// error — either way the caller falls back to the raw prompt-text path.
+    /// Multimodal content arrays are out of scope (text-only routing): a
+    /// template may stringify the array (divergent hashes → min-load) or error
+    /// (raw prompt-text fallback); neither fails the request.
     ///
-    /// Request-level template inputs beyond `messages` (`tools`, `documents`,
-    /// ...) are not threaded through: a request carrying them renders without
-    /// them, so its hashes won't match the engine and it routes by min-load —
-    /// no worse than before this path existed. Plain chat routes by templated
-    /// prefix.
+    /// `tools` and `documents` are supplied as `none` — the context HuggingFace
+    /// renders with when a request carries neither, so tools-branching
+    /// templates take the no-tools path. A request that does carry them renders
+    /// the no-tools form, so its hashes won't match the engine and it routes by
+    /// min-load — no worse than before this path existed. Any other variable
+    /// the template prints is a render error (semi-strict undefined), falling
+    /// back to raw rather than hashing a silently divergent prompt.
     pub fn render(&self, messages: &serde_json::Value) -> Result<String> {
         let tmpl = self
             .env
             .get_template(TEMPLATE_NAME)
             .context("chat template not registered")?;
-        tmpl.render(context! {
-            messages => messages,
-            add_generation_prompt => true,
-            bos_token => self.bos_token,
-            eos_token => self.eos_token,
-        })
-        .context("render chat template")
+        let mut ctx: BTreeMap<&str, JinjaValue> = BTreeMap::new();
+        ctx.insert("messages", JinjaValue::from_serialize(messages));
+        ctx.insert("add_generation_prompt", JinjaValue::from(true));
+        ctx.insert("tools", JinjaValue::from(()));
+        ctx.insert("documents", JinjaValue::from(()));
+        for (name, token) in &self.special_tokens {
+            ctx.insert(name, JinjaValue::from(token.clone()));
+        }
+        tmpl.render(ctx).context("render chat template")
     }
 }
 
@@ -253,6 +286,66 @@ mod tests {
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
         assert_eq!(tmpl.render(&messages()).unwrap(), "BE BRIEF");
+    }
+
+    /// An absent special token renders as `""` exactly like an undefined name
+    /// under HuggingFace's jinja2 — never as minijinja's literal `"none"`,
+    /// which would corrupt block 0 (and thus every chained block hash).
+    #[test]
+    fn absent_special_tokens_render_empty() {
+        let cfg = json!({"chat_template": "A{{ bos_token }}{{ pad_token }}B"});
+        let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
+        assert_eq!(tmpl.render(&json!([])).unwrap(), "AB");
+    }
+
+    /// Every name in HuggingFace's `special_tokens_map` is threaded from
+    /// `tokenizer_config.json`, not just `bos_token`/`eos_token`.
+    #[test]
+    fn named_special_tokens_from_config_are_supplied() {
+        let cfg = json!({
+            "chat_template": "{{ pad_token }}|{{ unk_token }}",
+            "pad_token": "<pad>",
+            "unk_token": {"content": "<unk>"},
+        });
+        let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
+        assert_eq!(tmpl.render(&json!([])).unwrap(), "<pad>|<unk>");
+    }
+
+    /// Printing a variable the router doesn't supply is a render error
+    /// (semi-strict undefined) so the caller falls back to raw-text hashing,
+    /// instead of rendering a plausible-but-divergent prompt.
+    #[test]
+    fn printing_unsupplied_variable_fails_render() {
+        let cfg = json!({
+            "chat_template": "{{ custom_kwarg }}",
+            "bos_token": "<s>",
+        });
+        let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
+        tmpl.render(&messages()).unwrap_err();
+    }
+
+    /// Undefined names stay usable in if-tests (semi-strict only rejects
+    /// printing them); common `{% if enable_thinking is defined %}`-style
+    /// guards must keep rendering.
+    #[test]
+    fn undefined_in_if_test_is_permitted() {
+        let cfg = json!({
+            "chat_template": "{% if enable_thinking is defined and enable_thinking %}T{% endif %}X",
+        });
+        let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
+        assert_eq!(tmpl.render(&messages()).unwrap(), "X");
+    }
+
+    /// `tools` is `none` in the render context — the same context HuggingFace
+    /// renders with for a request that carries no tools — so tools-branching
+    /// templates take the no-tools path instead of erroring or mis-branching.
+    #[test]
+    fn tools_supplied_as_none_takes_no_tools_branch() {
+        let cfg = json!({
+            "chat_template": "{% if tools is not none %}TOOLS{% endif %}X",
+        });
+        let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
+        assert_eq!(tmpl.render(&messages()).unwrap(), "X");
     }
 
     /// trim_blocks + lstrip_blocks match HuggingFace's compilation: the newline

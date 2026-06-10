@@ -749,8 +749,9 @@ mod tests {
     /// the **chat-templated** tokens (BOS + role markers + content) — the tokens
     /// the engine actually cached — not by the raw joined content. Worker w0
     /// published its blocks under the templated tokens; only a router that
-    /// renders the same template hashes a matching query. This is the fix that
-    /// takes live `overlap_blocks_sum` from 0 to non-zero for chat traffic.
+    /// renders the same template hashes a matching query. Hashing the raw
+    /// content instead would match nothing, leaving live `overlap_blocks_sum`
+    /// at 0 for chat traffic.
     #[test]
     fn chat_request_routes_by_templated_tokens() {
         let registry = tokenizer_registry_with_tiny();
@@ -804,10 +805,10 @@ mod tests {
         );
     }
 
-    /// Pre-fix behavior would hash the raw joined content; that misses the
-    /// engine's templated blocks. Confirm the two hashings genuinely differ so
-    /// the chat-template path is doing real work (a no-op template would make
-    /// this assertion fail).
+    /// Templated and raw-content hashings must genuinely differ, confirming
+    /// the chat-template path does real work (a no-op template would make this
+    /// assertion fail, and raw-content hashes would miss the engine's
+    /// templated blocks).
     #[test]
     fn chat_templated_hashes_differ_from_raw_content_hashes() {
         let registry = tokenizer_registry_with_tiny();

@@ -9,6 +9,7 @@ use anyhow::Result;
 use chat_template::ChatTemplate;
 use dashmap::DashMap;
 use dynamo_tokenizers::Tokenizer;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// How to turn a chat request's `messages` into the prompt the engine tokenizes
@@ -33,6 +34,37 @@ impl ChatEncoder {
     }
 }
 
+/// A model's chat encoder plus its fallback-logging state.
+struct ChatEncoderEntry {
+    encoder: ChatEncoder,
+    fallback_warned: AtomicBool,
+}
+
+impl ChatEncoderEntry {
+    fn new(encoder: ChatEncoder) -> Self {
+        Self {
+            encoder,
+            fallback_warned: AtomicBool::new(false),
+        }
+    }
+
+    /// Log a per-request fallback to raw prompt-text hashing. "Enabled but
+    /// failing every request" must be distinguishable from "healthy" at the
+    /// default (info) log level — otherwise cache-aware overlap silently
+    /// degrades to 0 with no signal — so the first failure for a model logs at
+    /// warn; subsequent ones at debug to avoid a per-request log flood.
+    fn log_fallback(&self, model_id: &str, cause: &str) {
+        if !self.fallback_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(model = %model_id, %cause,
+                "chat-encoder failed; falling back to raw prompt-text hashing \
+                 (cache-aware overlap degrades for this model; further failures log at debug)");
+        } else {
+            tracing::debug!(model = %model_id, %cause,
+                "chat-encoder failed; falling back to raw prompt-text hashing");
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct TokenizerRegistry {
     inner: DashMap<String, Arc<Tokenizer>>,
@@ -41,7 +73,7 @@ pub struct TokenizerRegistry {
     /// like DeepSeek-V4's). Cache-aware routing uses it to tokenize chat
     /// requests the way the engine does; models without one fall back to raw
     /// prompt-text tokenization.
-    encoders: DashMap<String, Arc<ChatEncoder>>,
+    encoders: DashMap<String, Arc<ChatEncoderEntry>>,
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -66,7 +98,8 @@ impl TokenizerRegistry {
         // routing degraded to overlap=0 on chat traffic", so it must never be
         // silent.
         if let Some(encoder) = me.resolve_chat_encoder(&m.id, &m.tokenizer_path) {
-            me.encoders.insert(m.id.clone(), Arc::new(encoder));
+            me.encoders
+                .insert(m.id.clone(), Arc::new(ChatEncoderEntry::new(encoder)));
         }
         Ok(me)
     }
@@ -112,28 +145,30 @@ impl TokenizerRegistry {
     /// result the same way the engine does (`add_special_tokens = false`, so the
     /// encoder's literal `bos_token`/role markers carry the specials). Returns
     /// `None` — caller falls back to raw routing — when the model has no
-    /// encoder, no tokenizer, or rendering/encoding produced no tokens.
+    /// encoder, no tokenizer, or rendering/encoding fails or yields no tokens.
     pub fn encode_chat(&self, model_id: &str, messages: &serde_json::Value) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
-        let encoder = Arc::clone(&*self.encoders.get(model_id)?);
+        let entry = Arc::clone(&*self.encoders.get(model_id)?);
         let tokenizer = self.get(model_id)?;
-        let rendered = encoder
+        let rendered = entry
+            .encoder
             .render(messages)
             .inspect_err(|e| {
-                // `?e` prints the full anyhow chain, so the underlying minijinja
-                // cause (e.g. a `raise_exception` message) is visible, not just
-                // the "render chat template" context.
-                tracing::debug!(model = %model_id, error = ?e,
-                    "chat-encoder render failed; falling back to raw prompt text")
+                // `{e:#}` prints the full anyhow chain, so the underlying
+                // minijinja cause (e.g. a `raise_exception` message) is
+                // visible, not just the "render chat template" context.
+                entry.log_fallback(model_id, &format!("render failed: {e:#}"))
             })
             .ok()?;
         match adapter::encode(&tokenizer, &rendered) {
             Ok(ids) if !ids.is_empty() => Some(ids),
-            Ok(_) => None,
+            Ok(_) => {
+                entry.log_fallback(model_id, "rendered prompt tokenized to zero tokens");
+                None
+            }
             Err(e) => {
-                tracing::debug!(model = %model_id, error = %e,
-                    "chat-encoder tokenize failed; falling back to raw prompt text");
+                entry.log_fallback(model_id, &format!("tokenize failed: {e:#}"));
                 None
             }
         }
@@ -148,8 +183,10 @@ impl TokenizerRegistry {
     /// fixture.
     #[cfg(test)]
     pub(crate) fn attach_chat_encoder_for_test(&self, model_id: &str, encoder: ChatEncoder) {
-        self.encoders
-            .insert(model_id.to_string(), Arc::new(encoder));
+        self.encoders.insert(
+            model_id.to_string(),
+            Arc::new(ChatEncoderEntry::new(encoder)),
+        );
     }
 
     /// Convenience: attach a Jinja chat encoder built from an inline
@@ -388,7 +425,13 @@ mod tests {
         );
 
         // encode_chat is exactly tokenize(render(messages)).
-        let rendered = reg.encoders.get("tiny").unwrap().render(&messages).unwrap();
+        let rendered = reg
+            .encoders
+            .get("tiny")
+            .unwrap()
+            .encoder
+            .render(&messages)
+            .unwrap();
         assert_eq!(chat_ids, adapter::encode(&tok, &rendered).unwrap());
     }
 
