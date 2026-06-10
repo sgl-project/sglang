@@ -8,10 +8,6 @@ Registry: nightly-amd-8-gpu-mi35x-glm51 suite
 
 import ast
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -165,7 +161,7 @@ class TestGLM51EvalMI35x(unittest.TestCase):
     def setUpClass(cls):
         cls.models = MI35X_GLM51_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_glm51_accuracy(self):
         all_results = []

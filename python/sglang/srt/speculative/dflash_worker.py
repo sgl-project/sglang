@@ -29,7 +29,10 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_npu
+
+_is_npu = is_npu()
+
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +101,7 @@ class DFlashWorker:
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
-        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton")
+        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
@@ -646,9 +649,6 @@ class DFlashWorker:
                 seq_lens_sum=seq_lens_sum,
                 seq_lens_cpu=seq_lens_cpu,
                 positions=positions,
-                req_to_token_pool=self.draft_model_runner.req_to_token_pool,
-                token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
-                attn_backend=self.draft_model_runner.attn_backend,
                 input_embeds=input_embeds,
                 spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=draft_spec_info,
@@ -1019,9 +1019,12 @@ class DFlashWorker:
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
-            k, v = attn.kv_proj_only(ctx_hidden)
-            k = attn.apply_k_norm(k)
-            k = attn.apply_k_rope(ctx_positions, k)
+            if _is_npu:
+                _, k, v = attn.forward_prepare_npu(ctx_positions, ctx_hidden)
+            else:
+                k, v = attn.kv_proj_only(ctx_hidden)
+                k = attn.apply_k_norm(k)
+                k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(

@@ -339,15 +339,24 @@ def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
             return local_component_path
 
         config["quantization_config"] = normalized_quant_config
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2, sort_keys=True)
-            f.write("\n")
-        logger.warning(
-            "Patched legacy flat ModelOpt quantization_config at %s with quant_type=%s "
-            "for diffusers compatibility.",
-            config_path,
-            normalized_quant_config.get("quant_type"),
-        )
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, sort_keys=True)
+                f.write("\n")
+        except OSError as exc:
+            logger.warning(
+                "Could not persist normalized ModelOpt config at %s (%s); "
+                "normalization will be applied in memory at load time.",
+                config_path,
+                exc,
+            )
+        else:
+            logger.warning(
+                "Patched legacy flat ModelOpt quantization_config at %s with quant_type=%s "
+                "for diffusers compatibility.",
+                config_path,
+                normalized_quant_config.get("quant_type"),
+            )
 
     return local_component_path
 
@@ -373,6 +382,12 @@ def get_diffusers_component_config(
     combined_config = reduce(
         lambda acc, path: acc | load_dict(path), config_file_paths, {}
     )
+
+    quant_config = combined_config.get("quantization_config")
+    if quant_config is not None:
+        combined_config["quantization_config"] = normalize_flat_modelopt_quant_config(
+            quant_config
+        )
 
     _clean_hf_config_inplace(combined_config)
 

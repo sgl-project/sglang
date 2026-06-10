@@ -60,6 +60,13 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         use_thumbnail: bool = True,
         **kwargs,
     ):
+        # Round-trip: `to_dict()` emits `raw_vision_config` (V2's storage
+        # name) but `from_dict()` rebuilds via this `vision_config` kwarg.
+        # Without this alias, the V3->V2 alias rebuild in `get_config` loses
+        # the vision config across the round-trip.
+        if vision_config is None:
+            vision_config = kwargs.pop("raw_vision_config", None)
+
         super().__init__(**kwargs)
 
         # Handle both cases: when loading from JSON (llm_config is dict) and when called internally by transformers (llm_config; vision_config are None)

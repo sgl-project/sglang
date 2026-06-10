@@ -110,12 +110,10 @@ class MockReqToTokenPool:
 
 
 # Test correctness of triton kernel for computing kv indices
-def check_kv_indices(forward_batch):
+def check_kv_indices(forward_batch, req_to_token_pool):
     for i in range(forward_batch.num_prefix_chunks):
         computed_kv_indices = forward_batch.prefix_chunk_kv_indices[i]
-        req_to_token = forward_batch.req_to_token_pool.req_to_token[
-            : forward_batch.batch_size, :
-        ]
+        req_to_token = req_to_token_pool.req_to_token[: forward_batch.batch_size, :]
         ref_kv_indices = torch.empty(
             forward_batch.prefix_chunk_num_tokens[i],
             dtype=torch.int32,
@@ -205,8 +203,20 @@ class TestPrefixChunkInfo(CustomTestCase):
                 extend_prefix_lens=prefix_lens,
                 extend_prefix_lens_cpu=prefix_lens_cpu,
             )
-            forward_batch.req_to_token_pool = self.req_to_token_pool
-            forward_batch.token_to_kv_pool = self.token_to_kv_pool
+            # Pool refs are resolved via the active ForwardContext; mock an
+            # attn_backend that carries the pools (Pattern A invariant).
+            from types import SimpleNamespace
+
+            from sglang.srt.model_executor.forward_context import (
+                ForwardContext,
+                set_forward_context,
+            )
+
+            mock_backend = SimpleNamespace(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+            )
+            set_forward_context(ForwardContext(attn_backend=mock_backend))
 
             forward_batch.prepare_chunked_prefix_cache_info(self.device)
             assert forward_batch.get_max_chunk_capacity() == max_chunk_capacity
@@ -221,7 +231,7 @@ class TestPrefixChunkInfo(CustomTestCase):
                 test_case["prefix_chunk_seq_lens"].to(self.device),
             )
 
-            check_kv_indices(forward_batch)
+            check_kv_indices(forward_batch, self.req_to_token_pool)
 
 
 if __name__ == "__main__":

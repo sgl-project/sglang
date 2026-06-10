@@ -48,11 +48,14 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
-    maybe_detect_nan,
-    maybe_detect_oob,
     record_stream_each,
     record_stream_for_v2_verify,
     select_top_k_tokens,
+)
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
 
@@ -103,6 +106,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
+            "multi-layer EAGLE requires speculative_num_draft_tokens == "
+            "speculative_num_steps + 1, "
+            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+        )
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -380,11 +388,20 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # The draft embed clamps unconditionally (to tolerate multimodal pad
+        # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
+        # would be clamped away instead of surfacing.
+        maybe_detect_oob(
+            next_token_ids,
+            0,
+            self.model_config.vocab_size,
+            "draft_extend_for_prefill: next_token_ids before draft embed",
+        )
+
         # Construct spec_info
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
             bonus_tokens=next_token_ids,
-            new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
@@ -408,6 +425,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner_list[0])
 
         # Construct input_ids
+        # TODO: same chunked-prefill chain divergence as PR #26329.
         if not batch.forward_mode.is_idle():
             rotate_input_ids_triton(
                 forward_batch.input_ids,
@@ -419,13 +437,14 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
-            forward_batch.req_to_token_pool = self.draft_runner_list[
-                step
-            ].req_to_token_pool
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
             )
             maybe_detect_nan(
+                output.logits_output.next_token_logits,
+                f"draft_extend_for_prefill step {step}",
+            )
+            maybe_detect_inf(
                 output.logits_output.next_token_logits,
                 f"draft_extend_for_prefill step {step}",
             )
@@ -512,6 +531,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 + batch_result.accept_lens
                 - 1
             )
+            # NOTE: this non-graph path runs the per-step forwards without any
+            # pre-plan (see warning above). Mark the batch so the forward path
+            # keeps skipping metadata init — preserves the pre-existing
+            # behavior; the latent issue is tracked by the warning.
+            forward_batch.mark_forward_metadata_ready()
 
         for step in range(self.speculative_num_steps):
             # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
@@ -526,11 +550,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
-                forward_batch.req_to_token_pool = self.draft_runner_list[
-                    step
-                ].req_to_token_pool
+                # Skip relies on the unconditional mark above (pre-existing
+                # no-pre-plan behavior preserved verbatim).
                 draft_logits_output = self.draft_runner_list[step].forward(
-                    forward_batch, skip_attn_backend_init=True
+                    forward_batch
                 )
                 probs = torch.softmax(
                     draft_logits_output.logits_output.next_token_logits[select_index],
@@ -665,11 +688,18 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         return self._draft_worker
 
+    @property
+    def spec_v2_attn_backends(self) -> tuple:
+        return (
+            self._target_worker.model_runner.attn_backend,
+            *self._draft_worker.draft_extend_attn_backend_list,
+        )
+
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch):
+    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -679,6 +709,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             )
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
+
+            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+            # Extend processed L prompt tokens; next verify iter expects same L.
+            batch_output.new_seq_lens = batch.seq_lens
+            # Publish before draft_extend so the fence is at target-end.
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
 
             # Chain-style MTP needs FULL to get all-token hidden states;
             # non-chain only needs LAST (the target model's hidden states).
@@ -704,12 +741,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 )
             verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
-            # Record a CUDA event after draft() GPU work is dispatched.
-            if self.plan_stream:
-                self._draft_done_event = torch.get_device_module(self.device).Event()
-                self._draft_done_event.record()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
+            # Publish before draft_extend so the fence is at verify-end.
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
             self.draft_worker._draft_extend_for_decode(batch, batch_output)
             return batch_output
 
@@ -726,10 +762,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            # Wait for the draft CUDA graph to finish before plan_stream
-            # begins its work.
-            if self.plan_stream and hasattr(self, "_draft_done_event"):
-                self.plan_stream.wait_event(self._draft_done_event)
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
@@ -758,34 +790,38 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     else None
                 ),
             )
+        # NOTE: metadata init is skipped here unconditionally, although
+        # prepare_for_v2_verify only plans when cuda-graph replay_prepare ran.
+        # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
+        # worker has not adopted that fix, so preserve its behavior verbatim.
+        verify_forward_batch.mark_forward_metadata_ready()
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
         )
         logits_output = forward_batch_output.logits_output
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_lens,
             accept_index,
         ) = verify_input.sample(batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_lens
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+            # stride = accept_tokens per-req width = accept_index.shape[1].
             fill_bonus_tokens[(bs,)](
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,
-                self.speculative_num_draft_tokens,
+                accept_index.shape[1],
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
@@ -795,11 +831,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        next_draft_input = EagleDraftInput(
-            bonus_tokens=bonus_tokens,
-            new_seq_lens=new_seq_lens,
-            verify_done=verify_done,
-        )
+        next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
         # verify_forward_batch transitively holds verify-time GPU tensors that
         # must outlive the imminent batch.input_ids rebind; scheduler pins it
         # in batch_record_buf via extra_keep_alive_refs. See EAGLEWorkerV2.verify.
@@ -810,6 +842,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
+            new_seq_lens=new_seq_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
