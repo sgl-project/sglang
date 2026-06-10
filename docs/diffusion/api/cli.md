@@ -83,8 +83,37 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--attention-backend {BACKEND}`: attention backend for native SGLang pipelines
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
-- `--acceleration-config {CONFIG}`: experimental diffusion acceleration policy. cuDNN SDPA auto mode and warmup-time dense LocalAttention autotune are enabled by default on eligible CUDA fp16/bf16 inference paths. With `--enable-torch-compile`, DiT forward uses warmup-time eager-vs-compiled autotune by default and warmup is enabled automatically unless explicitly disabled; real-request cache misses fall back to eager unless `torch_compile_live_miss=true` is set. Kernel-wise fused-vs-compiled autotune is available through `kernel_compile_ops=...`, but no custom op is enabled by default until a full-model e2e win is validated for that op family.
+- `--acceleration-config {CONFIG}`: experimental diffusion acceleration policy. Accepts a JSON/YAML path, a JSON string, or comma-separated `key=value` pairs. See [Acceleration Config](#acceleration-config).
 - `--warmup-steps {N}`: number of denoising steps used by warmup requests. The default is `2` so default server warmup also warms the steady-state denoiser path; set `--warmup-steps 1` explicitly for the previous shorter startup behavior.
+
+#### Acceleration Config
+
+`--acceleration-config` controls runtime backend selection for attention, full DiT `torch.compile`, and opt-in kernel-wise `CustomOp` autotune. Default behavior is conservative on the request path: warmup may benchmark eligible choices, but real-request cache misses fall back to the existing implementation unless the corresponding `*_live_miss=true` key is set.
+
+Examples:
+
+```bash
+# Disable attention autotune while keeping other defaults.
+--acceleration-config attention_autotune=false
+
+# Force full DiT eager mode even when --enable-torch-compile is set.
+--acceleration-config torch_compile_policy=force_eager
+
+# Opt in kernel-wise compile autotune for activation and rotary CustomOps.
+--acceleration-config kernel_compile_policy=auto,kernel_compile_ops=activation,rotary
+```
+
+Key groups:
+
+- Attention: `allow_cudnn_sdp=true|false`, `attention_autotune=true|false`, `attention_autotune_min_speedup=1.03`, `attention_autotune_live_miss=true|false`. cuDNN SDPA and warmup-time dense `LocalAttention` autotune are enabled by default on eligible CUDA fp16/bf16 paths.
+- Full DiT compile: `torch_compile_policy=auto|force_compile|force_eager|off`, `torch_compile_warmup=1`, `torch_compile_iters=3`, `torch_compile_min_speedup=1.05`, `torch_compile_live_miss=true|false`. This is active when `--enable-torch-compile` is set; default live misses fall back to eager.
+- Kernel-wise `CustomOp` compile: `kernel_compile_policy=auto|force_torch_compile|force_fused`, `kernel_compile_ops={OPS}`, `kernel_compile_warmup=3`, `kernel_compile_iters=10`, `kernel_compile_min_speedup=1.03`, `kernel_compile_live_miss=true|false`. No custom op is enabled by default until a full-model e2e win is validated.
+
+`kernel_compile_ops` accepts exact op names, class names, or groups:
+
+- Groups: `activation`, `rotary`, `elementwise`, `norm`, `scale_shift`, `fused_gate`, `all`.
+- Activation ops: `gelu_and_mul`, `silu_and_mul`, `gelu_new`, `quick_gelu`.
+- Other common ops: `rotary_embedding`, `mul_add`, `layer_norm`, `rms_norm`, `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidualLayerNormScaleShift`, `ScaleResidualRMSNormScaleShift`, `LayerNormTanhMulAdd`, `RMSNormTanhMulAdd`.
 
 ### Sampling and output
 

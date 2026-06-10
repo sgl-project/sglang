@@ -15,7 +15,12 @@ from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
     KERNEL_COMPILE_OPS_ENV,
     KERNEL_COMPILE_POLICY_ENV,
 )
-from sglang.multimodal_gen.runtime.layers.activation import GeluAndMul, SiluAndMul
+from sglang.multimodal_gen.runtime.layers.activation import (
+    GeluAndMul,
+    NewGELU,
+    QuickGELU,
+    SiluAndMul,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionImpl,
     FlashAttentionMetadata,
@@ -291,7 +296,7 @@ def bench_rotary_embedding(args: argparse.Namespace) -> None:
 
 def bench_activation_kernels(args: argparse.Namespace) -> None:
     dtype = _dtype(args.dtype)
-    x = torch.randn(
+    x_pair = torch.randn(
         args.batch, args.seq, args.hidden * 2, device="cuda", dtype=dtype
     )
     for cls, name, op_name in (
@@ -303,15 +308,28 @@ def bench_activation_kernels(args: argparse.Namespace) -> None:
             name,
             op_name,
             cls,
-            lambda op: op(x),
+            lambda op: op(x_pair),
         )
     _bench_kernel_op(
         args,
         "gelu_and_mul_tanh",
         "gelu_and_mul",
         lambda: GeluAndMul(approximate="tanh"),
-        lambda op: op(x),
+        lambda op: op(x_pair),
     )
+
+    x = torch.randn(args.batch, args.seq, args.hidden, device="cuda", dtype=dtype)
+    for cls, name, op_name in (
+        (NewGELU, "gelu_new", "gelu_new"),
+        (QuickGELU, "quick_gelu", "quick_gelu"),
+    ):
+        _bench_kernel_op(
+            args,
+            name,
+            op_name,
+            cls,
+            lambda op: op(x),
+        )
 
 
 def bench_plain_norm(args: argparse.Namespace) -> None:
@@ -325,7 +343,7 @@ def bench_plain_norm(args: argparse.Namespace) -> None:
             args,
             name,
             op_name,
-            lambda cls=cls: cls(args.hidden, dtype=dtype),
+            lambda cls=cls: cls(args.hidden, dtype=dtype).to(dtype=dtype),
             lambda op: op(x),
         )
 

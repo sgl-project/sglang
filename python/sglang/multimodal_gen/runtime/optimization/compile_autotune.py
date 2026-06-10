@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Warmup-time torch.compile autotune for whole diffusion modules.
+
+The controller benchmarks eager and compiled module forwards on warmup requests,
+commits the selected callable for steady-state execution, and avoids live
+compilation on real request cache misses unless explicitly enabled.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +23,10 @@ from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
+)
+from sglang.multimodal_gen.runtime.optimization.tensor_keys import (
+    value_key,
+    value_summary,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -207,14 +217,15 @@ class _TorchCompileAutotuner:
             self._module_name,
             torch.is_grad_enabled(),
             torch.is_inference_mode_enabled(),
-            tuple(_value_key(arg) for arg in args),
-            tuple((key, _value_key(value)) for key, value in sorted(kwargs.items())),
+            tuple(value_key(arg) for arg in args),
+            tuple((key, value_key(value)) for key, value in sorted(kwargs.items())),
         )
 
     def _shape_summary(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
-        values = [_value_summary(arg) for arg in args]
+        values = [value_summary(arg) for arg in args]
         values.extend(
-            f"{key}={_value_summary(value)}" for key, value in sorted(kwargs.items())
+            f"{key}={value_summary(value)}"
+            for key, value in sorted(kwargs.items())
         )
         values = [value for value in values if value]
         return ", ".join(values[:8])
@@ -245,62 +256,3 @@ def install_torch_compile_autotune(
     autotuned_forward._sglang_torch_compile_autotune = controller
     module.forward = autotuned_forward
     return True
-
-
-def _value_key(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return _tensor_key(value)
-    if isinstance(value, (str, int, float, bool, type(None))):
-        return value
-    if isinstance(value, torch.dtype):
-        return str(value)
-    if isinstance(value, (list, tuple)):
-        return (type(value).__name__, tuple(_value_key(item) for item in value))
-    if isinstance(value, Mapping):
-        return (
-            "mapping",
-            tuple(
-                (str(key), _value_key(item))
-                for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))
-            ),
-        )
-    return ("object", type(value).__module__, type(value).__qualname__)
-
-
-def _tensor_key(tensor: torch.Tensor) -> tuple:
-    device_index = tensor.device.index
-    capability = None
-    if tensor.device.type == "cuda":
-        device_index = (
-            torch.cuda.current_device() if device_index is None else device_index
-        )
-        capability = torch.cuda.get_device_capability(device_index)
-    return (
-        "tensor",
-        tensor.device.type,
-        device_index,
-        capability,
-        str(tensor.dtype),
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-        tensor.requires_grad,
-    )
-
-
-def _value_summary(value: Any) -> str:
-    if isinstance(value, torch.Tensor):
-        return f"{tuple(value.shape)}:{value.dtype}:{value.device.type}"
-    if isinstance(value, (list, tuple)):
-        tensor_items = [_value_summary(item) for item in value]
-        tensor_items = [item for item in tensor_items if item]
-        if tensor_items:
-            return f"{type(value).__name__}[{', '.join(tensor_items[:4])}]"
-    if isinstance(value, Mapping):
-        tensor_items = [
-            f"{key}:{_value_summary(item)}"
-            for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))
-        ]
-        tensor_items = [item for item in tensor_items if not item.endswith(":")]
-        if tensor_items:
-            return f"dict[{', '.join(tensor_items[:4])}]"
-    return ""

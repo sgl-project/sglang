@@ -1008,10 +1008,24 @@ class ServerArgs(DisaggServerArgsMixin):
         except json.JSONDecodeError:
             pass
 
-        # 3. treat as k=v pairs (simple implementation). e.g., "sparsity=0.5,enable_x=true"
+        # 3. treat as k=v pairs. Values may contain commas, e.g.
+        # "kernel_compile_ops=activation,rotary,attention_autotune=false".
         try:
             config = {}
-            pairs = config_str.split(",")
+            pairs = []
+            current_pair = None
+            for segment in config_str.split(","):
+                if "=" in segment:
+                    if current_pair is not None:
+                        pairs.append(current_pair)
+                    current_pair = segment
+                elif current_pair is not None:
+                    current_pair += f",{segment}"
+                else:
+                    raise ValueError
+            if current_pair is not None:
+                pairs.append(current_pair)
+
             for pair in pairs:
                 k, v = pair.split("=", 1)
                 k = k.strip()
@@ -1118,16 +1132,9 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.acceleration_config,
             help=(
                 "Experimental diffusion acceleration policy. Accepts a JSON/YAML path, "
-                "JSON string, or key=value pairs. Supported keys include "
-                "kernel_compile_policy=off|auto|force_torch_compile|force_fused "
-                "with kernel_compile_ops=op1,op2, kernel_compile_live_miss=true, "
-                "kernel_compile_min_speedup=1.03, allow_cudnn_sdp=false to disable "
-                "default cuDNN SDPA auto mode, attention_autotune=false to disable "
-                "default warmup-time dense LocalAttention autotune, "
-                "attention_autotune_live_miss=true to autotune cache misses on "
-                "real requests, attention_autotune_min_speedup=1.03, "
-                "torch_compile_policy=auto|force_compile|force_eager|off, "
-                "torch_compile_live_miss=true, and torch_compile_min_speedup=1.05."
+                "JSON string, or comma-separated key=value pairs. Common keys: "
+                "allow_cudnn_sdp, attention_autotune, torch_compile_policy, "
+                "kernel_compile_policy, kernel_compile_ops."
             ),
         )
 

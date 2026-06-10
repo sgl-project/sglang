@@ -207,6 +207,38 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "force_fused",
             )
 
+    def test_kernel_compile_ops_accepts_groups(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "acceleration_config": "kernel_compile_policy=auto,kernel_compile_ops=activation,norm,elementwise",
+                }
+            )
+
+            self.assertEqual(
+                custom_op_kernel_compile_policy("gelu_new", "NewGELU"),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("quick_gelu", "QuickGELU"),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("rms_norm", "RMSNorm"),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("mul_add", "MulAdd"),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy(
+                    "rotary_embedding", "RotaryEmbedding"
+                ),
+                "force_fused",
+            )
+
     def test_acceleration_config_accepts_attention_autotune(self):
         args = self._from_dict_without_model_resolution(
             {

@@ -378,8 +378,8 @@ class LayerNorm(CustomOp):
         return F.layer_norm(x, (self.hidden_size,), self.weight, self.bias, self.eps)
 
     def extra_repr(self) -> str:
-        s = f"hidden_size={self.weight.data.size(0)}"
-        s += f", eps={self.variance_epsilon}"
+        s = f"hidden_size={self.hidden_size}"
+        s += f", eps={self.eps}"
         return s
 
 
