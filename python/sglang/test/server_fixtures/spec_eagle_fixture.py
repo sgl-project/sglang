@@ -122,7 +122,6 @@ class SpecEagleServerBase(CustomTestCase):
         cls.target_model = cls.model
         cls._tokenizer = None
         with contextlib.ExitStack() as stack:
-            stack.enter_context(envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True))
             stack.enter_context(
                 envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True)
             )

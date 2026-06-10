@@ -398,6 +398,32 @@ class Envs:
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
 
+    # MoRI KV Transfer
+    # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
+    SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
+    # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
+    # values can increase parallelism and bandwidth utilization.
+    SGLANG_MORI_QP_PER_TRANSFER = EnvInt(4)
+    # Number of RDMA work requests posted in a single batch to each QP. Larger
+    # batch sizes reduce per-operation overhead and improve throughput at the
+    # cost of higher latency. -1 selects automatic sizing based on the number
+    # of merged work requests and available endpoints.
+    SGLANG_MORI_POST_BATCH_SIZE = EnvInt(-1)
+    # Number of worker threads in the RDMA executor thread pool. More workers
+    # can improve parallelism for large batch transfers across multiple QPs,
+    # but excessive threads may cause contention.
+    SGLANG_MORI_NUM_WORKERS = EnvInt(4)
+    # Number of sharded synchronous worker threads that drain KV transfers.
+    # Also the bound on outstanding (posted-but-not-completed) transfers, so it
+    # is the primary throttle keeping the RDMA send queue from overflowing.
+    SGLANG_MORI_TRANSFER_SHARDS = EnvInt(8)
+    # Poll cadence (ms) at which a transfer worker wakes to check the SLA while
+    # waiting for completion; real completion still wakes it immediately.
+    SGLANG_MORI_WAIT_POLL_MS = EnvInt(1000)
+    # Per-transfer SLA (ms) before a KV transfer is failed; 0 disables the SLA
+    # and relies on the RDMA retry-exceeded timeout only.
+    SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
+
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
@@ -407,6 +433,26 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
+    # before the MoE block for models whose MoE input hidden_size must be
+    # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of
+    # 256). When False (default) the pad runs as a separate
+    # torch.nn.functional.pad call inside the MoE method. When True, the
+    # aiter Triton kernel `fused_add_rmsnorm_pad` produces a padded
+    # post-attention layernorm output in one launch and the MoE method
+    # skips the explicit pad. Currently only takes effect on the
+    # post_attention_layernorm path with aiter backend and TP=1.
+    SGLANG_AITER_FUSE_RMSNORM_PAD = EnvBool(False)
+    # Physical layout for MHA KV cache. "nhd" (default) keeps the existing
+    # (size, head_num, head_dim) per-token storage that
+    # `aiter.mha.mha_batch_prefill_func`/`unified_attention` consume directly.
+    # "vectorized_5d" allocates K as (num_blocks, H_kv, head_dim/x, page_size, x)
+    # and V as (num_blocks, H_kv, page_size/x, head_dim, x) (x = 16 / dtype_size),
+    # matching the SHUFFLE layout that aiter's CK FmhaBatchPrefill kernel and
+    # `aiter.ops.triton.gluon.pa_decode_gluon` both consume natively. This is
+    # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
+    # decode without runtime permutes.
+    SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
@@ -448,13 +494,14 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
+    SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
-    # Enable per-token NVFP4 activation scaling path for FlashInfer TRT-LLM MoE.
+    # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
@@ -463,9 +510,6 @@ class Envs:
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
-    # TODO(mmangkad): Remove this once the FlashInfer unified allreduce-fusion
-    # transport issue on GB200/GB300 platforms is fixed and verified resolved.
-    SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT = EnvBool(None)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
@@ -763,6 +807,10 @@ class Envs:
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
 
+    # Eager forward wraps the ForwardBatch's own tensors instead of copying them
+    # into the CUDA graph buffer registry (no per-iter device-to-device copy).
+    SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
@@ -790,6 +838,9 @@ class Envs:
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
+    # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
+    SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
+    SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
