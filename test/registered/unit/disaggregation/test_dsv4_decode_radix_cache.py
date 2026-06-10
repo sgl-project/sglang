@@ -152,6 +152,7 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
         allow_radix_cache_insert_once=False,
         fill_ids=[1, 2, 3, 4, 5],
         extra_key=None,
+        req_pool_idx=0,
         cache_protected_len=0,
         swa_evicted_seqlen=4,
     )
@@ -175,7 +176,20 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
         inserted_req.cache_protected_len = 2
 
     tree_cache.cache_unfinished_req = cache_unfinished_req
-    processor = SimpleNamespace(tree_cache=tree_cache)
+    token_to_kv_pool_allocator = SimpleNamespace(freed_swa_indices=[])
+
+    def free_swa(indices):
+        token_to_kv_pool_allocator.freed_swa_indices.append(indices.tolist())
+
+    token_to_kv_pool_allocator.free_swa = free_swa
+    req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.tensor([[11, 12, 13, 14, 15]], dtype=torch.int64)
+    )
+    processor = SimpleNamespace(
+        tree_cache=tree_cache,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        req_to_token_pool=req_to_token_pool,
+    )
 
     SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
     SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
@@ -183,6 +197,7 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
     assert tree_cache.inserted_fill_ids == [[1, 2, 3]]
     assert tree_cache.inserted_swa_evicted_seqlens == [2]
     assert tree_cache.inserted_force_leaf_creation == [True]
+    assert token_to_kv_pool_allocator.freed_swa_indices == [[11, 12]]
     assert req.fill_ids == [1, 2, 3, 4, 5]
     assert req.cache_protected_len == 2
     assert req.swa_evicted_seqlen == 4

@@ -203,6 +203,15 @@ class SchedulerBatchResultProcessor:
         req.force_radix_leaf_creation = True
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
+            protected_len = min(getattr(req, "cache_protected_len", 0), radix_key_len)
+            if protected_len > 0 and hasattr(self.token_to_kv_pool_allocator, "free_swa"):
+                donated_full_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :protected_len
+                ]
+                # The donated DSV4 prompt leaf is full-only. Release any
+                # request-private SWA tail mapped from those full indices; the
+                # full pages stay owned by radix cache.
+                self.token_to_kv_pool_allocator.free_swa(donated_full_indices)
             if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
                 logger.info(
                     "DSV4 decode radix prompt inserted: rid=%s "
