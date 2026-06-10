@@ -160,6 +160,26 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         thread.join()
         return self._outputs[shape_key]
 
+    def replay_with_input_updates(
+        self,
+        shape_key: Any,
+        cpu_update_input: list,
+    ) -> Any:
+        """Rebind several recorded update points (one per draft step) on
+        the captured NPU graph in a background thread, then replay. Used by
+        the eagle draft runner, whose graph records one seq_lens update
+        point per speculative step."""
+        graph = self._graphs[shape_key]
+
+        def _update():
+            graph.update(cpu_update_input=cpu_update_input)
+
+        thread = threading.Thread(target=_update)
+        thread.start()
+        graph.replay()
+        thread.join()
+        return self._outputs[shape_key]
+
     def cleanup(self) -> None:
         self._graphs.clear()
         self._outputs.clear()

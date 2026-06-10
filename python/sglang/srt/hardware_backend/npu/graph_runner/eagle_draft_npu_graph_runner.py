@@ -61,6 +61,25 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             AttentionArch.MHA: torch.Tensor(),
         }
 
+    def _replay_backend(self, shape_key, forward_batch: ForwardBatch):
+        # NPU graphs are captured with auto_dispatch_capture=True, so each
+        # draft step recorded a seq_lens update point that must be rebound
+        # before replay; otherwise the graph replays stale per-step KV
+        # lengths, diverging across TP ranks and hanging in HCCL. deepseek-nsa
+        # captures without update points and replays directly.
+        if is_deepseek_dsa(self.model_runner.model_config.hf_config):
+            return self.backend.replay(shape_key, forward_batch)
+
+        attr_name = self.attr_name[AttentionArch.MLA]
+        raw_seq_lens_cpu = self.buffers.seq_lens_cpu[: self.raw_bs]
+        cpu_update_input = []
+        for step in range(self.speculative_num_steps - 1):
+            step_seq_lens = (raw_seq_lens_cpu + step + 1).tolist() + [0] * (
+                self.bs - self.raw_bs
+            )
+            cpu_update_input.append({attr_name: step_seq_lens})
+        return self.backend.replay_with_input_updates(shape_key, cpu_update_input)
+
     def _create_graph(self):
         return torch.npu.NPUGraph()
 

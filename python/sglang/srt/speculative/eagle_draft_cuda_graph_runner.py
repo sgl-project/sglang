@@ -416,6 +416,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
         return parent_list, top_scores_index, draft_tokens
 
+    def _replay_backend(self, shape_key, forward_batch: ForwardBatch):
+        # Overridable seam: device runners (e.g. NPU) rebind dynamic graph
+        # inputs here before replaying the captured artifact.
+        return self.backend.replay(shape_key, forward_batch)
+
     # -----------------------------------------------------------------
     # Replay
     # -----------------------------------------------------------------
@@ -530,7 +535,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             else contextlib.nullcontext()
         )
         with timer_ctx:
-            out = self.backend.replay(shape_key, forward_batch)
+            out = self._replay_backend(shape_key, forward_batch)
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)

@@ -258,6 +258,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return bs
 
+    def _replay_backend(self, shape_key, forward_batch: ForwardBatch):
+        # Overridable seam: device runners (e.g. NPU) rebind dynamic graph
+        # inputs here before replaying the captured artifact.
+        return self.backend.replay(shape_key, forward_batch)
+
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
@@ -553,7 +558,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             else contextlib.nullcontext()
         )
         with timer_ctx:
-            out = self.backend.replay(shape_key, forward_batch)
+            out = self._replay_backend(shape_key, forward_batch)
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             unpadding_bs = num_tokens

@@ -40,6 +40,21 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int32
 
+    def _replay_backend(self, shape_key, forward_batch: ForwardBatch):
+        # See EAGLEDraftNpuGraphRunner._replay_backend: rebind the recorded
+        # seq_lens update point before replay (a single step for extend).
+        if is_deepseek_dsa(self.model_runner.model_config.hf_config):
+            return self.backend.replay(shape_key, forward_batch)
+        seq_lens = self.buffers.seq_lens_cpu[: self.raw_bs].tolist() + [0] * (
+            self.bs - self.raw_bs
+        )
+        return self.backend.replay_with_input_update(
+            shape_key,
+            seq_lens=seq_lens,
+            attr_name="actual_seq_lengths_kv",
+            attr_type=[],
+        )
+
     def _capture_init(self, run_once_fn):
         for _ in range(2):
             torch.npu.synchronize()
