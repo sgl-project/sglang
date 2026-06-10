@@ -231,11 +231,18 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         )
 
     if not envs.SGLANG_ENABLE_SPEC_V2.get():
+        # The V1 worker only supports non-overlap scheduling.
         server_args.disable_overlap_schedule = True
-
-    if server_args.disable_overlap_schedule:
         logger.warning(
-            "Spec v1 is used for DFLASH speculative decoding because overlap schedule is disabled."
+            "Spec v1 is used for DFLASH speculative decoding because "
+            "SGLANG_ENABLE_SPEC_V2 is off; overlap schedule is disabled."
+        )
+    elif server_args.disable_overlap_schedule:
+        # The V2 worker does not support synchronous (non-overlap) driving yet.
+        raise ValueError(
+            "DFLASH spec v2 requires overlap scheduling. Set "
+            "SGLANG_ENABLE_SPEC_V2=0 to use the non-overlap v1 path instead of "
+            "--disable-overlap-schedule."
         )
     else:
         logger.warning("Spec v2 is enabled by default for DFLASH speculative decoding.")
