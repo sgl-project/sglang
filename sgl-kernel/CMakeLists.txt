@@ -63,10 +63,11 @@ FetchContent_Declare(
 FetchContent_Populate(repo-fmt)
 
 # Triton kernel
+# TEMP: Triton 3.7.1 is published from the release/3.7.x branch, but there is no
+# v3.7.1 source tag yet. Replace this branch tarball with the tag once it exists.
 FetchContent_Declare(
     repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.7.0.tar.gz
-    URL_HASH SHA256=ff5cdcdd1b3f30a5db06c4e690ac73b16342c8181820e2cdf74e8514065ea7b8
+    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/refs/heads/release/3.7.x.tar.gz
 )
 FetchContent_Populate(repo-triton)
 

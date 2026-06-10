@@ -226,6 +226,19 @@ uninstall_stale_flashinfer() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_pytorch_stack() {
+    # TEMP: use the PyTorch test index for PR CI until torch 2.12.1 CUDA
+    # wheels are available on the normal PyTorch index.
+    $PIP_CMD install \
+        "torch==2.12.1" \
+        "torchaudio==2.11.0" \
+        "torchvision==0.27.1" \
+        --extra-index-url "https://download.pytorch.org/whl/test/${CU_VERSION}" \
+        $PIP_INSTALL_SUFFIX
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 install_sglang() {
     EXTRAS="dev,runai,tracing"
     if [ -n "$OPTIONAL_DEPS" ]; then
@@ -514,6 +527,7 @@ main() {
     clean_site_packages
     setup_pip_toolchain
     uninstall_stale_flashinfer
+    install_pytorch_stack
     install_sglang
     install_sglang_kernel
     install_sglang_router
