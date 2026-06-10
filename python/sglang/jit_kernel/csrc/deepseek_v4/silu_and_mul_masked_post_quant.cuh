@@ -491,10 +491,6 @@ struct SiluAndMulContigPostQuantKernel {
         .with_device(device)
         .verify(output);
 
-    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
-    // Early exit for empty batch
-    if (num_tokens == 0) return;
-
     const auto hidden_dim = N.unwrap();
     RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
     RuntimeCheck(hidden_dim % kGroupSize == 0);
@@ -520,6 +516,10 @@ struct SiluAndMulContigPostQuantKernel {
           .verify(output_scale);
       scale_row_stride_int32 = static_cast<uint32_t>(M_pad.unwrap());
     }
+
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    // Early exit for empty batch
+    if (num_tokens == 0) return;
 
     const auto params = SiluMulQuantContigParams{
         .input = static_cast<const bf16_t*>(input.data_ptr()),
