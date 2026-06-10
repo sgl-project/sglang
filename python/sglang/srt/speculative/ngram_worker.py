@@ -35,6 +35,10 @@ USE_FULL_MASK = True
 
 
 class NGRAMWorker(BaseSpecWorker):
+    def alloc_memory_pool(self, **kwargs):
+        self.max_batch_size = self.model_runner.max_running_requests
+        self._init_preallocated_tensors()
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -62,10 +66,7 @@ class NGRAMWorker(BaseSpecWorker):
             target_worker.get_memory_pool()
         )
 
-        self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
-
-        self._init_preallocated_tensors()
 
         self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for

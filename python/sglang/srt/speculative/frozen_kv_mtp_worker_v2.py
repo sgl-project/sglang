@@ -32,10 +32,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    cuda_graph_fully_disabled,
-)
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -117,17 +114,13 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
             f"{self.speculative_algorithm.name}."
         )
 
-        # Defer cuda graph capture; we do it ourselves below.
-        backup_decode_mode = server_args.cuda_graph_config.decode.backend
-        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
-
         # Draft attention uses target req_to_token + KV allocator (read-only).
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
 
         target_cfg = target_worker.model_runner.memory_pool_config
-        draft_pool_config = MemoryPoolConfig(
+        self.draft_pool_config = MemoryPoolConfig(
             max_total_num_tokens=64,  # Dummy value
             max_running_requests=target_cfg.max_running_requests,
         )
@@ -153,7 +146,7 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=draft_pool_config,
+                memory_pool_config=self.draft_pool_config,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -170,27 +163,49 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
         if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
             self._bind_kv_context()
 
-        self.draft_model_runner.server_args.cuda_graph_config.decode.backend = (
-            backup_decode_mode
-        )
-
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
 
-        self.draft_attn_backend = self._init_draft_attn_backend()
-        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.draft_attn_backend = None
         self.cuda_graph_runner = None
         # Frozen draft has no draft-extend forward (seed-select only); keep these
         # None so inherited probes (spec_v2_attn_backends, adaptive) stay typed.
         self.draft_extend_attn_backend = None
         self.cuda_graph_runner_for_draft_extend = None
 
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        # NOTE: call TpModelWorker explicitly -- BaseDraftWorker precedes it in
+        # the MRO and its alloc_memory_pool is a no-op stub.
+        TpModelWorker.alloc_memory_pool(
+            self,
+            memory_pool_config=self.draft_pool_config,
+            req_to_token_pool=(
+                req_to_token_pool
+                if req_to_token_pool is not None
+                else self.req_to_token_pool
+            ),
+            token_to_kv_pool_allocator=(
+                token_to_kv_pool_allocator
+                if token_to_kv_pool_allocator is not None
+                else self.token_to_kv_pool_allocator
+            ),
+        )
+
+    def init_backends(self):
         with (
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
+            TpModelWorker.init_backends(self, disable_cuda_graph=True)
+            self.draft_attn_backend = self._init_draft_attn_backend()
+            self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
             self.init_cuda_graphs()
 
     @property
