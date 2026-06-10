@@ -455,6 +455,9 @@ class LayerCommunicator:
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
 
         self._context = CommunicateContext.init_new()
+        self._context.force_layernorm_before_dp_gather = (
+            force_layernorm_before_dp_gather
+        )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
@@ -688,9 +691,6 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        self._context.force_layernorm_before_dp_gather = (
-            self.force_layernorm_before_dp_gather
-        )
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,

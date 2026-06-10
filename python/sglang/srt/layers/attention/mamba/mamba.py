@@ -417,8 +417,6 @@ class MambaMixer2(torch.nn.Module):
             reduce_results=not is_dp_attention_enabled(),
             prefix=f"{prefix}.out_proj",
         )
-        if is_dp_attention_enabled():
-            self.out_proj.emulate_global_tp_chunks = True
 
         self.norm = Mixer2RMSNormGated(
             intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps

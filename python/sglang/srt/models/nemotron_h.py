@@ -596,8 +596,6 @@ class NemotronHAttention(nn.Module):
             reduce_results=not is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",
         )
-        if is_dp_attention_enabled():
-            self.o_proj.emulate_global_tp_chunks = True
 
         self.attn = RadixAttention(
             self.num_heads,
