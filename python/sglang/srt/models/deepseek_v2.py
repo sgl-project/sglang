@@ -38,12 +38,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
 )
-from sglang.srt.compilation.piecewise_context_manager import (
-    get_forward_context as get_pcg_forward_context,
-)
-from sglang.srt.compilation.piecewise_context_manager import (
-    is_in_piecewise_cuda_graph,
-)
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
     get_dsa_index_head_dim,
@@ -141,11 +135,20 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
-from sglang.srt.model_executor.breakable_cuda_graph.context import (
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
 )
@@ -231,7 +234,7 @@ if _is_cuda:
         should_allreduce_fusion: bool,
         use_reduce_scatter: bool,
     ) -> torch.Tensor:
-        forward_context = get_pcg_forward_context()
+        forward_context = get_tc_piecewise_forward_context()
         assert forward_context is not None
         assert forward_context.moe_fusions is not None
 
@@ -760,7 +763,7 @@ class DeepseekV2MoE(nn.Module):
                     ModelOptFp4LinearMethod,
                 )
                 and fc1_n % 128 == 0
-                and get_global_server_args().disable_piecewise_cuda_graph
+                and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 self.shared_experts.gate_up_proj._interleave_for_swiglu_fusion = True
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
@@ -855,7 +858,7 @@ class DeepseekV2MoE(nn.Module):
             server_args = get_global_server_args()
         return (
             _enable_pcg_dsv2_dual_stream
-            and (is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+            and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
             and get_moe_runner_backend().is_flashinfer_trtllm()
             and self.alt_stream is not None
             and self.num_fused_shared_experts == 0
@@ -2515,7 +2518,7 @@ class DeepseekV2Model(nn.Module):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
                 nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:

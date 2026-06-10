@@ -12,10 +12,6 @@ from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
-from sglang.srt.compilation.piecewise_context_manager import (
-    get_forward_context,
-    is_in_piecewise_cuda_graph,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
@@ -27,12 +23,16 @@ from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
-from sglang.srt.model_executor.breakable_cuda_graph.context import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     call_with_graph_break,
     is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -91,13 +91,13 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -109,7 +109,7 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
-    return is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
+    return is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
 
 
 if _is_cuda:
@@ -130,8 +130,11 @@ if _is_cuda:
         ), "Internal error: piecewise CUDA graph is only supported on CUDA"
         from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
-        forward_batch = get_forward_context().forward_batch
-        indexer = get_forward_context().dsa_indexers[layer_id]
+        forward_context = get_tc_piecewise_forward_context()
+        assert forward_context is not None
+        assert forward_context.dsa_indexers is not None
+        forward_batch = forward_context.forward_batch
+        indexer = forward_context.dsa_indexers[layer_id]
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
         # slice off padding from piecewise CUDA graph
@@ -178,8 +181,11 @@ if _is_cuda:
         ), "Internal error: indexer graph dispatch is only supported on CUDA"
         from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
-        forward_batch = get_forward_context().forward_batch
-        indexer = get_forward_context().dsa_indexers[layer_id]
+        forward_context = get_tc_piecewise_forward_context()
+        assert forward_context is not None
+        assert forward_context.dsa_indexers is not None
+        forward_batch = forward_context.forward_batch
+        indexer = forward_context.dsa_indexers[layer_id]
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
         extend_num_tokens = forward_batch.extend_num_tokens
@@ -301,7 +307,7 @@ def _broadcast_indexer_topk_from_rank0(
     if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
         return topk_indices
 
-    if is_in_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph():
         broadcast_indexer_topk_from_rank0_(topk_indices)
     else:
         _broadcast_indexer_topk_from_rank0_impl(topk_indices)
@@ -1151,9 +1157,10 @@ class Indexer(MultiPlatformOp):
         actual_seq_q: int,
         cp_index: List[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
-        assert (
-            not _is_in_piecewise_or_breakable_cuda_graph()
-        ), "DSA context parallel (_get_topk_ragged_with_cp) not supported under piecewise/breakable CUDA graph"
+        assert not _is_in_piecewise_or_breakable_cuda_graph(), (
+            "DSA context parallel (_get_topk_ragged_with_cp) not supported under "
+            "piecewise/breakable CUDA graph"
+        )
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -1300,9 +1307,10 @@ class Indexer(MultiPlatformOp):
         topk: int,
         layer_id: int,
     ) -> Optional[torch.Tensor]:
-        assert (
-            not _is_in_piecewise_or_breakable_cuda_graph()
-        ), "DSA forward_indexer (non-CUDA loop path) not supported under piecewise/breakable CUDA graph"
+        assert not _is_in_piecewise_or_breakable_cuda_graph(), (
+            "DSA forward_indexer (non-CUDA loop path) not supported under "
+            "piecewise/breakable CUDA graph"
+        )
         if not _is_npu:
             from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
 
@@ -1497,9 +1505,9 @@ class Indexer(MultiPlatformOp):
         )
 
         # In piecewise/breakable CUDA graph mode, metadata is fetched inside
-        # custom ops via get_forward_context() to prevent Dynamo from guarding
-        # on forward_metadata identity, which changes each replay when
-        # init_forward_metadata creates a new ForwardMetadata object.
+        # custom ops via get_tc_piecewise_forward_context() to prevent Dynamo
+        # from guarding on forward_metadata identity, which changes each replay
+        # when init_forward_metadata creates a new ForwardMetadata object.
         if not in_piecewise_or_breakable_cuda_graph:
             metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
             if metadata is None:
