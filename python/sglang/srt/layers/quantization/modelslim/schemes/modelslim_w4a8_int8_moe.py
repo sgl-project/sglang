@@ -36,6 +36,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         quant_config: Dict[str, Any],
         weight_prefix: str,
         group_size: int = 0,
+        tp_size: int = 1,
         activation_use_clip: bool = False,
     ) -> None:
         if weight_prefix not in ("w13", "w2"):
@@ -43,11 +44,12 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
                 f"weight_prefix must be 'w13' or 'w2', got '{weight_prefix}'"
             )
         self.quant_config = quant_config
-        self.kernel = NPUW4A8Int8MoEMethod()
         self.weight_prefix = weight_prefix
         self.group_size = group_size
+        self.tp_size = tp_size
         self.is_per_channel_weight = group_size == 0
         self.activation_use_clip = activation_use_clip
+        self.kernel = NPUW4A8Int8MoEMethod(is_per_channel_weight = self.is_per_channel_weight, activation_use_clip = self.activation_use_clip)
 
     def create_weights(
         self,
@@ -92,7 +94,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             scale_last_dim = in_features // self.group_size
 
         scale = torch.nn.Parameter(
-            torch.empty(num_experts, out_features, scale_last_dim, dtype=torch.float32),
+            torch.empty(num_experts, 2 * out_features, scale_last_dim, dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_weight_scale", scale)
@@ -100,7 +102,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         
         # ---- offset ----
         offset = torch.nn.Parameter(
-            torch.empty(num_experts, out_features, scale_last_dim, dtype=torch.float32),
+            torch.empty(num_experts, 2 * out_features, scale_last_dim, dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_weight_offset", offset)
@@ -111,7 +113,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             scale_second = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    out_features,
+                    2 * out_features,
                     in_features // self.group_size,
                     dtype=torch.float32,
                 ),
@@ -123,7 +125,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             offset_second = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    out_features,
+                    2 * out_features,
                     in_features // self.group_size,
                     dtype=torch.float32,
                 ),
@@ -135,7 +137,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         # ---- bias for scale (activation clip path) ----
         # This parameter is always created; the kernel uses it only when activation_use_clip is True.
         scale_bias = torch.nn.Parameter(
-            torch.empty(num_experts, out_features, bias_last_dim, dtype=torch.float32),
+            torch.empty(num_experts, 2 * out_features, bias_last_dim, dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_scale_bias", scale_bias)
@@ -143,4 +145,6 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Delegate weight processing to the kernel for the assigned weight group."""
-        self.kernel.process_weights_after_loading(layer, self.weight_prefix)
+        self.kernel.process_weights_after_loading(
+            layer, self.weight_prefix
+        )
