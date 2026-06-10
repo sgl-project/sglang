@@ -12,6 +12,7 @@ import sgl_kernel
 import torch
 
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DTYPE
+from sglang.jit_kernel.utils import KERNEL_PATH
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -25,7 +26,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = (
     Path(os.environ["SGLANG_NVFP4_REPO_ROOT"])
     if os.environ.get("SGLANG_NVFP4_REPO_ROOT")
-    else Path(__file__).resolve().parents[5]
+    # Anchor on the installed jit_kernel package (python/sglang/jit_kernel) so
+    # this stays correct regardless of where the benchmark file lives.
+    else KERNEL_PATH.parents[2]
 )
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "nvfp4_benchmarks"
 DEFAULT_SHAPE_LIBRARY = SCRIPT_DIR / "diffusion_nvfp4_shapes.json"

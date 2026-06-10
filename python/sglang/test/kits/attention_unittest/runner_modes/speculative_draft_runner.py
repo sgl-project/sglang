@@ -29,7 +29,7 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
     FrozenKVMTPDraftInput,
 )
-from sglang.srt.speculative.frozen_kv_mtp_worker import FrozenKVMTPWorker
+from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from ..attention_methods.dense_attention import (
@@ -226,26 +226,26 @@ class _FrozenKVMTPWorkerHarness:
         )
         self.model_runner.forward = model_forward
         self._hidden_size = settings.hidden_size
-        self.draft_forward = MethodType(FrozenKVMTPWorker.draft_forward, self)
+        self.draft_forward = MethodType(FrozenKVMTPDraftWorker.draft_forward, self)
         self._frozen_kv_target_view = MethodType(
-            FrozenKVMTPWorker._frozen_kv_target_view,
+            FrozenKVMTPDraftWorker._frozen_kv_target_view,
             self,
         )
         self._target_kv_pool_view = MethodType(
-            FrozenKVMTPWorker._target_kv_pool_view,
+            FrozenKVMTPDraftWorker._target_kv_pool_view,
             self,
         )
-        self._set_positions = MethodType(FrozenKVMTPWorker._set_positions, self)
+        self._set_positions = MethodType(FrozenKVMTPDraftWorker._set_positions, self)
         self._init_frozen_kv_metadata = MethodType(
-            FrozenKVMTPWorker._init_frozen_kv_metadata,
+            FrozenKVMTPDraftWorker._init_frozen_kv_metadata,
             self,
         )
         self._init_frozen_kv_metadata_capture_cuda_graph = MethodType(
-            FrozenKVMTPWorker._init_frozen_kv_metadata_capture_cuda_graph,
+            FrozenKVMTPDraftWorker._init_frozen_kv_metadata_capture_cuda_graph,
             self,
         )
         self._init_frozen_kv_metadata_replay_cuda_graph = MethodType(
-            FrozenKVMTPWorker._init_frozen_kv_metadata_replay_cuda_graph,
+            FrozenKVMTPDraftWorker._init_frozen_kv_metadata_replay_cuda_graph,
             self,
         )
 

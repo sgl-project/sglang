@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising import (
     LTX2DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
