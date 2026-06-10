@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+import dataclasses
+
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.joy_echo import (
     JoyEchoPipelineConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
     LTX2AVDenoisingStage,
@@ -13,7 +16,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import 
     LTX2DenoisingContext,
     LTX2ModelInputs,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.joy_echo_memory import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.joy_echo.memory import (
     build_memory_audio_rope_coords,
     build_memory_self_attention_block_mask,
     build_memory_video_rope_coords,
@@ -24,6 +27,103 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
     """JoyEcho DMD denoising with optional memory prefix and late-layer masks."""
+
+    def _prepare_denoising_loop(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> LTX2DenoisingContext:
+        ctx = super()._prepare_denoising_loop(batch, server_args)
+        if batch.enable_memory_bank or get_sp_world_size() <= 1:
+            return ctx
+        if (
+            ctx.is_ltx23_variant
+            and server_args.pipeline_config.can_shard_audio_latents_for_sp(
+                batch.audio_latents
+            )
+        ):
+            (
+                batch.audio_latents,
+                batch.did_sp_shard_audio_latents,
+            ) = server_args.pipeline_config.shard_audio_latents_for_sp(
+                batch, batch.audio_latents
+            )
+            ctx.audio_latents = batch.audio_latents
+        return ctx
+
+    def _prepare_ltx2_model_inputs(
+        self,
+        ctx: LTX2DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+        sigma: torch.Tensor,
+    ) -> LTX2ModelInputs:
+        model_inputs = super()._prepare_ltx2_model_inputs(
+            ctx, step, batch, server_args, sigma
+        )
+        if not getattr(batch, "did_sp_shard_audio_latents", False):
+            return model_inputs
+
+        batch_size = int(model_inputs.latent_model_input.shape[0])
+        video_self_attention_mask = self._build_ltx2_sp_padding_mask(
+            batch,
+            seq_len=int(model_inputs.latent_model_input.shape[1]),
+            batch_size=batch_size,
+            key="sp_video_valid_token_count",
+            device=model_inputs.latent_model_input.device,
+        )
+        audio_self_attention_mask = self._build_ltx2_sp_padding_mask(
+            batch,
+            seq_len=model_inputs.audio_num_frames_latent,
+            batch_size=batch_size,
+            key="sp_audio_valid_token_count",
+            device=model_inputs.audio_latent_model_input.device,
+        )
+        video_coords = server_args.pipeline_config.prepare_video_rope_coords_for_sp(
+            step.current_model,
+            batch,
+            model_inputs.latent_model_input,
+            num_frames=ctx.latent_num_frames_for_model,
+            height=ctx.latent_height,
+            width=ctx.latent_width,
+        )
+        audio_coords = server_args.pipeline_config.prepare_audio_rope_coords_for_sp(
+            step.current_model,
+            batch,
+            model_inputs.audio_latent_model_input,
+            num_frames=model_inputs.audio_num_frames_latent,
+        )
+        return dataclasses.replace(
+            model_inputs,
+            video_coords=video_coords,
+            audio_coords=audio_coords,
+            video_self_attention_mask=video_self_attention_mask,
+            audio_self_attention_mask=audio_self_attention_mask,
+            a2v_cross_attention_mask=audio_self_attention_mask,
+            v2a_cross_attention_mask=video_self_attention_mask,
+        )
+
+    def _build_ltx2_base_model_kwargs(
+        self,
+        ctx: LTX2DenoisingContext,
+        batch: Req,
+        model_inputs: LTX2ModelInputs,
+    ) -> dict[str, object]:
+        kwargs = super()._build_ltx2_base_model_kwargs(ctx, batch, model_inputs)
+        if not getattr(batch, "did_sp_shard_audio_latents", False):
+            return kwargs
+        kwargs.update(
+            {
+                "video_self_attention_mask": model_inputs.video_self_attention_mask,
+                "audio_self_attention_mask": model_inputs.audio_self_attention_mask,
+                "a2v_cross_attention_mask": model_inputs.a2v_cross_attention_mask,
+                "v2a_cross_attention_mask": model_inputs.v2a_cross_attention_mask,
+                "audio_replicated_for_sp": False,
+                "legacy_ltx23_one_stage_semantics": False,
+            }
+        )
+        return kwargs
 
     @staticmethod
     def _dmd_add_noise(
