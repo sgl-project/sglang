@@ -281,8 +281,22 @@ class Fp8Config(QuantizationConfig):
 
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
                 # SM100 (Blackwell) -> trtllm-gen path.
-                # SM90  (Hopper)    -> cutlass mixed-input path (FlashInfer #3084).
+                # SM90  (Hopper)    -> cutlass mixed-input W4A16 (FlashInfer #3084),
+                #   or the W4A8 CuTe-DSL grouped GEMM (FP8 activation) when
+                #   --flashinfer-mxfp4-moe-activation fp8 is set (prefill-worker kernel).
                 if is_sm90_supported() and not is_sm100_supported():
+                    from sglang.srt.server_args import get_global_server_args
+
+                    if (
+                        get_global_server_args().flashinfer_mxfp4_moe_activation
+                        == "fp8"
+                    ):
+                        from sglang.srt.layers.quantization.mxfp4_flashinfer_w4a8_moe import (
+                            Mxfp4FlashinferW4A8MoEMethod,
+                        )
+
+                        return Mxfp4FlashinferW4A8MoEMethod(fp8_method, prefix=prefix)
+
                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
                         Mxfp4FlashinferCutlassMoEMethod,
                     )
