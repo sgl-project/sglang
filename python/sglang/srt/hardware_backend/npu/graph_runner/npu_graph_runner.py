@@ -32,6 +32,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
+import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
@@ -39,6 +40,7 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.utils import (
+    empty_context,
     get_bool_env_var,
     get_compiler_backend,
     is_npu,
@@ -105,22 +107,68 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.if_use_v2 = any(
+            arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+            for arch in (model_runner.model_config.hf_config.architectures or [])
+        )
 
     def _init_arch_map(self):
         if self.is_dllm:
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "actual_seq_lengths_kv",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         else:
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "context_lens",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
+            "TARGET_VERIFY": [],
         }
+
+    def _create_device_graph(self):
+        return torch.npu.NPUGraph()
+
+    def _capture_graph(self, graph, pool, stream, run_once_fn):
+        if self.enable_torch_compile:
+            skip_guard_context = torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+        else:
+            skip_guard_context = empty_context()
+
+        with (
+            skip_guard_context,
+            torch.npu.graph(
+                graph,
+                pool=pool,
+                stream=stream,
+                auto_dispatch_capture=True,
+            ),
+        ):
+            out = run_once_fn()
+        return out
+
+    def _get_update_attr_name(self):
+        if self.if_use_v2:
+            return self.attr_name["TARGET_VERIFY"]
+        return self.attr_name[AttentionArch.MLA]
+
+    def _get_update_attr_type(self):
+        if self.if_use_v2:
+            return self.attr_type["TARGET_VERIFY"]
+        return self.attr_type[AttentionArch.MLA]
+
+    def _update_inputs(self, seq_lens):
+        if isinstance(self.update_attr_type, torch.Tensor):
+            seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+
+        self.graphs[self.bs].update(
+            cpu_update_input=[{self.update_attr_name: seq_lens}]
+        )
 
     def _cache_loc_dtype(self):
         return torch.int32
