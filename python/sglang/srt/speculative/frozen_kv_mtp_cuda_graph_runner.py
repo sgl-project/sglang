@@ -34,7 +34,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.frozen_kv_mtp_worker import FrozenKVMTPWorker
+    from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 
 
 @dataclass
@@ -47,7 +47,7 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: torch.Tensor
-    # Consumed by the captured seed iter; see `FrozenKVMTPWorker.draft_forward`.
+    # Consumed by the captured seed iter; see `FrozenKVMTPDraftWorker.draft_forward`.
     bonus_tokens: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -56,7 +56,7 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
 class FrozenKVMTPCudaGraphRunner:
     """CUDA graph runner for the Frozen-KV MTP recurrent draft-loop step."""
 
-    def __init__(self, frozen_kv_mtp_worker: FrozenKVMTPWorker):
+    def __init__(self, frozen_kv_mtp_worker: FrozenKVMTPDraftWorker):
         self.frozen_kv_mtp_worker = frozen_kv_mtp_worker
         self.model_runner = model_runner = frozen_kv_mtp_worker.draft_model_runner
         self.graphs = {}

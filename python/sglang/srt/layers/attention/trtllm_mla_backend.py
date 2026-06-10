@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
     mla_quantize_and_rope_for_fp8,
 )
@@ -388,7 +389,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             (batch_size, max_blocks), -1, dtype=torch.int32, device=device
         )
 
-        create_flashmla_kv_indices_triton[(batch_size,)](
+        create_flashmla_kv_indices_triton[
+            (
+                batch_size,
+                get_num_kv_index_blocks_flashmla(max_blocks, self.page_size),
+            )
+        ](
             self.req_to_token,
             req_pool_indices,
             seq_lens,
@@ -534,7 +540,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
 
         # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[(bs,)](
+        create_flashmla_kv_indices_triton[
+            (
+                bs,
+                get_num_kv_index_blocks_flashmla(
+                    metadata.block_kv_indices.shape[1], self.page_size
+                ),
+            )
+        ](
             self.req_to_token,
             req_pool_indices[:bs],
             seq_lens,
@@ -555,7 +568,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.disable_chunked_prefix_cache and has_prefix
         ) or is_in_piecewise_cuda_graph()
         if fallback_to_flashinfer_impl:
-            super().init_mha_chunk_metadata(forward_batch)
+            super().init_mha_chunk_metadata(
+                forward_batch, disable_flashinfer_ragged=True
+            )
 
     def init_forward_metadata_out_graph(
         self,
@@ -692,9 +707,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
             return super().init_forward_metadata(forward_batch)
-
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
-        super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
 
     def pad_draft_extend_query(
         self,

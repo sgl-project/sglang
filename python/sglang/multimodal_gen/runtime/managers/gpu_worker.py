@@ -37,14 +37,8 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
-from sglang.multimodal_gen.runtime.loader.weights_updater import (
-    WeightsUpdater,
-    get_updatable_modules,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
-    iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
@@ -54,6 +48,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
+    GPUWorkerPostTrainingMixin,
+)
 from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSessionCache,
 )
@@ -102,7 +99,7 @@ class _ExpandedOutputParts:
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
 
 
-class GPUWorker:
+class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
     """
@@ -893,48 +890,6 @@ class GPUWorker:
             return OutputBatch(error="Lora is not enabled")
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
-
-    def update_weights_from_disk(
-        self,
-        model_path: str,
-        flush_cache: bool = True,
-        target_modules: list[str] | None = None,
-    ) -> tuple[bool, str]:
-        """Update model weights from disk inplace without restarting the server."""
-        if not self.pipeline:
-            return False, "Pipeline is not initialized"
-
-        updater = WeightsUpdater(self.pipeline)
-        success, message = updater.update_weights_from_disk(
-            model_path,
-            flush_cache=flush_cache,
-            target_modules=target_modules,
-        )
-        if success:
-            self.server_args.model_path = model_path
-            self.pipeline.model_path = model_path
-        return success, message
-
-    def get_weights_checksum(
-        self, module_names: list[str] | None = None
-    ) -> dict[str, str]:
-        """Compute SHA-256 checksum of each module's weights."""
-        if not self.pipeline:
-            return {"error": "Pipeline is not initialized"}
-
-        all_modules = get_updatable_modules(self.pipeline)
-        names = module_names if module_names is not None else list(all_modules.keys())
-
-        checksums: dict[str, str] = {}
-        for name in names:
-            module = all_modules.get(name)
-            if module is None:
-                checksums[name] = "not_found"
-                continue
-            checksums[name] = compute_weights_checksum(
-                iter_materialized_weights(module)
-            )
-        return checksums
 
 
 OOM_MSG = """
