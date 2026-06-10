@@ -299,6 +299,7 @@ class DFlashWorkerV2(DFlashWorker):
                 next_draft_input=next_draft_input,
                 can_run_cuda_graph=False,
                 speculative_num_draft_tokens=int(self.block_size),
+                new_seq_lens=next_draft_input.new_seq_lens,
             )
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
@@ -673,4 +674,7 @@ class DFlashWorkerV2(DFlashWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.block_size),
+            # The non-overlap (sync) scheduler path advances batch.seq_lens
+            # from the result; overlap carries it via next_draft_input instead.
+            new_seq_lens=new_seq_lens,
         )
