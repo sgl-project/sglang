@@ -438,9 +438,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
             matched = False
             for ack_id in ack.node_ids:
-                matched |= self._finish_write_through_ack(
-                    ack_id, release_lock=True
-                )
+                matched |= self._finish_write_through_ack(ack_id, release_lock=True)
             if matched:
                 self.cache_controller.record_l1_l2_transfer_complete(
                     direction="offload",

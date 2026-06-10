@@ -1362,10 +1362,9 @@ class HiCacheController:
         total = int(token_count) * self._host_pool_size_per_token(PoolName.KV)
 
         for transfer in pool_transfers or []:
-            total += (
-                self._transfer_index_count(transfer)
-                * self._host_pool_size_per_token(transfer.name)
-            )
+            total += self._transfer_index_count(
+                transfer
+            ) * self._host_pool_size_per_token(transfer.name)
 
         if self.has_draft and self.mem_pool_host_draft is not None:
             draft_size_per_token = getattr(

@@ -11,8 +11,9 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.managers.cache_controller import HiCacheAck, HiCacheController
-from sglang.srt.observability.metrics_collector import HiCacheL1L2TransferMetricsCollector
-
+from sglang.srt.observability.metrics_collector import (
+    HiCacheL1L2TransferMetricsCollector,
+)
 
 # ── Test doubles ──────────────────────────────────────────────────────────────
 
@@ -224,7 +225,9 @@ class TestHiCacheL1L2TransferCollectorPrometheusOutput(unittest.TestCase):
 
         return generate_latest(self.registry).decode("utf-8")
 
-    def _find_metric_line(self, exposition: str, name_fragment: str, **label_filters) -> str:
+    def _find_metric_line(
+        self, exposition: str, name_fragment: str, **label_filters
+    ) -> str:
         """Return the first non-comment line matching name_fragment and all
         label_filters, or fail the test."""
         for line in exposition.splitlines():
@@ -271,7 +274,9 @@ class TestHiCacheL1L2TransferCollectorPrometheusOutput(unittest.TestCase):
             "hicache_l1_l2_transfer_bytes_total",
             direction="onboard",
         )
-        self.assertTrue(line.endswith(" 32768.0"), f"Expected value 32768.0 in: {line!r}")
+        self.assertTrue(
+            line.endswith(" 32768.0"), f"Expected value 32768.0 in: {line!r}"
+        )
 
     def test_duration_histogram_sum_when_xfer_us_provided(self):
         c = self._make_collector()
