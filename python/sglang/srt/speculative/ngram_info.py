@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -15,7 +14,6 @@ from sglang.srt.speculative.eagle_info_v2 import (
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
-@dataclass
 class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixin):
     def __init__(
         self,
