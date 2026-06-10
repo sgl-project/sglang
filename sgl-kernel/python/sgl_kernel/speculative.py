@@ -178,56 +178,6 @@ def build_tree_kernel_efficient_cpu(
     )
 
 
-def create_extend_after_decode_spec_info_cpu(
-    verified_id: torch.Tensor,
-    seq_lens: torch.Tensor,
-    accept_lens: torch.Tensor,
-    positions: torch.Tensor,
-    new_verified_id: torch.Tensor,
-    bs_upper: int,
-) -> None:
-    torch.ops.sgl_kernel.create_extend_after_decode_spec_info_cpu(
-        verified_id,
-        seq_lens,
-        accept_lens,
-        positions,
-        new_verified_id,
-        bs_upper,
-    )
-
-
-def align_evict_mask_to_page_size_cpu(
-    seq_lens: torch.Tensor,
-    evict_mask: torch.Tensor,
-    page_size: int,
-    num_draft_tokens: int,
-) -> None:
-    torch.ops.sgl_kernel.align_evict_mask_to_page_size_cpu(
-        seq_lens,
-        evict_mask,
-        page_size,
-        num_draft_tokens,
-    )
-
-
-def get_target_cache_loc_cpu(
-    tgt_cache_loc: torch.Tensor,
-    to_free_slots: torch.Tensor,
-    num_correct_drafts: torch.Tensor,
-    to_free_num_slots: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    num_verify_tokens: int,
-) -> None:
-    torch.ops.sgl_kernel.get_target_cache_loc_cpu(
-        tgt_cache_loc,
-        to_free_slots,
-        num_correct_drafts.to(torch.int64),
-        to_free_num_slots.to(torch.int64),
-        out_cache_loc,
-        num_verify_tokens,
-    )
-
-
 def assign_req_to_token_pool_cpu(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -245,26 +195,6 @@ def assign_req_to_token_pool_cpu(
         out_cache_loc,
         pool_len,
         bs_upper,
-    )
-
-
-def create_flashinfer_kv_indices_cpu(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    page_kernel_lens: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_start_idx,
-    kv_indices: torch.Tensor,
-    req_to_token_stride: int,
-) -> None:
-    torch.ops.sgl_kernel.create_flashinfer_kv_indices_cpu(
-        req_to_token,
-        req_pool_indices,
-        page_kernel_lens,
-        kv_indptr,
-        kv_start_idx,
-        kv_indices,
-        req_to_token_stride,
     )
 
 

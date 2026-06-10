@@ -475,10 +475,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
             key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
-            if is_cpu():
-                query = query.contiguous()
-                key = key.contiguous()
-                value = value.contiguous()
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(

@@ -514,8 +514,8 @@ def register_fake_ops(tp_size: int):
     ):
         assert q.dim() == 4
         assert v.dim() == 4
-        seq_len = q.shape[0]
         batch_size = q.shape[1]
+        seq_len = q.shape[0]
         v_num_heads = v.shape[2]
         v_head_dim = v.shape[3]
         return q.new_empty(seq_len, batch_size, v_num_heads, v_head_dim)
