@@ -263,7 +263,9 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+          # TEMP: use the PyTorch test CPU index until torch 2.12.1 wheels are
+          # available on the normal PyTorch index.
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow --extra-index-url https://download.pytorch.org/whl/test/cpu
 
       - name: Run test
         timeout-minutes: 60
