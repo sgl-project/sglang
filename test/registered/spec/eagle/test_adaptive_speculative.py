@@ -272,41 +272,33 @@ class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
         if os.path.exists(cls.adaptive_config_path):
             os.unlink(cls.adaptive_config_path)
 
-    def _post(self, payload: dict):
-        r = requests.post(self.base_url + "/generate", json=payload, timeout=600)
-        self.assertEqual(r.status_code, 200, r.text)
-        return r.json()
-
     def test_zero_step_within_sequence_recovery(self):
         """A long request shares a batch with many short ones: it decodes at
         steps=0 while the batch is large (BS>=8), then returns to steps=3 for its
-        (dominant) tail as the short ones finish. Its accept length must recover
-        to ~the steps=3 baseline, proving draft_extend kept the draft KV synced
-        while drafting was off -- a stale KV would reject the recovered drafts and
-        collapse accept length toward 1.0."""
-        full = {"temperature": 0, "max_new_tokens": 600, "ignore_eos": True}
-
-        # Baseline: this request never leaves steps=3 (BS=1).
-        base_len = self._post({"text": self.COUNT_PROMPT, "sampling_params": full})[
-            "meta_info"
-        ]["spec_accept_length"]
-
-        # Crossing: 13 short requests pin BS>=8 (steps=0) only briefly; the long
-        # request spends its dominant tail back at steps=3.
+        (dominant) tail as the short ones finish. Its draft accept rate must
+        recover near the steps=3 norm (~0.8 for this predictable workload)."""
         short = {"temperature": 0, "max_new_tokens": 10, "ignore_eos": True}
-        long_meta = self._post(
-            {"text": [self.COUNT_PROMPT] * 14, "sampling_params": [short] * 13 + [full]}
-        )[-1]["meta_info"]
+        full = {"temperature": 0, "max_new_tokens": 600, "ignore_eos": True}
+        r = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": [self.COUNT_PROMPT] * 14,
+                "sampling_params": [short] * 13 + [full],
+            },
+            timeout=600,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
 
+        long_meta = r.json()[-1]["meta_info"]
         hist = long_meta["spec_correct_drafts_histogram"]
         self.assertGreater(
             hist[0], 0, f"long request never decoded at steps=0 (hist={hist})"
         )
         self.assertGreater(
-            long_meta["spec_accept_length"],
-            0.8 * base_len,
-            f"accept length {long_meta['spec_accept_length']:.2f} did not recover to "
-            f"the steps=3 baseline {base_len:.2f} -> draft KV likely stale at steps=0",
+            long_meta["spec_accept_rate"],
+            0.8,
+            f"draft accept rate {long_meta['spec_accept_rate']:.2f} did not recover "
+            f"after steps=0 -> draft KV likely stale (hist={hist})",
         )
 
 
