@@ -75,7 +75,8 @@ def _kill_descendants(pid: int) -> None:
     for proc in descendants:
         try:
             proc.kill()
-        except psutil.NoSuchProcess:
+        except psutil.Error:
+            # NoSuchProcess (already gone) or AccessDenied -- nothing to do.
             pass
     psutil.wait_procs(descendants, timeout=5)
 
@@ -94,6 +95,8 @@ def _extract_num_gpus_override(
     while i < len(argv):
         a = argv[i]
         if a in ("--num-gpu", "--num-gpus"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"missing value for {a} (expected e.g. `{a} 2,4`)")
             override.extend(int(x) for x in argv[i + 1].split(","))
             i += 2
         elif a.startswith("--num-gpu=") or a.startswith("--num-gpus="):

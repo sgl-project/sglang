@@ -43,6 +43,8 @@ register_cuda_ci(
 # ---------------------------------------------------------------------------
 
 DTYPE = torch.bfloat16
+# torch.dtype.itemsize exists only on newer torch; element_size() is portable.
+DTYPE_ITEMSIZE = torch.tensor([], dtype=DTYPE).element_size()
 MESSAGE_SIZES_BYTES = [
     4 * 1024,  # 4K
     16 * 1024,  # 16K
@@ -174,8 +176,8 @@ class FlashInferAllReduceBackend:
         world_size = dist.get_world_size(group=group)
         # Use the smallest message size as the inner hidden dim, so any
         # message in the sweep is an integer multiple of it.
-        hidden_dim = min(MESSAGE_SIZES_BYTES) // DTYPE.itemsize
-        num_tokens = MAX_BYTES // (hidden_dim * DTYPE.itemsize)
+        hidden_dim = min(MESSAGE_SIZES_BYTES) // DTYPE_ITEMSIZE
+        num_tokens = MAX_BYTES // (hidden_dim * DTYPE_ITEMSIZE)
         self._comm = comm
         self._hidden_dim = hidden_dim
         self._workspace = comm.create_allreduce_fusion_workspace(
@@ -265,7 +267,7 @@ def benchmark(message_bytes: int, provider: str):
         )
     _init_all_backends()
     backend = BACKEND_FACTORY[provider]()
-    numel = message_bytes // DTYPE.itemsize
+    numel = message_bytes // DTYPE_ITEMSIZE
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     x = torch.randn(numel, dtype=DTYPE, device=device)
     # Bandwidth-equivalent bytes moved by a ring all-reduce per rank.

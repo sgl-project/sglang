@@ -158,7 +158,9 @@ def _init_nccl_group_once() -> dist.ProcessGroup:
 def _init_comm_once() -> CustomAllReduceV2:
     cpu_group = _init_cpu_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    max_size = max(TEST_SIZES) * max(d.itemsize for d in TEST_DTYPES)
+    max_size = max(TEST_SIZES) * max(
+        torch.tensor([], dtype=d).element_size() for d in TEST_DTYPES
+    )
     comm = CustomAllReduceV2(cpu_group, device, max_size, max_size)
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
