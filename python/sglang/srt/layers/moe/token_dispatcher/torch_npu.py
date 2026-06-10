@@ -93,13 +93,13 @@ class TorchNpuDispatcher(BaseDispatcher):
 
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
             # Prefill
-            self.init_routing_prefill = NPUMoEInitRouting_v2(quant_mode=1) #NPUMoEInitRouting_v1()
-            self.finalize_routing_prefill = NPUMoETokenUnpermute()# NPUFinalizeRouting(drop_pad_mode=2)
-            self.group_list_type_prefill = 1
+            self.init_routing_prefill = NPUMoEInitRouting_v1()
+            self.finalize_routing_prefill = NPUFinalizeRouting(drop_pad_mode=2)
+            self.group_list_type_prefill = 0
             # Decode
-            self.init_routing_decode = NPUMoEInitRouting_v2(quant_mode=1)
-            self.finalize_routing_decode = NPUMoETokenUnpermute()
-            self.group_list_type_decode = 1
+            self.init_routing_decode = NPUMoEInitRouting_v1()
+            self.finalize_routing_decode = NPUFinalizeRouting(drop_pad_mode=2)
+            self.group_list_type_decode = 0
 
         else:
             raise ValueError(
@@ -115,7 +115,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         The phase (prefill vs decode) is inferred from the stream capture state.
         """
         # Determine inference phase and select matching init/finalize kernels
-        if torch.npu.is_current_stream_capturing():
+        if not torch.npu.is_current_stream_capturing():
             self._dispatch = self.init_routing_prefill
             self._combine = self.finalize_routing_prefill
             group_list_type = self.group_list_type_prefill
