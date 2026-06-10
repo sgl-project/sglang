@@ -3668,6 +3668,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "v_proj",
     "o_proj",
     "out_proj",
+    "in_proj",
+    "gate",
     "q_a_proj",
     "kv_a_proj_with_mqa",
     "q_b_proj",
