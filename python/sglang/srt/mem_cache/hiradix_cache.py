@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchOperation,
+    storage_supports_host_dedup,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -42,6 +46,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    MLATokenToKVPoolFP4,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -77,6 +82,23 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        # Pre-rendezvous BOTH world-collectives HiCacheController would issue
+        # at init time — the NCCL mla_bcast_group AND the gloo
+        # prefetch_sync_groups — BEFORE any slow HostKVCache allocation below.
+        # Without this, rank 0 can spend 20-30 min pinning hundreds of GB of
+        # host KV while non-rank-0 attn-TP ranks race ahead through the dummy
+        # fast path, hit the next world all_gather_object inside
+        # create_custom_parallel_group, and trip the 600s NCCL watchdog that
+        # kills every rank in lockstep (seen on prod TP=16, --hicache-size 800).
+        # See HiCacheController.prebuild_mla_broadcast_state for the full
+        # rationale. Gating mirrors HiCacheController.is_mla so we don't build
+        # a group on ranks the controller will then ignore: FP4 pools and
+        # non-dedup storage backends keep full per-rank host pools and have
+        # no slow-rank-0 asymmetry, so there's no race to head off there.
+        self._mla_broadcast_state = self._maybe_prebuild_mla_broadcast_state(
+            params, server_args
+        )
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
@@ -90,6 +112,37 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
+            # Non-rank-0 MLA ranks use an allocator-only host pool.
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            from sglang.srt.layers.dp_attention import (
+                get_attention_tp_rank,
+                get_attention_tp_size,
+                is_dp_attention_enabled,
+            )
+            from sglang.srt.utils import is_cuda
+
+            if is_dp_attention_enabled():
+                mla_tp_rank = get_attention_tp_rank()
+                mla_tp_size = get_attention_tp_size()
+            else:
+                mla_tp_rank = get_tensor_model_parallel_rank()
+                mla_tp_size = get_tensor_model_parallel_world_size()
+            # Keep this in sync with HiCacheController dedup gating. FP4 pools
+            # are excluded (extra scale buffer the broadcast can't carry). Dedup
+            # only engages with a dedup-compatible storage backend (no L3 or the
+            # file backend); RDMA/registered backends can't tolerate the dummy
+            # pool's missing host buffer, so every rank keeps a full pool there.
+            mla_is_dummy = (
+                is_cuda()
+                and mla_tp_size > 1
+                and mla_tp_rank != 0
+                and not isinstance(self.kv_cache, MLATokenToKVPoolFP4)
+                and storage_supports_host_dedup(server_args.hicache_storage_backend)
+            )
+
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -97,6 +150,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                is_dummy=mla_is_dummy,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
@@ -135,6 +189,7 @@ class HiRadixCache(RadixCache):
                 load_cache_event=self.load_cache_event,
                 attn_cp_group=self.attn_cp_group,
                 attn_tp_group=self.attn_tp_group,
+                mla_broadcast_state=self._mla_broadcast_state,
             )
         else:
             self.cache_controller = HiCacheController(
@@ -154,6 +209,7 @@ class HiRadixCache(RadixCache):
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
+                mla_broadcast_state=self._mla_broadcast_state,
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -188,6 +244,22 @@ class HiRadixCache(RadixCache):
 
         super().__init__(params=params)
 
+    def _maybe_prebuild_mla_broadcast_state(
+        self, params: CacheInitParams, server_args: ServerArgs
+    ) -> Optional[dict]:
+        """Thin wrapper around HiCacheController.maybe_prebuild_mla_broadcast_state
+        for HiRadixCache's init time. Centralizing the gating there keeps the
+        non-DSA MLA path, the DSA hybrid path, and the unified assembler
+        strategies in lockstep with HiCacheController.is_mla.
+        """
+        return HiCacheController.maybe_prebuild_mla_broadcast_state(
+            self.kv_cache,
+            params.tp_cache_group,
+            params.attn_cp_cache_group,
+            params.attn_tp_cache_group,
+            server_args.hicache_storage_backend,
+        )
+
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
         for group in (self.attn_cp_group, self.attn_tp_group):
@@ -217,6 +289,10 @@ class HiRadixCache(RadixCache):
                 self.detach_storage_backend()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
+        try:
+            self.cache_controller._destroy_mla_broadcast_group()
+        except Exception:
+            logger.exception("Failed to destroy MLA broadcast group.")
 
     def _apply_storage_runtime_config(
         self,
