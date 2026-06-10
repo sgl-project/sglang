@@ -781,6 +781,7 @@ class ServerArgs:
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
+    default_custom_logit_processor: Optional[str] = None
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     enforce_shared_experts_fusion: bool = False
@@ -6764,6 +6765,15 @@ class ServerArgs:
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
         parser.add_argument(
+            "--default-custom-logit-processor",
+            type=str,
+            default=ServerArgs.default_custom_logit_processor,
+            choices=["RepetitionTruncationLogitProcessor"],
+            help="The default custom logit processor to apply when "
+            "--enable-custom-logit-processor is set but a request does not "
+            "specify its own.",
+        )
+        parser.add_argument(
             "--flashinfer-mla-disable-ragged",
             action="store_true",
             help="Not using ragged prefill wrapper when running flashinfer mla",
@@ -7444,6 +7454,25 @@ class ServerArgs:
                 "served_model_name cannot contain a colon (':') character. "
                 "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
                 f"Invalid value: '{self.served_model_name}'"
+            )
+
+        # Check custom logit processor
+        if (
+            self.default_custom_logit_processor is not None
+            and not self.enable_custom_logit_processor
+        ):
+            raise ValueError(
+                "--default-custom-logit-processor requires "
+                "--enable-custom-logit-processor to be set."
+            )
+        if (
+            self.default_custom_logit_processor == "RepetitionTruncationLogitProcessor"
+            and envs.SGLANG_DEBUG_REPETITION_TRUNCATION_DETECT_ONLY.get()
+        ):
+            logger.warning(
+                "SGLANG_DEBUG_REPETITION_TRUNCATION_DETECT_ONLY is enabled; "
+                "repetition will be detected but output will not be truncated. "
+                "This is intended for debugging only."
             )
 
         # Check LoRA

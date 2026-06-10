@@ -665,6 +665,10 @@ class Envs:
     # Logits processor
     SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
     SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+    # Debug-only: mark the repetition_truncation finish reason when a repeat is
+    # detected, but do not actually truncate the output. For observing detection
+    # rates in production without affecting generations.
+    SGLANG_DEBUG_REPETITION_TRUNCATION_DETECT_ONLY = EnvBool(False)
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)

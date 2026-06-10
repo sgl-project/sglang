@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
     GetLoadsReqInput,
 )
 from sglang.srt.managers.schedule_batch import (
+    FINISH_REPEAT_TRUNCATION,
     BaseFinishReason,
     Req,
 )
@@ -349,9 +350,18 @@ class _GenerationStreamAccumulator:
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
         self.rids.append(req.rid)
         self.http_worker_ipcs.append(req.http_worker_ipc)
-        self.finished_reasons.append(
+        finish_reason_data = (
             req.finished_reason.to_json() if req.finished_reason else None
         )
+        # Surface repetition truncation as the finish reason when it was detected,
+        # unless the request finished for a more specific terminal reason (abort).
+        if finish_reason_data and req.repetition_detected:
+            if finish_reason_data.get("type") not in (
+                "abort",
+                "repetition_truncation",
+            ):
+                finish_reason_data = FINISH_REPEAT_TRUNCATION().to_json()
+        self.finished_reasons.append(finish_reason_data)
         self.decoded_texts.append(req.decoded_text)
         decode_ids, read_offset = req.init_incremental_detokenize()
 

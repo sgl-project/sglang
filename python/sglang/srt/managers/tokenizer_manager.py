@@ -289,6 +289,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        # Init server-side default custom logit processor
+        self.maybe_init_default_custom_logit_processor()
+
+    def maybe_init_default_custom_logit_processor(self):
+        """Resolve --default-custom-logit-processor to a serialized processor.
+
+        Stored as self.default_custom_logit_processor (None when unset) and used
+        as the fallback when a request does not provide its own processor.
+        """
+        from sglang.srt.sampling.custom_logit_processor import (
+            DEFAULT_CUSTOM_LOGIT_PROCESSOR_REGISTRY,
+        )
+
+        self.default_custom_logit_processor = None
+        server_args = self.server_args
+        if (
+            server_args.enable_custom_logit_processor
+            and server_args.default_custom_logit_processor is not None
+        ):
+            processor_cls = DEFAULT_CUSTOM_LOGIT_PROCESSOR_REGISTRY[
+                server_args.default_custom_logit_processor
+            ]
+            self.default_custom_logit_processor = processor_cls.to_str()
+
     def init_model_config(self):
         server_args = self.server_args
         model_config_class = getattr(self, "model_config_class", ModelConfig)
@@ -1122,7 +1146,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_params=session_params,
-                custom_logit_processor=obj.custom_logit_processor,
+                custom_logit_processor=(
+                    obj.custom_logit_processor
+                    if obj.custom_logit_processor is not None
+                    else self.default_custom_logit_processor
+                ),
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
