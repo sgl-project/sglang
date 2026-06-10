@@ -47,9 +47,9 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
         "--hicache-ratio",
         "1.5",
         "--hicache-mem-layout",
-        "page_first_direct",
+        "page_first",
         "--hicache-io-backend",
-        "direct",
+        "kernel",
     ]
 
     bs_1_speed_thres = 170

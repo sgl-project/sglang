@@ -30,9 +30,6 @@ def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
     if layout == "page_first":
         k_dims = (8, host.layer_num, host.head_num, host.head_dim)
         v_dims = (8, host.layer_num, host.head_num, host.v_head_dim)
-    elif layout == "page_first_direct":
-        k_dims = (4, host.layer_num, host.page_size, host.head_num, host.head_dim)
-        v_dims = (4, host.layer_num, host.page_size, host.head_num, host.v_head_dim)
     else:
         raise ValueError(f"Unsupported test layout: {layout}")
 
@@ -124,18 +121,15 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         self.assertEqual(v_call.kwargs["item_size"], 24)
         self.assertEqual(v_call.kwargs["dst_layout_dim"], 72)
 
-    def test_direct_load_uses_single_buffer_calls_for_k_and_v(self):
-        # Direct copies infer single-buffer mode from one-element pointer lists.
-        # This test guards that asymmetric K/V never use the paired K/V form.
-        host = _make_host("page_first_direct")
+    def test_direct_load_is_rejected(self):
+        # Direct single-buffer D2H is not reliable for asymmetric K/V in the
+        # current sgl-kernel fast path, so the asymmetric host pool is kernel-only.
+        host = _make_host("page_first")
         device_pool = _make_device_pool(host)
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
 
-        with mock.patch(
-            "sglang.srt.mem_cache.memory_pool_host.transfer_kv_per_layer_direct_pf_lf",
-            create=True,
-        ) as transfer:
+        with self.assertRaisesRegex(ValueError, "expected 'kernel'"):
             host.load_to_device_per_layer(
                 device_pool,
                 host_indices,
@@ -144,41 +138,18 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
                 io_backend="direct",
             )
 
-        self.assertEqual(transfer.call_count, 2)
-        k_call, v_call = transfer.call_args_list
-        self.assertEqual(len(k_call.kwargs["src_ptrs"]), 1)
-        self.assertEqual(len(k_call.kwargs["dst_ptrs"]), 1)
-        self.assertEqual(len(v_call.kwargs["src_ptrs"]), 1)
-        self.assertEqual(len(v_call.kwargs["dst_ptrs"]), 1)
-        self.assertIs(k_call.kwargs["src_ptrs"][0], host.k_buffer)
-        self.assertIs(k_call.kwargs["dst_ptrs"][0], device_pool.k_buffer[2])
-        self.assertIs(v_call.kwargs["src_ptrs"][0], host.v_buffer)
-        self.assertIs(v_call.kwargs["dst_ptrs"][0], device_pool.v_buffer[2])
-
-    def test_direct_backup_uses_single_buffer_calls_for_k_and_v(self):
-        # Direct D2H similarly uses one destination buffer at a time, avoiding the
-        # paired-copy path that assumes K and V have the same element shape.
-        host = _make_host("page_first_direct")
+    def test_direct_backup_is_rejected(self):
+        # Same restriction for D2H backup: asymmetric MHA uses the kernel path
+        # until the direct kernel has an explicit safe asymmetric mode.
+        host = _make_host("page_first")
         device_pool = _make_device_pool(host)
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
 
-        with mock.patch(
-            "sglang.srt.mem_cache.memory_pool_host.transfer_kv_all_layer_direct_lf_pf",
-            create=True,
-        ) as transfer:
+        with self.assertRaisesRegex(ValueError, "expected 'kernel'"):
             host.backup_from_device_all_layer(
                 device_pool, host_indices, device_indices, io_backend="direct"
             )
-
-        self.assertEqual(transfer.call_count, 2)
-        k_call, v_call = transfer.call_args_list
-        self.assertIs(k_call.kwargs["src_ptrs"], device_pool.k_buffer)
-        self.assertEqual(len(k_call.kwargs["dst_ptrs"]), 1)
-        self.assertIs(k_call.kwargs["dst_ptrs"][0], host.k_buffer)
-        self.assertIs(v_call.kwargs["src_ptrs"], device_pool.v_buffer)
-        self.assertEqual(len(v_call.kwargs["dst_ptrs"]), 1)
-        self.assertIs(v_call.kwargs["dst_ptrs"][0], host.v_buffer)
 
 
 if __name__ == "__main__":

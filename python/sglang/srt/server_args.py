@@ -2432,27 +2432,22 @@ class ServerArgs:
                         "to enable --enable-hierarchical-cache for this model."
                     )
 
-                # MiMoV2 has head_dim != v_head_dim, so the host KV pool must use
-                # asymmetric K/V allocation. The AOT (non-JIT) 'kernel' transfer
-                # path passes a single item_size and would silently mis-stride V
-                # transfers when v_head_dim differs, so force io_backend='direct'.
-                # The direct transfer path for HiCache requires layout='page_first_direct'.
-                if self.hicache_io_backend != "direct":
+                # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
+                # asymmetric K/V allocation. Only the kernel/page_first transfer
+                # path has a safe split K/V implementation.
+                if self.hicache_io_backend != "kernel":
                     logger.warning(
-                        f"Force hicache_io_backend to 'direct' for MiMoV2 model "
-                        f"(was {self.hicache_io_backend!r}); the 'kernel' "
-                        f"transfer path assumes head_dim == v_head_dim and "
-                        f"would corrupt V copies."
+                        f"Force hicache_io_backend to 'kernel' for MiMoV2 model "
+                        f"(was {self.hicache_io_backend!r})."
                     )
-                    self.hicache_io_backend = "direct"
-                if self.hicache_mem_layout != "page_first_direct":
+                    self.hicache_io_backend = "kernel"
+                if self.hicache_mem_layout != "page_first":
                     logger.warning(
-                        f"Force hicache_mem_layout to 'page_first_direct' for "
+                        f"Force hicache_mem_layout to 'page_first' for "
                         f"MiMoV2 model (was {self.hicache_mem_layout!r}); "
-                        f"hicache_io_backend='direct' requires layout="
-                        f"'page_first_direct'."
+                        f"asymmetric K/V HiCache requires kernel/page_first."
                     )
-                    self.hicache_mem_layout = "page_first_direct"
+                    self.hicache_mem_layout = "page_first"
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch

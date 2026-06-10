@@ -905,10 +905,11 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
     K and V are stored in two independent host buffers (``self.k_buffer`` and
     ``self.v_buffer``) instead of a single ``(2, ...)`` tensor, so each side
-    keeps its native stride. The transfer paths dispatch K and V as independent
-    single-buffer copies so each side uses its own ``item_size``. The flat-page
-    L3 storage interface assumes a single shared ``item_size`` and would
-    silently corrupt V copies, so it raises ``NotImplementedError``.
+    keeps its native stride. The kernel transfer path dispatches K and V as
+    independent single-buffer copies so each side uses its own ``item_size``.
+    Direct transfer and the flat-page L3 storage interface assume a single
+    shared ``item_size`` in paths that are not safe for asymmetric K/V, so they
+    raise instead of silently corrupting V copies.
     """
 
     def get_size_per_token(self):
@@ -930,25 +931,10 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         if self.layout == "page_first":
             k_dims = (self.size, self.layer_num, self.head_num, self.head_dim)
             v_dims = (self.size, self.layer_num, self.head_num, self.v_head_dim)
-        elif self.layout == "page_first_direct":
-            k_dims = (
-                self.page_num,
-                self.layer_num,
-                self.page_size,
-                self.head_num,
-                self.head_dim,
-            )
-            v_dims = (
-                self.page_num,
-                self.layer_num,
-                self.page_size,
-                self.head_num,
-                self.v_head_dim,
-            )
         else:
             raise ValueError(
                 f"Unsupported layout for models with head_dim != v_head_dim: "
-                f"{self.layout}; expected 'page_first' or 'page_first_direct'."
+                f"{self.layout}; expected 'page_first'."
             )
 
         # token_stride_size / layout_dim are intentionally NOT set: K and V
@@ -1024,31 +1010,11 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                 item_size=self._v_token_stride_size(),
                 src_layout_dim=self._v_layout_dim(),
             )
-        elif io_backend == "direct":
-            if self.layout != "page_first_direct":
-                raise ValueError(
-                    f"Unsupported layout for models with head_dim != v_head_dim "
-                    f"and io_backend='direct': {self.layout}; "
-                    "expected 'page_first_direct'."
-                )
-            transfer_kv_per_layer_direct_pf_lf(
-                src_ptrs=[self.k_buffer],
-                dst_ptrs=[device_pool.k_buffer[layer_id]],
-                src_indices=host_indices,
-                dst_indices=device_indices,
-                layer_id=layer_id,
-                page_size=self.page_size,
-            )
-            transfer_kv_per_layer_direct_pf_lf(
-                src_ptrs=[self.v_buffer],
-                dst_ptrs=[device_pool.v_buffer[layer_id]],
-                src_indices=host_indices,
-                dst_indices=device_indices,
-                layer_id=layer_id,
-                page_size=self.page_size,
-            )
         else:
-            raise ValueError(f"Unsupported IO backend: {io_backend}")
+            raise ValueError(
+                f"Unsupported IO backend for models with head_dim != v_head_dim: "
+                f"{io_backend}; expected 'kernel'."
+            )
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -1077,29 +1043,11 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                 dst_layout_dim=self._v_layout_dim(),
                 num_layers=self.layer_num,
             )
-        elif io_backend == "direct":
-            if self.layout != "page_first_direct":
-                raise ValueError(
-                    f"Unsupported layout for models with head_dim != v_head_dim "
-                    f"and io_backend='direct': {self.layout}; "
-                    "expected 'page_first_direct'."
-                )
-            transfer_kv_all_layer_direct_lf_pf(
-                src_ptrs=device_pool.k_buffer,
-                dst_ptrs=[self.k_buffer],
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                page_size=self.page_size,
-            )
-            transfer_kv_all_layer_direct_lf_pf(
-                src_ptrs=device_pool.v_buffer,
-                dst_ptrs=[self.v_buffer],
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                page_size=self.page_size,
-            )
         else:
-            raise ValueError(f"Unsupported IO backend: {io_backend}")
+            raise ValueError(
+                f"Unsupported IO backend for models with head_dim != v_head_dim: "
+                f"{io_backend}; expected 'kernel'."
+            )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         raise self._flat_page_unsupported()
@@ -1120,7 +1068,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
     def get_page_buffer_meta(self, indices):
         assert len(indices) % self.page_size == 0
-        if self.layout not in ("page_first", "page_first_direct"):
+        if self.layout != "page_first":
             raise ValueError(
                 f"Unsupported layout for models with head_dim != v_head_dim: "
                 f"{self.layout}"
@@ -1166,7 +1114,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         return ptr_list, element_size_list
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        if self.layout not in ("page_first", "page_first_direct"):
+        if self.layout != "page_first":
             return False
         k_stride = (
             self.page_size

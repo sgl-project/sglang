@@ -9,8 +9,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
 
-# These tests use AsymmetricMHATokenToKVPoolHost methods and let that class
-# call the real sgl-kernel transfer ops.
+# These tests use AsymmetricMHATokenToKVPoolHost methods and let that class call
+# the real sgl-kernel transfer ops. The asymmetric host pool is kernel-only;
+# direct/page_first_direct is intentionally rejected in the CPU dispatch tests.
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="asymmetric host-pool tests require CUDA."
 )
@@ -19,10 +20,9 @@ DEVICE = "cuda"
 PAGE_SIZE = 16
 NUM_LAYERS = 3
 TOTAL_ITEMS = PAGE_SIZE * 8
-TOTAL_PAGES = TOTAL_ITEMS // PAGE_SIZE
-HEAD_NUM = 2
-K_HEAD_DIM = 4
-V_HEAD_DIM = 6
+HEAD_NUM = 4
+K_HEAD_DIM = 192
+V_HEAD_DIM = 128
 DTYPES = [torch.float16, torch.bfloat16]
 
 
@@ -45,28 +45,22 @@ def fill_with_offset(tensor, offset):
     tensor.copy_((data + offset).view_as(tensor))
 
 
-def make_host_pool(layout, dtype):
+def make_host_pool(dtype):
     host = AsymmetricMHATokenToKVPoolHost.__new__(AsymmetricMHATokenToKVPoolHost)
-    host.layout = layout
+    host.layout = "page_first"
     host.page_size = PAGE_SIZE
     host.layer_num = NUM_LAYERS
     host.head_num = HEAD_NUM
     host.head_dim = K_HEAD_DIM
     host.v_head_dim = V_HEAD_DIM
     host.dtype = dtype
-
-    if layout == "page_first":
-        k_shape = (TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, K_HEAD_DIM)
-        v_shape = (TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, V_HEAD_DIM)
-    elif layout == "page_first_direct":
-        k_shape = (TOTAL_PAGES, NUM_LAYERS, PAGE_SIZE, HEAD_NUM, K_HEAD_DIM)
-        v_shape = (TOTAL_PAGES, NUM_LAYERS, PAGE_SIZE, HEAD_NUM, V_HEAD_DIM)
-    else:
-        raise ValueError(f"Unsupported test layout: {layout}")
-
     host.kv_buffer = (
-        torch.zeros(k_shape, dtype=dtype).pin_memory(),
-        torch.zeros(v_shape, dtype=dtype).pin_memory(),
+        torch.zeros(
+            TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, K_HEAD_DIM, dtype=dtype
+        ).pin_memory(),
+        torch.zeros(
+            TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, V_HEAD_DIM, dtype=dtype
+        ).pin_memory(),
     )
     return host
 
@@ -98,77 +92,47 @@ def make_device_pool(dtype):
 
 def assert_backup_matches_device(host, device_pool, host_indices_host, device_indices):
     for layer_id in range(NUM_LAYERS):
-        if host.layout == "page_first":
-            torch.testing.assert_close(
-                host.k_buffer[host_indices_host, layer_id],
-                device_pool.k_buffer[layer_id][device_indices].cpu(),
-            )
-            torch.testing.assert_close(
-                host.v_buffer[host_indices_host, layer_id],
-                device_pool.v_buffer[layer_id][device_indices].cpu(),
-            )
-        else:
-            for host_page in range(len(host_indices_host) // PAGE_SIZE):
-                device_start = int(device_indices[host_page * PAGE_SIZE])
-                device_slice = slice(device_start, device_start + PAGE_SIZE)
-                torch.testing.assert_close(
-                    host.k_buffer[host_page, layer_id],
-                    device_pool.k_buffer[layer_id][device_slice].cpu(),
-                )
-                torch.testing.assert_close(
-                    host.v_buffer[host_page, layer_id],
-                    device_pool.v_buffer[layer_id][device_slice].cpu(),
-                )
+        torch.testing.assert_close(
+            host.k_buffer[host_indices_host, layer_id],
+            device_pool.k_buffer[layer_id][device_indices].cpu(),
+        )
+        torch.testing.assert_close(
+            host.v_buffer[host_indices_host, layer_id],
+            device_pool.v_buffer[layer_id][device_indices].cpu(),
+        )
 
 
 def assert_load_matches_host(host, device_pool, host_indices_host, load_indices):
     for layer_id in range(NUM_LAYERS):
-        if host.layout == "page_first":
-            torch.testing.assert_close(
-                device_pool.k_buffer[layer_id][load_indices],
-                host.k_buffer[host_indices_host, layer_id].to(DEVICE),
-            )
-            torch.testing.assert_close(
-                device_pool.v_buffer[layer_id][load_indices],
-                host.v_buffer[host_indices_host, layer_id].to(DEVICE),
-            )
-        else:
-            for host_page in range(len(host_indices_host) // PAGE_SIZE):
-                load_start = int(load_indices[host_page * PAGE_SIZE])
-                load_slice = slice(load_start, load_start + PAGE_SIZE)
-                torch.testing.assert_close(
-                    device_pool.k_buffer[layer_id][load_slice],
-                    host.k_buffer[host_page, layer_id].to(DEVICE),
-                )
-                torch.testing.assert_close(
-                    device_pool.v_buffer[layer_id][load_slice],
-                    host.v_buffer[host_page, layer_id].to(DEVICE),
-                )
+        torch.testing.assert_close(
+            device_pool.k_buffer[layer_id][load_indices],
+            host.k_buffer[host_indices_host, layer_id].to(DEVICE),
+        )
+        torch.testing.assert_close(
+            device_pool.v_buffer[layer_id][load_indices],
+            host.v_buffer[host_indices_host, layer_id].to(DEVICE),
+        )
 
 
-def run_roundtrip(layout, io_backend, dtype):
-    host = make_host_pool(layout, dtype)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_asymmetric_mha_kernel_page_first_roundtrip(dtype):
+    # Covers D2H backup + H2D load through AsymmetricMHATokenToKVPoolHost using
+    # MiMoV2's real K/V head dims and the real MLA single-buffer kernels.
+    host = make_host_pool(dtype)
     device_pool = make_device_pool(dtype)
 
     device_pages = torch.tensor([1, 2, 3], dtype=torch.int64)
     host_pages = torch.tensor([0, 1, 2], dtype=torch.int64)
     load_pages = torch.tensor([4, 5, 6], dtype=torch.int64)
-
     device_indices_host = token_indices_for_pages(device_pages)
     host_indices_host = token_indices_for_pages(host_pages)
     load_indices_host = token_indices_for_pages(load_pages)
-
-    if io_backend == "kernel":
-        device_indices = device_indices_host.to(DEVICE)
-        host_indices = host_indices_host.to(DEVICE)
-        load_indices = load_indices_host.to(DEVICE)
-    else:
-        device_indices = device_indices_host
-        host_indices = host_indices_host
-        load_indices = load_indices_host
+    device_indices = device_indices_host.to(DEVICE)
+    host_indices = host_indices_host.to(DEVICE)
+    load_indices = load_indices_host.to(DEVICE)
 
     host.backup_from_device_all_layer(
-        device_pool, host_indices, device_indices, io_backend
+        device_pool, host_indices, device_indices, io_backend="kernel"
     )
     torch.cuda.synchronize()
     assert_backup_matches_device(
@@ -179,25 +143,10 @@ def run_roundtrip(layout, io_backend, dtype):
         device_pool.k_buffer[layer_id].zero_()
         device_pool.v_buffer[layer_id].zero_()
         host.load_to_device_per_layer(
-            device_pool, host_indices, load_indices, layer_id, io_backend
+            device_pool, host_indices, load_indices, layer_id, io_backend="kernel"
         )
     torch.cuda.synchronize()
     assert_load_matches_host(host, device_pool, host_indices_host, load_indices_host)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_asymmetric_mha_kernel_page_first_roundtrip(dtype):
-    # Covers backup_from_device_all_layer + load_to_device_per_layer through
-    # AsymmetricMHATokenToKVPoolHost using the real MLA single-buffer kernels.
-    run_roundtrip(layout="page_first", io_backend="kernel", dtype=dtype)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_asymmetric_mha_direct_page_first_roundtrip(dtype):
-    # Covers the direct page_first_direct path through the host-pool class. The
-    # class passes one K or V buffer per call so direct copy uses single-buffer
-    # mode instead of paired K/V mode.
-    run_roundtrip(layout="page_first_direct", io_backend="direct", dtype=dtype)
 
 
 if __name__ == "__main__":
