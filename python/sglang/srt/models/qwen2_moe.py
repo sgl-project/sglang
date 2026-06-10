@@ -407,7 +407,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         True,
                         shared_output,
                     )
-                elif _use_aiter:
+                elif _is_hip:
                     from sglang.jit_kernel.triton.sigmoid_gate_mul import (
                         sigmoid_gate_mul_broadcast,
                     )
