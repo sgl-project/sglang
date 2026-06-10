@@ -1156,7 +1156,9 @@ class AscendAttnBackend(AttentionBackend):
                                 else FULL_ATTENTION_WINDOW
                             ),
                             next_tokens=(
-                                0 if layer.sliding_window_size != -1 else FULL_ATTENTION_WINDOW
+                                0
+                                if layer.sliding_window_size != -1
+                                else FULL_ATTENTION_WINDOW
                             ),
                             atten_mask=self.fia_mask,
                             block_table=block_tables,
