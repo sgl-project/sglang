@@ -10,8 +10,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
-
 PAD_SLOT_ID = -1
 
 
@@ -631,12 +629,8 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
-    USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
-    if USE_GDC:
-        tl.extra.cuda.gdc_wait()
-
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
@@ -984,9 +978,6 @@ def _causal_conv1d_update_kernel(
                 mask=mask_retrieve,
             )
 
-    if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
-
 
 def causal_conv1d_update(
     x: torch.Tensor,
@@ -1133,8 +1124,6 @@ def causal_conv1d_update(
     else:
         stride_retrieve_parent_token_seq = stride_retrieve_parent_token_token = 0
 
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
@@ -1194,7 +1183,6 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
-        **pdl_kwargs,
     )
     if unsqueeze:
         out = out.squeeze(-1)
