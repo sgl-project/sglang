@@ -118,7 +118,6 @@ from sglang.srt.layers.attention.attention_registry import (
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
-    DpPaddingMode,
     get_attention_tp_group,
     get_attention_tp_size,
     initialize_dp_attention,
@@ -152,6 +151,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    CaptureKind,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
@@ -2745,36 +2745,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             lora_ids = None
 
-        forward_batch = ForwardBatch(
+        forward_batch = ForwardBatch.init_for_capture(
+            capture_kind=CaptureKind.DUMMY_RUN,
+            buffers=buffers,
+            bs=batch_size,
+            num_tokens=num_tokens,
             forward_mode=capture_forward_mode,
-            batch_size=batch_size,
-            input_ids=buffers.input_ids,
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_cpu=buffers.seq_lens_cpu,
-            next_token_logits_buffer=buffers.next_token_logits_buffer,
-            orig_seq_lens=buffers.seq_lens,
-            out_cache_loc=buffers.out_cache_loc,
-            seq_lens_sum=buffers.seq_lens.sum().item(),
-            encoder_lens=buffers.encoder_lens,
-            return_logprob=False,
-            positions=buffers.positions,
             extend_num_tokens=extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_start_loc=extend_start_loc,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            global_num_tokens_gpu=buffers.global_num_tokens_gpu,
-            global_num_tokens_cpu=global_num_tokens_cpu,
-            global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-            global_dp_buffer_len=global_dp_buffer_len,
-            mrope_positions=buffers.mrope_positions,
-            spec_algorithm=self.spec_algorithm,
             spec_info=spec_info,
+            spec_algorithm=self.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
-            num_token_non_padded=buffers.num_token_non_padded,
+            global_num_tokens_cpu=global_num_tokens_cpu,
+            global_dp_buffer_len=global_dp_buffer_len,
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )

@@ -46,7 +46,6 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
-    DpPaddingMode,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
@@ -60,6 +59,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    CaptureKind,
     ForwardBatch,
     ForwardMode,
     NgramEmbeddingInfo,
@@ -626,31 +626,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         buffers: DecodeInputBuffers = self.buffers
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Registry-owned FB-shared slots come through the registry (which
-        # shares physical storage with self.buffers via source=...); the rest
-        # still come off buffers directly.
+        # FB-shared slots live in the registry (sharing physical storage with
+        # self.buffers); init_for_capture slices them to the capture shape.
+        # The buffer mutation + dp gather below stay on the caller.
         registry = self.buffer_registry
-
-        def _slot(name):
-            return registry.get_slot(name).slice_for(bs, num_tokens)
-
-        input_ids = _slot("input_ids")
-        req_pool_indices = _slot("req_pool_indices")
-        seq_lens = _slot("seq_lens")
-        seq_lens_cpu = _slot("seq_lens_cpu")
-        out_cache_loc = _slot("out_cache_loc")
-        positions = _slot("positions")
-        encoder_lens = (
-            _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
-        )
-        mrope_positions = _slot("mrope_positions")
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
-        rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
-        bootstrap_room_ids_int = (
-            buffers.bootstrap_room_ids_int[:bs]
-            if buffers.bootstrap_room_ids_int is not None
-            else None
-        )
 
         buffers.num_token_non_padded[...] = num_tokens
         if (
@@ -680,7 +659,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
             num_tokens_tensor = torch.tensor(
-                global_num_tokens_cpu, dtype=torch.int32, device=input_ids.device
+                global_num_tokens_cpu,
+                dtype=torch.int32,
+                device=buffers.input_ids.device,
             )
             buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
             buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
@@ -698,52 +679,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             lora_ids = None
 
-        mamba_track_indices = (
-            _slot("mamba_track_indices")
-            if registry.has_slot("mamba_track_indices")
-            else None
-        )
-        mamba_track_mask = (
-            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
-        )
-
         if stream_idx is None:
             attn_backend = self.attn_backend
         else:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
-        forward_batch = ForwardBatch(
+        forward_batch = ForwardBatch.init_for_capture(
+            capture_kind=CaptureKind.FULL_GRAPH,
+            registry=registry,
+            buffers=buffers,
+            bs=bs,
+            num_tokens=num_tokens,
             forward_mode=self.capture_forward_mode,
-            batch_size=bs,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            next_token_logits_buffer=next_token_logits_buffer,
-            orig_seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=None,
-            encoder_lens=encoder_lens,
-            return_logprob=False,
-            positions=positions,
-            global_num_tokens_gpu=buffers.global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            spec_info=spec_info,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            capture_hidden_mode=self.capture_hidden_mode,
+            lora_ids=lora_ids,
             global_dp_buffer_len=global_dp_buffer_len,
             global_num_tokens_cpu=global_num_tokens_cpu,
-            mrope_positions=mrope_positions,
-            spec_algorithm=self.model_runner.spec_algorithm,
-            spec_info=spec_info,
-            capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
-            lora_ids=lora_ids,
-            rids_int=rids_int,
-            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
