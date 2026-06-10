@@ -1,7 +1,7 @@
 ---
 title: "MiniMax-M2.5"
 metatags:
-  description: "Deploy MiniMax-M2.5 model with SGLang on Ascend NPUs, including single-node, multi-node, and PD disaggregation modes."
+  description: "Deploy MiniMax-M2.5 model with SGLang on Ascend NPUs, including single-node and PD disaggregation modes."
 ---
 
 ## Introduction
@@ -30,10 +30,8 @@ v0.5.10 or a later version.
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 8192`                                          |
 | NPU Graph                     | `--cuda-graph-bs 8 16 24 32 48 64 80`                                                         |
-| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
+| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
-| Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                                        |
-| EPLB                          | `--load-balance-method round_robin`                                                           |
 
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
@@ -117,12 +115,13 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. The following command is based on the W8A8 quantized model.
 
+```bash Launch server
 #============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   EAGLE_MODEL_PATH: path to the EAGLE3 draft model directory
 #============================================================
 
-```bash Launch server
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -169,7 +168,7 @@ python -m sglang.launch_server \
    --disable-radix-cache \
    --prefill-delayer-max-delay-passes 500 \
    --enable-prefill-delayer \
-    --chunked-prefill-size -1 --max-prefill-tokens 8192 \
+   --chunked-prefill-size -1 --max-prefill-tokens 8192 \
    --cuda-graph-bs 8 16 24 32 48 64 80 \
    --moe-a2a-backend ascend_fuseep --deepep-mode auto --quantization modelslim \
    --speculative-algorithm EAGLE3 \
@@ -188,23 +187,24 @@ For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms
 PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
 throughput for high-concurrency scenarios. The following command is based on the W8A8 quantized model.
 
-#### 2 x Atlas 800I A3
+#### 2 x Atlas 800I A3 (W8A8)
 
 The prefill node and decode node will each run on one Atlas 800I A3.
 
 1. Run the following command on both prefill and decode nodes.
 
+```bash Prefill node
 #============================================================
 # Before running, update the following variables:
 #   P_IP: prefill node IP address
 #   D_IP: decode node IP address
 #   ASCEND_MF_STORE_URL: prefill node IP with port (e.g., tcp://192.168.1.1:24667)
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME (decode section): network interface name for HCCL
-#   GLOO_SOCKET_IFNAME (decode section): network interface name for Gloo
+#   EAGLE_MODEL_PATH: path to the EAGLE3 draft model directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 #============================================================
 
-```bash Prefill node
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -245,8 +245,8 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export HCCL_SOCKET_IFNAME=your_nic
-        export GLOO_SOCKET_IFNAME=your_nic
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export ASCEND_USE_FIA=1
         export HCCL_BUFFSIZE=2500
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
@@ -280,8 +280,8 @@ do
         echo "${D_IP[$i]}"
         export HCCL_BUFFSIZE=1600
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
-        export HCCL_SOCKET_IFNAME=your_nic
-        export GLOO_SOCKET_IFNAME=your_nic
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_FUSED_MOE_MODE=2
@@ -312,13 +312,13 @@ done
 
 2. Launch the SGLang Router (on any reachable node):
 
+```bash Router
 #============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
 #============================================================
 
-```bash Router
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy round_robin \
@@ -326,10 +326,10 @@ python -m sglang_router.launch_router \
     --decode http://<your decode ip>:33000 \
     --host 127.0.0.1 \
     --mini-lb \
-    --port 32001
+    --port 6688
 ```
 
-The full sglang server will serve on `http://127.0.0.1:32001`.
+The full sglang server will serve on `http://127.0.0.1:6688`.
 
 ## Functional verification
 
