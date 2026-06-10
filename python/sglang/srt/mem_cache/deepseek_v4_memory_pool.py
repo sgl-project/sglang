@@ -647,7 +647,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if ratio == 0:
                 self.layer_mapping.append(
                     DeepSeekV4LayerItem(
-                        compress_ratio=ratio,
+                        compress_ratio=0,
                         compress_layer_id=c1_cnt,
                     )
                 )
