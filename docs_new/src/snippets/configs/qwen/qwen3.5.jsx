@@ -141,6 +141,10 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     cookbookModel: "qwen/qwen3.5",
   },
 
+  // General playground axes ship on every cookbook by default; only the axes
+  // this model cannot use are removed — hisparse (DSA-style models only) and
+  // the MegaMoE backend (DeepSeek-V4 Blackwell kernels). MoE knobs are greyed
+  // out on the dense variants.
   playgroundFeatures: {
     attention: {
       knobs: [
@@ -149,7 +153,37 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
           { value: 16, disable: { nodes: ["single"] },
             disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to 2 Nodes first (only the 397B BF16 H100 recipe is multi-node)." },
         ]},
+        { id: "cp", label: "CP", values: [null, 1, 2, 4] },
+        { id: "dpAttn", label: "DP-Attention",
+          values: [
+            null, false, 1, 2, 4, 8,
+            { value: 16, disable: { nodes: ["single"] },
+              disableReason: "DP-Attention=16 requires 16 ranks — switch the Deploy panel's Nodes to 2 Nodes first." },
+          ],
+          labels: { "auto": "Auto", "false": "Off" } },
       ],
+    },
+
+    moe: {
+      backend: {
+        options: [
+          { id: null, label: "Inherited" },
+          { id: "deepep", label: "DeepEP", flags: ["--moe-a2a-backend deepep"],
+            disable: { variant: ["27b", "9b", "4b", "2b", "0.8b"] },
+            disableReason: "MoE backends apply to the MoE variants (397B / 122B / 35B) only." },
+        ],
+      },
+      ep: { label: "EP", values: [
+        null,
+        { value: 1, disable: { variant: ["27b", "9b", "4b", "2b", "0.8b"] },
+          disableReason: "EP applies to the MoE variants (397B / 122B / 35B) only." },
+        { value: 2, disable: { variant: ["27b", "9b", "4b", "2b", "0.8b"] },
+          disableReason: "EP applies to the MoE variants (397B / 122B / 35B) only." },
+        { value: 4, disable: { variant: ["27b", "9b", "4b", "2b", "0.8b"] },
+          disableReason: "EP applies to the MoE variants (397B / 122B / 35B) only." },
+        { value: 8, disable: { variant: ["27b", "9b", "4b", "2b", "0.8b"] },
+          disableReason: "EP applies to the MoE variants (397B / 122B / 35B) only." },
+      ]},
     },
 
     parsers: {
@@ -172,6 +206,46 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         { id: "eagle",   label: "EAGLE / MTP",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
+      ],
+    },
+
+    pdDisagg: {
+      modes: [
+        { id: "off",     label: "Off" },
+        { id: "prefill", label: "Prefill role" },
+        { id: "decode",  label: "Decode role" },
+      ],
+      transferBackends: [
+        { id: "mooncake", label: "Mooncake" },
+        { id: "nixl",     label: "NiXL" },
+      ],
+      ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
+      router: {
+        port: 8000,
+        command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:30000 \\
+  --decode http://<decode-host>:30001 \\
+  --host 0.0.0.0 --port 8000 \\
+  --disable-circuit-breaker \\
+  --health-check-interval-secs 999999`,
+      },
+    },
+
+    hicache: {
+      backends: [
+        { id: null,       label: "Auto" },
+        { id: "file",     label: "File" },
+        { id: "mooncake", label: "Mooncake" },
+        { id: "hf3fs",    label: "HF3FS" },
+        { id: "nixl",     label: "NiXL" },
+      ],
+      writePolicies: [
+        { id: "auto",                    label: "Auto" },
+        { id: "write_through",           label: "Write-through" },
+        { id: "write_back",              label: "Write-back" },
+        { id: "write_through_selective", label: "Write-through (selective)" },
       ],
     },
   },
@@ -222,7 +296,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--expert-parallel-size 8",
+        "--ep 8",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
@@ -247,7 +321,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--expert-parallel-size 8",
+        "--ep 8",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",

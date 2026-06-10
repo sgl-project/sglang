@@ -61,7 +61,7 @@ import { benchmarks } from "/src/snippets/configs/qwen/qwen3.5-benchmarks.jsx";
 
 ## Playground
 
-The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits the recipes carried over from the legacy cookbook; the Playground lets you turn knobs on top of whichever cell the Deploy panel is currently showing — override TP, strip or swap the speculative-decoding preset (NEXTN ↔ EAGLE), or toggle the reasoning / tool-call parsers.
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits the recipes carried over from the legacy cookbook; the Playground lets you turn knobs on top of whichever cell the Deploy panel is currently showing — parallelism overrides (TP / CP / DP-Attention), MoE backend + EP (MoE variants only), the speculative-decoding presets (NEXTN ↔ EAGLE, or off), the reasoning / tool-call parsers, prefill/decode disaggregation, and HiCache tiers.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
