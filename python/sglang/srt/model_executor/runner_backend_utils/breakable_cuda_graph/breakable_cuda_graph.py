@@ -12,12 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 """Breakable CUDA Graph: capture a region as a sequence of
-``torch.cuda.CUDAGraph`` segments separated by eager break points.
+torch.cuda.CUDAGraph segments separated by eager break points.
 
-Each segment is a real ``torch.cuda.CUDAGraph``. Its destructor calls
-``releasePool`` on the shared mempool, so the pool's ``use_count`` tracks how
+Each segment is a real torch.cuda.CUDAGraph. Its destructor calls
+releasePool on the shared mempool, so the pool's use_count tracks how
 many segments are alive; the pool stays pinned as long as any segment graph
-is alive. This lets ``weak_ref_tensor`` views of intermediate pool-allocated
+is alive. This lets weak_ref_tensor views of intermediate pool-allocated
 tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
@@ -34,7 +34,9 @@ try:
 except ImportError:
     rt = None
 
-from sglang.srt.model_executor.breakable_cuda_graph.cuda_utils import checkCudaErrors
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
+    checkCudaErrors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -153,9 +155,9 @@ def _weak_ref_if_tensor(x):
     mempool reclaim per-layer intermediates between segments — storage stays
     alive for each segment CUDAGraph's lifetime via its pool use_count.
 
-    ``weak_ref_tensors`` is imported lazily: the module hard-raises on
+    weak_ref_tensors is imported lazily: the module hard-raises on
     non-CUDA/NPU platforms, and we only reach this code during an active
-    BCG capture (which can't happen on CPU-only runners anyway)."""
+    Breakable capture (which can't happen on CPU-only runners anyway)."""
     if torch.is_tensor(x):
         from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
@@ -238,7 +240,7 @@ def eager_on_graph(enable: bool):
 
 
 class BreakableCUDAGraph:
-    """Container holding one ``torch.cuda.CUDAGraph`` per segment plus an
+    """Container holding one torch.cuda.CUDAGraph per segment plus an
     eager break function between consecutive segments."""
 
     def __init__(self) -> None:
@@ -259,12 +261,12 @@ class BreakableCUDAGraph:
 
 class BreakableCUDAGraphCapture:
     """Context manager that captures the enclosed code as one or more
-    ``torch.cuda.CUDAGraph`` segments separated by eager break points.
+    torch.cuda.CUDAGraph segments separated by eager break points.
 
-    Each segment shares the supplied ``pool`` (``MempoolId_t`` tuple) so
+    Each segment shares the supplied pool (MempoolId_t tuple) so
     pool-allocated intermediates can be reused across segments. While any
-    segment is alive, its ``beginAllocateToPool`` call keeps the mempool's
-    ``use_count`` > 0, which makes ``weak_ref_tensor`` of segment-allocated
+    segment is alive, its beginAllocateToPool call keeps the mempool's
+    use_count > 0, which makes weak_ref_tensor of segment-allocated
     tensors safe across subsequent replays.
     """
 

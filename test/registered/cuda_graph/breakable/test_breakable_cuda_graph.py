@@ -1,10 +1,10 @@
 """Tests for the breakable CUDA graph (BCG) runner.
 
 Two test classes:
-- ``TestBreakableCUDAGraphBasic`` / ``TestCopyOutput`` / ``TestBreakGraphHelper``:
+- TestBreakableCUDAGraphBasic / TestCopyOutput / TestBreakGraphHelper:
   unit tests for the core capture / replay mechanism (simple tensor ops).
-- ``TestBreakableCudaGraph``: integration test — spin up Qwen3-8B with
-  ``--enable-breakable-cuda-graph`` and check mgsm_en accuracy.
+- TestBreakableCudaGraph: integration test — spin up Qwen3-8B with
+  --enable-breakable-cuda-graph and check mgsm_en accuracy.
 """
 
 import unittest
@@ -53,7 +53,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         except ImportError:
             raise unittest.SkipTest("cuda-python not installed")
 
-        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,
             BreakableCUDAGraphCapture,
             eager_on_graph,
@@ -199,7 +199,7 @@ class TestCopyOutput(CustomTestCase):
         except ImportError:
             raise unittest.SkipTest("cuda-python not installed")
 
-        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             _copy_output,
         )
 
@@ -261,7 +261,7 @@ class TestBreakGraphHelper(CustomTestCase):
         except ImportError:
             raise unittest.SkipTest("cuda-python not installed")
 
-        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,
             BreakableCUDAGraphCapture,
             break_graph,
@@ -303,7 +303,7 @@ class TestBreakableCudaGraph(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-breakable-cuda-graph",
+                "--cuda-graph-backend-prefill=breakable",
             ],
         )
 
