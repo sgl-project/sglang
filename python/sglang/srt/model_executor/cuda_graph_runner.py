@@ -89,12 +89,10 @@ try:
         BufferAddressRegistry,
         CUFunctionRegistry,
         GraphMetadata,
-        get_global_registry,
         inspect_cuda_graph,
     )
     from sglang.srt.model_executor.cuda_graph_serializer import (
         GraphCacheKey,
-        compute_pool_offset,
         load_graph_cache,
         reconstruct_cuda_graph,
         save_graph_cache,
@@ -794,7 +792,6 @@ class CudaGraphRunner:
         self.cuda_graph_cache_dir = model_runner.server_args.cuda_graph_cache_dir
         self._graph_cache_hits = 0
         self._graph_cache_misses = 0
-        self._pool_offset: Optional[int] = None  # Computed after first capture
 
         # Capture
         try:
@@ -914,13 +911,9 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
-        # Pre-load cached pool base for pool offset computation.
-        # After the first capture initializes the CUDA graph memory pool,
-        # we compare the current pool base with the cached one to compute
-        # a single offset that translates all intermediate tensor addresses.
-        cached_pool_base = self._load_cached_pool_base() if (
-            _CUDA_GRAPH_CACHE_AVAILABLE and self.cuda_graph_cache_dir
-        ) else None
+        # Try to load cached graphs first (fast restart path)
+        if _CUDA_GRAPH_CACHE_AVAILABLE and self.cuda_graph_cache_dir:
+            self._try_load_all_from_cache()
 
         def _capture_one_stream(stream_idx: Optional[int] = None):
             avail_mem = get_available_gpu_memory(
@@ -935,26 +928,14 @@ class CudaGraphRunner:
                 else reversed(self.capture_bs)
             )
             for i, bs in enumerate(capture_range):
+                # Skip capture if graph was loaded from cache
                 key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-
-                # After the pool is initialized (first capture done), try
-                # loading subsequent batch sizes from cache using the pool
-                # offset for intermediate tensor address translation.
-                if self._pool_offset is not None:
-                    try:
-                        graph = self._try_load_from_cache(
-                            bs, pool_offset=self._pool_offset,
-                            stream_idx=stream_idx,
+                if key in self.graphs:
+                    if get_tensor_model_parallel_rank() == 0:
+                        capture_range.set_description(
+                            f"Loaded from cache ({bs=})"
                         )
-                        if graph is not None:
-                            self.graphs[key] = graph
-                            if get_tensor_model_parallel_rank() == 0:
-                                capture_range.set_description(
-                                    f"Loaded from cache ({bs=})"
-                                )
-                            continue
-                    except Exception as e:
-                        logger.debug(f"Cache load failed for bs={bs}: {e}")
+                    continue
 
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
@@ -980,15 +961,6 @@ class CudaGraphRunner:
                     key = bs if stream_idx is None else f"{stream_idx}_{bs}"
                     self.graphs[key] = graph
                     self.output_buffers[key] = output_buffers
-
-                    # After the first capture, compute the pool offset
-                    # for translating intermediate tensor addresses in
-                    # cached graphs. The pool is shared across all batch
-                    # sizes, so one offset works for all.
-                    if self._pool_offset is None and cached_pool_base is not None:
-                        self._pool_offset = self._compute_pool_offset(
-                            graph, cached_pool_base
-                        )
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -1321,10 +1293,9 @@ class CudaGraphRunner:
             return
 
         loaded = 0
-        pool_offset = self._pool_offset or 0
         for bs in self.capture_bs:
             try:
-                graph = self._try_load_from_cache(bs, pool_offset=pool_offset)
+                graph = self._try_load_from_cache(bs)
                 if graph is not None:
                     key = bs  # PDMux not supported for cache yet
                     self.graphs[key] = graph
@@ -1342,121 +1313,10 @@ class CudaGraphRunner:
                 f"(dir={self.cuda_graph_cache_dir})",
             )
 
-    def _load_cached_pool_base(self) -> Optional[int]:
-        """Load the pool base address from any cached graph metadata.
-
-        The pool base is needed to compute the address offset for translating
-        intermediate tensor addresses across process restarts. All cached graphs
-        from the same capture session share the same pool, so we only need
-        to find one with a non-zero pool_base_addr.
-
-        Returns:
-            The cached pool base address, or None if no cache exists.
-        """
-        if not _CUDA_GRAPH_CACHE_AVAILABLE or not self.cuda_graph_cache_dir:
-            return None
-
-        try:
-            import hashlib
-
-            model_hash = hashlib.md5(
-                str(self.model_runner.model_config.model_path).encode()
-            ).hexdigest()[:16]
-
-            for bs in self.capture_bs:
-                cache_key = GraphCacheKey(
-                    model_hash=model_hash,
-                    batch_size=bs,
-                    num_tokens_per_bs=self.num_tokens_per_bs,
-                    capture_hidden_mode=self.capture_hidden_mode.name,
-                    device_name=torch.cuda.get_device_name(),
-                    cuda_driver_version=torch.cuda.driver_version(),
-                    compute_capability=torch.cuda.get_device_capability(),
-                )
-                cached = load_graph_cache(cache_key, self.cuda_graph_cache_dir)
-                if cached is not None and cached.pool_base_addr != 0:
-                    logger.info(
-                        f"Loaded cached pool base 0x{cached.pool_base_addr:x} "
-                        f"from cache for bs={bs}"
-                    )
-                    return cached.pool_base_addr
-
-            logger.info("No cached pool base found in graph cache")
-            return None
-
-        except Exception as e:
-            logger.debug(f"Failed to load cached pool base: {e}")
-            return None
-
-    def _compute_pool_offset(
-        self, graph: torch.cuda.CUDAGraph, cached_pool_base: int
-    ) -> Optional[int]:
-        """Compute the pool offset for translating intermediate tensor addresses.
-
-        After the first capture initializes the CUDA graph memory pool, this
-        method inspects the captured graph to find the current pool base address
-        and computes the offset from the cached pool base.
-
-        All intermediate tensors from the same pool shift by a single constant
-        offset across process restarts, so this offset applies to all batch sizes.
-
-        Args:
-            graph: A captured CUDA graph (with keep_graph=True).
-            cached_pool_base: The pool base address from the cached metadata.
-
-        Returns:
-            The pool offset (new_base - old_base), or None if it cannot be computed.
-        """
-        if not _CUDA_GRAPH_CACHE_AVAILABLE:
-            return None
-
-        try:
-            # Inspect the captured graph to find the current pool base
-            address_registry = BufferAddressRegistry()
-            if self.buffers is not None:
-                for name, tensor in self.buffers.named_buffers():
-                    if tensor is not None and tensor.is_cuda:
-                        address_registry.register_buffer(name, tensor)
-            address_registry.register_model_weights(self.model_runner.model)
-
-            func_registry = get_global_registry()
-            metadata = inspect_cuda_graph(
-                graph,
-                known_buffers=address_registry.get_known_buffers(),
-                known_weights=address_registry.get_known_weights(),
-                registry=func_registry,
-            )
-
-            if metadata.pool_base_addr == 0:
-                logger.warning(
-                    "Cannot compute pool offset: captured graph has no "
-                    "intermediate tensor allocations (pool_base_addr=0)"
-                )
-                return None
-
-            offset = metadata.pool_base_addr - cached_pool_base
-            logger.info(
-                f"Computed pool offset: 0x{offset:x} "
-                f"(current_base=0x{metadata.pool_base_addr:x}, "
-                f"cached_base=0x{cached_pool_base:x})"
-            )
-            return offset
-
-        except Exception as e:
-            logger.warning(f"Failed to compute pool offset: {e}")
-            return None
-
     def _try_load_from_cache(
-        self, bs: int, pool_offset: int = 0, stream_idx: Optional[int] = None
+        self, bs: int, stream_idx: Optional[int] = None
     ) -> Optional[Any]:
         """Try to reconstruct a CUDA graph from disk cache.
-
-        Args:
-            bs: Batch size.
-            pool_offset: Offset to apply to intermediate tensor addresses.
-                Computed as new_pool_base - cached_pool_base after the first
-                capture initializes the CUDA graph memory pool.
-            stream_idx: Stream index for pd_mux (not yet supported for cache).
 
         Returns a graph object (torch.cuda.CUDAGraph or _ReconstructedCUDAGraph)
         if cache hit and reconstruction succeeds, None otherwise.
@@ -1496,20 +1356,16 @@ class CudaGraphRunner:
             # Register model weights
             address_registry.register_model_weights(self.model_runner.model)
 
-            # Reconstruct the graph with pool offset for intermediate tensors
+            # Reconstruct the graph
             func_registry = get_global_registry()
-            graph = reconstruct_cuda_graph(
-                cached, address_registry, func_registry,
-                pool_offset=pool_offset,
-            )
+            graph = reconstruct_cuda_graph(cached, address_registry, func_registry)
 
             if graph is not None:
                 self._graph_cache_hits += 1
                 log_info_on_rank0(
                     logger,
                     f"CUDA graph cache hit for bs={bs} "
-                    f"(pool_offset=0x{pool_offset:x}, "
-                    f"hits={self._graph_cache_hits}, misses={self._graph_cache_misses})",
+                    f"(hits={self._graph_cache_hits}, misses={self._graph_cache_misses})",
                 )
             else:
                 self._graph_cache_misses += 1

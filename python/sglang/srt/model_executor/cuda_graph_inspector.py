@@ -164,11 +164,6 @@ class GraphMetadata:
     weight_map: Dict[int, str] = field(default_factory=dict)
     # Pool-allocated intermediate tensor mapping: data_ptr -> (alloc_index, size)
     intermediate_map: Dict[int, Tuple[int, int]] = field(default_factory=dict)
-    # Pool base address: the base allocation address of the first intermediate
-    # tensor found in the graph. Used to compute pool offset for address
-    # translation across process restarts (all intermediate tensors from the
-    # same pool shift by a single constant offset).
-    pool_base_addr: int = 0
     # Capture context
     device_name: str = ""
     cuda_driver_version: int = 0
@@ -742,26 +737,6 @@ def inspect_cuda_graph(
         deps = _get_node_dependencies(node, node_array, num_nodes)
         if i < len(metadata.nodes) and hasattr(metadata.nodes[i], 'dependency_indices'):
             metadata.nodes[i].dependency_indices = deps
-
-    # Detect pool base address from the first intermediate tensor found.
-    # All intermediate tensors from the same CUDA graph memory pool share a
-    # common base offset that shifts uniformly across process restarts.
-    # Recording the pool base enables address translation on restart.
-    for node in metadata.nodes:
-        if isinstance(node, KernelNodeInfo):
-            for p in node.params:
-                if p.is_device_pointer and p.category == PointerCategory.INTERMEDIATE:
-                    if p.base_addr != 0:
-                        metadata.pool_base_addr = p.base_addr
-                        break
-            if metadata.pool_base_addr != 0:
-                break
-
-    if metadata.pool_base_addr != 0:
-        logger.debug(
-            f"Detected pool base address: 0x{metadata.pool_base_addr:x} "
-            f"(from first intermediate tensor allocation)"
-        )
 
     return metadata
 

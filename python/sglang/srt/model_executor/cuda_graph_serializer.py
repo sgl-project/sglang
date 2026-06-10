@@ -156,11 +156,6 @@ class SerializableGraphMetadata:
     # Address maps at capture time (for debugging / validation)
     buffer_map: Dict[str, str] = field(default_factory=dict)   # ptr_hex -> "name:size"
     weight_map: Dict[str, str] = field(default_factory=dict)   # ptr_hex -> "fqn"
-    # Pool base address for intermediate tensor address translation.
-    # All intermediate tensors from the same pool shift by a single constant
-    # offset across process restarts. Recording the pool base enables computing
-    # this offset: pool_offset = new_pool_base - pool_base_addr.
-    pool_base_addr: int = 0
     # Capture context
     device_name: str = ""
     cuda_driver_version: int = 0
@@ -180,7 +175,6 @@ def serialize_graph_metadata(
         version=CACHE_VERSION,
         cache_key=cache_key.to_string(),
         num_nodes=metadata.num_nodes,
-        pool_base_addr=metadata.pool_base_addr,
         device_name=metadata.device_name,
         cuda_driver_version=metadata.cuda_driver_version,
         compute_capability=list(metadata.compute_capability),
@@ -333,7 +327,6 @@ def reconstruct_cuda_graph(
     cached: SerializableGraphMetadata,
     address_registry: BufferAddressRegistry,
     func_registry: CUFunctionRegistry,
-    pool_offset: int = 0,
 ) -> Optional[torch.cuda.CUDAGraph]:
     """Reconstruct a CUDA graph from cached metadata and current addresses.
 
@@ -345,9 +338,6 @@ def reconstruct_cuda_graph(
         cached: Serialized graph metadata from a previous capture.
         address_registry: Current buffer/weight addresses for pointer patching.
         func_registry: Registry for resolving kernel names to CUfunction handles.
-        pool_offset: Offset to apply to intermediate tensor addresses.
-            Computed as new_pool_base - old_pool_base. All intermediate
-            (pool-allocated) tensor addresses are shifted by this constant.
 
     Returns:
         A torch.cuda.CUDAGraph ready for replay, or None if reconstruction fails.
@@ -402,7 +392,7 @@ def reconstruct_cuda_graph(
             if node_type == "kernel":
                 handle = _add_kernel_node(
                     graph, node_data, translation, func_registry,
-                    node_handles, param_memory, pool_offset
+                    node_handles, param_memory
                 )
                 if handle is None:
                     # Failed to add a kernel node - cannot reconstruct
@@ -411,14 +401,14 @@ def reconstruct_cuda_graph(
                 node_handles.append(handle)
 
             elif node_type == "memcpy":
-                handle = _add_memcpy_node(graph, node_data, translation, node_handles, pool_offset)
+                handle = _add_memcpy_node(graph, node_data, translation, node_handles)
                 if handle is None:
                     cu.cuGraphDestroy(graph)
                     return None
                 node_handles.append(handle)
 
             elif node_type == "memset":
-                handle = _add_memset_node(graph, node_data, translation, node_handles, pool_offset)
+                handle = _add_memset_node(graph, node_data, translation, node_handles)
                 if handle is None:
                     cu.cuGraphDestroy(graph)
                     return None
@@ -512,7 +502,6 @@ def _add_kernel_node(
     func_registry: CUFunctionRegistry,
     existing_nodes: list,
     param_memory: list,
-    pool_offset: int = 0,
 ):
     """Add a kernel node to the graph being reconstructed.
 
@@ -554,26 +543,16 @@ def _add_kernel_node(
         if is_device_ptr:
             # Translate the address
             new_value = translation.get(raw_value, raw_value)
-            if new_value == raw_value:
-                # No exact match in translation table.
-                # For intermediate/unknown pool-allocated tensors,
-                # apply the pool offset (all such tensors shift by a
-                # single constant across process restarts).
-                if category in (
-                    PointerCategory.INTERMEDIATE.value,
-                    PointerCategory.UNKNOWN.value,
-                ) and pool_offset != 0:
-                    new_value = raw_value + pool_offset
-                elif category not in (
-                    PointerCategory.UNKNOWN.value,
-                    PointerCategory.INTERMEDIATE.value,
-                ):
-                    logger.warning(
-                        f"Cannot translate pointer 0x{raw_value:x} "
-                        f"(category={category}, name={p.get('symbolic_name', '')}). "
-                        f"Falling back to normal capture."
-                    )
-                    return None
+            if new_value == raw_value and category not in (
+                PointerCategory.UNKNOWN.value,
+                PointerCategory.INTERMEDIATE.value,
+            ):
+                logger.warning(
+                    f"Cannot translate pointer 0x{raw_value:x} "
+                    f"(category={category}, name={p.get('symbolic_name', '')}). "
+                    f"Falling back to normal capture."
+                )
+                return None
             param_values.append(new_value)
         else:
             param_values.append(raw_value)
@@ -638,7 +617,7 @@ def _add_kernel_node(
     return result[1]
 
 
-def _add_memcpy_node(graph, node_data: Dict, translation: Dict[int, int], existing_nodes: list, pool_offset: int = 0):
+def _add_memcpy_node(graph, node_data: Dict, translation: Dict[int, int], existing_nodes: list):
     """Add a memcpy node to the graph being reconstructed."""
     import ctypes
 
@@ -650,9 +629,9 @@ def _add_memcpy_node(graph, node_data: Dict, translation: Dict[int, int], existi
         logger.warning(f"Memcpy node {node_data['node_index']} has zero copy size, skipping")
         return None
 
-    # Translate addresses (apply pool_offset for untranslated pointers)
-    new_src = translation.get(src_ptr, src_ptr + pool_offset if pool_offset else src_ptr)
-    new_dst = translation.get(dst_ptr, dst_ptr + pool_offset if pool_offset else dst_ptr)
+    # Translate addresses
+    new_src = translation.get(src_ptr, src_ptr)
+    new_dst = translation.get(dst_ptr, dst_ptr)
 
     # Build CUDA_MEMCPY3D structure for the copy parameters
     copy_params = cu.CUDA_MEMCPY3D(
@@ -706,7 +685,7 @@ def _add_memcpy_node(graph, node_data: Dict, translation: Dict[int, int], existi
     return result[1]
 
 
-def _add_memset_node(graph, node_data: Dict, translation: Dict[int, int], existing_nodes: list, pool_offset: int = 0):
+def _add_memset_node(graph, node_data: Dict, translation: Dict[int, int], existing_nodes: list):
     """Add a memset node to the graph being reconstructed."""
     import ctypes
 
@@ -718,8 +697,8 @@ def _add_memset_node(graph, node_data: Dict, translation: Dict[int, int], existi
         logger.warning(f"Memset node {node_data['node_index']} has zero size, skipping")
         return None
 
-    # Translate address (apply pool_offset for untranslated pointers)
-    new_dst = translation.get(dst_ptr, dst_ptr + pool_offset if pool_offset else dst_ptr)
+    # Translate address
+    new_dst = translation.get(dst_ptr, dst_ptr)
 
     # Build CUDA_MEMSET_NODE_PARAMS structure
     memset_params = cu.CUDA_MEMSET_NODE_PARAMS(
@@ -750,43 +729,6 @@ def _add_memset_node(graph, node_data: Dict, translation: Dict[int, int], existi
         return None
 
     return result[1]
-
-
-# ---------------------------------------------------------------------------
-# Pool offset computation
-# ---------------------------------------------------------------------------
-def compute_pool_offset(
-    cached: SerializableGraphMetadata,
-    current_pool_base: int,
-) -> int:
-    """Compute the pool offset for translating intermediate tensor addresses.
-
-    All intermediate tensors from the same CUDA graph memory pool shift by a
-    single constant offset across process restarts. This function computes that
-    offset from the cached pool base and the current pool base.
-
-    Args:
-        cached: Serialized graph metadata from a previous capture.
-        current_pool_base: The base address of the current pool (from
-            inspecting a newly captured graph's intermediate tensors).
-
-    Returns:
-        The offset to add to old intermediate addresses to get new addresses.
-        Returns 0 if the cached metadata has no pool base recorded.
-    """
-    if cached.pool_base_addr == 0:
-        logger.warning(
-            "Cached metadata has no pool_base_addr; cannot compute pool offset. "
-            "Intermediate tensor addresses will not be translated."
-        )
-        return 0
-    offset = current_pool_base - cached.pool_base_addr
-    logger.info(
-        f"Pool offset: 0x{offset:x} "
-        f"(cached_base=0x{cached.pool_base_addr:x}, "
-        f"current_base=0x{current_pool_base:x})"
-    )
-    return offset
 
 
 # ---------------------------------------------------------------------------
