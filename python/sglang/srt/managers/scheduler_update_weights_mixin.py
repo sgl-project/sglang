@@ -231,9 +231,10 @@ class SchedulerUpdateWeightsMixin:
 
     def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
         try:
-            selector = recv_req.selector or "target"
+            selector = recv_req.selector if recv_req.selector is not None else "target"
             # Validate before mutating any runner so a bad selector cannot leave
-            # weights half-randomized.
+            # weights half-randomized (an empty string is rejected here, not
+            # silently coerced to "target").
             if selector not in ("target", "draft", "all"):
                 raise ValueError(
                     f"invalid selector {selector!r}; expected one of target/draft/all"
@@ -280,6 +281,13 @@ class SchedulerUpdateWeightsMixin:
                 # Shared storage (embed/head) is randomized once by the first
                 # runner; later runners skip it via visited_storage.
                 visited_storage = set()
+                if selector == "draft":
+                    # Don't randomize target-owned storage (e.g. embed/head shared
+                    # with the draft via set_embed_and_head); draft-only reset
+                    # scrambles draft-private weights.
+                    self.tp_worker.model_runner.check_weights(
+                        action="mark_reset_storage", visited_storage=visited_storage
+                    )
                 for role, r in runners:
                     _check(
                         role,

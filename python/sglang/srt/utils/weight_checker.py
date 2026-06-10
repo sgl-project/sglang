@@ -47,6 +47,14 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
     return any(pat in name for pat in _NON_PERSISTENT_BUFFER_PATTERNS)
 
 
+def _storage_key(param: torch.Tensor):
+    try:
+        storage = param.untyped_storage()
+        return (param.device, storage.data_ptr(), storage.nbytes())
+    except AttributeError:
+        return (param.device, param.data_ptr())
+
+
 class WeightChecker:
     def __init__(self, model_runner):
         self._model_runner = model_runner
@@ -58,6 +66,8 @@ class WeightChecker:
             return self._snapshot()
         elif action == "reset_tensors":
             return self._reset_tensors(visited_storage)
+        elif action == "mark_reset_storage":
+            return self._mark_reset_storage(visited_storage)
         elif action == "compare":
             return self._compare()
         elif action == "checksum":
@@ -81,15 +91,20 @@ class WeightChecker:
             # Randomize each storage at most once when fanning out across runners
             # that may share a tensor's storage (e.g. embed/head tied to target).
             if visited_storage is not None:
-                try:
-                    storage = param.untyped_storage()
-                    key = (param.device, storage.data_ptr(), storage.nbytes())
-                except AttributeError:
-                    key = (param.device, param.data_ptr())
+                key = _storage_key(param)
                 if key in visited_storage:
                     continue
                 visited_storage.add(key)
             param.copy_(_random_like(param))
+
+    def _mark_reset_storage(self, visited_storage):
+        # Record the storages reset would touch without randomizing them, so a
+        # draft-only reset can skip target-owned storage (e.g. embed/head shared
+        # with the draft via set_embed_and_head).
+        for name, param in self._model_state():
+            if _is_non_persistent_buffer_name(name):
+                continue
+            visited_storage.add(_storage_key(param))
 
     def _compare(self):
         assert self._snapshot_tensors is not None
