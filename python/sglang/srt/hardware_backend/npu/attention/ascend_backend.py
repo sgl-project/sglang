@@ -1867,7 +1867,7 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, v
                 )
 
-        if sinks is not None:
+        if sinks is not None or self.is_hybrid_swa:
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self.is_hybrid_swa and layer.sliding_window_size != -1:
                 block_tables = self.forward_metadata.block_tables_swa
@@ -1921,7 +1921,9 @@ class AscendAttnBackend(AttentionBackend):
                         if layer.sliding_window_size != -1
                         else FULL_ATTENTION_WINDOW
                     ),
-                    next_tokens=0,
+                    next_tokens=(
+                        0 if layer.sliding_window_size == -1 else FULL_ATTENTION_WINDOW
+                    ),
                     atten_mask=self.fia_mask.to(torch.int8),
                     sparse_mode=sparse_mode,
                     softmax_scale=layer.scaling,
