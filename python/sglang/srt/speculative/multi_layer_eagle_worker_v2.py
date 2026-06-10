@@ -546,7 +546,12 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             # pre-plan (see warning above). Mark the batch so the forward path
             # keeps skipping metadata init — preserves the pre-existing
             # behavior; the latent issue is tracked by the warning.
-            forward_batch.mark_forward_metadata_ready()
+            # On NPU with --disable-cuda-graph, leave each draft runner to init
+            # its own metadata in forward_extend (post-pad), otherwise
+            # per-runner attn_backend.forward_metadata is never initialized for
+            # draft_runner_list[1+].
+            if not _is_npu or can_cuda_graph:
+                forward_batch.mark_forward_metadata_ready()
 
         for step in range(self.speculative_num_steps):
             # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
