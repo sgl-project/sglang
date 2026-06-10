@@ -207,11 +207,8 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
 class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
     """steps=0 (nospec) fallback triggered by batch size.
 
-    Config routes BS>=8 -> steps=0 (drafting disabled) and BS<8 -> steps=3. A
-    long request batched with many short ones decodes at steps=0 under load, then
-    returns to steps=3 as the batch drains and must recover full draft acceptance
-    -- i.e. draft_extend keeps the draft KV synced while drafting is off. If it
-    didn't, post-recovery drafts would be rejected (~0 accepts).
+    Config routes BS>=8 -> steps=0 (drafting disabled) and BS<8 -> steps=3, so the
+    server cycles steps=3 -> steps=0 -> steps=3 as load rises and falls.
     """
 
     model = DEFAULT_TARGET_MODEL_EAGLE
@@ -272,33 +269,51 @@ class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
         if os.path.exists(cls.adaptive_config_path):
             os.unlink(cls.adaptive_config_path)
 
-    def test_zero_step_within_sequence_recovery(self):
-        """A long request shares a batch with many short ones: it decodes at
-        steps=0 while the batch is large (BS>=8), then returns to steps=3 for its
-        (dominant) tail as the short ones finish. Its draft accept rate must
-        recover near the steps=3 norm (~0.8 for this predictable workload)."""
-        short = {"temperature": 0, "max_new_tokens": 10, "ignore_eos": True}
-        full = {"temperature": 0, "max_new_tokens": 600, "ignore_eos": True}
+    def _steps(self) -> int:
+        r = requests.get(self.base_url + "/server_info", timeout=30)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["internal_states"][0]["speculative_num_steps"]
+
+    def test_batch_size_step_cycle(self):
+        """The server cycles steps=3 -> steps=0 -> steps=3 as load rises and falls:
+        a BS=1 request drafts at steps=3; a 14-way batch (BS>=8) routes the worker
+        to nospec steps=0; a following BS=1 request returns to steps=3 with drafting
+        restored (high accept rate again)."""
+        one = {"temperature": 0, "max_new_tokens": 64, "ignore_eos": True}
+
+        def generate_single() -> dict:
+            r = requests.post(
+                self.base_url + "/generate",
+                json={"text": self.COUNT_PROMPT, "sampling_params": one},
+                timeout=600,
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            return r.json()["meta_info"]
+
+        # Phase 1: BS=1 -> steps=3, drafting active.
+        m1 = generate_single()
+        self.assertEqual(self._steps(), 3, "expected steps=3 at BS=1")
+        self.assertGreater(
+            m1["spec_accept_rate"], 0.8, f"not drafting at steps=3: {m1}"
+        )
+
+        # Phase 2: BS=14 -> the worker switches to nospec steps=0. Equal-length
+        # requests finish together, so the last decode batch (and thus the state)
+        # is at BS=14 -> steps=0.
+        full = {"temperature": 0, "max_new_tokens": 128, "ignore_eos": True}
         r = requests.post(
             self.base_url + "/generate",
-            json={
-                "text": [self.COUNT_PROMPT] * 14,
-                "sampling_params": [short] * 13 + [full],
-            },
+            json={"text": [self.COUNT_PROMPT] * 14, "sampling_params": [full] * 14},
             timeout=600,
         )
         self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._steps(), 0, "BS>=8 did not switch to steps=0")
 
-        long_meta = r.json()[-1]["meta_info"]
-        hist = long_meta["spec_correct_drafts_histogram"]
+        # Phase 3: BS=1 -> steps=3 again, drafting restored.
+        m3 = generate_single()
+        self.assertEqual(self._steps(), 3, "did not reopen to steps=3")
         self.assertGreater(
-            hist[0], 0, f"long request never decoded at steps=0 (hist={hist})"
-        )
-        self.assertGreater(
-            long_meta["spec_accept_rate"],
-            0.8,
-            f"draft accept rate {long_meta['spec_accept_rate']:.2f} did not recover "
-            f"after steps=0 -> draft KV likely stale (hist={hist})",
+            m3["spec_accept_rate"], 0.8, f"drafting not restored after steps=0: {m3}"
         )
 
 
