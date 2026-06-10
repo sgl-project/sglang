@@ -81,12 +81,12 @@ class TorchNpuDispatcher(BaseDispatcher):
         self.ascend_dispatcher_output_dtype = get_ascend_dispatcher_output_dtype(self)
 
         if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
-            self.dispatch = NPUMoEInitRouting_v2(quant_mode=-1)
-            self.combine = NPUFinalizeRouting(drop_pad_mode=2)
+            self.init = NPUMoEInitRouting_v2(quant_mode=-1)
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
 
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
-            self.dispatch = NPUMoEInitRouting_v2(quant_mode=1)
-            self.combine = NPUFinalizeRouting(drop_pad_mode=2)
+            self.init = NPUMoEInitRouting_v2(quant_mode=1)
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
 
         else:
             raise ValueError(
@@ -110,7 +110,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             expanded_row_idx,
             expert_tokens,
             hidden_states_scale,
-        ) = self.dispatch._init_routing(
+        ) = self.init._init_routing(
             hidden_states,
             topk_output.topk_ids,
             self.num_experts,
@@ -135,7 +135,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             raise RuntimeError("combine() called before dispatch()")
 
         dispatch_out = self._dispatch_output
-        final_hidden_states = self.combine._finalize_routing(
+        final_hidden_states = self.finalize._finalize_routing(
             combine_input.hidden_states,
             topk_weights=dispatch_out.topk_output.topk_weights,
             expanded_row_idx=dispatch_out.expanded_row_idx,
