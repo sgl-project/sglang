@@ -184,6 +184,11 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+    # Per-component transformer weight overrides (key = model_index.json component name).
+    # Pipelines use this when a checkpoint ships separate quantized weights for
+    # secondary DiT components; the generic loader consumes it without model-specific
+    # filename logic.
+    component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
 
     # Quantization method for online quantization
     quantization: str | None = None
@@ -773,9 +778,11 @@ class ServerArgs(DisaggServerArgsMixin):
         # SamplingParams use classifier-free guidance (negative_prompt is not None),
         # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
         if cfg_unspecified:
+            deployment_config = self.pipeline_config.get_model_deployment_config()
             cfg_group_size = self.dp_size * self.tp_size * 2
             if (
                 self.performance_mode != "manual"
+                and deployment_config.auto_enable_cfg_parallel
                 and self.num_gpus >= 2
                 and self.num_gpus % cfg_group_size == 0
                 and sp_unspecified

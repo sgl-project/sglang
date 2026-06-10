@@ -157,15 +157,18 @@ class SWAKVPool(BaseSWAKVPool):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        swa_loc: Optional[torch.Tensor] = None,
     ):
 
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            loc = self.translate_loc_from_full_to_swa(loc)
+            # swa_loc is the full->SWA translation, computed once per forward by
+            # the attention backend; set_kv_buffer never translates internally.
+            assert swa_loc is not None
             self.swa_kv_pool.set_kv_buffer(
                 None,
-                loc,
+                swa_loc,
                 cache_k,
                 cache_v,
                 k_scale,
