@@ -27,6 +27,7 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -138,6 +139,8 @@ class MultiItemScoringParams:
 @dataclass
 class DecodeMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
+    # full->SWA translated out_cache_loc (SWA KV-store write target)
+    swa_out_cache_loc: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -146,6 +149,7 @@ class PrefillMetadata:
     use_ragged: bool
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
+    swa_out_cache_loc: Optional[torch.Tensor] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -173,6 +177,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
         self.enable_mis = model_runner.server_args.enable_mis
 
         # FIXME: remove dllm workarounds from flashinfer
@@ -541,7 +546,28 @@ class FlashInferAttnBackend(AttentionBackend):
             for w in self.decode_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_decode_plan, w)
 
+        # Refill the SWA write-target buffer from the live out_cache_loc before
+        # replay (bound onto the metadata at capture below).
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            n = forward_batch.out_cache_loc.shape[0]
+            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
+            if in_capture:
+                self.forward_metadata.swa_out_cache_loc = (
+                    self.cuda_graph_swa_out_cache_loc[:n]
+                )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        swa_out_cache_loc = None
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            )
+
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -554,7 +580,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrappers)
+            self.forward_metadata = DecodeMetadata(
+                self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
+            )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -568,7 +596,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
             )
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_paged, False, False
+                self.prefill_wrappers_paged,
+                False,
+                False,
+                swa_out_cache_loc=swa_out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -583,7 +614,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
             )
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_verify, False, False
+                self.prefill_wrappers_verify,
+                False,
+                False,
+                swa_out_cache_loc=swa_out_cache_loc,
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -631,6 +665,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged,
                 extend_no_prefix,
                 multi_item_params,
+                swa_out_cache_loc=swa_out_cache_loc,
             )
 
     def init_cuda_graph_state(
@@ -651,6 +686,14 @@ class FlashInferAttnBackend(AttentionBackend):
         self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
             cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
         ]
+
+        # SWA write-target buffer; refilled and bound onto forward_metadata in
+        # init_forward_metadata_out_graph before each replay.
+        self.cuda_graph_swa_out_cache_loc = (
+            torch.zeros(max_num_tokens, dtype=torch.int64, device="cuda")
+            if self.use_sliding_window_kv_pool
+            else None
+        )
 
         # Ensure tensors are properly allocated
         for i in range(self.num_wrappers):
@@ -771,9 +814,20 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                    if self.use_sliding_window_kv_pool:
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            cache_loc,
+                            k,
+                            v,
+                            layer.k_scale,
+                            layer.v_scale,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        )
+                    else:
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
 
             causal = (
                 not layer.is_cross_attention
@@ -863,9 +917,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
+                if self.use_sliding_window_kv_pool:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -891,9 +956,20 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
+                if self.use_sliding_window_kv_pool:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
 
         # Call the wrapped function
         o = decode_wrapper.forward(

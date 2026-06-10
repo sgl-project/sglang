@@ -415,10 +415,12 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     return output_tensor
 
 
-def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
+def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=None):
     """
     Allgather KV cache from all CP ranks and write the full result
     into each rank's local memory pool.
+
+    swa_loc is the pre-translated full->SWA write target for hybrid SWA pools.
     """
     cache_loc = (
         forward_batch.out_cache_loc
@@ -436,14 +438,26 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
         v, cp_size, forward_batch, torch.cuda.current_stream()
     )
 
-    get_token_to_kv_pool().set_kv_buffer(
-        layer,
-        cache_loc,
-        key_cache_full,
-        value_cache_full,
-        layer.k_scale,
-        layer.v_scale,
-    )
+    pool = get_token_to_kv_pool()
+    if swa_loc is not None:
+        pool.set_kv_buffer(
+            layer,
+            cache_loc,
+            key_cache_full,
+            value_cache_full,
+            layer.k_scale,
+            layer.v_scale,
+            swa_loc=swa_loc,
+        )
+    else:
+        pool.set_kv_buffer(
+            layer,
+            cache_loc,
+            key_cache_full,
+            value_cache_full,
+            layer.k_scale,
+            layer.v_scale,
+        )
 
 
 def cp_attn_forward_extend(
