@@ -34,9 +34,14 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -53,7 +58,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
-    fill_accepted_out_cache_loc,
+    fill_accept_out_cache_loc,
     fill_bonus_tokens,
 )
 from sglang.srt.speculative.eagle_utils import (
@@ -71,6 +76,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
     select_top_k_tokens,
+    spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -150,8 +156,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        backup_decode_mode = server_args.cuda_graph_config.decode.backend
+        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
@@ -198,7 +204,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.init_lm_head()
 
         # Init attention backend and cuda graphs
-        self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        self.draft_runner.server_args.cuda_graph_config.decode.backend = (
+            backup_decode_mode
+        )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -208,10 +216,8 @@ class EagleDraftWorker(BaseDraftWorker):
             speculative_moe_a2a_backend_context(),
         ):
             self.init_attention_backend()
-            if server_args.enable_breakable_cuda_graph:
-                self.draft_runner.init_piecewise_cuda_graphs(
-                    force_for_draft_worker=True
-                )
+            if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
+                self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
             self.init_cuda_graphs()
 
         if (c := self.draft_runner.canary_manager) is not None:
@@ -235,8 +241,13 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         num_steps = self.speculative_num_steps
         sa = self.server_args
+        decode_max_bs = (
+            sa.cuda_graph_config.decode.max_bs
+            if sa.cuda_graph_config is not None
+            else None
+        )
         max_bs = max(
-            sa.cuda_graph_max_bs or 0,
+            decode_max_bs or 0,
             sa.max_running_requests or 0,
             1,
         )
@@ -322,7 +333,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
         if self.server_args.model_impl == "mindspore":
@@ -562,9 +573,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 if (c := self.draft_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
-            with forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
-            ), canary_index_ctx:
+            with (
+                forward_context(
+                    ForwardContext(
+                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                    )
+                ),
+                canary_index_ctx,
+            ):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
@@ -879,7 +895,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         draft_attn_backend=self._draft_worker.draft_attn_backend,
                         cuda_graph_runner=self._draft_worker.cuda_graph_runner,
                         target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.graph_runner,
+                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
                         draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
@@ -888,7 +904,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     cuda_graph_bs=(
                         None
                         if self.server_args.disable_cuda_graph
-                        else self.server_args.cuda_graph_bs
+                        else self.server_args.cuda_graph_bs_decode
                     ),
                 )
 
@@ -939,6 +955,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
             ):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
@@ -971,6 +988,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
             ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
@@ -985,6 +1003,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
@@ -1033,8 +1052,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 target_model_runner.init_new_workspace = backup_init
 
             target_graph_runner = None
-            if not self.server_args.disable_cuda_graph:
-                TargetGraphRunnerCls = NPUGraphRunner if _is_npu else CudaGraphRunner
+            if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+                TargetGraphRunnerCls = (
+                    NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
+                )
                 target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
@@ -1093,7 +1114,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Target side
         self._target_worker.model_runner.attn_backend = state.target_attn_backend
-        self._target_worker.model_runner.graph_runner = state.target_graph_runner
+        self._target_worker.model_runner.decode_cuda_graph_runner = (
+            state.target_graph_runner
+        )
 
         # Sync server_args
         self.server_args.speculative_num_steps = state.speculative_num_steps
@@ -1123,7 +1146,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
-            sa.cuda_graph_bs,
+            sa.cuda_graph_bs_decode,
             sa.disable_cuda_graph,
         )
 
@@ -1134,7 +1157,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
         if cuda_graph_bs is not None:
-            sa.cuda_graph_bs = cuda_graph_bs
+            sa.cuda_graph_bs_decode = cuda_graph_bs
             # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
             # for steps that no BS range uses (e.g. step=1). Disable graph
             # capture for those steps; restore in finally so subsequent steps
@@ -1158,7 +1181,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
-                sa.cuda_graph_bs,
+                sa.cuda_graph_bs_decode,
                 sa.disable_cuda_graph,
             ) = backup
             dw._rebuild_topk1_chain_buffers()
@@ -1209,7 +1232,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 verify_input,
                 (
-                    self.target_worker.model_runner.graph_runner.bs
+                    self.target_worker.model_runner.decode_cuda_graph_runner.bs
                     if can_run_cuda_graph
                     else None
                 ),
@@ -1271,9 +1294,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
         ):
-            self._mamba_verify_update(
-                batch, verify_input, accept_lens, accept_index, bs
-            )
+            self._mamba_verify_update(batch, accept_lens, accept_index, bs)
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
@@ -1297,7 +1318,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not batch.forward_mode.is_idle() and self.topk > 1:
             # topk == 1 needs nothing here: the accepted path is already the front
             # chain, so the whole compaction is an identity transform.
-            predict = self._finalize_accepted_tree_path(
+            predict = self._finalize_accept_tree_path(
                 batch, accept_index, accept_lens, predict, logits_output, bs
             )
 
@@ -1323,7 +1344,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _mamba_verify_update(
         self,
         batch: ScheduleBatch,
-        verify_input: EagleVerifyInput,
         accept_lens: torch.Tensor,
         accept_index: torch.Tensor,
         bs: int,
@@ -1331,17 +1351,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """Update mamba state for hybrid GDN models after verification."""
         # `accept_lens` already includes the bonus token (drafts + 1 per req).
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-            if verify_input.topk != 1:
-                raise ValueError("Spec v2 currently only supports topk = 1.")
-
-            accepted_indices_offset = torch.arange(
+            accept_indices_offset = torch.arange(
                 0,
                 bs * self.speculative_num_draft_tokens,
                 step=self.speculative_num_draft_tokens,
                 dtype=accept_lens.dtype,
                 device=accept_lens.device,
             )
-            last_correct_step_indices = accept_lens - 1
+            req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+            # Per-req tree step of the last accepted node, i.e. the step whose
+            # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
+            last_correct_step_indices = (
+                accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+                - accept_indices_offset
+            )
 
             if batch.mamba_track_indices is not None:
                 # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1359,13 +1382,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 to_track_ith = torch.clamp(
                     tracking_point - seq_lens_pre_verify - 1, min=0
                 ).to(torch.int64)
-                req_idx = torch.arange(
-                    bs,
-                    dtype=torch.int64,
-                    device=accept_lens.device,
-                )
                 candidate_track_steps = (
-                    accept_index[req_idx, to_track_ith] - accepted_indices_offset
+                    accept_index[req_idx, to_track_ith] - accept_indices_offset
                 )
                 mamba_steps_to_track = torch.where(
                     to_track_mask,
@@ -1382,7 +1400,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 model=self.target_worker.model_runner.model,
             )
 
-    def _finalize_accepted_tree_path(
+    def _finalize_accept_tree_path(
         self,
         batch: ScheduleBatch,
         accept_index: torch.Tensor,
@@ -1396,17 +1414,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         downstream chain-layout code (draft-extend select_index, committed-KV reads)
         assumes. Returns compacted predict; mutates logits_output.hidden_states
         (moved only when present)."""
-        self.move_accepted_tokens_to_target_kvcache(
-            batch, accept_index, accept_lens - 1
-        )
-        predict = self._compact_accepted_to_front(predict, accept_index, bs)
+        self.move_accept_tokens_to_target_kvcache(batch, accept_index, accept_lens - 1)
+        predict = self._compact_accept_to_front(predict, accept_index, bs)
         if logits_output.hidden_states is not None:
-            logits_output.hidden_states = self._compact_accepted_to_front(
+            logits_output.hidden_states = self._compact_accept_to_front(
                 logits_output.hidden_states, accept_index, bs
             )
         return predict
 
-    def move_accepted_tokens_to_target_kvcache(
+    def move_accept_tokens_to_target_kvcache(
         self,
         batch: ScheduleBatch,
         accept_index: torch.Tensor,
@@ -1419,14 +1435,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch: The batch to run.
             accept_index: The index of the accepted tokens (incl. bonus).
             num_correct_drafts: Per-req count of correct drafts (excludes bonus);
-                seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
+                seq_lens is advanced by num_correct_drafts + 1 to cover the bonus slot.
         """
         bs = len(batch.seq_lens)
         # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the
         # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
         size = bs * accept_index.shape[1]
 
-        # fill_accepted_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
+        # fill_accept_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
         maybe_detect_oob(
             accept_index,
             -1,
@@ -1439,9 +1455,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dtype=torch.int64,
             device=self.device,
         )
-        accepted_out_cache_loc = torch.zeros(
-            size, dtype=torch.int64, device=self.device
-        )
+        accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=self.device)
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
@@ -1451,17 +1465,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
-        fill_accepted_out_cache_loc[(size,)](
+        fill_accept_out_cache_loc[(size,)](
             accept_index,
             batch.out_cache_loc,
-            accepted_out_cache_loc,
+            accept_out_cache_loc,
             next_power_of_2(size),
         )
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-            tgt_cache_loc, accepted_out_cache_loc
+            tgt_cache_loc, accept_out_cache_loc
         )
 
-    def _compact_accepted_to_front(
+    def _compact_accept_to_front(
         self, x: torch.Tensor, accept_index: torch.Tensor, bs: int
     ) -> torch.Tensor:
         """Gather the accepted tree path to the front of each per-req block.
