@@ -133,13 +133,12 @@ changes**: docs.json path/title unchanged, vendor card + logo already exist.
 - Token-level audit from step 3 passes.
 
 ### 8. PR + review
-One PR per model. **Push the branch to the upstream repo
-(`sgl-project/sglang`), not a fork** — docs previews only build for in-repo
-branches, and the preview is how reviewers check the page (a fork-headed PR
-ends up closed and reopened, as happened to the pilot: #27843 → #27848).
-PR body: migration framing, verified policy applied, the audit PASS count +
-script, any inherited-infeasible combos flagged for re-verification. Then run
-`/cookbook-review-pr <N>` and fix findings.
+One PR per model. PR body: migration framing, verified policy applied, the
+audit PASS count + script, any inherited-infeasible combos flagged for
+re-verification. Then run `/cookbook-review-pr <N>` and fix findings.
+FYI: docs previews only build for in-repo (`sgl-project/sglang`) branches —
+a fork-headed PR is perfectly fine but renders no preview; a maintainer can
+re-push the branch in-repo if a preview is wanted for review.
 
 ### 9. Keep this skill current
 Any new convention, engine behavior, or pitfall you discover while migrating
