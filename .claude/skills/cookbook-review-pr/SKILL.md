@@ -78,7 +78,9 @@ than restating.
 
 ### 4. Benchmarks
 - Each `benchmarks[]` entry's `match` tuple corresponds to a real cell.
-- `defaultAccuracy` keys ∈ `ACCURACY_LABELS` (and `benchmarkCommands.accuracy`).
+- `defaultAccuracy` / per-cell `accuracy` keys ∈ the effective accuracy labels — the
+  config's `accuracyLabels` override if present, else the engine's default
+  `ACCURACY_LABELS` (gpqa/aime25/gsm8k) — and `benchmarkCommands.accuracy`.
 - A benchmark's quantization must match a variant actually listed — `(BF16)` on a model
   that only released FP8/FP4 is a factual bug.
 - `benchmarkCommands.speed` is `python3 -m sglang.bench_serving` (the workload), separate
