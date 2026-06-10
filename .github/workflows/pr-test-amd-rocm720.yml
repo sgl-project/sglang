@@ -177,14 +177,15 @@ jobs:
               - ".github/workflows/pr-test-amd-rocm720.yml"
             jit_kernel:
               - "python/sglang/jit_kernel/**"
+              - "test/registered/jit/**"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
               - "python/sglang/srt/observability/**"
               - "python/sglang/jit_kernel/diffusion/**"
-              - "python/sglang/jit_kernel/tests/diffusion/**"
-              - "python/sglang/jit_kernel/benchmark/diffusion/**"
+              - "test/registered/jit/diffusion/**"
+              - "test/registered/jit/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
 

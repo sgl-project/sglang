@@ -217,12 +217,11 @@ def is_flashinfer_allreduce_unavailable() -> bool:
 def _make_flashinfer_workspace_allocation_prop(cuda_driver):
     from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
+    handle_types = cuda_driver.CUmemAllocationHandleType
     if is_mnnvl_fabric_supported(torch.cuda.current_device()):
-        handle_type = cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        handle_type = handle_types.CU_MEM_HANDLE_TYPE_FABRIC
     else:
-        handle_type = (
-            cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        )
+        handle_type = handle_types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
 
     prop = cuda_driver.CUmemAllocationProp()
     prop.requestedHandleTypes = handle_type
@@ -666,11 +665,9 @@ def ensure_workspace_initialized(
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
     server_args = get_global_server_args()
-    server_backend = server_args.flashinfer_allreduce_fusion_backend
-    if server_backend is None:
+    backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
+    if backend is None:
         return False
-    is_multi_node = getattr(server_args, "nnodes", 1) > 1
-    backend = _resolve_backend(server_backend, is_multi_node)
 
     if (
         not workspace_manager.initialized

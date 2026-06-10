@@ -3204,7 +3204,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch: ForwardBatch,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if not self.server_args.enable_pdmux:
+        if not self.server_args.enable_pdmux and self.device == "cuda":
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
         # Set extra arguments
         pdmux_override = False
@@ -3294,7 +3294,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ret = self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
             return (ret, can_run_graph)
 
-        if not self.server_args.enable_pdmux:
+        if not self.server_args.enable_pdmux and self.device == "cuda":
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
 
         # Launch model forward
@@ -3355,7 +3355,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # called from the idle path can re-read a prior batch's req_pool
         # indices and trigger SWA mapping use-after-free.
         if forward_batch.batch_size > 0:
-            if not self.server_args.enable_pdmux:
+            if not self.server_args.enable_pdmux and self.device == "cuda":
                 forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
             self.attn_backend.init_forward_metadata(forward_batch)
         else:
