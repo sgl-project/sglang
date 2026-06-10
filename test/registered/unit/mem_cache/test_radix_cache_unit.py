@@ -863,9 +863,11 @@ class TestRadixCache(unittest.TestCase):
         torch_allocated_before = torch.cuda.memory_allocated()
 
         # build dataset with common prefix
-        common_prefix = [random.randint(1, vocab_size) for _ in range(base_prefix_len)]
+        common_prefix = [
+            random.randint(1, vocab_size - 1) for _ in range(base_prefix_len)
+        ]
         for _ in range(num_seqs):
-            suffix = [random.randint(1, vocab_size) for _ in range(suffix_len)]
+            suffix = [random.randint(1, vocab_size - 1) for _ in range(suffix_len)]
             seq = common_prefix + suffix
             keys.append(seq)
             values.append(torch.zeros(len(seq), device="cuda", dtype=torch.int32))
