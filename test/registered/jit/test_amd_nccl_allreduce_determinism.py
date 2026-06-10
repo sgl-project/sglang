@@ -20,6 +20,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=120, suite="sgl-kernel-unit-test-2-gpu-amd")
+
 
 def get_open_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
