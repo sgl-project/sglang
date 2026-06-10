@@ -299,7 +299,7 @@ class DraftBackendFactory:
     def _create_intel_amx_prefill_backend(self):
         from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
 
-        return IntelAMXAttnBackend(self.draft_model_runner, skip_prefill=False)
+        return IntelAMXAttnBackend(self.draft_model_runner)
 
     def _create_aiter_prefill_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
