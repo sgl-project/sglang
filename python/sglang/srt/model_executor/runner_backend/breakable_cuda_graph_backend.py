@@ -99,6 +99,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             cuda_graph=graph,
             pool=self._pool,
             stream=self._capture_stream,
+            debug=get_bool_env_var("SGLANG_BCG_DEBUG"),
         ):
             out = captured_fn()
         self._graphs[shape_key] = graph
