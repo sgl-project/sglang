@@ -6793,11 +6793,6 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# CANN 9.0 environment
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-export PYTHONPATH=/path/to/sglang/python:$PYTHONPATH
-
 # Performance environment variables
 export STREAMS_PER_DEVICE=32
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
@@ -6858,11 +6853,6 @@ unset http_proxy
 unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
-
-# CANN 9.0 environment
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-export PYTHONPATH=/path/to/sglang/python:$PYTHONPATH
 
 # Performance environment variables
 export STREAMS_PER_DEVICE=32
