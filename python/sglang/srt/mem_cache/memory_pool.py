@@ -129,7 +129,7 @@ def _set_kv_buffer_impl(
             row_dim,
         )
 
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner import get_is_capture_mode
 
     if (
         get_is_capture_mode()
@@ -1535,7 +1535,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         layer_id_override: Optional[int] = None,
     ):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-FP4)")
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
 
         if layer_id_override is not None:
             layer_id = layer_id_override

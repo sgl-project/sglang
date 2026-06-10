@@ -29,9 +29,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
@@ -424,9 +424,10 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     inputs and fault on strided tensors (root cause of the #21734 revert
     in #23159).
     """
+
     if (
         _is_cuda
-        and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
+        and get_global_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
     ):
         return x.view(*x.shape[:-1], -1, head_dim)
     return x.reshape(-1, head_dim)
@@ -461,12 +462,13 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
+
     if (
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and get_global_server_args().piecewise_cuda_graph_compiler
+        and get_global_server_args().cuda_graph_config.prefill.tc_compiler
         != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):

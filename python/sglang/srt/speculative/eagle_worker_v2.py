@@ -34,9 +34,14 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -151,8 +156,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        backup_decode_mode = server_args.cuda_graph_config.decode.backend
+        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
@@ -199,7 +204,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.init_lm_head()
 
         # Init attention backend and cuda graphs
-        self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        self.draft_runner.server_args.cuda_graph_config.decode.backend = (
+            backup_decode_mode
+        )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -209,10 +216,8 @@ class EagleDraftWorker(BaseDraftWorker):
             speculative_moe_a2a_backend_context(),
         ):
             self.init_attention_backend()
-            if server_args.enable_breakable_cuda_graph:
-                self.draft_runner.init_piecewise_cuda_graphs(
-                    force_for_draft_worker=True
-                )
+            if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
+                self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
             self.init_cuda_graphs()
 
         if (c := self.draft_runner.canary_manager) is not None:
@@ -236,8 +241,13 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         num_steps = self.speculative_num_steps
         sa = self.server_args
+        decode_max_bs = (
+            sa.cuda_graph_config.decode.max_bs
+            if sa.cuda_graph_config is not None
+            else None
+        )
         max_bs = max(
-            sa.cuda_graph_max_bs or 0,
+            decode_max_bs or 0,
             sa.max_running_requests or 0,
             1,
         )
@@ -323,7 +333,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
         if self.server_args.model_impl == "mindspore":
@@ -885,7 +895,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         draft_attn_backend=self._draft_worker.draft_attn_backend,
                         cuda_graph_runner=self._draft_worker.cuda_graph_runner,
                         target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.graph_runner,
+                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
                         draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
@@ -894,7 +904,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     cuda_graph_bs=(
                         None
                         if self.server_args.disable_cuda_graph
-                        else self.server_args.cuda_graph_bs
+                        else self.server_args.cuda_graph_bs_decode
                     ),
                 )
 
@@ -1042,8 +1052,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 target_model_runner.init_new_workspace = backup_init
 
             target_graph_runner = None
-            if not self.server_args.disable_cuda_graph:
-                TargetGraphRunnerCls = NPUGraphRunner if _is_npu else CudaGraphRunner
+            if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+                TargetGraphRunnerCls = (
+                    NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
+                )
                 target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
@@ -1102,7 +1114,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Target side
         self._target_worker.model_runner.attn_backend = state.target_attn_backend
-        self._target_worker.model_runner.graph_runner = state.target_graph_runner
+        self._target_worker.model_runner.decode_cuda_graph_runner = (
+            state.target_graph_runner
+        )
 
         # Sync server_args
         self.server_args.speculative_num_steps = state.speculative_num_steps
@@ -1132,7 +1146,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
-            sa.cuda_graph_bs,
+            sa.cuda_graph_bs_decode,
             sa.disable_cuda_graph,
         )
 
@@ -1143,7 +1157,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
         if cuda_graph_bs is not None:
-            sa.cuda_graph_bs = cuda_graph_bs
+            sa.cuda_graph_bs_decode = cuda_graph_bs
             # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
             # for steps that no BS range uses (e.g. step=1). Disable graph
             # capture for those steps; restore in finally so subsequent steps
@@ -1167,7 +1181,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
-                sa.cuda_graph_bs,
+                sa.cuda_graph_bs_decode,
                 sa.disable_cuda_graph,
             ) = backup
             dw._rebuild_topk1_chain_buffers()
@@ -1218,7 +1232,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 verify_input,
                 (
-                    self.target_worker.model_runner.graph_runner.bs
+                    self.target_worker.model_runner.decode_cuda_graph_runner.bs
                     if can_run_cuda_graph
                     else None
                 ),
@@ -1421,7 +1435,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch: The batch to run.
             accept_index: The index of the accepted tokens (incl. bonus).
             num_correct_drafts: Per-req count of correct drafts (excludes bonus);
-                seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
+                seq_lens is advanced by num_correct_drafts + 1 to cover the bonus slot.
         """
         bs = len(batch.seq_lens)
         # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the

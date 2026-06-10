@@ -430,11 +430,15 @@ class EagleVerifyInputV2Mixin:
 
         # Run attention backend plan and cuda graph preparation
         can_run_cuda_graph = bool(
-            target_worker.model_runner.graph_runner
-            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+            target_worker.model_runner.decode_cuda_graph_runner
+            and target_worker.model_runner.decode_cuda_graph_runner.can_run(
+                verify_forward_batch
+            )
         )
         if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+            target_worker.model_runner.decode_cuda_graph_runner.replay_prepare(
+                verify_forward_batch
+            )
             verify_forward_batch.mark_forward_metadata_ready()
         # Non-cuda-graph: defer init to forward_extend, which runs after
         # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing

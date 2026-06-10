@@ -33,7 +33,7 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enforce-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=tc_piecewise",
                 "--disable-radix-cache",
             ],
         )
@@ -69,7 +69,7 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
             model_path=model_path,
             enable_multimodal=True,
             is_embedding=True,
-            enforce_piecewise_cuda_graph=True,
+            cuda_graph_backend_prefill="tc_piecewise",
         )
         out = engine.encode([text], image_data=[DEFAULT_IMAGE_URL])[0]["embedding"]
         engine.shutdown()
@@ -79,7 +79,7 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
             model_path=model_path,
             enable_multimodal=True,
             is_embedding=True,
-            disable_piecewise_cuda_graph=True,
+            cuda_graph_backend_prefill="disabled",
         )
         out_without_pcg = engine.encode([text], image_data=[DEFAULT_IMAGE_URL])[0][
             "embedding"

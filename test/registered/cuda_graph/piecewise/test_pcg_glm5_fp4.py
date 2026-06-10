@@ -43,7 +43,7 @@ class TestPCGGlm5Fp4(CustomTestCase):
                 "--quantization",
                 "modelopt_fp4",
                 "--disable-flashinfer-autotune",
-                "--enforce-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=tc_piecewise",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
