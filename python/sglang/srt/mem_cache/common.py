@@ -396,13 +396,6 @@ def alloc_paged_token_slots_extend(
     if backup_state:
         state = allocator.backup_state()
 
-    # DSV4-NPU allocator additionally needs req_pool_indices (for c-pool
-    # last_loc lookup via per-req tables) and the per-req c{4,128}_state pool
-    # lens (DSV4StateLens — tail-only allocation in a separate paged slot
-    # space). It returns a DSV4OutCacheLoc bundle (not a bare loc tensor); we
-    # unpack out_full_loc for the generic return and stash the bundle on the
-    # batch so the attention backend / per-req-table hooks read it explicitly
-    # off the batch. Gate via hasattr so non-DSV4 allocators stay unchanged.
     is_dsv4 = req_pool_indices is not None and hasattr(
         allocator, "c4_attn_allocator"
     )
