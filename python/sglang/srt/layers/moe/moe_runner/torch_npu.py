@@ -121,10 +121,6 @@ class TorchNpuRunnerCore(MoeRunnerCore):
         x = runner_input.hidden_states
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
-        
-        expert_tokens = torch.cat(
-            [expert_tokens[:1], torch.diff(expert_tokens, dim=0)])
-        group_list_type = 1
 
         # --- w13 (gate & up) projection ---
         hidden_states = self.config.layer.w13_kernel.apply(
