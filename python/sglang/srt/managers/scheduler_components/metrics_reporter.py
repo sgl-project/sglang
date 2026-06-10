@@ -555,12 +555,17 @@ class SchedulerMetricsReporter:
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
         cache_split_msg = (
-            f"#cached-token-device: {prefill_stats.log_hit_tokens_device}, "
-            f"#cached-token-host: {prefill_stats.log_hit_tokens_host}, "
+            (
+                f"#cached-token-device: {prefill_stats.log_hit_tokens_device}, "
+                f"#cached-token-host: {prefill_stats.log_hit_tokens_host}, "
+            )
+            if prefill_stats.log_hit_tokens_host > 0
+            or prefill_stats.log_hit_tokens_device > 0
+            else ""
         )
 
         if (
-            self.scheduler.enable_hicache_storage
+            getattr(self.scheduler, "enable_hicache_storage", False)
             or prefill_stats.log_hit_tokens_storage > 0
         ):
             cache_split_msg += (
