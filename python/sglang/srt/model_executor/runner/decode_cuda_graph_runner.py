@@ -35,10 +35,8 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
-from sglang.srt.compilation.torch_compile_decoration import (
-    patch_model,
-    set_torch_compile_config,
-)
+from sglang.srt.compilation import torch_compile_decoration
+from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import (
     graph_capture,
@@ -815,7 +813,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
-                with patch_model(
+                with torch_compile_decoration.patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
                     num_tokens=bs * self.num_tokens_per_bs,
