@@ -178,7 +178,8 @@ def build_otel_span_tree(otel_spans):
 
     for span in otel_spans:
         parent_span_id = span.get("parentSpanId", "")
-        if span.get("attributes", {}).get("module") == "sglang::request":
+        module_name = span.get("attributes", {}).get("module", "")
+        if module_name == "sglang::request" or module_name == "sglang::mooncake":
             root_spans.append(span)
         elif parent_span_id in span_id_map:
             parent_span = span_id_map[parent_span_id]

@@ -3,26 +3,23 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.common import get_last_loc
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.triton_ops.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_draft_cache_locs as assign_draft_cache_locs,
+    assign_extend_cache_locs as assign_extend_cache_locs,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_req_to_token_pool as assign_req_to_token_pool,
@@ -45,7 +42,11 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.cache_locs import (
     get_target_cache_loc as get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.speculative.triton_ops.eagle import (
+    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
+)
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -53,6 +54,10 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
@@ -75,6 +80,31 @@ TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
     _is_cuda or _is_musa
 )  # This kernel is only available for CUDA and MUSA now
+
+
+def draft_kv_indices_buffer_width(
+    num_seqs: int, topk: int, max_context_len: int
+) -> int:
+    """Per-step row width of the EAGLE draft-decode kv_indices buffer.
+
+    num_seqs * topk branches each attend up to max_context_len KV slots; the topk
+    factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
+    """
+    assert (
+        num_seqs * topk * max_context_len < 2**31
+    ), "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    return num_seqs * topk * max_context_len
+
+
+def draft_kv_indices_used_len(
+    seq_lens_sum: int, topk: int, bs: int, num_steps: int
+) -> int:
+    """kv_indices length used through num_steps draft-decode steps.
+
+    bs = topk * num_seqs branches, one index appended per branch per step. Called with
+    num_steps = i + 1 (per-step slice) and speculative_num_steps (capacity assert).
+    """
+    return seq_lens_sum * topk + bs * num_steps
 
 
 def record_stream_each(tensors, stream):
@@ -222,6 +252,44 @@ def select_top_k_tokens(
     )
 
 
+def _sample_simulated_acc_len(
+    simulate_acc_len: float,
+    simulate_acc_method: str,
+    max_len: int,
+) -> int:
+    """Sample a simulated acceptance length in [1, max_len]."""
+    if simulate_acc_method == "multinomial":
+        simulated_values = torch.normal(
+            mean=simulate_acc_len,
+            std=1.0,
+            size=(1,),
+            device="cpu",
+        )
+        # clamp simulated values to be between 1 and max_len
+        simulated_values = torch.clamp(simulated_values, min=1.0, max=max_len)
+        simulate_acc_len = int(simulated_values.round().item())
+    elif simulate_acc_method == "match-expected":
+        # multinomial sampling does not match the expected length
+        # we keep it for the sake of compatibility of existing tests
+        # but it's better to use "match-expected" for the cases that need to
+        # match the expected length, One caveat is that this will only sample
+        # either round down or round up of the expected length
+        simulate_acc_len = max(1.0, min(max_len, simulate_acc_len))
+        lower = int(simulate_acc_len // 1)
+        upper = lower + 1 if lower < max_len else lower
+        if lower == upper:
+            simulate_acc_len = lower
+        else:
+            weight_upper = simulate_acc_len - lower
+            weight_lower = 1.0 - weight_upper
+            probs = torch.tensor([weight_lower, weight_upper], device="cpu")
+            sampled_index = torch.multinomial(probs, num_samples=1)
+            simulate_acc_len = lower if sampled_index == 0 else upper
+    else:
+        raise ValueError(f"Invalid simulate_acc_method: {simulate_acc_method}")
+    return int(simulate_acc_len)
+
+
 def generate_simulated_accept_index(
     accept_index,
     predict,
@@ -232,36 +300,9 @@ def generate_simulated_accept_index(
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
 ):
     assert simulate_acc_len > 0.0
-
-    if simulate_acc_method == "multinomial":
-        simulated_values = torch.normal(
-            mean=simulate_acc_len,
-            std=1.0,
-            size=(1,),
-            device="cpu",
-        )
-        # clamp simulated values to be between 1 and self.spec_steps
-        simulated_values = torch.clamp(simulated_values, min=1.0, max=spec_steps + 1)
-        simulate_acc_len = int(simulated_values.round().item())
-    elif simulate_acc_method == "match-expected":
-        # multinomial sampling does not match the expected length
-        # we keep it for the sake of compatibility of existing tests
-        # but it's better to use "match-expected" for the cases that need to
-        # match the expected length, One caveat is that this will only sample
-        # either round down or round up of the expected length
-        simulate_acc_len = max(1.0, min(spec_steps + 1, simulate_acc_len))
-        lower = int(simulate_acc_len // 1)
-        upper = lower + 1 if lower < spec_steps + 1 else lower
-        if lower == upper:
-            simulate_acc_len = lower
-        else:
-            weight_upper = simulate_acc_len - lower
-            weight_lower = 1.0 - weight_upper
-            probs = torch.tensor([weight_lower, weight_upper], device="cpu")
-            sampled_index = torch.multinomial(probs, num_samples=1)
-            simulate_acc_len = lower if sampled_index == 0 else upper
-    else:
-        raise ValueError(f"Invalid simulate_acc_method: {SIMULATE_ACC_METHOD}")
+    simulate_acc_len = _sample_simulated_acc_len(
+        simulate_acc_len, simulate_acc_method, spec_steps + 1
+    )
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
@@ -302,13 +343,13 @@ def traverse_tree(
             is_accepted = True
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
-            curr_token_id = draft_tokens[curr]
-            if vocab_size and curr_token_id >= vocab_size:
+            current_token = draft_tokens[curr]
+            if vocab_size and current_token >= vocab_size:
                 is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
                 is_accepted = (
-                    parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
+                    parent_bitmask[current_token // 32] & (1 << (current_token % 32))
                 ) != 0
 
         if is_accepted:
@@ -433,37 +474,65 @@ def draft_tp_context(tp_group: GroupCoordinator):
         yield
 
 
-# Disable torch.compile for this function because it will be
-# even slower.
-# @torch.compile(dynamic=True)
-def get_last_loc_large_page_size_large_top_k(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    speculative_num_steps: int,
-    topk: int,
-    page_size: int,
+def spec_stage_span(name: str):
+    """Profiler span for a coarse speculative-decoding stage (``draft`` /
+    ``draft_extend`` / ``verify``).
+    """
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(name)
+    return nullcontext()
+
+
+def move_accept_tokens_to_target_kvcache(
+    batch: ScheduleBatch,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ):
-    prefix_lens = seq_lens
-    last_page_lens = prefix_lens % page_size
-    num_new_pages_per_topk = (
-        last_page_lens + speculative_num_steps + page_size - 1
-    ) // page_size
-    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
-        page_size * topk
-    )
-    extend_lens = seq_lens - prefix_lens
-    last_loc = get_last_loc(
-        req_to_token,
-        req_pool_indices,
-        prefix_lens,
+    """
+    Move accepted tokens (drafts + bonus) to the target KV cache.
+
+    Args:
+        batch: The batch to run.
+        accept_index: The index of the accepted tokens (incl. bonus).
+        num_correct_drafts: Per-req count of correct drafts (excludes bonus);
+            seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
+    """
+    bs = len(batch.seq_lens)
+    device = batch.seq_lens.device
+    # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the
+    # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
+    size = bs * accept_index.shape[1]
+
+    # fill_accept_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
+    maybe_detect_oob(
+        accept_index,
+        -1,
+        batch.out_cache_loc.size(0),
+        "spec v2 move_accept_tokens accept_index",
     )
 
-    return (
-        prefix_lens,
-        seq_lens,
-        last_loc,
-        num_new_pages_per_topk,
-        extend_lens,
-        last_page_lens,
+    tgt_cache_loc = torch.zeros(
+        size,
+        dtype=torch.int64,
+        device=device,
+    )
+    accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
+    assign_extend_cache_locs[(bs,)](
+        batch.req_pool_indices,
+        batch.req_to_token_pool.req_to_token,
+        batch.seq_lens,
+        batch.seq_lens + num_correct_drafts + 1,
+        tgt_cache_loc,
+        batch.req_to_token_pool.req_to_token.shape[1],
+        next_power_of_2(bs),
+    )
+    fill_accept_out_cache_loc[(size,)](
+        accept_index,
+        batch.out_cache_loc,
+        accept_out_cache_loc,
+        next_power_of_2(size),
+    )
+    token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+        tgt_cache_loc, accept_out_cache_loc
     )

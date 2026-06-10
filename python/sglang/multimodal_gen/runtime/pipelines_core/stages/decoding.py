@@ -31,6 +31,33 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
+def scale_and_shift_latents(latents: torch.Tensor, server_args, vae) -> torch.Tensor:
+    """De-normalize latents before VAE decode (single shared implementation).
+
+    Used by DecodingStage.scale_and_shift and by realtime stages that decode
+    outside a DecodingStage instance.
+    """
+    scaling_factor, shift_factor = (
+        server_args.pipeline_config.get_decode_scale_and_shift(
+            latents.device, latents.dtype, vae
+        )
+    )
+
+    # 1. scale
+    if isinstance(scaling_factor, torch.Tensor):
+        latents = latents / scaling_factor.to(latents.device, latents.dtype)
+    else:
+        latents = latents / scaling_factor
+
+    # 2. apply shifting if needed
+    if shift_factor is not None:
+        if isinstance(shift_factor, torch.Tensor):
+            latents = latents + shift_factor.to(latents.device, latents.dtype)
+        else:
+            latents = latents + shift_factor
+    return latents
+
+
 def _ensure_tensor_decode_output(decode_output):
     """
     Ensure VAE decode output is a tensor.
@@ -106,25 +133,7 @@ class DecodingStage(PipelineStage):
         return result
 
     def scale_and_shift(self, latents: torch.Tensor, server_args):
-        scaling_factor, shift_factor = (
-            server_args.pipeline_config.get_decode_scale_and_shift(
-                latents.device, latents.dtype, self.vae
-            )
-        )
-
-        # 1. scale
-        if isinstance(scaling_factor, torch.Tensor):
-            latents = latents / scaling_factor.to(latents.device, latents.dtype)
-        else:
-            latents = latents / scaling_factor
-
-        # 2. apply shifting if needed
-        if shift_factor is not None:
-            if isinstance(shift_factor, torch.Tensor):
-                latents += shift_factor.to(latents.device, latents.dtype)
-            else:
-                latents += shift_factor
-        return latents
+        return scale_and_shift_latents(latents, server_args, self.vae)
 
     @torch.no_grad()
     def decode(

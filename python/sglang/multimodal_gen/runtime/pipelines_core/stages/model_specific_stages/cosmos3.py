@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -321,11 +322,8 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         if is_i2v:
             vae_dtype = next(self.vae.parameters()).dtype
-            pixel_video = (
-                batch.preprocessed_image.unsqueeze(2)
-                .expand(-1, -1, batch.num_frames, -1, -1)
-                .contiguous()
-                .to(device=device, dtype=vae_dtype)
+            pixel_video = batch.preprocessed_image.unsqueeze(2).to(
+                device=device, dtype=vae_dtype
             )
             with torch.no_grad():
                 cond_latent = self._vae_encode(pixel_video).to(dtype)
@@ -486,6 +484,11 @@ class Cosmos3DenoisingStage(PipelineStage):
         result.add_check("latents", batch.latents, V.is_tensor)
         result.add_check("timesteps", batch.timesteps, V.is_tensor)
         return result
+
+    def step_profile(self):
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler:
+            profiler.step_denoising_step()
 
     def _run_transformer(
         self,
@@ -702,6 +705,9 @@ class Cosmos3DenoisingStage(PipelineStage):
 
             if image_latent is not None:
                 latents[:, :, 0:1, :, :] = image_latent
+
+            if batch.profile and not batch.is_warmup:
+                self.step_profile()
 
         batch.latents = latents
         self.log_info("Denoising complete")
