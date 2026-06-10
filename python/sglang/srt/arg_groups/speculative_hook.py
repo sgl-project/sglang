@@ -256,10 +256,13 @@ def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
-    logger.warning(
-        "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
-    )
+    # SGLANG_ENABLE_SPEC_V2=False selects the non-overlap (synchronous) spec v2
+    # path instead of the overlap-scheduled one; both run the V2 worker.
+    if (
+        not envs.SGLANG_ENABLE_SPEC_V2.get()
+        and not server_args.disable_overlap_schedule
+    ):
+        server_args.disable_overlap_schedule = True
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -396,7 +399,6 @@ def _handle_ngram(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
     server_args.enable_mixed_chunk = False
     server_args.speculative_eagle_topk = server_args.speculative_ngram_max_bfs_breadth
     if server_args.speculative_num_draft_tokens is None:
@@ -404,6 +406,11 @@ def _handle_ngram(server_args: "ServerArgs") -> None:
         logger.warning(
             "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
             "You can override this by explicitly setting --speculative-num-draft-tokens."
+        )
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = (
+            server_args.speculative_num_draft_tokens
+            // server_args.speculative_eagle_topk
         )
     if server_args.speculative_ngram_external_corpus_path is not None:
         if server_args.speculative_ngram_external_sam_budget <= 0:
@@ -425,7 +432,7 @@ def _handle_ngram(server_args: "ServerArgs") -> None:
                 f"speculative_num_draft_tokens - 1 ({server_args.speculative_num_draft_tokens - 1})."
             )
     logger.warning(
-        "The overlap scheduler and mixed chunked prefill are disabled because of "
+        "The mixed chunked prefill are disabled because of "
         "using ngram speculative decoding."
     )
 

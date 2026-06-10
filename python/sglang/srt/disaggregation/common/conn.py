@@ -392,6 +392,11 @@ class CommonKVManager(BaseKVManager):
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
+            # If the server was bound to the wildcard address (0.0.0.0 / ::), use the
+            # actual local IP instead — a PUT to http://0.0.0.0:<port>/route is rejected
+            # with 403 by aiohttp ≥3.9 because 0.0.0.0 is not a valid HTTP Host value.
+            if host in ("0.0.0.0", "::"):
+                host = self.local_ip
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
