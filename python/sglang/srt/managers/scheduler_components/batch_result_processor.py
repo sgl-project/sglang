@@ -21,6 +21,9 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_components.invariant_checker import (
+    bk_on_resolve_decode,
+)
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -654,6 +657,7 @@ class SchedulerBatchResultProcessor:
                 continue
 
             # Non-spec and V2: full post-processing
+            bk_on_resolve_decode(req)
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():

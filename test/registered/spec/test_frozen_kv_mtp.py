@@ -4,6 +4,7 @@ from typing import Optional
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -99,12 +100,16 @@ class TestFrozenKVMTP(CustomTestCase):
     def _run_gsm8k_mtp(self, topk: int) -> None:
         process = None
         try:
-            process = popen_launch_server(
-                "google/gemma-4-E4B-it",
-                self.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
-                other_args=self._server_args(topk),
-            )
+            # Bookkeeping clock checks: fail fast on double/missing
+            # decode_batch_idx ticks, doubled SWA evict passes, and KV
+            # watermark violations.
+            with envs.SGLANG_ENABLE_REQ_BOOKKEEPING_CHECK.override(True):
+                process = popen_launch_server(
+                    "google/gemma-4-E4B-it",
+                    self.base_url,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
+                    other_args=self._server_args(topk),
+                )
             requests.get(self.base_url + "/flush_cache", timeout=30)
 
             server_info = get_server_info(self.base_url)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -315,3 +316,90 @@ def create_scheduler_watchdog(
         soft=soft,
         dump_info=dump_info,
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-request bookkeeping clock checks (SGLANG_ENABLE_REQ_BOOKKEEPING_CHECK).
+#
+# Exactly-once protocol: `bk_on_prepare_decode` assigns each decode iteration
+# an id; the owner tick / evict sites stamp it (`bk_on_clock_tick` /
+# `bk_on_evict_swa`) and a second stamp with the same id fails fast; the
+# decode resolve verifies the clock is live (`bk_on_resolve_decode`).
+# `bk_check_watermarks` guards 0 <= kv_committed_len <= kv_allocated_len <=
+# req_to_token row width. Static companion: the ownership allowlist in
+# test/registered/unit/spec/test_decode_bookkeeping_ownership.py.
+# ---------------------------------------------------------------------------
+
+_bk_iter_seq = itertools.count(1)
+_bk_latest_iter_id = 0
+# Overlap runs prepare(k+1) before resolve(k), and PP microbatches interleave
+# several prepares per resolve, so a live clock may lag the newest iter id.
+# 8 gives headroom for those while still catching a stuck (never-ticked)
+# clock, whose lag grows without bound.
+_BK_MAX_RESOLVE_LAG = 8
+
+
+def _bk_iter_id(batch) -> Optional[int]:
+    return getattr(batch, "_bk_iter_id", None)
+
+
+def bk_on_prepare_decode(batch) -> None:
+    """Start a checked decode iteration; call at prepare_for_decode entry."""
+    if not envs.SGLANG_ENABLE_REQ_BOOKKEEPING_CHECK.get():
+        return
+    global _bk_latest_iter_id
+    _bk_latest_iter_id = next(_bk_iter_seq)
+    batch._bk_iter_id = _bk_latest_iter_id
+    bk_check_watermarks(batch)
+
+
+def bk_on_clock_tick(req, batch) -> None:
+    """Stamp a `decode_batch_idx` tick; at most one per req per iteration."""
+    iter_id = _bk_iter_id(batch)
+    if iter_id is None:
+        return
+    assert getattr(req, "_bk_tick_iter_id", None) != iter_id, (
+        f"decode_batch_idx ticked twice in decode iter {iter_id} "
+        f"(rid={req.rid}). Per-iter bookkeeping is owned by exactly one "
+        "site; see test_decode_bookkeeping_ownership.py."
+    )
+    req._bk_tick_iter_id = iter_id
+
+
+def bk_on_evict_swa(batch) -> None:
+    """Stamp a `maybe_evict_swa` pass; at most one per decode iteration."""
+    iter_id = _bk_iter_id(batch)
+    if iter_id is None:
+        return
+    assert getattr(batch, "_bk_evict_iter_id", None) != iter_id, (
+        f"maybe_evict_swa ran twice in decode iter {iter_id}. The first "
+        "decode iter of an overlap schedule must not evict while the "
+        "previous extend batch is in flight; a doubled eviction pass "
+        "re-opens that race."
+    )
+    batch._bk_evict_iter_id = iter_id
+
+
+def bk_on_resolve_decode(req) -> None:
+    """Verify the req's decode clock is live when its result is resolved."""
+    if not envs.SGLANG_ENABLE_REQ_BOOKKEEPING_CHECK.get():
+        return
+    stamp = getattr(req, "_bk_tick_iter_id", None)
+    assert stamp is not None and _bk_latest_iter_id - stamp <= _BK_MAX_RESOLVE_LAG, (
+        f"decode_batch_idx never ticked (or went stale) for rid={req.rid}: "
+        f"tick stamp={stamp}, latest iter={_bk_latest_iter_id}. The clock "
+        "gates SWA eviction cadence and prefix-lock release; a stuck clock "
+        "means the owning prepare_for_decode path skipped this req."
+    )
+
+
+def bk_check_watermarks(batch) -> None:
+    """0 <= kv_committed_len <= kv_allocated_len <= req_to_token row width."""
+    row_width = batch.req_to_token_pool.req_to_token.shape[1]
+    for req in batch.reqs:
+        committed, allocated = req.kv_committed_len, req.kv_allocated_len
+        assert 0 <= committed <= allocated <= row_width, (
+            f"KV watermark violation for rid={req.rid}: "
+            f"committed={committed}, allocated={allocated}, "
+            f"row_width={row_width}."
+        )

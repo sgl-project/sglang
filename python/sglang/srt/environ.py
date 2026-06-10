@@ -623,6 +623,10 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    # Per-request bookkeeping clock checks (decode_batch_idx tick, SWA evict,
+    # KV watermarks); see scheduler_components/invariant_checker.py. Off in
+    # prod; tests turn it on to fail-fast on double/missing bookkeeping.
+    SGLANG_ENABLE_REQ_BOOKKEEPING_CHECK = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

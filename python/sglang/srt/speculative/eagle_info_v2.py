@@ -16,6 +16,9 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     set_mamba_track_indices_from_reqs,
 )
+from sglang.srt.managers.scheduler_components.invariant_checker import (
+    bk_on_clock_tick,
+)
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -167,6 +170,7 @@ class EagleDraftInputV2Mixin:
             nxt_kv_lens[i] = nxt
             num_needed_tokens += nxt - cur
             r.kv_allocated_len = nxt
+            bk_on_clock_tick(r, batch)
             r.decode_batch_idx += 1
             # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
             r.kv_committed_len += 1
