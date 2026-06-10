@@ -24,7 +24,6 @@ class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
         "fp8",
         "--mamba-scheduler-strategy",
         "extra_buffer",
-        "--enable-piecewise-cuda-graph",
         "--speculative-algorithm",
         "NEXTN",
         "--reasoning-parser",
@@ -42,7 +41,7 @@ class TestPCGWithSTANDALONE(PCGSpecBase, unittest.TestCase):
     model = "meta-llama/Llama-3.1-8B-Instruct"
     server_args = [
         "--trust-remote-code",
-        "--enforce-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=tc_piecewise",
         "--mem-fraction-static",
         "0.5",
         "--speculative-algorithm",
@@ -65,7 +64,7 @@ class TestPCGWithNGRAM(PCGSpecBase, unittest.TestCase):
     model = "Qwen/Qwen2.5-Coder-7B-Instruct"
     server_args = [
         "--trust-remote-code",
-        "--enforce-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=tc_piecewise",
         "--speculative-algorithm",
         "NGRAM",
         "--speculative-num-draft-tokens",

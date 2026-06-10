@@ -22,7 +22,7 @@ class TestPCGWithEAGLE3(PCGSpecBase, unittest.TestCase):
         "--tp",
         "2",
         "--trust-remote-code",
-        "--enforce-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=tc_piecewise",
         "--mem-fraction-static",
         "0.6",
         "--speculative-algorithm",

@@ -26,7 +26,8 @@ class TestPCGWithDFlash(PCGSpecBase, CustomTestCase):
         "--trust-remote-code",
         "--attention-backend",
         "flashinfer",
-        "--enforce-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill",
+        "tc_piecewise",
         "--speculative-algorithm",
         "DFLASH",
         "--speculative-draft-model-path",
@@ -35,7 +36,7 @@ class TestPCGWithDFlash(PCGSpecBase, CustomTestCase):
         "1",
         "--max-running-requests",
         "64",
-        "--cuda-graph-bs",
+        "--cuda-graph-bs-decode",
         *[str(i) for i in range(1, 65)],
     ]
     server_env = {"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"}
