@@ -1,11 +1,13 @@
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchResult
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv_cache_builder import is_supported_dsv4_decode_radix_mtp
@@ -204,3 +206,47 @@ def test_swa_component_force_leaf_creation_allows_full_only_leaf():
         key_len=256,
         params=InsertParams(swa_evicted_seqlen=256, force_leaf_creation=True),
     )
+
+
+def test_dsv4_decode_radix_match_uses_full_match_for_full_only_leaf():
+    queue = _make_queue(page_size=2)
+    node = object()
+    tree_cache = SimpleNamespace(captured_params=None)
+
+    def supports_mamba():
+        return False
+
+    def match_prefix(params):
+        tree_cache.captured_params = params
+        return MatchResult(
+            device_indices=torch.tensor([1, 2], dtype=torch.int64),
+            last_device_node=node,
+            last_host_node=node,
+            best_match_node=node,
+        )
+
+    def inc_lock_ref(_node):
+        return SimpleNamespace(swa_uuid_for_lock=None)
+
+    tree_cache.supports_mamba = supports_mamba
+    tree_cache.match_prefix = match_prefix
+    tree_cache.inc_lock_ref = inc_lock_ref
+    queue.tree_cache = tree_cache
+
+    req = SimpleNamespace(
+        origin_input_ids=[1, 2, 3],
+        extra_key=None,
+        prefix_indices=None,
+        last_node=None,
+        last_host_node=None,
+        best_match_node=None,
+        host_hit_length=0,
+        swa_uuid_for_lock=None,
+    )
+
+    prefix_indices, prefix_len = DecodePreallocQueue._match_prefix_and_lock(queue, req)
+
+    assert prefix_indices.tolist() == [1, 2]
+    assert prefix_len == 2
+    assert tree_cache.captured_params.return_full_match is True
+    assert req.last_node is node
