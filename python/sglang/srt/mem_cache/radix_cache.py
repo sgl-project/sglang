@@ -220,9 +220,8 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
-        # Session holders: the set of session_ids whose requests extended this node
-        # to a leaf. release_session(id) drops id and frees the node only once the
-        # set empties (last holder). None for plain (non-session) nodes; LRU-neutral.
+        # Sessions holding this leaf; release_session frees the node only once the
+        # set empties (last holder). None for plain nodes; LRU-neutral.
         self.session_ids: Optional[Set[str]] = None
 
         self.id = TreeNode.counter if id is None else id

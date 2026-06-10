@@ -15,17 +15,13 @@ logger = logging.getLogger(__name__)
 
 
 class SessionRadixCacheMixin:
-    """Tags radix KV by ``session_id``; ``release_session`` (close) frees a
-    session's tagged chains. Tagged KV is ordinary LRU radix -- no pinning, no
-    open. A node carries the *set* of sessions holding it, so a node physically
-    shared by several sessions (byte-identical content -> same leaf) is freed
-    only when its last holder closes, not on the first close. Mixed into
-    RadixCache."""
+    """Tags radix KV by session id; ``release_session`` (close) frees a session's
+    tagged chains. A node holds the set of sessions on it, so a node shared by
+    several sessions is freed only when its last holder closes. Tagged KV is
+    ordinary LRU radix -- no pinning, no open. Mixed into RadixCache."""
 
     def _tag_session_leaf(self, req: Req, radix_key, node=None) -> None:
-        """Add this request's session_id to its leaf's holder set; no-op for
-        non-session reqs. Idempotent: a session re-tagging the same leaf turn
-        over turn is a set membership no-op."""
+        """Add this request's session id to its leaf's holder set; no-op for non-session reqs."""
         sid = getattr(req, "session_id", None)
         if sid is None:
             return
@@ -35,19 +31,12 @@ class SessionRadixCacheMixin:
             if node.session_ids is None:
                 node.session_ids = set()
             node.session_ids.add(sid)
-            logger.debug(
-                "tag session %s: node=%d len=%d holders=%d",
-                sid,
-                node.id,
-                len(node.key),
-                len(node.session_ids),
-            )
+            logger.debug("tag session %s: node=%d holders=%d", sid, node.id, len(node.session_ids))
 
     def release_session(self, session_id: str) -> int:
-        """Free a session's tagged KV on close: find its leaves by holder set,
-        drop this session, and free each node only once no other session still
-        holds it (last-holder refcount) -- shared prefixes and shared leaves are
-        kept. No index, so a late request can't leak. Synchronous, LRU-neutral."""
+        """Close: drop this session from each of its tagged leaves, freeing a node
+        only once no other session still holds it (last holder). Shared
+        prefixes/leaves kept. No index, so a late request can't leak. Synchronous."""
         pending = [
             n
             for n in self.evictable_leaves
