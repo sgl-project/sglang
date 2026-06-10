@@ -10,8 +10,7 @@ import torch.distributed as dist
 import triton
 
 from sglang.jit_kernel.all_reduce import fused_parallel_qknorm
-from sglang.jit_kernel.tests.test_custom_all_reduce import multiprocess_test
-from sglang.jit_kernel.tests.utils import multiprocess_main
+from sglang.jit_kernel.tests.utils import multiprocess_main, multiprocess_test
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
