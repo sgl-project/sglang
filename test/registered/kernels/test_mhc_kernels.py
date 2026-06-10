@@ -3,6 +3,9 @@ import torch
 
 import sglang.srt.layers.mhc as mhc
 from sglang.srt.layers.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
 
 
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
@@ -109,3 +112,9 @@ def test_mhc_fused_post_pre_matches_unfused(
     layer_atol = 2e-2 if use_norm else 2e-3
     layer_rtol = 2e-2 if use_norm else 2e-3
     torch.testing.assert_close(layer_out, layer_ref, atol=layer_atol, rtol=layer_rtol)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

@@ -27,6 +27,7 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -814,20 +815,14 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    if self.use_sliding_window_kv_pool:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer,
-                            cache_loc,
-                            k,
-                            v,
-                            layer.k_scale,
-                            layer.v_scale,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
-                        )
-                    else:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                        )
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
+                    )
 
             causal = (
                 not layer.is_cross_attention
@@ -917,20 +912,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                if self.use_sliding_window_kv_pool:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                else:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -956,20 +945,14 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if self.use_sliding_window_kv_pool:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                else:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                )
 
         # Call the wrapped function
         o = decode_wrapper.forward(

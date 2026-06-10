@@ -69,6 +69,7 @@ from sglang.srt.layers.attention.utils import (
     pad_sequence_with_mask,
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
@@ -2051,20 +2052,14 @@ class AiterAttnBackend(AttentionBackend):
                 # launch_reshape_and_cache_flash; always route through
                 # set_kv_buffer which dispatches to the SHUFFLE 5D writer.
                 if self.kv_cache_is_vectorized_5d:
-                    if self.use_sliding_window_kv_pool:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer,
-                            cache_loc,
-                            k,
-                            v,
-                            k_descale,
-                            v_descale,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
-                        )
-                    else:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, k_descale, v_descale
-                        )
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        k_descale,
+                        v_descale,
+                    )
                 # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
                 # both unified attention and sliding window kv pool are active.
                 # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
@@ -2101,20 +2096,14 @@ class AiterAttnBackend(AttentionBackend):
                 elif self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
-                    if self.use_sliding_window_kv_pool:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer,
-                            cache_loc,
-                            k,
-                            v,
-                            k_descale,
-                            v_descale,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
-                        )
-                    else:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, k_descale, v_descale
-                        )
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        k_descale,
+                        v_descale,
+                    )
 
         if self.use_mla:
             max_q_len = self.forward_metadata.max_q_len
@@ -2540,20 +2529,17 @@ class AiterAttnBackend(AttentionBackend):
         if save_kv_cache:
             # SHUFFLE 5D pool path — see forward_extend for rationale.
             if self.kv_cache_is_vectorized_5d:
-                if self.use_sliding_window_kv_pool:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(
                         forward_batch.out_cache_loc,
-                        k,
-                        v,
-                        k_descale,
-                        v_descale,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                else:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, forward_batch.out_cache_loc, k, v, k_descale, v_descale
-                    )
+                        self.forward_metadata.swa_out_cache_loc,
+                    ),
+                    k,
+                    v,
+                    k_descale,
+                    v_descale,
+                )
             # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
             # both unified attention and sliding window kv pool are active.
             # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
@@ -2595,17 +2581,15 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     forward_batch.out_cache_loc,
                 )
-            elif self.use_sliding_window_kv_pool:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    forward_batch.out_cache_loc,
-                    k,
-                    v,
-                    swa_loc=self.forward_metadata.swa_out_cache_loc,
-                )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer,
+                    KVWriteLoc(
+                        forward_batch.out_cache_loc,
+                        self.forward_metadata.swa_out_cache_loc,
+                    ),
+                    k,
+                    v,
                 )
 
         if self.use_mla:

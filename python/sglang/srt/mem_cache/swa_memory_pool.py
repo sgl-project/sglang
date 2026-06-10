@@ -5,7 +5,11 @@ import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    KVCache,
+    MHATokenToKVPool,
+    unwrap_write_loc,
+)
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 
 logger = logging.getLogger(__name__)
@@ -152,14 +156,14 @@ class SWAKVPool(BaseSWAKVPool):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
-        swa_loc: Optional[torch.Tensor] = None,
     ):
-
+        # loc_info bundles the full loc and the pre-translated SWA loc.
+        loc, swa_loc = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
