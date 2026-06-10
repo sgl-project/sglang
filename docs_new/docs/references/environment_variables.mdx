@@ -576,17 +576,17 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer TRTLLM per-token NVFP4 activation scaling; ignores checkpoint activation FP32 scale by treating it as <code>1</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer TRTLLM NVFP4 per-token activation scaling; ignores checkpoint activation FP32 scale by treating it as <code>1</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>FLASHINFER_NVFP4_4OVER6</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer NVFP4 4over6 scaling for the per-token activation path; effective only with <code>SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer NVFP4 4over6 scaling for NVFP4 per-token activation and online NVFP4 MoE weight quantization paths</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>FLASHINFER_NVFP4_4OVER6_E4M3_USE_256</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use <code>256</code> as the E4M3 scale maximum for FlashInfer NVFP4 4over6 per-token activation scaling; otherwise uses <code>448</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use <code>256</code> as the E4M3 scale maximum for FlashInfer NVFP4 4over6 scaling; otherwise uses <code>448</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
 <tr>
@@ -602,6 +602,11 @@ SGLang supports various environment variables that can be used to configure its 
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FP8_IGNORED_LAYERS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A comma-separated list of layer names to ignore during FP8 quantization. For example: <code>model.layers.0,model.layers.1.,qkv_proj</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FP4_IGNORED_LAYERS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A comma-separated list of layer names to keep out of FP4 online quantization, including <code>nvfp4_online</code>. For example: <code>model.layers.40,model.layers.41</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
 </tbody>

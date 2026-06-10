@@ -394,7 +394,15 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         from sglang.srt.server_args import ServerArgs
 
-        self.assertFalse(ServerArgs(model_path="dummy").enable_breakable_cuda_graph)
+        # cg-refactor folded the legacy enable_breakable_cuda_graph flag
+        # into cuda_graph_config. Verify the per-phase backend selectors
+        # default to None (i.e. nothing opted into BREAKABLE without an
+        # explicit CLI flag).
+        sa = ServerArgs(model_path="dummy")
+        self.assertNotEqual(sa.cuda_graph_backend_decode, "breakable")
+        self.assertNotEqual(sa.cuda_graph_backend_prefill, "breakable")
+        self.assertNotEqual(sa.decode_cuda_graph_backend, "breakable")
+        self.assertNotEqual(sa.prefill_cuda_graph_backend, "breakable")
         self.assertFalse(
             AttentionBackend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
