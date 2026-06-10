@@ -12,6 +12,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     set_mamba_track_indices_from_reqs,
@@ -473,6 +474,17 @@ class EagleVerifyInputV2Mixin:
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
+
+        # Apply the custom logit processors if registered in the sampling info.
+        # Done before penalties and the grammar mask, matching the other spec
+        # backends (eagle_info / ngram_info / dflash_info) so a custom processor
+        # cannot override tokens the grammar mask has already forbidden.
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(
+                next_token_logits,
+                sampling_info,
+                num_tokens_in_batch=self.draft_token_num,
+            )
 
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.
