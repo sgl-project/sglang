@@ -312,6 +312,8 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         server_args=server_args,
     )
 
+    spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+
     _use_mlx = use_mlx()
     if _use_mlx:
         from sglang.srt.hardware_backend.mlx.model_runner_stub import (
@@ -319,6 +321,45 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         )
 
         model_runner = MlxModelRunnerStub(**runner_kwargs)
+    elif spec_algorithm.is_speculative():
+        from sglang.srt.managers.tp_worker import TpModelWorker
+
+        target_worker = TpModelWorker(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            pp_rank=0,
+            attn_cp_rank=0,
+            moe_dp_rank=0,
+            dp_rank=None,
+            nccl_port=port_args.nccl_port,
+        )
+        rank_print(
+            f"max_total_num_tokens={target_worker.model_runner.max_total_num_tokens}"
+        )
+
+        DraftWorkerClass = spec_algorithm.create_worker(server_args)
+        spec_worker = DraftWorkerClass(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            attn_cp_rank=0,
+            moe_dp_rank=0,
+            dp_rank=None,
+            nccl_port=port_args.nccl_port,
+            target_worker=target_worker,
+        )
+
+        tokenizer = get_tokenizer(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+        )
+        if server_args.tp_size > 1:
+            dist.barrier()
+        return _SpecBenchRunner(spec_worker, target_worker, server_args), tokenizer
     else:
         model_runner = ModelRunner(**runner_kwargs)
         model_runner.alloc_memory_pool()
@@ -538,6 +579,109 @@ class _TorchBenchRunner:
         return self.torch_runner.max_total_num_tokens // (input_len + output_len)
 
 
+class _SpecBenchRunner:
+    """Wraps a speculative decoding worker for the SD benchmark path."""
+
+    def __init__(self, spec_worker, target_worker, server_args):
+        self.spec_worker = spec_worker
+        self.model_runner = target_worker.model_runner
+        self.server_args = server_args
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+
+    def clear(self):
+        self.model_runner.req_to_token_pool.clear()
+        self.model_runner.token_to_kv_pool_allocator.clear()
+        draft_runner = self.spec_worker.draft_worker.draft_runner
+        draft_runner.token_to_kv_pool_allocator.clear()
+        if draft_runner.req_to_token_pool is not self.model_runner.req_to_token_pool:
+            # Currently the draft worker shares the target's req_to_token_pool;
+            # clear separately if that ever changes.
+            draft_runner.req_to_token_pool.clear()
+            draft_runner.req_to_token_pool.req_to_token.zero_()
+
+        # The bench never finishes requests, so the previous run's
+        # req_to_token rows survive `clear()` (it only resets the free
+        # lists) and are re-exposed when the next run reuses the same
+        # req_pool_indices. Zero them so every run starts from the same
+        # all-zero mapping table as a fresh engine (bit-reproducible runs).
+        # Historical note: the accept-length collapse this used to paper
+        # over (~3.0 -> ~1.6 on the second run with EAGLE topk=4) was really
+        # caused by decode() below not advancing kv_committed_len: with
+        # committed lagging seq_lens, eagle_info_v2.prepare_for_decode
+        # under-writes the rows and the draft/verify gathers read past the
+        # written watermark, picking up stale slot ids. With the bookkeeping
+        # mirrored correctly (and asserted in prepare_for_decode), stale
+        # rows are never read; this zero_() is determinism hygiene, not a
+        # correctness fix.
+        self.model_runner.req_to_token_pool.req_to_token.zero_()
+
+    @torch.no_grad()
+    def extend(self, reqs):
+        dummy_tree_cache = TreeCacheNamespace(
+            page_size=self.server_args.page_size,
+            device=self.model_runner.device,
+            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+        )
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+            tree_cache=dummy_tree_cache,
+            model_config=self.model_runner.model_config,
+            enable_overlap=False,
+            spec_algorithm=self.spec_algorithm,
+        )
+        batch.prepare_for_extend()
+        if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
+        _maybe_prepare_mlp_sync_batch(batch, self.model_runner)
+
+        result = self.spec_worker.forward_batch_generation(batch)
+        batch.spec_info = result.next_draft_input
+        if result.new_seq_lens is not None:
+            batch.seq_lens = result.new_seq_lens
+        logits = (
+            result.logits_output.next_token_logits if result.logits_output else None
+        )
+        return result.next_token_ids, logits, batch
+
+    @torch.no_grad()
+    def decode(self, next_token_ids, batch):
+        batch.prepare_for_decode()
+        _maybe_prepare_mlp_sync_batch(batch, self.model_runner)
+
+        result = self.spec_worker.forward_batch_generation(batch)
+        batch.spec_info = result.next_draft_input
+        if result.new_seq_lens is not None:
+            batch.seq_lens = result.new_seq_lens
+        if result.accept_lens is not None:
+            accept_lens = result.accept_lens.tolist()
+            # Mirror the scheduler's KV bookkeeping: -1 because
+            # prepare_for_decode pre-claimed the bonus slot.
+            for req, al in zip(batch.reqs, accept_lens):
+                req.kv_committed_len += al - 1
+        else:
+            accept_lens = [1] * len(batch.reqs)
+        logits = (
+            result.logits_output.next_token_logits if result.logits_output else None
+        )
+        return result.next_token_ids, logits, accept_lens
+
+    def cleanup(self, batch):
+        pass
+
+    def synchronize(self):
+        synchronize(self.model_runner.device)
+
+    def max_batch_size(self, input_len, output_len):
+        return self.model_runner.max_total_num_tokens // (input_len + output_len)
+
+
 class _MlxBenchRunner:
     """Wraps MlxModelRunner for the MLX benchmark path."""
 
@@ -671,10 +815,21 @@ def correctness_test(
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
     for _ in range(bench_args.output_len[0] - 1):
-        next_token_ids, _ = model_runner.decode(next_token_ids, batch)
+        ret = model_runner.decode(next_token_ids, batch)
+        next_token_ids = ret[0]
         next_token_ids_list = next_token_ids.tolist()
-        for i in range(len(reqs)):
-            output_ids[i].append(next_token_ids_list[i])
+        if len(ret) == 3:
+            # SD path: tokens are packed per request with a fixed stride;
+            # only the first accept_lens[i] tokens of each chunk are valid.
+            accept_lens = ret[2]
+            stride = len(next_token_ids_list) // len(reqs)
+            for i in range(len(reqs)):
+                output_ids[i].extend(
+                    next_token_ids_list[i * stride : i * stride + accept_lens[i]]
+                )
+        else:
+            for i in range(len(reqs)):
+                output_ids[i].append(next_token_ids_list[i])
 
     # Clean up
     model_runner.cleanup(batch)
@@ -772,44 +927,109 @@ def latency_test_run_once(
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
     trace_filename_decode = None
     profiler = None
-    for i in range(output_len - 1):
-        model_runner.synchronize()
-        # Start profiler at the specified step
-        if enable_profile_decode and i == profile_start:
-            trace_filename_decode = _create_torch_profiler_filename(
-                profile_filename_prefix, batch_size, input_len, output_len, "decode"
-            )
-            profiler = start_profile(
-                profile_activities,
-                profile_record_shapes=profile_record_shapes,
-                rank_print=rank_print,
-                trace_filename=trace_filename_decode,
-            )
 
-        tic = time.perf_counter()
-        next_token_ids, _ = model_runner.decode(next_token_ids, batch)
-        model_runner.synchronize()
-        latency = time.perf_counter() - tic
+    is_spec = isinstance(model_runner, _SpecBenchRunner)
+    if is_spec:
+        # Per-request accounting: each request stops contributing once it
+        # reaches output_len (1 token already generated by the prefill).
+        tokens_generated = [1] * batch_size
+        decode_steps_per_req = [0] * batch_size
+        step = 0
+        while min(tokens_generated) < output_len:
+            model_runner.synchronize()
+            if enable_profile_decode and step == profile_start:
+                trace_filename_decode = _create_torch_profiler_filename(
+                    profile_filename_prefix, batch_size, input_len, output_len, "decode"
+                )
+                profiler = start_profile(
+                    profile_activities,
+                    profile_record_shapes=profile_record_shapes,
+                    rank_print=rank_print,
+                    trace_filename=trace_filename_decode,
+                )
 
-        # Stop profiler after the specified number of steps
-        if enable_profile_decode and profiler is not None and i >= profile_end - 1:
-            stop_profile(
-                profiler,
-                profile_activities,
-                rank_print=rank_print,
-                save_trace=True,
-                trace_filename=trace_filename_decode,
-                stage="decode",
-            )
-            profiler = None
+            tic = time.perf_counter()
+            next_token_ids, _, accept_lens = model_runner.decode(next_token_ids, batch)
+            model_runner.synchronize()
+            latency = time.perf_counter() - tic
 
-        tot_latency += latency
-        throughput = batch_size / latency
-        decode_latencies.append(latency)
-        if i < 5 or (log_decode_step > 0 and i % log_decode_step == 0):
-            rank_print(
-                f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
-            )
+            if (
+                enable_profile_decode
+                and profiler is not None
+                and step >= profile_end - 1
+            ):
+                stop_profile(
+                    profiler,
+                    profile_activities,
+                    rank_print=rank_print,
+                    save_trace=True,
+                    trace_filename=trace_filename_decode,
+                    stage="decode",
+                )
+                profiler = None
+
+            new_tokens = 0
+            for i in range(batch_size):
+                if tokens_generated[i] >= output_len:
+                    continue
+                accepted = min(accept_lens[i], output_len - tokens_generated[i])
+                tokens_generated[i] += accepted
+                new_tokens += accepted
+                decode_steps_per_req[i] += 1
+            tot_latency += latency
+            decode_latencies.append(latency)
+            if step < 5 or (log_decode_step > 0 and step % log_decode_step == 0):
+                rank_print(
+                    f"Decode(SD) {step}. new tokens: {new_tokens}, "
+                    f"latency: {latency:6.5f} s, "
+                    f"throughput: {new_tokens / latency:9.2f} token/s"
+                )
+            step += 1
+
+        measurement_results["num_spec_steps"] = step
+        total_req_steps = sum(decode_steps_per_req)
+        measurement_results["avg_accept_length"] = (
+            sum(n - 1 for n in tokens_generated) / total_req_steps
+            if total_req_steps > 0
+            else 0
+        )
+    else:
+        for i in range(output_len - 1):
+            model_runner.synchronize()
+            if enable_profile_decode and i == profile_start:
+                trace_filename_decode = _create_torch_profiler_filename(
+                    profile_filename_prefix, batch_size, input_len, output_len, "decode"
+                )
+                profiler = start_profile(
+                    profile_activities,
+                    profile_record_shapes=profile_record_shapes,
+                    rank_print=rank_print,
+                    trace_filename=trace_filename_decode,
+                )
+
+            tic = time.perf_counter()
+            next_token_ids, _ = model_runner.decode(next_token_ids, batch)
+            model_runner.synchronize()
+            latency = time.perf_counter() - tic
+
+            if enable_profile_decode and profiler is not None and i >= profile_end - 1:
+                stop_profile(
+                    profiler,
+                    profile_activities,
+                    rank_print=rank_print,
+                    save_trace=True,
+                    trace_filename=trace_filename_decode,
+                    stage="decode",
+                )
+                profiler = None
+
+            tot_latency += latency
+            throughput = batch_size / latency
+            decode_latencies.append(latency)
+            if i < 5 or (log_decode_step > 0 and i % log_decode_step == 0):
+                rank_print(
+                    f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
+                )
 
     # Record decode timing from 2nd output
     if output_len > 1:
