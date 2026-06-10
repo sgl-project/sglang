@@ -66,21 +66,6 @@ _OWNER_SITES = {
     ("speculative/eagle_info.py", "EagleVerifyInput.verify", "kv_committed_len"): 1,
     ("speculative/eagle_info.py", "EagleVerifyInput.verify", "kv_allocated_len"): 1,
     ("speculative/eagle_info.py", "EagleVerifyInput.verify", "spec_verify_ct"): 1,
-    (
-        "speculative/ngram_info.py",
-        "NgramVerifyInput._fill_requests",
-        "spec_verify_ct",
-    ): 1,
-    (
-        "speculative/ngram_info.py",
-        "NgramVerifyInput._free_cache",
-        "kv_committed_len",
-    ): 1,
-    (
-        "speculative/ngram_info.py",
-        "NgramVerifyInput._free_cache",
-        "kv_allocated_len",
-    ): 1,
     ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "kv_committed_len"): 1,
     ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "kv_allocated_len"): 1,
     ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "spec_verify_ct"): 1,
