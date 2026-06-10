@@ -343,7 +343,7 @@ class DeepSeekV4IndexerPool(KVCache):
 
 
 class DeepSeekV4LayerItem(NamedTuple):
-    compress_ratio: Literal[0, 1, 4, 128]
+    compress_ratio: Literal[0, 4, 128]
     compress_layer_id: int
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
 
@@ -623,10 +623,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = []
 
         for ratio in self.compression_ratios:
-            # ratio in (0, 1) (V4-Flash dense / uncompressed edge layers) get
-            # no compress-state pool; only ratio 4/128 do. Pool construction is
-            # delegated to _make_{attn,indexer}_state_pool so the NPU subclass
-            # can swap the pool class without re-spelling this loop.
             has_compress_state = ratio in (4, 128)
             compress_state_pool = (
                 self._make_attn_state_pool(ratio, enable_memory_saver)
@@ -647,12 +643,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.layer_mapping: List[DeepSeekV4LayerItem] = []
 
         for ratio in self.compression_ratios:
-            # V4-Flash adds compress_ratio=1 for dense edge layers; both 0 and 1
-            # mean "no compression / compressor", sharing the uncompressed bucket.
-            if ratio in (0, 1):
+            # Dense layers (compress_ratio=0) share the uncompressed SWA bucket.
+            if ratio == 0:
                 self.layer_mapping.append(
                     DeepSeekV4LayerItem(
-                        compress_ratio=ratio,
+                        compress_ratio=0,
                         compress_layer_id=c1_cnt,
                     )
                 )

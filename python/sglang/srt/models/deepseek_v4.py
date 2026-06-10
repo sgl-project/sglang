@@ -312,18 +312,13 @@ class MQALayer(nn.Module):
             if compress_ratio_override is not None
             else config.compress_ratios[layer_id]
         )
-        # V4-Flash uses ratio=1 for the dense (uncompressed) edge layers
-        # (e.g. [1, 1, 4, 128, ..., 1] for the 43-layer Flash variant), in
-        # addition to the {0, 4, 128} the original V4 model ships. Treat 0
-        # and 1 the same throughout: neither has a Compressor/C4Indexer and
-        # neither uses the compress_rope_theta / yarn original_seq_len.
+
         assert compress_ratio in (
             0,
-            1,
             4,
             128,
-        ), f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
-        self.compress_ratio: Literal[0, 1, 4, 128] = compress_ratio
+        ), f"V4 compress_ratio: expected one of (0, 4, 128), got {compress_ratio}"
+        self.compress_ratio: Literal[0, 4, 128] = compress_ratio
 
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
@@ -341,7 +336,7 @@ class MQALayer(nn.Module):
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
         # YARN correction applies to ALL layers regardless of compress_ratio:
-        # dense (ratio 0/1) and compressed (ratio 4/128) layers share the same
+        # dense (ratio 0) and compressed (ratio 4/128) layers share the same
         # YARN-corrected inv_freq; only the rope base differs (rope_theta vs
         # compress_rope_theta).
         original_seq_len = rope_scaling["original_max_position_embeddings"]
@@ -852,47 +847,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         shape, dtype = x.size(), x.dtype
 
         if _is_npu:
-            # IDLE / empty short-circuit, mirroring the dsv4-flash source.
-            # The kernel emits post/comb in fp32 (sinkhorn iterates in fp32),
-            # so the dummies must too — otherwise downstream comb/post-aware
-            # ops see a silent fp32 ↔ bf16 split between idle and non-idle
-            # batches.
-            is_idle = (
-                forward_batch is not None
-                and forward_batch.forward_mode.is_idle()
-            )
-            if is_idle or x.shape[0] == 0:
-                bs = x.shape[0]
-                y = torch.empty((bs, shape[-1]), dtype=dtype, device=x.device)
-                post = torch.empty(
-                    (bs, self.hc_mult), dtype=torch.float32, device=x.device
-                )
-                comb = torch.empty(
-                    (bs, self.hc_mult, self.hc_mult),
-                    dtype=torch.float32,
-                    device=x.device,
-                )
-                return y, post, comb, False
+            from sglang.srt.layers.mhc import npu_hc_pre
 
-            # Note the return order: (y, post, comb) — y is the (T, hidden)
-            # mixed activation, post / comb are the hc_post inputs. The
-            # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
-            # cast back to the input dtype before the downstream
-            # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
-            y, post, comb = torch.ops.custom.npu_hc_pre(
+            return npu_hc_pre(
                 x,
                 hc_fn,
                 hc_scale,
                 hc_base,
                 hc_mult=self.hc_mult,
                 hc_sinkhorn_iters=self.hc_sinkhorn_iters,
-                norm_eps=self.rms_norm_eps,
+                rms_norm_eps=self.rms_norm_eps,
                 hc_eps=self.hc_eps,
+                forward_batch=forward_batch,
             )
-            # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
-            # not fold input_layernorm. Return norm_fused=False so the caller
-            # applies the layernorm itself, matching the deepgemm/torch paths.
-            return y.to(dtype), post, comb, False
 
         if x.shape[0] == 0:
             y = torch.empty((0, shape[-1]), dtype=dtype, device=x.device)

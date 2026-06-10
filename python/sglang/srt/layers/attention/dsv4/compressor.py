@@ -27,6 +27,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import add_prefix, is_npu
 
 _is_npu = is_npu()
@@ -286,7 +287,7 @@ def create_paged_compressor_data(
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
 
 
-class Compressor(nn.Module):
+class Compressor(MultiPlatformOp):
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -334,9 +335,6 @@ class Compressor(nn.Module):
         assert not self.ape_converted
         self.ape_converted = True
 
-        if _is_npu:
-            return
-
         if self.overlap:
             ape = torch.chunk(self.ape.data, 2, dim=-1)
             ape = torch.cat([ape[0], ape[1]], dim=0)
@@ -352,15 +350,10 @@ class Compressor(nn.Module):
         assert isinstance(ret, CompressStatePool)
         return ret
 
-    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+    def forward_native(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
-
-        if _is_npu:
-            return forward_batch.attn_backend.forward_compress(
-                self, x, forward_batch
-            )
 
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
         if nsa_use_prefill_cp(forward_batch):
@@ -387,4 +380,21 @@ class Compressor(nn.Module):
             compress_ratio=self.ratio,
             forward_batch=forward_batch,
             is_paged=True,
+        )
+
+    def forward_npu(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+        
+        if nsa_use_prefill_cp(forward_batch):
+            x = cp_all_gather_rerange_output(
+                x,
+                get_attention_cp_size(),
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+
+        return forward_batch.attn_backend.forward_compress(
+            self, x, forward_batch
         )

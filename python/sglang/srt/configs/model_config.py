@@ -105,9 +105,7 @@ def is_deepseek_nsa(config) -> bool:
         in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
-            "DeepseekV4ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
-            "DeepseekV4ForCausalLMNextN",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
