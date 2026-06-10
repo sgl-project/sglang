@@ -207,11 +207,11 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
 class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
     """steps=0 (nospec) fallback triggered by batch size.
 
-    Config routes BS>=8 -> steps=0 (drafting disabled) and BS<8 -> steps=3.
-    Verifies (1) a concurrent burst drives the worker to steps=0, and (2) a
-    sequence decoded at steps=0 recovers full draft acceptance once it returns
-    to steps=3 -- i.e. draft_extend keeps the draft KV synced while drafting is
-    off. If it didn't, post-recovery drafts would be rejected (~0 accepts).
+    Config routes BS>=8 -> steps=0 (drafting disabled) and BS<8 -> steps=3. A
+    long request batched with many short ones decodes at steps=0 under load, then
+    returns to steps=3 as the batch drains and must recover full draft acceptance
+    -- i.e. draft_extend keeps the draft KV synced while drafting is off. If it
+    didn't, post-recovery drafts would be rejected (~0 accepts).
     """
 
     model = DEFAULT_TARGET_MODEL_EAGLE
@@ -271,46 +271,6 @@ class TestAdaptiveZeroStepBatchSizeServer(CustomTestCase):
             kill_process_tree(cls.process.pid)
         if os.path.exists(cls.adaptive_config_path):
             os.unlink(cls.adaptive_config_path)
-
-    def _generate(self, max_new_tokens: int) -> dict:
-        r = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": self.COUNT_PROMPT,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": max_new_tokens,
-                    "ignore_eos": True,
-                },
-            },
-            timeout=600,
-        )
-        self.assertEqual(r.status_code, 200, r.text)
-        return r.json()["meta_info"]
-
-    def test_batch_size_triggers_zero_step(self):
-        """A large batch (BS>=8) decodes at steps=0 (drafting disabled); a single
-        request (BS=1) decodes at steps=3 (drafting active)."""
-        prompts = [self.COUNT_PROMPT] * 14
-        params = [{"temperature": 0, "max_new_tokens": 200, "ignore_eos": True}] * 14
-        r = requests.post(
-            self.base_url + "/generate",
-            json={"text": prompts, "sampling_params": params},
-            timeout=600,
-        )
-        self.assertEqual(r.status_code, 200, r.text)
-        for out in r.json():
-            hist = out["meta_info"]["spec_correct_drafts_histogram"]
-            # Drafting off -> most verify steps accept 0 drafts. A few steps=3 may
-            # slip in while the batch fills during prefill, so compare by mass.
-            self.assertGreater(
-                hist[0], sum(hist[1:]), f"BS>=8 should disable drafting (hist={hist})"
-            )
-
-        single = self._generate(200)["spec_correct_drafts_histogram"]
-        self.assertGreater(
-            sum(single[1:]), 0, f"BS=1 should draft at steps>0 (hist={single})"
-        )
 
     def test_zero_step_within_sequence_recovery(self):
         """One long request batched with many short ones decodes at steps=0 while
