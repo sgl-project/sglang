@@ -25,7 +25,7 @@ from __future__ import annotations
 import bisect
 import inspect
 import logging
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 import tqdm
@@ -386,7 +386,6 @@ class BreakableCudaGraphRunner:
                 if get_tensor_model_parallel_rank() == 0
                 else reversed(self.capture_num_tokens)
             )
-            shared_output_buffer = None
             for num_tokens in capture_range:
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
@@ -398,11 +397,7 @@ class BreakableCudaGraphRunner:
                         f"[BCG] Capturing ({num_tokens=} {avail_mem=:.2f} GB)"
                     )
 
-                graph, output = self._capture_one(
-                    num_tokens, pool, stream, shared_output_buffer
-                )
-                if shared_output_buffer is None:
-                    shared_output_buffer = output
+                graph, output = self._capture_one(num_tokens, pool, stream)
                 self.graphs[num_tokens] = graph
                 self.output_buffers[num_tokens] = output
 
@@ -434,62 +429,7 @@ class BreakableCudaGraphRunner:
                     return False
         return num_tokens <= self.max_num_tokens
 
-    def _slice_output(self, output: Any, num_tokens: int) -> Any:
-        if output is None:
-            return None
-        if torch.is_tensor(output):
-            return output[:num_tokens]
-        if isinstance(output, PPProxyTensors):
-            return output[:num_tokens]
-        if isinstance(output, tuple):
-            return tuple(self._slice_output(item, num_tokens) for item in output)
-        if isinstance(output, list):
-            return [self._slice_output(item, num_tokens) for item in output]
-        raise TypeError(f"Unsupported BCG output type: {type(output)}")
-
-    def _copy_output_to_buffer(
-        self, output: Any, output_buffer: Any, num_tokens: int
-    ) -> None:
-        if output is None or output_buffer is None:
-            if output is None and output_buffer is None:
-                return
-            raise ValueError(
-                "BCG output structure changed between capture sizes: "
-                f"{type(output)} vs {type(output_buffer)}"
-            )
-        if torch.is_tensor(output) and torch.is_tensor(output_buffer):
-            output_buffer[:num_tokens].copy_(output[:num_tokens])
-            return
-        if isinstance(output, PPProxyTensors) and isinstance(
-            output_buffer, PPProxyTensors
-        ):
-            if output.tensors.keys() != output_buffer.tensors.keys():
-                raise ValueError(
-                    "BCG output proxy structure changed between capture sizes: "
-                    f"{output.tensors.keys()} != {output_buffer.tensors.keys()}"
-                )
-            for key, tensor in output.tensors.items():
-                self._copy_output_to_buffer(
-                    tensor, output_buffer.tensors[key], num_tokens
-                )
-            return
-        if isinstance(output, (list, tuple)) and isinstance(
-            output_buffer, type(output)
-        ):
-            if len(output) != len(output_buffer):
-                raise ValueError(
-                    "BCG output sequence structure changed between capture sizes: "
-                    f"{len(output)} != {len(output_buffer)}"
-                )
-            for item, buffer in zip(output, output_buffer):
-                self._copy_output_to_buffer(item, buffer, num_tokens)
-            return
-        raise TypeError(
-            "Unsupported BCG output buffer pair: "
-            f"{type(output)} vs {type(output_buffer)}"
-        )
-
-    def _capture_one(self, num_tokens, pool, stream, shared_output_buffer=None):
+    def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
         self._init_forward_metadata_for_capture(forward_batch, num_tokens)
@@ -508,14 +448,6 @@ class BreakableCudaGraphRunner:
             graph = BreakableCUDAGraph()
             with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
                 output = run_once()
-                if shared_output_buffer is not None:
-                    self._copy_output_to_buffer(
-                        output, shared_output_buffer, num_tokens
-                    )
-            if shared_output_buffer is None:
-                output = self._slice_output(output, num_tokens)
-            else:
-                output = self._slice_output(shared_output_buffer, num_tokens)
 
         return graph, output
 
