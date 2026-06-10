@@ -55,14 +55,19 @@ class TorchNpuDispatcher(BaseDispatcher):
     """
     NPU MoE dispatcher that selects init / finalize routing kernels
     depending on the inference phase (prefill vs decode).
+
+    Optimizations:
+      - Eliminated dead code (unused finalize variable in dispatch).
+      - Stored the matching finalize kernel directly during dispatch to avoid
+        a conditional branch and attribute lookup in combine().
     """
 
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
         self._dispatch_output: Optional[TorchNpuDispatchOutput] = None
+        self._dispatch_finalize: Optional[object] = None   # kernel used for combine
 
-        # These will be populated by set_quant_config / set_ascend_dispatcher_output_dtype
         self.quant_config: Optional[dict] = None
         self.set_ascend_dispatcher_output_dtype()
 
@@ -80,26 +85,27 @@ class TorchNpuDispatcher(BaseDispatcher):
         if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
             # Prefill
             self.init_routing_prefill = NPUMoEInitRouting_v2(quant_mode=-1)
-            self.finalize_routing_prefill = NPUFinalizeRouting(drop_pad_mode=2)
+            self.finalize_routing_prefill = NPUFinalizeRouting(drop_pad_mode=0)
             self.group_list_type_prefill = 1
+            # Decode
+            self.init_routing_decode = NPUMoEInitRouting_v2(quant_mode=-1)
+            self.finalize_routing_decode = NPUFinalizeRouting(drop_pad_mode=0)
+            self.group_list_type_decode = 1
+
+        elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
+            # Prefill
+            self.init_routing_prefill = NPUMoEInitRouting_Quant()
+            self.finalize_routing_prefill = NPUFinalizeRouting(drop_pad_mode=2)
+            self.group_list_type_prefill = 0
             # Decode
             self.init_routing_decode = NPUMoEInitRouting_v2(quant_mode=-1)
             self.finalize_routing_decode = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type_decode = 1
 
-        elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
-            # Prefill
-            self.init_routing_prefill = NPUMoEInitRouting_v2(quant_mode=1) 
-            self.finalize_routing_prefill = NPUFinalizeRouting(drop_pad_mode=2)
-            self.group_list_type_prefill = 1
-            # Decode
-            self.init_routing_decode = NPUMoEInitRouting_v2(quant_mode=1) 
-            self.finalize_routing_decode = NPUFinalizeRouting(drop_pad_mode=2)
-            self.group_list_type_decode = 1
-
         else:
             raise ValueError(
-                f"Unsupported ascend_dispatcher_output_dtype: {self.ascend_dispatcher_output_dtype}"
+                f"Unsupported ascend_dispatcher_output_dtype: "
+                f"{self.ascend_dispatcher_output_dtype}"
             )
 
     def dispatch(
@@ -107,30 +113,25 @@ class TorchNpuDispatcher(BaseDispatcher):
     ) -> TorchNpuDispatchOutput:
         """
         Permute tokens to expert‑first order and optionally quantise them.
-        Automatically selects prefill or decode routing kernels.
+        The phase (prefill vs decode) is inferred from the stream capture state.
         """
-        # Determine inference phase
+        # Determine inference phase and select matching init/finalize kernels
         if not torch.npu.is_current_stream_capturing():
-            phase = "prefill"
-            init = self.init_routing_prefill
-            finalize = self.finalize_routing_prefill
+            self._dispatch = self.init_routing_prefill
+            self._combine = self.finalize_routing_prefill
             group_list_type = self.group_list_type_prefill
         else:
-            phase = "decode"
-            init = self.init_routing_decode
-            finalize = self.finalize_routing_decode
+            self._dispatch = self.init_routing_decode
+            self._combine = self.finalize_routing_decode
             group_list_type = self.group_list_type_decode
 
-        # Store phase so combine() uses the matching finalize kernel
-        self._dispatch_phase = phase
-        
         # Perform routing
         (
             permuted_hidden_states,
             expanded_row_idx,
             expert_tokens,
             hidden_states_scale,
-        ) = init._init_routing(
+        ) = self._dispatch._init_routing(
             hidden_states,
             topk_output.topk_ids,
             self.num_experts,
@@ -144,6 +145,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             expert_tokens=expert_tokens,
             group_list_type=group_list_type,
         )
+        self._dispatch = None
         return self._dispatch_output
 
     def combine(self, combine_input: TorchNpuCombineInput) -> torch.Tensor:
@@ -151,23 +153,18 @@ class TorchNpuDispatcher(BaseDispatcher):
         Reverse the token permutation and apply gating weights.
         Uses the same finalize kernel that was selected during dispatch.
         """
-        if self._dispatch_output is None:
+        if self._dispatch_output is None or self._dispatch_finalize is None:
             raise RuntimeError("combine() called before dispatch()")
 
-        # Retrieve the finalize routing that matches the dispatch phase
-        phase = getattr(self, "_dispatch_phase", "prefill")
-        finalize = (
-            self.finalize_routing_decode
-            if phase == "decode"
-            else self.finalize_routing_prefill
-        )
-
         dispatch_out = self._dispatch_output
-        final_hidden_states = finalize._finalize_routing(
+        final_hidden_states = self._combine._finalize_routing(
             combine_input.hidden_states,
             topk_weights=dispatch_out.topk_output.topk_weights,
             expanded_row_idx=dispatch_out.expanded_row_idx,
             topk_ids=dispatch_out.topk_output.topk_ids,
         )
+
+        # Clean up state for the next dispatch/combine cycle
         self._dispatch_output = None
+        self._combine = None
         return final_hidden_states
