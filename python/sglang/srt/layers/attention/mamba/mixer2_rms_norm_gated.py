@@ -81,8 +81,6 @@ class Mixer2RMSNormGated(MultiPlatformOp):
                 # Compute local sum and then reduce to obtain global sum
                 local_sums = x.pow(2).sum(dim=-1, keepdim=True)
                 if self.use_attn_tp_group:
-                    # NOTE: ProcessGroup.all_reduce is in-place and returns a Work
-                    # handle, so use attn_tp_all_reduce which returns the tensor.
                     global_sums = attn_tp_all_reduce(local_sums)
                 else:
                     global_sums = tensor_model_parallel_all_reduce(local_sums)

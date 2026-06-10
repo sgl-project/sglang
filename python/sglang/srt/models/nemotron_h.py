@@ -318,13 +318,7 @@ class NemotronHMoE(nn.Module):
 
 
 class NemotronHMLPLikeDecoderLayer(nn.Module):
-    """Shared forward for the dense-MLP / MoE decoder layers.
-
-    Both apply ``self.mixer`` after norm (and, under DP attention, after the
-    gather to the full-TP layout). Subclasses only differ in ``__init__`` —
-    which mixer they build — and set ``self.mixer``, ``self.norm`` and
-    ``self.layer_communicator``.
-    """
+    """Shared forward for the dense-MLP / MoE decoder layers."""
 
     def forward(
         self,
@@ -415,13 +409,7 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
 
 
 class NemotronHAttnLikeDecoderLayer(nn.Module):
-    """Shared DP-attention input prep for the Mamba / full-attention layers.
-
-    Both run their mixer on the attn-TP group (DP-local) and only gather into
-    the full-TP layout at the next MLP/MoE boundary. Subclasses set ``self.norm``
-    and ``self.layer_communicator`` and call ``_set_prev_layer_is_attn`` in
-    ``__init__``.
-    """
+    """Shared DP-attention input prep for the Mamba / full-attention layers."""
 
     def _set_prev_layer_is_attn(self, config: NemotronHConfig, layer_idx: int) -> None:
         self.prev_layer_is_attn = layer_idx > 0 and _is_attn_layer(
@@ -434,9 +422,6 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # A preceding attention layer leaves its output attn-TP-partial; reduce
-        # it before this layer reads it. Then drop the DP-padding rows and gather
-        # into the attn-TP-full layout the mixer runs in.
         if self.prev_layer_is_attn and residual is not None:
             hidden_states = attn_tp_all_reduce(hidden_states)
         hidden_states, residual = _zero_dp_padding_rows(
@@ -513,11 +498,6 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             ):
                 return torch.zeros_like(hidden_states), residual
 
-            # DP-attention may carry per-DP padding rows while Mamba metadata is
-            # built from real token counts. The CUDA graph custom op bypasses
-            # the Python path that trims real tokens and restores padded shape,
-            # so keep DP-attention on the explicit forward until the graph op
-            # learns the same padding contract.
             output = self._forward_mamba(hidden_states, forward_batch)
             output, _ = _zero_dp_padding_rows(output, forward_batch)
             return output, residual
@@ -618,15 +598,6 @@ class NemotronHAttention(nn.Module):
             output, _ = self.o_proj(attn_output)
             return output
 
-        # DP attention pads each rank's batch to a common size for collective
-        # alignment. Those padding rows are fake: they must not write KV cache and
-        # must leave the layer as zeros. Prefill runs a varlen kernel keyed on the
-        # real cu_seqlens, so Q/K/V are trimmed to the real tokens; decode runs a
-        # wrapper captured at the padded batch size, so Q stays padded while K/V
-        # and the cache-write locations are trimmed.
-        # target_verify (spec/NEXTN) uses the SAME padded-batch wrapper as decode
-        # (qo_indptr is built at the padded length), so Q must stay padded there too —
-        # otherwise q.shape[0] (real) != qo_indptr[-1] (padded) in flashinfer prefill.
         padded_shape = hidden_states.shape[0]
         real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
         has_padding = real_tokens < padded_shape
@@ -634,9 +605,6 @@ class NemotronHAttention(nn.Module):
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_idle()
-            # A decode/idle batch DP-padded into ForwardMode.EXTEND (MAX_LEN) still
-            # runs the padded-batch wrapper, so Q must stay padded. Genuine prefill
-            # has no _original_forward_mode and keeps trimming Q to the real tokens.
             or getattr(forward_batch, "_original_forward_mode", None) is not None
         )
         original_out_cache_loc = forward_batch.out_cache_loc
@@ -649,22 +617,11 @@ class NemotronHAttention(nn.Module):
                 forward_batch.out_cache_loc = original_out_cache_loc[:real_tokens]
             if not keep_q_padded:
                 q = q[:real_tokens]
-        # real_tokens == 0: a fully-idle DP rank carrying a synthesized fake prefill
-        # (one req spanning all num_tokens padding tokens, prefix 0). Keep Q/K/V at the
-        # padded length so the prefill ragged kernel sees a well-formed self-attention
-        # (matching cu_seqlens); trimming K/V to 0 while Q stays padded makes the kernel
-        # read past K/V (TMA-descriptor / illegal-instruction failure). It must still run
-        # the attention collective but must NOT write KV: save_kv_cache is False below
-        # (a 0-row store_cache launches a 0-grid kernel -> CUDA invalid argument), and the
-        # output rows are zeroed afterwards.
         attn_output = self.attn.forward(
             q, k, v, forward_batch, save_kv_cache=real_tokens > 0
         )
-        # out_cache_loc is only consumed by self.attn.forward (KV write); restore it now.
         forward_batch.out_cache_loc = original_out_cache_loc
 
-        # Restore the padded row count (padding rows zeroed) before o_proj so the
-        # next collective sees the same shape as the layer input.
         attn_output = _pad_to_original_num_tokens(attn_output, padded_shape)
         output, _ = self.o_proj(attn_output)
         if has_padding:

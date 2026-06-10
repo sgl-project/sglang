@@ -1,10 +1,4 @@
-"""DP-attention helpers for the Nemotron-H model.
-
-Kept out of the modeling file (``nemotron_h.py``) to keep that file focused on
-module definitions. These helpers deal with the token padding that DP-attention
-introduces for collective alignment, and with building the per-layer
-``LayerCommunicator``.
-"""
+"""DP-attention helpers for the Nemotron-H model."""
 
 from typing import Optional
 
@@ -49,11 +43,7 @@ def _zero_dp_padding_rows(
     forward_batch: ForwardBatch,
     residual: Optional[torch.Tensor] = None,
 ):
-    """Zero the DP-padding rows of ``hidden_states`` (and ``residual``) in place.
-
-    Always returns the ``(hidden_states, residual)`` pair (``residual`` may be
-    None); callers that only need the hidden states can ignore the second value.
-    """
+    """Zero the DP-padding rows of hidden_states (and residual) in place."""
     real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
     if real_tokens < hidden_states.shape[0]:
         hidden_states[real_tokens:].zero_()
@@ -95,9 +85,6 @@ def _pad_to_original_num_tokens(
 
 
 def _build_layer_scatter_modes() -> LayerScatterModes:
-    # Nemotron-H uses attention/mamba as local-DP, attn-TP-partial producers.
-    # The following MLP/MoE layer is the only place that gathers/reduces that
-    # partial into the full TP layout before scattering back to the local DP slice.
     return LayerScatterModes(
         layer_input_mode=ScatterMode.TP_ATTN_FULL,
         attn_mode=ScatterMode.TP_ATTN_FULL,
@@ -114,10 +101,5 @@ def _make_layer_communicator(
         layer_scatter_modes=_build_layer_scatter_modes(),
         input_layernorm=layer_norm if for_attn else nn.Identity(),
         post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
-        # Keep residual+RMSNorm at the same per-token boundary as normal TP
-        # execution: layernorm BEFORE the DP gather so the gather moves
-        # already-normalized tokens into the global MLP/MoE TP layout without
-        # changing the residual-add boundary. Opt-in so other DP models keep the
-        # default (layernorm-after-gather unless attn_tp_size == 1).
         force_layernorm_before_dp_gather=True,
     )

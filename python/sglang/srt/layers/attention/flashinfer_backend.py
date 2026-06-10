@@ -54,13 +54,7 @@ logger = logging.getLogger(__name__)
 
 
 def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
-    """Round ``max_bs`` up to the same alignment cuda-graph capture pads batch
-    sizes to (see ``get_batch_sizes_to_capture``). Per-request index buffers are
-    sized from this so a padded capture/warmup batch -- e.g. DP attention
-    rounding ``req_to_token_pool.size`` 13 -> 16 to keep ``bs * num_tokens_per_bs``
-    a multiple of ``attn_tp_size`` -- does not overflow ``kv_indptr`` /
-    ``kv_last_page_len``. A no-op when ``max_bs`` is already aligned (the common
-    case) or when no gathered buffer / TBO / CP alignment applies."""
+    """Pad max_bs to the alignment cuda-graph capture uses (see get_batch_sizes_to_capture)."""
     mul_base = 1
     if server_args.enable_two_batch_overlap:
         mul_base *= 2
@@ -1112,10 +1106,6 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
-        # Under dp-attention, an IDLE rank's spec_info (EagleVerifyInput.create_idle_input)
-        # carries no kv_indptr/kv_indices; its rows are all fake DP padding and the output is
-        # discarded, so build a valid decode plan from the (padded) seq_lens instead of reading
-        # the missing spec tensors. Real (non-idle) spec verify keeps using spec_info's plan.
         if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)

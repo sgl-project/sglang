@@ -406,8 +406,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
-    # Per-rank non-padded (spec-adjusted) row counts; independent copy that
-    # survives the in-place DP padding of global_num_tokens_cpu.
     global_num_tokens_non_padded_cpu: Optional[List[int]] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
@@ -1141,11 +1139,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_idle()
         ):
             if self.spec_info is not None and not self.spec_info.is_draft_input():
-                # Spec target-verify: keep the num_tokens_per_req structure so every
-                # DP rank runs the same verify forward with identical collectives
-                # (the IDLE->EXTEND conversion below collapses verify's multi-token
-                # reqs and leaves idle ranks empty -> NCCL deadlock). Idle ranks are
-                # promoted to TARGET_VERIFY and padded with fake reqs/rows.
                 if self.forward_mode.is_idle():
                     setattr(self, "_original_forward_mode", self.forward_mode)
                     self.forward_mode = ForwardMode.TARGET_VERIFY
@@ -1153,12 +1146,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
-                # MAX_LEN reaches here only for an idle/empty rank (assert below).
-                # Synthesize ONE fake request spanning all num_tokens rows (prefix 0)
-                # so the rank issues the same collectives as busy ranks with non-empty
-                # metadata. One request — not num_tokens single-token ones, which
-                # would overflow the attention backend's per-rank kv_indptr buffer.
-                # The output is discarded downstream (real_tokens == 0).
                 dev = self.seq_lens.device
                 assert (
                     self.seq_lens.shape[0] == 0

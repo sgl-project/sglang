@@ -467,10 +467,6 @@ class MambaMixer2(torch.nn.Module):
 
         query_start_loc = metadata.query_start_loc
 
-        # DP attention can pad hidden_states for collective alignment. Keep the
-        # padded projection/gate shape, run kernels only on real tokens, then run
-        # norm/out_proj on the padded shape so the next collective sees the same
-        # row count as the layer input.
         padded_num_tokens = hidden_states.shape[0]
 
         # 1. Gated MLP's linear projection
@@ -534,9 +530,6 @@ class MambaMixer2(torch.nn.Module):
             [num_prefill_tokens, num_decode_tokens],
             dim=0,
         )
-        # Split along the real batch dimension. DP-attention may pad
-        # state_indices_tensor beyond num_prefills + num_decodes for collective
-        # alignment; fake decode rows must not update Mamba states.
         state_indices_tensor_p = state_indices_tensor[:num_prefills]
         state_indices_tensor_d = state_indices_tensor[
             num_prefills : num_prefills + num_decodes
@@ -555,10 +548,6 @@ class MambaMixer2(torch.nn.Module):
             device=hidden_states.device,
         )
         if projected_states.shape[0] > num_actual_tokens:
-            # DP-attention padding rows are not written by the prefill/decode
-            # kernels, but the gated RMSNorm / out_proj run on the padded shape;
-            # zero just those rows so they carry no uninitialized data. Non-DP
-            # (no padding) keeps main's plain ``torch.empty`` with no extra work.
             preallocated_ssm_out[num_actual_tokens:].zero_()
         preallocated_ssm_out_active = preallocated_ssm_out[:num_actual_tokens]
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
@@ -776,12 +765,8 @@ class MambaMixer2(torch.nn.Module):
         # norm usage
         hidden_states = self.norm(preallocated_ssm_out, gate)
 
-        # 5. Final linear projection. Run out_proj on the padded shape so
-        # DP-attn collectives see the same row count as the layer input.
         mixer_out, _ = self.out_proj(hidden_states)
         if mixer_out.shape[0] > num_actual_tokens:
-            # Zero DP-attention padded rows so they do not carry uninitialized
-            # data (potentially NaN) into subsequent layers' residual additions.
             mixer_out[num_actual_tokens:].zero_()
         if output is not None:
             output[:padded_num_tokens].copy_(mixer_out)

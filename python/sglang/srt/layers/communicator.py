@@ -1031,10 +1031,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            # Default (other DP models): layernorm before the gather only when
-            # attn_tp_size == 1 (smaller data, no attn-TP reduce needed). Models
-            # that need layernorm-before-gather at attn_tp_size > 1 opt in via
-            # force_layernorm_before_dp_gather (e.g. Nemotron-H).
             use_layer_norm_before_gather = (
                 context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
             )

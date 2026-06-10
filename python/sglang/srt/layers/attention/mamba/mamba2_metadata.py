@@ -199,9 +199,6 @@ class Mamba2Metadata(ForwardMetadata):
                 if forward_batch.spec_info is not None
                 else 1
             )
-            # DP-attention pads decode batches to satisfy collective alignment.
-            # The padded rows must stay in hidden_states, but they must not be
-            # treated as real Mamba decode requests or update recurrent state.
             num_decodes = getattr(forward_batch, "_original_batch_size", None)
             if num_decodes is None:
                 num_decodes = len(forward_batch.seq_lens)
@@ -217,8 +214,6 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefills = len(forward_batch.extend_seq_lens)
         else:
             num_prefills = len(extend_seq_lens_cpu)
-        # Compute from CPU-side data to avoid a host-device sync (.item() on a
-        # GPU tensor would block on the prefill query_start_loc).
         if extend_seq_lens_cpu is not None:
             num_prefill_tokens = int(sum(extend_seq_lens_cpu))
         else:
@@ -229,10 +224,6 @@ class Mamba2Metadata(ForwardMetadata):
         num_decodes = batch_size - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
-        # Precompute flag to avoid device syncs later. A non-zero prefix length
-        # only means full-attention KV can be reused. Mamba recurrent state is
-        # reusable only when the scheduler provides a tracked Mamba state slot
-        # for that request; otherwise reprocess the extend chunk from zero state.
         has_initial_states = context_lens_tensor > 0
         mamba_track_mask = getattr(forward_batch, "mamba_track_mask", None)
         if mamba_track_mask is not None:
@@ -242,13 +233,6 @@ class Mamba2Metadata(ForwardMetadata):
         prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
-        # seq_idx must have one entry per *real* prefill token. The repeats below
-        # (query_start_loc.diff()) sum to the real prefill-token count. With
-        # dp-attention, num_prefill_tokens falls back to extend_num_tokens, which
-        # INCLUDES DP padding rows, so passing it as output_size triggers a CUDA
-        # assert (output_size != sum(repeats)). Only pass output_size when it comes
-        # from the CPU-side extend_seq_lens (then it equals the real count and keeps
-        # the no-sync fast path); otherwise let repeat_interleave infer it.
         _seq_idx_output_size = (
             num_prefill_tokens if extend_seq_lens_cpu is not None else None
         )
