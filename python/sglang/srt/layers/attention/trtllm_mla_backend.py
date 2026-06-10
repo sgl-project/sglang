@@ -14,7 +14,6 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
@@ -23,12 +22,16 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
     mla_quantize_and_rope_for_fp8,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
@@ -388,7 +391,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             (batch_size, max_blocks), -1, dtype=torch.int32, device=device
         )
 
-        create_flashmla_kv_indices_triton[(batch_size,)](
+        create_flashmla_kv_indices_triton[
+            (
+                batch_size,
+                get_num_kv_index_blocks_flashmla(max_blocks, self.page_size),
+            )
+        ](
             self.req_to_token,
             req_pool_indices,
             seq_lens,
@@ -534,7 +542,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
 
         # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[(bs,)](
+        create_flashmla_kv_indices_triton[
+            (
+                bs,
+                get_num_kv_index_blocks_flashmla(
+                    metadata.block_kv_indices.shape[1], self.page_size
+                ),
+            )
+        ](
             self.req_to_token,
             req_pool_indices[:bs],
             seq_lens,
@@ -549,13 +564,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def init_mha_chunk_metadata(self, forward_batch: "ForwardBatch") -> None:
+    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             self.disable_chunked_prefix_cache and has_prefix
-        ) or is_in_piecewise_cuda_graph()
+        ) or is_in_tc_piecewise_cuda_graph()
         if fallback_to_flashinfer_impl:
-            super().init_mha_chunk_metadata(forward_batch)
+            super().init_mha_chunk_metadata(
+                forward_batch, disable_flashinfer_ragged=True
+            )
 
     def init_forward_metadata_out_graph(
         self,
@@ -612,7 +629,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             has_prefix = any(forward_batch.extend_prefix_lens_cpu)
             fallback_to_flashinfer_impl = (
                 self.disable_chunked_prefix_cache and has_prefix
-            ) or is_in_piecewise_cuda_graph()
+            ) or is_in_tc_piecewise_cuda_graph()
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 
@@ -692,9 +709,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
             return super().init_forward_metadata(forward_batch)
-
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
-        super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
 
     def pad_draft_extend_query(
         self,
@@ -777,7 +791,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return output[:total_tokens, :, :]
 
     def _compute_decode_bmm1_scale(self, layer: RadixAttention) -> float:
-        """BMM1 scale ``q_scale * k_scale * softmax_scale``. k_scale only
+        """BMM1 scale q_scale * k_scale * softmax_scale. k_scale only
         applies when the KV cache stores FP8."""
         q_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
@@ -855,7 +869,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
-        Returns the output tensor or ``(output, lse)`` if ``return_lse``."""
+        Returns the output tensor or (output, lse) if return_lse."""
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
@@ -956,9 +970,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             or self.forward_decode_metadata
         )
 
-        # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-        # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
-        # and padding logic in prepare_mlp_sync_batch to avoid this
+        # Backstop: metadata was built pre-pad (marked) and DP padding then
+        # grew the batch. The marker path deliberately does not re-plan
+        # post-pad (DSA can't rebuild on a padded batch, see #27091), so this
+        # local re-plan catches the size mismatch.
         batch_size = getattr(metadata, "batch_size", None)
         if batch_size is not None and batch_size < forward_batch.batch_size:
             self.init_forward_metadata(forward_batch)
@@ -1058,9 +1073,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or self.forward_decode_metadata
             )
 
-            # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-            # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
-            # and padding logic in prepare_mlp_sync_batch to avoid this
+            # Backstop: metadata was built pre-pad (marked) and DP padding
+            # then grew the batch. The marker path deliberately does not
+            # re-plan post-pad (DSA can't rebuild on a padded batch, see
+            # #27091), so this local re-plan catches the size mismatch.
             batch_size = getattr(metadata, "batch_size", None)
             if batch_size is not None and batch_size < forward_batch.batch_size:
                 self.init_forward_metadata(forward_batch)
