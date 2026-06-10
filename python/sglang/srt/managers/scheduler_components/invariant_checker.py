@@ -321,13 +321,14 @@ def create_scheduler_watchdog(
 # ---------------------------------------------------------------------------
 # Per-request bookkeeping clock checks (SGLANG_ENABLE_REQ_BOOKKEEPING_CHECK).
 #
-# Exactly-once protocol: `bk_on_prepare_decode` assigns each decode iteration
-# an id; the owner tick / evict sites stamp it (`bk_on_clock_tick` /
-# `bk_on_evict_swa`) and a second stamp with the same id fails fast; the
-# decode resolve verifies the clock is live (`bk_on_resolve_decode`).
-# `bk_check_watermarks` guards 0 <= kv_committed_len <= kv_allocated_len <=
-# req_to_token row width. Static companion: the ownership allowlist in
-# test/registered/unit/spec/test_decode_bookkeeping_ownership.py.
+# - `bk_on_prepare_decode`: assigns each decode iteration an id
+# - `bk_on_clock_tick` / `bk_on_evict_swa`: owner sites stamp the id;
+#   a second stamp with the same id fails fast
+# - `bk_on_resolve_decode`: verifies the clock is live at decode resolve
+# - `bk_check_watermarks`: 0 <= kv_committed_len <= kv_allocated_len <=
+#   req_to_token row width
+#
+# Static companion: test/registered/unit/spec/test_decode_bookkeeping_ownership.py
 # ---------------------------------------------------------------------------
 
 _bk_iter_seq = itertools.count(1)
