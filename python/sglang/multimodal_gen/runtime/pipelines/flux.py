@@ -7,9 +7,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    InputValidationStage,
-    TextEncodingStage,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
+    FluxProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -38,7 +37,9 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     vae_scale_factor = (
         server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
     )
-    image_seq_len = (int(height) // vae_scale_factor) * (int(width) // vae_scale_factor)
+    image_seq_len = (int(height) // (vae_scale_factor * 2)) * (
+        int(width) // (vae_scale_factor * 2)
+    )
 
     mu = calculate_shift(
         image_seq_len,
@@ -65,26 +66,13 @@ class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_stage(InputValidationStage())
-
-        self.add_stage(
-            TextEncodingStage(
-                text_encoders=[
-                    self.get_module("text_encoder"),
-                    self.get_module("text_encoder_2"),
-                ],
-                tokenizers=[
-                    self.get_module("tokenizer"),
-                    self.get_module("tokenizer_2"),
-                ],
-            ),
-            "prompt_encoding_stage_primary",
+        self.add_standard_t2i_stages(
+            text_encoder_key=["text_encoder", "text_encoder_2"],
+            tokenizer_key=["tokenizer", "tokenizer_2"],
+            text_encoding_stage_name="prompt_encoding_stage_primary",
+            prepare_extra_timestep_kwargs=[prepare_mu],
+            progressive_denoising_stage_cls=FluxProgressiveDenoisingStage,
         )
-
-        self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
-        self.add_standard_latent_preparation_stage()
-        self.add_standard_denoising_stage()
-        self.add_standard_decoding_stage()
 
 
 EntryClass = FluxPipeline

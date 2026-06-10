@@ -4,7 +4,7 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, Union
 
 from pydantic import ConfigDict, Discriminator, Field, TypeAdapter, model_validator
-from rich.console import RenderableType
+from rich.console import Group, RenderableType
 from rich.markup import escape
 
 from sglang.srt.debug_utils.comparator.output_formatter import (  # noqa: F401 — re-export
@@ -32,6 +32,7 @@ from sglang.srt.debug_utils.comparator.output_formatter import (
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorComparisonInfo,
+    TensorInfo,
 )
 from sglang.srt.debug_utils.comparator.utils import Pair, _StrictBase
 
@@ -84,6 +85,7 @@ class BundleFileInfo(_StrictBase):
     dtype: str
     rank: Optional[int] = None
     parallel_info: Optional[dict[str, str]] = None  # e.g. {"tp": "0/4", "ep": "1/2"}
+    filename: Optional[str] = None
 
 
 class BundleSideInfo(_StrictBase):
@@ -121,6 +123,12 @@ class RecordLocation(_StrictBase):
 class _BaseComparisonRecord(_OutputRecord):
     location: RecordLocation = Field(default_factory=RecordLocation)
 
+    def to_rich(self, verbosity: Verbosity = "normal") -> RenderableType:
+        result = _render_record_rich(self, verbosity=verbosity)
+        if isinstance(result, str):
+            return result + "\n"
+        return Group(result, "")
+
     def _format_location_prefix(self) -> str:
         if self.location.step is not None:
             return f"[step={self.location.step}] "
@@ -152,6 +160,9 @@ class ComparisonSkipRecord(_BaseComparisonRecord):
     type: Literal["comparison_skip"] = "comparison_skip"
     name: str
     reason: str
+    available_side: Optional[Literal["baseline", "target"]] = None
+    available_tensor_info: Optional[TensorInfo] = None
+    available_bundle_info: Optional[BundleSideInfo] = None
 
     @property
     def category(self) -> str:
@@ -170,6 +181,7 @@ class ComparisonErrorRecord(_BaseComparisonRecord):
     type: Literal["comparison_error"] = "comparison_error"
     name: str
     exception_type: str
+    exception_message: str
     traceback_str: str
 
     @property

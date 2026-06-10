@@ -9,7 +9,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 # NOTE: per-commit-4-gpu, per-commit-8-gpu-h200, per-commit-8-gpu-h20, per-commit-4-gpu-b200,
 # per-commit-4-gpu-gb200, per-commit-4-gpu-deepep, and per-commit-8-gpu-h200-deepep suites
-# have been migrated to stage-c suites in test/registered/ using the CI registry system.
+# have been migrated to base-c suites in test/registered/ using the CI registry system.
 suites = {
     # quantization_test suite migrated to test/registered/quant/
     # All CUDA tests migrated to test/registered/
@@ -37,13 +37,14 @@ suite_amd = {
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         # The time estimation for `test_int4fp8_moe.py` assumes `mistralai/Mixtral-8x7B-Instruct-v0.1` is already cached (running on 1xMI300X).
     ],
-    # per-commit-4-gpu-amd migrated to test/registered/distributed/ using the CI registry system
+    # per-commit-4-gpu-amd migrated to test/registered/ using the CI registry system
     "per-commit-4-gpu-amd": [],
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
     # by test/run_suite.py using the registry system.
 }
 
+# Keep the Arm64 bootstrap suite limited to hosted-runner-safe unit kernels.
 # Add Intel Xeon tests
 suite_xeon = {
     "per-commit-cpu": [
@@ -66,59 +67,19 @@ suite_xeon = {
         TestFile("cpu/test_qkv_proj_with_rope.py"),
         TestFile("cpu/test_qwen3.py"),
         TestFile("cpu/test_rope.py"),
+        TestFile("cpu/test_server_args_backend.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
     ],
 }
 
-# Add Intel XPU tests
-# NOTE: please sort the test cases alphabetically by the test file name
-suite_xpu = {
-    "per-commit-xpu": [
-        TestFile("xpu/test_deepseek_ocr.py"),
-        # TestFile("xpu/test_internvl.py"),
-        TestFile("xpu/test_intel_xpu_backend.py"),
-    ],
-}
-
-# Add Ascend NPU tests
-# TODO: Set accurate estimate time
-# NOTE: please sort the test cases alphabetically by the test file name
-suite_ascend = {
-    "per-commit-1-npu-a2": [
-        TestFile("ascend/test_ascend_autoround_dense.py", 400),
-        TestFile("ascend/test_ascend_autoround_moe.py", 400),
-        TestFile("ascend/test_ascend_gptq_moe.py", 400),
-        TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
-        TestFile("ascend/test_ascend_hicache_mha.py", 400),
-        TestFile("ascend/test_ascend_sampling_backend.py", 400),
-        TestFile("ascend/test_ascend_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
-        TestFile("test_embed_interpolate_unittest.py", 400),
-    ],
-    "per-commit-2-npu-a2": [
-        TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
-    ],
-    "per-commit-4-npu-a3": [
-        TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_hicache_mla.py", 400),
-        TestFile("ascend/test_ascend_tp4_bf16.py", 400),
-        TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
-        TestFile("ascend/test_llada2_mini_ascend.py", 800),
-    ],
-    "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 3600),
-    ],
-}
+# XPU tests migrated to test/registered/xpu/ using register_xpu_ci().
+# The legacy per-commit-xpu suite is replaced by stage-a-test-1-gpu-xpu
+# and stage-b-test-1-gpu-xpu in test/run_suite.py (registry-based).
+suite_xpu = {}
 
 suites.update(suite_amd)
 suites.update(suite_xeon)
-suites.update(suite_ascend)
 suites.update(suite_xpu)
 
 
@@ -326,4 +287,9 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATION NOTICE: The folder `test/srt` should be deprecated as soon as possible. "
+        "Migrate tests to the new CI registry system described in `test/README.md`.",
+        flush=True,
+    )
     main()

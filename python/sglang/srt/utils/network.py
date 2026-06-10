@@ -49,9 +49,19 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
     return None
 
 
+MAX_VALID_PORT = 65535
+
+
 def wait_port_available(
     port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
 ) -> bool:
+    if port < 0 or port > MAX_VALID_PORT:
+        raise ValueError(
+            f"{port_name} has invalid port number {port}. "
+            f"Valid TCP port range is 0-{MAX_VALID_PORT}."
+        )
+
+    error_message = f"{port_name} at {port} is not available"
     for i in range(timeout_s):
         if is_port_available(port):
             return True
@@ -62,12 +72,12 @@ def wait_port_available(
                 logger.warning(
                     f"The port {port} is in use, but we could not find the process that uses it."
                 )
-
-            pid = process.pid
-            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
-            logger.info(
-                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
-            )
+            else:
+                pid = process.pid
+                error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
+                logger.info(
+                    f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
+                )
         time.sleep(0.1)
 
     if raise_exception:
@@ -189,22 +199,23 @@ def get_zmq_socket_on_host(
     Args:
         context: ZeroMQ context to create the socket from.
         socket_type: Type of ZeroMQ socket to create.
-        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
+        host: Host to bind to, without "tcp://" prefix. Defaults to
+            "127.0.0.1" (localhost-only) to avoid exposing unauthenticated
+            sockets to the network (CVE-2026-3060). Callers that need
+            cross-machine reachability must pass an explicit host.
 
     Returns:
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
     socket = context.socket(socket_type)
-    # Bind to random TCP port, auto-wrapping IPv6 and setting zmq.IPV6 flag
     config_socket(socket, socket_type)
-    if host:
-        if is_valid_ipv6_address(host):
-            socket.setsockopt(zmq.IPV6, 1)
-            bind_host = f"tcp://[{host}]"
-        else:
-            bind_host = f"tcp://{host}"
+    if host is None:
+        host = "127.0.0.1"
+    if is_valid_ipv6_address(host):
+        socket.setsockopt(zmq.IPV6, 1)
+        bind_host = f"tcp://[{host}]"
     else:
-        bind_host = "tcp://*"
+        bind_host = f"tcp://{host}"
     port = socket.bind_to_random_port(bind_host)
     return port, socket
 
@@ -230,7 +241,7 @@ def config_socket(socket, socket_type: zmq.SocketType):
         set_send_opt()
     elif socket_type == zmq.PULL:
         set_recv_opt()
-    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
+    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP, zmq.PAIR]:
         set_send_opt()
         set_recv_opt()
     else:
@@ -373,8 +384,7 @@ def get_zmq_socket(
         port = socket.bind_to_random_port("tcp://*")
         return port, socket
     else:
-        # Handle IPv6 if endpoint contains brackets
-        if endpoint.find("[") != -1:
+        if is_zmq_endpoint_ipv6(endpoint):
             socket.setsockopt(zmq.IPV6, 1)
 
         config_socket(socket, socket_type)
@@ -385,6 +395,17 @@ def get_zmq_socket(
             socket.connect(endpoint)
 
         return socket
+
+
+def is_zmq_endpoint_ipv6(endpoint: str) -> bool:
+    """Return whether a ZMQ TCP endpoint contains a bracketed IPv6 host."""
+    prefix = "tcp://["
+    if not endpoint.startswith(prefix):
+        return False
+    end = endpoint.find("]", len(prefix))
+    if end == -1:
+        return False
+    return is_valid_ipv6_address(endpoint[len(prefix) : end])
 
 
 def _is_ipv6(host: str) -> bool:

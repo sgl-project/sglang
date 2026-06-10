@@ -8,11 +8,6 @@ Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4 suite
 
 import ast
 import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -38,21 +33,6 @@ register_amd_ci(
 )
 
 INVALID = -9999999
-
-# Model path configuration for MI35x DeepSeek-R1-MXFP4
-# Priority: 1) env var, 2) local path, 3) HuggingFace model ID
-DEEPSEEK_R1_MXFP4_LOCAL_PATH = "/data2/models/amd-DeepSeek-R1-MXFP4-Preview"
-DEEPSEEK_R1_MXFP4_HF_MODEL_ID = "amd/DeepSeek-R1-MXFP4-Preview"
-
-
-def get_model_path() -> str:
-    """Get effective model path: env var > local path > HF model ID."""
-    env_path = os.environ.get("DEEPSEEK_R1_MXFP4_MODEL_PATH")
-    if env_path:
-        return env_path
-    if os.path.exists(DEEPSEEK_R1_MXFP4_LOCAL_PATH):
-        return DEEPSEEK_R1_MXFP4_LOCAL_PATH
-    return DEEPSEEK_R1_MXFP4_HF_MODEL_ID
 
 
 @dataclass
@@ -81,11 +61,10 @@ class ModelConfig:
 
 def get_mxfp4_models() -> List[ModelConfig]:
     """Get DeepSeek-R1-MXFP4 model configurations for MI35x."""
-    model_path = get_model_path()
     return [
         # DeepSeek-R1-MXFP4 basic only (MTP tested in perf job)
         ModelConfig(
-            model_path=model_path,
+            model_path="amd/DeepSeek-R1-MXFP4-Preview",
             tp_size=8,
             accuracy_threshold=0.93,
             timeout=3600,
@@ -191,19 +170,6 @@ class TestDeepSeekR1MXFP4EvalMI35x(unittest.TestCase):
 
     def test_deepseek_r1_mxfp4_accuracy(self):
         """Test DeepSeek-R1-MXFP4 models with GSM8K completion benchmark."""
-        # Check if model exists
-        model_path = get_model_path()
-        is_local_path = model_path.startswith("/")
-        if is_local_path and not os.path.exists(model_path):
-            print(f"\n⏭️ SKIPPING: Local model not found at {model_path}")
-            self.skipTest(f"Local model not found at {model_path}")
-            return
-
-        if is_local_path:
-            print(f"📁 Using local model: {model_path}")
-        else:
-            print(f"📥 Using HuggingFace model: {model_path}")
-
         all_results = []
         summary = "### DeepSeek-R1-MXFP4 Models (MI35x)\n\n"
         summary += "| Model | Variant | TP | Accuracy | Threshold | Status |\n"
