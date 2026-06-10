@@ -146,6 +146,7 @@ export const GLM51Deployment = () => {
 
     let cmd = '';
     if (enableSpec) cmd += 'SGLANG_ENABLE_SPEC_V2=1 ';
+    if (hardware === 'b200' && effectiveQuant === 'fp8') cmd += 'SGLANG_ENABLE_JIT_DEEPGEMM=1 ';
     cmd += 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
