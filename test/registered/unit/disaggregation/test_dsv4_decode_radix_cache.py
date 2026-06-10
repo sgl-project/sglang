@@ -5,9 +5,11 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv_cache_builder import is_supported_dsv4_decode_radix_mtp
+from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -154,6 +156,7 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
     tree_cache = SimpleNamespace(
         inserted_fill_ids=[],
         inserted_swa_evicted_seqlens=[],
+        inserted_force_leaf_creation=[],
         page_size=2,
         sliding_window_size=2,
         is_eagle=True,
@@ -164,6 +167,9 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
         tree_cache.inserted_swa_evicted_seqlens.append(
             inserted_req.swa_evicted_seqlen
         )
+        tree_cache.inserted_force_leaf_creation.append(
+            inserted_req.force_radix_leaf_creation
+        )
 
     tree_cache.cache_unfinished_req = cache_unfinished_req
     processor = SimpleNamespace(tree_cache=tree_cache)
@@ -172,9 +178,28 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
     SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
 
     assert tree_cache.inserted_fill_ids == [[1, 2, 3]]
-    assert tree_cache.inserted_swa_evicted_seqlens == [0]
+    assert tree_cache.inserted_swa_evicted_seqlens == [2]
+    assert tree_cache.inserted_force_leaf_creation == [True]
     assert req.fill_ids == [1, 2, 3, 4, 5]
     assert req.cache_protected_len == 2
     assert req.swa_evicted_seqlen == 4
+    assert req.force_radix_leaf_creation is False
     assert req.allow_radix_cache_insert_once is False
     assert req.dsv4_decode_radix_cache_prompt_once is False
+
+
+def test_swa_component_force_leaf_creation_allows_full_only_leaf():
+    component = SWAComponent.__new__(SWAComponent)
+
+    assert SWAComponent.should_skip_leaf_creation(
+        component,
+        total_prefix_len=0,
+        key_len=256,
+        params=InsertParams(swa_evicted_seqlen=256),
+    )
+    assert not SWAComponent.should_skip_leaf_creation(
+        component,
+        total_prefix_len=0,
+        key_len=256,
+        params=InsertParams(swa_evicted_seqlen=256, force_leaf_creation=True),
+    )

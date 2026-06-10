@@ -23,7 +23,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
-    page_align_floor,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -191,21 +190,15 @@ class SchedulerBatchResultProcessor:
         old_fill_ids = req.fill_ids
         old_cache_protected_len = getattr(req, "cache_protected_len", 0)
         old_swa_evicted_seqlen = getattr(req, "swa_evicted_seqlen", 0)
-        sliding_window_size = getattr(self.tree_cache, "sliding_window_size", None)
-        swa_tail_len = page_align_floor(sliding_window_size or page_size, page_size)
-        swa_tail_len = max(page_size, swa_tail_len)
-        swa_tail_len = min(radix_key_len, swa_tail_len)
+        old_force_leaf_creation = getattr(req, "force_radix_leaf_creation", False)
 
         req.fill_ids = prompt_fill_ids
         req.cache_protected_len = max(old_cache_protected_len, radix_key_len)
-        # If the request's SWA evicted seqlen already covers the whole prompt
-        # key, the unified SWA component skips leaf creation entirely. Keep a
-        # window-sized SWA tail for the donated prompt so the full radix leaf is
-        # created and later matches can validate the SWA window.
-        req.swa_evicted_seqlen = min(
-            page_align_floor(old_swa_evicted_seqlen, page_size),
-            max(0, radix_key_len - swa_tail_len),
-        )
+        # DSV4 prompt donation only needs a full-attention radix leaf. Mark the
+        # whole donated key as SWA-evicted so the SWA component stays tombstoned,
+        # but force full leaf creation so later matches can reuse the full prefix.
+        req.swa_evicted_seqlen = radix_key_len
+        req.force_radix_leaf_creation = True
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
             if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
@@ -220,6 +213,7 @@ class SchedulerBatchResultProcessor:
         finally:
             req.fill_ids = old_fill_ids
             req.swa_evicted_seqlen = old_swa_evicted_seqlen
+            req.force_radix_leaf_creation = old_force_leaf_creation
             if req.cache_protected_len < old_cache_protected_len:
                 req.cache_protected_len = old_cache_protected_len
 
