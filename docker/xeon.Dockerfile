@@ -23,7 +23,7 @@ RUN apt-get update && \
 
 WORKDIR /opt
 
-ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+ENV UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/uv /root/.local/bin/uvx /usr/local/bin/ && \
     uv venv --python 3.12
