@@ -2745,6 +2745,13 @@ class ServerArgs:
                 "as the first layer might not be an attention layer"
             )
 
+        elif model_arch in ["ZayaForCausalLM"]:
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=True,
+                support_mamba_cache_extra_buffer=False,
+            )
+
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]
             and is_hip()
