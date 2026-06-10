@@ -118,11 +118,13 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
-    def draft_is_flat(self) -> bool:
-        """Drafts are a flat candidate list written to contiguous slots after
-        seq_lens, with no per-topk page duplication -- so the flat per-decode
-        KV alloc formula applies at any page size."""
-        return self.is_ngram()
+    def needs_per_topk_page_duplication(self) -> bool:
+        """Whether the draft phase materializes topk divergent KV chains, so
+        that with page_size > 1 each branch needs its own copy of the partial
+        tail page (see get_alloc_len_per_decode). NGRAM has no draft-time KV
+        at all -- its tree lives only in the verify mask and the draft KV is
+        written as one contiguous extend at verify."""
+        return not self.is_ngram()
 
     def create_future_map(
         self,

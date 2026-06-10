@@ -78,8 +78,9 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
-    def draft_is_flat(self) -> bool:
-        return False
+    def needs_per_topk_page_duplication(self) -> bool:
+        # Conservative default: reserve the larger paged-tree footprint.
+        return True
 
     def supports_spec_v2(self) -> bool:
         return self.supports_overlap
