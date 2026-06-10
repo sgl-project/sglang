@@ -424,9 +424,11 @@ class ServerArgs(DisaggServerArgsMixin):
         enabled = False
         for text_encoder_config in self.pipeline_config.text_encoder_configs:
             if isinstance(text_encoder_config, T5Config):
-                text_encoder_config.parallel_folding = True
-                enabled = True
-                text_encoder_config.parallel_folding_mode = "sp"
+                # TODO text_encoder_config there not included real num_heads need to fix
+                enabled = False
+                # text_encoder_config.parallel_folding = True
+                # enabled = True
+                # text_encoder_config.parallel_folding_mode = "sp"
 
         if enabled:
             logger.info(
