@@ -24,11 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_xpu_ci(
-    est_time=300,
-    suite="stage-b-test-1-gpu-xpu",
-    disabled="Pending intel/sglang-dev:latest rebuild against torch-xpu 2.12 ABI",
-)
+register_xpu_ci(est_time=300, suite="stage-b-test-1-gpu-xpu")
 
 
 class TestXPUMultiFeature(CustomTestCase):
@@ -41,12 +37,12 @@ class TestXPUMultiFeature(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-xpu-multi-feature"
+        # No API key: the radix-cache helper sends raw POSTs to /generate
+        # without auth headers, so the server must be open.
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
             other_args=["--device", "xpu"],
         )
         cls.openai_url = cls.base_url + "/v1"
@@ -56,7 +52,8 @@ class TestXPUMultiFeature(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def _client(self) -> openai.Client:
-        return openai.Client(api_key=self.api_key, base_url=self.openai_url)
+        # Server has no API key, but openai client still requires a non-empty string.
+        return openai.Client(api_key="EMPTY", base_url=self.openai_url)
 
     def test_openai_chat_completion(self):
         response = self._client().chat.completions.create(
