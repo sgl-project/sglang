@@ -19,12 +19,12 @@ framework-specific optimization workflow.
 - `python/sglang/jit_kernel/diffusion/triton/ltx2_rotary.py`
 - `python/sglang/jit_kernel/diffusion/triton/varlen_pack_pad.py`
 - `python/sglang/jit_kernel/diffusion/cutedsl/scale_residual_norm_scale_shift.py`
-- `python/sglang/jit_kernel/tests/diffusion/test_qwen_image_modulation.py`
-- `python/sglang/jit_kernel/tests/diffusion/test_group_norm_silu.py`
-- `python/sglang/jit_kernel/tests/diffusion/test_varlen_pack_pad.py`
-- `python/sglang/jit_kernel/tests/diffusion/test_varlen_uspattn_equivalence.py`
-- `python/sglang/jit_kernel/benchmark/diffusion/bench_qwen_image_modulation.py`
-- `python/sglang/jit_kernel/benchmark/diffusion/bench_group_norm_silu.py`
+- `test/registered/jit/diffusion/test_qwen_image_modulation.py`
+- `test/registered/jit/diffusion/test_group_norm_silu.py`
+- `test/registered/jit/diffusion/test_varlen_pack_pad.py`
+- `test/registered/jit/diffusion/test_varlen_uspattn_equivalence.py`
+- `test/registered/jit/benchmark/diffusion/bench_qwen_image_modulation.py`
+- `test/registered/jit/benchmark/diffusion/bench_group_norm_silu.py`
 - `python/sglang/jit_kernel/norm.py`
 - `python/sglang/multimodal_gen/runtime/platforms/cuda.py`
 - `python/sglang/multimodal_gen/runtime/layers/attention/selector.py`
@@ -38,7 +38,7 @@ framework-specific optimization workflow.
 - Use cases: `x * (1 + scale) + shift`, `a * (k + b) + c`, and Qwen-style `(layernorm/residual layernorm) + scale/shift + gate select`.
 - Constraints: `x` must be CUDA and contiguous. `scale/shift` support 0D/1D/2D/3D/4D broadcast. 4D `[B, F, 1, C]` requires `L % F == 0`.
 - NPU fallback: `scale_shift.py` swaps to `npu_fallback` native path.
-- Validation: `python/sglang/jit_kernel/tests/diffusion/test_qwen_image_modulation.py`.
+- Validation: `test/registered/jit/diffusion/test_qwen_image_modulation.py`.
 
 2. Norm + Scale/Shift fusion (CuTe DSL)
 - Kernels: `fused_norm_scale_shift`, `fused_scale_residual_norm_scale_shift`
@@ -56,7 +56,7 @@ framework-specific optimization workflow.
   - `y = tanh(gate) * norm(x) + shift`
   - `y, y2 = tanh(gate) * norm(x) + shift`, then `y2 = norm(y) * (1 + scale)`
 - Constraints: same CuTe DSL envelope as the norm+scale/shift family in practice: contiguous last dim, fp16/bf16/fp32, and `D % 256 == 0`, `D <= 8192`.
-- Validation: `python/sglang/jit_kernel/tests/diffusion/test_norm_tanh_mul_add_norm_scale.py`
+- Validation: `test/registered/jit/diffusion/test_norm_tanh_mul_add_norm_scale.py`
 - Behavior: this is already a mainline fast path, so if Z-Image traces show the unfused chain, treat it as a missing or regressed existing optimization before proposing a new kernel.
 
 4. Triton LayerNorm/RMSNorm fusion
@@ -64,7 +64,7 @@ framework-specific optimization workflow.
 - Locations: `triton/norm.py`, `layernorm.py`
 - Use cases: fp32 RMSNorm with residual/dropout/rowscale/x1 branches, and inference-friendly `norm_infer`.
 - Constraints: last dim must be contiguous, and `N * element_size < 64KB`.
-- Validation: `python/sglang/jit_kernel/tests/test_rmsnorm.py`.
+- Validation: `test/registered/jit/test_rmsnorm.py`.
 
 5. Triton one-pass RMSNorm (small hidden size fast path)
 - Kernel: `triton_one_pass_rms_norm`
@@ -78,7 +78,7 @@ framework-specific optimization workflow.
 - Use case: GPT-J style RoPE when not Neox.
 - Constraints: `head_size` must be even.
 - NPU fallback: `npu_fallback.apply_rotary_embedding_native`.
-- Validation: `python/sglang/jit_kernel/tests/test_rope.py`.
+- Validation: `test/registered/jit/test_rope.py`.
 
 7. LTX2 split RoPE fusion
 - Kernel: `apply_ltx2_split_rotary_emb`
@@ -93,8 +93,8 @@ framework-specific optimization workflow.
 - Use case: `activation(group_norm(x))` when the activation is non-inplace `nn.SiLU` and the GroupNorm is affine.
 - Enablement: mainline uses `apply_group_norm_silu(...)` in HunyuanVideo VAE paths and LTX latent upsampler paths by default; there is no env toggle. The wrapper dispatches to Triton only when guards pass.
 - Constraints: CUDA inference path only; no grad, `x.requires_grad == False`, `nn.GroupNorm`, `nn.SiLU(inplace=False)`, affine norm with weight and bias. Unsupported cases fall back to native `activation(norm(x))`.
-- Validation: `python/sglang/jit_kernel/tests/diffusion/test_group_norm_silu.py`.
-- Microbench: `python/sglang/jit_kernel/benchmark/diffusion/bench_group_norm_silu.py`.
+- Validation: `test/registered/jit/diffusion/test_group_norm_silu.py`.
+- Microbench: `test/registered/jit/benchmark/diffusion/bench_group_norm_silu.py`.
 
 **Faster CUDA Kernel Usage Points**
 
@@ -117,7 +117,7 @@ framework-specific optimization workflow.
 4. Varlen USP attention pack/scatter
 - Locations: `runtime/layers/attention/layer.py`, `triton/varlen_pack_pad.py`
 - Behavior: masked `USPAttention.forward` can gather dense Q/K/V into packed `[total_valid, H, D]` rows with `fused_pack_qkv`, run varlen attention, then scatter back with `fused_scatter_to_padded`.
-- Validation: `python/sglang/jit_kernel/tests/diffusion/test_varlen_pack_pad.py` and `test_varlen_uspattn_equivalence.py`.
+- Validation: `test/registered/jit/diffusion/test_varlen_pack_pad.py` and `test_varlen_uspattn_equivalence.py`.
 - Workflow rule: if a masked attention trace spends time in Python/advanced indexing pack or scatter, first check whether this fused varlen path should have engaged.
 
 **QK Norm Optimization**
@@ -130,7 +130,7 @@ framework-specific optimization workflow.
   - `can_use_fused_inplace_qknorm(head_dim, dtype)` returns true.
   - Supported head dims: `64, 128, 256, 512, 1024`.
 - Behavior: Fused path operates on `q` and `k` in place after reshaping to `[B, -1, head_dim]`. If preconditions fail, fall back to per-tensor RMSNorm.
-- Validation: `python/sglang/jit_kernel/tests/test_qknorm.py` and `python/sglang/jit_kernel/tests/test_qknorm_across_heads.py`.
+- Validation: `test/registered/jit/test_qknorm.py` and `test/registered/jit/test_qknorm_across_heads.py`.
 
 **QK Norm + RoPE Optimization**
 
@@ -145,7 +145,7 @@ framework-specific optimization workflow.
   - `can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, dtype)` returns true.
   - Supported head dims: `64, 128, 256`.
 - Behavior: `apply_qk_norm_rope` prefers the fused JIT kernel when all guards pass; otherwise it falls back to `apply_qk_norm(...)` plus `apply_flashinfer_rope_qk_inplace(...)`.
-- Validation: `python/sglang/jit_kernel/tests/diffusion/test_qknorm_rope.py`.
+- Validation: `test/registered/jit/diffusion/test_qknorm_rope.py`.
 - Workflow rule: treat LTX2 traces that miss the generic fused path as an enablement/shape-guard issue first, and check the separate LTX2 split-RoPE path before proposing new attention-prep kernels.
 
 **Nunchaku Fused GELU MLP**

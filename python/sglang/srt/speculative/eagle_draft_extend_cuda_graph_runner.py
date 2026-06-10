@@ -1,25 +1,18 @@
 from __future__ import annotations
 
-import bisect
 import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
-from sglang.srt.model_executor.cuda_graph_runner import (
-    CUDA_GRAPH_CAPTURE_FAILED_MSG,
-    CudaGraphRunner,
-    DeepEPCudaGraphRunnerAdapter,
-    LogitsProcessorOutput,
-    get_batch_sizes_to_capture,
-    get_global_graph_memory_pool,
-    model_capture_mode,
-    set_global_graph_memory_pool,
+from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    set_dp_buffer_len,
     set_is_extend_in_batch,
-    set_torch_compile_config,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -27,6 +20,16 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.runner import (
+    DecodeCudaGraphRunner,
+    DeepEPCudaGraphRunnerAdapter,
+    get_batch_sizes_to_capture,
+    model_capture_mode,
+)
+from sglang.srt.model_executor.runner_backend import FullCudaGraphBackend
+from sglang.srt.model_executor.runner_backend_utils import (
+    CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
@@ -61,7 +64,14 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
-class EAGLEDraftExtendCudaGraphRunner:
+class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
+    """EAGLE draft-extend cuda-graph runner.
+
+    Subclasses DecodeCudaGraphRunner to inherit the outer capture
+    loop + backend scaffolding. Overrides capture_one_shape,
+    replay, can_run for EAGLE-specific draft-extend semantics.
+    """
+
     def __init__(
         self,
         eagle_worker: EagleDraftWorker,
@@ -72,23 +82,27 @@ class EAGLEDraftExtendCudaGraphRunner:
         # Parse args
         self.eagle_worker = eagle_worker
         if not hasattr(eagle_worker, "model_runner"):
-            # V2: EagleDraftWorker
             self.model_runner = model_runner = eagle_worker.draft_runner
             self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
         else:
             self.model_runner = model_runner = eagle_worker.model_runner
             self.forward_mode = ForwardMode.DRAFT_EXTEND
 
-        self.graphs = {}
-        self.output_buffers = {}
+        # Fields the parent's capture() reads:
+        self.device = model_runner.device
+        self.device_module = torch.get_device_module(self.device)
+        self.tp_size = model_runner.tp_size
+        self.dp_size = model_runner.dp_size
+        self.pp_size = model_runner.server_args.pp_size
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        self.tp_size = self.model_runner.tp_size
-        self.dp_size = self.model_runner.dp_size
+        self.enable_profile_cuda_graph = (
+            model_runner.server_args.enable_profile_cuda_graph
+        )
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
             if speculative_num_steps is None
@@ -98,16 +112,22 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.draft_extend_attn_backend = (
             draft_extend_attn_backend or eagle_worker.draft_extend_attn_backend
         )
-        self.enable_profile_cuda_graph = (
-            model_runner.server_args.enable_profile_cuda_graph
-        )
+        self.attn_backend = self.draft_extend_attn_backend
+
+        # Disable parent paths that don't apply.
+        self.compile_bs = []
         self.enable_pdmux = False
+        self.record_nolora_graph = False
+        self.is_dllm = False
+
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        self.capture_forward_mode = self.forward_mode
+        self.capture_hidden_mode = CaptureHiddenMode.LAST
+
+        self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1
 
-        # Attention backend
         # Size cuda-graph buffers by num_draft_tokens (full tree width), not
         # num_steps + 1, or topk > 1 draft-extend overflows them.
         self.num_tokens_per_bs = model_runner.server_args.speculative_num_draft_tokens
@@ -120,15 +140,11 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
-        seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-        )
         self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
 
         if self.enable_torch_compile:
             set_torch_compile_config()
 
-        # Graph inputs
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -204,6 +220,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                 dtype=torch.float,
             )
 
+        seq_lens_cpu = torch.full(
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32, device="cpu"
+        )
+
         self.buffers = EagleDraftExtendInputBuffers(
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -222,7 +242,11 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         self.buffers.share_buffers()
 
-        # Capture
+        self.backend = FullCudaGraphBackend(
+            self,
+            enable_memory_saver=model_runner.server_args.enable_memory_saver,
+        )
+
         try:
             with model_capture_mode():
                 self.capture()
@@ -230,6 +254,12 @@ class EAGLEDraftExtendCudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _cache_loc_dtype(self):
+        return torch.int64
+
+    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
+        return bs
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -243,7 +273,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
         is_bs_supported = (
-            cuda_graph_bs in self.graphs
+            self.backend.can_run(forward_batch, cuda_graph_bs)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -253,41 +283,15 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         return is_bs_supported
 
-    def _create_graph(self):
-        return torch.cuda.CUDAGraph()
-
-    def _cache_loc_dtype(self):
-        return torch.int64
-
-    def _capture_init(self, run_once_fn):
-        for _ in range(2):
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once_fn()
-
-    def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with torch.cuda.graph(graph, pool=pool, stream=stream):
-            out = run_once_fn()
-        return out
-
-    def _replay(self, forward_batch: ForwardBatch):
-        ctx = (
-            self.model_runner.device_timer.wrap(
-                metadata={"category": "eagle_draft_extend"}
-            )
-            if self.model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
-            self.graphs[self.bs].replay()
-
-    def capture(self):
-        CudaGraphRunner.capture(self)
-
-    def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):
+    def capture_one_shape(
+        self,
+        size: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        variant_label: Optional[str] = None,
+    ):
+        bs = size
         buffers = self.buffers
-        graph = self._create_graph()
-        stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
         # Graph inputs
@@ -349,7 +353,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             num_accept_tokens=num_accept_tokens,
         )
 
-        # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
             batch_size=bs,
@@ -386,7 +389,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             set_is_extend_in_batch(False)
 
-            # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
@@ -418,29 +420,29 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch, in_capture=True
             )
             self.deepep_adapter.capture(is_extend_in_batch=True)
-
             canary_ctx = (
                 c.with_active_single_forward_manager(0)
                 if (c := self.model_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
             with canary_ctx:
-                self._capture_init(run_once)
-
-                out = self._capture_graph(
-                    graph, get_global_graph_memory_pool(), stream, run_once
+                shape_key = self._make_graph_key(bs)
+                self.backend.capture_one(
+                    shape_key,
+                    run_once,
+                    dummies=None,
+                    post_warmup_hook=getattr(
+                        self.draft_extend_attn_backend,
+                        "on_after_cuda_graph_warmup",
+                        None,
+                    ),
                 )
-
-        set_global_graph_memory_pool(graph.pool())
-        return graph, out
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
 
-        # batch_size and num_seqs can be different in case there are finished examples
-        # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size
         num_tokens = forward_batch.input_ids.shape[0]
         if self.require_mlp_tp_gather:
@@ -450,11 +452,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 else max_num_tokens
             )
-            index = bisect.bisect_left(self.capture_bs, max_batch_size)
+            bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
-            index = bisect.bisect_left(self.capture_bs, raw_bs)
+            bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
-        bs = self.capture_bs[index]
         if bs * self.num_tokens_per_bs != num_tokens:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
@@ -466,7 +467,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
 
-        # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         if forward_batch.extend_seq_lens is not None:
@@ -496,7 +496,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            # V1: pruned_states = bs; V2: pruned_states = num_tokens
             if self.forward_mode.is_draft_extend_v2():
                 buffers.global_num_tokens_for_logprob_gpu.fill_(
                     bs * self.num_tokens_per_bs
@@ -546,14 +545,20 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Replay
         self.raw_bs = raw_bs
         self.bs = bs
-        self._replay(forward_batch)
-        out = self.output_buffers[bs]
+        shape_key = self._make_graph_key(bs)
+        timer_ctx = (
+            self.model_runner.device_timer.wrap(
+                metadata={"category": "eagle_draft_extend"}
+            )
+            if self.model_runner.device_timer
+            else contextlib.nullcontext()
+        )
+        with timer_ctx:
+            out = self.backend.replay(shape_key, forward_batch)
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
-            # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.
             unpadding_bs = num_tokens
         elif bs != raw_bs:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[

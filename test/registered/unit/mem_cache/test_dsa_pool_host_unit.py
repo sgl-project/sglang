@@ -1,3 +1,4 @@
+import inspect
 import unittest
 
 import torch
@@ -13,6 +14,14 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+
+
+class TestDSAOffloadSignatures(unittest.TestCase):
+    def test_cpu_copy_methods_accept_mamba_indices(self):
+        for method_name in ("get_cpu_copy", "load_cpu_copy"):
+            with self.subTest(method_name=method_name):
+                signature = inspect.signature(getattr(DSATokenToKVPool, method_name))
+                self.assertIn("mamba_indices", signature.parameters)
 
 
 class TestDSAHiCacheTransfer(unittest.TestCase):

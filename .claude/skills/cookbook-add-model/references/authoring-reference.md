@@ -109,13 +109,12 @@ the `_playground.jsx` header):
 | Axis key | Widget | Use when |
 |---|---|---|
 | `attention` | TP / CP / DP-Attention sub-knobs (DP-Attention is a combined knob: its value is the DP degree AND toggles `--enable-dp-attention`) | Model exposes parallelism knobs in its cells (§2.2) and you want users to override them. |
-| `moe` | Backend select + EP knob | Model is MoE and supports multiple `--moe-*-backend` choices. |
+| `moe` | Backend select (incl. MegaMoE) + EP knob; picking the MegaMoE backend reveals a Quantization sub-select (W4A8/W4A4) | Model is MoE and supports multiple `--moe-*-backend` choices. For Blackwell MoE kernel-fusion, give the `megamoe` backend option a `requiresHw` (and optional `excludesStrategy`) gate, then add a sibling `megamoeQuant` block (`{stripEnv, options}`): W4A8 = `NUM_MAX` only, W4A4 adds the FP4-activations env vars; both strip the DeepEP dispatch env. |
 | `parsers` | Multi-toggle | Model has reasoning / tool-call parsers. |
 | `speculative` | Single-select chip group | Model has spec-decoding presets you want to expose. |
 | `pdDisagg` | Mode + transfer backend (+ optional per-backend env via `envWhen` hw-gate) + IB device + optional `router{port, command}` | Model supports prefill/decode disaggregation. When a PD role is active and `router` is set, the playground shows the router (SGLang Model Gateway) launch command as a separate companion block and retargets the cURL modal to `router.port` (clients hit the router, not the role servers). |
 | `hicache` | Enable + storage + write policy | Model is large enough that hierarchical KV cache matters. |
 | `hisparse` | Enable + host-ratio select; whole card gated on the live PD-Disagg mode being `decode` | DSA-style model (DeepSeek-V3.2 / V4, GLM-5) that supports decode-side hierarchical sparse attention. |
-| `megamoe` | Single-select with hw/strategy gating | Blackwell-only kernel fusion variant. |
 
 **Per-chip constraints**: any chip entry in any axis can be wrapped with
 `hide` / `disable` constraint objects:

@@ -14,19 +14,13 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.speculative.frozen_kv_mtp_info import (
-    FrozenKVMTPContext,
-    FrozenKVMTPDraftExtendInput,
-    FrozenKVMTPDraftInput,
-)
-from sglang.srt.speculative.spec_utils import fast_topk
+from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -159,22 +153,3 @@ def select_last_extend_hidden(
     lens = torch.tensor(batch.extend_lens, device=hidden_states.device)
     last_indices = torch.cumsum(lens, dim=0) - 1
     return hidden_states[last_indices.to(torch.long)]
-
-
-def select_last_verified_seed(
-    draft_input: FrozenKVMTPDraftExtendInput,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    counts = draft_input.num_accept_tokens.to(torch.long)
-    last_indices = torch.cumsum(counts, dim=0) - 1
-    return (
-        draft_input.input_ids[last_indices],
-        draft_input.hidden_states[last_indices],
-    )
-
-
-def capture_for_decode(
-    logits_output: LogitsProcessorOutput, draft_input: FrozenKVMTPDraftInput, topk: int
-) -> None:
-    probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-    draft_input.topk_p, draft_input.topk_index = fast_topk(probs, topk, dim=-1)
-    draft_input.hidden_states = logits_output.hidden_states

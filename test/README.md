@@ -45,7 +45,7 @@ python3 test/registered/core/test_srt_endpoint.py
 python3 test/registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode
 
 # Single JIT kernel test
-python3 python/sglang/jit_kernel/tests/test_add_constant.py
+python3 test/registered/jit/test_add_constant.py
 
 # Run a suite
 python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
@@ -73,9 +73,9 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
-JIT kernel files live outside `test/registered/` but still use registration:
-- Correctness tests: `python/sglang/jit_kernel/tests/test_*.py` → `base-b-kernel-unit-1-gpu-large`
-- Benchmarks: `python/sglang/jit_kernel/benchmark/bench_*.py` → `base-b-kernel-benchmark-1-gpu-large`
+JIT kernel correctness tests and benchmarks live under `test/registered/jit/`, same as other registered tests (their helpers stay alongside the kernel source under `python/sglang/jit_kernel/` and are imported by absolute path):
+- Correctness tests: `test/registered/jit/test_*.py` → `base-b-kernel-unit-1-gpu-large`
+- Benchmarks: `test/registered/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-1-gpu-large`
 
 ## Choosing a Suite
 

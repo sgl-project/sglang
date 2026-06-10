@@ -82,7 +82,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
+from sglang.multimodal_gen.runtime.realtime.states import (
+    get_realtime_causal_dit_state,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -1216,7 +1218,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             return None
         session = getattr(forward_batch, "session", None)
         if session is not None:
-            state = session.get_or_create_state(RealtimeCausalDiTState)
+            state = get_realtime_causal_dit_state(session)
             return state.runtime_cache.setdefault(name, {})
         extra = getattr(forward_batch, "extra", None)
         if extra is None:

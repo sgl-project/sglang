@@ -26,10 +26,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.compilation.piecewise_context_manager import (
-    get_forward_context,
-    is_in_piecewise_cuda_graph,
-)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -70,6 +66,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
@@ -299,7 +299,7 @@ class GptOssSparseMoeBlock(nn.Module):
         else:
             router_input = hidden_states
 
-        if is_in_piecewise_cuda_graph():
+        if is_in_tc_piecewise_cuda_graph():
             final_hidden_states = moe_impl(self.layer_id, hidden_states)
         else:
             router_logits, _ = self.router(router_input)
@@ -326,7 +326,7 @@ class GptOssSparseMoeBlock(nn.Module):
 
 @register_custom_op(out_shape="hidden_states")
 def moe_impl(layer_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
-    forward_context = get_forward_context()
+    forward_context = get_tc_piecewise_forward_context()
     moe_fusion = forward_context.moe_fusions[layer_id]
     router_logits, _ = moe_fusion.router(hidden_states)
     topk_output = moe_fusion.topk(hidden_states, router_logits)

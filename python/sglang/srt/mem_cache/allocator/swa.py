@@ -268,11 +268,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = (
-            alloc_swa_indices
-        )
+        self.full_to_swa_index_mapping[
+            alloc_full_indices[-swa_tail_len:].to(torch.int64)
+        ] = alloc_swa_indices.to(torch.int64)
         if swa_tail_len < extend_num_tokens:
-            self.full_to_swa_index_mapping[alloc_full_indices[:-swa_tail_len]] = 0
+            self.full_to_swa_index_mapping[
+                alloc_full_indices[:-swa_tail_len].to(torch.int64)
+            ] = 0
         return alloc_full_indices
 
     def alloc_decode(

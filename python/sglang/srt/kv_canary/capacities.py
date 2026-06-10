@@ -63,7 +63,10 @@ class CanaryLaunchCapacities:
                 f"kv-canary: pool_slot_count must be positive, got {pool_slot_count}"
             )
 
-        cuda_graph_max_bs = server_args.cuda_graph_max_bs or 0
+        cuda_graph_config = server_args.cuda_graph_config
+        cuda_graph_max_bs = (
+            cuda_graph_config.decode.max_bs if cuda_graph_config is not None else 0
+        ) or 0
         if cuda_graph_max_bs < 0:
             raise ValueError(
                 f"kv-canary: cuda_graph_max_bs must be non-negative, got {cuda_graph_max_bs}"

@@ -146,7 +146,7 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def supports_spec_v2(self) -> bool:
-        return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
+        return self.is_eagle() or self.is_standalone()
 
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
@@ -177,17 +177,13 @@ class SpeculativeAlgorithm(Enum):
             return DFlashWorker
 
         if self.is_frozen_kv_mtp():
-            if enable_overlap:
-                raise ValueError(
-                    "FROZEN_KV_MTP does not support spec v2. Disable overlap "
-                    "scheduling to use FrozenKVMTPWorker."
-                )
-
-            from sglang.srt.speculative.frozen_kv_mtp_worker import (
-                FrozenKVMTPWorker,
+            # V2 worker drives both overlap and non-overlap (scheduler runs it
+            # synchronously when overlap is disabled), same as EAGLE.
+            from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
+                FrozenKVMTPWorkerV2,
             )
 
-            return FrozenKVMTPWorker
+            return FrozenKVMTPWorkerV2
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).

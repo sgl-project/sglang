@@ -43,7 +43,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SanaWMSelfForcingSampler,
     SanaWMSelfForcingSamplerConfig,
 )
-from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
+from sglang.multimodal_gen.runtime.realtime.states import (
+    get_realtime_causal_dit_state,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -159,31 +161,6 @@ def self_forcing_denoise_chunk(
     return updated_cache
 
 
-class SanaWMStreamCacheState(RealtimeCausalDiTState):
-    """Per-session streaming DiT state, framework-pattern (cf. LingBot).
-
-    The Wan-shaped ``kv_cache`` field stays None — SANA-WM's cache is the
-    heterogeneous per-block 10-slot list (GDN recurrent matrix states + softmax
-    concat windows + conv tails), carried in the fields below."""
-
-    def __init__(self):
-        super().__init__()
-        # kv[chunk][block][slot] — grown per chunk, stale chunks evicted.
-        self.stream_kv_cache: list = []
-        self.chunk_indices: list[int] = [0]
-        # Growing stage-1 latent buffer (cond frame + denoised chunks).
-        self.latents: torch.Tensor | None = None
-        # Per-session flow-Euler scheduler (fresh shift=1.0; persists across ticks).
-        self.scheduler: FlowMatchEulerDiscreteScheduler | None = None
-
-    def dispose(self) -> None:
-        super().dispose()
-        self.stream_kv_cache = []
-        self.chunk_indices = [0]
-        self.latents = None
-        self.scheduler = None
-
-
 class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
     """Autoregressive self-forcing streaming denoise — SANA-WM's causal-DMD variant.
 
@@ -263,7 +240,7 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
             kv_cache, chunk_idx, valid, num_cached_blocks, num_blocks
         )
 
-    # Realtime per-chunk path (sessions): per-session state in SanaWMStreamCacheState.
+    # Realtime per-chunk path (sessions): per-session state in RealtimeCausalDiTState.
     @torch.no_grad()
     def _forward_realtime_chunk(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.latents is None or batch.latents.ndim != 5:
@@ -276,7 +253,9 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
         target_dtype = PRECISION_TO_TYPE.get(
             getattr(pcfg, "dit_precision", "bf16"), torch.bfloat16
         )
-        state = batch.session.get_or_create_state(SanaWMStreamCacheState)
+        if batch.session is None:
+            raise ValueError("SANA-WM realtime denoising requires a realtime session")
+        state = get_realtime_causal_dit_state(batch.session)
         if batch.block_idx == 0 and state.latents is not None:
             state.dispose()  # session restart on chunk 0 (mirrors the base stage)
 
@@ -292,6 +271,12 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
             )
         if state.scheduler is None:
             state.scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
+        kv_cache = state.kv_cache
+        if kv_cache is None:
+            # SANA-WM stores its heterogeneous per-block 10-slot stream cache in
+            # the generic causal DiT kv_cache slot.
+            kv_cache = []
+            state.kv_cache = kv_cache
 
         # Device-only move, NO dtype cast: Module.to(dtype=...) would cast the
         # DiT's complex RoPE buffers to real, discarding the imaginary part
@@ -318,11 +303,11 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
             start_f = state.chunk_indices[-1] if chunk_idx > 0 else 0
             end_f = (start_f + n) if chunk_idx > 0 else n
             state.chunk_indices.append(end_f)
-            state.stream_kv_cache.append(
+            kv_cache.append(
                 [[None] * _NUM_STREAM_CACHE_SLOTS for _ in range(num_blocks)]
             )
             chunk_kv, sink_num = self._accumulate_kv_cache(
-                state.stream_kv_cache,
+                kv_cache,
                 chunk_idx,
                 state.chunk_indices,
                 sampler_cfg.num_cached_blocks,
@@ -339,7 +324,7 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
                     if sink_start > 0:
                         valid = [0] + list(range(sink_start, chunk_idx))
                 self._evict_stale_kv_cache(
-                    state.stream_kv_cache,
+                    kv_cache,
                     chunk_idx,
                     valid,
                     sampler_cfg.num_cached_blocks,
@@ -404,7 +389,7 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
                 attn_metadata=None,
                 forward_batch=batch,
             ):
-                state.stream_kv_cache[chunk_idx] = self_forcing_denoise_chunk(
+                kv_cache[chunk_idx] = self_forcing_denoise_chunk(
                     transformer=transformer,
                     scheduler=state.scheduler,
                     sigmas=sc.explicit_sigmas,

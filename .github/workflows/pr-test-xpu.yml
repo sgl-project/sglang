@@ -118,7 +118,15 @@ jobs:
 
       - name: Cleanup container
         if: always()
-        run: docker rm -f ci_sglang_xpu || true
+        run: |
+          rm -rf \
+            python/build \
+            python/sglang.egg-info \
+            test/result.jsonl || true
+          docker rm -f ci_sglang_xpu || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
 
   # ==================== Wait for Stage A ==================== #
   wait-for-stage-a:
@@ -173,7 +181,15 @@ jobs:
 
       - name: Cleanup container
         if: always()
-        run: docker rm -f ci_sglang_xpu || true
+        run: |
+          rm -rf \
+            python/build \
+            python/sglang.egg-info \
+            test/result.jsonl || true
+          docker rm -f ci_sglang_xpu || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
 
   finish:
     if: always()

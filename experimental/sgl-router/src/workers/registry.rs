@@ -197,11 +197,17 @@ impl WorkerRegistry {
         self.by_id.get(id).map(|w| Arc::clone(&w))
     }
 
-    /// Snapshot of every registered worker, across all models and modes.
+    /// Snapshot of every registered worker, across all models and modes,
+    /// regardless of breaker state. Order is unspecified (iterates the
+    /// underlying `DashMap`).
     ///
     /// Used by fleet-wide admin fan-out (e.g. `/flush_cache`) that targets
-    /// every worker the router knows about rather than one model's pool.
-    /// Order is unspecified (iterates the underlying `DashMap`).
+    /// every worker the router knows about rather than one model's pool, and
+    /// by the `/metrics` scrape path to render per-worker gauges
+    /// (`sgl_router_worker_health`, `_cb_state`, `_inflight_requests`) plus
+    /// the pool-size gauge. The metrics path samples this fresh on each
+    /// scrape rather than pushing, so a removed worker stops appearing
+    /// immediately.
     pub fn all(&self) -> Vec<Arc<Worker>> {
         self.by_id.iter().map(|e| Arc::clone(e.value())).collect()
     }
@@ -276,6 +282,18 @@ mod tests {
         r.remove(&WorkerId("w1".into()));
         assert!(r.workers_for(&ModelId("m1".into())).is_empty());
         assert!(r.workers_for(&ModelId("m2".into())).is_empty());
+    }
+
+    #[test]
+    fn all_lists_multi_model_worker_once() {
+        let r = WorkerRegistry::default();
+        // "a" serves two models; `all` must still list it once,
+        // unlike a per-model enumeration which would double-count.
+        let _ = r.add(spec("a", WorkerMode::Plain, &["m1", "m2"]));
+        let _ = r.add(spec("b", WorkerMode::Plain, &["m1"]));
+        let mut urls: Vec<String> = r.all().iter().map(|w| w.url.clone()).collect();
+        urls.sort();
+        assert_eq!(urls, vec!["http://a:30000", "http://b:30000"]);
     }
 
     /// `healthy_workers_for` must drop workers whose breaker is Open.

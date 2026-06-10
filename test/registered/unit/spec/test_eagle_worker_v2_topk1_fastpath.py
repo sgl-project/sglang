@@ -50,7 +50,10 @@ def _make_worker(num_steps: int, num_draft_tokens: int):
     worker.device = DEVICE
     worker.speculative_num_steps = num_steps
     worker.speculative_num_draft_tokens = num_draft_tokens
-    worker.server_args = SimpleNamespace(cuda_graph_max_bs=8, max_running_requests=8)
+    worker.server_args = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(max_bs=8)),
+        max_running_requests=8,
+    )
     return worker
 
 

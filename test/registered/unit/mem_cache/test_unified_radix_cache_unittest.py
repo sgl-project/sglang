@@ -99,6 +99,7 @@ class CacheConfig:
     head_dim: int = 64
     dtype: torch.dtype = torch.bfloat16
     eviction_policy: str = "lru"
+    is_eagle: bool = False
 
     @property
     def has_mamba(self) -> bool:
@@ -125,6 +126,8 @@ class CacheConfig:
             or self.num_layers != defaults["num_layers"].default
         ):
             parts.append(f"h{self.head_num}l{self.num_layers}")
+        if self.is_eagle:
+            parts.append("eagle")
         return "_".join(parts)
 
 
@@ -324,11 +327,97 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
         eviction_policy=cfg.eviction_policy,
+        is_eagle=cfg.is_eagle,
     )
     tree = UnifiedRadixCache(params=cache_init_params)
     tree.cache_init_params = cache_init_params
 
     return tree, allocator, req_to_token_pool
+
+
+class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL,),
+        is_eagle=True,
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def test_l3_prefetch_uses_bigram_radix_key(self):
+        from sglang.srt.mem_cache.utils import get_hash_str
+
+        tree, allocator, _ = build_fixture(self.cfg)
+        tree.enable_storage = True
+        tree.prefetch_threshold = 1
+        tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+        value = allocator.alloc(len(tokens) - 1)
+        self.assertIsNotNone(value)
+        tree.insert(InsertParams(key=RadixKey(tokens), value=value))
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        leaf = match.last_device_node
+        self.assertTrue(leaf.key.is_bigram)
+        self.assertEqual(len(leaf.hash_value), 2)
+
+        class FakeHostPool:
+            def alloc(self, num_tokens):
+                return torch.arange(num_tokens, dtype=torch.int64)
+
+        class FakeCacheController:
+            def __init__(self):
+                self.mem_pool_host = FakeHostPool()
+                self.prefetch_tokens_occupied = 0
+                self.prefetch_args = None
+
+            def prefetch_rate_limited(self):
+                return False
+
+            def prefetch(
+                self,
+                request_id,
+                host_indices,
+                new_input_tokens,
+                last_hash=None,
+                prefix_keys=None,
+                extra_pools=None,
+            ):
+                self.prefetch_args = (
+                    request_id,
+                    host_indices,
+                    new_input_tokens,
+                    last_hash,
+                    prefix_keys,
+                    extra_pools,
+                )
+                return mock.Mock()
+
+        controller = FakeCacheController()
+        tree.cache_controller = controller
+        tree.prefetch_from_storage("req", tree.root_node, tokens)
+
+        _, _, storage_key, _, _, _ = controller.prefetch_args
+        self.assertIsInstance(storage_key, RadixKey)
+        self.assertTrue(storage_key.is_bigram)
+        self.assertEqual(len(storage_key), len(tokens) - 1)
+
+        queried_hashes = []
+        running_hash = None
+        for start in range(0, len(storage_key), tree.page_size):
+            running_hash = get_hash_str(
+                storage_key[start : start + tree.page_size], running_hash
+            )
+            queried_hashes.append(running_hash)
+        self.assertEqual(queried_hashes, leaf.hash_value)
+
+        canonical_hashes = []
+        running_hash = None
+        for start in range(0, len(tokens) - 1, tree.page_size):
+            running_hash = get_hash_str(
+                tokens[start : start + tree.page_size], running_hash
+            )
+            canonical_hashes.append(running_hash)
+        self.assertNotEqual(canonical_hashes, leaf.hash_value)
 
 
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):

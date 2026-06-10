@@ -14,7 +14,6 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
@@ -30,6 +29,9 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
@@ -562,11 +564,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def init_mha_chunk_metadata(self, forward_batch: "ForwardBatch") -> None:
+    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             self.disable_chunked_prefix_cache and has_prefix
-        ) or is_in_piecewise_cuda_graph()
+        ) or is_in_tc_piecewise_cuda_graph()
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(
                 forward_batch, disable_flashinfer_ragged=True
@@ -627,7 +629,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             has_prefix = any(forward_batch.extend_prefix_lens_cpu)
             fallback_to_flashinfer_impl = (
                 self.disable_chunked_prefix_cache and has_prefix
-            ) or is_in_piecewise_cuda_graph()
+            ) or is_in_tc_piecewise_cuda_graph()
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 
@@ -789,7 +791,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return output[:total_tokens, :, :]
 
     def _compute_decode_bmm1_scale(self, layer: RadixAttention) -> float:
-        """BMM1 scale ``q_scale * k_scale * softmax_scale``. k_scale only
+        """BMM1 scale q_scale * k_scale * softmax_scale. k_scale only
         applies when the KV cache stores FP8."""
         q_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
@@ -867,7 +869,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
-        Returns the output tensor or ``(output, lse)`` if ``return_lse``."""
+        Returns the output tensor or (output, lse) if return_lse."""
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)

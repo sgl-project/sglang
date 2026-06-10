@@ -3,10 +3,16 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -621,9 +627,61 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
 
 
-class TestCutedslMoeMaxNumTokens(unittest.TestCase):
+class TestCudaGraphConfigDataclassAccess(CustomTestCase):
+    def test_overlap_force_cpu_seq_lens_with_tc_piecewise_prefill(self):
+        from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
+
+        server_args = SimpleNamespace(
+            enable_two_batch_overlap=False,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
+            ),
+        )
+        attn_backend = SimpleNamespace(needs_cpu_seq_lens=False)
+
+        self.assertTrue(decide_needs_cpu_seq_lens(server_args, [attn_backend]))
+
+    @patch(
+        "sglang.srt.model_executor.runner_backend."
+        "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
+    )
+    def test_tc_piecewise_build_config_reads_phase_config_dataclass(
+        self, mock_get_moe_a2a_backend
+    ):
+        from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+            TcPiecewiseCudaGraphBackend,
+        )
+
+        mock_backend = mock_get_moe_a2a_backend.return_value
+        mock_backend.is_deepep.return_value = False
+        mock_backend.is_mooncake.return_value = False
+        server_args = SimpleNamespace(
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(
+                    backend=Backend.TC_PIECEWISE,
+                    bs=[32, 64],
+                    tc_compiler="eager",
+                )
+            ),
+            enable_torch_compile_debug_mode=False,
+        )
+
+        config = TcPiecewiseCudaGraphBackend.build_compilation_config(server_args)
+
+        self.assertEqual(config.get_capture_sizes(), [32, 64])
+        self.assertEqual(config.compiler, "eager")
+
+
+class TestCutedslMoeMaxNumTokens(CustomTestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
-    to exercise the math independently of __post_init__ resolution."""
+    to exercise the math independently of __post_init__ resolution.
+
+    cg-refactor: the legacy disable_piecewise_cuda_graph /
+    piecewise_cuda_graph_max_tokens / cuda_graph_max_bs fields were
+    consolidated into cuda_graph_config; the helper accepts the legacy
+    kwarg names for test readability and translates them to the per-phase
+    dataclasses.
+    """
 
     def _args(self, **overrides):
         server_args = ServerArgs(model_path="dummy")
@@ -636,8 +694,21 @@ class TestCutedslMoeMaxNumTokens(unittest.TestCase):
             cuda_graph_max_bs=512,
         )
         fields.update(overrides)
+        disable_piecewise = fields.pop("disable_piecewise_cuda_graph")
+        piecewise_max = fields.pop("piecewise_cuda_graph_max_tokens")
+        cg_max_bs = fields.pop("cuda_graph_max_bs")
         for key, value in fields.items():
             setattr(server_args, key, value)
+        server_args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=cg_max_bs),
+            prefill=PhaseConfig(
+                backend=(
+                    Backend.DISABLED if disable_piecewise else Backend.TC_PIECEWISE
+                ),
+                max_bs=piecewise_max,
+                tc_compiler="eager",
+            ),
+        )
         return server_args
 
     def test_prefill_dominates_in_default_config(self):

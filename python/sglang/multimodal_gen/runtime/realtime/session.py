@@ -33,6 +33,7 @@ class RealtimeSession:
     def get_or_create_state(
         self, state_cls: type[BaseRealtimeState]
     ) -> BaseRealtimeState:
+        """returns the BaseRealtimeState instance hold by the current RealtimeSession"""
         state = self._states.get(state_cls)
         if state is None:
             state = state_cls()

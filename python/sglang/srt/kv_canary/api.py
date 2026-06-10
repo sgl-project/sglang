@@ -12,6 +12,11 @@ from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patcher.utils import wrap_method
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -32,10 +37,11 @@ def install_canary(
     if config.mode is CanaryMode.NONE:
         return None
 
-    assert server_args.disable_piecewise_cuda_graph, (
+    assert not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE), (
         "kv-canary: piecewise cuda graph is not supported by the current "
-        "SingleForwardManager design; pass --disable-piecewise-cuda-graph "
-        "when canary is enabled"
+        "SingleForwardManager design; set "
+        "--cuda-graph-backend-prefill=disabled (or =breakable) when canary "
+        "is enabled"
     )
 
     perturb_config = PerturbConfig.from_env()

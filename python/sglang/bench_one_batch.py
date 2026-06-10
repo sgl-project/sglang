@@ -65,7 +65,10 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import destroy_distributed_environment
+from sglang.srt.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+)
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
@@ -74,6 +77,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -936,11 +940,15 @@ def latency_test(
                 fout.write(json.dumps(result) + "\n")
 
     if server_args.tp_size > 1:
+        destroy_model_parallel()
         destroy_distributed_environment()
 
 
 def main(server_args, bench_args):
-    server_args.cuda_graph_max_bs = max(bench_args.batch_size)
+    # Post-init write to the legacy cuda_graph_max_bs_decode field would
+    # not propagate to cuda_graph_config; update the decode phase directly.
+    if server_args.cuda_graph_config is not None:
+        server_args.cuda_graph_config[Phase.DECODE].max_bs = max(bench_args.batch_size)
 
     _set_envs_and_config(server_args)
 
@@ -957,12 +965,17 @@ def main(server_args, bench_args):
 
     port_args = PortArgs.init_new(server_args)
 
+    # Calculate local ranks for multi-node setup
+    nranks_per_node = server_args.tp_size // server_args.nnodes
+    local_rank_start = server_args.node_rank * nranks_per_node
+    local_rank_end = local_rank_start + nranks_per_node
+
     if server_args.tp_size == 1:
         work_func(server_args, port_args, bench_args, 0, 0)
     else:
         workers = []
-        for tp_rank in range(server_args.tp_size):
-            with maybe_reindex_device_id(tp_rank) as gpu_id:
+        for tp_rank in range(local_rank_start, local_rank_end):
+            with maybe_reindex_device_id(tp_rank - local_rank_start) as gpu_id:
                 proc = multiprocessing.Process(
                     target=work_func,
                     args=(

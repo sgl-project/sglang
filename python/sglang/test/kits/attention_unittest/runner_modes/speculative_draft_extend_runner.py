@@ -1154,19 +1154,19 @@ def _capture_eagle_draft_extend_graph_runner(
 ) -> EAGLEDraftExtendCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.graph_capture",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_attention_cp_size",
+            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
             lambda: 1,
         ),
     ):

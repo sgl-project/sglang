@@ -95,6 +95,9 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
+    if scheduler._engine_paused:
+        ctx.continue_generation()
+
     ctx._release_exhausted_pools()
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):

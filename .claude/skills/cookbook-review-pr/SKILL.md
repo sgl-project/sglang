@@ -53,8 +53,8 @@ than restating.
   NVL72) — NOT every `multi-N` hw (standard-IB DeepEP / Marlin multi-node don't need it).
 - `github.cookbookModel` matches the issue-template `model` dropdown value.
 - `playgroundFeatures` axes are pruned to what the model supports — no empty/stub axes
-  (`megamoe` only on Blackwell MoE; `hisparse` only DSA-style; `pdDisagg.router` only with
-  a PD topology).
+  (the `moe` axis's MegaMoE backend option + `megamoeQuant` block only on Blackwell MoE,
+  gated by `requiresHw`; `hisparse` only DSA-style; `pdDisagg.router` only with a PD topology).
 - **No leftover `__TOKEN__`** — the config was stamped from the template and every
   placeholder is filled (`grep -rn '__[A-Z_]*__'` on the new config/benchmarks/MDX returns
   nothing).
