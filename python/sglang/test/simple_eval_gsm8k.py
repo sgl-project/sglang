@@ -107,20 +107,32 @@ class GSM8KEval(Eval):
     def _build_prefix(self, idx: int) -> str:
         return self._few_shot_prompt
 
-    def _use_chat_mode_instruction(self, sampler: SamplerBase) -> bool:
+    def _chat_prompt_style(self, sampler: SamplerBase) -> Optional[str]:
         if not isinstance(sampler, ChatCompletionSampler):
-            return False
+            return None
         model = (sampler.model or "").lower()
-        return "mistral" in model or "mixtral" in model
+        if "gemma" in model:
+            return None
+        if "mistral" in model or "mixtral" in model:
+            return "explicit_answer"
+        return "wrapped_raw"
 
     def _build_prompt(self, idx: int, question: str, sampler: SamplerBase) -> str:
         prefix = self._build_prefix(idx)
-        if self._use_chat_mode_instruction(sampler):
+        prompt_style = self._chat_prompt_style(sampler)
+        if prompt_style == "explicit_answer":
             return (
                 CHAT_MODE_INSTRUCTION
                 + self._chat_few_shot_prompt
                 + "Now solve this problem:\n\n"
                 + f"Question: {self._lines[idx]['question']}"
+            )
+        if prompt_style == "wrapped_raw":
+            return (
+                CHAT_MODE_INSTRUCTION
+                + prefix
+                + "Now solve this problem:\n\n"
+                + question
             )
         return prefix + question
 
