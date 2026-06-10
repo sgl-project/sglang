@@ -115,6 +115,59 @@ struct cumsum_kernel<float, CHUNK_SIZE, BLOCK_H> {
 };
 #endif
 
+template <typename scalar_t, int CHUNK_SIZE>
+struct decay_mask_kernel {
+  static inline void apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input) {
+    TORCH_CHECK(false, "decay_mask_kernel: scalar path not implemented!");
+  }
+};
+
+#if defined(CPU_CAPABILITY_AVX512)
+template <int CHUNK_SIZE>
+struct decay_mask_kernel<float, CHUNK_SIZE> {
+  static inline void apply(float* __restrict__ out, const float* __restrict__ input) {
+    static_assert(CHUNK_SIZE % 16 == 0);
+
+    constexpr int ROWS = CHUNK_SIZE;
+    constexpr int COLS = CHUNK_SIZE / 16;
+
+    __m512 va;
+    __m512 vb[COLS];
+    __m512 vc;
+
+    // step 1: load g[j]
+    auto loadb = [&](auto i) { vb[i] = _mm512_loadu_ps(input + i * 16); };
+    Unroll<COLS>{}(loadb);
+
+    // step2: exp(g[i] - g[j])
+    auto compute = [&](auto i) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+
+      if constexpr (col == 0) {
+        va = _mm512_set1_ps(input[row]);
+      }
+
+      // mask vb[col] (already loaded in step 1) for the lower-triangular region
+      constexpr int len = std::max(0, std::min(row + 1 - col * 16, 16));
+
+      if constexpr (len == 16) {
+        vc = _mm512_fexp_u20_ps(va - vb[col]);
+      } else if constexpr (len == 0) {
+        vc = _mm512_setzero_ps();
+      } else {
+        vc = _mm512_fexp_u20_ps(va - vb[col]);
+        // do mask for vc
+        constexpr __mmask16 vmask = (1 << len) - 1;
+        vc = _mm512_mask_blend_ps(vmask, _mm512_setzero_ps(), vc);
+      }
+      _mm512_storeu_ps(out + row * CHUNK_SIZE + col * 16, vc);
+    };
+    Unroll<ROWS * COLS>{}(compute);
+  }
+};
+#endif
+
 // template head_dim here to reduce extra read
 //   * normal approach: read inputs 2 times:
 //     - reduce: 1R
@@ -169,7 +222,6 @@ void chunk_local_cumsum_kernel_impl(
     const scalar_t* __restrict__ g,
     const int32_t* __restrict__ cu_seqlens,
     const int32_t* __restrict__ chunk_indices,
-    int64_t T,
     int64_t Hv,
     int64_t NT) {
   constexpr int BLOCK_H = 16;
@@ -191,11 +243,58 @@ void chunk_local_cumsum_kernel_impl(
 
       const scalar_t* __restrict__ g_ptr = g + (batch_offset + mb_start) * Hv + hb * BLOCK_H;
       scalar_t* __restrict__ gsum_ptr = g_ + nt * (Hv * CHUNK_SIZE) + hb * (BLOCK_H * CHUNK_SIZE);
-
       cumsum_kernel<scalar_t, CHUNK_SIZE, BLOCK_H>::apply(gsum_ptr, g_ptr, mb_size, Hv, CHUNK_SIZE);
 
       // move to the next index
       data_index_step(nt, NT, hb, HB);
+    }
+  });
+}
+
+// w : [B, T, Hv, D]
+// u : [B, T, Hv, Dv]
+// d : [B, NT, Hv, C, C]
+// k : [B, T, H, D]
+// v : [B, T, Hv, Dv]
+// g : [B, NT, Hv, C]
+// beta : [B, T, Hv]
+// cu_seqlens : [num_seqs + 1]
+// chunk_indices : [NT * 2]
+template <typename scalar_t, int CHUNK_SIZE>
+void chunk_gated_delta_rule_fwd_intra_kernel_impl(
+    scalar_t* __restrict__ w,
+    scalar_t* __restrict__ u,
+    float* __restrict__ d,
+    const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v,
+    const float* __restrict__ g,
+    const scalar_t* __restrict__ beta,
+    const int32_t* __restrict__ cu_seqlens,
+    const int32_t* __restrict__ chunk_indices,
+    int64_t H,
+    int64_t Hv,
+    int64_t D,
+    int64_t Dv,
+    int64_t NT) {
+  // parallel on [NT, Hv]
+  at::parallel_for(0, NT * Hv, 0, [&](int64_t begin, int64_t end) {
+    int64_t nt{0}, hv{0};
+    data_index_init(begin, nt, NT, hv, Hv);
+
+    for (int64_t i = begin; i < end; ++i) {
+      int32_t bs = chunk_indices[nt * 2 + 0];
+      int32_t batch_offset = cu_seqlens[bs];
+      int32_t seqlen = cu_seqlens[bs + 1] - cu_seqlens[bs];
+      int64_t mb_start = chunk_indices[nt * 2 + 1] * CHUNK_SIZE;
+      int64_t mb_size = std::min(seqlen - mb_start, int64_t(CHUNK_SIZE));
+
+      // step 1: compute decay mask
+      const float* __restrict__ g_ptr = g + nt * (Hv * CHUNK_SIZE) + hv * CHUNK_SIZE;
+      float* __restrict__ d_ptr = d + nt * (Hv * CHUNK_SIZE * CHUNK_SIZE) + hv * (CHUNK_SIZE * CHUNK_SIZE);
+      decay_mask_kernel<float, CHUNK_SIZE>::apply(d_ptr, g_ptr);
+
+      // move to the next index
+      data_index_step(nt, NT, hv, Hv);
     }
   });
 }
@@ -1335,18 +1434,15 @@ at::Tensor l2norm(const at::Tensor& x, double eps, bool has_scale) {
   return out.to(x.scalar_type());
 }
 
+// [NB]: instantiate decay_mask to avoid heavy recomputation in the kernel with exp
 template <int CHUNK_SIZE>
 at::Tensor chunk_local_cumsum(const at::Tensor& g, const at::Tensor& cu_seqlens, const at::Tensor& chunk_indices) {
   int64_t B = g.size(0);
-  int64_t T = g.size(1);
+  // int64_t T = g.size(1);
   int64_t Hv = g.size(2);
   int64_t NT = chunk_indices.size(0);
 
   std::cout << "### chunk_local_cumsum" << std::endl;
-  std::cout << "### B: " << B << std::endl;
-  std::cout << "### Hv: " << Hv << std::endl;
-  std::cout << "### NT: " << NT << std::endl;
-  std::cout << "### CHUNK_SIZE: " << CHUNK_SIZE << std::endl;
 
   at::Tensor g_ = at::empty({B, NT, Hv, CHUNK_SIZE}, g.options());
   AT_DISPATCH_FLOATING_TYPES(g.scalar_type(), "chunk_local_cumsum", [&] {
@@ -1355,7 +1451,6 @@ at::Tensor chunk_local_cumsum(const at::Tensor& g, const at::Tensor& cu_seqlens,
         g.data_ptr<scalar_t>(),
         cu_seqlens.data_ptr<int32_t>(),
         chunk_indices.data_ptr<int32_t>(),
-        T,
         Hv,
         NT);
   });
@@ -1399,6 +1494,61 @@ at::Tensor cumsum(const at::Tensor& g, const at::Tensor& cu_seqlens, int chunk_s
     outputs.push_back(cumsum(g.narrow(1, start, end - start), chunk_size));
   }
   return at::cat(outputs, 2).transpose_(1, 2);
+}
+
+// TODO: debug code remove me!!!
+// Reference for decay_mask on chunked local cumsum g.
+// Matches test_mamba.py: ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+// on g with shape [B, NT, Hv, chunk_size], returning [B, NT, Hv, chunk_size, chunk_size].
+at::Tensor decay_mask_ref(const at::Tensor& g, int chunk_size) {
+  TORCH_CHECK(g.dim() == 4, "decay_mask: expect g with shape [B, NT, Hv, chunk_size]");
+  TORCH_CHECK(chunk_size > 0, "decay_mask: chunk_size must be positive");
+  TORCH_CHECK(g.size(-1) == chunk_size, "decay_mask: g last dim must equal chunk_size");
+
+  auto gf = g.to(at::kFloat);
+  return (gf.unsqueeze(-1) - gf.unsqueeze(-2)).tril().exp().tril();
+}
+
+template <int CHUNK_SIZE>
+std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_intra(
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& g,
+    const at::Tensor& beta,
+    const at::Tensor& cu_seqlens,
+    const at::Tensor& chunk_indices) {
+  int64_t B = k.size(0);
+  int64_t T = k.size(1);
+  int64_t H = k.size(2);
+  int64_t D = k.size(3);
+  int64_t Hv = v.size(2);
+  int64_t Dv = v.size(3);
+  int64_t NT = chunk_indices.size(0);
+
+  std::cout << "\n### chunk_gated_delta_rule_fwd_intra ..." << std::endl;
+
+  at::Tensor w = at::empty({B, T, Hv, D}, k.options());                                 // BFloat16
+  at::Tensor u = at::empty({B, T, Hv, Dv}, k.options());                                // BFloat16
+  at::Tensor decay_mask = at::empty({B, NT, Hv, CHUNK_SIZE, CHUNK_SIZE}, g.options());  // Float
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(k.scalar_type(), "chunk_gated_delta_rule_fwd_intra", [&] {
+    chunk_gated_delta_rule_fwd_intra_kernel_impl<scalar_t, CHUNK_SIZE>(
+        w.data_ptr<scalar_t>(),
+        u.data_ptr<scalar_t>(),
+        decay_mask.data_ptr<float>(),
+        k.data_ptr<scalar_t>(),
+        v.data_ptr<scalar_t>(),
+        g.data_ptr<float>(),
+        beta.data_ptr<scalar_t>(),
+        cu_seqlens.data_ptr<int32_t>(),
+        chunk_indices.data_ptr<int32_t>(),
+        H,
+        Hv,
+        D,
+        Dv,
+        NT);
+  });
+
+  return std::make_tuple(w, u, decay_mask);
 }
 
 // [NB]: Support only varlen inputs
@@ -1476,6 +1626,22 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
               << std::endl;
     // std::cout << "### g_ref[0][0]: " << g_ref[0][0].view({-1, CHUNK_SIZE}) << std::endl;
     // std::cout << "### g_[0][0]: " << g_[0][0].view({-1, CHUNK_SIZE}) << std::endl;
+  }
+
+  // fused kkt + solve_tril + recompute_w_u
+  auto [w, u, decay_mask] =
+      chunk_gated_delta_rule_fwd_intra<CHUNK_SIZE>(key, value, g_, beta, cu_seqlens, chunk_indices);
+
+  if (debug) {
+    auto decay_mask2 = decay_mask_ref(g_, CHUNK_SIZE);
+    auto decay_mask_f = decay_mask.to(at::kFloat);
+    auto decay_mask2_f = decay_mask2.to(at::kFloat);
+    // fexp_u20 vs torch.exp: use relaxed rtol/atol (same spirit as torch.allclose)
+    constexpr double rtol = 1e-3;
+    constexpr double atol = 1e-2;
+    const bool decay_mask_ok = at::allclose(decay_mask_f, decay_mask2_f, rtol, atol);
+    std::cout << "### check decay_mask allclose: " << (decay_mask_ok ? "true" : "false") << " (rtol=" << rtol
+              << ", atol=" << atol << ")" << std::endl;
   }
 
   at::Tensor output = at::empty_like(value, value.options());  // [B, T, Hv, Dv]
