@@ -1238,7 +1238,11 @@ async def benchmark(
 
     # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
     # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
-    first_prompt = getattr(input_requests[0], "prompt", None)
+    first_prompt = (
+        input_requests[0].get("prompt")
+        if isinstance(input_requests[0], dict)
+        else getattr(input_requests[0], "prompt", "")
+    )
     is_multi_turn = (
         isinstance(first_prompt, list)
         and bool(first_prompt)
