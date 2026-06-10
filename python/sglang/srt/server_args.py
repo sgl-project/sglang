@@ -727,7 +727,6 @@ class ServerArgs:
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
-    cuda_graph_cache_dir: Optional[str] = None
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -6439,16 +6438,6 @@ class ServerArgs:
             "When enabled, graph breaks are inserted so every operation runs eagerly "
             "while still going through the CUDA graph capture / replay path. "
             "Useful for debugging CUDA graph capture / replay issues.",
-        )
-        parser.add_argument(
-            "--cuda-graph-cache-dir",
-            type=str,
-            default=None,
-            help="Directory to cache CUDA graph metadata for fast restart. "
-            "On first start, graph metadata is serialized to this directory. "
-            "On subsequent starts, graphs are reconstructed from cache, "
-            "skipping the warmup + capture forward passes. "
-            "Set to empty string or 'none' to disable.",
         )
         parser.add_argument(
             "--enable-layerwise-nvtx-marker",

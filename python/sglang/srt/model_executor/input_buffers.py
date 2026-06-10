@@ -14,24 +14,6 @@ _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
 @dataclass
 class ForwardInputBuffers:
 
-    def named_buffers(self):
-        """Yield (name, tensor) pairs for all tensor fields in this dataclass."""
-        for f in fields(self):
-            name = f.name
-            buffer = getattr(self, name)
-            if buffer is None:
-                continue
-            if dataclasses.is_dataclass(buffer):
-                for sub_name, sub_buffer in vars(buffer).items():
-                    if isinstance(sub_buffer, torch.Tensor):
-                        yield f"{name}.{sub_name}", sub_buffer
-            elif isinstance(buffer, dict):
-                for sub_name, sub_buffer in buffer.items():
-                    if isinstance(sub_buffer, torch.Tensor):
-                        yield f"{name}.{sub_name}", sub_buffer
-            elif isinstance(buffer, torch.Tensor):
-                yield name, buffer
-
     def _share_one_buffer(self, name: str, new_buffer: torch.Tensor) -> torch.Tensor:
 
         buffer_size = new_buffer.size()

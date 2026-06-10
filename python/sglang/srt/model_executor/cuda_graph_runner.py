@@ -85,24 +85,6 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 try:
-    from sglang.srt.model_executor.cuda_graph_inspector import (
-        BufferAddressRegistry,
-        CUFunctionRegistry,
-        GraphMetadata,
-        inspect_cuda_graph,
-    )
-    from sglang.srt.model_executor.cuda_graph_serializer import (
-        GraphCacheKey,
-        load_graph_cache,
-        reconstruct_cuda_graph,
-        save_graph_cache,
-    )
-
-    _CUDA_GRAPH_CACHE_AVAILABLE = True
-except ImportError:
-    _CUDA_GRAPH_CACHE_AVAILABLE = False
-
-try:
     from kt_kernel import KTMoEWrapper
 
     KTRANSFORMERS_AVAILABLE = True
@@ -788,11 +770,6 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-        # CUDA graph cache for fast restart
-        self.cuda_graph_cache_dir = model_runner.server_args.cuda_graph_cache_dir
-        self._graph_cache_hits = 0
-        self._graph_cache_misses = 0
-
         # Capture
         try:
             with model_capture_mode():
@@ -911,10 +888,6 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
-        # Try to load cached graphs first (fast restart path)
-        if _CUDA_GRAPH_CACHE_AVAILABLE and self.cuda_graph_cache_dir:
-            self._try_load_all_from_cache()
-
         def _capture_one_stream(stream_idx: Optional[int] = None):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
@@ -928,15 +901,6 @@ class CudaGraphRunner:
                 else reversed(self.capture_bs)
             )
             for i, bs in enumerate(capture_range):
-                # Skip capture if graph was loaded from cache
-                key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-                if key in self.graphs:
-                    if get_tensor_model_parallel_rank() == 0:
-                        capture_range.set_description(
-                            f"Loaded from cache ({bs=})"
-                        )
-                    continue
-
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
                         self.model_runner.device,
@@ -1021,14 +985,7 @@ class CudaGraphRunner:
             if _is_hip:
                 raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
             return BreakableCUDAGraph()
-        # Use keep_graph=True when caching is enabled so we can inspect
-        # the graph nodes for serialization after capture.
-        keep_graph = (
-            _CUDA_GRAPH_CACHE_AVAILABLE
-            and bool(self.cuda_graph_cache_dir)
-            and not envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get()
-        )
-        return torch.cuda.CUDAGraph(keep_graph=keep_graph)
+        return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
         self, bs: int, forward: Callable, stream_idx: Optional[int] = None
@@ -1246,9 +1203,6 @@ class CudaGraphRunner:
                     graph, get_global_graph_memory_pool(), stream, run_once
                 )
 
-        # Save graph metadata to cache if caching is enabled
-        self._save_to_cache(bs, graph, stream_idx)
-
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
@@ -1282,155 +1236,6 @@ class CudaGraphRunner:
         if self.capture_hidden_mode != required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
-
-    def _try_load_all_from_cache(self):
-        """Try to load all batch size graphs from disk cache.
-
-        For each batch size, attempts to reconstruct the graph from cache.
-        Successfully loaded graphs are stored in self.graphs and skip normal capture.
-        """
-        if not _CUDA_GRAPH_CACHE_AVAILABLE or not self.cuda_graph_cache_dir:
-            return
-
-        loaded = 0
-        for bs in self.capture_bs:
-            try:
-                graph = self._try_load_from_cache(bs)
-                if graph is not None:
-                    key = bs  # PDMux not supported for cache yet
-                    self.graphs[key] = graph
-                    # Output buffers not available for cached graphs;
-                    # they will be set during first replay.
-                    # TODO: serialize output_buffers layout
-                    loaded += 1
-            except Exception as e:
-                logger.debug(f"Cache load failed for bs={bs}: {e}")
-
-        if loaded > 0:
-            log_info_on_rank0(
-                logger,
-                f"Loaded {loaded}/{len(self.capture_bs)} CUDA graphs from cache "
-                f"(dir={self.cuda_graph_cache_dir})",
-            )
-
-    def _try_load_from_cache(
-        self, bs: int, stream_idx: Optional[int] = None
-    ) -> Optional[Any]:
-        """Try to reconstruct a CUDA graph from disk cache.
-
-        Returns a graph object (torch.cuda.CUDAGraph or _ReconstructedCUDAGraph)
-        if cache hit and reconstruction succeeds, None otherwise.
-        """
-        if not _CUDA_GRAPH_CACHE_AVAILABLE or not self.cuda_graph_cache_dir:
-            return None
-
-        try:
-            import hashlib
-
-            # Build cache key
-            model_hash = hashlib.md5(
-                str(self.model_runner.model_config.model_path).encode()
-            ).hexdigest()[:16]
-            cache_key = GraphCacheKey(
-                model_hash=model_hash,
-                batch_size=bs,
-                num_tokens_per_bs=self.num_tokens_per_bs,
-                capture_hidden_mode=self.capture_hidden_mode.name,
-                device_name=torch.cuda.get_device_name(),
-                cuda_driver_version=torch.cuda.driver_version(),
-                compute_capability=torch.cuda.get_device_capability(),
-            )
-
-            cached = load_graph_cache(cache_key, self.cuda_graph_cache_dir)
-            if cached is None:
-                self._graph_cache_misses += 1
-                return None
-
-            # Build current address registry
-            address_registry = BufferAddressRegistry()
-            if self.buffers is not None:
-                for name, tensor in self.buffers.named_buffers():
-                    if tensor is not None and tensor.is_cuda:
-                        address_registry.register_buffer(name, tensor)
-
-            # Register model weights
-            address_registry.register_model_weights(self.model_runner.model)
-
-            # Reconstruct the graph
-            func_registry = get_global_registry()
-            graph = reconstruct_cuda_graph(cached, address_registry, func_registry)
-
-            if graph is not None:
-                self._graph_cache_hits += 1
-                log_info_on_rank0(
-                    logger,
-                    f"CUDA graph cache hit for bs={bs} "
-                    f"(hits={self._graph_cache_hits}, misses={self._graph_cache_misses})",
-                )
-            else:
-                self._graph_cache_misses += 1
-
-            return graph
-
-        except Exception as e:
-            logger.warning(f"CUDA graph cache load failed for bs={bs}: {e}")
-            self._graph_cache_misses += 1
-            return None
-
-    def _save_to_cache(
-        self,
-        bs: int,
-        graph: torch.cuda.CUDAGraph,
-        stream_idx: Optional[int] = None,
-    ):
-        """Serialize a captured CUDA graph's metadata to disk cache."""
-        if not _CUDA_GRAPH_CACHE_AVAILABLE or not self.cuda_graph_cache_dir:
-            return
-
-        try:
-            import hashlib
-
-            # Build cache key
-            model_hash = hashlib.md5(
-                str(self.model_runner.model_config.model_path).encode()
-            ).hexdigest()[:16]
-            cache_key = GraphCacheKey(
-                model_hash=model_hash,
-                batch_size=bs,
-                num_tokens_per_bs=self.num_tokens_per_bs,
-                capture_hidden_mode=self.capture_hidden_mode.name,
-                device_name=torch.cuda.get_device_name(),
-                cuda_driver_version=torch.cuda.driver_version(),
-                compute_capability=torch.cuda.get_device_capability(),
-            )
-
-            # Build address registry for the current capture
-            address_registry = BufferAddressRegistry()
-            if self.buffers is not None:
-                for name, tensor in self.buffers.named_buffers():
-                    if tensor is not None and tensor.is_cuda:
-                        address_registry.register_buffer(name, tensor)
-            address_registry.register_model_weights(self.model_runner.model)
-
-            # Inspect the graph (requires keep_graph=True)
-            func_registry = get_global_registry()
-            metadata = inspect_cuda_graph(
-                graph,
-                known_buffers=address_registry.get_known_buffers(),
-                known_weights=address_registry.get_known_weights(),
-                registry=func_registry,
-            )
-
-            # Save to disk
-            save_graph_cache(metadata, cache_key, self.cuda_graph_cache_dir)
-            log_info_on_rank0(
-                logger,
-                f"Saved CUDA graph cache for bs={bs} "
-                f"({metadata.num_nodes} nodes)",
-            )
-
-        except Exception as e:
-            logger.warning(f"CUDA graph cache save failed for bs={bs}: {e}")
 
     def replay_prepare(
         self,
