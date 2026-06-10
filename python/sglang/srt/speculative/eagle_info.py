@@ -10,6 +10,28 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    create_extend_after_decode_spec_info,
+)
+from sglang.srt.utils import is_cpu, is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+
+_is_cpu = is_cpu()
+
+if is_cuda() or is_musa():
+    from sgl_kernel import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+        tree_speculative_sampling_target_only,
+    )
+elif _is_cpu:
+    from sgl_kernel import (
+        align_evict_mask_to_page_size_cpu,
+        create_extend_after_decode_spec_info_cpu,
+        create_flashinfer_kv_indices_cpu,
+        get_target_cache_loc_cpu,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +46,90 @@ def _draft_runner_of(worker):
     return (
         worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
     )
+
+
+def _create_flashinfer_kv_indices(
+    req_to_token,
+    req_pool_indices,
+    paged_kernel_lens,
+    cum_kv_seq_len,
+    kv_start_idx,
+    kv_indices,
+    req_to_token_stride,
+    batch_size,
+):
+    if _is_cpu:
+        create_flashinfer_kv_indices_cpu(
+            req_to_token,
+            req_pool_indices.to(torch.int32),
+            paged_kernel_lens.to(torch.int32),
+            cum_kv_seq_len.to(torch.int32),
+            kv_start_idx.to(torch.int32) if kv_start_idx is not None else kv_start_idx,
+            kv_indices,
+            req_to_token_stride,
+        )
+    else:
+        create_flashinfer_kv_indices_triton[(batch_size,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            cum_kv_seq_len,
+            kv_start_idx,
+            kv_indices,
+            req_to_token_stride,
+        )
+
+
+def _create_extend_after_decode_spec_info(
+    input_ids,
+    seq_lens,
+    accept_length,
+    positions,
+    verified_id,
+    bs_upper,
+    batch_size,
+):
+    if _is_cpu:
+        create_extend_after_decode_spec_info_cpu(
+            input_ids.to(torch.int32),
+            seq_lens.to(torch.int32),
+            accept_length.to(torch.int32),
+            positions,
+            verified_id,
+            bs_upper,
+        )
+    else:
+        create_extend_after_decode_spec_info[(batch_size,)](
+            input_ids,
+            seq_lens,
+            accept_length,
+            positions,
+            verified_id,
+            bs_upper,
+        )
+
+
+def _align_evict_mask_to_page_size(
+    seq_lens,
+    evict_mask,
+    page_size: int,
+    num_draft_tokens: int,
+):
+    if _is_cpu:
+        align_evict_mask_to_page_size_cpu(
+            seq_lens.to(torch.int32),
+            evict_mask,
+            page_size,
+            num_draft_tokens,
+        )
+    else:
+        align_evict_mask_to_page_size[(seq_lens.shape[0],)](
+            seq_lens,
+            evict_mask,
+            page_size,
+            num_draft_tokens,
+            next_power_of_2(num_draft_tokens),
+        )
 
 
 @dataclass
@@ -69,18 +175,19 @@ class EagleVerifyInput(SpecInput):
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+        device = "cpu" if _is_cpu else "cuda"
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
             retrieve_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_cum_len=None,
             topk=topk,
@@ -119,7 +226,7 @@ class EagleVerifyInput(SpecInput):
             dtype=torch.int32,
             device=device,
         )
-        create_flashinfer_kv_indices_triton[(batch_size,)](
+        _create_flashinfer_kv_indices(
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
@@ -127,6 +234,7 @@ class EagleVerifyInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
+            batch_size,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -385,6 +493,43 @@ class EagleDraftExtendInput(SpecInput):
             capture_hidden_mode=capture_hidden_mode,
         )
 
+    def prepare_extend_after_decode(
+        self,
+        batch: ScheduleBatch,
+        speculative_num_steps: int,
+    ):
+        # Caller must have installed `self` as `batch.spec_info` before calling.
+        assert batch.spec_info is self
+        if batch.forward_mode.is_idle():
+            return
+
+        # The kernel below populates `self.positions` and `self.bonus_tokens`;
+        # the worker reads `self.bonus_tokens` to construct next iter's
+        # `EagleDraftInput`.
+        batch.input_ids = self.input_ids
+        batch.extend_lens = self.num_accept_tokens_cpu
+        batch.extend_num_tokens = sum(batch.extend_lens)
+        batch.seq_lens = self.seq_lens
+        batch.seq_lens_cpu = self.seq_lens_cpu
+        batch.req_pool_indices = self.req_pool_indices
+        batch.return_logprob = False
+        batch.return_hidden_states = False
+
+        self.capture_hidden_mode = CaptureHiddenMode.LAST
+        self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
+        self.bonus_tokens = torch.empty_like(self.num_accept_tokens, dtype=torch.int32)
+
+        _create_extend_after_decode_spec_info(
+            batch.input_ids,
+            batch.seq_lens,
+            self.num_accept_tokens,
+            self.positions,
+            self.bonus_tokens,
+            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
+            len(batch.seq_lens),
+        )
+
+
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
@@ -406,7 +551,7 @@ class EagleDraftExtendInput(SpecInput):
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
 
-        create_flashinfer_kv_indices_triton[(bs,)](
+        _create_flashinfer_kv_indices(
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
@@ -414,5 +559,6 @@ class EagleDraftExtendInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
+            bs,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None

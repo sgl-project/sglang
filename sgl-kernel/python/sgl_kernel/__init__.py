@@ -112,11 +112,25 @@ else:
         top_p_renorm_prob,
     )
     from sgl_kernel.speculative import (
+        align_evict_mask_to_page_size_cpu,
+        assign_draft_cache_locs_page_size_1_cpu,
+        assign_extend_cache_locs_cpu,
+        assign_new_state_cpu,
+        assign_req_to_token_pool_cpu,
+        build_draft_decode_metadata_cpu,
         build_tree_kernel_efficient,
+        build_tree_kernel_efficient_cpu,
+        create_extend_after_decode_spec_info_cpu,
+        create_flashinfer_kv_indices_cpu,
+        fill_accepted_out_cache_loc_cpu,
+        fill_new_verified_id_cpu,
+        get_target_cache_loc_cpu,
         reconstruct_indices_from_tree_mask,
+        rotate_input_ids_cpu,
         segment_packbits,
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
+        verify_tree_greedy_cpu,
     )
     from sgl_kernel.top_k import (
         fast_topk,

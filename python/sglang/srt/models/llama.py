@@ -784,7 +784,7 @@ class LlamaForCausalLM(nn.Module):
         if _is_xpu:
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
-        else:
+        elif torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
@@ -803,7 +803,7 @@ class LlamaForCausalLM(nn.Module):
         if _is_xpu:
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
-        else:
+        elif torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 

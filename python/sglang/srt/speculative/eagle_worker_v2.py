@@ -60,7 +60,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
+from sglang.srt.speculative.eagle_info_v2 import fill_new_verified_id_func
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
@@ -92,6 +92,7 @@ from sglang.srt.utils.common import (
     empty_context,
     fast_topk,
     get_available_gpu_memory,
+    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
@@ -100,6 +101,7 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -343,7 +345,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+        if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
         if self.server_args.model_impl == "mindspore":
@@ -1333,16 +1335,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.speculative_num_draft_tokens,
         )
 
+        if _is_cpu:
+            verify_done = None
+        else:
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
+
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1]
             # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-            fill_bonus_tokens[(bs,)](
+            fill_new_verified_id_func(
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,
                 accept_index.shape[1],
+                bs,
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)

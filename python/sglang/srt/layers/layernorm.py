@@ -768,7 +768,11 @@ class GemmaRMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if _is_cpu_amx_available:
+            if not x.is_contiguous():
+                x = x.contiguous()
             if residual is not None:
+                if not residual.is_contiguous():
+                    residual = residual.contiguous()
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
                 torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(

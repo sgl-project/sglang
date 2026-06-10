@@ -505,14 +505,20 @@ def register_fake_ops(tp_size: int):
         use_qk_l2norm_in_kernel,
         softplus_beta=1.0,
         softplus_threshold=20.0,
+        is_kda=False,
+        disable_state_update=False,
+        intermediate_states_buffer=None,
+        intermediate_state_indices=None,
+        cache_steps=0,
+        retrieve_parent_token=None,
     ):
         assert q.dim() == 4
         assert v.dim() == 4
-        batch_size = q.shape[1]
         seq_len = q.shape[0]
+        batch_size = q.shape[1]
         v_num_heads = v.shape[2]
         v_head_dim = v.shape[3]
-        return q.new_empty(batch_size, seq_len, v_num_heads, v_head_dim)
+        return q.new_empty(seq_len, batch_size, v_num_heads, v_head_dim)
 
     @register_cpu_compile_fake("fused_gdn_gating_cpu")
     def _(A_log, a, b, dt_bias):

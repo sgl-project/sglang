@@ -75,9 +75,41 @@ def causal_conv1d_fn_cpu(
     )
 
 
-def causal_conv1d_update_cpu(
-    mixed_qkv, conv_states, conv_weights, bias, activation, conv_state_indices
+def _build_retrieve_parent_token(
+    retrieve_next_token, retrieve_next_sibling, retrieve_parent_token
 ):
+    bs, seqlen = retrieve_next_token.shape
+    rnt = retrieve_next_token
+    rns = retrieve_next_sibling
+    rpt = retrieve_parent_token
+    rpt.zero_()
+    for n in range(bs):
+        for t in range(seqlen):
+            child = rnt[n, t].item()
+            if child >= 0 and child < seqlen:
+                rpt[n, child] = t
+            sibling = rns[n, t].item()
+            if sibling >= 0 and sibling < seqlen:
+                rpt[n, sibling] = rpt[n, t].item()
+
+
+def causal_conv1d_update_cpu(
+    mixed_qkv,
+    conv_states,
+    conv_weights,
+    bias,
+    activation,
+    conv_state_indices,
+    intermediate_conv_window=None,
+    intermediate_state_indices=None,
+    retrieve_next_token=None,
+    retrieve_next_sibling=None,
+    retrieve_parent_token=None,
+):
+    if retrieve_next_token is not None and retrieve_parent_token is not None:
+        _build_retrieve_parent_token(
+            retrieve_next_token, retrieve_next_sibling, retrieve_parent_token
+        )
     return torch.ops.sgl_kernel.causal_conv1d_update_cpu(
         mixed_qkv,
         conv_states,
@@ -88,6 +120,8 @@ def causal_conv1d_update_cpu(
         conv_state_indices,
         -1,
         True,
+        intermediate_conv_window,
+        intermediate_state_indices,
     )
 
 
