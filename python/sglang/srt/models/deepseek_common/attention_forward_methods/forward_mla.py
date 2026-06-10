@@ -27,10 +27,10 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
-from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
-from sglang.srt.model_executor.breakable_cuda_graph.context import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     call_with_graph_break,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
