@@ -49,6 +49,34 @@ def _copy_seq_lens(
     return [list(seq_lens) for seq_lens in value]
 
 
+_TEXT_CACHE_TENSOR_LIST_FIELDS = (
+    "prompt_embeds",
+    "pooled_embeds",
+    "prompt_attention_mask",
+    "prompt_embeds_mask",
+    "negative_prompt_embeds",
+    "neg_pooled_embeds",
+    "negative_attention_mask",
+    "negative_prompt_embeds_mask",
+)
+_TEXT_CACHE_SEQ_LENS_FIELDS = (
+    "prompt_seq_lens",
+    "negative_prompt_seq_lens",
+)
+_TEXT_CACHE_FIELDS = _TEXT_CACHE_TENSOR_LIST_FIELDS + _TEXT_CACHE_SEQ_LENS_FIELDS
+_TEXT_CACHE_DEFAULT_EMPTY_LIST_FIELDS = {
+    "prompt_embeds",
+    "pooled_embeds",
+    "neg_pooled_embeds",
+}
+
+
+def _copy_text_cache_field(name: str, value):
+    if name in _TEXT_CACHE_SEQ_LENS_FIELDS:
+        return _copy_seq_lens(value)
+    return _copy_tensor_list(value)
+
+
 class RealtimeTextState(BaseRealtimeState):
     def __init__(self):
         super().__init__()
@@ -66,16 +94,8 @@ class RealtimeTextState(BaseRealtimeState):
 
     def clear_text_cache(self):
         self.cache_key = None
-        self.prompt_embeds = None
-        self.pooled_embeds = None
-        self.prompt_attention_mask = None
-        self.prompt_embeds_mask = None
-        self.prompt_seq_lens = None
-        self.negative_prompt_embeds = None
-        self.neg_pooled_embeds = None
-        self.negative_attention_mask = None
-        self.negative_prompt_embeds_mask = None
-        self.negative_prompt_seq_lens = None
+        for field in _TEXT_CACHE_FIELDS:
+            setattr(self, field, None)
 
     def dispose(self):
         super().dispose()
@@ -97,33 +117,16 @@ class RealtimeTextEncodingStage(TextEncodingStage):
         )
 
     def _restore_cached_outputs(self, batch: Req, state: RealtimeTextState) -> Req:
-        batch.prompt_embeds = _copy_tensor_list(state.prompt_embeds) or []
-        batch.pooled_embeds = _copy_tensor_list(state.pooled_embeds) or []
-        batch.prompt_attention_mask = _copy_tensor_list(state.prompt_attention_mask)
-        batch.prompt_embeds_mask = _copy_tensor_list(state.prompt_embeds_mask)
-        batch.prompt_seq_lens = _copy_seq_lens(state.prompt_seq_lens)
-        batch.negative_prompt_embeds = _copy_tensor_list(state.negative_prompt_embeds)
-        batch.neg_pooled_embeds = _copy_tensor_list(state.neg_pooled_embeds) or []
-        batch.negative_attention_mask = _copy_tensor_list(state.negative_attention_mask)
-        batch.negative_prompt_embeds_mask = _copy_tensor_list(
-            state.negative_prompt_embeds_mask
-        )
-        batch.negative_prompt_seq_lens = _copy_seq_lens(state.negative_prompt_seq_lens)
+        for field in _TEXT_CACHE_FIELDS:
+            value = _copy_text_cache_field(field, getattr(state, field))
+            if value is None and field in _TEXT_CACHE_DEFAULT_EMPTY_LIST_FIELDS:
+                value = []
+            setattr(batch, field, value)
         return batch
 
     def _store_outputs(self, batch: Req, state: RealtimeTextState) -> None:
-        state.prompt_embeds = _copy_tensor_list(batch.prompt_embeds)
-        state.pooled_embeds = _copy_tensor_list(batch.pooled_embeds)
-        state.prompt_attention_mask = _copy_tensor_list(batch.prompt_attention_mask)
-        state.prompt_embeds_mask = _copy_tensor_list(batch.prompt_embeds_mask)
-        state.prompt_seq_lens = _copy_seq_lens(batch.prompt_seq_lens)
-        state.negative_prompt_embeds = _copy_tensor_list(batch.negative_prompt_embeds)
-        state.neg_pooled_embeds = _copy_tensor_list(batch.neg_pooled_embeds)
-        state.negative_attention_mask = _copy_tensor_list(batch.negative_attention_mask)
-        state.negative_prompt_embeds_mask = _copy_tensor_list(
-            batch.negative_prompt_embeds_mask
-        )
-        state.negative_prompt_seq_lens = _copy_seq_lens(batch.negative_prompt_seq_lens)
+        for field in _TEXT_CACHE_FIELDS:
+            setattr(state, field, _copy_text_cache_field(field, getattr(batch, field)))
 
     @torch.no_grad()
     def forward(
