@@ -21,13 +21,13 @@ from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
     _post_load_weights,
+    device_loading_context,
 )
 from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
     get_quant_method_name,
-    get_socket_path,
     hash_quant_config,
     recv_msg,
     send_msg,
@@ -103,22 +103,26 @@ class IpcModelLoader(BaseModelLoader):
 
         from sglang.srt.model_loader.loader import (
             _get_quantization_config,
-            device_loading_context,
         )
-        from sglang.srt.model_loader.utils import set_default_torch_dtype
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
         if self.copy_mode:
             model = self._load_copy_mode(
-                model_config, device_config, entries,
-                target_device, quant_config,
+                model_config,
+                device_config,
+                entries,
+                target_device,
+                quant_config,
             )
         else:
             model = self._load_zero_copy_mode(
-                model_config, device_config, entries,
-                target_device, quant_config,
+                model_config,
+                device_config,
+                entries,
+                target_device,
+                quant_config,
             )
 
         # Post-load hooks (e.g., model-specific finalization)
@@ -153,9 +157,7 @@ class IpcModelLoader(BaseModelLoader):
         if is_param:
             existing = getattr(obj, leaf_name, None)
             if isinstance(existing, nn.Parameter):
-                new_param = nn.Parameter(
-                    tensor, requires_grad=existing.requires_grad
-                )
+                new_param = nn.Parameter(tensor, requires_grad=existing.requires_grad)
             else:
                 new_param = nn.Parameter(tensor, requires_grad=False)
             setattr(obj, leaf_name, new_param)
@@ -163,7 +165,12 @@ class IpcModelLoader(BaseModelLoader):
             obj.register_buffer(leaf_name, tensor)
 
     def _load_zero_copy_mode(
-        self, model_config, device_config, entries, target_device, quant_config,
+        self,
+        model_config,
+        device_config,
+        entries,
+        target_device,
+        quant_config,
     ) -> nn.Module:
         """Zero-copy load: map IPC tensors directly as param.data.
 
@@ -180,7 +187,9 @@ class IpcModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with torch.device("meta"):
                 model = _initialize_model(
-                    model_config, self.load_config, quant_config,
+                    model_config,
+                    self.load_config,
+                    quant_config,
                 )
 
         # Build lookup dicts of existing parameter/buffer names in the
@@ -214,7 +223,10 @@ class IpcModelLoader(BaseModelLoader):
                     ref_param = existing_params[name]
                 else:
                     ref_param = existing_buffers[name]
-                if imported_tensor.shape != ref_param.shape or imported_tensor.dtype != ref_param.dtype:
+                if (
+                    imported_tensor.shape != ref_param.shape
+                    or imported_tensor.dtype != ref_param.dtype
+                ):
                     logger.warning(
                         f"[IpcModelLoader] Shape/dtype mismatch for {name}: "
                         f"IPC={imported_tensor.shape}/{imported_tensor.dtype} "
@@ -303,7 +315,12 @@ class IpcModelLoader(BaseModelLoader):
         return model
 
     def _load_copy_mode(
-        self, model_config, device_config, entries, target_device, quant_config,
+        self,
+        model_config,
+        device_config,
+        entries,
+        target_device,
+        quant_config,
     ) -> nn.Module:
         """Copy mode: initialize model on GPU, then copy IPC weights over.
 
@@ -316,7 +333,9 @@ class IpcModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
-                    model_config, self.load_config, quant_config,
+                    model_config,
+                    self.load_config,
+                    quant_config,
                 )
                 # Run quant post-processing to create parameters like weight_scale
                 for _, module in model.named_modules():
@@ -423,9 +442,11 @@ class IpcModelLoader(BaseModelLoader):
 
             engine_config = CacheConfig(
                 model_path=model_config.model_path,
-                model_arch=model_config.hf_config.architectures[0]
-                if model_config.hf_config.architectures
-                else "",
+                model_arch=(
+                    model_config.hf_config.architectures[0]
+                    if model_config.hf_config.architectures
+                    else ""
+                ),
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 dp_size=1,  # TODO: get actual dp_size
@@ -482,7 +503,9 @@ class IpcModelLoader(BaseModelLoader):
         )
         loader_cls = self._fallback_loader_cls or DefaultModelLoader
         fallback = loader_cls(fallback_config)
-        return fallback.load_model(model_config=model_config, device_config=device_config)
+        return fallback.load_model(
+            model_config=model_config, device_config=device_config
+        )
 
     def download_model(self, model_config) -> None:
         """No-op: daemon handles its own model downloading."""

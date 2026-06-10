@@ -20,8 +20,6 @@ import socket
 import sys
 import time
 
-import torch
-
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -29,12 +27,24 @@ def find_free_port():
         return s.getsockname()[1]
 
 
-def run_single_daemon(model_path, gpu_id, tp_size, tp_rank, dist_init_method,
-                      socket_path, ready_path, done_path, load_format, dtype,
-                      quantization, trust_remote_code):
+def run_single_daemon(
+    model_path,
+    gpu_id,
+    tp_size,
+    tp_rank,
+    dist_init_method,
+    socket_path,
+    ready_path,
+    done_path,
+    load_format,
+    dtype,
+    quantization,
+    trust_remote_code,
+):
     """Run a single daemon process for one TP rank."""
-    from sglang.srt.weight_cache.daemon import WeightCacheDaemon
     import traceback
+
+    from sglang.srt.weight_cache.daemon import WeightCacheDaemon
 
     daemon = WeightCacheDaemon(
         model_path=model_path,
@@ -63,11 +73,14 @@ def run_single_daemon(model_path, gpu_id, tp_size, tp_rank, dist_init_method,
     with open(ready_path, "w") as f:
         f.write(f"pid={os.getpid()}\n")
         f.write(f"num_entries={len(daemon.state_entries)}\n")
-    print(f"[Daemon gpu={gpu_id} rank={tp_rank}] Ready with "
-          f"{len(daemon.state_entries)} tensors", flush=True)
+    print(
+        f"[Daemon gpu={gpu_id} rank={tp_rank}] Ready with "
+        f"{len(daemon.state_entries)} tensors",
+        flush=True,
+    )
 
     # Serve connections until done
-    from sglang.srt.weight_cache.protocol import send_msg, recv_msg, CacheConfig
+    from sglang.srt.weight_cache.protocol import CacheConfig, recv_msg, send_msg
 
     if os.path.exists(socket_path):
         os.unlink(socket_path)
@@ -83,20 +96,28 @@ def run_single_daemon(model_path, gpu_id, tp_size, tp_rank, dist_init_method,
                 try:
                     req = recv_msg(conn)
                     if req.get("type") == "query_config":
-                        send_msg(conn, {"status": "ok", "config": daemon.config.to_dict()})
+                        send_msg(
+                            conn, {"status": "ok", "config": daemon.config.to_dict()}
+                        )
                     elif req.get("type") == "fetch_state":
                         engine_config = CacheConfig.from_dict(req["config"])
                         if daemon.config.matches(engine_config):
-                            send_msg(conn, {
-                                "status": "ok",
-                                "config": daemon.config.to_dict(),
-                                "entries": daemon.state_entries,
-                            })
+                            send_msg(
+                                conn,
+                                {
+                                    "status": "ok",
+                                    "config": daemon.config.to_dict(),
+                                    "entries": daemon.state_entries,
+                                },
+                            )
                         else:
-                            send_msg(conn, {
-                                "status": "mismatch",
-                                "daemon_config": daemon.config.to_dict(),
-                            })
+                            send_msg(
+                                conn,
+                                {
+                                    "status": "mismatch",
+                                    "daemon_config": daemon.config.to_dict(),
+                                },
+                            )
                     elif req.get("type") == "ping":
                         send_msg(conn, {"status": "ok"})
                 except Exception:
@@ -151,10 +172,20 @@ def main():
 
         p = mp.Process(
             target=run_single_daemon,
-            args=(args.model_path, i, tp_size, i, dist_init_method,
-                  socket_path, ready_path, done_path,
-                  args.load_format, args.dtype, args.quantization,
-                  args.trust_remote_code),
+            args=(
+                args.model_path,
+                i,
+                tp_size,
+                i,
+                dist_init_method,
+                socket_path,
+                ready_path,
+                done_path,
+                args.load_format,
+                args.dtype,
+                args.quantization,
+                args.trust_remote_code,
+            ),
             name=f"daemon_gpu{i}",
         )
         p.start()
@@ -203,8 +234,8 @@ def main():
     print(f"\nAll {tp_size} daemons ready! Total load time: {time.time()-start:.1f}s")
 
     # Query config from daemon 0
-    from sglang.srt.weight_cache.protocol import CacheConfig, send_msg, recv_msg
     from sglang.srt.utils import MultiprocessingSerializer
+    from sglang.srt.weight_cache.protocol import recv_msg, send_msg
 
     socket_path = "/tmp/sglang_weight_cache_gpu0.sock"
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -214,10 +245,12 @@ def main():
     result = recv_msg(s)
     s.close()
     daemon_config = result.get("config", {})
-    print(f"\nDaemon 0 config: model={daemon_config.get('model_path')}, "
-          f"arch={daemon_config.get('model_arch')}, "
-          f"tp_size={daemon_config.get('tp_size')}, "
-          f"dtype={daemon_config.get('dtype')}")
+    print(
+        f"\nDaemon 0 config: model={daemon_config.get('model_path')}, "
+        f"arch={daemon_config.get('model_arch')}, "
+        f"tp_size={daemon_config.get('tp_size')}, "
+        f"dtype={daemon_config.get('dtype')}"
+    )
 
     # Fetch state from daemon 0
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -240,8 +273,10 @@ def main():
         for name in sample_names:
             entry = entries[name]
             imported = MultiprocessingSerializer.deserialize(entry["handle"])
-            print(f"  {name}: shape={tuple(imported.shape)}, "
-                  f"dtype={imported.dtype}, device={imported.device}")
+            print(
+                f"  {name}: shape={tuple(imported.shape)}, "
+                f"dtype={imported.dtype}, device={imported.device}"
+            )
             del imported
 
         # Test copy mode: clone and verify
@@ -249,8 +284,10 @@ def main():
         imported = MultiprocessingSerializer.deserialize(first_entry["handle"])
         cloned = imported.clone()
         del imported
-        print(f"\nCopy mode: cloned tensor shape={tuple(cloned.shape)}, "
-              f"dtype={cloned.dtype}, device={cloned.device}")
+        print(
+            f"\nCopy mode: cloned tensor shape={tuple(cloned.shape)}, "
+            f"dtype={cloned.dtype}, device={cloned.device}"
+        )
 
         print("\nIPC import OK!")
     else:

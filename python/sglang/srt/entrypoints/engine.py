@@ -586,7 +586,6 @@ class Engine(EngineScoreMixin, EngineBase):
         import multiprocessing as mp
 
         from sglang.srt.utils.network import NetworkAddress
-
         from sglang.srt.weight_cache.daemon import run_weight_cache_daemon
         from sglang.srt.weight_cache.protocol import get_ready_path
 

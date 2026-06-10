@@ -19,7 +19,6 @@ import logging
 import os
 import signal
 import socket
-import sys
 import time
 from typing import Any, Dict, Optional
 
@@ -110,6 +109,7 @@ class WeightCacheDaemon:
             if self.dist_init_method is None:
                 # Fallback: auto-assign a port. This only works for tp_size=1.
                 import socket as sock_mod
+
                 with sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM) as s:
                     s.bind(("127.0.0.1", 0))
                     free_port = s.getsockname()[1]
@@ -130,6 +130,7 @@ class WeightCacheDaemon:
 
         # Initialize DP attention state (required by some models like Qwen3 MoE)
         from sglang.srt.layers.dp_attention import initialize_dp_attention
+
         initialize_dp_attention(server_args, model_config)
 
         logger.info(
@@ -149,7 +150,10 @@ class WeightCacheDaemon:
         from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.model_loader.loader import get_model_loader
-        from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+        from sglang.srt.server_args import (
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
 
         # Set up global server args (required by model __init__ and weight loading)
         server_args = ServerArgs(
@@ -189,9 +193,11 @@ class WeightCacheDaemon:
 
         self.config = CacheConfig(
             model_path=self.model_path,
-            model_arch=model_config.hf_config.architectures[0]
-            if model_config.hf_config.architectures
-            else "",
+            model_arch=(
+                model_config.hf_config.architectures[0]
+                if model_config.hf_config.architectures
+                else ""
+            ),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             dp_size=self.dp_size,
@@ -252,7 +258,9 @@ class WeightCacheDaemon:
 
         # Export all items from state_dict (parameters + persistent buffers)
         for name, tensor in self.model.state_dict().items():
-            ipc_handle = MultiprocessingSerializer.serialize(tensor.data, output_str=True)
+            ipc_handle = MultiprocessingSerializer.serialize(
+                tensor.data, output_str=True
+            )
             self.state_entries[name] = {
                 "handle": ipc_handle,
                 "shape": list(tensor.shape),
@@ -265,7 +273,9 @@ class WeightCacheDaemon:
         non_persistent_count = 0
         for name, buf in self.model.named_buffers():
             if name not in state_dict_names:
-                ipc_handle = MultiprocessingSerializer.serialize(buf.data, output_str=True)
+                ipc_handle = MultiprocessingSerializer.serialize(
+                    buf.data, output_str=True
+                )
                 self.state_entries[name] = {
                     "handle": ipc_handle,
                     "shape": list(buf.shape),
@@ -303,14 +313,15 @@ class WeightCacheDaemon:
             f.write(f"config={self.config.to_dict()}\n")
 
         logger.info(
-            f"[WeightCacheDaemon gpu={self.gpu_id}] "
-            f"Listening on {self.socket_path}"
+            f"[WeightCacheDaemon gpu={self.gpu_id}] " f"Listening on {self.socket_path}"
         )
 
         self._running = True
 
         def _signal_handler(signum, frame):
-            logger.info(f"[WeightCacheDaemon gpu={self.gpu_id}] Received signal {signum}, shutting down")
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] Received signal {signum}, shutting down"
+            )
             self._running = False
 
         signal.signal(signal.SIGTERM, _signal_handler)
@@ -364,18 +375,23 @@ class WeightCacheDaemon:
                     f"[WeightCacheDaemon gpu={self.gpu_id}] "
                     f"Config mismatch: {mismatches}"
                 )
-                send_msg(conn, {"status": "mismatch", "daemon_config": self.config.to_dict()})
+                send_msg(
+                    conn, {"status": "mismatch", "daemon_config": self.config.to_dict()}
+                )
                 return
 
             logger.info(
                 f"[WeightCacheDaemon gpu={self.gpu_id}] "
                 f"Serving {len(self.state_entries)} IPC handles to engine"
             )
-            send_msg(conn, {
-                "status": "ok",
-                "config": self.config.to_dict(),
-                "entries": self.state_entries,
-            })
+            send_msg(
+                conn,
+                {
+                    "status": "ok",
+                    "config": self.config.to_dict(),
+                    "entries": self.state_entries,
+                },
+            )
 
         elif req.get("type") == "ping":
             send_msg(conn, {"status": "ok"})
@@ -393,7 +409,13 @@ class WeightCacheDaemon:
             send_msg(conn, {"status": "ok"})
 
         else:
-            send_msg(conn, {"status": "error", "message": f"Unknown request type: {req.get('type')}"})
+            send_msg(
+                conn,
+                {
+                    "status": "error",
+                    "message": f"Unknown request type: {req.get('type')}",
+                },
+            )
 
     def shutdown(self):
         """Release GPU memory and clean up."""
@@ -458,9 +480,12 @@ if __name__ == "__main__":
     parser.add_argument("--quantization", default=None, help="Quantization method")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--revision", default=None, help="Model revision")
-    parser.add_argument("--dist-init-method", default=None,
-                        help="Distributed init method (e.g. tcp://127.0.0.1:PORT). "
-                             "Required for tp_size > 1. All daemons must share the same address.")
+    parser.add_argument(
+        "--dist-init-method",
+        default=None,
+        help="Distributed init method (e.g. tcp://127.0.0.1:PORT). "
+        "Required for tp_size > 1. All daemons must share the same address.",
+    )
 
     args = parser.parse_args()
 
