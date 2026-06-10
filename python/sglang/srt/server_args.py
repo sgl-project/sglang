@@ -844,10 +844,6 @@ class ServerArgs:
     dsa_prefill_cp_mode: str = "round-robin-split"
     enable_prefill_context_parallel: bool = False
     prefill_cp_mode: str = "in-seq-split"
-    # Parser-only markers consumed by _handle_legacy_cp_arguments() so
-    # deprecated mode-only invocations can still enable CP.
-    _legacy_dsa_prefill_cp_mode: Optional[str] = None
-    _legacy_prefill_cp_mode: Optional[str] = None
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -954,15 +950,9 @@ class ServerArgs:
         # Normalize deprecated CP aliases before validations or model-specific
         # defaults inspect enable_prefill_cp/cp_strategy.
         self._handle_legacy_cp_arguments()
-
-        if self.enable_prefill_cp and self.cp_strategy is None:
-            raise ValueError(
-                "--cp-strategy must be set when --enable-prefill-cp is enabled."
-            )
+        self._validate_prefill_only_disable_kv_cache_args()
 
         if self.model_path.lower() in ["none", "dummy"]:
-            self._handle_context_parallelism()
-            self._validate_prefill_only_disable_kv_cache_args()
             # Skip for dummy models
             return
 
@@ -1012,14 +1002,6 @@ class ServerArgs:
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
-        # Handle context parallelism before validating prefill-only KV cache
-        # constraints so deprecated CP aliases have normalized to enable_prefill_cp.
-        self._handle_context_parallelism()
-
-        # Validate --prefill-only-disable-kv-cache args before the backend-specific
-        # half runs below.
-        self._validate_prefill_only_disable_kv_cache_args()
-
         # Set kernel backends.
         self._handle_sampling_backend()
         # Must run before _handle_attention_backend_compatibility so the
@@ -1050,6 +1032,10 @@ class ServerArgs:
 
         # Handle data parallelism.
         self._handle_data_parallelism()
+
+        # Re-apply after model-specific defaults resolve attention_backend so
+        # canonical CP mirrors to the right legacy runtime aliases.
+        self._handle_legacy_cp_arguments()
 
         # Handle context parallelism.
         self._handle_context_parallelism()
@@ -3429,29 +3415,46 @@ class ServerArgs:
             )
 
     def _handle_legacy_cp_arguments(self):
+        legacy_mode_to_strategy = {
+            "in-seq-split": "zigzag",
+            "round-robin-split": "interleave",
+        }
+        strategy_to_legacy_mode = {
+            "zigzag": "in-seq-split",
+            "interleave": "round-robin-split",
+        }
+
         if (
             self.enable_prefill_context_parallel
             or self.enable_dsa_prefill_context_parallel
         ):
             self.enable_prefill_cp = True
 
-        legacy_mode_to_strategy = {
-            "in-seq-split": "zigzag",
-            "round-robin-split": "interleave",
-        }
         if self.enable_prefill_context_parallel and self.cp_strategy is None:
             self.cp_strategy = legacy_mode_to_strategy[self.prefill_cp_mode]
         if self.enable_dsa_prefill_context_parallel and self.cp_strategy is None:
             self.cp_strategy = legacy_mode_to_strategy[self.dsa_prefill_cp_mode]
 
-        if self._legacy_dsa_prefill_cp_mode is not None:
-            self.enable_prefill_cp = True
-            self.cp_strategy = legacy_mode_to_strategy[self._legacy_dsa_prefill_cp_mode]
-            self.dsa_prefill_cp_mode = self._legacy_dsa_prefill_cp_mode
-        if self._legacy_prefill_cp_mode is not None:
-            self.enable_prefill_cp = True
-            self.cp_strategy = legacy_mode_to_strategy[self._legacy_prefill_cp_mode]
-            self.prefill_cp_mode = self._legacy_prefill_cp_mode
+        if (
+            self.enable_prefill_context_parallel
+            and self.enable_dsa_prefill_context_parallel
+        ):
+            return
+
+        if not self.enable_prefill_cp or self.cp_strategy is None:
+            return
+
+        mode = strategy_to_legacy_mode[self.cp_strategy]
+        use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
+            self, "attention_backend", None
+        ) in ("dsa", "dsv4")
+        if use_dsa_legacy_aliases:
+            self.enable_dsa_prefill_context_parallel = True
+            self.enable_prefill_context_parallel = False
+        else:
+            self.enable_prefill_context_parallel = True
+        self.dsa_prefill_cp_mode = mode
+        self.prefill_cp_mode = mode
 
     def _handle_context_parallelism(self):
         if self.enable_prefill_cp and self.cp_strategy is None:
@@ -3508,24 +3511,6 @@ class ServerArgs:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
-
-        if not self.enable_prefill_cp:
-            return
-
-        mode = {
-            "zigzag": "in-seq-split",
-            "interleave": "round-robin-split",
-        }[self.cp_strategy]
-        use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
-            self, "attention_backend", None
-        ) in ("dsa", "dsv4")
-        if use_dsa_legacy_aliases:
-            self.enable_dsa_prefill_context_parallel = True
-            self.enable_prefill_context_parallel = False
-        else:
-            self.enable_prefill_context_parallel = True
-        self.dsa_prefill_cp_mode = mode
-        self.prefill_cp_mode = mode
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -7252,11 +7237,11 @@ class ServerArgs:
         )
         parser.add_argument(
             "--dsa-prefill-cp-mode",
-            dest="_legacy_dsa_prefill_cp_mode",
+            dest="dsa_prefill_cp_mode",
             action=DeprecatedAliasStoreAction,
             new_flag="--cp-strategy",
             type=str,
-            default=ServerArgs._legacy_dsa_prefill_cp_mode,
+            default=ServerArgs.dsa_prefill_cp_mode,
             choices=DSA_PREFILL_CP_SPLIT_CHOICES,
             help=(
                 "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
@@ -7266,21 +7251,21 @@ class ServerArgs:
         )
         parser.add_argument(
             "--nsa-prefill-cp-mode",
-            dest="_legacy_dsa_prefill_cp_mode",
+            dest="dsa_prefill_cp_mode",
             action=DeprecatedAliasStoreAction,
             new_flag="--cp-strategy",
             type=str,
-            default=ServerArgs._legacy_dsa_prefill_cp_mode,
+            default=argparse.SUPPRESS,
             choices=DSA_PREFILL_CP_SPLIT_CHOICES,
             help="[Deprecated] Use --cp-strategy instead.",
         )
         parser.add_argument(
             "--prefill-cp-mode",
-            dest="_legacy_prefill_cp_mode",
+            dest="prefill_cp_mode",
             action=DeprecatedAliasStoreAction,
             new_flag="--cp-strategy",
             type=str,
-            default=ServerArgs._legacy_prefill_cp_mode,
+            default=ServerArgs.prefill_cp_mode,
             choices=PREFILL_CP_SPLIT_CHOICES,
             help=(
                 "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "

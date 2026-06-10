@@ -111,8 +111,6 @@ class TestContextParallelServerArgs(CustomTestCase):
             cp_strategy=None,
             dsa_prefill_cp_mode="round-robin-split",
             prefill_cp_mode="in-seq-split",
-            _legacy_dsa_prefill_cp_mode=None,
-            _legacy_prefill_cp_mode=None,
             attn_cp_size=1,
             tp_size=1,
             dp_size=1,
@@ -149,17 +147,25 @@ class TestContextParallelServerArgs(CustomTestCase):
 
     def test_deprecated_dsa_cp_mode_maps_to_unified_strategy(self):
         args = self.parser.parse_args(
-            ["--model", "dummy", "--dsa-prefill-cp-mode", "round-robin-split"]
+            [
+                "--model",
+                "dummy",
+                "--enable-dsa-prefill-context-parallel",
+                "--dsa-prefill-cp-mode",
+                "round-robin-split",
+            ]
         )
         server_args = self._new_cp_args(
-            _legacy_dsa_prefill_cp_mode=args._legacy_dsa_prefill_cp_mode
+            enable_dsa_prefill_context_parallel=(
+                args.enable_dsa_prefill_context_parallel
+            ),
+            dsa_prefill_cp_mode=args.dsa_prefill_cp_mode,
         )
 
         server_args._handle_legacy_cp_arguments()
 
         self.assertTrue(server_args.enable_prefill_cp)
         self.assertEqual(server_args.cp_strategy, "interleave")
-        self.assertEqual(server_args._legacy_dsa_prefill_cp_mode, "round-robin-split")
         self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
 
     def test_canonical_interleave_cp_mirrors_to_dsa_runtime_aliases(self):
@@ -169,6 +175,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             attention_backend="dsa",
         )
 
+        server_args._handle_legacy_cp_arguments()
         server_args._handle_context_parallelism()
 
         self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
@@ -202,7 +209,6 @@ class TestContextParallelServerArgs(CustomTestCase):
                 "deepseek_v32_dsa_in_seq_split",
                 dict(
                     enable_dsa_prefill_context_parallel=True,
-                    _legacy_dsa_prefill_cp_mode="in-seq-split",
                     dsa_prefill_cp_mode="in-seq-split",
                     tp_size=8,
                     dp_size=2,
@@ -217,9 +223,21 @@ class TestContextParallelServerArgs(CustomTestCase):
                 "deepseek_v32_dsa_round_robin_split",
                 dict(
                     enable_dsa_prefill_context_parallel=True,
-                    _legacy_dsa_prefill_cp_mode="round-robin-split",
                     tp_size=8,
                     attn_cp_size=8,
+                ),
+                "interleave",
+                "round-robin-split",
+                True,
+                False,
+            ),
+            (
+                "deepseek_v4_flash_fp4_b200_dsa_round_robin_split",
+                dict(
+                    enable_dsa_prefill_context_parallel=True,
+                    dsa_prefill_cp_mode="round-robin-split",
+                    tp_size=4,
+                    attn_cp_size=4,
                 ),
                 "interleave",
                 "round-robin-split",
