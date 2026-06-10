@@ -458,10 +458,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         item = self.layer_mapping[layer_id]
         if item.compress_ratio == 4:
             if from_indexer:
-                if self.c4_indexer_kv_pool.has_npu_storage:
-                    kv = self.c4_indexer_kv_pool.get_index_k(item.compress_layer_id)
-                else:
-                    kv = self.c4_indexer_kv_pool.kv_buffer[item.compress_layer_id]
+                kv = self.c4_indexer_kv_pool.get_index_k(item.compress_layer_id)
             else:
                 kv = self.c4_kv_pool.kv_buffer[item.compress_layer_id]
         elif item.compress_ratio == 128:
@@ -507,11 +504,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         loc: torch.Tensor,
         kv: torch.Tensor,
         score: torch.Tensor,
-        scale: Optional[torch.Tensor],
         from_indexer: bool,
     ) -> None:
         # KVAndScore.kv_score is [..., 2*coff*head_dim] = [kv | score].
-        _ = scale  # int8 scale not modelled — state-pool layout is float32
         kv_score = self._get_state_pool(layer_id, from_indexer).kv_score_buffer.kv_score
         last_dim = kv_score.shape[-1]
         half = last_dim // 2
@@ -591,9 +586,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # scale buffer alongside the int8 K buffer).
         assert from_indexer, "only indexer compress pool has dequant scale"
         compress_layer_id = self.layer_mapping[layer_id].compress_layer_id
-        if self.c4_indexer_kv_pool.has_npu_storage:
-            return self.c4_indexer_kv_pool.get_index_scale(compress_layer_id)
-        return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(compress_layer_id)
+        return self.c4_indexer_kv_pool.get_index_scale(compress_layer_id)
 
     def translate_kv_loc_to_compress_state_loc(
         self,
