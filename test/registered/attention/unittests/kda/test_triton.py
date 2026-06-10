@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -277,6 +278,11 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
             ):
                 run_kda_eagle_draft_extend_case(self, case, spec_kind=spec_kind)
 
+    @unittest.skipIf(
+        is_hip(),
+        "split-op extend runner exercises the piecewise-CUDA-graph path "
+        "(TcPiecewiseForwardContext.num_tokens), which is not wired on ROCm.",
+    )
     def test_runner_mode_split_op_extend_cases(self):
         for case, static_num_tokens in self.SPLIT_OP_CASES:
             for breakable in (False, True):

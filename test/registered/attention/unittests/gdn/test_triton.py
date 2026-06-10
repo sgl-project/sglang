@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -262,6 +263,11 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_gdn_cuda_graph_decode_case(self, case)
 
+    @unittest.skipIf(
+        is_hip(),
+        "split-op extend runner exercises the piecewise-CUDA-graph path "
+        "(TcPiecewiseForwardContext.num_tokens), which is not wired on ROCm.",
+    )
     def test_runner_mode_split_op_extend_cases(self):
         for case, static_num_tokens in self.SPLIT_OP_CASES:
             for breakable in (False, True):
