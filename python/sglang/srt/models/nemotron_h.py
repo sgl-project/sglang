@@ -184,7 +184,6 @@ class NemotronHMoE(nn.Module):
             layer_id=layer_idx,
             is_gated=False,
             routing_method_type=RoutingMethodType.DeepSeekV3,
-            routed_scaling_factor=self.routed_scaling_factor,
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -194,8 +193,7 @@ class NemotronHMoE(nn.Module):
             renormalize=config.norm_topk_prob,
             scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+            routed_scaling_factor=1.0,
         )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
@@ -287,9 +285,14 @@ class NemotronHMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
-        # routed_scaling_factor is fused into the experts call (applied by the
-        # MoE runner / topk), so final_hidden_states is already scaled.
         final_hidden_states, shared_output = self._forward_core(hidden_states)
+
+        # Fix FP16 overflow
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states *= self.routed_scaling_factor
+        elif self.shared_experts is not None:
+            assert shared_output is not None
+            shared_output *= 1.0 / self.routed_scaling_factor
 
         if self.use_latent_moe:
             final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)

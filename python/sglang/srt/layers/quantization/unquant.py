@@ -511,12 +511,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 ),
             )[0]
 
-            if (
-                not layer.should_fuse_routed_scaling_factor_in_topk
-                and moe_runner_config.routed_scaling_factor is not None
-            ):
-                output.mul_(moe_runner_config.routed_scaling_factor)
-
             return StandardCombineInput(hidden_states=output)
         elif self.use_flashinfer_trtllm_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
