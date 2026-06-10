@@ -206,6 +206,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner_list[0].tp_group
         ), speculative_moe_backend_context():
             super().init_backends()
+        # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
+        # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
+        self.tree_mask_mode = (
+            TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
+        )
 
     def mtp_model_runner(self, step: int):
         return self.draft_runner_list[step]

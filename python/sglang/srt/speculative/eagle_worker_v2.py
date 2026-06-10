@@ -237,6 +237,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if (c := self.draft_runner.canary_manager) is not None:
             c.mark_init_finished()
 
+        # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
+        # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
+        self.tree_mask_mode = (
+            TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
+        )
+
+
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
         # top_scores_index are runtime-invariant. Must be rebuilt after any
@@ -338,7 +345,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        # Keep in sync with __init__: QLEN_ONLY on CPU, FULL_MASK on GPU.
+        self.tree_mask_mode = (
+            TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
+        )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
