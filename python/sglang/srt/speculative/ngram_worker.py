@@ -64,6 +64,9 @@ class NGRAMWorker:
         self._init_preallocated_tensors()
 
         self.adaptive_controller = None
+        # rids of the last decode batch; used to erase corpus match state for
+        # requests that left the batch (see forward_batch_generation).
+        self._prev_decode_rids: set = set()
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
@@ -98,6 +101,7 @@ class NGRAMWorker:
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
+        self._prev_decode_rids = set()
 
     def update_weights_from_tensor(self, recv_req):
         # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
@@ -439,13 +443,19 @@ class NGRAMWorker:
                 on_publish(new_seq_lens)
 
             self._update_ngram_corpus(batch)
-            # Clean up per-request match state for finished/retracted requests.
-            finished_req_ids = []
-            for req in batch.reqs:
-                if req.finished() or req.is_retracted:
-                    finished_req_ids.append(req.rid)
-            if finished_req_ids:
-                self.ngram_corpus.erase_match_state(finished_req_ids)
+            # Clean up per-request match state for requests that left the
+            # decode batch (finished/retracted). Checking req.finished() here
+            # does not work under overlap scheduling: results are processed one
+            # iteration behind, so the flag is still False inside the forward
+            # and the request is gone from the next batch. Diff against the
+            # previous decode batch instead. Entries of requests that never
+            # come back persist until reset(); this is acceptable because
+            # MatchState is small.
+            cur_rids = {req.rid for req in batch.reqs}
+            departed_rids = self._prev_decode_rids - cur_rids
+            if departed_rids:
+                self.ngram_corpus.erase_match_state(list(departed_rids))
+            self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
 
         else:
