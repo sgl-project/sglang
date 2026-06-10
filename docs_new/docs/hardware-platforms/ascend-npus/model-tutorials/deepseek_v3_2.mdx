@@ -60,7 +60,7 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-We publish both **stable releases** and **daily builds**. The following command is based on the stable release tag.
+Both **stable releases** and **daily builds** are available. The following command is based on the stable release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 <Tabs>
@@ -196,8 +196,8 @@ do
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1200
         export TASK_QUEUE_ENABLE=2
-        export HCCL_SOCKET_IFNAME=xxx
-        export GLOO_SOCKET_IFNAME=xxx
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
 
         python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
         --tp-size 32 \
@@ -239,8 +239,8 @@ do
         export TASK_QUEUE_ENABLE=0
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
 
-        export HCCL_SOCKET_IFNAME=xxx
-        export GLOO_SOCKET_IFNAME=xxx
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
 
         DP=8
         export HCCL_BUFFSIZE=400
