@@ -20,7 +20,9 @@ import datetime
 import gc
 import hashlib
 import inspect
+import json
 import logging
+import math
 import os
 import socket
 import threading
@@ -29,7 +31,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -132,6 +134,7 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.io_struct import DeltaEncoding, DeltaParam, DeltaSpec
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -1815,8 +1818,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
+        files: Optional[List[str]] = None,
     ) -> tuple[bool, str]:
-        """Update engine weights in-place from the disk."""
+        """Update engine weights in-place from disk.
+
+        For load_format == "delta", model_path is a per-sync directory and files
+        are the basenames to read and apply.
+        """
+        if load_format == "delta":
+            if not files:
+                return False, "load_format='delta' requires non-empty files"
+            return self._apply_delta([os.path.join(model_path, name) for name in files])
+
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
@@ -2046,6 +2059,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         shapes,
         group_name,
         load_format: Optional[str] = None,
+        delta: Optional[str] = None,
     ):
         """
         Update specific parameter in the model weights online
@@ -2065,6 +2079,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if load_format == "flattened_bucket":
             return self._update_bucketed_weights_from_distributed(
                 names, dtypes, shapes, group_name
+            )
+        if load_format == "delta":
+            if delta is None:
+                return False, "load_format='delta' requires a DeltaSpec in the request"
+            spec_dict = json.loads(delta)
+            spec = DeltaSpec(
+                encoding=DeltaEncoding(spec_dict["encoding"]),
+                params=[DeltaParam(**param) for param in spec_dict["params"]],
+                checksum=int(spec_dict["checksum"]),
+            )
+            return self._apply_delta_from_distributed(
+                names, dtypes, shapes, group_name, spec
             )
         try:
             weights = []
@@ -2126,6 +2152,149 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"The full weights of the ModelRunner are partially updated. "
                 f"Please discard the whole weights."
             )
+            logger.error(error_msg)
+            return False, error_msg
+
+    def _decode_delta_one_param(
+        self,
+        encoding: DeltaEncoding,
+        positions: torch.Tensor,
+        values: torch.Tensor,
+        param: DeltaParam,
+    ) -> torch.Tensor:
+        """Decode one param's sparse delta into a full-shape NaN-masked tensor."""
+        numel = math.prod(param.shape)
+        param_dtype = param.dtype if isinstance(param.dtype, torch.dtype) else getattr(torch, param.dtype)
+        flat = torch.full((numel,), float("nan"), dtype=param_dtype, device=self.device)
+        val_slice = values[param.val_start : param.val_end]
+        if val_slice.numel() == 0:
+            return flat.view(tuple(param.shape))
+
+        pos_bytes = positions[param.pos_start : param.pos_end]
+        if encoding is DeltaEncoding.INDICES:
+            width = 4
+        elif encoding in (DeltaEncoding.DELTAS, DeltaEncoding.DELTAS_ZSTD):
+            width = param.pos_width
+        else:
+            raise ValueError(f"unsupported delta encoding: {encoding!r}")
+
+        n_elems = pos_bytes.numel() // width
+        byte_view = pos_bytes.view(n_elems, width).to(torch.int64)
+        if width == 2:
+            unpacked = byte_view[:, 0] | (byte_view[:, 1] << 8)
+        else:
+            unpacked = byte_view[:, 0] | (byte_view[:, 1] << 8) | (byte_view[:, 2] << 16) | (byte_view[:, 3] << 24)
+
+        if encoding is DeltaEncoding.INDICES:
+            idx = unpacked
+        else:
+            idx = (unpacked + 1).cumsum(dim=0) - 1
+        flat.index_copy_(0, idx, val_slice.to(param_dtype))
+        return flat.view(tuple(param.shape))
+
+    def _apply_delta_payload(
+        self,
+        encoding: DeltaEncoding,
+        params: List[DeltaParam],
+        positions: torch.Tensor,
+        values: torch.Tensor,
+        expected_checksum: int,
+    ) -> None:
+        actual_checksum = _delta_checksum(positions, values)
+        if actual_checksum != expected_checksum:
+            raise RuntimeError(
+                f"delta checksum mismatch: expected={expected_checksum} got={actual_checksum}; "
+                "indicates corruption between sender encode and receiver apply"
+            )
+
+        chunk_byte_cap = self.server_args.update_weight_delta_chunk_bytes
+        with _delta_apply_context(self.model):
+            chunk: List[Tuple[str, torch.Tensor]] = []
+            chunk_bytes = 0
+            for param in params:
+                tensor = self._decode_delta_one_param(encoding, positions, values, param)
+                tensor_bytes = tensor.numel() * tensor.element_size()
+                if chunk and chunk_bytes + tensor_bytes > chunk_byte_cap:
+                    self.model.load_weights(chunk)
+                    chunk = []
+                    chunk_bytes = 0
+                chunk.append((param.name, tensor))
+                chunk_bytes += tensor_bytes
+            if chunk:
+                self.model.load_weights(chunk)
+
+    def _decode_and_apply_delta_blob(self, blob: bytes) -> None:
+        from safetensors.torch import load as st_load
+
+        header_len = int.from_bytes(blob[:8], "little")
+        metadata = json.loads(blob[8 : 8 + header_len]).get("__metadata__", {})
+        encoding = DeltaEncoding(metadata["encoding"])
+        params = [DeltaParam(**param) for param in json.loads(metadata["params"])]
+        expected_checksum = int(metadata["checksum"])
+
+        tensors = st_load(blob)
+        positions = tensors["__positions__"].to(self.device, non_blocking=True)
+        values = tensors["__values__"].to(self.device, non_blocking=True)
+        self._apply_delta_payload(encoding, params, positions, values, expected_checksum)
+
+    def _apply_delta_from_distributed(
+        self,
+        names: List[str],
+        dtypes: List[str],
+        shapes: List[List[int]],
+        group_name: str,
+        delta: DeltaSpec,
+    ) -> tuple[bool, str]:
+        try:
+            recv: Dict[str, torch.Tensor] = {}
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                tensor = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        tensor,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                recv[name] = tensor
+            for handle in handles:
+                handle.wait()
+
+            self._apply_delta_payload(
+                delta.encoding,
+                delta.params,
+                recv["__positions__"],
+                recv["__values__"],
+                delta.checksum,
+            )
+            return True, "Succeeded to apply delta update."
+        except Exception as e:
+            error_msg = f"Failed to apply delta from distributed: {e}."
+            logger.error(error_msg)
+            return False, error_msg
+
+    def _apply_delta(self, paths: List[str]) -> tuple[bool, str]:
+        import concurrent.futures
+
+        n_files = len(paths)
+        workers = max(1, min(n_files, self.server_args.update_weight_delta_read_workers))
+
+        def read_and_decompress(path: str) -> bytes:
+            with open(path, "rb") as handle:
+                return _maybe_zstd_decompress(handle.read())
+
+        try:
+            for start in range(0, n_files, workers):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                    batch = list(pool.map(read_and_decompress, paths[start : start + workers]))
+                for blob in batch:
+                    self._decode_and_apply_delta_blob(blob)
+            return True, f"Applied {n_files} delta file(s)."
+        except Exception as e:
+            error_msg = f"Failed to apply delta update from disk: {e}."
             logger.error(error_msg)
             return False, error_msg
 
@@ -3751,6 +3920,115 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         quant_method.process_weights_after_loading(module)
 
         return True, "Success"
+
+
+def _param_storage_index(model):
+    """Build a storage owner lookup for tensors owned by model params/buffers."""
+    import bisect
+
+    starts: List[int] = []
+    ends: List[int] = []
+    owners: List[torch.Tensor] = []
+    seen: set[int] = set()
+    for tensors in (model.named_parameters(), model.named_buffers()):
+        for _, tensor in tensors:
+            if tensor.is_meta:
+                continue
+            try:
+                ptr = tensor.data_ptr()
+            except RuntimeError:
+                continue
+            if ptr == 0 or ptr in seen:
+                continue
+            seen.add(ptr)
+            size = tensor.numel() * tensor.element_size()
+            starts.append(ptr)
+            ends.append(ptr + size)
+            owners.append(tensor)
+
+    order = sorted(range(len(starts)), key=lambda i: starts[i])
+    starts = [starts[i] for i in order]
+    ends = [ends[i] for i in order]
+    owners = [owners[i] for i in order]
+
+    def find_parent(dst):
+        try:
+            ptr = dst.data_ptr()
+        except RuntimeError:
+            return None
+        idx = bisect.bisect_right(starts, ptr) - 1
+        if 0 <= idx < len(starts) and starts[idx] <= ptr < ends[idx]:
+            return owners[idx]
+        return None
+
+    return find_parent
+
+
+@contextlib.contextmanager
+def _delta_apply_context(model):
+    """Patch copy_/fill_ so NaN source values leave model params unchanged."""
+    is_param_target = _param_storage_index(model)
+    original_copy_ = torch.Tensor.copy_
+    original_fill_ = torch.Tensor.fill_
+
+    def patched_copy_(self, src, *args, **kwargs):
+        if is_param_target(self) is not None:
+            src_aligned = src.to(device=self.device, dtype=self.dtype) if src.dtype != self.dtype else src
+            mask = ~torch.isnan(src_aligned)
+            self[mask] = src_aligned[mask]
+            return self
+        return original_copy_(self, src, *args, **kwargs)
+
+    def patched_fill_(self, value):
+        if is_param_target(self) is not None:
+            try:
+                if math.isnan(value):
+                    return self
+            except TypeError:
+                pass
+            return original_fill_(self, value)
+        return original_fill_(self, value)
+
+    original_post_load = getattr(model, "post_load_weights", None)
+    if original_post_load is not None:
+
+        def wrapped_post_load(*args, **kwargs):
+            current_copy = torch.Tensor.copy_
+            current_fill = torch.Tensor.fill_
+            torch.Tensor.copy_ = original_copy_
+            torch.Tensor.fill_ = original_fill_
+            try:
+                return original_post_load(*args, **kwargs)
+            finally:
+                torch.Tensor.copy_ = current_copy
+                torch.Tensor.fill_ = current_fill
+
+        model.post_load_weights = wrapped_post_load
+
+    torch.Tensor.copy_ = patched_copy_
+    torch.Tensor.fill_ = patched_fill_
+    try:
+        yield
+    finally:
+        torch.Tensor.copy_ = original_copy_
+        torch.Tensor.fill_ = original_fill_
+        if original_post_load is not None:
+            model.post_load_weights = original_post_load
+
+
+def _delta_checksum(positions: torch.Tensor, values: torch.Tensor) -> int:
+    p = int(torch.hash_tensor(positions).item()) if positions.numel() else 0
+    v = int(torch.hash_tensor(values).item()) if values.numel() else 0
+    return p ^ (v << 1)
+
+
+def _maybe_zstd_decompress(blob: bytes) -> bytes:
+    # Zstandard frame magic: 0xFD2FB528 little-endian.
+    if blob.startswith(b"\x28\xb5\x2f\xfd"):
+        import zstandard
+
+        return zstandard.ZstdDecompressor().decompress(blob)
+    return blob
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

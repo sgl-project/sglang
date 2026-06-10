@@ -1019,6 +1019,7 @@ class Engine(EngineScoreMixin, EngineBase):
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
         load_format: Optional[str] = None,
+        delta: Optional[str] = None,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -1028,6 +1029,7 @@ class Engine(EngineScoreMixin, EngineBase):
             group_name=group_name,
             flush_cache=flush_cache,
             load_format=load_format,
+            delta=delta,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
@@ -1061,6 +1063,7 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         model_path: str,
         load_format: Optional[str] = None,
+        files: Optional[List[str]] = None,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
@@ -1071,6 +1074,7 @@ class Engine(EngineScoreMixin, EngineBase):
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
             load_format=load_format,
+            files=files,
         )
 
         return self.loop.run_until_complete(

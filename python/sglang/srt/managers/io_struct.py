@@ -1416,6 +1416,8 @@ class PauseContinueBroadcast:
 class UpdateWeightFromDiskReqInput(BaseReq):
     # The model path with the new weights
     model_path: str
+    # Required iff load_format == "delta": basenames under model_path to apply.
+    files: Optional[List[str]] = None
     # The format to load the weights
     load_format: Optional[str] = None
     # Whether to abort all requests before updating weights
@@ -1446,6 +1448,37 @@ class UpdateWeightFromDiskReqOutput(BaseReq):
     num_paused_requests: Optional[int] = 0
 
 
+class DeltaEncoding(str, Enum):
+    """Position encoding for delta weight updates."""
+
+    INDICES = "indices"
+    DELTAS = "deltas"
+    DELTAS_ZSTD = "deltas_zstd"
+
+
+@dataclass
+class DeltaParam:
+    """Per-param slice into the shared (positions, values) delta payload."""
+
+    name: str
+    dtype: str
+    shape: List[int]
+    pos_start: int
+    pos_end: int
+    pos_width: int
+    val_start: int
+    val_end: int
+
+
+@dataclass
+class DeltaSpec:
+    """Decoding manifest for one delta bucket."""
+
+    encoding: DeltaEncoding
+    params: List[DeltaParam]
+    checksum: int = 0
+
+
 @dataclass
 class UpdateWeightsFromDistributedReqInput(BaseReq):
     names: List[str]
@@ -1461,6 +1494,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # JSON-encoded DeltaSpec; required iff load_format == "delta".
+    delta: Optional[str] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 

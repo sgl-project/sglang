@@ -98,6 +98,7 @@ class BaseTpWorker(ABC):
         success, message = self.model_runner.update_weights_from_disk(
             recv_req.model_path,
             recv_req.load_format,
+            files=recv_req.files,
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
@@ -153,6 +154,7 @@ class BaseTpWorker(ABC):
             recv_req.shapes,
             recv_req.group_name,
             recv_req.load_format,
+            recv_req.delta,
         )
         return success, message
 

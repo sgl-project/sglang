@@ -821,6 +821,8 @@ class ServerArgs:
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
+    update_weight_delta_chunk_bytes: int = 512 * 1024 * 1024
+    update_weight_delta_read_workers: int = 4
     weight_loader_prefetch_checkpoints: bool = False
     weight_loader_prefetch_num_threads: int = 4
     weight_loader_drop_cache_after_load: bool = False
@@ -7015,6 +7017,18 @@ class ServerArgs:
             "--weight-loader-disable-mmap",
             action="store_true",
             help="Disable mmap while loading weight using safetensors.",
+        )
+        parser.add_argument(
+            "--update-weight-delta-chunk-bytes",
+            type=int,
+            default=ServerArgs.update_weight_delta_chunk_bytes,
+            help="Byte cap per model.load_weights call when applying a delta update.",
+        )
+        parser.add_argument(
+            "--update-weight-delta-read-workers",
+            type=int,
+            default=ServerArgs.update_weight_delta_read_workers,
+            help="Max parallel I/O threads for reading delta update files from disk.",
         )
         parser.add_argument(
             "--weight-loader-prefetch-checkpoints",
