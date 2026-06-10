@@ -52,9 +52,9 @@ _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
 def is_dsv4_moe_rs_to_next_attn_enabled() -> bool:
     # DSV4 MoE-post reduce-scatter is an AMD/ROCm-only optimization
-    # (validated on gfx950); gate on HIP so DSV4_MOE_RS_TO_NEXT_ATTN is a
+    # (validated on gfx950); gate on HIP so SGLANG_DSV4_MOE_RS_TO_NEXT_ATTN is a
     # no-op on CUDA/other backends.
-    return _is_hip and get_bool_env_var("DSV4_MOE_RS_TO_NEXT_ATTN", "0")
+    return _is_hip and get_bool_env_var("SGLANG_DSV4_MOE_RS_TO_NEXT_ATTN", "0")
 
 
 class DpPaddingMode(IntEnum):

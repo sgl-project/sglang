@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.utils import (
     is_tbo_enabled,
     should_skip_post_experts_all_reduce,
     should_use_dp_reduce_scatterv,
+    should_use_dsv4_dp_moe_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 
@@ -27,6 +28,7 @@ __all__ = [
     "get_deepep_mode",
     "should_skip_post_experts_all_reduce",
     "should_use_dp_reduce_scatterv",
+    "should_use_dsv4_dp_moe_reduce_scatterv",
     "should_use_flashinfer_cutlass_moe_fp4_allgather",
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",

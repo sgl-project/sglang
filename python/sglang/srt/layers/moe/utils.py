@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
+    is_dsv4_moe_rs_to_next_attn_enabled,
 )
 from sglang.srt.utils import is_npu
 
@@ -425,6 +426,23 @@ def should_use_dp_reduce_scatterv():
         and is_dp_attention_enabled()
         and get_attention_dp_size() > 1
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+    )
+
+
+def should_use_dsv4_dp_moe_reduce_scatterv():
+    """
+    DSV4-specific variant of :func:`should_use_dp_reduce_scatterv` for the
+    post-MoE combine under DP attention + TP-MoE (AMD/ROCm only, gated by
+    ``SGLANG_DSV4_MOE_RS_TO_NEXT_ATTN``). Unlike ``should_use_dp_reduce_scatterv``
+    it does not require ``moe_expert_parallel_world_size == attention_dp_size``,
+    so it also covers the MoE-TP layout. Only changes the combine; dispatch is
+    unchanged.
+    """
+    return (
+        is_dsv4_moe_rs_to_next_attn_enabled()
+        and is_dp_attention_enabled()
+        and get_attention_dp_size() > 1
+        and get_moe_a2a_backend().is_none()
     )
 
 

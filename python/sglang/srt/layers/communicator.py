@@ -56,7 +56,6 @@ from sglang.srt.layers.dp_attention import (
     get_moe_cp_size,
     is_allocation_symmetric,
     is_dp_attention_enabled,
-    is_dsv4_moe_rs_to_next_attn_enabled,
     is_enable_moe_cp_allgather,
     moe_cp_all_gather_into_tensor,
 )
@@ -64,6 +63,7 @@ from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_una
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
+    should_use_dsv4_dp_moe_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
@@ -98,15 +98,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-
-
-def should_use_dsv4_dp_moe_reduce_scatterv() -> bool:
-    return (
-        is_dsv4_moe_rs_to_next_attn_enabled()
-        and is_dp_attention_enabled()
-        and get_attention_dp_size() > 1
-        and get_moe_a2a_backend().is_none()
-    )
 
 
 if _use_aiter:
