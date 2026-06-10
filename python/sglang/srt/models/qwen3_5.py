@@ -75,6 +75,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -132,6 +133,15 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
     )
+
+_aiter_fused_qkv_split_qk_norm_rope_cache = None
+if _is_hip and get_bool_env_var("SGLANG_USE_AITER_FUSED_QK_NORM_ROPE_CACHE", "false"):
+    try:
+        from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
+            fused_qkv_split_qk_norm_rope_cache as _aiter_fused_qkv_split_qk_norm_rope_cache,
+        )
+    except ImportError:
+        _aiter_fused_qkv_split_qk_norm_rope_cache = None
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -909,6 +919,57 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
         return q, k, v, gate
 
+    def _prepare_qkv_aiter_fused(self, positions, hidden_states, forward_batch):
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        pool = get_token_to_kv_pool()
+        k_buffer = pool.get_key_buffer(self.attn.layer_id)
+        v_buffer = pool.get_value_buffer(self.attn.layer_id)
+
+        # Pool stores K/V as flat per-token NHD: [size+page_size, head_num, head_dim].
+        # The aiter kernel wants paged NHD: [num_blocks, page_size, head_num, head_dim].
+        page_size = pool.page_size
+        num_blocks = k_buffer.shape[0] // page_size
+        key_cache = k_buffer.view(
+            num_blocks, page_size, k_buffer.shape[1], k_buffer.shape[2]
+        )
+        value_cache = v_buffer.view(
+            num_blocks, page_size, v_buffer.shape[1], v_buffer.shape[2]
+        )
+
+        # SGLang stores cos|sin concatenated along last dim; aiter wants them split.
+        cos, sin = self.rotary_emb.cos_sin_cache.chunk(2, dim=-1)
+
+        result = _aiter_fused_qkv_split_qk_norm_rope_cache(
+            qkv=qkv,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            cos=cos,
+            sin=sin,
+            positions=positions,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=forward_batch.out_cache_loc,
+            qh=self.num_heads,
+            kvh=self.num_kv_heads,
+            head_dim=self.head_dim,
+            is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+            attn_output_gate=self.attn_output_gate,
+            gated_qkv_layout="interleaved",
+            kv_cache_layout="NHD",
+            k_scale=self.attn.k_scale,
+            v_scale=self.attn.v_scale,
+            eps=self.q_norm.variance_epsilon,
+        )
+
+        if self.attn_output_gate:
+            q, gate, k, v = result
+            gate = gate.reshape(gate.shape[0], -1)
+        else:
+            q, k, v = result
+            gate = None
+        return q, k, v, gate
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -916,23 +977,52 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
-            q, k, v, gate = self.forward_prepare_native(
-                positions=positions,
-                hidden_states=hidden_states,
+        # Fused QK-norm+RoPE+cache is ROCm/aiter-only; the kernel handle is None on
+        # every other platform, so skip the gating (and its mm/position probing)
+        # entirely there and fall through to the native/NPU path unchanged.
+        use_aiter_fused = False
+        if _aiter_fused_qkv_split_qk_norm_rope_cache is not None:
+            # mRoPE uses 3-row positions [3, T] but the fused kernel does 1-D RoPE
+            # only; fuse on row 0 only when there are no mm inputs (rows then identical).
+            if positions.dim() == 2 and positions.shape[0] == 3:
+                positions_fusable = not forward_batch.contains_mm_inputs()
+                fused_positions = positions[0]
+            else:
+                # Plain 1-D positions fuse directly; anything else is not fusable.
+                positions_fusable = positions.dim() == 1
+                fused_positions = positions
+
+            # The fused kernel writes the KV cache inline, so require a real
+            # out_cache_loc (it is None during warmup/idle).
+            use_aiter_fused = (
+                positions_fusable and forward_batch.out_cache_loc is not None
             )
-        else:
-            q, k, v, gate = self.forward_prepare_npu(
-                positions=positions,
+
+        if use_aiter_fused:
+            q, k, v, gate = self._prepare_qkv_aiter_fused(
+                positions=fused_positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=False)
+        else:
+            if (
+                not _is_npu
+                or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+                or not self.attn_output_gate
+            ):
+                q, k, v, gate = self.forward_prepare_native(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
+            else:
+                q, k, v, gate = self.forward_prepare_npu(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+            attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
