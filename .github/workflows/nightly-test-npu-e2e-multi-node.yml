@@ -6,7 +6,7 @@ on:
       runner:
         required: false
         type: string
-        default: linux-aarch64-a3-0
+        default: linux-amd64-cpu-8
       test_type:
         required: false
         type: string
