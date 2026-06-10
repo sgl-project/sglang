@@ -200,6 +200,8 @@ class NGRAMWorker:
         if not prev_token_ids.is_cpu:
             prev_token_ids = prev_token_ids.cpu()
             prev_accept_lens = prev_accept_lens.cpu()
+        # Worker-level staging: written here at draft prep, consumed by
+        # _update_ngram_corpus after verify within the same forward call.
         self.prev_token_ids = prev_token_ids.tolist()
         self.prev_accept_lens = prev_accept_lens.tolist()
 
