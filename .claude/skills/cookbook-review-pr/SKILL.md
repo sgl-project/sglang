@@ -145,7 +145,10 @@ than restating.
   `generation_config.json` defaults); listing them in §1 informationally is fine.
 
 ### 10. Quantization rules
-- FP4 is Blackwell-only (B200/B300/GB300) — never AMD; AMD FP4 chips must be `disabled`.
+- **NVFP4** checkpoints are Blackwell-only (B200/B300/GB300) — never AMD. An AMD FP4 cell
+  is legitimate ONLY when the vendor published an **MXFP4** checkpoint for it (e.g.
+  `amd/Qwen3.5-397B-A17B-MXFP4` on MI355X) — verify the HF repo resolves; otherwise the
+  AMD FP4 chip must be absent/`disabled`.
 - BF16 / FP8 work on NVIDIA and AMD. FP8 configs adding `--kv-cache-dtype fp8_e4m3` should
   note the accuracy trade-off.
 
