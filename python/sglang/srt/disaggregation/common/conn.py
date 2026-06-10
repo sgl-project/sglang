@@ -127,9 +127,9 @@ class CommonKVManager(BaseKVManager):
         )
 
         # bind zmq socket
-        context = zmq.Context()
+        self._zmq_ctx = zmq.Context()
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            context, zmq.PULL, host=self.local_ip
+            self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
@@ -430,10 +430,14 @@ class CommonKVManager(BaseKVManager):
         with self._push_socket_lock:
             if endpoint in self._push_socket_cache:
                 return self._push_socket_cache[endpoint]
-            sock = zmq.Context().socket(zmq.PUSH)
+            sock = self._zmq_ctx.socket(zmq.PUSH)
             sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.SNDTIMEO, 10000)
-            sock.setsockopt(zmq.RECONNECT_IVL_MAX, 30000)
+            sock.setsockopt(zmq.RECONNECT_IVL, -1)
+            sock.setsockopt(zmq.SNDTIMEO, 30000)
+            sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
             if is_ipv6:
                 sock.setsockopt(zmq.IPV6, 1)
             sock.connect(endpoint)
@@ -1046,7 +1050,12 @@ class CommonKVReceiver(BaseKVReceiver):
             if endpoint not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
                 sock.setsockopt(zmq.LINGER, 0)
-                sock.setsockopt(zmq.RECONNECT_IVL_MAX, 30000)
+                sock.setsockopt(zmq.RECONNECT_IVL, -1)
+                sock.setsockopt(zmq.SNDTIMEO, 30000)
+                sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+                sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+                sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+                sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
                 sock.connect(endpoint)
