@@ -147,9 +147,6 @@ def _forward_with_allreduce_fusion(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
-        from sglang.srt.compilation.piecewise_context_manager import (
-            is_in_piecewise_cuda_graph,
-        )
         from sglang.srt.distributed import (
             get_attn_tensor_model_parallel_world_size,
             get_moe_expert_parallel_world_size,
@@ -172,15 +169,6 @@ def _forward_with_allreduce_fusion(
         if world_size > 1:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-
-            # Under piecewise CUDA graph (PCG), aiter's fused AR+RMSNorm is a
-            # JIT/pybind kernel that torch.compile cannot trace. Skip it and use
-            # the traceable all-reduce custom op + RMSNorm instead. This only
-            # affects the PCG-captured prefill path; decode keeps the fused
-            # kernel (is_in_piecewise_cuda_graph() is False there).
-            if _use_aiter and is_in_piecewise_cuda_graph():
-                x = tensor_model_parallel_all_reduce(x)
-                return norm_module.forward(x, residual, None)
 
             # Prefer AITER fused AR+RMSNorm when enabled on AMD.
             if _use_aiter:
