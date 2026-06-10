@@ -10,7 +10,7 @@ def _get_pipeline_class_name(extra_argv):
     return None
 
 
-def _has_registered_pipeline_class(extra_argv):
+def has_registered_pipeline_class(extra_argv):
     pipeline_class_name = _get_pipeline_class_name(extra_argv)
     if not pipeline_class_name:
         return False

@@ -6,6 +6,7 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
+from sglang.cli.utils import get_is_diffusion_model
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
@@ -32,8 +33,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.registry import _get_config_info
-from sglang.multimodal_gen.runtime.entrypoints.cli.generate_routing import (
-    _has_registered_pipeline_class,
+from sglang.multimodal_gen.runtime.entrypoints.cli.routing import (
+    has_registered_pipeline_class,
 )
 from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
     KERNEL_COMPILE_ITERS_ENV,
@@ -221,7 +222,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
     def test_generate_cli_accepts_registered_pipeline_class(self):
         self.assertTrue(
-            _has_registered_pipeline_class(
+            has_registered_pipeline_class(
                 [
                     "--model-path",
                     "/data/LTX-2.3",
@@ -231,18 +232,29 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             )
         )
         self.assertTrue(
-            _has_registered_pipeline_class(
+            has_registered_pipeline_class(
                 ["--model-path", "/data/LTX-2.3", "--pipeline-class-name=LTX2Pipeline"]
             )
         )
         self.assertFalse(
-            _has_registered_pipeline_class(
+            has_registered_pipeline_class(
                 [
                     "--model-path",
                     "/data/LTX-2.3",
                     "--pipeline-class-name",
                     "MissingPipeline",
                 ]
+            )
+        )
+        self.assertTrue(
+            get_is_diffusion_model(
+                "/data/LTX-2.3",
+                [
+                    "--model-path",
+                    "/data/LTX-2.3",
+                    "--pipeline-class-name",
+                    "LTX2Pipeline",
+                ],
             )
         )
 
