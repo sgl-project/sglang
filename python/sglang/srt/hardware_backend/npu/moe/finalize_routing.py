@@ -51,7 +51,7 @@ class NPUFinalizeRouting(BaseFinalizeRouting):
             scales=topk_weights,
             expanded_src_to_dst_row=expanded_row_idx,
             export_for_source_row=topk_ids,
-            #drop_pad_mode=self.drop_pad_mode,
+            drop_pad_mode=self.drop_pad_mode,
         )
         return final_hidden_states
 
