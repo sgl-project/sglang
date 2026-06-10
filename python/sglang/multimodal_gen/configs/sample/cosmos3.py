@@ -63,6 +63,13 @@ class Cosmos3SamplingParams(SamplingParams):
     # Action data for forward_dynamics: [T, D] nested list (API) or JSON string
     # (CLI via --action). Ignored by the other action modes.
     action: Any = None
+    # Viewpoint phrasing for the structured action caption.
+    action_view_point: str = "ego_view"
+    # Optional dataset-derived action stats (JSON) for (de)normalization. When
+    # set, input actions are normalized and predicted actions de-normalized
+    # into physical units with ``action_normalization``.
+    action_stats_path: str | None = None
+    action_normalization: str = "quantile"
 
     def _set_output_file_name(self) -> None:
         # The pipeline config's ``task_type=TI2V`` drives ``data_type`` to

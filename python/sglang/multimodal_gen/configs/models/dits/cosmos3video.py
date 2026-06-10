@@ -155,6 +155,7 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     unified_3d_mrope_temporal_modality_margin: int = 15000
 
     # Audio (sound) modality
+    sound_gen: bool = False
     sound_dim: int = 64
     sound_latent_fps: float = 25.0
     temporal_compression_factor_sound: int = 1
