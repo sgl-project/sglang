@@ -659,6 +659,8 @@ class DeepseekV4AttnBackend(
                     use_prefill_cuda_graph=use_graph_plan,
                     online_state_slot_offset=online_c128_state_slot_offset,
                 )
+        c4_compress_metadata = create(compress_ratio=4)
+        c128_compress_metadata = create(compress_ratio=128)
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
@@ -1078,6 +1080,7 @@ class DeepseekV4AttnBackend(
         max_seq_len_override: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
     ):
+        logical_forward_mode = _get_logical_forward_mode(forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
