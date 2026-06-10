@@ -643,11 +643,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                is_propagated = False
                 try:
                     decode_req.kv_receiver.failure_exception()
                 except Exception as e:
                     error_message += f" with exception {e}"
-                logger.error(error_message)
+                    is_propagated = getattr(e, "is_from_another_rank", False)
+                # Mute error message for propagated exceptions to avoid duplicate logging
+                if is_propagated:
+                    logger.debug(error_message)
+                else:
+                    logger.error(error_message)
                 prepare_abort(
                     decode_req.req,
                     error_message,
@@ -1609,13 +1615,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
+                is_propagated = False
                 if poll == KVPoll.Failed:
                     try:
                         decode_req.kv_receiver.failure_exception()
                     except Exception as e:
                         error_message += f" with exception {e}"
+                        is_propagated = getattr(e, "is_from_another_rank", False)
                 self._clean_hicache_prefetch_resources(decode_req)
-                logger.error(error_message)
+                # Mute error message for propagated exceptions to avoid duplicate logging
+                if is_propagated:
+                    logger.debug(error_message)
+                else:
+                    logger.error(error_message)
                 prepare_abort(
                     decode_req.req,
                     error_message,

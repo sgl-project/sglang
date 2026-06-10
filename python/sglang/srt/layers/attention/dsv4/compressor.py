@@ -179,6 +179,8 @@ class CompressorBackendMixin:
             if compressor.ratio == 4
             else core_metadata.c128_out_loc
         )
+        if out_loc.shape[0] > new_compressed_kv.shape[0]:
+            out_loc = out_loc[: new_compressed_kv.shape[0]]
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_extra_key_buffer_fused(
                 layer_id=layer_id,
@@ -202,16 +204,19 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch, attn_backend=self)
+        out_loc = self.forward_metadata.core_metadata.c4_out_loc
+        if out_loc.shape[0] > new_compressed_kv.shape[0]:
+            out_loc = out_loc[: new_compressed_kv.shape[0]]
         if self.enable_deepseek_v4_fp4_indexer:
             token_to_kv_pool.set_index_k_fp4(
                 layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                loc=out_loc,
                 cache_k=new_compressed_kv,
             )
         elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                loc=out_loc,
                 cache_k=new_compressed_kv,
             )
         else:
@@ -220,7 +225,7 @@ class CompressorBackendMixin:
             )
             token_to_kv_pool.set_index_k_scale_buffer(
                 layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                loc=out_loc,
                 index_k=new_compressed_kv_fp8,
                 index_k_scale=new_compressed_kv_scale,
             )
@@ -405,9 +410,9 @@ class Compressor(nn.Module):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        if _tgemm is not None:
-            # linear_bf16_fp32 uses tgemm.mm + .float(); skip the .float() cast
-            # because downstream Triton kernels promote bf16→fp32 internally.
+        if _tgemm is not None and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+            # v1 compress goes through fused_compress_triton, which promotes
+            # bf16->fp32 internally, so skip the .float() cast.
             kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
         else:
             kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
