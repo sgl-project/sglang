@@ -146,7 +146,7 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_ngram()
 
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
@@ -205,11 +205,6 @@ class SpeculativeAlgorithm(Enum):
 
             return StandaloneWorkerV2
         elif self.is_ngram():
-            if enable_overlap:
-                raise ValueError(
-                    f"Speculative algorithm {self.name} does not support overlap worker creation."
-                )
-
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
