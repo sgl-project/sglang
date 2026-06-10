@@ -629,6 +629,7 @@ class SchedulerBatchResultProcessor:
         # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
+        is_prebuilt_batch = batch.forward_mode.is_prebuilt()
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -652,6 +653,18 @@ class SchedulerBatchResultProcessor:
                 if req.grammar is not None:
                     req.grammar.finished = req.finished()
                 continue
+
+            if (
+                is_prebuilt_batch
+                and getattr(req, "dsv4_decode_radix_cache_prompt_once", False)
+            ):
+                # process_prebuilt() runs before the prebuilt forward and the
+                # batch still references the request-owned prompt pages via
+                # out_cache_loc. Insert only after forward completes so overlap
+                # insertion can safely free duplicate prompt KV.
+                req.dsv4_decode_radix_cache_prompt_once = False
+                req.allow_radix_cache_insert_once = True
+                maybe_cache_unfinished_req(req, self.tree_cache)
 
             # Non-spec and V2: full post-processing
             next_token_id = next_token_ids[i]
