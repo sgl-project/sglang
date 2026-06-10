@@ -32,6 +32,10 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    cuda_graph_fully_disabled,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -114,8 +118,8 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
         )
 
         # Defer cuda graph capture; we do it ourselves below.
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        backup_decode_mode = server_args.cuda_graph_config.decode.backend
+        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         # Draft attention uses target req_to_token + KV allocator (read-only).
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -166,8 +170,8 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
         if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
             self._bind_kv_context()
 
-        self.draft_model_runner.server_args.disable_cuda_graph = (
-            backup_disable_cuda_graph
+        self.draft_model_runner.server_args.cuda_graph_config.decode.backend = (
+            backup_decode_mode
         )
 
         self.draft_tp_context = (
@@ -324,7 +328,7 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
             self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def init_cuda_graphs(self) -> None:
-        if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
+        if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
             return
         if self.target_worker.device != "cuda":
             logger.info(
