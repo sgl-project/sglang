@@ -444,26 +444,19 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         # Process scale
-        scale: torch.Tensor = getattr(layer, f"{weight_prefix}_weight_scale")
-        setattr(
-            layer,
-            f"{weight_prefix}_weight_scale",
-            torch.nn.Parameter(scale.data.squeeze(-1), requires_grad=False),
-        )
+        scale = scale.data.transpose(-1, -2).contiguous()  # [E, N, 1] -> [E, 1, N]
+        setattr(layer, f"{weight_prefix}_weight_scale",
+                torch.nn.Parameter(scale, requires_grad=False))
         self._cached_scale[weight_prefix] = getattr(
             layer, f"{weight_prefix}_weight_scale"
         )
 
         # Process offset
-        offset: Optional[torch.Tensor] = getattr(
-            layer, f"{weight_prefix}_weight_offset", None
-        )
+        offset = getattr(layer, f"{weight_prefix}_weight_offset", None)
         if offset is not None:
-            setattr(
-                layer,
-                f"{weight_prefix}_weight_offset",
-                torch.nn.Parameter(offset.data.squeeze(-1), requires_grad=False),
-            )
+            offset = offset.data.transpose(-1, -2).contiguous()
+            setattr(layer, f"{weight_prefix}_weight_offset",
+                    torch.nn.Parameter(offset, requires_grad=False))
         self._cached_offset[weight_prefix] = getattr(
             layer, f"{weight_prefix}_weight_offset", None
         )
@@ -590,7 +583,7 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
-#  NPUW16A16Bf16MoEMethod
+#  NPUWUnquantMoEMethod
 # ---------------------------------------------------------------------------
 class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
     """Unquant MoE – all computations in BF16, no quantization."""
