@@ -730,6 +730,7 @@ class ModelRunnerKVCacheMixin:
                 )
             elif _is_npu and (
                 self.server_args.attention_backend == "ascend"
+                or is_dsv4_model
                 or self.hybrid_gdn_config is not None
             ):
                 if self.is_hybrid_swa:

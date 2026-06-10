@@ -21,7 +21,12 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
         )
 
     if server_args.device == "npu":
-        server_args.attention_backend = "ascend"
+        # NPU keeps the device-aware "dsv4" backend (the registry routes it to
+        # the Ascend V4 subclass); only the pool geometry / dtype differ.
+        # set_default_server_args() pins all three backends to "ascend" for
+        # generic NPU models; undo that here so V4 stays consistently on dsv4.
+        server_args.prefill_attention_backend = "dsv4"
+        server_args.decode_attention_backend = "dsv4"
         server_args.page_size = 128
         server_args.kv_cache_dtype = "bfloat16"
 
