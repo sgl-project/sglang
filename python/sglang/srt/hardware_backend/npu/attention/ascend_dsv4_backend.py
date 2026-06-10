@@ -1131,7 +1131,7 @@ class DeepseekV4AscendAttnBackend(
         assert cmp_native_page_size == ori_page_size, (
             f"cmp page_size={cmp_native_page_size} != ori page_size={ori_page_size}; "
             "c{N}_kv_pool must be allocated with the global page_size on NPU "
-            "(see DeepSeekV4SingleKVPool.kernel_page_size)"
+            "(see NPUDeepSeekV4SingleKVPool.kernel_page_size)"
         )
 
         attn_kwargs = dict(

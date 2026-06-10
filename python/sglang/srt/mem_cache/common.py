@@ -355,15 +355,23 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
-def _get_dsv4_state_lens(batch):
-    """Return the per-req c{4,128}_state pool alloc lens (a ``DSV4StateLens``)
-    the scheduler attached to the batch in
-    :meth:`ScheduleBatch._compute_dsv4_state_lens_extend` / ``..._decode``.
+def _compute_dsv4_state_lens(batch, *, is_decode: bool):
+    """Per-req c{4,128}_state pool alloc lens (a ``DSV4StateLens``) for this
+    alloc step. The DSV4-NPU allocator owns the computation (it also mutates the
+    per-req cumulative state on each ``Req``); we just trigger it here, right
+    before the paged alloc that consumes the result.
 
-    None on CUDA / non-V4 paths (where the helper did not run), so the
-    ``alloc_paged_token_slots_*`` forwarding stays a no-op.
+    None on CUDA / non-V4 paths (allocator has no ``compute_dsv4_state_lens_*``)
+    so the ``alloc_paged_token_slots_*`` forwarding stays a no-op.
     """
-    return getattr(batch, "dsv4_state_lens", None)
+    allocator = batch.token_to_kv_pool_allocator
+    if not hasattr(allocator, "compute_dsv4_state_lens_extend"):
+        return None
+    if is_decode:
+        return allocator.compute_dsv4_state_lens_decode(batch.reqs)
+    return allocator.compute_dsv4_state_lens_extend(
+        batch.reqs, batch.seq_lens_cpu.tolist()
+    )
 
 
 def alloc_paged_token_slots_extend(
@@ -388,13 +396,6 @@ def alloc_paged_token_slots_extend(
     if backup_state:
         state = allocator.backup_state()
 
-    # DSV4-NPU allocator additionally needs req_pool_indices (for c-pool
-    # last_loc lookup via per-req tables) and the per-req c{4,128}_state pool
-    # lens (DSV4StateLens — tail-only allocation in a separate paged slot
-    # space). It returns a DSV4OutCacheLoc bundle (not a bare loc tensor); we
-    # unpack out_full_loc for the generic return and stash the bundle on the
-    # batch so the attention backend / per-req-table hooks read it explicitly
-    # off the batch. Gate via hasattr so non-DSV4 allocators stay unchanged.
     is_dsv4 = req_pool_indices is not None and hasattr(
         allocator, "c4_attn_allocator"
     )
@@ -518,7 +519,7 @@ def alloc_for_extend(
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
-            dsv4_state_lens=_get_dsv4_state_lens(batch),
+            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
             batch=batch,
         )
 
@@ -643,7 +644,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             last_loc=last_loc,
             token_per_req=token_per_req,
             req_pool_indices=batch.req_pool_indices,
-            dsv4_state_lens=_get_dsv4_state_lens(batch),
+            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
             batch=batch,
         )
 

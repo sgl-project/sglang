@@ -29,7 +29,7 @@ The subclass overrides only:
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch_npu
@@ -38,9 +38,51 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4IndexerPool,
+    DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
     ONLINE_C128,
 )
+
+
+class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
+    """NPU bf16 variant of the full / SWA / c4 / c128 single-KV pool.
+
+    ``npu_sparse_attn_sharedkv`` reads KV in PA_ND layout
+    ``(num_pages, kernel_page_size, num_kv_heads=1, dim)`` with ``dim`` packing
+    K_nope + K_rope as bf16, and requires ``cmp_kv.shape[1] == ori_kv.shape[1]``.
+    So the c4/c128 pools (whose token-level page_size is ``page_size // ratio``)
+    are allocated at the GLOBAL ``kernel_page_size`` rather than their own
+    per-ratio page_size; the SWA pool uses ``kernel_page_size == page_size``.
+    The CUDA fp8-packed-bytes layout (the base ``create_buffer``) is untouched.
+    """
+
+    def __init__(self, *args, kernel_page_size: int, **kwargs):
+        # Set before super().__init__ — it calls _create_buffers() ->
+        # create_buffer(), which reads self.kernel_page_size.
+        self.kernel_page_size = kernel_page_size
+        super().__init__(*args, **kwargs)
+
+    def create_buffer(self, *, num_pages: int):
+        # Non-bf16 store dtype (should not happen on the NPU DSV4 path) falls
+        # back to the base packed layout.
+        if self.store_dtype != torch.bfloat16:
+            return super().create_buffer(num_pages=num_pages)
+        kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.kv_cache_total_dim = kv_dim
+        # Use the GLOBAL kernel_page_size so cmp_kv.shape[1] == ori_kv.shape[1].
+        # Writes are flat-indexed (set_compress_buffer flattens (0, 1) and
+        # indexes by loc), so page granularity affects only shape, not location.
+        npu_num_pages = (
+            self.size + self.kernel_page_size + 1
+        ) // self.kernel_page_size
+        return torch.zeros(
+            npu_num_pages,
+            self.kernel_page_size,
+            1,
+            kv_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
 
 
 def npu_state_pool_size(
@@ -240,11 +282,54 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
 class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     """NPU-only DSV4 KV pool with paged compress-state buffers.
 
-    Mirrors the CUDA :class:`DeepSeekV4TokenToKVPool` for full / SWA / c4 /
-    c128 KV pools (those layouts already match the kernel). The only
-    behavioral difference is the compress-state pool, which on NPU must be
-    paged rather than ring-buffered.
+    The full / SWA / c4 / c128 KV pools use the NPU bf16 PA_ND layout
+    (:class:`NPUDeepSeekV4SingleKVPool`); the compress-state pool is paged
+    (:class:`NPUCompressStatePool`) rather than ring-buffered; and the indexer
+    pool adds dedicated int8 K + fp16 scale buffers
+    (:class:`NPUDeepSeekV4IndexerPool`). The generic-accessor / port-hook
+    methods at the bottom of this class are the NPU equivalents of the CUDA
+    DSV4 store-cache chain — kept here, not in the community base, which raises
+    ``NotImplementedError`` for them (CUDA goes through the radix / store_cache
+    accessors instead).
     """
+
+    def _make_kv_pool(
+        self,
+        *,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        global_page_size: int,
+        cls: type = DeepSeekV4SingleKVPool,
+    ) -> NPUDeepSeekV4SingleKVPool:
+        # NPU does not use the HiSparse c4 device pool; fail loud if someone
+        # enables it so the silent layout mismatch surfaces at init.
+        assert cls is DeepSeekV4SingleKVPool, (
+            "enable_hisparse is not supported on the NPU DSV4 KV pool "
+            f"(got c4 pool class {cls.__name__})."
+        )
+        return NPUDeepSeekV4SingleKVPool(
+            size,
+            page_size,
+            dtype,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            kernel_page_size=global_page_size,
+        )
+
+    def _get_state_pool(self, layer_id: int, from_indexer: bool) -> CompressStatePool:
+        """Select this layer's attention vs c4-indexer compress-state pool.
+        Wraps the community getters so the NPU port hooks below don't index the
+        pool lists directly."""
+        if from_indexer:
+            return self.get_indexer_compress_states(layer_id)
+        return self.get_attention_compress_states(layer_id)
 
     def _make_attn_state_pool(
         self, ratio: int, enable_memory_saver: bool
@@ -306,6 +391,202 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             enable_memory_saver,
             kernel_page_size=self.page_size,
         )
+
+    def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
+        """fp32 ``[block_num, page_size, 2*coff*D]`` view of this layer's
+        kv+score buffer — the fused compressor op
+        (``torch.ops.custom.compressor``)'s ``state_cache`` argument."""
+        return self._get_state_pool(layer_id, from_indexer).state_cache_3d
+
+    # ------------------------------------------------------------------
+    # Generic KV accessors. The community base raises NotImplementedError for
+    # these (the CUDA DSV4 path uses set_swa_key_buffer_radix + store_cache);
+    # AscendAttnBackend.forward_extend reads KV through them, so we route to
+    # the right sub-pool by the layer's compression ratio.
+    # ------------------------------------------------------------------
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        item = self.layer_mapping[layer_id]
+        ratio = item.compress_ratio
+        if ratio in (0, 1):
+            return self.swa_kv_pool.kv_buffer[item.compress_layer_id]
+        if ratio == 4:
+            return self.c4_kv_pool.kv_buffer[item.compress_layer_id]
+        if ratio == 128:
+            return self.c128_kv_pool.kv_buffer[item.compress_layer_id]
+        raise ValueError(f"unsupported compress_ratio={ratio} for get_key_buffer")
+
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        # V4 uses MQA / latent attention — the K buffer doubles as V.
+        return self.get_key_buffer(layer_id)
+
+    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        buf = self.get_key_buffer(layer_id)
+        return buf, buf
+
+    def get_swa_buffer(
+        self, layer_id: int, loc: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Return the SWA layer's KV cache in PA_ND layout
+        (num_pages, page_size, num_kv_heads=1, dim). When ``loc`` is given,
+        flatten across (num_pages, page_size) and gather the matching tokens —
+        shape becomes (num_tokens, 1, dim).
+        """
+        # Index swa_kv_pool.kv_buffer by RAW layer_id, not by
+        # item.compress_layer_id: compress_layer_id is a per-bucket counter
+        # (c1/c4/c128 each starting at 0), so writes from different ratios
+        # would collide on the same kv_buffer slot. swa_kv_pool is sized with
+        # layer_num=total_layers, so per-layer slots already exist.
+        kv = self.swa_kv_pool.kv_buffer[layer_id]
+        if loc is not None:
+            kv = kv.flatten(0, 1)[loc]
+        return kv
+
+    def get_compress_buffer(
+        self,
+        layer_id: int,
+        from_indexer: bool = False,
+        loc: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Return the compressed KV buffer for a c4 / c128 layer.
+
+        Routes to c4 / c128 kv_pool by layer compression ratio. Returns
+        ``None`` for ratio in (0, 1) (no compress KV exists). The
+        from_indexer=True branch returns the dedicated int8 K buffer that
+        ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
+        """
+        item = self.layer_mapping[layer_id]
+        if item.compress_ratio == 4:
+            if from_indexer:
+                kv = self.c4_indexer_kv_pool.get_index_k(item.compress_layer_id)
+            else:
+                kv = self.c4_kv_pool.kv_buffer[item.compress_layer_id]
+        elif item.compress_ratio == 128:
+            assert not from_indexer, "c128 has no indexer pool"
+            kv = self.c128_kv_pool.kv_buffer[item.compress_layer_id]
+        else:
+            return None
+        if loc is not None:
+            kv = kv.flatten(0, 1)[loc]
+        return kv
+
+    def set_swa_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache: torch.Tensor,
+    ) -> None:
+        """Write ``cache`` into the SWA pool at flat token positions ``loc``.
+
+        ``cache`` shape: (num_tokens, num_kv_heads=1, dim). The buffer view is
+        (num_pages, page_size, 1, dim) so we flatten the first two dims and
+        index_put.
+        """
+        # Index by raw layer_id (see get_swa_buffer) to avoid bucket collision.
+        buf = self.swa_kv_pool.kv_buffer[layer_id]
+        buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
+        # Caller (V4 MQALayer) may hand us cache shaped (T, dim); the buffer has
+        # an explicit num_kv_heads=1 axis, so insert it.
+        if cache.ndim == buf_flat.ndim - 1:
+            cache = cache.unsqueeze(1)
+        buf_flat[loc] = cache.to(buf_flat.dtype)
+
+    # ------------------------------------------------------------------
+    # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu on top
+    # of CompressStatePool / NPUDeepSeekV4SingleKVPool / NPUDeepSeekV4IndexerPool.
+    # CompressStatePool stores a single fused [kv | score] tensor of shape
+    # (size, 2*coff*head_dim); split + cat is just a last-dim slice.
+    # ------------------------------------------------------------------
+
+    def set_state_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        kv: torch.Tensor,
+        score: torch.Tensor,
+        from_indexer: bool,
+    ) -> None:
+        # KVAndScore.kv_score is [..., 2*coff*head_dim] = [kv | score].
+        kv_score = self._get_state_pool(layer_id, from_indexer).kv_score_buffer.kv_score
+        last_dim = kv_score.shape[-1]
+        half = last_dim // 2
+        kv_view = kv.reshape(-1, half).to(kv_score.dtype)
+        score_view = score.reshape(-1, half).to(kv_score.dtype)
+        kv_score[loc, :half] = kv_view
+        kv_score[loc, half:] = score_view
+
+    def get_state_buffer(
+        self,
+        layer_id: int,
+        from_indexer: bool,
+        kv_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        kv_score = self._get_state_pool(layer_id, from_indexer).kv_score_buffer.kv_score
+        if kv_indices is not None:
+            kv_score = kv_score[kv_indices]
+        last_dim = kv_score.shape[-1]
+        half = last_dim // 2
+        kv = kv_score[..., :half].unsqueeze(-2)  # add num_kv_heads=1 axis
+        score = kv_score[..., half:].unsqueeze(-2)
+        return kv, score
+
+    def set_compress_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_scale: Optional[torch.Tensor],
+        from_indexer: bool,
+    ) -> None:
+        # Routes to:
+        #   from_indexer=True               → c4_indexer_kv_pool (int8 + scale)
+        #   from_indexer=False, ratio=4     → c4_kv_pool
+        #   from_indexer=False, ratio=128   → c128_kv_pool
+        #
+        # On NPU we bypass the CUDA fused_store_cache and do direct tensor
+        # writes against the bf16 buffer.
+        ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        device_type = kv.device.type
+        if from_indexer:
+            assert ratio == 4, f"indexer only on c4 layers, got ratio={ratio}"
+            if device_type == "npu":
+                assert self.c4_indexer_kv_pool.has_npu_storage, (
+                    "NPU index buffers not allocated — pool was init'd on CUDA?"
+                )
+                self.c4_indexer_kv_pool.set_index_k_scale(
+                    compress_layer_id, loc, kv, kv_scale
+                )
+                return
+            if kv_scale is None:
+                self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, kv)
+                return
+            self.c4_indexer_kv_pool.set_index_k_scale_buffer(
+                compress_layer_id, loc, kv, kv_scale
+            )
+            return
+        compress_pool = self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
+        if device_type == "npu":
+            # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
+            # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
+            buf = compress_pool.kv_buffer[compress_layer_id]
+            buf_flat = buf.flatten(0, 1)
+            kv_view = kv.to(buf_flat.dtype)
+            if kv_view.ndim == buf_flat.ndim - 1:
+                kv_view = kv_view.unsqueeze(1)
+            buf_flat[loc] = kv_view
+            return
+        compress_pool.set_key_buffer_fused(compress_layer_id, loc, kv)
+
+    def get_compress_dequant_scale_buffer(
+        self,
+        layer_id: int,
+        from_indexer: bool,
+    ) -> torch.Tensor:
+        # Returns the float16 dequant scale buffer (NPU indexer pool's dedicated
+        # scale buffer alongside the int8 K buffer).
+        assert from_indexer, "only indexer compress pool has dequant scale"
+        compress_layer_id = self.layer_mapping[layer_id].compress_layer_id
+        return self.c4_indexer_kv_pool.get_index_scale(compress_layer_id)
 
     def translate_kv_loc_to_compress_state_loc(
         self,
