@@ -1059,6 +1059,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.last_node = self.tree_cache.root_node
                     decode_req.req.swa_uuid_for_lock = None
 
+                if self._uses_dsv4_decode_radix_cache():
+                    # DSV4 compressed sidecars cannot rebuild SWA tombstones
+                    # from decode-radix protected prefix pages: those pages are
+                    # owned by the radix tree, not freshly allocated by this req.
+                    decode_req.req.swa_evicted_seqlen = max(
+                        decode_req.req.swa_evicted_seqlen, prefix_len
+                    )
+
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
                 )
