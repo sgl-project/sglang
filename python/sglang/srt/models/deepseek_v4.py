@@ -1328,15 +1328,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         name: str,
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
-        scale_suffix: str = "weight_scale_inv",
     ) -> str:
-        # ``scale_suffix`` controls how DeepSeek modelslim's ``.scale`` channel
-        # gets renamed to match the in-model parameter:
-        #  * "weight_scale_inv" — FP8 ckpts (deep_gemm convention, the default)
-        #  * "weight_scale"     — INT8 / W8A8 ckpts saved by compressed-tensors
-        # V4-Flash-W8A8 uses int-quantized + per-channel scale; without this
-        # parameterisation the loader looks up gate_up_proj.weight_scale_inv
-        # while the int8 quant scheme registers gate_up_proj.weight_scale.
         if name == "embed.weight":
             return "model.embed_tokens.weight"
         if name == "head.weight":
@@ -1369,9 +1361,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     elif rest.startswith("head."):
                         rest = "shared_head.head.weight"
                     elif rest == "e_proj.scale":
-                        rest = "e_proj." + scale_suffix
+                        rest = "e_proj.weight_scale_inv"
                     elif rest == "h_proj.scale":
-                        rest = "h_proj." + scale_suffix
+                        rest = "h_proj.weight_scale_inv"
                 name = f"model.layers.{num_hidden_layers}." + rest
 
         if name.startswith("layers."):
@@ -1381,9 +1373,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-        scale_target = "." + scale_suffix
         if "self_attn" in name:
-            name = name.replace(".scale", scale_target)
+            name = name.replace(".scale", ".weight_scale_inv")
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
@@ -1391,25 +1382,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
         if "mlp" in name:
-            name = name.replace(".scale", scale_target)
+            name = name.replace(".scale", ".weight_scale_inv")
 
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-
-        # Compressed-tensors saves int-quantized W8A8 ckpts with parameter
-        # name `weight_scale` while FP8 ckpts save `weight_scale_inv`. The
-        # remap below has to match whichever the model created — sniff it
-        # off any existing scale parameter, falling back to the FP8 default.
-        scale_suffix = "weight_scale_inv"
-        for _name in params_dict:
-            if _name.endswith(".weight_scale"):
-                scale_suffix = "weight_scale"
-                break
-            if _name.endswith(".weight_scale_inv"):
-                break  # default already correct
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -1488,7 +1467,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
-                        scale_suffix=scale_suffix,
                     )
 
                     layer_id = get_layer_id(name)

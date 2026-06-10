@@ -215,28 +215,6 @@ class CompressedTensorsConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> CompressedTensorsConfig:
         ignore: List[str] = cast(List[str], config.get("ignore", []))
-        # DeepSeek V4 modelslim ckpts (e.g. V4-Flash-W8A8) write the ignore
-        # list with native module naming (`layers.0.attn.wq_a`) while sglang
-        # registers the same modules under HF-style names
-        # (`model.layers.0.self_attn.wq_a`). Without this translation
-        # should_ignore_layer's exact-match probe never fires, so layers
-        # the ckpt left in bf16 get treated as int8-quantized; loading then
-        # blows up at `init para dtype and loaded weight dtype should be
-        # the same`. Inject the translated form alongside the original.
-        translated = []
-        for pat in ignore:
-            if pat.startswith("layers.") and ".attn." in pat:
-                translated.append(
-                    "model." + pat.replace(".attn.", ".self_attn.")
-                )
-            elif pat.startswith("layers.") and ".ffn." in pat:
-                translated.append(
-                    "model." + pat.replace(".ffn.", ".mlp.")
-                )
-            elif pat.startswith("layers."):
-                translated.append("model." + pat)
-        if translated:
-            ignore = list(ignore) + translated
         quant_format = cast(str, config.get("format"))
         target_scheme_map = cls._quantization_scheme_map_from_config(config=config)
         sparsity_scheme_map, sparsity_ignore_list = cls._parse_sparsity_config(
