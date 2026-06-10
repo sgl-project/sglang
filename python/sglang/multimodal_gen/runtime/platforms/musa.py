@@ -122,7 +122,7 @@ class MusaPlatformBase(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
@@ -130,8 +130,8 @@ class MusaPlatformBase(Platform):
         if empty_cache:
             torch.cuda.empty_cache()
 
-        if torch.distributed.is_initialized():
-            device_id = torch.distributed.get_rank()
+        if device_id is None:
+            device_id = torch.cuda.current_device()
 
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
@@ -160,6 +160,23 @@ class MusaPlatformBase(Platform):
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+        elif selected_backend == AttentionBackendEnum.SAGE_ATTN:
+            try:
+                from sageattention import sageattn  # noqa: F401
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (  # noqa: F401
+                    SageAttentionBackend,
+                )
+
+                logger.info("Using Sage Attention backend")
+
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
+            except ImportError as e:
+                logger.info(e)
+                logger.info(
+                    "Sage Attention backend is not installed (To install it, run `pip install sageattention>=0.1.0`). Falling back to Flash Attention."
+                )
+                target_backend = AttentionBackendEnum.FA
         elif selected_backend in [
             AttentionBackendEnum.FA,
         ]:
@@ -208,7 +225,7 @@ class MusaPlatformBase(Platform):
             logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        logger.info("Using FlashAttention (FA3) backend on MUSA")
+        logger.info("Using FlashAttention (FA3) backend")
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
     @classmethod

@@ -22,14 +22,14 @@ from typing import TYPE_CHECKING, Dict, Union
 import numpy as np
 import torch
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+    from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 from sglang.srt.utils import is_npu
 
@@ -45,7 +45,7 @@ if is_npu():
 
 
 class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
-    def __init__(self, eagle_worker: EAGLEWorker):
+    def __init__(self, eagle_worker: EagleDraftWorker):
         super().__init__(eagle_worker)
         self.update_attr_name = None
         self.update_attr_type = None
@@ -96,7 +96,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def _replay(self, forward_batch: ForwardBatch):
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
-        if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+        if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
             seq_lens_for_each_draft_step = []
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = forward_batch.seq_lens_cpu + speculative_step_id + 1

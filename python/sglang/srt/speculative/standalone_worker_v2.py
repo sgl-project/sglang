@@ -70,6 +70,11 @@ class StandaloneDraftWorker(EagleDraftWorker):
             server_args.speculative_algorithm
         )
 
+        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
+        self._topk1_parents_prealloc = None
+        self._topk1_score_indices_prealloc = None
+        self._rebuild_topk1_chain_buffers()
+
         # Set constant
         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -93,7 +98,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
+                pp_rank=0,  # spec workers don't support pipeline parallelism
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
                 attn_cp_rank=attn_cp_rank,
@@ -116,9 +121,10 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
