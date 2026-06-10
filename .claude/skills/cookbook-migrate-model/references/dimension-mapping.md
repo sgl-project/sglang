@@ -108,9 +108,12 @@ Decisions log, in the order they came up:
    emits the cells literal, and an independent audit that `git show`s the
    ORIGINAL generator, stubs `useState`/`useEffect`, calls its
    `generateCommand(values)` per combo via indirect eval, and token-diffs
-   against the new cells (expected deltas only). Pilot result: 185/185
-   identical + 1 intentional override. Scripts are archived in PR #27848's
-   description (collapsed details block).
+   against the new cells (expected deltas only). Read the legacy source via
+   `git show main:<path>` — NOT `HEAD:` (the migration branch's HEAD has
+   already deleted the file, so the audit breaks after the deletion commit).
+   Re-run the audit after ANY later cells revision (renames included). Pilot
+   result: 185/185 identical + 1 intentional override. Scripts are archived
+   in PR #27848's description (collapsed details block).
 8. **Inherited-infeasible combos kept verbatim** (e.g. 122B BF16 tp1 on
    mi325x: 244 GB weights vs 256 GB VRAM with mem-fraction 0.8) — they stay
    yellow and are listed in the PR body for the re-verification track.
