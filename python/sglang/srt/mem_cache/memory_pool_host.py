@@ -751,24 +751,14 @@ class MHATokenToKVPoolHost(HostKVCache):
             real_index = index // self.page_size
             self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
                 data_page.reshape(
-                    2,
-                    1,
-                    self.layer_num,
-                    self.page_size,
-                    self.head_num,
-                    self.head_dim,
+                    2, 1, self.layer_num, self.page_size, self.head_num, self.head_dim
                 )
             )
         elif self.layout == "page_head":
             real_index = index // self.page_size
             self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
                 data_page.reshape(
-                    2,
-                    1,
-                    self.head_num,
-                    self.page_size,
-                    self.layer_num,
-                    self.head_dim,
+                    2, 1, self.head_num, self.page_size, self.layer_num, self.head_dim
                 )
             )
         else:
