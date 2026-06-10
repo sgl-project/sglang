@@ -62,8 +62,8 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
     if _is_hip:
-        if _is_gfx95 and Lq > 128:
-            # gfx950 (CDNA4), head_dim > 128: a larger query tile halves KV bytes
+        if _is_gfx95 and 128 < Lq <= 256:
+            # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
             # streamed per call (each workgroup reads the whole prefix); 8 warps
             # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
             # 28% -> 44% MFU, numerically equivalent (BLOCK_N reduction order

@@ -328,10 +328,14 @@ class TestTritonAttention(CustomTestCase):
         self.assertEqual(
             ea._get_block_sizes_for_extend_attention(128, 128)[3:], (64, 64, 4)
         )
-        # head_dim > 128: tuned tile on gfx95, default elsewhere
+        # 128 < head_dim <= 256: tuned tile on gfx95, default elsewhere
         expected = (128, 64, 8) if ea._is_gfx95 else (64, 64, 4)
         self.assertEqual(
             ea._get_block_sizes_for_extend_attention(256, 256)[3:], expected
+        )
+        # head_dim > 256: falls back to the default on all HIP archs
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(576, 576)[3:], (64, 64, 4)
         )
 
     def _test_extend_attention_sliding_window_once(
