@@ -282,11 +282,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def _replay_graph(self, shape_key, forward_batch):
+        return self.backend.replay(shape_key, forward_batch)
+
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return bs
-
-    def _replay_backend(self, shape_key, forward_batch, buffers, raw_bs, bs):
-        return self.backend.replay(shape_key, forward_batch)
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -588,7 +588,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
-        out = self._replay_backend(shape_key, forward_batch, buffers, raw_bs, bs)
+        out = self._replay_graph(shape_key, forward_batch)
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             unpadding_bs = num_tokens
