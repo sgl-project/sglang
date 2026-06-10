@@ -941,6 +941,7 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
+            loaded_back = 0
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
