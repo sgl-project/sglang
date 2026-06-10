@@ -497,13 +497,17 @@ class EagleVerifyInputV2Mixin:
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         predict_shape = list(next_token_logits.shape)[:-1]
         predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-        accept_index_size = (
+        # Longest root-to-leaf chain of the verify tree, incl. the root; bounds
+        # the accept_index row width. EAGLE trees are depth-bounded by the draft
+        # loop (spec_steps + 1); NGRAM trees are node-budgeted with no depth cap
+        # (a single corpus match can chain all draft_token_num nodes).
+        max_tree_depth = (
             self.draft_token_num
             if batch.spec_algorithm.is_ngram()
             else self.spec_steps + 1
         )
         accept_index = torch.full(
-            (bs, accept_index_size), -1, dtype=torch.int32, device=device
+            (bs, max_tree_depth), -1, dtype=torch.int32, device=device
         )
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
@@ -589,18 +593,16 @@ class EagleVerifyInputV2Mixin:
                 tp_group.broadcast(num_correct_drafts, src=0)
 
         if SIMULATE_ACC_LEN > 0:
-            # Do simulation
+            # Do simulation. The helper builds (and returns) a replacement
+            # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
+            # to keep the simulated width identical to the real one.
             accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
                 num_correct_drafts=num_correct_drafts,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
-                spec_steps=(
-                    self.draft_token_num
-                    if batch.spec_algorithm.is_ngram()
-                    else self.spec_steps
-                ),
+                spec_steps=max_tree_depth - 1,
             )
 
         # `num_correct_drafts` stays drafts-only inside this function; the returned
