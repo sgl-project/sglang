@@ -29,7 +29,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+from sglang.srt.layers.deepseek_v4_rope import (
+    apply_rotary_emb_triton,
+    v4_rope_inplace_npu,
+)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
@@ -90,127 +93,6 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-
-
-# Cache for the contiguous real/imag halves of each freqs_cis tensor used in
-# v4_rope_inplace_npu. complex freqs_cis.real / freqs_cis.imag are strided
-# views (stride=2 on the underlying interleaved real layout); 
-_NPU_ROPE_CONTIG_CACHE: dict[int, tuple] = {}
-
-
-def _get_contig_freqs_real_imag(freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return contiguous (real, imag) halves of ``freqs_cis``, cached by id.
-
-    Used by NPU rope paths to avoid the per-call StridedSlice materialization
-    triggered by aclnnIndex over the strided ``.real`` / ``.imag`` views of
-    the complex ``freqs_cis`` buffer. First call per freqs_cis pays the
-    contiguous() once; later calls reuse the cached tensors.
-
-    All callers within a single MQALayer (outer rope, indexer inner rope,
-    compressor epilog rope) get the same freqs_cis instance, so each layer
-    materializes at most one (real, imag) pair.
-    """
-    cache_key = id(freqs_cis)
-    cached = _NPU_ROPE_CONTIG_CACHE.get(cache_key)
-    if cached is None:
-        cached = (freqs_cis.real.contiguous(), freqs_cis.imag.contiguous())
-        _NPU_ROPE_CONTIG_CACHE[cache_key] = cached
-    return cached
-
-
-def get_fused_compressor_rope_cos_sin(
-    freqs_cis: torch.Tensor,
-    positions_cmp: torch.Tensor,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build (cos, sin) tensors shaped ``[T, rope_head_dim]`` for the fused
-    compressor op (``torch.ops.custom.compressor``).
-
-    The op consumes ``rope_cos`` / ``rope_sin`` of shape
-    ``[min(T, T//cmp_ratio + B), rope_head_dim]`` in bf16/fp16. We index
-    the cached contig real/imag halves of the complex ``freqs_cis`` and
-    interleave-double the last dim to match the kernel's expected layout
-    (matches dsv4_release ``ComplexExpRotaryEmbedding.cos_cache``, which
-    is built as ``complex_cache.real.repeat_interleave(2, dim=-1)``).
-
-    Safe to call from inside a captured aclgraph: both ``index_select`` and
-    ``repeat_interleave`` over a graph-input ``positions_cmp`` of fixed
-    capture-time shape produce static-shape outputs. Identical to what the
-    existing inplace_partial_rotary_mul fallback does at
-    :func:`v4_rope_inplace_npu`, just without the inverse / 4D-view step.
-    """
-    real_contig, imag_contig = _get_contig_freqs_real_imag(freqs_cis)
-    cos_half = real_contig.index_select(0, positions_cmp)
-    sin_half = imag_contig.index_select(0, positions_cmp)
-    cos = cos_half.repeat_interleave(2, dim=-1).to(dtype)
-    sin = sin_half.repeat_interleave(2, dim=-1).to(dtype)
-    return cos, sin
-
-
-def v4_rope_inplace_npu(
-    q_rope: torch.Tensor,
-    kv_rope: Optional[torch.Tensor],
-    freqs_cis: torch.Tensor,
-    positions: torch.Tensor,
-    inverse: bool = False,
-) -> None:
-    """In-place interleaved RoPE for V4 — torch fallback used on NPU.
-
-    Mirrors main's CUDA `fused_rope` kernel: consecutive (even, odd) pairs
-    of x form complex pairs, with `freqs_cis` a complex tensor where
-    `freqs_cis.real[t, k]` = cos(theta_{t,k}), `freqs_cis.imag` = sin(...)
-    indexed by frequency pair k in [0, rope_dim/2).
-
-    NOTE on V4-Flash YARN `mscale`: when the model was trained with the
-    YARN magnitude-scale `mscale` ≠ 1.0, the cos/sin values stored in
-    `freqs_cis` MUST already be pre-multiplied by `mscale` at precompute
-    time — see `deepseek_v4_rope.precompute_freqs_cis`. This function
-    just reads what's stored; it does NOT apply mscale here.
-
-    Prefer the NPU-native `torch.ops.custom.inplace_partial_rotary_mul`:
-    the torch fallback differs by ~1 ULP per element vs the kernel because
-    torch does bf16*bf16 muls with bf16 accumulation while the NPU kernel
-    accumulates in fp32; 43 layers × (Q + K) = 86 rope calls compound that
-    drift enough to flip argmax on marginal prompts.
-    """
-    # Build cos/sin caches in the layout the kernel expects:
-    # (T, 1, 1, rope_dim) with each freq pair value repeated twice for
-    # the interleaved pairing convention. Use contig real/imag views
-    # cached by id(freqs_cis); see _get_contig_freqs_real_imag.
-    freqs_real_contig, freqs_imag_contig = _get_contig_freqs_real_imag(freqs_cis)
-    cos_half = freqs_real_contig[positions]  # (T, rope_dim/2)
-    sin_half = freqs_imag_contig[positions]
-    if inverse:
-        sin_half = -sin_half
-    cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
-    sin_full = sin_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
-    rope_dim = cos_full.shape[-1]
-    # repeat_interleave produces a contiguous tensor, so the .view()
-    # below already returns a contiguous result — no .contiguous() needed.
-    cos4 = cos_full.view(-1, 1, 1, rope_dim)
-    sin4 = sin_full.view(-1, 1, 1, rope_dim)
-    # q_rope: (T, n_heads, rope_dim) → (T, 1, n_heads, rope_dim) view
-    # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
-    q_view = q_rope.unsqueeze(1)
-    torch.ops.custom.inplace_partial_rotary_mul(
-        q_view,
-        cos4,
-        sin4,
-        rotary_mode="interleave",
-        partial_slice=[0, rope_dim],
-    )
-    if kv_rope is not None:
-        if kv_rope.dim() == 3:
-            kv_view = kv_rope.unsqueeze(1)
-        else:
-            kv_view = kv_rope.view(-1, 1, 1, rope_dim)
-        torch.ops.custom.inplace_partial_rotary_mul(
-            kv_view,
-            cos4,
-            sin4,
-            rotary_mode="interleave",
-            partial_slice=[0, rope_dim],
-        )
 
 
 if TYPE_CHECKING:

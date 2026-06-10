@@ -288,7 +288,9 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        from sglang.srt.models.deepseek_v4 import get_fused_compressor_rope_cos_sin
+        from sglang.srt.layers.deepseek_v4_rope import (
+            get_fused_compressor_rope_cos_sin,
+        )
 
         ratio = compressor.ratio
         coff = 1 + int(compressor.overlap)
@@ -520,7 +522,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     def _compute_q_npu(
         self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        from sglang.srt.models.deepseek_v4 import v4_rope_inplace_npu
+        from sglang.srt.layers.deepseek_v4_rope import v4_rope_inplace_npu
 
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
