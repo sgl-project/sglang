@@ -999,9 +999,10 @@ class SchedulerMetricsReporter:
             self._device_timer_window_gpu_time = 0.0
         else:
             cpu_time = now - self._device_timer_window_start
-            self.fwd_occupancy = min(
-                self._device_timer_window_gpu_time / cpu_time * 100, 100
-            )
+            if cpu_time > 0:
+                self.fwd_occupancy = min(
+                    self._device_timer_window_gpu_time / cpu_time * 100, 100
+                )
         self._device_timer_window_batch_count += 1
         if (
             self._device_timer_window_batch_count
