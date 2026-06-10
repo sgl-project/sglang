@@ -55,6 +55,29 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
+def _build_retrieve_parent_token(
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    retrieve_parent_token: torch.Tensor,
+):
+    """CPU fallback for the parent-token table that the CUDA conv kernel
+    builds fused. Sequential: each sibling inherits the parent assigned to
+    the previous sibling in the chain, so the loop order is load-bearing."""
+    bs, seqlen = retrieve_next_token.shape
+    rnt = retrieve_next_token
+    rns = retrieve_next_sibling
+    rpt = retrieve_parent_token
+    rpt.zero_()
+    for n in range(bs):
+        for t in range(seqlen):
+            child = rnt[n, t].item()
+            if child >= 0 and child < seqlen:
+                rpt[n, child] = t
+            sibling = rns[n, t].item()
+            if sibling >= 0 and sibling < seqlen:
+                rpt[n, sibling] = rpt[n, t].item()
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -288,6 +311,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        if (
+            is_cpu()
+            and forward_batch.forward_mode.is_target_verify()
+            and self.forward_metadata.retrieve_next_token is not None
+        ):
+            # Build the eagle-tree parent-token table once per verify step (it
+            # is shared by all layers); CUDA builds it fused inside the triton
+            # conv kernel instead. Built as int32 because the CPU gating kernel
+            # requires it.
+            retrieve_parent_token = torch.empty_like(
+                self.forward_metadata.retrieve_next_token, dtype=torch.int32
+            )
+            _build_retrieve_parent_token(
+                self.forward_metadata.retrieve_next_token,
+                self.forward_metadata.retrieve_next_sibling,
+                retrieve_parent_token,
+            )
+            self.forward_metadata.retrieve_parent_token = retrieve_parent_token
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -486,6 +527,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a=a,
                 b=b,
                 ssm_states=ssm_states,
+                # [:batch_size] slices are zero-copy no-ops on CUDA (triton reads only the first N entries); required by the CPU kernel's length validation.
                 cache_indices=cache_indices[:batch_size],
                 query_start_loc=query_start_loc,
                 intermediate_states_buffer=intermediate_state_cache,

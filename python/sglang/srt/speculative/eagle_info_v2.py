@@ -27,6 +27,21 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     prepare_mamba_track_for_verify,
 )
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    assign_draft_cache_locs_contiguous as assign_draft_cache_locs_contiguous,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    assign_extend_cache_locs as assign_extend_cache_locs,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    assign_extend_cache_locs_func as _assign_extend_cache_locs_func_triton,
+)
+from sglang.srt.speculative.triton_ops.eagle import (
+    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
+)
+from sglang.srt.speculative.triton_ops.eagle import (
+    fill_bonus_tokens as fill_bonus_tokens,
+)
 from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
@@ -42,24 +57,6 @@ from sglang.srt.utils.async_probe import (
 )
 
 _is_cpu = is_cpu()
-
-if not _is_cpu:
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        assign_draft_cache_locs_contiguous as assign_draft_cache_locs_contiguous,
-    )
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        assign_extend_cache_locs as assign_extend_cache_locs,
-    )
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        assign_extend_cache_locs_func as assign_extend_cache_locs_func,
-    )
-    from sglang.srt.speculative.triton_ops.eagle import (
-        fill_accept_out_cache_loc as _fill_accept_out_cache_loc_triton,
-    )
-    from sglang.srt.speculative.triton_ops.eagle import (
-        fill_bonus_tokens as _fill_bonus_tokens_triton,
-    )
-
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -138,7 +135,7 @@ def fill_bonus_tokens_func(accept_tokens, accept_lens, bonus_tokens, accept_stri
     if _is_cpu:
         fill_bonus_tokens_cpu(accept_tokens, accept_lens, bonus_tokens, accept_stride)
     else:
-        _fill_bonus_tokens_triton[(bs,)](
+        fill_bonus_tokens[(bs,)](
             accept_tokens, accept_lens, bonus_tokens, accept_stride
         )
 
@@ -151,7 +148,7 @@ def fill_accept_out_cache_loc_func(
             accept_index, out_cache_loc, accept_out_cache_loc, size
         )
     else:
-        _fill_accept_out_cache_loc_triton[(size,)](
+        fill_accept_out_cache_loc[(size,)](
             accept_index, out_cache_loc, accept_out_cache_loc, next_power_of_2(size)
         )
 
@@ -165,24 +162,7 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
-    if _is_cuda or _is_hip or _is_musa:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int64,
-            device=device,
-        )
-        assign_extend_cache_locs[(batch_size,)](
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-            next_power_of_2(batch_size),
-        )
-        return out_cache_loc
-
-    elif _is_cpu:
+    if _is_cpu:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int64,
@@ -197,6 +177,48 @@ def assign_extend_cache_locs_func(
             req_to_token.shape[1],
         )
         return out_cache_loc
+    else:
+        return _assign_extend_cache_locs_func_triton(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            batch_size,
+            draft_token_num,
+            device,
+        )
+
+
+def fill_extend_cache_locs_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+):
+    """Like assign_extend_cache_locs_func, but writes into a caller-allocated
+    out_cache_loc (verify-KV movement sizes it as bs * accept_index.shape[1],
+    which can differ from bs * draft_token_num for topk > 1 trees)."""
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+        )
+    else:
+        assign_extend_cache_locs[(batch_size,)](
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+            next_power_of_2(batch_size),
+        )
 
 
 @dataclass

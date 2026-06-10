@@ -176,8 +176,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        if is_cpu() and retrieve_parent_token is not None:
-            retrieve_parent_token = retrieve_parent_token.to(torch.int32)
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,

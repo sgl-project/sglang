@@ -21,8 +21,7 @@ _is_cpu = is_cpu()
 if _is_cpu:
     from sgl_kernel import assign_new_state_cpu as _assign_new_state_cpp
     from sgl_kernel import rotate_input_ids_cpu as _rotate_input_ids_cpp
-
-if not _is_cpu:
+else:
     from sglang.srt.speculative.triton_ops.multi_layer_eagle import (
         assign_hidden_states_pool_triton as _assign_hidden_states_pool_triton_gpu,
         assign_new_state_triton as _assign_new_state_triton_gpu,
@@ -38,9 +37,24 @@ def rotate_input_ids(
     input_ids, extend_start_loc, extend_seq_lens, topk_index, select_index=None
 ):
     if _is_cpu:
-        _rotate_input_ids_cpp(
-            input_ids, extend_start_loc, extend_seq_lens, topk_index, select_index
+        # _rotate_input_ids_cpp requires int64 tensors; input_ids is mutated in
+        # place and may be int32, so rotate an int64 copy and write it back.
+        if extend_start_loc.dtype != torch.int64:
+            extend_start_loc = extend_start_loc.to(torch.int64)
+        if extend_seq_lens.dtype != torch.int64:
+            extend_seq_lens = extend_seq_lens.to(torch.int64)
+        if topk_index.dtype != torch.int64:
+            topk_index = topk_index.to(torch.int64)
+        if select_index is not None and select_index.dtype != torch.int64:
+            select_index = select_index.to(torch.int64)
+        input_ids64 = (
+            input_ids if input_ids.dtype == torch.int64 else input_ids.to(torch.int64)
         )
+        _rotate_input_ids_cpp(
+            input_ids64, extend_start_loc, extend_seq_lens, topk_index, select_index
+        )
+        if input_ids64 is not input_ids:
+            input_ids.copy_(input_ids64)
     else:
         return _rotate_input_ids_triton_gpu(
             input_ids, extend_start_loc, extend_seq_lens, topk_index, select_index
@@ -74,6 +88,7 @@ def assign_new_state(
     Wrapper function to calculate offsets and launch the Triton or CPU kernel.
     """
     if _is_cpu:
+        # assign_new_state_cpu requires int64 index tensors; cast at any future CPU call site.
         _assign_new_state_cpp(
             next_token_ids,
             old_input_ids,

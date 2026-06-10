@@ -329,6 +329,10 @@ void assign_draft_cache_locs_contiguous_cpu(
     int64_t pool_len,
     int64_t topk,
     int64_t num_steps) {
+  // Contiguous slot layout: requires page_size == 1 or topk == 1 (see prepare_for_v2_draft guard).
+  TORCH_CHECK(req_pool_indices.scalar_type() == at::kLong && seq_lens.scalar_type() == at::kLong);
+  TORCH_CHECK(req_to_token.scalar_type() == at::kInt && out_cache_loc.scalar_type() == at::kLong);
+  TORCH_CHECK(out_cache_loc.numel() == req_pool_indices.numel() * topk * num_steps);
   int64_t bs = req_pool_indices.size(0);
   int64_t copy_len = topk * num_steps;
 
@@ -420,6 +424,8 @@ void rotate_input_ids_cpu(
   });
 }
 
+// NOTE: index tensors must be int64; the existing GPU graph-runner call site feeds int32 — any future CPU wiring must
+// cast.
 void assign_new_state_cpu(
     const at::Tensor& next_token_ids,
     const at::Tensor& old_input_ids,

@@ -814,12 +814,12 @@ inline at::vec::Vectorized<float> softplus(const at::vec::Vectorized<float>& x, 
   return Vec::blendv(Vec::blendv(log1pex, expx, mask_lo), x, mask_hi);
 }
 
-template <typename scalar_t, bool IsVarLen>
+template <typename scalar_t, typename param_t, bool IsVarLen>
 void fused_sigmoid_gating_delta_rule_update_impl(
     const scalar_t* __restrict__ q_ptr,
     const scalar_t* __restrict__ k_ptr,
     const scalar_t* __restrict__ v_ptr,
-    const float* __restrict__ A_log_ptr,
+    const param_t* __restrict__ A_log_ptr,
     const scalar_t* __restrict__ a_ptr,
     const scalar_t* __restrict__ dt_bias_ptr,
     const scalar_t* __restrict__ b_ptr,
@@ -830,7 +830,7 @@ void fused_sigmoid_gating_delta_rule_update_impl(
     const int32_t* __restrict__ cu_seqlens_ptr,
     float* __restrict__ isb_ptr,
     const int32_t* __restrict__ isi_ptr,
-    int64_t cache_steps,
+    int64_t isb_cache_steps,
     const int32_t* __restrict__ rpt_ptr,
     int64_t rpt_stride,
     // Dimensions
@@ -862,7 +862,7 @@ void fused_sigmoid_gating_delta_rule_update_impl(
   const int64_t state_entry_size = head_dim * v_head_dim;
   const int64_t state_slot_stride = v_num_heads * state_entry_size;
   const int64_t isb_step_stride = state_slot_stride;
-  const int64_t isb_cache_stride = cache_steps * isb_step_stride;
+  const int64_t isb_cache_stride = isb_cache_steps * isb_step_stride;
 
   if (use_qk_l2norm_in_kernel) {
     float eps = 1e-5f;
@@ -940,7 +940,7 @@ void fused_sigmoid_gating_delta_rule_update_impl(
               state_entry_size * sizeof(float));
         }
 
-        float g_val = -std::exp(A_log_ptr[ni]) *
+        float g_val = -std::exp(static_cast<float>(A_log_ptr[ni])) *
                       softplus(
                           static_cast<float>(a_ptr[pos * v_num_heads + ni]) + static_cast<float>(dt_bias_ptr[ni]),
                           softplus_threshold);
@@ -1341,9 +1341,12 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const std::optional<at::Tensor>& intermediate_state_indices = std::nullopt,
     int64_t cache_steps = 0,
     const std::optional<at::Tensor>& retrieve_parent_token = std::nullopt) {
+  TORCH_CHECK(!is_kda, "fused_sigmoid_gating_delta_rule_update_cpu: is_kda is not supported on CPU");
   CHECK_DIM(4, q);
   CHECK_DIM(4, v);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
 
   int64_t total_tokens = q.size(0) * q.size(1);
   int64_t num_sequences = cu_seqlens.size(0) - 1;
@@ -1354,7 +1357,13 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
   int64_t v_num_heads = v.size(2);
   int64_t v_head_dim = v.size(3);
 
-  CHECK_INPUT_SHAPE_DTYPE<true>(A_log, 1, {v_num_heads}, at::kFloat);
+  CHECK_INPUT_SHAPE_DTYPE<true>(k, 4, {q.size(0), q.size(1), num_heads, head_dim}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(v, 4, {q.size(0), q.size(1), v_num_heads, v_head_dim}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<false>(a, 2, {total_tokens, v_num_heads}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<false>(b, 2, {total_tokens, v_num_heads}, q.scalar_type());
+  // A_log accepts fp32 or q's reduced dtype (dispatch below pairs them as param_t).
+  CHECK_INPUT_SHAPE_DTYPE<true>(
+      A_log, 1, {v_num_heads}, A_log.scalar_type() == at::kFloat ? at::kFloat : q.scalar_type());
   CHECK_INPUT_SHAPE_DTYPE<true>(dt_bias, 1, {v_num_heads}, q.scalar_type());
   CHECK_INPUT_SHAPE_DTYPE<true>(initial_state_indices, 1, {num_sequences}, at::kInt);
   CHECK_INPUT_SHAPE_DTYPE<true>(cu_seqlens, 1, {num_sequences + 1}, at::kInt);
@@ -1367,6 +1376,11 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
   const int32_t* isi_ptr = nullptr;
   const int32_t* rpt_ptr = nullptr;
   int64_t rpt_stride = 0;
+  int64_t isb_cache_steps = 0;
+
+  TORCH_CHECK(
+      !retrieve_parent_token.has_value() || intermediate_states_buffer.has_value(),
+      "fused_sigmoid_gating_delta_rule_update_cpu: retrieve_parent_token requires intermediate_states_buffer");
 
   if (intermediate_states_buffer.has_value()) {
     auto& isb = intermediate_states_buffer.value();
@@ -1377,6 +1391,9 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     TORCH_CHECK(isb.size(2) == v_num_heads);
     TORCH_CHECK(isb.size(3) == head_dim);
     TORCH_CHECK(isb.size(4) == v_head_dim);
+    // Derive the per-slot step capacity from the buffer shape (like the CUDA
+    // wrapper) instead of trusting the runtime cache_steps argument.
+    isb_cache_steps = isb.size(1);
     isb_ptr = isb.data_ptr<float>();
   }
 
@@ -1389,6 +1406,8 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
 
   if (retrieve_parent_token.has_value()) {
     auto& rpt = retrieve_parent_token.value();
+    CHECK_DIM(2, rpt);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(rpt);
     CHECK_EQ(rpt.scalar_type(), at::kInt);
     CHECK_EQ(rpt.size(0), num_sequences);
     rpt_stride = rpt.stride(0);
@@ -1407,77 +1426,78 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
   at::Tensor core_attn_out = at::empty({q.size(0), token_dim_size, v_num_heads, v_head_dim}, q.options());
   at::Tensor qk_scale_buf = at::empty({2 * total_tokens, num_heads}, at::kFloat);
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "fused_sigmoid_gating_delta_rule_update", [&] {
-    if (is_varlen) {
-      fused_sigmoid_gating_delta_rule_update_impl<scalar_t, true>(
-          q.data_ptr<scalar_t>(),
-          k.data_ptr<scalar_t>(),
-          v.data_ptr<scalar_t>(),
-          A_log.data_ptr<float>(),
-          a.data_ptr<scalar_t>(),
-          dt_bias.data_ptr<scalar_t>(),
-          b.data_ptr<scalar_t>(),
-          initial_state_indices.data_ptr<int32_t>(),
-          initial_state_source.data_ptr<float>(),
-          core_attn_out.data_ptr<scalar_t>(),
-          qk_scale_buf.data_ptr<float>(),
-          cu_seqlens.data_ptr<int32_t>(),
-          isb_ptr,
-          isi_ptr,
-          cache_steps,
-          rpt_ptr,
-          rpt_stride,
-          num_sequences,
-          total_tokens,
-          num_heads,
-          head_dim,
-          v_num_heads,
-          v_head_dim,
-          q_stride_token,
-          q_stride_head,
-          k_stride_token,
-          k_stride_head,
-          v_stride_token,
-          v_stride_head,
-          use_qk_l2norm_in_kernel,
-          disable_state_update,
-          softplus_threshold);
-    } else {
-      fused_sigmoid_gating_delta_rule_update_impl<scalar_t, false>(
-          q.data_ptr<scalar_t>(),
-          k.data_ptr<scalar_t>(),
-          v.data_ptr<scalar_t>(),
-          A_log.data_ptr<float>(),
-          a.data_ptr<scalar_t>(),
-          dt_bias.data_ptr<scalar_t>(),
-          b.data_ptr<scalar_t>(),
-          initial_state_indices.data_ptr<int32_t>(),
-          initial_state_source.data_ptr<float>(),
-          core_attn_out.data_ptr<scalar_t>(),
-          qk_scale_buf.data_ptr<float>(),
-          cu_seqlens.data_ptr<int32_t>(),
-          isb_ptr,
-          isi_ptr,
-          cache_steps,
-          rpt_ptr,
-          rpt_stride,
-          num_sequences,
-          total_tokens,
-          num_heads,
-          head_dim,
-          v_num_heads,
-          v_head_dim,
-          q_stride_token,
-          q_stride_head,
-          k_stride_token,
-          k_stride_head,
-          v_stride_token,
-          v_stride_head,
-          use_qk_l2norm_in_kernel,
-          disable_state_update,
-          softplus_threshold);
-    }
-  });
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(
+      q.scalar_type(), A_log.scalar_type(), "fused_sigmoid_gating_delta_rule_update", [&] {
+        if (is_varlen) {
+          fused_sigmoid_gating_delta_rule_update_impl<scalar_t, param_t, true>(
+              q.data_ptr<scalar_t>(),
+              k.data_ptr<scalar_t>(),
+              v.data_ptr<scalar_t>(),
+              A_log.data_ptr<param_t>(),
+              a.data_ptr<scalar_t>(),
+              dt_bias.data_ptr<scalar_t>(),
+              b.data_ptr<scalar_t>(),
+              initial_state_indices.data_ptr<int32_t>(),
+              initial_state_source.data_ptr<float>(),
+              core_attn_out.data_ptr<scalar_t>(),
+              qk_scale_buf.data_ptr<float>(),
+              cu_seqlens.data_ptr<int32_t>(),
+              isb_ptr,
+              isi_ptr,
+              isb_cache_steps,
+              rpt_ptr,
+              rpt_stride,
+              num_sequences,
+              total_tokens,
+              num_heads,
+              head_dim,
+              v_num_heads,
+              v_head_dim,
+              q_stride_token,
+              q_stride_head,
+              k_stride_token,
+              k_stride_head,
+              v_stride_token,
+              v_stride_head,
+              use_qk_l2norm_in_kernel,
+              disable_state_update,
+              softplus_threshold);
+        } else {
+          fused_sigmoid_gating_delta_rule_update_impl<scalar_t, param_t, false>(
+              q.data_ptr<scalar_t>(),
+              k.data_ptr<scalar_t>(),
+              v.data_ptr<scalar_t>(),
+              A_log.data_ptr<param_t>(),
+              a.data_ptr<scalar_t>(),
+              dt_bias.data_ptr<scalar_t>(),
+              b.data_ptr<scalar_t>(),
+              initial_state_indices.data_ptr<int32_t>(),
+              initial_state_source.data_ptr<float>(),
+              core_attn_out.data_ptr<scalar_t>(),
+              qk_scale_buf.data_ptr<float>(),
+              cu_seqlens.data_ptr<int32_t>(),
+              isb_ptr,
+              isi_ptr,
+              isb_cache_steps,
+              rpt_ptr,
+              rpt_stride,
+              num_sequences,
+              total_tokens,
+              num_heads,
+              head_dim,
+              v_num_heads,
+              v_head_dim,
+              q_stride_token,
+              q_stride_head,
+              k_stride_token,
+              k_stride_head,
+              v_stride_token,
+              v_stride_head,
+              use_qk_l2norm_in_kernel,
+              disable_state_update,
+              softplus_threshold);
+        }
+      });
   return core_attn_out;
 }
 

@@ -708,10 +708,26 @@ at::Tensor causal_conv1d_update_cpu(
 
   // Multi-token path: process each time step sequentially,
   // updating conv_state after each step.
-  const bool cache_intermediate = intermediate_conv_window.has_value() && intermediate_state_indices.has_value();
+  TORCH_CHECK(
+      intermediate_conv_window.has_value() == intermediate_state_indices.has_value(),
+      "causal_conv1d_update_cpu: intermediate_conv_window and intermediate_state_indices "
+      "must be passed together.");
+  const bool cache_intermediate = intermediate_conv_window.has_value();
+  const int64_t state_len = width - 1;
+  if (cache_intermediate) {
+    auto& icw = intermediate_conv_window.value();
+    auto& isi = intermediate_state_indices.value();
+    CHECK_DIM(4, icw);
+    CHECK_CONTIGUOUS(icw);
+    CHECK_EQ(icw.scalar_type(), scalar_type);
+    CHECK_EQ(icw.size(1), seqlen);
+    CHECK_EQ(icw.size(2), dim);
+    CHECK_EQ(icw.size(3), state_len);
+    CHECK_EQ(isi.scalar_type(), at::kInt);
+    CHECK_EQ(isi.numel(), batch);
+  }
   const int32_t* intermediate_indices_ptr =
       cache_intermediate ? intermediate_state_indices.value().data_ptr<int32_t>() : nullptr;
-  const int64_t state_len = width - 1;
 
   at::Tensor out = at::empty_like(x);
   for (int64_t t = 0; t < seqlen; ++t) {

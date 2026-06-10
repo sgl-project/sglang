@@ -75,24 +75,6 @@ def causal_conv1d_fn_cpu(
     )
 
 
-def _build_retrieve_parent_token(
-    retrieve_next_token, retrieve_next_sibling, retrieve_parent_token
-):
-    bs, seqlen = retrieve_next_token.shape
-    rnt = retrieve_next_token
-    rns = retrieve_next_sibling
-    rpt = retrieve_parent_token
-    rpt.zero_()
-    for n in range(bs):
-        for t in range(seqlen):
-            child = rnt[n, t].item()
-            if child >= 0 and child < seqlen:
-                rpt[n, child] = t
-            sibling = rns[n, t].item()
-            if sibling >= 0 and sibling < seqlen:
-                rpt[n, sibling] = rpt[n, t].item()
-
-
 def causal_conv1d_update_cpu(
     mixed_qkv,
     conv_states,
@@ -106,10 +88,10 @@ def causal_conv1d_update_cpu(
     retrieve_next_sibling=None,
     retrieve_parent_token=None,
 ):
-    if retrieve_next_token is not None and retrieve_parent_token is not None:
-        _build_retrieve_parent_token(
-            retrieve_next_token, retrieve_next_sibling, retrieve_parent_token
-        )
+    # retrieve_next_token / retrieve_next_sibling / retrieve_parent_token are
+    # accepted for call-site compatibility with the CUDA conv kernel (which
+    # builds the parent-token table fused in the conv update). On CPU the
+    # table is built once per verify step in GDNAttnBackend.init_forward_metadata.
     return torch.ops.sgl_kernel.causal_conv1d_update_cpu(
         mixed_qkv,
         conv_states,

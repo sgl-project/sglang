@@ -1,7 +1,13 @@
 import logging
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils.common import cpu_has_amx_support, is_blackwell, is_hip, is_musa
+from sglang.srt.utils.common import (
+    cpu_has_amx_support,
+    is_blackwell,
+    is_cpu,
+    is_hip,
+    is_musa,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,14 +153,14 @@ class DraftBackendFactory:
         )
 
     def _select_hybrid_linear_attn_decode_backend(self):
-        if cpu_has_amx_support():
+        if is_cpu() and cpu_has_amx_support():
             return self._create_intel_amx_decode_backend
         if is_blackwell():
             return self._create_triton_decode_backend
         return self._create_fa3_decode_backend
 
     def _select_hybrid_linear_attn_prefill_backend(self):
-        if cpu_has_amx_support():
+        if is_cpu() and cpu_has_amx_support():
             return self._create_intel_amx_prefill_backend
         if is_blackwell():
             return self._create_triton_prefill_backend
