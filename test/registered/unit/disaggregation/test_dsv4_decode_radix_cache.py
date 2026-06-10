@@ -1,8 +1,14 @@
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.kv_cache_builder import is_supported_dsv4_decode_radix_mtp
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def _make_queue(*, page_size: int, enable_decode_radix: bool = True):
@@ -57,3 +63,66 @@ def test_allow_radix_cache_insert_once_bypasses_skip_once():
 
     assert tree_cache.num_cache_unfinished_req == 1
     assert req.allow_radix_cache_insert_once is False
+
+
+def test_dsv4_decode_radix_mtp_guard_allows_eagle_topk1_online_c128():
+    server_args = SimpleNamespace(speculative_eagle_topk=1)
+
+    with envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(True):
+        with envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.override(True):
+            assert is_supported_dsv4_decode_radix_mtp(
+                spec_algorithm=SpeculativeAlgorithm.EAGLE,
+                server_args=server_args,
+            )
+
+
+def test_dsv4_decode_radix_mtp_guard_rejects_non_minimal_paths():
+    server_args = SimpleNamespace(speculative_eagle_topk=1)
+
+    with envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(True):
+        with envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.override(True):
+            assert not is_supported_dsv4_decode_radix_mtp(
+                spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+                server_args=server_args,
+            )
+            assert not is_supported_dsv4_decode_radix_mtp(
+                spec_algorithm=SpeculativeAlgorithm.FROZEN_KV_MTP,
+                server_args=server_args,
+            )
+
+    server_args.speculative_eagle_topk = 2
+    with envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(True):
+        with envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.override(True):
+            assert not is_supported_dsv4_decode_radix_mtp(
+                spec_algorithm=SpeculativeAlgorithm.EAGLE,
+                server_args=server_args,
+            )
+
+
+def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
+    req = SimpleNamespace(
+        dsv4_decode_radix_cache_prompt_once=True,
+        dsv4_decode_radix_cache_prompt_len=3,
+        skip_radix_cache_insert=True,
+        allow_radix_cache_insert_once=False,
+        fill_ids=[1, 2, 3, 4, 5],
+    )
+    tree_cache = SimpleNamespace(inserted_fill_ids=[])
+
+    def cache_unfinished_req(inserted_req, **_kwargs):
+        tree_cache.inserted_fill_ids.append(list(inserted_req.fill_ids))
+
+    tree_cache.cache_unfinished_req = cache_unfinished_req
+    processor = SimpleNamespace(tree_cache=tree_cache)
+
+    SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(
+        processor, req, is_prebuilt_batch=True
+    )
+    SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(
+        processor, req, is_prebuilt_batch=True
+    )
+
+    assert tree_cache.inserted_fill_ids == [[1, 2, 3]]
+    assert req.fill_ids == [1, 2, 3, 4, 5]
+    assert req.allow_radix_cache_insert_once is False
+    assert req.dsv4_decode_radix_cache_prompt_once is False
