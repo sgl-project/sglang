@@ -113,11 +113,21 @@ else:
         top_p_renorm_prob,
     )
     from sgl_kernel.speculative import (
+        assign_draft_cache_locs_contiguous_cpu,
+        assign_extend_cache_locs_cpu,
+        assign_new_state_cpu,
+        assign_req_to_token_pool_cpu,
+        build_draft_decode_metadata_cpu,
         build_tree_kernel_efficient,
+        build_tree_kernel_efficient_cpu,
+        fill_accept_out_cache_loc_cpu,
+        fill_bonus_tokens_cpu,
         reconstruct_indices_from_tree_mask,
+        rotate_input_ids_cpu,
         segment_packbits,
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
+        verify_tree_greedy_cpu,
     )
     from sgl_kernel.top_k import (
         fast_topk,

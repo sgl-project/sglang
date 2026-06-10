@@ -51,11 +51,12 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_cpu, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Qwen2Config = None
 
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -646,8 +647,9 @@ class Qwen2ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if not _is_cpu:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

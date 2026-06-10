@@ -101,6 +101,7 @@ from sglang.srt.utils.common import (
     empty_context,
     fast_topk,
     get_available_gpu_memory,
+    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
@@ -110,6 +111,7 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -259,6 +261,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if (c := self.draft_runner.canary_manager) is not None:
             c.mark_init_finished()
 
+        # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
+        # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
+        self.tree_mask_mode = (
+            TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
+        )
+
     def _init_dsa_index_share_state(self) -> None:
         # Populate DSA index-share fields from the draft runner's hf_config.
         # Reused by the attention unit-test harnesses, which skip __init__.
@@ -400,7 +408,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+        if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
         if self.server_args.model_impl == "mindspore":
@@ -1668,17 +1676,35 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.speculative_num_draft_tokens,
         )
 
+        if _is_cpu:
+            verify_done = None
+        else:
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
+
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1]
             # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-            fill_bonus_tokens[(bs,)](
-                accept_tokens,
-                accept_lens,
-                bonus_tokens,
-                accept_index.shape[1],
-            )
+            if _is_cpu:
+                from sgl_kernel import (
+                    fill_bonus_tokens_cpu,
+                )
+
+                fill_bonus_tokens_cpu(
+                    accept_tokens,
+                    accept_lens,
+                    bonus_tokens,
+                    accept_index.shape[1],
+                )
+            else:
+                fill_bonus_tokens[(bs,)](
+                    accept_tokens,
+                    accept_lens,
+                    bonus_tokens,
+                    accept_index.shape[1],
+                )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 

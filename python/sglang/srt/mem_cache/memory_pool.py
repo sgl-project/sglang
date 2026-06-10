@@ -508,8 +508,7 @@ class MambaPool:
                         temporal_state_shape[2],
                     ),
                     dtype=ssm_dtype,
-                    device=device,
-                    # device="cuda",
+                    device="cuda",
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
@@ -551,7 +550,7 @@ class MambaPool:
                                 shared_win,
                             ),
                             dtype=conv_dtype,
-                            device=device,
+                            device="cuda",
                         )
                         # view[l, s, step, d, w] = phys[l, s, d, step + w]
                         view = phys.as_strided(
@@ -586,7 +585,7 @@ class MambaPool:
                                 conv_shape[1],
                             ),
                             dtype=conv_dtype,
-                            device=device,
+                            device="cuda",
                         )
                         for conv_shape in conv_state_shape
                     ]
@@ -1429,7 +1428,7 @@ class MHATokenToKVPool(KVCache):
             else None
         )
 
-        if enable_kv_cache_copy and not self.use_hnd:
+        if enable_kv_cache_copy and not self.use_hnd and not _is_cpu:
             # The tiled byte copy assumes NHD slot-rows; HND uses a (page, off)
             # gather in move_kv_cache instead, so skip the slot-row copy config.
             self._init_kv_copy_and_warmup()
@@ -1985,7 +1984,7 @@ class MHATokenToKVPool(KVCache):
         # Physical move strategy. Override for layouts that change buffer identity
         # (e.g. PageMajorMHATokenToKVPool always uses the native move). The 3-D
         # per-layer buffers here ignore page_size in move_kv_cache_native.
-        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get() or _is_cpu:
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
 

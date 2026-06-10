@@ -25,6 +25,7 @@ from sglang.srt.speculative.triton_ops.spec_tree import (
     verify_tree_greedy_kernel_triton,
 )
 from sglang.srt.utils import (
+    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
@@ -46,6 +47,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,11 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+elif _is_cpu:
+    from sgl_kernel import (
+        build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
+    )
+    from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
 
 
 ALLOC_EXTEND_FUNCS = defaultdict(
@@ -243,6 +250,21 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
             tree_mask_mode,
         )
+    elif _is_cpu:
+        sgl_build_tree_kernel_efficient_cpu(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
     else:
         sgl_build_tree_kernel_efficient(
             parent_list,
@@ -370,6 +392,18 @@ def verify_tree_greedy_func(
             accept_token_num=accept_token_num,  # mutable
             candidates=candidates,
             # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+
+    elif _is_cpu:
+        sgl_verify_tree_greedy_cpu(
+            predicts=predicts,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=accept_token_num,  # mutable
+            candidates=candidates,
             retrive_index=retrieve_index,
             retrive_next_token=retrieve_next_token,
             retrive_next_sibling=retrieve_next_sibling,

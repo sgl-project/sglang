@@ -1092,7 +1092,7 @@ class Qwen3NextForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        if _is_cuda:
+        if not _is_cpu:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
@@ -1108,7 +1108,7 @@ class Qwen3NextForCausalLM(nn.Module):
             return
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
-        if _is_cuda:
+        if not _is_cpu:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 

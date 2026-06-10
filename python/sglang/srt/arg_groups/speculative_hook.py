@@ -332,6 +332,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
+    if server_args.device == "cpu" and not server_args.disable_overlap_schedule:
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap schedule is not implemented for speculative decoding on CPU."
+        )
+
     if resolved_view(server_args).disable_overlap_schedule:
         logger.warning(
             "Non-overlap (synchronous) spec v2 is used for eagle/eagle3/standalone "
