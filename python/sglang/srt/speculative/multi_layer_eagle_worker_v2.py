@@ -19,6 +19,9 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
+    MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
+)
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import (
@@ -52,12 +55,15 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
     select_top_k_tokens,
 )
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
@@ -106,6 +112,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
+            "multi-layer EAGLE requires speculative_num_draft_tokens == "
+            "speculative_num_steps + 1, "
+            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+        )
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -222,9 +233,14 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         if self.server_args.disable_cuda_graph:
             return
 
-        self.cuda_graph_runner_for_draft_extend = (
-            MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
-        )
+        if not _is_npu:
+            self.cuda_graph_runner_for_draft_extend = (
+                MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
+            )
+        else:
+            self.cuda_graph_runner_for_draft_extend = (
+                MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(self)
+            )
 
     def reset_cuda_graph_buffers(self, forward_batch, batch_result):
         if self.cuda_graph_runner_for_draft_extend:
@@ -383,6 +399,16 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # The draft embed clamps unconditionally (to tolerate multimodal pad
+        # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
+        # would be clamped away instead of surfacing.
+        maybe_detect_oob(
+            next_token_ids,
+            0,
+            self.model_config.vocab_size,
+            "draft_extend_for_prefill: next_token_ids before draft embed",
+        )
+
         # Construct spec_info
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
