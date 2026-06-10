@@ -110,7 +110,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         Automatically selects prefill or decode routing kernels.
         """
         # Determine inference phase
-        if not torch.npu.is_current_stream_capturing():
+        '''if not torch.npu.is_current_stream_capturing():
             phase = "prefill"
             init = self.init_routing_prefill
             finalize = self.finalize_routing_prefill
@@ -119,22 +119,37 @@ class TorchNpuDispatcher(BaseDispatcher):
             phase = "decode"
             init = self.init_routing_decode
             finalize = self.finalize_routing_decode
-            group_list_type = self.group_list_type_decode
+            group_list_type = self.group_list_type_decode'''
 
         # Store phase so combine() uses the matching finalize kernel
         self._dispatch_phase = phase
 
-        # Perform routing
-        (
-            permuted_hidden_states,
-            expanded_row_idx,
-            expert_tokens,
-            hidden_states_scale,
-        ) = init._init_routing(
-            hidden_states,
-            topk_output.topk_ids,
-            self.num_experts,
-        )
+        if not torch.npu.is_current_stream_capturing():
+            # Perform routing
+            (
+                permuted_hidden_states,
+                expanded_row_idx,
+                expert_tokens,
+                hidden_states_scale,
+            ) = self.init_routing_prefill._init_routing(
+                hidden_states,
+                topk_output.topk_ids,
+                self.num_experts,
+            )
+            group_list_type=1
+        else:
+            # Perform routing
+            (
+                permuted_hidden_states,
+                expanded_row_idx,
+                expert_tokens,
+                hidden_states_scale,
+            ) = self.init_routing_decode._init_routing(
+                hidden_states,
+                topk_output.topk_ids,
+                self.num_experts,
+            )
+            group_list_type=1
 
         self._dispatch_output = TorchNpuDispatchOutput(
             hidden_states=permuted_hidden_states,
@@ -155,15 +170,15 @@ class TorchNpuDispatcher(BaseDispatcher):
             raise RuntimeError("combine() called before dispatch()")
 
         # Retrieve the finalize routing that matches the dispatch phase
-        phase = getattr(self, "_dispatch_phase", "prefill")
-        finalize = (
+        #phase = getattr(self, "_dispatch_phase", "prefill")
+        '''finalize = (
             self.finalize_routing_decode
             if phase == "decode"
             else self.finalize_routing_prefill
-        )
+        )'''
 
         dispatch_out = self._dispatch_output
-        final_hidden_states = finalize._finalize_routing(
+        final_hidden_states = self.finalize_routing_prefill._finalize_routing(
             combine_input.hidden_states,
             topk_weights=dispatch_out.topk_output.topk_weights,
             expanded_row_idx=dispatch_out.expanded_row_idx,
