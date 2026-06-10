@@ -44,6 +44,13 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
+def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
+    """Sync-free sum of seq_lens for decode metrics."""
+    if batch.seq_lens_cpu is not None:
+        return int(batch.seq_lens_cpu.sum().item())
+    return sum(req.seqlen for req in batch.reqs)
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -53,6 +60,8 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    reprocessed_log_input_tokens: int = 0
+    reprocessed_log_hit_tokens: int = 0
     num_pending_tokens: int = 0
 
     @classmethod
@@ -66,6 +75,8 @@ class PrefillStats:
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
+            reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
+            reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -308,6 +319,31 @@ class SchedulerMetricsReporter:
             var_decode_kv_tokens=decode_q.variance(),
         )
 
+    def _active_spec_config_snapshot(self) -> dict[str, int]:
+        """Read the currently active speculative decoding configuration."""
+        draft_worker = self.scheduler.draft_worker
+        if draft_worker is None:
+            return {
+                "num_steps": 0,
+                "num_draft_tokens": 0,
+            }
+
+        # Fallback to server_args if draft_worker does not have the attributes.
+        server_args = self.scheduler.server_args
+        num_steps = getattr(
+            draft_worker, "speculative_num_steps", server_args.speculative_num_steps
+        )
+        num_draft_tokens = getattr(
+            draft_worker,
+            "speculative_num_draft_tokens",
+            server_args.speculative_num_draft_tokens,
+        )
+
+        return {
+            "num_steps": num_steps or 0,
+            "num_draft_tokens": num_draft_tokens or 0,
+        }
+
     def update_spec_metrics(self, bs: int, num_correct_drafts: int):
         self.spec_num_accept_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
@@ -430,7 +466,7 @@ class SchedulerMetricsReporter:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        total_context = float(batch.seq_lens_cpu.sum().item())
+        total_context = float(_decode_total_seq_lens(batch))
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * total_context
@@ -546,9 +582,16 @@ class SchedulerMetricsReporter:
                 )
 
             priority_enabled = self.scheduler.enable_priority_scheduling
-            total_tokens = prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
+            effective_input_tokens = (
+                prefill_stats.log_input_tokens
+                - prefill_stats.reprocessed_log_input_tokens
+            )
+            effective_hit_tokens = (
+                prefill_stats.log_hit_tokens - prefill_stats.reprocessed_log_hit_tokens
+            )
+            total_tokens = effective_input_tokens + effective_hit_tokens
             cache_hit_rate = (
-                prefill_stats.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
+                effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
 
             # Basics
@@ -659,6 +702,8 @@ class SchedulerMetricsReporter:
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
+        spec_num_steps = 0
+        spec_num_draft_tokens = 0
         if self.scheduler.spec_algorithm.is_none():
             spec_accept_length = 0
             spec_accept_rate = 0
@@ -679,6 +724,12 @@ class SchedulerMetricsReporter:
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+
+            if self.current_scheduler_metrics_enabled:
+                spec_snapshot = self._active_spec_config_snapshot()
+                spec_num_steps = spec_snapshot["num_steps"]
+                spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
+
         cache_hit_rate = 0.0
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -736,7 +787,7 @@ class SchedulerMetricsReporter:
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
-            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
+            self.stats.decode_sum_seq_lens = _decode_total_seq_lens(batch)
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
@@ -744,6 +795,8 @@ class SchedulerMetricsReporter:
             # Speculative decoding
             self.stats.spec_accept_length = spec_accept_length
             self.stats.spec_accept_rate = spec_accept_rate
+            self.stats.spec_num_steps = spec_num_steps
+            self.stats.spec_num_draft_tokens = spec_num_draft_tokens
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs

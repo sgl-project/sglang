@@ -45,7 +45,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.2 Configuration Tips
 
-For more detailed configuration tips, please refer to [GLM-4.5/GLM-4.6 Usage](../../../docs/basic_usage/glm45).
+- **Thinking Budget:** Use `--enable-custom-logit-processor` flag and pass `Glm4MoeThinkingBudgetLogitProcessor` in requests to cap the model's thinking token count. See the [GLM-4.5 cookbook page](/cookbook/autoregressive/GLM/GLM-4.5) for the full Thinking Budget usage example.
 
 ## 4. Model Invocation
 
