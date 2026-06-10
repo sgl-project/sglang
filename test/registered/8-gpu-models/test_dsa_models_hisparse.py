@@ -38,7 +38,7 @@ class TestGLM5DPHiSparse(CustomTestCase):
             "--disable-radix-cache",
             "--kv-cache-dtype",
             "bfloat16",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "flashmla_sparse",
             "--enable-hisparse",
             "--hisparse-config",

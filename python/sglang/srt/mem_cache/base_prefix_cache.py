@@ -17,7 +17,11 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_RADIX_CACHE,
+    RadixCacheMetricsCollector,
+    resolve_collector_class,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -70,7 +74,9 @@ class InsertResult:
     """Result of an insert operation"""
 
     prefix_len: int
+    total_len: int = 0
     mamba_exist: bool = False
+    inserted_host_node: Any = None
 
 
 @dataclasses.dataclass
@@ -97,6 +103,7 @@ class IncLockRefResult:
 
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
+    swa_uuid_for_host_lock: Optional[int] = None
     # Component nodes that were tombstones at acquire time. Replaying this set
     # at release prevents a short-lived lock from consuming a later load-back or
     # request lock after that tombstone becomes a valid device value.
@@ -108,6 +115,7 @@ class IncLockRefResult:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
             swa_uuid_for_lock=self.swa_uuid_for_lock,
+            swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
             skip_lock_node_ids={
                 component_type: set(node_ids)
                 for component_type, node_ids in self.skip_lock_node_ids.items()
@@ -120,6 +128,7 @@ class DecLockRefParams:
     """Parameters for dec_lock_ref operation."""
 
     swa_uuid_for_lock: Optional[int] = None
+    swa_uuid_for_host_lock: Optional[int] = None
     skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
         default_factory=dict
     )
@@ -158,11 +167,12 @@ class MatchResult(NamedTuple):
                             load_back walk (FULL / SWA / ...). For legacy caches
                             that don't run multi-component validation, set this
                             equal to `last_host_node`.
-        host_hit_length :   Length of the host cache hit. For pure-KV caches this is the
-                            number of evicted KV tokens on CPU. For hybrid Mamba models this
-                            is max(kv_host_tokens, 1-if-mamba-on-host) so that a mamba-only
-                            host hit still triggers load-back without adding a separate field.
-                            0 if HiCache is not enabled.
+        host_hit_length :   Number of Full-KV tokens that hit on host (CPU) and need to be
+                            loaded back to device. Pure-KV cache semantics;
+        swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
+                            window) and will be load-back into the SWA device pool.
+        mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
+                            into the Mamba device pool. Typically 0 or 1.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
@@ -173,6 +183,8 @@ class MatchResult(NamedTuple):
     last_host_node: Any
     best_match_node: Any
     host_hit_length: int = 0
+    swa_host_hit_length: int = 0
+    mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
 
@@ -190,6 +202,8 @@ def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":
         last_host_node=root,
         best_match_node=root,
         host_hit_length=0,
+        swa_host_hit_length=0,
+        mamba_host_hit_length=0,
     )
 
 
@@ -207,7 +221,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         labels = {"cache_type": self.__class__.__name__}
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
-        self.metrics_collector = RadixCacheMetricsCollector(labels=labels)
+        radix_cache_cls = resolve_collector_class(
+            server_args,
+            STAT_LOGGER_ROLE_RADIX_CACHE,
+            RadixCacheMetricsCollector,
+        )
+        self.metrics_collector = radix_cache_cls(labels=labels)
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:
@@ -223,6 +242,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
+
+    def supports_fast_match_prefix(self) -> bool:
+        return False
 
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
