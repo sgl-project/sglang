@@ -66,7 +66,6 @@ class TorchNpuDispatcher(BaseDispatcher):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
         self._dispatch_output: Optional[TorchNpuDispatchOutput] = None
-        self._dispatch_finalize: Optional[object] = None   # kernel used for combine
 
         self.quant_config: Optional[dict] = None
         self.set_ascend_dispatcher_output_dtype()
@@ -153,7 +152,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         Reverse the token permutation and apply gating weights.
         Uses the same finalize kernel that was selected during dispatch.
         """
-        if self._dispatch_output is None or self._dispatch_finalize is None:
+        if self._dispatch_output is None or self._combine is None:
             raise RuntimeError("combine() called before dispatch()")
 
         dispatch_out = self._dispatch_output
