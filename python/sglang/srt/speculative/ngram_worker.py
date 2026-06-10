@@ -17,7 +17,7 @@ from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
-    record_stream_each,
+    record_stream_for_v2_verify,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
@@ -354,7 +354,7 @@ class NGRAMWorker:
         self, batch: ScheduleBatch, on_publish=None
     ) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
-        record_stream_each(batch.seq_lens, fwd_stream)
+        record_stream_for_v2_verify(batch, None, fwd_stream)
         bs = len(batch.reqs)
 
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
