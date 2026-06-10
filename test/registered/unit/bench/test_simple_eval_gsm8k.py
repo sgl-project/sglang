@@ -32,6 +32,7 @@ def _write_synthetic_dataset(path: str, n: int) -> None:
 class TestSimpleEvalGSM8K(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
         cls._tmpdir = tempfile.TemporaryDirectory()
         cls._data_path = os.path.join(cls._tmpdir.name, "synthetic.jsonl")
         _write_synthetic_dataset(cls._data_path, 16)
