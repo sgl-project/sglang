@@ -147,16 +147,29 @@ class IntelAMXAttnBackend(AttentionBackend):
         # In speculative decoding, we can infer these from spec_info or compute them
         bs = forward_batch.batch_size
         seq_lens = forward_batch.seq_lens
+        tree_mask = None
         if forward_batch.extend_seq_lens is None:
             # TARGET_VERIFY mode: infer extend_seq_lens from spec_info
             if forward_batch.spec_info is not None and hasattr(
                 forward_batch.spec_info, "draft_token_num"
             ):
-                draft_token_num = forward_batch.spec_info.draft_token_num
+                spec_info = forward_batch.spec_info
+                draft_token_num = spec_info.draft_token_num
                 extend_seq_lens = torch.full(
                     (bs,), draft_token_num, dtype=torch.int32, device=self.device
                 )
                 seq_lens = forward_batch.seq_lens + draft_token_num
+                # EAGLE topk > 1 verifies a token tree: each draft token may only
+                # attend to its ancestors among the draft tokens (the committed
+                # prefix stays fully visible). spec_info.custom_mask is built with
+                # TreeMaskMode.QLEN_ONLY on CPU: a flat
+                # [bs * draft_token_num * draft_token_num] bool tensor.
+                # topk == 1 is a chain, which equals the kernel's built-in causal
+                # masking, so no mask is passed (same for non-spec extend).
+                if getattr(spec_info, "topk", 1) > 1:
+                    custom_mask = getattr(spec_info, "custom_mask", None)
+                    if custom_mask is not None and custom_mask.numel() > 0:
+                        tree_mask = custom_mask
             else:
                 raise RuntimeError(
                     "extend_seq_lens is None but cannot infer from spec_info. "
@@ -192,6 +205,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
             sinks,
+            tree_mask,
         )
         return o
 
