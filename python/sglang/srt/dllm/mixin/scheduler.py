@@ -111,8 +111,9 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        if result.accept_length_per_req_cpu is None:
-            raise RuntimeError("FDFO dLLM result is missing accept lengths.")
+        assert (
+            result.accept_length_per_req_cpu is not None
+        ), "FDFO dLLM result is missing accept lengths."
 
         self.token_to_kv_pool_allocator.free_group_begin()
         block_size = self.dllm_config.block_size
