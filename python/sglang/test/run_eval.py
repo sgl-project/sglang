@@ -174,7 +174,15 @@ def run_eval(args):
     elif args.eval_name == "gsm8k":
         from sglang.test.simple_eval_gsm8k import GSM8KEval
 
-        if getattr(args, "stop", None) is None:
+        # Default stop sequences keep Mistral/Mixtral from continuing into a
+        # self-generated `Question:` block. Do not apply them to other models:
+        # reasoning models (e.g. GLM-5 served with --reasoning-parser) restate
+        # `Question:` inside their chain-of-thought, and a global stop
+        # truncates the reasoning mid-way.
+        gsm8k_model = (getattr(args, "model", None) or "").lower()
+        if getattr(args, "stop", None) is None and (
+            "mistral" in gsm8k_model or "mixtral" in gsm8k_model
+        ):
             args.stop = ["\nQuestion:", "\n\nQuestion:"]
         eval_obj = GSM8KEval(
             num_examples=args.num_examples,
