@@ -148,11 +148,20 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
         allow_radix_cache_insert_once=False,
         fill_ids=[1, 2, 3, 4, 5],
         cache_protected_len=0,
+        swa_evicted_seqlen=4,
     )
-    tree_cache = SimpleNamespace(inserted_fill_ids=[])
+    tree_cache = SimpleNamespace(
+        inserted_fill_ids=[],
+        inserted_swa_evicted_seqlens=[],
+        page_size=2,
+        sliding_window_size=2,
+    )
 
     def cache_unfinished_req(inserted_req, **_kwargs):
         tree_cache.inserted_fill_ids.append(list(inserted_req.fill_ids))
+        tree_cache.inserted_swa_evicted_seqlens.append(
+            inserted_req.swa_evicted_seqlen
+        )
 
     tree_cache.cache_unfinished_req = cache_unfinished_req
     processor = SimpleNamespace(tree_cache=tree_cache)
@@ -160,8 +169,10 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
     SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
     SchedulerBatchResultProcessor._maybe_insert_dsv4_decode_radix_prompt(processor, req)
 
-    assert tree_cache.inserted_fill_ids == [[1, 2, 3]]
+    assert tree_cache.inserted_fill_ids == [[1, 2]]
+    assert tree_cache.inserted_swa_evicted_seqlens == [0]
     assert req.fill_ids == [1, 2, 3, 4, 5]
-    assert req.cache_protected_len == 3
+    assert req.cache_protected_len == 2
+    assert req.swa_evicted_seqlen == 4
     assert req.allow_radix_cache_insert_once is False
     assert req.dsv4_decode_radix_cache_prompt_once is False

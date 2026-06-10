@@ -23,6 +23,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
+    page_align_floor,
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -173,22 +174,44 @@ class SchedulerBatchResultProcessor:
             maybe_cache_unfinished_req(req, self.tree_cache)
             return
 
+        page_size = getattr(self.tree_cache, "page_size", 1)
+        aligned_prompt_len = page_align_floor(prompt_len, page_size)
+        if aligned_prompt_len <= 0:
+            req.allow_radix_cache_insert_once = False
+            return
+
         old_fill_ids = req.fill_ids
         old_cache_protected_len = getattr(req, "cache_protected_len", 0)
-        req.fill_ids = old_fill_ids[:prompt_len]
-        req.cache_protected_len = max(old_cache_protected_len, prompt_len)
+        old_swa_evicted_seqlen = getattr(req, "swa_evicted_seqlen", 0)
+        sliding_window_size = getattr(self.tree_cache, "sliding_window_size", None)
+        swa_tail_len = page_align_floor(sliding_window_size or page_size, page_size)
+        swa_tail_len = max(page_size, swa_tail_len)
+        swa_tail_len = min(aligned_prompt_len, swa_tail_len)
+
+        req.fill_ids = old_fill_ids[:aligned_prompt_len]
+        req.cache_protected_len = max(old_cache_protected_len, aligned_prompt_len)
+        # If the request's SWA evicted seqlen already covers the whole prompt
+        # key, the unified SWA component skips leaf creation entirely. Keep a
+        # window-sized SWA tail for the donated prompt so the full radix leaf is
+        # created and later matches can validate the SWA window.
+        req.swa_evicted_seqlen = min(
+            page_align_floor(old_swa_evicted_seqlen, page_size),
+            max(0, aligned_prompt_len - swa_tail_len),
+        )
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
             if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
                 logger.info(
                     "DSV4 decode radix prompt inserted: rid=%s "
-                    "prompt_len=%d fill_len=%d",
+                    "prompt_len=%d aligned_prompt_len=%d fill_len=%d",
                     req.rid,
-                    len(req.fill_ids),
+                    prompt_len,
+                    aligned_prompt_len,
                     len(old_fill_ids),
                 )
         finally:
             req.fill_ids = old_fill_ids
+            req.swa_evicted_seqlen = old_swa_evicted_seqlen
             if req.cache_protected_len < old_cache_protected_len:
                 req.cache_protected_len = old_cache_protected_len
 
