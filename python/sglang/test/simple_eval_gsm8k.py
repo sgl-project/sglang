@@ -6,6 +6,8 @@ from typing import Optional
 
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
+    ANSWER_PATTERN,
+    ChatCompletionSampler,
     HTML_JINJA,
     Eval,
     EvalResult,
@@ -16,6 +18,13 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 GSM8K_URL = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
 INVALID = -9999999
+
+CHAT_MODE_INSTRUCTION = (
+    "Solve the following math problems. Show your reasoning, then write the "
+    "final answer on the last line in the exact format `Answer: <integer>` "
+    "with nothing after the integer.\n\n"
+    "Here are some worked examples:\n\n"
+)
 
 
 def get_one_example(lines, i, include_answer):
@@ -38,6 +47,15 @@ def get_answer_value(answer_str):
         return ast.literal_eval(numbers[-1])
     except (SyntaxError, ValueError):
         return INVALID
+
+
+def extract_answer(response_text: str):
+    match = re.search(ANSWER_PATTERN, response_text)
+    if match:
+        candidate = get_answer_value(match.group(1))
+        if candidate != INVALID:
+            return candidate
+    return get_answer_value(response_text)
 
 
 class GSM8KEval(Eval):
@@ -73,12 +91,23 @@ class GSM8KEval(Eval):
     def _build_prefix(self, idx: int) -> str:
         return self._few_shot_prompt
 
+    def _build_prompt(self, idx: int, question: str, sampler: SamplerBase) -> str:
+        prefix = self._build_prefix(idx)
+        if isinstance(sampler, ChatCompletionSampler):
+            return (
+                CHAT_MODE_INSTRUCTION
+                + prefix
+                + "Now solve this problem:\n\n"
+                + question
+            )
+        return prefix + question
+
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(idx: int) -> SingleEvalResult:
             question = get_one_example(self._lines, idx, include_answer=False)
             correct_answer = get_answer_value(self._lines[idx]["answer"])
 
-            prompt_content = self._build_prefix(idx) + question
+            prompt_content = self._build_prompt(idx, question, sampler)
             prompt_messages = [
                 sampler._pack_message(content=prompt_content, role="user")
             ]
@@ -88,7 +117,7 @@ class GSM8KEval(Eval):
             except Exception:
                 response_text = ""
 
-            extracted_answer = get_answer_value(response_text)
+            extracted_answer = extract_answer(response_text)
             score = float(extracted_answer == correct_answer)
 
             html = common.jinja_env.from_string(HTML_JINJA).render(
