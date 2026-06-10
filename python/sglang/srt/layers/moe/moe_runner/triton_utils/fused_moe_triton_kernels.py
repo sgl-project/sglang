@@ -1248,6 +1248,8 @@ def _fused_append_shared_experts_with_weights_kernel(
     S: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    APPLY_SIGMOID: tl.constexpr,
+    EP_SCALE: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -1267,14 +1269,32 @@ def _fused_append_shared_experts_with_weights_kernel(
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
     shared_ws = tl.load(shared_weights_ptr + pid * S + offs_s, mask=mask_s)
 
+    if APPLY_SIGMOID:
+        shared_ws = tl.sigmoid(shared_ws.to(tl.float32)).to(shared_ws.dtype)
+    if EP_SCALE > 0.0:
+        shared_ws = shared_ws / EP_SCALE
+
     tl.store(out_ids_ptr + out_row_ptr + K + offs_s, shared_ids, mask=mask_s)
     tl.store(out_weights_ptr + out_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_shared_experts_with_weights(
-    topk_ids, topk_weights, shared_weights, num_fused_shared_experts, N=None
+    topk_ids,
+    topk_weights,
+    shared_weights,
+    num_fused_shared_experts,
+    N=None,
+    apply_sigmoid: bool = False,
+    ep_scale: float = 0.0,
 ):
-    """Like fused_append_shared_experts but accepts per-token shared weights tensor."""
+    """Like fused_append_shared_experts but accepts per-token shared weights tensor.
+
+    Args:
+        apply_sigmoid: When True the kernel applies sigmoid to shared_weights
+            in-place, eliminating a standalone sigmoid dispatch.
+        ep_scale: When > 0 the kernel divides the (possibly sigmoided) shared
+            weights by this value (expert-parallel scaling).
+    """
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1307,6 +1327,8 @@ def fused_append_shared_experts_with_weights(
         S=s,
         BLOCK_K=block_k,
         BLOCK_S=block_s,
+        APPLY_SIGMOID=apply_sigmoid,
+        EP_SCALE=ep_scale,
         num_warps=1,
     )
     return out_ids, out_weights

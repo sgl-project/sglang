@@ -321,6 +321,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
+        # Pre-compute EP scale for fused shared expert path (used once in
+        # the Triton kernel rather than every forward call).
+        moe_ep_size = get_moe_expert_parallel_world_size()
+        if moe_ep_size > 1 and not is_deepep_class_backend():
+            self.moe_ep_scale = float(moe_ep_size)
+        else:
+            self.moe_ep_scale = 0.0
+
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
@@ -341,24 +349,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ]
 
     def _get_shared_expert_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return sigmoid(shared_expert_gate) for fused shared expert weights."""
+        """Return raw shared_expert_gate logits (pre-sigmoid).
+
+        Sigmoid and EP scaling are fused into the Triton append kernel via
+        ``apply_sigmoid`` and ``ep_scale`` parameters, eliminating a standalone
+        sigmoid kernel launch per MoE layer.
+        """
         if not self.enable_shared_expert_fusion or self.shared_expert_gate is None:
             return None
         shared_out = self.shared_expert_gate(hidden_states)
         shared_logits = shared_out[0] if isinstance(shared_out, tuple) else shared_out
-        w = F.sigmoid(shared_logits)
-        # This block runs only on the AMD AITER shared_expert_fusion path
-        # Allreduce-EP path: the fused shared expert occupies a single global
-        # slot loaded onto every EP rank (see FusedMoE.__init__: num_shared_slots
-        # == num_fused_shared_experts when not is_deepep_class_backend()). Every
-        # rank therefore computes the same full shared output, and the
-        # post-experts all_reduce sums it ep_size times. Pre-scale the per-token
-        # routing weight by 1/ep_size to cancel this, mirroring DeepSeek-V2's
-        # fused_shared_experts_scaling_factor pattern.
-        moe_ep_size = get_moe_expert_parallel_world_size()
-        if moe_ep_size > 1 and not is_deepep_class_backend():
-            w = w / float(moe_ep_size)
-        return w
+        return shared_logits
 
     def _append_shared_to_topk_output(
         self,
@@ -382,6 +383,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_weights,
             self.num_fused_shared_experts,
             N=self.num_experts,
+            apply_sigmoid=True,
+            ep_scale=self.moe_ep_scale,
         )
         return StandardTopKOutput(
             topk_weights=fused_topk_weights,
