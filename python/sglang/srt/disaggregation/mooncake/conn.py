@@ -10,10 +10,9 @@ import time
 from collections import defaultdict
 from typing import List, Optional, Tuple, Union
 
-import zmq
-
 import numpy as np
 import numpy.typing as npt
+import zmq
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
