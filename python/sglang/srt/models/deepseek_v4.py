@@ -80,6 +80,13 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
+# NPU-only: bind torch_npu in this module's namespace. _compute_q_b /
+# _forward_prepare call torch_npu.npu_rms_norm directly; module-level imports
+# elsewhere (e.g. model_runner) don't make the name visible here. torch.ops.
+# custom.* is registered separately via hardware_backend.npu.utils.
+if _is_npu:
+    import torch_npu
+
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
