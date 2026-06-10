@@ -118,6 +118,12 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
+    def draft_is_flat(self) -> bool:
+        """Drafts are a flat candidate list written to contiguous slots after
+        seq_lens, with no per-topk page duplication -- so the flat per-decode
+        KV alloc formula applies at any page size."""
+        return self.is_ngram()
+
     def create_future_map(
         self,
         device: torch.device,
