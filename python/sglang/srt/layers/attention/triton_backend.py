@@ -668,16 +668,19 @@ class TritonAttnBackend(AttentionBackend):
             # Eager only (CG replay bypasses init); explicit D2H here instead of
             # letting torch.empty inside generate_attn_arg_prefill .item() on a
             # GPU cumsum tensor.
-            seq_lens_sum = (
-                forward_batch.seq_lens_sum
-                if forward_batch.seq_lens_sum is not None
-                else int(forward_batch.seq_lens.sum())
+            # Triton extend kernels receive accepted-token K/V separately, so
+            # kv_indices should cover only prefix cache positions.
+            prefix_lens = forward_batch.extend_prefix_lens
+            prefix_lens_sum = (
+                sum(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.extend_prefix_lens_cpu is not None
+                else int(prefix_lens.sum())
             )
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    seq_lens_sum,
+                    prefix_lens,
+                    prefix_lens_sum,
                     self.req_to_token,
                 )
             )
