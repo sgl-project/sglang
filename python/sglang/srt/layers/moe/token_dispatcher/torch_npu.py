@@ -102,25 +102,6 @@ class TorchNpuDispatcher(BaseDispatcher):
         No longer needs to distinguish prefill vs decode because the same
         routing kernels are used for both phases.
         """
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
-    
-        # --- begin fix ---
-        # Replace -1 (invalid) expert IDs with a valid expert index (e.g. 0)
-        # and set the corresponding weight to zero.
-        invalid_mask = topk_ids == -1
-        print(topk_ids)
-        if invalid_mask.any():
-            topk_ids = topk_ids.clone()              # avoid modifying original
-            topk_weights = topk_weights.clone()
-            topk_ids[invalid_mask] = 0               # any valid expert, e.g. 0
-            topk_weights[invalid_mask] = 0.0         # nullify contribution
-            # Update the named tuple with the sanitised tensors
-            topk_output = TopKOutput(
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                topk_metadata=topk_output.topk_metadata
-            )
         (
             permuted_hidden_states,
             expanded_row_idx,
