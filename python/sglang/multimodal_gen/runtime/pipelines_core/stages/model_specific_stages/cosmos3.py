@@ -14,7 +14,6 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -42,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -322,11 +322,8 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         if is_i2v:
             vae_dtype = next(self.vae.parameters()).dtype
-            pixel_video = (
-                batch.preprocessed_image.unsqueeze(2)
-                .expand(-1, -1, batch.num_frames, -1, -1)
-                .contiguous()
-                .to(device=device, dtype=vae_dtype)
+            pixel_video = batch.preprocessed_image.unsqueeze(2).to(
+                device=device, dtype=vae_dtype
             )
             with torch.no_grad():
                 cond_latent = self._vae_encode(pixel_video).to(dtype)
@@ -488,6 +485,11 @@ class Cosmos3DenoisingStage(PipelineStage):
         result.add_check("timesteps", batch.timesteps, V.is_tensor)
         return result
 
+    def step_profile(self):
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler:
+            profiler.step_denoising_step()
+
     def _run_transformer(
         self,
         latents: torch.Tensor,
@@ -499,6 +501,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         cache_key: str = "default",
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run transformer forward pass.
 
@@ -513,10 +516,9 @@ class Cosmos3DenoisingStage(PipelineStage):
                 and "uncond" for unconditional to enable cache reuse across steps.
             noisy_frame_mask: Optional [B, 1, T, 1, 1] I2V conditioning mask.
         """
-        with set_forward_context(
-            current_timestep=int(timestep.flatten()[0].item()),
-            attn_metadata=None,
-        ):
+        if current_timestep is None:
+            current_timestep = int(timestep.flatten()[0].item())
+        with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
             return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=None,  # Not used by Cosmos3
@@ -610,7 +612,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             f"CFG_parallel={enable_cfg_parallel}, cfg_rank={cfg_rank}"
         )
 
-        progress_bar = tqdm(
+        progress_bar = self.progress_bar(
             enumerate(timesteps),
             total=len(timesteps),
             desc="Denoising",
@@ -641,6 +643,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         noisy_frame_mask=velocity_mask,
                         cond_text_seq_len=batch.extra["cond_text_seq_len"],
                         uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
+                        current_timestep=i,
                     )
                 elif effective_scale == 1.0:
                     noise_pred = self._run_transformer(
@@ -653,6 +656,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         cache_key="cond",
                         noisy_frame_mask=velocity_mask,
                         max_text_seq_len=batch.extra["cond_text_seq_len"],
+                        current_timestep=i,
                     )
                 else:
                     noise_pred = self._predict_noise_cfg_batched(
@@ -670,6 +674,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                             batch.extra["cond_text_seq_len"],
                             batch.extra["uncond_text_seq_len"],
                         ),
+                        current_timestep=i,
                     )
             else:
                 noise_pred = self._run_transformer(
@@ -682,6 +687,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                     cache_key="cond",
                     noisy_frame_mask=velocity_mask,
                     max_text_seq_len=batch.extra["cond_text_seq_len"],
+                    current_timestep=i,
                 )
 
             # I2V: zero-velocity at conditioned frames so the scheduler keeps
@@ -700,6 +706,9 @@ class Cosmos3DenoisingStage(PipelineStage):
             if image_latent is not None:
                 latents[:, :, 0:1, :, :] = image_latent
 
+            if batch.profile and not batch.is_warmup:
+                self.step_profile()
+
         batch.latents = latents
         self.log_info("Denoising complete")
         return batch
@@ -717,6 +726,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         guidance_scale: float,
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run CFG by stacking both branches into a batch_size=2 forward.
 
@@ -744,6 +754,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             cache_key="cfg_batched",
             noisy_frame_mask=mask_batched,
             max_text_seq_len=max_text_seq_len,
+            current_timestep=current_timestep,
         )
 
         noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2, dim=0)
@@ -767,6 +778,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         noisy_frame_mask: torch.Tensor | None = None,
         cond_text_seq_len: int | None = None,
         uncond_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run CFG with one branch per CFG rank, combined by all-reduce.
 
@@ -787,6 +799,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 cache_key="cond",
                 noisy_frame_mask=noisy_frame_mask,
                 max_text_seq_len=cond_text_seq_len,
+                current_timestep=current_timestep,
             )
             partial = guidance_scale * noise_pred
         else:
@@ -800,6 +813,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 cache_key="uncond",
                 noisy_frame_mask=noisy_frame_mask,
                 max_text_seq_len=uncond_text_seq_len,
+                current_timestep=current_timestep,
             )
             partial = (1.0 - guidance_scale) * noise_pred
 
@@ -873,7 +887,7 @@ class Cosmos3DecodingStage(PipelineStage):
 
     @staticmethod
     def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
-        return (decoded * 0.5 + 0.5).clamp(0, 1).float()
+        return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
 
     @staticmethod
     def _postprocess_video_np(video: torch.Tensor, is_image_gen: bool) -> np.ndarray:
