@@ -68,7 +68,7 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
 
         # Process scale
         scale: torch.Tensor = getattr(layer, f"{weight_prefix}_weight_scale")
-        scale_np = scale.data.cpu().numpy()
+        scale_np = scale.data.cpu().contiguous().numpy()
         scale_np.dtype = np.uint32
         scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
         # squeeze(-1) already yields contiguous tensor; no extra .contiguous() needed
@@ -147,7 +147,7 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
 
     def _pack_to_int32(self, weight: torch.Tensor):
         # pack 4 int8(int4*2) to int32, because in pytorch, we need to use int32 to represent int4
-        return weight.view(torch.int32).contiguous()
+        return weight.contiguous().view(torch.int32)
 
     def apply(
         self,
@@ -162,7 +162,6 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
         scale = self._cached_scale.get(weight_prefix)
         if scale is None:
             scale = getattr(layer, f"{weight_prefix}_weight_scale")
-        print(pertoken_scale)
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
                 hidden_states
@@ -360,7 +359,7 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
     ) -> torch.Tensor:
         scale = scale.transpose(1, 2).contiguous()
         if is_per_channel:
-            scale_np = scale.cpu().numpy()
+            scale_np = scale.cpu().contiguous().numpy()
             scale_np.dtype = np.uint32
             scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
             return scale_uint64_tensor
@@ -390,7 +389,7 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
             f"Last dimension of weight must be divisible by 4 for int8→int32 packing, "
             f"got shape {weight.shape}"
         )
-        return weight.view(torch.int32).contiguous()
+        return weight.contiguous().view(torch.int32)
 
     def apply(
         self,
@@ -504,7 +503,7 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
                 f"Last dimension of int8 weight must be divisible by 4 for int32 packing, "
                 f"got {weight.shape}"
             )
-            new_weight = weight.view(torch.int32)
+            new_weight = weight.contiguous().view(torch.int32)
         else:
             raise ValueError(f"Unsupported weight dtype for packing: {weight.dtype}")
         return new_weight.contiguous()

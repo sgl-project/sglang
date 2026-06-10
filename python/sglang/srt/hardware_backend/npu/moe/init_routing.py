@@ -36,7 +36,7 @@ class NPUMoEInitRouting_v1(BaseInitRouting):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
         row_idx_len = num_tokens * topk_ids.shape[1]
         row_idx = (
@@ -75,7 +75,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
@@ -107,7 +107,7 @@ class NPUMoEInitRouting_Quant(BaseInitRouting):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
 
         hidden_states, expanded_row_idx, expert_tokens, _, pertoken_scale = (
