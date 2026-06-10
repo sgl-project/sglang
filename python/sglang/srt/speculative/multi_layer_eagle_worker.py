@@ -12,6 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
+from __future__ import annotations
+
 import logging
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
