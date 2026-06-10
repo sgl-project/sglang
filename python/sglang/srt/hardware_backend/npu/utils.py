@@ -99,6 +99,7 @@ def init_npu_backend():
     import sgl_kernel_npu  # noqa: F401
     import torch_npu
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
+    import custom_ops  # noqa: F401
 
     # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
     torch.cuda.is_available = lambda: False

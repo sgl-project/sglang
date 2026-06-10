@@ -80,12 +80,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-# NPU-only deps. `custom_ops` registers torch.ops.custom.{npu_hc_pre,
-# npu_hc_post, inplace_partial_rotary_mul, ...} from the cann-8.5.0-a3 wheel.
-if _is_npu:
-    import custom_ops  # noqa: F401  registers torch.ops.custom.*
-    import torch_npu
-
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
