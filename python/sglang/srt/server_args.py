@@ -387,6 +387,10 @@ class ServerArgs:
     tokenizer_backend: str = "huggingface"
     tokenizer_worker_num: int = 1
     detokenizer_worker_num: int = 1
+    # Sharding strategy for MultiDetokenizerRouter when detokenizer_worker_num > 1.
+    # "single": one router for all DP schedulers (legacy behavior).
+    # "dp_rank": one router per DP rank (avoids the single-router bottleneck).
+    detokenizer_router_sharding: Literal["single", "dp_rank"] = "single"
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -4723,6 +4727,15 @@ class ServerArgs:
             help="The worker num of the detokenizer manager.",
         )
         parser.add_argument(
+            "--detokenizer-router-sharding",
+            type=str,
+            default=ServerArgs.detokenizer_router_sharding,
+            choices=["single", "dp_rank"],
+            help="Sharding of MultiDetokenizerRouter when detokenizer_worker_num > 1. "
+            "'single' uses one router for all DP schedulers; "
+            "'dp_rank' uses one router per DP rank.",
+        )
+        parser.add_argument(
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
@@ -8317,6 +8330,18 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 ZMQ_TCP_PORT_DELTA = 233
 DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
+# TCP port offset from port_base for per-DP MultiDetokenizerRouter sockets in
+# DP-attention mode. Leaves enough headroom past the other reserved offsets.
+DETOKENIZER_ROUTER_TCP_PORT_DELTA = 20
+
+
+def use_dp_rank_detokenizer_router(server_args: ServerArgs) -> bool:
+    """Whether to launch one MultiDetokenizerRouter per DP rank."""
+    return (
+        server_args.detokenizer_worker_num > 1
+        and server_args.detokenizer_router_sharding == "dp_rank"
+        and server_args.dp_size > 1
+    )
 
 
 @dataclasses.dataclass
@@ -8339,6 +8364,15 @@ class PortArgs:
 
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
+    # Per-DP-rank IPC names for MultiDetokenizerRouter when sharding="dp_rank".
+    # Each DP scheduler writes to its own router IPC instead of the global one.
+    detokenizer_router_ipc_names: Optional[List[str]] = None
+
+    def scheduler_detokenizer_ipc(self, dp_rank: int) -> str:
+        """IPC name a scheduler at ``dp_rank`` should push outputs to."""
+        if self.detokenizer_router_ipc_names is not None:
+            return self.detokenizer_router_ipc_names[dp_rank]
+        return self.detokenizer_ipc_name
 
     # zmq address for load snapshot PUSH/PULL (dp-attention TCP mode only;
     # empty when IPC mode derives the address from instance_id).
@@ -8367,6 +8401,15 @@ class PortArgs:
             )
 
         instance_id = uuid.uuid4().hex[:12]
+        # Per-DP-rank router IPCs are only allocated on the top-level init
+        # (``dp_rank is None``); per-rank init_new calls inherit them via the
+        # parent ``port_args`` passed to the controller.
+        if dp_rank is None and use_dp_rank_detokenizer_router(server_args):
+            detokenizer_router_ipc_names = _build_detokenizer_router_ipc_names(
+                server_args
+            )
+        else:
+            detokenizer_router_ipc_names = None
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
@@ -8379,6 +8422,7 @@ class PortArgs:
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
                 instance_id=instance_id,
+                detokenizer_router_ipc_names=detokenizer_router_ipc_names,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -8452,7 +8496,27 @@ class PortArgs:
                     dist_init_host, load_collector_port
                 ).to_tcp(),
                 instance_id=instance_id,
+                detokenizer_router_ipc_names=detokenizer_router_ipc_names,
             )
+
+
+def _build_detokenizer_router_ipc_names(server_args: ServerArgs) -> List[str]:
+    """Allocate one IPC per DP rank for MultiDetokenizerRouter."""
+    if server_args.enable_dp_attention:
+        # Use TCP addresses anchored at dist_init_addr so all nodes can reach them.
+        if server_args.nnodes == 1 and server_args.dist_init_addr is None:
+            na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+        else:
+            na = NetworkAddress.parse(server_args.dist_init_addr)
+        base = na.port + 1 + DETOKENIZER_ROUTER_TCP_PORT_DELTA
+        return [
+            NetworkAddress(na.host, base + i).to_tcp()
+            for i in range(server_args.dp_size)
+        ]
+    return [
+        f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        for _ in range(server_args.dp_size)
+    ]
 
 
 def auto_choose_speculative_params(self: ServerArgs):

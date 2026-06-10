@@ -337,7 +337,7 @@ class MultiHttpWorkerDetokenizerMixin:
             # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
             # forward either batched or single requests, so handle both shapes.
             if isinstance(recv_obj, BaseBatchReq):
-                for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
+                for i, ipc_name in enumerate(recv_obj.http_worker_ipcs or ()):
                     new_output = _handle_output_by_index(output, i)
                     self.socket_mapping.send_output(
                         ipc_name, new_output, is_tokenizer=True
@@ -469,7 +469,7 @@ class MultiTokenizerRouter:
         else:
             raise ValueError(f"Unknown recv_obj type: {type(recv_obj)}")
 
-        for i, ipc_name in enumerate(ipc_names):
+        for i, ipc_name in enumerate(ipc_names or ()):
             new_recv_obj = _handle_output_by_index(recv_obj, i)
             self.socket_mapping.send_output(ipc_name, new_recv_obj)
 
@@ -480,6 +480,10 @@ class MultiDetokenizerRouter:
     Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
     ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
     always land on the same detokenizer and ``decode_status`` stays consistent.
+
+    When ``detokenizer_router_sharding="dp_rank"``, one router process is
+    launched per DP rank so each scheduler only contends with its own router,
+    avoiding a global single-router bottleneck.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
@@ -515,42 +519,55 @@ class MultiDetokenizerRouter:
                 self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
                 continue
 
-            # Batch request.
             if isinstance(recv_obj, BaseBatchReq):
-                # Idle/no-op batch (rids=[]): broadcast to all detokenizers
-                if not recv_obj.rids:
-                    for ipc in self.ipc_name_list:
-                        self._send(ipc, recv_obj)
-                    continue
-
-                ipcs = recv_obj.http_worker_ipcs
-                assert (
-                    ipcs is not None
-                    and len(ipcs) == len(recv_obj.rids)
-                    and all(x is not None for x in ipcs)
-                ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
-
-                # Split per-item and route each by its own ipc.
-                for i, ipc_key in enumerate(ipcs):
-                    one = _handle_output_by_index(recv_obj, i)
-                    if one is recv_obj:
-                        raise TypeError(f"Cannot split {type(recv_obj)}")
-                    one.http_worker_ipcs = [ipc_key]
-                    self._send(self._pick(ipc_key), one)
+                self._route_batch(recv_obj)
                 continue
 
             raise ValueError(
                 f"MultiDetokenizerRouter got unsupported type {type(recv_obj)}"
             )
 
+    def _route_batch(self, recv_obj: BaseBatchReq) -> None:
+        ipcs = recv_obj.http_worker_ipcs
+        valid_ipcs = (
+            recv_obj.rids
+            and ipcs is not None
+            and len(ipcs) == len(recv_obj.rids)
+            and all(x is not None for x in ipcs)
+        )
+        if not valid_ipcs:
+            # Idle batch (rids=[]) or warmup/control batches without per-item
+            # http_worker_ipcs. Forward to a single worker instead of broadcasting
+            # so load-update batches don't fan out N-ways.
+            if recv_obj.rids:
+                logger.warning(
+                    "Batch req has invalid http_worker_ipcs; fallback to one worker. "
+                    f"rids={recv_obj.rids}"
+                )
+            self._send(self.ipc_name_list[0], recv_obj)
+            return
+
+        # Split per-item and route each by its own ipc.
+        for i, ipc_key in enumerate(ipcs):
+            one = _handle_output_by_index(recv_obj, i)
+            if one is recv_obj:
+                raise TypeError(f"Cannot split {type(recv_obj)}")
+            one.http_worker_ipcs = [ipc_key]
+            self._send(self._pick(ipc_key), one)
+
 
 def run_multi_detokenizer_router_process(
     ipc_name_list: List[str],
     server_args: ServerArgs,
     port_args: PortArgs,
+    router_index: int = 0,
+    router_count: int = 1,
 ):
     kill_itself_when_parent_died()
-    setproctitle.setproctitle("sglang::detokenizer_router")
+    title = "sglang::detokenizer_router"
+    if router_count > 1:
+        title = f"{title}:{router_index}"
+    setproctitle.setproctitle(title)
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 

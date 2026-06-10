@@ -705,8 +705,10 @@ class Engine(EngineScoreMixin, EngineBase):
         - When ``detokenizer_worker_num == 1``: a single detokenizer process listens on
           ``port_args.detokenizer_ipc_name`` (the original behavior).
         - When ``detokenizer_worker_num > 1``: each detokenizer worker gets its own
-          private IPC socket, and a ``MultiDetokenizerRouter`` process owns the
-          original ``port_args.detokenizer_ipc_name`` and fans out to them.
+          private IPC socket. One or more ``MultiDetokenizerRouter`` processes fan
+          out to them. The router count is determined by
+          ``port_args.detokenizer_router_ipc_names`` (set in ``PortArgs.init_new``
+          when ``detokenizer_router_sharding="dp_rank"``).
 
         Returns (processes, names) for SubprocessWatchdog.
         """
@@ -723,30 +725,48 @@ class Engine(EngineScoreMixin, EngineBase):
             names.append("detokenizer")
             return processes, names
 
-        router_ipc_name = port_args.detokenizer_ipc_name
+        # Launch one detokenizer process per worker on a private IPC.
         worker_ipc_names: List[str] = []
-        try:
-            for i in range(server_args.detokenizer_worker_num):
-                worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-                port_args.detokenizer_ipc_name = worker_ipc
-                proc = mp.Process(
-                    target=run_detokenizer_process_func,
-                    args=(server_args, port_args),
-                )
-                proc.start()
-                processes.append(proc)
-                names.append(f"detokenizer_{i}")
-                worker_ipc_names.append(worker_ipc)
-        finally:
-            port_args.detokenizer_ipc_name = router_ipc_name
+        for i in range(server_args.detokenizer_worker_num):
+            worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+            worker_port_args = dataclasses.replace(
+                port_args, detokenizer_ipc_name=worker_ipc
+            )
+            proc = mp.Process(
+                target=run_detokenizer_process_func,
+                args=(server_args, worker_port_args),
+            )
+            proc.start()
+            processes.append(proc)
+            names.append(f"detokenizer_{i}")
+            worker_ipc_names.append(worker_ipc)
 
-        router_proc = mp.Process(
-            target=run_multi_detokenizer_router_process,
-            args=(worker_ipc_names, server_args, port_args),
-        )
-        router_proc.start()
-        processes.append(router_proc)
-        names.append("detokenizer_router")
+        # Launch routers: one per DP rank when sharding="dp_rank", else a single
+        # router bound to the global detokenizer IPC.
+        router_ipc_names = port_args.detokenizer_router_ipc_names or [
+            port_args.detokenizer_ipc_name
+        ]
+        for router_idx, router_ipc in enumerate(router_ipc_names):
+            router_port_args = dataclasses.replace(
+                port_args, detokenizer_ipc_name=router_ipc
+            )
+            router_proc = mp.Process(
+                target=run_multi_detokenizer_router_process,
+                args=(
+                    worker_ipc_names,
+                    server_args,
+                    router_port_args,
+                    router_idx,
+                    len(router_ipc_names),
+                ),
+            )
+            router_proc.start()
+            processes.append(router_proc)
+            names.append(
+                f"detokenizer_router_{router_idx}"
+                if len(router_ipc_names) > 1
+                else "detokenizer_router"
+            )
 
         return processes, names
 

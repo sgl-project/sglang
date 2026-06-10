@@ -73,7 +73,9 @@ class RayDataParallelController(DataParallelController):
         for dp_rank in range(server_args.dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
-            tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.detokenizer_ipc_name = port_args.scheduler_detokenizer_ipc(
+                dp_rank
+            )
             tmp_port_args.instance_id = port_args.instance_id
 
             # Hold NCCL port so the next DP rank gets a different one
@@ -169,7 +171,7 @@ class RayDataParallelController(DataParallelController):
                             # dist_init_addr is unset).  Scheduler actors must
                             # connect to the same addresses.
                             rank_port_args.detokenizer_ipc_name = (
-                                port_args.detokenizer_ipc_name
+                                port_args.scheduler_detokenizer_ipc(actual_dp_rank)
                             )
                             rank_port_args.tokenizer_ipc_name = (
                                 port_args.tokenizer_ipc_name
