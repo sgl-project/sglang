@@ -97,7 +97,7 @@ ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
+ARG MOONCAKE_COMMIT="d8f35569afaff14e76eae3719d7cc82fecf6a513"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
 ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
@@ -264,7 +264,7 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      rm go1.22.2.linux-amd64.tar.gz && \
      mkdir -p build && \
      cd build && \
-     cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON && \
+     cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON && \
      make -j "$(nproc)" && make install; \
     fi
 
