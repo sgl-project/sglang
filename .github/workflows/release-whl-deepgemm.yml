@@ -111,10 +111,13 @@ jobs:
           pattern: deepgemm-wheel-cuda12.9-x86_64
 
       - name: Install wheel and deps
+        env:
+          CU_TAG: cu129
         run: |
           python3 -m pip install --upgrade pip
-          # Runner torch must match the ABI the bundled _C.so was built against.
-          python3 -c "import torch; v = torch.__version__.split('+')[0]; assert v == '${TORCH_VER}', f'runner torch {v} != ${TORCH_VER}'"
+          # deep_gemm imports torch before loading _C.so, so torch must preload the
+          # libcudart the cu129 wheel links. Pin the CUDA-matched torch (see sgl-deep-gemm.Dockerfile).
+          python3 -m pip install "torch==${TORCH_VER}" --index-url "https://download.pytorch.org/whl/${CU_TAG}" --force-reinstall
           python3 -m pip install numpy
           python3 -m pip install dist/*.whl
           python3 -c "import deep_gemm; print('deep_gemm:', deep_gemm.__file__)"
@@ -253,10 +256,13 @@ jobs:
           pattern: deepgemm-wheel-cuda13.0-x86_64
 
       - name: Install wheel and deps
+        env:
+          CU_TAG: cu130
         run: |
           python3 -m pip install --upgrade pip
-          # Runner torch must match the ABI the bundled _C.so was built against.
-          python3 -c "import torch; v = torch.__version__.split('+')[0]; assert v == '${TORCH_VER}', f'runner torch {v} != ${TORCH_VER}'"
+          # deep_gemm imports torch before loading _C.so, so torch must preload the
+          # libcudart the cu130 wheel links. Pin the CUDA-matched torch (see sgl-deep-gemm.Dockerfile).
+          python3 -m pip install "torch==${TORCH_VER}" --index-url "https://download.pytorch.org/whl/${CU_TAG}" --force-reinstall
           python3 -m pip install numpy
           python3 -m pip install dist/*.whl
           python3 -c "import deep_gemm; print('deep_gemm:', deep_gemm.__file__)"
