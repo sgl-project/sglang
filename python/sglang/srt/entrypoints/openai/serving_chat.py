@@ -1114,13 +1114,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 ret_item["meta_info"] if request.return_meta_info else None
             )
             # NOTE: content should not be None but empty string to make sure retokenize consistency.
+            # NOTE: reasoning_content is returned as-is (including an empty string when a
+            # reasoning parser is configured but no reasoning was produced) rather than being
+            # coerced to None, so clients always see the parser's output verbatim.
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
                     content=text if text else "",
                     tool_calls=tool_calls,
-                    reasoning_content=reasoning_text if reasoning_text else None,
+                    reasoning_content=reasoning_text,
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,

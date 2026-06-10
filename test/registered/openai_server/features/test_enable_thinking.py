@@ -93,8 +93,10 @@ class TestEnableThinking(CustomTestCase):
         self.assertTrue(len(data["choices"]) > 0)
         self.assertIn("message", data["choices"][0])
 
+        # reasoning_content is returned as-is; with thinking disabled the reasoning
+        # parser yields an empty string rather than being coerced to None.
         if "reasoning_content" in data["choices"][0]["message"]:
-            self.assertIsNone(data["choices"][0]["message"]["reasoning_content"])
+            self.assertFalse(data["choices"][0]["message"]["reasoning_content"])
 
     def test_stream_chat_completion_with_reasoning(self):
         # Test streaming with "enable_thinking": True, reasoning_content should not be empty
