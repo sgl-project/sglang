@@ -7,7 +7,7 @@ Prepare token routing before expert computation. Two API versions are provided:
 """
 
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
