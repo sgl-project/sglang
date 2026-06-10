@@ -25,9 +25,10 @@ Migration-specific references in this skill:
    are copied verbatim from the legacy page — even when today's defaults differ
    (e.g. `SGLANG_ENABLE_SPEC_V2=1` is now default; keep it anyway). The recipe
    that was verified is the recipe as written. Allowed normalizations are ONLY
-   the four alias rewrites in dimension-mapping.md §2 (`launch_server`→`sglang
+   the five alias rewrites in dimension-mapping.md §2 (`launch_server`→`sglang
    serve`, `--model`→`--model-path`, `--tp-size`→`--tp`, abbreviated
-   `--speculative-algo`→`--speculative-algorithm`).
+   `--speculative-algo`→`--speculative-algorithm`,
+   `--expert-parallel-size`→`--ep`).
 2. **Never invent versions or numbers.** `sglang_version` is the legacy page's
    string verbatim — including "main branch", "0.5.8+", or a commit hash.
    Benchmark numbers only from the legacy page's measured blocks. Docker tags

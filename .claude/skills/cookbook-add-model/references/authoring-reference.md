@@ -102,9 +102,14 @@ automatically.
 
 ## 2.3 Configure `playgroundFeatures` (optional)
 
-The Playground widget is opt-in per axis. Add only the axes that make sense
-for this model. Recognised axis keys and their schemas (full reference in
-the `_playground.jsx` header):
+The Playground is **opt-out, not opt-in**: every cookbook ships the general
+axes by default — `attention` (TP/CP/DP-Attn), `moe` (backend + EP, for MoE
+models), `parsers`, `speculative`, `pdDisagg`, `hicache` — then adds
+model-specific axes (e.g. MegaMoE for DeepSeek-V4) and deletes ONLY the axes
+this model genuinely cannot use (e.g. `hisparse` on non-DSA models, `moe` on a
+pure-dense model). Knobs that don't apply to a subset of variants/hw get
+`disable` + `disableReason`, not removal. Recognised axis keys and their
+schemas (full reference in the `_playground.jsx` header):
 
 | Axis key | Widget | Use when |
 |---|---|---|

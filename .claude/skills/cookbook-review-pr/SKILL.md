@@ -55,9 +55,13 @@ than restating.
   template's `model` field is a free-form input prefilled from this value; if the config
   omits the `github` block, the engine falls back to `deepseek-ai/deepseek-v4` and the
   page's submissions get mislabeled.
-- `playgroundFeatures` axes are pruned to what the model supports — no empty/stub axes
-  (the `moe` axis's MegaMoE backend option + `megamoeQuant` block only on Blackwell MoE,
-  gated by `requiresHw`; `hisparse` only DSA-style; `pdDisagg.router` only with a PD topology).
+- `playgroundFeatures` is opt-OUT: the **general axes ship on every cookbook by default**
+  (`attention` TP/CP/DP-Attn, `moe` backend+EP for MoE models, `parsers`, `speculative`,
+  `pdDisagg`, `hicache`) — flag a missing general axis unless the model genuinely cannot
+  use it. Model-specific axes only where applicable (MegaMoE backend + `megamoeQuant`
+  only on Blackwell MoE, gated by `requiresHw`; `hisparse` only DSA-style). Knobs that are
+  meaningless for a subset of variants/hw are `disable`d with a reason, not silently live
+  (e.g. MoE knobs greyed on dense variants). No empty/stub axes.
 - **No leftover `__TOKEN__`** — the config was stamped from the template and every
   placeholder is filled (`grep -rn '__[A-Z_]*__'` on the new config/benchmarks/MDX returns
   nothing).

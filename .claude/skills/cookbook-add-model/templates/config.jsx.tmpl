@@ -149,7 +149,10 @@ sgl-eval run gsm8k \\
     cookbookModel: "__HF_ORG__/__MODEL_SLUG__",
   },
 
-  // Opt-in per axis. DELETE any axis your model doesn't expose (don't leave a stub).
+  // Opt-OUT per axis: general axes (attention / moe-for-MoE / parsers /
+  // speculative / pdDisagg / hicache) ship on every cookbook — DELETE only the
+  // axes this model genuinely cannot use (e.g. hisparse on non-DSA models, moe
+  // on pure-dense models); prefer disable+disableReason for variant/hw subsets.
   playgroundFeatures: {
 
     // ----- Card: "Attention Parallelism" -----  KEEP if the model exposes TP/CP/DP

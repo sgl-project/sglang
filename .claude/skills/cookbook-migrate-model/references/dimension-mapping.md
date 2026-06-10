@@ -25,19 +25,36 @@ this file is about the *mapping decisions*.
 | `--model X` / `--model-path X` | `--model-path {{MODEL_NAME}}` + `modelNames` key |
 | `--tp-size N` | `--tp N` |
 | `--speculative-algo X` (abbreviated) | `--speculative-algorithm X` — the Playground spec axis strips/derives by the full first token only; an abbreviated alias would survive toggles and double up |
+| `--expert-parallel-size N` | `--ep N` — the Playground EP knob recognizes/strips only `--ep`; the long form would survive toggles and double up |
 | (absent) | append `--host {{HOST_IP}}`, `--port {{PORT}}` to every cell |
 | `--nnodes N --node-rank … --dist-init-addr …` literals | delete; `match.nodes: "multi-N"` + `nodesOptions` entry — the engine injects the trio after the last parallelism anchor plus the multi-node header comment |
 | env-var command prefixes | verbatim into `cell.env[]` (never drop/normalize) |
 | flag order as emitted | re-sort to canonical: `--trust-remote-code` → `--model-path` → parallelism (`--tp`/`--dp`/`--enable-dp-attention`/EP) → MoE → tuning → `--host`/`--port` (Playground insert anchors assume this). Keep the legacy relative order within the tuning span so commands stay eyeball-diffable. |
 
 Caveats discovered in the pilot:
-- The Playground `moe.ep` knob only understands `--ep`. A legacy
-  `--expert-parallel-size N` is kept verbatim — and then the `moe` axis is NOT
-  declared (it was no user-facing choice in the legacy widget anyway).
+- The Playground `moe.ep` knob only understands `--ep` — normalize a legacy
+  `--expert-parallel-size N` to `--ep N` (alias, see table above) so the knob
+  can recognize/strip it.
 - `multiNodeHints` only for hw whose fabric needs manual NIC env (gb200-class);
   standard-IB H100 multi-node needs none.
 - `dockerImages`: only the tags the legacy page pinned. CPU/Xeon stays unmapped
   (`:dev` fallback) with a "install from source" tip.
+
+## 2b. Playground axes: opt-out, not opt-in
+
+The legacy page's silence about a feature does NOT mean the axis is dropped.
+Every cookbook ships the **general axes** by default — `attention`
+(TP/CP/DP-Attn), `moe` (backend + EP) for MoE models, `parsers`,
+`speculative`, `pdDisagg`, `hicache` — then adds model-specific axes, and
+deletes ONLY axes the model genuinely cannot use (`hisparse` is DSA-only;
+MegaMoE is DeepSeek-V4 Blackwell-only). Knobs meaningless for a subset of
+variants/hw get `disable` + `disableReason` (per-chip constraints), not
+removal — e.g. MoE backend/EP greyed out on dense variants.
+
+`speculative` presets must include every algorithm that actually appears on
+the page — including the measured command's algorithm when it differs from
+the generator default (Qwen3.5 ships both NEXTN and EAGLE) — otherwise the
+verified cell's baseline can't be re-applied after a strip.
 
 ## 3. Verified policy mechanics
 
@@ -97,9 +114,12 @@ Decisions log, in the order they came up:
    `nvidia/...NVFP4` (b200/b300) vs `amd/...MXFP4` (mi355x).
 4. **Xeon** as `config.hardware` `vendor:"intel"`; cells carry
    `--device cpu --disable-overlap-schedule`; no docker mapping.
-5. **Playground axes**: `attention.tp` + `parsers` + `speculative` only. No
-   `moe` axis (legacy widget offered no EP/backend choice; the one
-   `--expert-parallel-size 8` flag stays verbatim in its cell).
+5. **Playground axes**: the full general set per §2b — attention
+   (TP/CP/DP-Attn), moe (DeepEP backend + EP knob, `disable`+reason on the
+   dense variants), parsers, speculative (NEXTN + EAGLE — both algorithms
+   appear on the page), pdDisagg, hicache. Excluded as inapplicable:
+   hisparse (DSA-only), MegaMoE (DSv4 Blackwell-only). The legacy
+   `--expert-parallel-size 8` flag is normalized to `--ep 8` for the EP knob.
 6. **Benchmarks**: one entry (the measured cell) only — entry-less cells render
    "pending" without stubs. `tokens_per_sec_per_gpu` = output tok/s ÷ 8.
    `sglang_version: "main branch"` verbatim. MMMU via `accuracyLabels` +
