@@ -197,6 +197,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             speculative_moe_backend_context(),
         ):
             super().init_attention_backends()
+        # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
+        # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
+        self.tree_mask_mode = (
+            TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
+        )
 
     def init_cuda_graphs(self):
         with (

@@ -401,7 +401,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        # Keep in sync with __init__: QLEN_ONLY on CPU, FULL_MASK on GPU.
+        self.tree_mask_mode = (
+            TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
+        )
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
