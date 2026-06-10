@@ -101,6 +101,10 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
 
+def _draft_model_needs_only_mtp_weights(model) -> bool:
+    return model.__class__.__name__ == "Qwen3_5ForCausalLMMTP"
+
+
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
@@ -157,9 +161,10 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
+        (
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+        ) = target_worker.get_memory_pool()
 
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
@@ -428,9 +433,11 @@ class EagleDraftWorker(BaseDraftWorker):
         with canary_outside_ctx:
             # Run draft
             if can_cuda_graph:
-                parent_list, top_scores_index, draft_tokens = (
-                    self.cuda_graph_runner.replay(forward_batch)
-                )
+                (
+                    parent_list,
+                    top_scores_index,
+                    draft_tokens,
+                ) = self.cuda_graph_runner.replay(forward_batch)
             else:
                 if (
                     not forward_batch.forward_mode.is_idle()
@@ -453,7 +460,10 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Build tree mask
         # Directly write to cuda graph buffers for verify attn
-        tree_mask_buf, position_buf = (
+        (
+            tree_mask_buf,
+            position_buf,
+        ) = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
 
@@ -840,9 +850,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             server_args.speculative_algorithm
         )
 
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
+        (
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+        ) = target_worker.get_memory_pool()
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -1193,12 +1204,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = (
-                verify_input.prepare_for_v2_verify(
-                    self.req_to_token_pool,
-                    batch,
-                    self.target_worker,
-                )
+            (
+                verify_forward_batch,
+                can_run_cuda_graph,
+            ) = verify_input.prepare_for_v2_verify(
+                self.req_to_token_pool,
+                batch,
+                self.target_worker,
             )
 
         # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
@@ -1461,12 +1473,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
         named_tensors = MultiprocessingSerializer.deserialize(
             recv_req.serialized_named_tensors[self.tp_rank]
         )
-        success, message = self.draft_worker.draft_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
-            load_format=recv_req.load_format,
-        )
-        if not success:
-            return success, message
+        # Avoid moving full target weights to the draft device when the draft
+        # model only consumes MTP branch weights.
+        if _draft_model_needs_only_mtp_weights(
+            self.draft_worker.draft_runner.model
+        ) and isinstance(named_tensors, list):
+            draft_named_tensors = [
+                (name, tensor) for name, tensor in named_tensors if "mtp" in name
+            ]
+        else:
+            draft_named_tensors = named_tensors
+
+        if draft_named_tensors:
+            (
+                success,
+                message,
+            ) = self.draft_worker.draft_runner.update_weights_from_tensor(
+                named_tensors=draft_named_tensors,
+                load_format=recv_req.load_format,
+            )
+            if not success:
+                return success, message
 
         success, message = self.target_worker.model_runner.update_weights_from_tensor(
             named_tensors=named_tensors,
