@@ -80,8 +80,8 @@ MI35X_GPT_OSS_W4A8_MXFP4_MODELS = [
         ],
         # AITER MXFP4 fused-MoE for gpt-oss uses the SEPARATED gate/up tile
         # layout (matches `gptoss_fp4_tuned_fmoe.csv` flydsl entries, the
-        # `QuarkW4A8MXFp4MoE.process_weights_after_loading` shuffle and the 
-        # Mxfp4MoEMethod weight shuffle, both uses `shuffle_weight_a16w4` 
+        # `QuarkW4A8MXFp4MoE.process_weights_after_loading` shuffle and the
+        # Mxfp4MoEMethod weight shuffle, both uses `shuffle_weight_a16w4`
         # and + `shuffle_scale_a16w4`) Other AITER MXFP4 callers default
         # to INTERLEAVE, so opt out explicitly here.
         env_vars={
