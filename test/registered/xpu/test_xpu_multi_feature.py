@@ -24,7 +24,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_xpu_ci(est_time=300, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(
+    est_time=300,
+    suite="stage-b-test-1-gpu-xpu",
+    disabled="Pending intel/sglang-dev:latest rebuild against torch-xpu 2.12 ABI",
+)
 
 
 class TestXPUMultiFeature(CustomTestCase):
