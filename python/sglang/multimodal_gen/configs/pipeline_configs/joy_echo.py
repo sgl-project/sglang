@@ -4,6 +4,7 @@ from typing import Optional
 
 from sglang.multimodal_gen.configs.models.dits.joy_echo import JoyEchoConfig
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 
 
@@ -30,6 +31,7 @@ JOY_ECHO_DEFAULT_SIGMAS: tuple[float, ...] = (
 class JoyEchoPipelineConfig(LTX2PipelineConfig):
     """Pipeline configuration for JoyEcho long-video generation."""
 
+    task_type: ModelTaskType = ModelTaskType.T2V
     dit_config: JoyEchoConfig = field(default_factory=JoyEchoConfig)
     vae_config: LTXVideoVAEConfig = field(default_factory=_default_joy_echo_vae_config)
 
