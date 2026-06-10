@@ -465,24 +465,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request, final_res["text"], tokenizer
             )
 
-            # Calculate usage from actual output
-            if hasattr(final_res, "meta_info"):
-                num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
-                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
-                num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
-            elif hasattr(final_res, "prompt_token_ids") and hasattr(
-                final_res, "outputs"
-            ):
-                # Fallback calculation if meta_info not available
-                num_prompt_tokens = (
-                    len(final_res.prompt_token_ids) if final_res.prompt_token_ids else 0
-                )
-                num_generated_tokens = (
-                    len(final_res.outputs[0].token_ids)
-                    if final_res.outputs and final_res.outputs[0].token_ids
-                    else 0
-                )
-                num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
+            # Calculate usage from actual output (final_res is a dict produced
+            # by tokenizer_manager, with token counts under "meta_info").
+            meta_info = (
+                final_res.get("meta_info") if isinstance(final_res, dict) else None
+            )
+            if meta_info:
+                num_prompt_tokens = meta_info.get("prompt_tokens", 0)
+                num_generated_tokens = meta_info.get("completion_tokens", 0)
+                num_cached_tokens = meta_info.get("cached_tokens", 0)
                 num_reasoning_tokens = 0
             else:
                 # Final fallback
