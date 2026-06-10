@@ -70,7 +70,10 @@ class NegotiateTestCase:
 
 def _run_negotiate_test(rank, test_cases):
     world_size = torch.distributed.get_world_size()
-    cpu_group = torch.distributed.new_group(backend="gloo")
+    # Device-qualified so the group also works when torch.distributed is routed
+    # through TorchComms (a bare "gloo" expands to a phantom mps backend the
+    # parent PG lacks). "cpu:gloo" is equivalent for the native gloo path.
+    cpu_group = torch.distributed.new_group(backend="cpu:gloo")
 
     for case in test_cases:
         delayer = PrefillDelayer(
