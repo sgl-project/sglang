@@ -2681,7 +2681,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_spec_info():
             spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            # V1 SUFFIX uses NgramVerifyInput at K = num_draft_tokens.
+            # V2 SUFFIX uses EagleVerifyInput (build_suffix_v2_eagle_verify_input).
+            # Route V2 SUFFIX through the Eagle branch when overlap is enabled;
+            # V1 SUFFIX stays on the Ngram branch below.
+            _suffix_v2 = (
+                self.spec_algorithm.is_suffix()
+                and not self.server_args.disable_overlap_schedule
+            )
+            # HYBRID_SUFFIX_MTP claims both is_ngram() and is_eagle() True at
+            # the enum level (so existing dispatch sites trigger). Disambiguate
+            # by num_tokens_per_bs which is fixed by the active CudaGraphRunner:
+            #   - short_chain runner: K = speculative_num_steps + 1 → MTP path
+            #     → EagleVerifyInput
+            #   - baseline runner:    K = 1 → no spec_info (plain decode)
+            #   - main runner:        K = speculative_num_draft_tokens → SUFFIX
+            #     path → V2 always emits EagleVerifyInput (HYBRID is V2-only).
+            _hybrid_is_short = (
+                self.spec_algorithm.is_hybrid_suffix_mtp()
+                and num_tokens_per_bs == self.server_args.speculative_num_steps + 1
+            )
+            _hybrid_is_baseline = (
+                self.spec_algorithm.is_hybrid_suffix_mtp() and num_tokens_per_bs == 1
+            )
+            if (
+                self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_standalone()
+                or _suffix_v2
+            ) and not _hybrid_is_baseline:
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
                 if self.is_draft_worker:
@@ -2718,7 +2745,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     ),
                 )
 
-            elif self.spec_algorithm.is_ngram():
+            elif (
+                self.spec_algorithm.is_ngram()
+                and not _suffix_v2
+                and not _hybrid_is_short
+                and not _hybrid_is_baseline
+            ):
                 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
                 spec_info = NgramVerifyInput(
@@ -2913,6 +2945,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+
+        # HYBRID_SUFFIX_MTP runs three chain widths per step (selected by its
+        # internal HybridBackendSelector): K_suffix (e.g. 16) for the SUFFIX
+        # path, K_mtp = num_steps + 1 for the MTP path, and K=1 for the NONE
+        # (plain decode) path. The main `graph_runner` above captured K_suffix;
+        # instantiate the two narrower runners alongside it and let
+        # `_forward_raw` dispatch by input-token width.
+        self.short_chain_graph_runner = None
+        self.baseline_chain_graph_runner = None
+        if (
+            self.spec_algorithm.is_hybrid_suffix_mtp()
+            and self.device == "cuda"
+            and not self.server_args.disable_cuda_graph
+        ):
+            from sglang.srt.model_executor.hybrid_baseline_cuda_graph_runner import (
+                HybridBaselineCudaGraphRunner,
+            )
+            from sglang.srt.model_executor.hybrid_short_chain_cuda_graph_runner import (
+                HybridShortChainCudaGraphRunner,
+            )
+
+            sc_tic = time.perf_counter()
+            sc_before = get_available_gpu_memory(self.device, self.gpu_id)
+            self.short_chain_graph_runner = HybridShortChainCudaGraphRunner(self)
+            sc_after = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                "Capture HYBRID short-chain cuda graph end. Time elapsed: %.2f s. "
+                "mem usage=%.2f GB. avail mem=%.2f GB.",
+                time.perf_counter() - sc_tic,
+                sc_before - sc_after,
+                sc_after,
+            )
+            bl_tic = time.perf_counter()
+            bl_before = get_available_gpu_memory(self.device, self.gpu_id)
+            self.baseline_chain_graph_runner = HybridBaselineCudaGraphRunner(self)
+            bl_after = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                "Capture HYBRID baseline cuda graph end. Time elapsed: %.2f s. "
+                "mem usage=%.2f GB. avail mem=%.2f GB.",
+                time.perf_counter() - bl_tic,
+                bl_before - bl_after,
+                bl_after,
+            )
 
     def init_piecewise_cuda_graphs(self, force_for_draft_worker: bool = False):
         """Initialize piecewise CUDA graph runner."""
@@ -3519,11 +3594,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
-            can_run_graph = bool(
-                mode_check()
-                and self.graph_runner
-                and self.graph_runner.can_run(forward_batch)
-            )
+            # HYBRID_SUFFIX_MTP dispatch: each forward step's K is one of
+            # {K_suffix (SUFFIX path), K_mtp = num_steps+1 (MTP), K=1 (NONE)}.
+            # The 3 captured runners each claim by exact token-width match
+            # (see HybridShortChainCudaGraphRunner.can_run / HybridBaseline
+            # CudaGraphRunner.can_run); the main `graph_runner` covers
+            # K_suffix. Try short-chain → baseline → main in width-ascending
+            # order so the narrower (cheaper) graphs are picked first.
+            # getattr: draft-model runners never run the HYBRID block in
+            # init_device_graphs, and the main runner's own capture phase
+            # calls _forward_raw before the extra runners are assigned.
+            short_chain_runner = getattr(self, "short_chain_graph_runner", None)
+            baseline_runner = getattr(self, "baseline_chain_graph_runner", None)
+            picked_runner = None
+            if mode_check():
+                if short_chain_runner is not None and short_chain_runner.can_run(
+                    forward_batch
+                ):
+                    picked_runner = short_chain_runner
+                elif baseline_runner is not None and baseline_runner.can_run(
+                    forward_batch
+                ):
+                    picked_runner = baseline_runner
+                elif self.graph_runner and self.graph_runner.can_run(forward_batch):
+                    picked_runner = self.graph_runner
+            can_run_graph = picked_runner is not None
 
             # Hisparse coordinator — backends now read it from self.model_runner.
             if (
@@ -3533,9 +3628,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
-            # Replay cuda graph if applicable
+            # Replay cuda graph if applicable (picked_runner is the K-matching
+            # runner from the dispatch above; == self.graph_runner for
+            # non-HYBRID algorithms).
             if can_run_graph:
-                ret = self.graph_runner.replay(
+                ret = picked_runner.replay(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )

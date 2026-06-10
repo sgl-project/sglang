@@ -34,16 +34,20 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
     ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.speculative_algorithm is not None:
+        # DSv4 supports EAGLE (spec-v2), SUFFIX (model-free, NGRAMWorker
+        # family), and HYBRID_SUFFIX_MTP (per-batch SUFFIX/MTP/NONE dispatch,
+        # spec-v2 only).
+        _allowed = {"EAGLE", "SUFFIX", "HYBRID_SUFFIX_MTP"}
         assert (
-            server_args.speculative_algorithm == "EAGLE"
-        ), f"Only EAGLE speculative algorithm is supported for {model_arch}"
-        assert (
-            server_args.speculative_eagle_topk == 1
-        ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
-
-        if not envs.SGLANG_ENABLE_SPEC_V2.get():
-            envs.SGLANG_ENABLE_SPEC_V2.set(True)
-            logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
+            server_args.speculative_algorithm in _allowed
+        ), f"Speculative algorithm {server_args.speculative_algorithm} not supported for {model_arch}; allowed: {sorted(_allowed)}"
+        if server_args.speculative_algorithm in ("EAGLE", "HYBRID_SUFFIX_MTP"):
+            assert (
+                server_args.speculative_eagle_topk == 1
+            ), f"Only EAGLE with topk == 1 is supported for {model_arch}"
+            if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
 
     if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
         server_args.swa_full_tokens_ratio = 0.1

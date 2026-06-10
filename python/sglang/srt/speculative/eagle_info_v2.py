@@ -420,21 +420,45 @@ class EagleVerifyInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
+        # SUFFIX is model-free and never consumes target hidden states, so it
+        # verifies in NULL capture mode and reuses the cheaper NULL cuda graph.
+        # Standalone EAGLE3 is likewise NULL. Every other non-standalone V2
+        # spec algo (EAGLE/MTP, and the HYBRID SUFFIX path that feeds MTP
+        # keep-up) still needs FULL. The getattr guard keeps this safe for
+        # pure EAGLE/MTP runs where the SUFFIX plugin (which installs
+        # is_suffix()) was never imported.
+        spec_algo = target_worker.model_runner.spec_algorithm
+        _is_suffix = getattr(spec_algo, "is_suffix", None)
         capture_mode = (
             CaptureHiddenMode.NULL
-            if target_worker.model_runner.spec_algorithm.is_standalone()
+            if spec_algo.is_standalone() or (callable(_is_suffix) and _is_suffix())
             else CaptureHiddenMode.FULL
         )
         batch.capture_hidden_mode = capture_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
-        # Run attention backend plan and cuda graph preparation
-        can_run_cuda_graph = bool(
-            target_worker.model_runner.graph_runner
-            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
-        )
+        # Run attention backend plan and cuda graph preparation.
+        # HYBRID_SUFFIX_MTP captures up to three runners at different chain
+        # widths (short_chain K=num_steps+1, baseline K=1, main K=num_draft_
+        # tokens); pick the one whose captured K matches this verify batch —
+        # the extra runners' can_run gate on exact token width, so at most
+        # one claims it. For every other algorithm the getattrs are None and
+        # this reduces to the plain main-runner check. Must mirror the
+        # dispatch order in ModelRunner._forward_raw so replay_prepare and
+        # the later replay land on the same runner.
+        _mr = target_worker.model_runner
+        _picked_runner = None
+        for _runner in (
+            getattr(_mr, "short_chain_graph_runner", None),
+            getattr(_mr, "baseline_chain_graph_runner", None),
+            _mr.graph_runner,
+        ):
+            if _runner is not None and _runner.can_run(verify_forward_batch):
+                _picked_runner = _runner
+                break
+        can_run_cuda_graph = _picked_runner is not None
         if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+            _picked_runner.replay_prepare(verify_forward_batch)
             verify_forward_batch.mark_forward_metadata_ready()
         # Non-cuda-graph: defer init to forward_extend, which runs after
         # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
