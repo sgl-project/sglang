@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleDraftExtendCudaGraphRunner,
@@ -82,7 +83,7 @@ class MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(
         super().__init__(eagle_worker)
 
     def _init_and_capture(self):
-        if self.eagle_worker.server_args.disable_cuda_graph:
+        if cuda_graph_fully_disabled():
             self.runners = [None] * self.speculative_num_steps
             return
 

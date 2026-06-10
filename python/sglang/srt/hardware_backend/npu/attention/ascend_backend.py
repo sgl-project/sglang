@@ -24,6 +24,8 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
@@ -55,6 +57,9 @@ class ForwardMetadata:
 
     # mapped block_tables for swa
     block_tables_swa: Optional[torch.Tensor] = None
+
+    # pre-translated full->SWA write target for SWAKVPool.set_kv_buffer
+    swa_out_cache_loc: Optional[torch.Tensor] = None
 
     # seq len inputs
     extend_seq_lens_cpu_int: Optional[torch.Tensor] = None
@@ -222,7 +227,7 @@ class AscendAttnMaskBuilder:
 
 
 def _cp_allgather_and_save_kv_npu(
-    forward_batch, layer, k, v, cp_size, token_to_kv_pool
+    forward_batch, layer, k, v, cp_size, token_to_kv_pool, swa_loc=None
 ):
     """NPU-compatible CP KV all-gather with merged K/V communication.
 
@@ -234,6 +239,9 @@ def _cp_allgather_and_save_kv_npu(
 
     Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
     a single all-gather for both K and V.
+
+    swa_loc is the pre-translated full->SWA write target for hybrid SWA pools
+    (None for non-SWA pools); set_kv_buffer never translates internally.
     """
     cache_loc = (
         forward_batch.out_cache_loc
@@ -260,7 +268,7 @@ def _cp_allgather_and_save_kv_npu(
 
     token_to_kv_pool.set_kv_buffer(
         layer,
-        cache_loc,
+        KVWriteLoc(cache_loc, swa_loc),
         key_cache_full,
         value_cache_full,
     )
@@ -330,6 +338,10 @@ class AscendAttnBackend(AttentionBackend):
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
             )
             self.sliding_window_size = model_runner.sliding_window_size
+        self.use_sliding_window_kv_pool = (
+            isinstance(self.token_to_kv_pool, SWAKVPool)
+            and self.token_to_kv_pool.swa_layer_nums > 0
+        )
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -387,7 +399,10 @@ class AscendAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
         if in_capture:
             self._init_cuda_graph_metadata(
-                bs, forward_batch.forward_mode, forward_batch.seq_lens
+                bs,
+                forward_batch.forward_mode,
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
             )
         self._apply_cuda_graph_metadata(
             bs=bs,
@@ -400,6 +415,7 @@ class AscendAttnBackend(AttentionBackend):
             ),
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
+            out_cache_loc=forward_batch.out_cache_loc,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -489,6 +505,13 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 )
 
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            self.forward_metadata.swa_out_cache_loc = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
+
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -521,12 +544,20 @@ class AscendAttnBackend(AttentionBackend):
             self.graph_metadata["swa_indices"] = torch.arange(
                 total_context_len, device=self.device, dtype=torch.int32
             )
+        if self.use_sliding_window_kv_pool:
+            # refilled in place at replay; the captured graph reads this storage
+            self.swa_out_cache_loc_buf = torch.zeros(
+                max_num_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
 
     def _init_cuda_graph_metadata(
         self,
         bs: int,
         forward_mode: ForwardMode,
         seq_lens: torch.Tensor,
+        out_cache_loc: Optional[torch.Tensor] = None,
     ) -> "ForwardMetadata":
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
@@ -534,6 +565,9 @@ class AscendAttnBackend(AttentionBackend):
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
+        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
+            num_tokens = out_cache_loc.shape[0]
+            metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if (
@@ -600,12 +634,21 @@ class AscendAttnBackend(AttentionBackend):
         seq_lens_cpu: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         metadata = self.graph_metadata[bs]
+
+        # refill the captured SWA write-target buffer in place from the live loc
+        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
+            n = out_cache_loc.shape[0]
+            self.swa_out_cache_loc_buf[n:].zero_()
+            self.swa_out_cache_loc_buf[:n].copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
+            )
         max_len = seq_lens_cpu[:bs].max().item()
         if forward_mode.is_target_verify():
             max_len += self.speculative_num_draft_tokens
@@ -1109,6 +1152,7 @@ class AscendAttnBackend(AttentionBackend):
                         v,
                         self.attn_cp_size,
                         self.token_to_kv_pool,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                     )
                 else:
                     # support cross attention
@@ -1117,7 +1161,14 @@ class AscendAttnBackend(AttentionBackend):
                         if not layer.is_cross_attention
                         else forward_batch.encoder_out_cache_loc
                     )
-                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    swa_loc = (
+                        self.forward_metadata.swa_out_cache_loc
+                        if not layer.is_cross_attention
+                        else None
+                    )
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                    )
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1737,7 +1788,13 @@ class AscendAttnBackend(AttentionBackend):
     ):
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer,
+                KVWriteLoc(
+                    forward_batch.out_cache_loc,
+                    self.forward_metadata.swa_out_cache_loc,
+                ),
+                k,
+                v,
             )
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1802,7 +1859,13 @@ class AscendAttnBackend(AttentionBackend):
                 )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer,
+                    KVWriteLoc(
+                        forward_batch.out_cache_loc,
+                        self.forward_metadata.swa_out_cache_loc,
+                    ),
+                    k,
+                    v,
                 )
 
         if not self.use_mla:
@@ -2013,7 +2076,13 @@ class AscendAttnBackend(AttentionBackend):
                 )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer,
+                    KVWriteLoc(
+                        forward_batch.out_cache_loc,
+                        self.forward_metadata.swa_out_cache_loc,
+                    ),
+                    k,
+                    v,
                 )
 
         if sinks is not None:
@@ -2357,7 +2426,17 @@ class AscendAttnBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                # swa_out_cache_loc is the full->SWA write target, derived from
+                # out_cache_loc; it must not be applied to cross-attention writes
+                # (which target encoder_out_cache_loc) and is None for non-SWA pools.
+                swa_loc = (
+                    self.forward_metadata.swa_out_cache_loc
+                    if not layer.is_cross_attention
+                    else None
+                )
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                )
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -2654,7 +2733,13 @@ class AscendAttnBackend(AttentionBackend):
             )
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer,
+                KVWriteLoc(
+                    forward_batch.out_cache_loc,
+                    self.forward_metadata.swa_out_cache_loc,
+                ),
+                k,
+                v,
             )
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
