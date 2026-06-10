@@ -505,9 +505,6 @@ class ModelRunnerKVCacheMixin:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     token_to_kv_pool_class=NPUMHATokenToKVPool,
-                    enable_kv_cache_copy=(
-                        self.server_args.speculative_algorithm is not None
-                    ),
                     **kwargs,
                 )
             elif self.use_mla_backend:
