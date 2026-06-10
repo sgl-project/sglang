@@ -1274,6 +1274,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            if (
+                self._uses_dsv4_decode_radix_cache()
+                and envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get()
+            ):
+                logger.info(
+                    "DSV4 decode radix transfer stats: rid=%s "
+                    "origin_input_len=%d decode_prefix_len=%d "
+                    "transfer_tokens=%d transfer_pages=%d page_size=%d",
+                    decode_req.req.rid,
+                    origin_input_len,
+                    total_prefix_len,
+                    origin_input_len - total_prefix_len,
+                    len(page_indices),
+                    kv_transfer_page_size,
+                )
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
