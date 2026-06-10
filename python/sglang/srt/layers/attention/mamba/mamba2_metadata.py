@@ -218,9 +218,9 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefill_tokens = int(sum(extend_seq_lens_cpu))
         else:
             num_prefill_tokens = int(forward_batch.extend_num_tokens)
-        batch_size = getattr(
-            forward_batch, "_original_batch_size", len(forward_batch.seq_lens)
-        )
+        batch_size = getattr(forward_batch, "_original_batch_size", None)
+        if batch_size is None:
+            batch_size = len(forward_batch.seq_lens)
         num_decodes = batch_size - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None

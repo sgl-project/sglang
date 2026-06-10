@@ -83,12 +83,12 @@ from sglang.srt.model_loader.weight_utils import (
     replace_substrings,
 )
 from sglang.srt.models.nemotron_h_utils import (
-    _get_real_num_tokens,
-    _is_attn_layer,
-    _make_layer_communicator,
-    _pad_to_original_num_tokens,
-    _zero_dp_global_padding_rows,
-    _zero_dp_padding_rows,
+    get_real_num_tokens,
+    is_attn_layer,
+    make_layer_communicator,
+    pad_to_original_num_tokens,
+    zero_dp_global_padding_rows,
+    zero_dp_padding_rows,
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
@@ -328,13 +328,13 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if is_dp_attention_enabled():
-            hidden_states, residual = _zero_dp_padding_rows(
+            hidden_states, residual = zero_dp_padding_rows(
                 hidden_states, forward_batch, residual
             )
             hidden_states, residual = self.layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
-            hidden_states = _zero_dp_global_padding_rows(hidden_states, forward_batch)
+            hidden_states = zero_dp_global_padding_rows(hidden_states, forward_batch)
             hidden_states = self.mixer.forward(hidden_states)
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
@@ -382,7 +382,7 @@ class NemotronHMLPDecoderLayer(NemotronHMLPLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(self.norm, for_attn=False)
+        self.layer_communicator = make_layer_communicator(self.norm, for_attn=False)
 
 
 class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
@@ -405,14 +405,14 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(self.norm, for_attn=False)
+        self.layer_communicator = make_layer_communicator(self.norm, for_attn=False)
 
 
 class NemotronHAttnLikeDecoderLayer(nn.Module):
     """Shared DP-attention input prep for the Mamba / full-attention layers."""
 
     def _set_prev_layer_is_attn(self, config: NemotronHConfig, layer_idx: int) -> None:
-        self.prev_layer_is_attn = layer_idx > 0 and _is_attn_layer(
+        self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
             config.hybrid_override_pattern[layer_idx - 1]
         )
 
@@ -424,7 +424,7 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.prev_layer_is_attn and residual is not None:
             hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states, residual = _zero_dp_padding_rows(
+        hidden_states, residual = zero_dp_padding_rows(
             hidden_states, forward_batch, residual
         )
         return self.layer_communicator.prepare_attn(
@@ -456,7 +456,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(self.norm, for_attn=True)
+        self.layer_communicator = make_layer_communicator(self.norm, for_attn=True)
         self._set_prev_layer_is_attn(config, layer_idx)
 
     def _forward_mamba(
@@ -465,7 +465,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         """Core Mamba forward logic, called directly or via split op."""
         original_num_tokens = hidden_states.shape[0]
         if forward_batch.forward_mode.is_extend():
-            real_num_tokens = _get_real_num_tokens(hidden_states, forward_batch)
+            real_num_tokens = get_real_num_tokens(hidden_states, forward_batch)
             if real_num_tokens < original_num_tokens:
                 hidden_states = hidden_states[:real_num_tokens]
         attn_backend = get_attn_backend()
@@ -479,7 +479,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             forward_batch=forward_batch,
             use_triton_causal_conv=True,
         )
-        return _pad_to_original_num_tokens(output, original_num_tokens)
+        return pad_to_original_num_tokens(output, original_num_tokens)
 
     def forward(
         self,
@@ -494,12 +494,12 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             )
             if (
                 forward_batch.forward_mode.is_idle()
-                or _get_real_num_tokens(hidden_states, forward_batch) == 0
+                or get_real_num_tokens(hidden_states, forward_batch) == 0
             ):
                 return torch.zeros_like(hidden_states), residual
 
             output = self._forward_mamba(hidden_states, forward_batch)
-            output, _ = _zero_dp_padding_rows(output, forward_batch)
+            output, _ = zero_dp_padding_rows(output, forward_batch)
             return output, residual
 
         if residual is None:
@@ -599,13 +599,13 @@ class NemotronHAttention(nn.Module):
             return output
 
         padded_shape = hidden_states.shape[0]
-        real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
+        real_tokens = get_real_num_tokens(hidden_states, forward_batch)
         has_padding = real_tokens < padded_shape
         keep_q_padded = (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_idle()
-            or getattr(forward_batch, "_original_forward_mode", None) is not None
+            or forward_batch._original_forward_mode is not None
         )
         original_out_cache_loc = forward_batch.out_cache_loc
 
@@ -622,7 +622,7 @@ class NemotronHAttention(nn.Module):
         )
         forward_batch.out_cache_loc = original_out_cache_loc
 
-        attn_output = _pad_to_original_num_tokens(attn_output, padded_shape)
+        attn_output = pad_to_original_num_tokens(attn_output, padded_shape)
         output, _ = self.o_proj(attn_output)
         if has_padding:
             output[real_tokens:].zero_()
@@ -648,7 +648,7 @@ class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(self.norm, for_attn=True)
+        self.layer_communicator = make_layer_communicator(self.norm, for_attn=True)
         self._set_prev_layer_is_attn(config, layer_idx)
 
     def forward(
