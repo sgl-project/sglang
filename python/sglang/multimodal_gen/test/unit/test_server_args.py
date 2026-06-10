@@ -285,11 +285,11 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             )
             self.assertEqual(
                 custom_op_kernel_compile_policy("rotary_embedding", "RotaryEmbedding"),
-                "auto",
+                "force_fused",
             )
             self.assertEqual(
                 custom_op_kernel_compile_policy("gelu_and_mul", "GeluAndMul"),
-                "auto",
+                "force_fused",
             )
 
     def test_attention_acceleration_can_be_disabled(self):
@@ -580,6 +580,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         server_args = dispatch_launch.call_args.args[0]
         self.assertTrue(server_args.warmup)
         self.assertTrue(server_args.server_warmup)
+        self.assertEqual(server_args.warmup_steps, 2)
         self.assertFalse(server_args.is_arg_explicitly_set("warmup"))
         self.assertFalse(server_args.is_arg_explicitly_set("server_warmup"))
 

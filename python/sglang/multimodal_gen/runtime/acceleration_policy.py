@@ -20,19 +20,16 @@ KERNEL_COMPILE_LIVE_MISS_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_LIVE_MISS"
 TORCH_COMPILE_MODE_ENV = "SGLANG_TORCH_COMPILE_MODE"
 _KERNEL_COMPILE_SUPPRESSION_DEPTH = 0
 
-# keep defaults narrow: shape-sensitive scale-shift kernels remain opt-in
-DEFAULT_KERNEL_COMPILE_OPS = frozenset(
-    {
-        "rotary_embedding",
-        "RotaryEmbedding",
-        "gelu_and_mul",
-        "GeluAndMul",
-    }
-)
+# kernel-wise compile stays opt-in until a full-model e2e win is validated
+DEFAULT_KERNEL_COMPILE_OPS = frozenset()
 
 SUPPORTED_KERNEL_COMPILE_OPS = frozenset(
     {
         *DEFAULT_KERNEL_COMPILE_OPS,
+        "rotary_embedding",
+        "RotaryEmbedding",
+        "gelu_and_mul",
+        "GeluAndMul",
         "mul_add",
         "fuse_layernorm_scale_shift_gate_select01",
         "fuse_residual_layernorm_scale_shift_gate_select01",

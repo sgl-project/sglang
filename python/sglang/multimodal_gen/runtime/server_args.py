@@ -225,7 +225,7 @@ class ServerArgs(DisaggServerArgsMixin):
     warmup: bool = False
     server_warmup: bool = False
     warmup_resolutions: list[str] = None
-    warmup_steps: int = 1
+    warmup_steps: int = 2
 
     disable_autocast: bool | None = None
 
