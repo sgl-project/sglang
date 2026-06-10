@@ -592,5 +592,54 @@ def fused_qk_gemma_rmsnorm(
     return q_out, k_out
 
 
+# ---------------------------------------------------------------------------
+# Fused sigmoid(gate) * x Triton kernel
+# Eliminates two standalone kernels (sigmoid + mul) per attention layer.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fused_sigmoid_mul_kernel(
+    gate_ptr,
+    x_ptr,
+    out_ptr,
+    N,  # number of elements per row
+    stride_row,
+    BLOCK_N: tl.constexpr,
+    FP16: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < N
+    out_dtype = tl.float16 if FP16 else tl.bfloat16
+    gate = tl.load(gate_ptr + row * stride_row + offs, mask=mask).to(tl.float32)
+    x = tl.load(x_ptr + row * stride_row + offs, mask=mask).to(tl.float32)
+    out = x * tl.sigmoid(gate)
+    tl.store(out_ptr + row * stride_row + offs, out.to(out_dtype), mask=mask)
+
+
+def fused_sigmoid_mul(gate: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Compute sigmoid(gate) * x in one fused kernel."""
+    assert gate.shape == x.shape
+    assert gate.is_contiguous() and x.is_contiguous()
+    orig_shape = x.shape
+    N = gate.shape[-1]
+    gate_2d = gate.reshape(-1, N)
+    x_2d = x.reshape(-1, N)
+    M = gate_2d.shape[0]
+    out = torch.empty_like(x_2d)
+    BLOCK_N = triton.next_power_of_2(N)
+    num_warps = 4 if BLOCK_N <= 2048 else 8
+    _fused_sigmoid_mul_kernel[(M,)](
+        gate_2d,
+        x_2d,
+        out,
+        N,
+        gate_2d.stride(0),
+        BLOCK_N=BLOCK_N,
+        FP16=(x.dtype == torch.float16),
+        num_warps=num_warps,
+    )
+    return out.view(orig_shape)
+
+
 # Register the inplace op
 fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])
