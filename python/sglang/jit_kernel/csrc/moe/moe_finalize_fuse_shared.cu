@@ -54,7 +54,7 @@
 #include "tvm_ffi_utils.h"
 #include <cuda_runtime.h>
 
-namespace tokenspeed {
+namespace sglang {
 
 using BF16 = cutlass::bfloat16_t;
 
@@ -323,7 +323,7 @@ void dispatchFinalize(
   }
 }
 
-}  // namespace tokenspeed
+}  // namespace sglang
 
 // ---------------------------------------------------------------------------
 // Host launcher
