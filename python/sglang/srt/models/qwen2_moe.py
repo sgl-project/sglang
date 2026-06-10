@@ -87,8 +87,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -112,6 +117,8 @@ if is_npu():
 from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
@@ -127,7 +134,7 @@ def can_fuse_shared_expert(
 ) -> bool:
     """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
 
-    Caller must still gate on ``support_shared_expert_fusion`` and ``_use_aiter``.
+    Caller must still gate on support_shared_expert_fusion and _use_aiter.
     """
     if (
         get_global_server_args().disable_shared_experts_fusion is True
@@ -468,10 +475,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states.clone())
 
+        # ===== TO BE REFACTORED ====
+        # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
+        # MoE dispatch so it overlaps the down-LoRA shrink on the alt stream.
+        staged = False
+        if shared_output is not None and _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
+                shared_add_overlap_enabled,
+                stage_shared_expert_add,
+                unstage_shared_expert_add,
+            )
+
+            if shared_add_overlap_enabled():
+                stage_shared_expert_add(shared_output, current_stream)
+                staged = True
+        # ===== END TO BE REFACTORED ====
+
         with torch.cuda.stream(self.alt_stream):
             router_output = self._forward_router_experts(hidden_states)
 
         current_stream.wait_stream(self.alt_stream)
+
+        if staged and unstage_shared_expert_add() is None:
+            # The dispatch consumed the staging (add already enqueued); skip the caller's add.
+            shared_output = None
 
         return router_output, shared_output
 
@@ -846,7 +873,7 @@ class Qwen2MoeModel(nn.Module):
             for i in range(self.start_layer, self.end_layer):
                 ctx = (
                     nullcontext()
-                    if not get_global_server_args().disable_piecewise_cuda_graph
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
