@@ -44,10 +44,10 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
-    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
         return (
             f"speculative_algorithm={server_args.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/DFLASH are supported)"
         )
     if server_args.speculative_eagle_topk != 1:
         return (
@@ -115,6 +115,31 @@ def _load_adaptive_config(
     return cfg, bs_entries
 
 
+def _resolve_candidate_steps(
+    initial_steps: int,
+    cfg: dict[str, object],
+    default_candidates: tuple[int, ...] = (1, 3, 7),
+) -> list[int]:
+    """Return sorted, deduplicated candidate steps; inserts *initial_steps* when missing."""
+    raw = cfg.get("candidate_steps") or default_candidates
+    candidates: set[int] = set(raw)
+
+    # Ensure the worker's initial speculative_num_steps is itself a candidate.
+    # Otherwise AdaptiveController.register() would store the worker's pre-built
+    # runtime state under a key that _activate() never queries, leaking that
+    # state's draft attn backend and cuda graph buffers for the process lifetime.
+    if initial_steps not in candidates:
+        log_info_on_rank0(
+            logger,
+            f"Adding initial speculative_num_steps={initial_steps} to "
+            f"candidate_steps={sorted(candidates)} so the pre-built "
+            f"runtime state is reused.",
+        )
+        candidates.add(initial_steps)
+
+    return sorted(candidates)
+
+
 def resolve_candidate_steps_from_config(
     cfg_path: str | None = None,
 ) -> list[int]:
@@ -152,10 +177,20 @@ class AdaptiveStepSlot:
     - num_steps can be selected from different candidate sets on different batch_sizes
     """
 
-    def __init__(self, initial_steps: int, cfg: dict):
-        candidates = sorted(set(cfg["candidate_steps"]))
-        assert len(candidates) >= 1, "candidate_steps must have at least 1 value"
-        self.candidate_steps = candidates
+    def __init__(
+        self,
+        initial_steps: int,
+        cfg: dict,
+        is_dflash: bool = False,
+    ):
+        # TODO: Wider range of candidate_steps (once lazy init is supported).
+        # DFlash uses drafted-token counts [3,7,11,15] → verify query-lens [4,8,12,16].
+        # EAGLE/EAGLE3 uses [1, 3, 7] draft steps by default.
+        default_candidates = (3, 7, 11, 15) if is_dflash else (1, 3, 7)
+        self.candidate_steps = _resolve_candidate_steps(initial_steps, cfg, default_candidates)
+        assert (
+            len(self.candidate_steps) >= 1
+        ), "candidate_steps must have at least 1 value"
 
         self.ema_alpha = cfg.get("ema_alpha", 0.2)
         self.update_interval = cfg.get("update_interval", 5)
@@ -249,6 +284,7 @@ class AdaptiveSpeculativeParams:
         self,
         initial_steps: int,
         cfg_path: str | None = None,
+        is_dflash: bool = False,
     ):
         cfg, bs_entries = _load_adaptive_config(cfg_path)
         self._bs_list: list[int] = sorted(bs_entries)
@@ -259,6 +295,7 @@ class AdaptiveSpeculativeParams:
             self._slots[bs] = AdaptiveStepSlot(
                 initial_steps=initial_steps,
                 cfg={**cfg, **entry},
+                is_dflash=is_dflash,
             )
 
         first_slot = self._slots[self._bs_list[0]]

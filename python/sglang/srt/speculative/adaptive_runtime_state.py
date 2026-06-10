@@ -73,9 +73,14 @@ class AdaptiveController:
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
         self.worker = worker
+        is_dflash = worker.server_args.speculative_algorithm == "DFLASH"
+        initial_steps = (
+            worker.block_size - 1 if is_dflash else worker.speculative_num_steps
+        )
         self.params = AdaptiveSpeculativeParams(
-            initial_steps=worker.speculative_num_steps,
+            initial_steps=initial_steps,
             cfg_path=config_path,
+            is_dflash=is_dflash,
         )
         self._states: dict[int, SpecRuntimeState] = {}
 
