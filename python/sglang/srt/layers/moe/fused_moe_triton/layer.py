@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
@@ -286,7 +287,7 @@ class FusedMoE(torch.nn.Module):
                     self.use_deep_gemm,
                 )
         self.supports_deferred_finalize = (
-            server_args.enable_moe_deferred_finalize_requested
+            envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
             and get_moe_runner_backend().is_flashinfer_trtllm()
             and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
         )

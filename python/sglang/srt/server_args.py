@@ -646,7 +646,6 @@ class ServerArgs:
         "megamoe",
     ] = "none"
     moe_runner_backend: str = "auto"
-    enable_moe_deferred_finalize_requested: bool = False
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
@@ -3375,11 +3374,7 @@ class ServerArgs:
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-        uses_flashinfer_trtllm_moe_runner = self.moe_runner_backend in [
-            "flashinfer_trtllm",
-            "experimental_sgl_trtllm",
-        ]
-        if uses_flashinfer_trtllm_moe_runner:
+        if self.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert self.quantization in [
                 "modelopt_fp4",
                 "fp8",
@@ -3393,10 +3388,6 @@ class ServerArgs:
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
-
-        self.enable_moe_deferred_finalize_requested = (
-            envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
-        )
 
         if self.moe_runner_backend == "flashinfer_trtllm_routed":
             assert self.quantization in [
