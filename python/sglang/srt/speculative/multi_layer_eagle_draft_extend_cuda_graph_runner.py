@@ -272,10 +272,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
 
-        self.backend = FullCudaGraphBackend(
-            self,
-            enable_memory_saver=self.model_runner.server_args.enable_memory_saver,
-        )
+        self.backend = self._create_backend()
 
         try:
             with model_capture_mode():
@@ -284,6 +281,15 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _create_backend(self):
+        return FullCudaGraphBackend(
+            self,
+            enable_memory_saver=self.model_runner.server_args.enable_memory_saver,
+        )
+
+    def _run_backend(self, shape_key, forward_batch, buffers, raw_bs, bs):
+        return self.backend.replay(shape_key, forward_batch)
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return bs
@@ -588,7 +594,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
-        out = self.backend.replay(shape_key, forward_batch)
+        out = self._run_backend(shape_key, forward_batch, buffers, raw_bs, bs)
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             unpadding_bs = num_tokens
