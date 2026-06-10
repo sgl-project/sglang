@@ -20,15 +20,9 @@ KERNEL_COMPILE_LIVE_MISS_ENV = "SGLANG_DIFFUSION_KERNEL_COMPILE_LIVE_MISS"
 TORCH_COMPILE_MODE_ENV = "SGLANG_TORCH_COMPILE_MODE"
 _KERNEL_COMPILE_SUPPRESSION_DEPTH = 0
 
+# keep defaults narrow: shape-sensitive scale-shift kernels remain opt-in
 DEFAULT_KERNEL_COMPILE_OPS = frozenset(
     {
-        "mul_add",
-        "fuse_layernorm_scale_shift_gate_select01",
-        "fuse_residual_layernorm_scale_shift_gate_select01",
-        "LayerNormScaleShift",
-        "RMSNormScaleShift",
-        "ScaleResidualLayerNormScaleShift",
-        "ScaleResidualRMSNormScaleShift",
         "rotary_embedding",
         "RotaryEmbedding",
         "gelu_and_mul",
@@ -39,6 +33,13 @@ DEFAULT_KERNEL_COMPILE_OPS = frozenset(
 SUPPORTED_KERNEL_COMPILE_OPS = frozenset(
     {
         *DEFAULT_KERNEL_COMPILE_OPS,
+        "mul_add",
+        "fuse_layernorm_scale_shift_gate_select01",
+        "fuse_residual_layernorm_scale_shift_gate_select01",
+        "LayerNormScaleShift",
+        "RMSNormScaleShift",
+        "ScaleResidualLayerNormScaleShift",
+        "ScaleResidualRMSNormScaleShift",
         "silu_and_mul",
         "SiluAndMul",
         "LayerNormTanhMulAdd",

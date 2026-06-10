@@ -164,9 +164,10 @@ class CustomOp(nn.Module):
             compiled_ms = self._time_kernel_candidate(
                 lambda: compiled_forward(*args, **kwargs)
             )
-            if not self._outputs_match(
+            outputs_match, mismatch_summary = self._compare_outputs(
                 self.forward_cuda(*args, **kwargs), compiled_forward(*args, **kwargs)
-            ):
+            )
+            if not outputs_match:
                 decision = KernelCompileDecision(
                     selected="fused",
                     fused_ms=fused_ms,
@@ -176,9 +177,10 @@ class CustomOp(nn.Module):
                 _CUSTOM_OP_KERNEL_AUTOTUNE_CACHE[key] = decision
                 self._commit_kernel_decision(decision, commit)
                 logger.warning(
-                    "CustomOp autotune selected fused for %s because compiled output mismatched (%s)",
+                    "CustomOp autotune selected fused for %s because compiled output mismatched (%s): %s",
                     self._op_label(),
                     self._shape_summary(args, kwargs),
+                    mismatch_summary,
                 )
                 return decision
         except Exception as e:
@@ -285,23 +287,59 @@ class CustomOp(nn.Module):
         return ", ".join(values[:6])
 
     def _outputs_match(self, lhs: Any, rhs: Any) -> bool:
+        return self._compare_outputs(lhs, rhs)[0]
+
+    def _compare_outputs(
+        self, lhs: Any, rhs: Any, path: str = "output"
+    ) -> tuple[bool, str]:
         if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
             if lhs.shape != rhs.shape or lhs.dtype != rhs.dtype:
-                return False
+                return (
+                    False,
+                    f"{path}: lhs(shape={tuple(lhs.shape)}, dtype={lhs.dtype}) "
+                    f"rhs(shape={tuple(rhs.shape)}, dtype={rhs.dtype})",
+                )
             if torch.is_floating_point(lhs):
-                return bool(torch.allclose(lhs, rhs, rtol=1e-2, atol=1e-2))
-            return bool(torch.equal(lhs, rhs))
+                if torch.allclose(lhs, rhs, rtol=1e-2, atol=1e-2):
+                    return True, ""
+                lhs_float = lhs.float()
+                rhs_float = rhs.float()
+                diff = (lhs_float - rhs_float).abs()
+                if diff.numel() == 0:
+                    return False, f"{path}: empty tensor values differ"
+                max_abs = diff.max().item()
+                max_rel = (diff / rhs_float.abs().clamp_min(1e-12)).max().item()
+                lhs_abs_max = lhs_float.abs().max().item()
+                rhs_abs_max = rhs_float.abs().max().item()
+                return (
+                    False,
+                    f"{path}: max_abs={max_abs:.4e}, max_rel={max_rel:.4e}, "
+                    f"lhs_abs_max={lhs_abs_max:.4e}, rhs_abs_max={rhs_abs_max:.4e}",
+                )
+            if torch.equal(lhs, rhs):
+                return True, ""
+            return False, f"{path}: tensor values differ"
         if isinstance(lhs, tuple) and isinstance(rhs, tuple) and len(lhs) == len(rhs):
-            return all(
-                self._outputs_match(l_item, r_item)
-                for l_item, r_item in zip(lhs, rhs)
-            )
+            for index, (l_item, r_item) in enumerate(zip(lhs, rhs)):
+                matches, summary = self._compare_outputs(
+                    l_item, r_item, f"{path}[{index}]"
+                )
+                if not matches:
+                    return False, summary
+            return True, ""
         if isinstance(lhs, list) and isinstance(rhs, list) and len(lhs) == len(rhs):
-            return all(
-                self._outputs_match(l_item, r_item)
-                for l_item, r_item in zip(lhs, rhs)
-            )
-        return lhs == rhs
+            for index, (l_item, r_item) in enumerate(zip(lhs, rhs)):
+                matches, summary = self._compare_outputs(
+                    l_item, r_item, f"{path}[{index}]"
+                )
+                if not matches:
+                    return False, summary
+            return True, ""
+        if isinstance(lhs, tuple) or isinstance(rhs, tuple):
+            return False, f"{path}: tuple mismatch"
+        if isinstance(lhs, list) or isinstance(rhs, list):
+            return False, f"{path}: list mismatch"
+        return (True, "") if lhs == rhs else (False, f"{path}: value mismatch")
 
     def _get_compiled_forward_native(self) -> Callable:
         if self._compiled_forward_native is None:

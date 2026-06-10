@@ -6,6 +6,7 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
+from sglang.cli.generate import _has_registered_pipeline_class
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
@@ -216,6 +217,33 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(args.acceleration_config.attention_autotune_min_speedup, 1.03)
         self.assertTrue(args.acceleration_config.attention_autotune_live_miss)
 
+    def test_generate_cli_accepts_registered_pipeline_class(self):
+        self.assertTrue(
+            _has_registered_pipeline_class(
+                [
+                    "--model-path",
+                    "/data/LTX-2.3",
+                    "--pipeline-class-name",
+                    "LTX2Pipeline",
+                ]
+            )
+        )
+        self.assertTrue(
+            _has_registered_pipeline_class(
+                ["--model-path", "/data/LTX-2.3", "--pipeline-class-name=LTX2Pipeline"]
+            )
+        )
+        self.assertFalse(
+            _has_registered_pipeline_class(
+                [
+                    "--model-path",
+                    "/data/LTX-2.3",
+                    "--pipeline-class-name",
+                    "MissingPipeline",
+                ]
+            )
+        )
+
     def test_acceleration_config_accepts_torch_compile_autotune(self):
         args = self._from_dict_without_model_resolution(
             {
@@ -253,7 +281,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             self.assertEqual(kernel_config.min_speedup, 1.03)
             self.assertFalse(kernel_config.live_miss)
             self.assertEqual(
-                custom_op_kernel_compile_policy("mul_add", "MulAdd"), "auto"
+                custom_op_kernel_compile_policy("mul_add", "MulAdd"), "force_fused"
             )
             self.assertEqual(
                 custom_op_kernel_compile_policy("rotary_embedding", "RotaryEmbedding"),
