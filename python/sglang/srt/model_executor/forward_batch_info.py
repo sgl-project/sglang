@@ -377,6 +377,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     original_global_num_tokens_cpu: Optional[List[int]] = None
+    # Per-rank non-padded (spec-adjusted) row counts; independent copy that
+    # survives the in-place DP padding of global_num_tokens_cpu.
+    global_num_tokens_non_padded_cpu: Optional[List[int]] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -532,13 +535,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # the raw count would wrongly zero the 2nd..Nth verify token of every
             # request under dp-attention (corrupting all but position 0). For the
             # non-spec path global_num_tokens is batch.global_num_tokens (no-op).
-            ret.original_global_num_tokens_cpu = list(global_num_tokens)
-            ret.global_num_tokens_cpu = list(global_num_tokens)
+            ret.original_global_num_tokens_cpu = batch.global_num_tokens
+            ret.global_num_tokens_non_padded_cpu = list(global_num_tokens)
+            ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
             ).to(device, non_blocking=True)
 
-            ret.global_num_tokens_for_logprob_cpu = list(global_num_tokens_for_logprob)
+            ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
@@ -852,11 +856,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         assert self.global_num_tokens_for_logprob_cpu is not None
 
         setattr(self, "_original_batch_size", self.batch_size)
-        self.original_global_num_tokens_cpu = list(self.original_global_num_tokens_cpu)
-        self.global_num_tokens_for_logprob_cpu = list(
-            self.global_num_tokens_for_logprob_cpu
-        )
-        global_num_tokens = list(self.global_num_tokens_cpu)
+        global_num_tokens = self.global_num_tokens_cpu
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
 

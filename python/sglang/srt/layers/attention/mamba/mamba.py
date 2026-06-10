@@ -524,12 +524,20 @@ class MambaMixer2(torch.nn.Module):
         # Preallocate output tensor to avoid memcpy cost for merging prefill
         # and decode outputs
 
-        preallocated_ssm_out = hidden_states.new_zeros(
+        preallocated_ssm_out = torch.empty(
             [
                 projected_states.shape[0],
                 (self.num_heads * self.head_dim) // self.tp_size,
-            ]
+            ],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
+        if projected_states.shape[0] > num_actual_tokens:
+            # DP-attention padding rows are not written by the prefill/decode
+            # kernels, but the gated RMSNorm / out_proj run on the padded shape;
+            # zero just those rows so they carry no uninitialized data. Non-DP
+            # (no padding) keeps the plain ``torch.empty`` with no extra work.
+            preallocated_ssm_out[num_actual_tokens:].zero_()
         preallocated_ssm_out_active = preallocated_ssm_out[:num_actual_tokens]
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out_active,
