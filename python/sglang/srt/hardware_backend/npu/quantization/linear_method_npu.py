@@ -4,13 +4,14 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch.nn.parameter import Parameter
 
-try:
-    import torch_npu
-except ImportError:
-    torch_npu = None
-
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.platforms import current_platform
+
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    import torch_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -18,8 +19,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MXFP8_BLOCK_SIZE = 32
-_FLOAT8_E8M0FNU_DTYPE = getattr(
-    torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)
+_FLOAT8_E8M0FNU_DTYPE = (
+    getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None))
+    if _is_npu
+    else getattr(torch, "float8_e8m0fnu", None)
 )
 
 
