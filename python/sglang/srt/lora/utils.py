@@ -9,6 +9,22 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 
 @dataclass
+class MoELoRABatchInfo:
+    # Per-request segment indptrs used by MoE LoRA routing, shape (bs + 1,).
+    seg_indptr: torch.Tensor
+
+    # Per-request adapter index used by MoE LoRA routing, shape (bs,).
+    req_to_lora: torch.Tensor
+
+    # A mask indicating if lora adapter is enabled. Shape (num_loras,)
+    adapter_enabled: torch.Tensor
+
+    # A mapping of which lora adapter is used for each token. Shape (num_tokens,)
+    # If a token has no lora adapter, the value is -1.
+    token_lora_mapping: torch.Tensor
+
+
+@dataclass
 class LoRABatchInfo:
     # The forward mode is using CUDA Graph.
     use_cuda_graph: bool
@@ -48,10 +64,43 @@ class LoRABatchInfo:
     # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
     has_active_lora: bool = False
 
+    # Per-request segment indptrs, shape (bs + 1,). Required by MoE virtual
+    # experts which map tokens to requests regardless of the dense-LoRA
+    # backend's internal segmentation.  For the triton backend these are
+    # identical to seg_indptr/weight_indices; for csgmv they differ because
+    # its segments are chunked across adapters.
+    req_seg_indptr: Optional[torch.Tensor] = None
+
+    # Per-request adapter index, shape (bs,).
+    req_weight_indices: Optional[torch.Tensor] = None
+
+    # MoE LoRA batch info
+    moe_lora_info: Optional[MoELoRABatchInfo] = None
+
 
 class LoRAType(Enum):
     LORA_A = 0
     LORA_B = 1
+
+
+def copy_weight_into_buffer(
+    buffer_view: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    """
+    Copy a LoRA weight tensor into a destination buffer.
+
+    When a pinned CPU source has a dtype mismatch with a device destination,
+    cast on the destination device instead of doing the conversion on CPU.
+    """
+    if weight.dtype == buffer_view.dtype:
+        buffer_view.copy_(weight, non_blocking=True)
+        return
+
+    if weight.device.type == "cpu" and buffer_view.device.type != "cpu":
+        weight = weight.to(device=buffer_view.device, non_blocking=True)
+
+    buffer_view.copy_(weight.to(dtype=buffer_view.dtype), non_blocking=True)
 
 
 def get_hidden_dim(
@@ -123,6 +172,18 @@ def get_hidden_dim(
             return (
                 config.hidden_size,
                 q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+            )
+        elif module_name == "q_b_proj":
+            return (
+                config.q_lora_rank,
+                config.num_attention_heads
+                * (config.qk_nope_head_dim + config.qk_rope_head_dim),
+            )
+        elif module_name == "kv_b_proj":
+            return (
+                config.kv_lora_rank,
+                config.num_attention_heads
+                * (config.qk_nope_head_dim + config.v_head_dim),
             )
         elif module_name == "gate_up_proj_moe":
             moe_inter = (
@@ -264,6 +325,8 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "embed_tokens",
         "lm_head",
         "fused_qkv_a_proj_with_mqa",
+        "q_b_proj",
+        "kv_b_proj",
     }
 )
 

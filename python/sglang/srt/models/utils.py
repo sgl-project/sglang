@@ -29,8 +29,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
@@ -274,12 +275,20 @@ class AutoWeightsLoader:
 
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    """Enable fused set_kv_buffer on CUDA with bfloat16 KV cache and HIP with bf16/fp16/fp8 KV cache.
+
+    SHUFFLE 5D pools on HIP also work — the underlying triton kernel
+    (`fused_qk_rope_reshape_and_cache`) natively supports the 5D
+    SHUFFLE layout (key_cache.ndim==5, value_cache.ndim==5). We just need
+    the per-layer arg builder to pass the raw 5D buffers without the
+    `.view(-> 4D NHD)` reshape, and let the rotary forward pass
+    `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
+    """
+    pool = get_token_to_kv_pool()
     return (
         _is_cuda
-        and hasattr(forward_batch.token_to_kv_pool, "dtype")
-        and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
-        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
+        and pool.dtype == torch.bfloat16
+        and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
 
@@ -292,7 +301,7 @@ def create_fused_set_kv_buffer_arg(
     from sglang.jit_kernel.rope import FusedSetKVBufferArg
 
     layer_id = layer.layer_id
-    token_to_kv_pool = forward_batch.token_to_kv_pool
+    token_to_kv_pool = get_token_to_kv_pool()
 
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
@@ -312,16 +321,26 @@ def create_fused_set_kv_buffer_arg(
             if layer.sliding_window_size > 0
             else None
         )
+        # SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
+        # fused_qk_rope_reshape_and_cache via flash_layout=False. For the
+        # legacy NHD 3D pool we reshape to the (num_blocks, page_size, H, D)
+        # paged view the kernel expects under flash_layout=True.
+        if k_buffer.ndim == 5:
+            key_cache = k_buffer
+            value_cache = v_buffer
+        else:
+            key_cache = k_buffer.view(
+                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
+            )
+            value_cache = v_buffer.view(
+                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
+            )
         return {
             "v": value.view(-1, layer.tp_v_head_num, layer.v_head_dim),
             "k_scale": layer.k_scale,
             "v_scale": layer.v_scale,
-            "key_cache": k_buffer.view(
-                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
-            ),
-            "value_cache": v_buffer.view(
-                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
-            ),
+            "key_cache": key_cache,
+            "value_cache": value_cache,
             "slot_mapping": forward_batch.out_cache_loc,
             "swa_slot_mapping": slot_mapping_swa,
         }
@@ -405,9 +424,10 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     inputs and fault on strided tensors (root cause of the #21734 revert
     in #23159).
     """
+
     if (
         _is_cuda
-        and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
+        and get_global_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
     ):
         return x.view(*x.shape[:-1], -1, head_dim)
     return x.reshape(-1, head_dim)
@@ -442,12 +462,13 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
+
     if (
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and get_global_server_args().piecewise_cuda_graph_compiler
+        and get_global_server_args().cuda_graph_config.prefill.tc_compiler
         != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):

@@ -125,8 +125,13 @@ _SRC = _ROOT / "bindings" / "python"
 if str(_E2E_TEST) not in sys.path:
     sys.path.insert(0, str(_E2E_TEST))
 
-# Add bindings/python to path if the wheel is not installed (for local development)
-_wheel_installed = find_spec("sglang_router.sglang_router_rs") is not None
+# Add bindings/python to path if the wheel is not installed (for local development).
+# find_spec raises ModuleNotFoundError when the parent package itself is absent,
+# which is the case in CI jobs that don't install the sglang_router wheel.
+try:
+    _wheel_installed = find_spec("sglang_router.sglang_router_rs") is not None
+except ModuleNotFoundError:
+    _wheel_installed = False
 
 if not _wheel_installed and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))

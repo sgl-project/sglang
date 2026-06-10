@@ -18,9 +18,15 @@ import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    configure_layerwise_offload_modules,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     normalize,
@@ -116,6 +122,10 @@ class ImageEncodingStage(PipelineStage):
         "image_embeds",
         "prompt_embeds",
         "negative_prompt_embeds",
+        "prompt_embeds_mask",
+        "negative_prompt_embeds_mask",
+        "prompt_seq_lens",
+        "negative_prompt_seq_lens",
     )
 
     def __init__(
@@ -156,6 +166,30 @@ class ImageEncodingStage(PipelineStage):
 
         return postprocess_funcs[0](outputs, image_inputs)
 
+    @staticmethod
+    def _split_text_conditioning_output(output):
+        if isinstance(output, TextConditioningOutput):
+            return (
+                output.prompt_embeds,
+                output.prompt_embeds_mask,
+                output.prompt_seq_lens,
+            )
+        return output, None, None
+
+    @staticmethod
+    def _full_text_seq_lens(prompt_embeds: torch.Tensor) -> list[int]:
+        if prompt_embeds.ndim == 2:
+            return [int(prompt_embeds.shape[0])]
+        return [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
+
+    @staticmethod
+    def _default_text_mask(prompt_embeds: torch.Tensor) -> torch.Tensor:
+        if prompt_embeds.ndim == 2:
+            shape = (1, prompt_embeds.shape[0])
+        else:
+            shape = prompt_embeds.shape[:2]
+        return torch.ones(shape, dtype=torch.bool, device=prompt_embeds.device)
+
     @torch.no_grad()
     def forward(
         self,
@@ -182,6 +216,10 @@ class ImageEncodingStage(PipelineStage):
 
         all_prompt_embeds = []
         all_neg_prompt_embeds = []
+        all_prompt_embeds_masks = []
+        all_neg_prompt_embeds_masks = []
+        all_prompt_seq_lens = []
+        all_neg_prompt_seq_lens = []
 
         image_processor_call_params = inspect.signature(
             self.image_processor.__call__
@@ -263,22 +301,84 @@ class ImageEncodingStage(PipelineStage):
                                 output_hidden_states=True,
                             )
 
-                all_prompt_embeds.append(
-                    self.encoding_image_edit(
-                        outputs, image_inputs, server_args.pipeline_config
+                prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
+                    self._split_text_conditioning_output(
+                        self.encoding_image_edit(
+                            outputs, image_inputs, server_args.pipeline_config
+                        )
                     )
                 )
+                all_prompt_embeds.append(prompt_embeds)
+                all_prompt_embeds_masks.append(prompt_embeds_mask)
+                all_prompt_seq_lens.extend(
+                    prompt_seq_lens
+                    if prompt_seq_lens is not None
+                    else self._full_text_seq_lens(prompt_embeds)
+                )
                 if batch.do_classifier_free_guidance:
-                    all_neg_prompt_embeds.append(
-                        self.encoding_image_edit(
-                            neg_outputs, neg_image_inputs, server_args.pipeline_config
+                    neg_prompt_embeds, neg_prompt_embeds_mask, neg_prompt_seq_lens = (
+                        self._split_text_conditioning_output(
+                            self.encoding_image_edit(
+                                neg_outputs,
+                                neg_image_inputs,
+                                server_args.pipeline_config,
+                            )
                         )
+                    )
+                    all_neg_prompt_embeds.append(neg_prompt_embeds)
+                    all_neg_prompt_embeds_masks.append(neg_prompt_embeds_mask)
+                    all_neg_prompt_seq_lens.extend(
+                        neg_prompt_seq_lens
+                        if neg_prompt_seq_lens is not None
+                        else self._full_text_seq_lens(neg_prompt_embeds)
                     )
 
         if all_prompt_embeds:
             batch.prompt_embeds.append(torch.cat(all_prompt_embeds, dim=0))
+            if batch.prompt_embeds_mask is None:
+                batch.prompt_embeds_mask = []
+            batch.prompt_embeds_mask.append(
+                torch.cat(
+                    [
+                        (
+                            mask
+                            if mask is not None
+                            else self._default_text_mask(prompt_embeds)
+                        )
+                        for prompt_embeds, mask in zip(
+                            all_prompt_embeds, all_prompt_embeds_masks, strict=True
+                        )
+                    ],
+                    dim=0,
+                )
+            )
+            if batch.prompt_seq_lens is None:
+                batch.prompt_seq_lens = []
+            batch.prompt_seq_lens.append(all_prompt_seq_lens)
         if all_neg_prompt_embeds:
             batch.negative_prompt_embeds.append(torch.cat(all_neg_prompt_embeds, dim=0))
+            if batch.negative_prompt_embeds_mask is None:
+                batch.negative_prompt_embeds_mask = []
+            batch.negative_prompt_embeds_mask.append(
+                torch.cat(
+                    [
+                        (
+                            mask
+                            if mask is not None
+                            else self._default_text_mask(neg_prompt_embeds)
+                        )
+                        for neg_prompt_embeds, mask in zip(
+                            all_neg_prompt_embeds,
+                            all_neg_prompt_embeds_masks,
+                            strict=True,
+                        )
+                    ],
+                    dim=0,
+                )
+            )
+            if batch.negative_prompt_seq_lens is None:
+                batch.negative_prompt_seq_lens = []
+            batch.negative_prompt_seq_lens.append(all_neg_prompt_seq_lens)
 
         return batch
 
@@ -390,6 +490,16 @@ class LTX2ImageEncodingStage(PipelineStage):
             safetensors_load_file(weights_path), strict=True
         )
         self._condition_image_encoder_dir = encoder_dir
+        if server_args.should_configure_layerwise_offload_for_lazy_component(
+            "condition_image_encoder"
+        ):
+            modules = {"condition_image_encoder": self._condition_image_encoder}
+            configure_layerwise_offload_modules(
+                modules,
+                server_args,
+                component_names=server_args.layerwise_offload_components,
+                warn_missing=False,
+            )
         return True
 
     # -- image preprocessing ---------------------------------------------
@@ -693,9 +803,15 @@ class ImageVAEEncodingStage(PipelineStage):
         "vae_image_sizes",
     )
 
-    def __init__(self, vae: ParallelTiledVAE, **kwargs) -> None:
+    def __init__(
+        self,
+        vae: ParallelTiledVAE,
+        component_name: str = "vae",
+        **kwargs,
+    ) -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
+        self.component_name = component_name
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -705,7 +821,7 @@ class ImageVAEEncodingStage(PipelineStage):
         return [
             ComponentUse(
                 stage_name,
-                "vae",
+                self.component_name,
                 target_dtype=vae_dtype,
             )
         ]
@@ -741,7 +857,10 @@ class ImageVAEEncodingStage(PipelineStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        with self.use_declared_component(component_name="vae", module=self.vae) as vae:
+        with self.use_declared_component(
+            component_name=self.component_name,
+            module=self.vae,
+        ) as vae:
             assert vae is not None
             self.vae = vae
 
@@ -785,6 +904,9 @@ class ImageVAEEncodingStage(PipelineStage):
                     #     self.vae.enable_parallel()
                     if not vae_autocast_enabled:
                         video_condition = video_condition.to(vae_dtype)
+                    video_condition = server_args.pipeline_config.preprocess_vae_encode(
+                        video_condition, self.vae
+                    )
                     latent_dist: DiagonalGaussianDistribution = self.vae.encode(
                         video_condition
                     )
@@ -820,15 +942,9 @@ class ImageVAEEncodingStage(PipelineStage):
                         )
                     )
 
-                    # apply shift & scale if needed
-                    if isinstance(shift_factor, torch.Tensor):
-                        shift_factor = shift_factor.to(latent_condition.device)
-
-                    if isinstance(scaling_factor, torch.Tensor):
-                        scaling_factor = scaling_factor.to(latent_condition.device)
-
-                    latent_condition -= shift_factor
-                    latent_condition = latent_condition * scaling_factor
+                    latent_condition = self.scale_and_shift_encode_latents(
+                        latent_condition, scaling_factor, shift_factor
+                    )
                 else:
                     latent_condition = normalized_latent_condition
 
@@ -845,6 +961,19 @@ class ImageVAEEncodingStage(PipelineStage):
             prepare_condition_image_latent_ids(condition_latents, batch)
 
         return batch
+
+    @staticmethod
+    def scale_and_shift_encode_latents(
+        latents: torch.Tensor, scaling_factor, shift_factor
+    ) -> torch.Tensor:
+        if shift_factor is not None:
+            if isinstance(shift_factor, torch.Tensor):
+                shift_factor = shift_factor.to(latents.device)
+            latents -= shift_factor
+
+        if isinstance(scaling_factor, torch.Tensor):
+            scaling_factor = scaling_factor.to(latents.device)
+        return latents * scaling_factor
 
     def build_dedup_fingerprint(
         self, batch: Req, server_args: ServerArgs
@@ -873,8 +1002,20 @@ class ImageVAEEncodingStage(PipelineStage):
         sample_mode: str = "sample",
     ):
         if sample_mode == "sample":
+            if hasattr(encoder_output, "latent_dist"):
+                return encoder_output.latent_dist.sample(generator)
+            if hasattr(encoder_output, "latent"):
+                return encoder_output.latent
+            if hasattr(encoder_output, "latents"):
+                return encoder_output.latents
             return encoder_output.sample(generator)
         elif sample_mode == "argmax":
+            if hasattr(encoder_output, "latent_dist"):
+                return encoder_output.latent_dist.mode()
+            if hasattr(encoder_output, "latent"):
+                return encoder_output.latent
+            if hasattr(encoder_output, "latents"):
+                return encoder_output.latents
             return encoder_output.mode()
         else:
             raise AttributeError("Could not access latents of provided encoder_output")

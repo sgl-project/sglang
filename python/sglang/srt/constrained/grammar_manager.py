@@ -11,6 +11,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
     create_grammar_backend,
 )
+from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -36,6 +37,12 @@ class GrammarManager:
             )
         else:
             self.grammar_backend = None
+
+        self._enable_strict_thinking = (
+            self.grammar_backend.enable_strict_thinking
+            if self.grammar_backend is not None
+            else False
+        )
 
         self.grammar_sync_group = scheduler.dp_tp_cpu_group
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
@@ -64,6 +71,20 @@ class GrammarManager:
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
+
+    def _get_request_thinking_budget(self, req: Req) -> int | None:
+        custom_params = req.sampling_params.custom_params
+        if not isinstance(custom_params, dict):
+            return None
+        thinking_budget = custom_params.get("thinking_budget")
+        return thinking_budget if isinstance(thinking_budget, int) else None
+
+    def _apply_request_reasoning_budget(self, req: Req) -> None:
+        thinking_budget = self._get_request_thinking_budget(req)
+        if thinking_budget is None:
+            return
+        if isinstance(req.grammar, ReasonerGrammarObject):
+            req.grammar.max_think_tokens = thinking_budget
 
     def process_req_with_grammar(self, req: Req) -> bool:
         # Init grammar cache for this request
@@ -103,6 +124,15 @@ class GrammarManager:
                             f"Failed to compile {key[0]} grammar: {value.error_message}"
                         )
                         req.set_finish_with_abort(error_msg)
+                    else:
+                        self._apply_request_reasoning_budget(req)
+        elif self._enable_strict_thinking:
+            grammar_obj = self.grammar_backend.init_strict_reasoning_grammar(
+                req.require_reasoning
+            )
+            if grammar_obj is not None:
+                req.grammar = grammar_obj
+                self._apply_request_reasoning_budget(req)
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -177,8 +207,16 @@ class GrammarManager:
                 continue
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
-            req.grammar = req.grammar.result()
+            try:
+                req.grammar = req.grammar.result()
+            except Exception as e:
+                logger.error(
+                    f"Grammar compilation raised an exception: {e}, "
+                    f"grammar_key={req.grammar_key}"
+                )
+                req.grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
             self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+            self._apply_request_reasoning_budget(req)
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
