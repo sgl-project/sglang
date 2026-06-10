@@ -198,6 +198,26 @@ def test_invalid_selector_fails_before_touching_any_runner():
     draft_runner.check_weights.assert_not_called()
 
 
+def test_empty_string_selector_is_rejected_not_coerced_to_target():
+    # P1 regression: selector="" must be rejected (it used to be coerced to
+    # "target" by `selector or "target"`). It is distinct from None, which still
+    # defaults to "target".
+    target_runner = _checksum_runner({"w": "a"})
+    draft_runner = _checksum_runner({"w": "b"})
+    scheduler = _scheduler(
+        tp_worker=SimpleNamespace(model_runner=target_runner),
+        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+    )
+
+    out = _call(scheduler, action="reset_tensors", selector="")
+
+    assert out.success is False
+    assert "invalid selector" in out.message
+    # Rejected before any mutation.
+    target_runner.check_weights.assert_not_called()
+    draft_runner.check_weights.assert_not_called()
+
+
 def test_compare_error_message_carries_role_label():
     # Target's compare is a no-op (Mock default); only the draft raises. The
     # wrapped message must carry the failing runner's role label.
@@ -265,3 +285,68 @@ def test_reset_without_shared_visited_set_randomizes_twice():
     checker_b.handle("reset_tensors", visited_storage=set())
 
     assert not torch.equal(shared, after_a)
+
+
+# ---------------------------------------------------------------------------
+# selector="draft" + reset_tensors: target-owned storage is protected (P0)
+# ---------------------------------------------------------------------------
+
+
+class _NamedParamModel:
+    """Model surface for _model_state: yields a caller-supplied set of named
+    Parameters, so two models can share a Parameter object (shared storage) while
+    each also holds private ones."""
+
+    def __init__(self, named_params):
+        self._named_params = list(named_params)
+
+    def named_parameters(self):
+        return list(self._named_params)
+
+    def named_buffers(self):
+        return []
+
+
+class _RealCheckerRunner:
+    """Minimal model_runner whose check_weights drives a real WeightChecker, so
+    reset_tensors / mark_reset_storage run their actual storage-dedup logic."""
+
+    def __init__(self, named_params):
+        self.model = _NamedParamModel(named_params)
+        self._checker = WeightChecker(self)
+
+    def check_weights(self, action, visited_storage=None):
+        return self._checker.handle(action, visited_storage=visited_storage)
+
+
+def test_draft_only_reset_protects_target_owned_shared_storage():
+    # P0 regression: under selector="draft" + reset_tensors the scheduler must
+    # pre-seed visited_storage with target-owned storage (via mark_reset_storage)
+    # so embed/head shared with the draft (set_embed_and_head) is NOT scrambled;
+    # only draft-PRIVATE weights get randomized.
+    shared = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+    t_priv = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+    d_priv = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+    target_runner = _RealCheckerRunner(
+        [("embed", shared), ("t_priv", t_priv)]
+    )
+    draft_runner = _RealCheckerRunner(
+        [("embed", shared), ("d_priv", d_priv)]
+    )
+    scheduler = _scheduler(
+        tp_worker=SimpleNamespace(model_runner=target_runner),
+        # iter_draft_model_runners yields [("draft", draft_runner)].
+        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+    )
+
+    shared_before = shared.clone()
+    d_priv_before = d_priv.clone()
+
+    out = _call(scheduler, action="reset_tensors", selector="draft")
+
+    assert out.success is True
+    # Shared/target-owned storage left untouched...
+    assert torch.equal(shared, shared_before)
+    # ...while the draft's private weight was randomized.
+    assert not torch.equal(d_priv, d_priv_before)
