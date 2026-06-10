@@ -305,6 +305,24 @@ def get_quant_config(
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         if model_config.quantization == "quark_mxfp4":
+            # ModelOpt-style NVFP4 checkpoints keep their quant metadata in a
+            # separate hf_quant_config.json
+            modelopt_quant_path = os.path.join(hf_folder, "hf_quant_config.json")
+            if os.path.isfile(modelopt_quant_path):
+                with open(modelopt_quant_path) as f:
+                    raw_quant_config = json.load(f)
+                source_quant = raw_quant_config.get("quantization", raw_quant_config)
+                if "FP4" in (source_quant.get("quant_algo") or "").upper():
+                    flat_quant_config = dict(source_quant)
+                    flat_quant_config["quant_method"] = (
+                        raw_quant_config.get("producer", {}).get("name") or "modelopt"
+                    )
+                    flat_quant_config["requantization_method"] = (
+                        model_config.quantization
+                    )
+                    flat_quant_config["packed_modules_mapping"] = packed_modules_mapping
+                    flat_quant_config["hf_config"] = model_config.hf_config
+                    return quant_cls.from_config(flat_quant_config)
             return quant_cls(
                 online_scheme=model_config.quantization,
                 hf_config=model_config.hf_config,

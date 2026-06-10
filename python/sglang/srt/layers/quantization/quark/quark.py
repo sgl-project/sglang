@@ -134,6 +134,28 @@ class QuarkConfig(QuantizationConfig):
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
         self._quantized_layers = set()
 
+        self._maybe_disable_shared_experts_fusion()
+
+    def _maybe_disable_shared_experts_fusion(self) -> None:
+        """Turn off shared-expert fusion when the producer keeps shared experts
+        in a higher precision than the routed experts.
+        """
+        if not any("shared_expert" in pattern for pattern in self.exclude_layers):
+            return
+
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        if not server_args.disable_shared_experts_fusion:
+            server_args.disable_shared_experts_fusion = True
+            logger.info(
+                "Quark: shared experts are excluded from quantization (kept in "
+                "a higher precision) while routed experts are quantized; "
+                "disabling shared experts fusion to avoid loading "
+                "higher-precision shared experts through the quantized "
+                "routed-expert path."
+            )
+
     @property
     def quantized_layers(self) -> tuple[list[str], int]:
         # Extract unique layer types (last part after ".")
