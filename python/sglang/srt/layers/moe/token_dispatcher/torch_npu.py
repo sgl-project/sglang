@@ -122,7 +122,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             group_list_type = self.group_list_type_decode'''
 
         # Store phase so combine() uses the matching finalize kernel
-        self._dispatch_phase = phase
+        #self._dispatch_phase = phase
 
         if not torch.npu.is_current_stream_capturing():
             # Perform routing
