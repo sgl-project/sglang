@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.managers.cache_controller import storage_supports_host_dedup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -23,6 +22,11 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
     PoolEntry,
+)
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupPrebuild,
+    is_mla_dedup_dummy_rank,
+    maybe_prebuild_mla_host_dedup,
 )
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
@@ -64,7 +68,7 @@ def build_kv_host_pool(
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla and is_dummy:
-        # Non-rank-0 MLA/DSA dedup: allocator-only host pool (no buffer).
+        # Dedup dummy rank: allocator-only host pool (no buffer).
         kwargs["is_dummy"] = True
     return kv_host_pool_cls(
         kv_pool,
@@ -124,7 +128,7 @@ def build_kv_only_stack(
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
     is_dummy: bool = False,
-    mla_broadcast_state: Optional[dict] = None,
+    mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -164,7 +168,7 @@ def build_kv_only_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        mla_broadcast_state=mla_broadcast_state,
+        mla_dedup_prebuild=mla_dedup_prebuild,
     )
     return host_pool_group, cache_controller
 
@@ -609,7 +613,7 @@ def build_anchor_sidecar_stack(
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
     is_dummy: bool = False,
-    mla_broadcast_state: Optional[dict] = None,
+    mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -657,7 +661,7 @@ def build_anchor_sidecar_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        mla_broadcast_state=mla_broadcast_state,
+        mla_dedup_prebuild=mla_dedup_prebuild,
     )
     return host_pool_group, cache_controller
 
@@ -950,49 +954,16 @@ class _DsaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
-        from sglang.srt.distributed import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-        )
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_rank,
-            get_attention_tp_size,
-            is_dp_attention_enabled,
-        )
-        from sglang.srt.managers.cache_controller import HiCacheController
-        from sglang.srt.mem_cache.memory_pool import (
-            MLATokenToKVPool,
-            MLATokenToKVPoolFP4,
-        )
-        from sglang.srt.utils import is_cuda
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
 
-        # MLA/DSA host-memory dedup: non-rank-0 attention-TP ranks use dummy
-        # (allocator-only) host pools; rank 0 owns the host copy and broadcasts.
-        # Keep this in sync with HiCacheController dedup gating: FP4 pools are
-        # excluded (extra scale buffer the broadcast can't carry).
-        if is_dp_attention_enabled():
-            mla_tp_rank = get_attention_tp_rank()
-            mla_tp_size = get_attention_tp_size()
-        else:
-            mla_tp_rank = get_tensor_model_parallel_rank()
-            mla_tp_size = get_tensor_model_parallel_world_size()
-        mla_is_dummy = (
-            is_cuda()
-            and mla_tp_size > 1
-            and mla_tp_rank != 0
-            and not isinstance(kvcache, MLATokenToKVPoolFP4)
-            and storage_supports_host_dedup(storage_backend)
-        )
-
-        # Pre-rendezvous BEFORE build_anchor_sidecar_stack allocates the host
-        # pool. Without this, rank 0's multi-minute DSA host KV pin races
-        # non-rank-0's create_custom_parallel_group inside the controller's
-        # __init__ and trips the 600s NCCL watchdog (same race as HiRadixCache
-        # path; see HiCacheController.prebuild_mla_broadcast_state).
-        mla_broadcast_state = HiCacheController.maybe_prebuild_mla_broadcast_state(
+        # MLA/DSA host dedup: dummy pools on non-src ranks; prebuild the
+        # process groups before the slow host KV alloc (NCCL-watchdog race,
+        # see maybe_prebuild_mla_host_dedup).
+        mla_is_dummy = is_mla_dedup_dummy_rank(kvcache, storage_backend)
+        mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
             kvcache,
             params.tp_cache_group,
             attn_cp_group,
@@ -1029,7 +1000,7 @@ class _DsaStrategy(StackStrategy):
             pp_size=params.pp_size,
             enable_storage_metrics=enable_storage_metrics,
             is_dummy=mla_is_dummy,
-            mla_broadcast_state=mla_broadcast_state,
+            mla_dedup_prebuild=mla_dedup_prebuild,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1082,49 +1053,15 @@ class _PlainKvStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
-        from sglang.srt.distributed import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-        )
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_rank,
-            get_attention_tp_size,
-            is_dp_attention_enabled,
-        )
-        from sglang.srt.managers.cache_controller import HiCacheController
-        from sglang.srt.mem_cache.memory_pool import (
-            MLATokenToKVPool,
-            MLATokenToKVPoolFP4,
-        )
-        from sglang.srt.utils import is_cuda
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
 
-        # MLA host-memory dedup for the plain (unified) MLA path: non-rank-0
-        # attention-TP ranks use a dummy (allocator-only) host pool. Gating must
-        # match HiCacheController (FP4 excluded; dedup-compatible storage only).
-        if is_dp_attention_enabled():
-            mla_tp_rank = get_attention_tp_rank()
-            mla_tp_size = get_attention_tp_size()
-        else:
-            mla_tp_rank = get_tensor_model_parallel_rank()
-            mla_tp_size = get_tensor_model_parallel_world_size()
-        mla_is_dummy = (
-            use_mla
-            and is_cuda()
-            and mla_tp_size > 1
-            and mla_tp_rank != 0
-            and not isinstance(kvcache, MLATokenToKVPoolFP4)
-            and storage_supports_host_dedup(storage_backend)
-        )
-
-        # Pre-rendezvous BEFORE build_kv_only_stack allocates the host pool.
-        # Without this, rank 0's multi-minute MLA host KV pin races non-rank-0
-        # ranks into HybridCacheController's create_custom_parallel_group and
-        # trips the 600s NCCL watchdog. Same race as the HiRadixCache and DSA
-        # paths — see HiCacheController.prebuild_mla_broadcast_state.
-        mla_broadcast_state = HiCacheController.maybe_prebuild_mla_broadcast_state(
+        # Same dedup gating + watchdog prebuild as the DSA path; MHA pools
+        # gate to False/None.
+        mla_is_dummy = is_mla_dedup_dummy_rank(kvcache, storage_backend)
+        mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
             kvcache,
             params.tp_cache_group,
             attn_cp_group,
@@ -1152,7 +1089,7 @@ class _PlainKvStrategy(StackStrategy):
             pp_size=params.pp_size,
             enable_storage_metrics=enable_storage_metrics,
             is_dummy=mla_is_dummy,
-            mla_broadcast_state=mla_broadcast_state,
+            mla_dedup_prebuild=mla_dedup_prebuild,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1269,46 +1206,18 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     load_cache_event,
     attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    mla_broadcast_state: Optional[dict] = None,
+    mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
 
     This entrypoint is currently intended only for HiRadixCache's DSA path.
     """
     try:
-        from sglang.srt.distributed import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-        )
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_rank,
-            get_attention_tp_size,
-            is_dp_attention_enabled,
-        )
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolFP4
-        from sglang.srt.utils import is_cuda
-
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
 
-        # MLA/DSA host-memory dedup: non-rank-0 attention-TP ranks use dummy
-        # (allocator-only) host pools; rank 0 owns the host copy and broadcasts.
-        # Keep in sync with HiCacheController gating (FP4 excluded). The sidecar
-        # factory now takes (kv_host_pool, is_dummy) -- build_anchor_sidecar_stack
-        # calls it with two args.
-        if is_dp_attention_enabled():
-            mla_tp_rank = get_attention_tp_rank()
-            mla_tp_size = get_attention_tp_size()
-        else:
-            mla_tp_rank = get_tensor_model_parallel_rank()
-            mla_tp_size = get_tensor_model_parallel_world_size()
-        mla_is_dummy = (
-            is_cuda()
-            and mla_tp_size > 1
-            and mla_tp_rank != 0
-            and not isinstance(kv, MLATokenToKVPoolFP4)
-            and storage_supports_host_dedup(server_args.hicache_storage_backend)
-        )
+        # MLA/DSA host dedup: dummy KV + indexer pools on non-src ranks.
+        mla_is_dummy = is_mla_dedup_dummy_rank(kv, server_args.hicache_storage_backend)
 
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
@@ -1338,7 +1247,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             pp_size=radix_cache.pp_size,
             enable_storage_metrics=enable_storage_metrics,
             is_dummy=mla_is_dummy,
-            mla_broadcast_state=mla_broadcast_state,
+            mla_dedup_prebuild=mla_dedup_prebuild,
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group

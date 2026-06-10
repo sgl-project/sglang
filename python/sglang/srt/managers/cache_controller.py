@@ -14,7 +14,6 @@ limitations under the License.
 """
 
 import logging
-import math
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -44,31 +43,17 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import (
-    DSATokenToKVPool,
-    MLATokenToKVPool,
-    MLATokenToKVPoolFP4,
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupPrebuild,
+    maybe_build_mla_broadcaster,
+    storage_supports_host_dedup,
 )
-from sglang.srt.utils import get_device_module, is_cuda
+from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
-
-
-# Storage backends compatible with MLA/NSA host-memory dedup. The dummy
-# (non-rank-0) host pool has no local KV buffer, so dedup only engages for
-# backends that never construct against / register / read that buffer.
-# "file" (HiCacheFile) is built from config alone and stages via flat copies,
-# so it coexists; the RDMA/registered backends (mooncake/eic/simm/hf3fs/nixl/
-# aibrix) touch the host buffer at construct or register time, so dedup stays
-# off for them and every rank keeps a full host pool (pre-dedup behavior).
-_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file"})
-
-
-def storage_supports_host_dedup(storage_backend) -> bool:
-    """Whether MLA/NSA host-memory dedup can engage with this storage backend."""
-    return storage_backend in _DEDUP_COMPATIBLE_STORAGE
 
 
 class LayerLoadingEvent:
@@ -283,25 +268,12 @@ class HiCacheController:
         pp_rank: int = 0,
         pp_size: int = 1,
         enable_storage_metrics: bool = False,
-        mla_broadcast_state: Optional[dict] = None,
+        mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
-        # Optional prebuilt rendezvous state from HiRadixCache (created BEFORE
-        # the slow rank-0 host KV alloc, see prebuild_mla_broadcast_state for
-        # the 10-min NCCL watchdog story). Consumed in this __init__ for the
-        # MLA broadcast group, and in _create_prefetch_sync_groups for the
-        # gloo prefetch groups. Cleared after consumption so any future
-        # runtime detach→re-attach builds fresh.
-        self._prebuilt_prefetch_sync_groups: Optional[
-            List[torch.distributed.ProcessGroup]
-        ] = (
-            mla_broadcast_state.get("prefetch_sync_groups")
-            if mla_broadcast_state is not None
-            else None
-        )
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -362,50 +334,22 @@ class HiCacheController:
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
-        # MLA KV is identical across TP ranks; rank 0 owns the host copy and
-        # broadcasts loaded GPU pages to the other ranks.
-        # FP4 is excluded: it keeps an extra per-rank scale buffer that this
-        # broadcast does not replicate (MLATokenToKVPoolFP4 subclasses MLA).
-        # Dedup only engages with a dedup-compatible storage backend (see
-        # storage_supports_host_dedup): the non-rank-0 dummy pool has no host
-        # buffer, which RDMA/registered L3 backends cannot tolerate. Must match
-        # the dummy-pool decision in HiRadixCache / the hybrid assembler.
-        self.is_mla = (
-            isinstance(self.mem_pool_device, MLATokenToKVPool)
-            and not isinstance(self.mem_pool_device, MLATokenToKVPoolFP4)
-            and is_cuda()
-            and storage_supports_host_dedup(storage_backend)
-        )
-        # DSA additionally stores a per-page indexer buffer that must be
-        # broadcast alongside the MLA latent (DSATokenToKVPool subclasses MLA).
-        self.is_dsa = isinstance(self.mem_pool_device, DSATokenToKVPool)
-        self.mla_bcast_group = None
-        if self.is_mla:
-            if is_dp_attention_enabled():
-                self._mla_tp_rank = get_attention_tp_rank()
-                self._mla_tp_size = get_attention_tp_size()
-            else:
-                self._mla_tp_rank = get_tensor_model_parallel_rank()
-                self._mla_tp_size = get_tensor_model_parallel_world_size()
-            if self._mla_tp_size > 1:
-                if mla_broadcast_state is not None:
-                    # Pre-built by HiRadixCache BEFORE HostKVCache alloc, so
-                    # the world all_gather_object inside
-                    # create_custom_parallel_group did NOT race rank 0's
-                    # multi-minute host KV pin against the 600s NCCL watchdog.
-                    self.mla_bcast_group = mla_broadcast_state["mla_bcast_group"]
-                    self._mla_bcast_src = mla_broadcast_state["mla_bcast_src"]
-                    self._mla_bt_num_tokens = mla_broadcast_state["mla_bt_num_tokens"]
-                    self._mla_bt = mla_broadcast_state["mla_bt"]
-                    self._mla_idx_bufs = mla_broadcast_state["mla_idx_bufs"]
-                    if self._mla_idx_bufs is not None:
-                        self._mla_idx_elem = mla_broadcast_state["mla_idx_elem"]
-                        self._mla_idx_bt = mla_broadcast_state["mla_idx_bt"]
-                else:
-                    self._init_mla_broadcast()
+        # MLA/DSA host-memory dedup (see mla_host_dedup): consume the groups
+        # the caller prebuilt before the slow host KV alloc, else build
+        # inline with the same gating.
+        if mla_dedup_prebuild is not None:
+            self.mla_broadcaster = mla_dedup_prebuild.broadcaster
+            self._prebuilt_prefetch_sync_groups = (
+                mla_dedup_prebuild.prefetch_sync_groups
+            )
         else:
-            self._mla_tp_rank = 0
-            self._mla_tp_size = 1
+            self.mla_broadcaster = maybe_build_mla_broadcaster(
+                self.mem_pool_device,
+                self.tp_group,
+                self.attn_tp_group,
+                storage_backend,
+            )
+            self._prebuilt_prefetch_sync_groups = None
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -423,199 +367,17 @@ class HiCacheController:
 
     @property
     def mla_broadcast_enabled(self) -> bool:
-        return self.is_mla and self.mla_bcast_group is not None
+        return self.mla_broadcaster is not None
 
-    def _init_mla_broadcast(self) -> None:
-        # Delegate to the static helper so the runtime detach→re-attach path
-        # (which has no prebuilt state) and the early-prebuild path share one
-        # construction code path.
-        state = HiCacheController.prebuild_mla_broadcast_state(
-            self.mem_pool_device,
-            self.tp_group,
-            self.attn_cp_group,
-            self.attn_tp_group,
-            self.layer_num,
-            self.device,
-            is_dsa=self.is_dsa,
-            enable_storage=False,
-        )
-        self.mla_bcast_group = state["mla_bcast_group"]
-        self._mla_bcast_src = state["mla_bcast_src"]
-        self._mla_bt_num_tokens = state["mla_bt_num_tokens"]
-        self._mla_bt = state["mla_bt"]
-        self._mla_idx_bufs = state["mla_idx_bufs"]
-        if self._mla_idx_bufs is not None:
-            self._mla_idx_elem = state["mla_idx_elem"]
-            self._mla_idx_bt = state["mla_idx_bt"]
-
-    @staticmethod
-    def prebuild_mla_broadcast_state(
-        mem_pool_device,
-        tp_group: torch.distributed.ProcessGroup,
-        attn_cp_group: Optional[torch.distributed.ProcessGroup],
-        attn_tp_group: Optional[torch.distributed.ProcessGroup],
-        layer_num: int,
-        device,
-        *,
-        is_dsa: bool,
-        enable_storage: bool = False,
-    ) -> dict:
-        """Create every world-collective HiCacheController would issue at
-        init time BEFORE HostKVCache is allocated.
-
-        Why: HostKVCache.__init__ on rank 0 pins the full host KV (can exceed
-        the 10-min NCCL watchdog at 800GB), while non-rank-0 attn-TP ranks
-        hit the dummy fast path and race ahead to the next world-collective.
-        Two collectives downstream would otherwise race rank 0's slow pin:
-          (a) _init_mla_broadcast → create_custom_parallel_group(nccl) for
-              the mla_bcast_group  (broadcast loaded KV across attn-TP);
-          (b) attach_storage_backend → _create_prefetch_sync_groups →
-              create_custom_parallel_group(gloo) for prefetch_sync_groups
-              (only with --hicache-storage-backend; coordinates L3
-              prefetch/eviction across ranks).
-        Both go through an all_gather_object + new_group on the default-world
-        NCCL comm, whose watchdog kills the proc at 600s.
-
-        Calling this BEFORE HostKVCache means the rendezvouses happen while
-        rank 0 has not started pinning yet — they complete in <1s on all
-        ranks in lockstep, and rank 0 is then free to take its time pinning
-        without racing any further collective.
-
-        Returns a dict to be passed into HiCacheController(...) via
-        mla_broadcast_state=...
-            HiCacheController.__init__ uses the prebuilt mla_bcast_group;
-            _create_prefetch_sync_groups uses the prebuilt
-            prefetch_sync_groups if present.
-        """
-        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
-
-        base_group = tp_group
-        if is_dp_attention_enabled() and attn_tp_group is not None:
-            base_group = attn_tp_group
-        group_ranks = torch.distributed.get_process_group_ranks(base_group)
-
-        # Dedicated NCCL group so the load-time broadcast never interleaves
-        # with the model-forward collectives.
-        mla_bcast_group = create_custom_parallel_group(
-            group_ranks=list(group_ranks), backend="nccl"
-        )
-        mla_bcast_src = group_ranks[0]
-
-        # Staging buffer coalescing all layers of one token chunk into a
-        # single broadcast; reused across loads and bounded by bt_num_tokens.
-        mla_bt_num_tokens = 512
-        mla_bt = torch.empty(
-            layer_num * mla_bt_num_tokens * mem_pool_device.kv_cache_dim,
-            dtype=mem_pool_device.kv_buffer[0].dtype,
-            device=device,
-        )
-        # DSA also stores a per-page indexer buffer that must be broadcast.
-        mla_idx_bufs = None
-        mla_idx_elem = None
-        mla_idx_bt = None
-        if is_dsa:
-            mla_idx_bufs = mem_pool_device.index_k_with_scale_buffer
-            mla_idx_elem = math.prod(mla_idx_bufs[0].shape[1:]) or 1
-            mla_idx_bt = torch.empty(
-                layer_num * mla_bt_num_tokens * mla_idx_elem,
-                dtype=mla_idx_bufs[0].dtype,
-                device=device,
-            )
-
-        # Prefetch sync group rendezvouses (storage-backend path only). Mirror
-        # _create_prefetch_sync_groups: CP+TP attn groups if either is set,
-        # else the model-tp group. Dedupe by rank-set so a CP=1 case doesn't
-        # double-build the same gloo group.
-        #
-        # Stays None when enable_storage=False, so that a later runtime
-        # attach_storage_backend (with no prebuilt groups) still goes through
-        # the normal inline build path in _create_prefetch_sync_groups instead
-        # of consuming an empty prebuilt list and ending up with zero groups.
-        prefetch_sync_groups: Optional[List[torch.distributed.ProcessGroup]] = None
-        if enable_storage:
-            prefetch_sync_groups = []
-            seen_rank_sets = set()
-            if attn_cp_group is not None or attn_tp_group is not None:
-                base_groups = [attn_cp_group, attn_tp_group]
-            else:
-                base_groups = [tp_group]
-            for group in base_groups:
-                if group is None or torch.distributed.get_world_size(group=group) == 1:
-                    continue
-                ranks = tuple(torch.distributed.get_process_group_ranks(group))
-                if ranks in seen_rank_sets:
-                    continue
-                seen_rank_sets.add(ranks)
-                prefetch_sync_groups.append(
-                    create_custom_parallel_group(
-                        group_ranks=list(ranks), backend="gloo"
-                    )
-                )
-
-        return {
-            "mla_bcast_group": mla_bcast_group,
-            "mla_bcast_src": mla_bcast_src,
-            "mla_bt_num_tokens": mla_bt_num_tokens,
-            "mla_bt": mla_bt,
-            "mla_idx_bufs": mla_idx_bufs,
-            "mla_idx_elem": mla_idx_elem,
-            "mla_idx_bt": mla_idx_bt,
-            "prefetch_sync_groups": prefetch_sync_groups,
-        }
-
-    @staticmethod
-    def maybe_prebuild_mla_broadcast_state(
-        kv_cache,
-        tp_group: torch.distributed.ProcessGroup,
-        attn_cp_group: Optional[torch.distributed.ProcessGroup],
-        attn_tp_group: Optional[torch.distributed.ProcessGroup],
-        storage_backend: Optional[str],
-    ) -> Optional[dict]:
-        """Gated convenience wrapper around prebuild_mla_broadcast_state.
-
-        Returns None when no rendezvous is needed (MHA, FP4, non-cuda,
-        mla_tp_size == 1, or a non-dedup-compatible storage backend), else
-        the state dict to pass to HiCacheController(...) via
-        mla_broadcast_state=...
-
-        Gating must mirror HiCacheController.is_mla (minus the per-rank
-        check) so we don't build a group on ranks the controller would
-        then ignore — that would leak the NCCL group AND desync the
-        rendezvous counter. Shared between HiRadixCache and the unified
-        assembler strategies.
-        """
-        if not (
-            isinstance(kv_cache, MLATokenToKVPool)
-            and not isinstance(kv_cache, MLATokenToKVPoolFP4)
-            and storage_supports_host_dedup(storage_backend)
-        ):
-            return None
-        if not is_cuda():
-            return None
-        if is_dp_attention_enabled():
-            mla_tp_size = get_attention_tp_size()
-        else:
-            mla_tp_size = get_tensor_model_parallel_world_size()
-        if mla_tp_size <= 1:
-            return None
-        return HiCacheController.prebuild_mla_broadcast_state(
-            kv_cache,
-            tp_group,
-            attn_cp_group,
-            attn_tp_group,
-            kv_cache.layer_num,
-            kv_cache.device,
-            is_dsa=isinstance(kv_cache, DSATokenToKVPool),
-            enable_storage=storage_backend is not None,
-        )
+    @property
+    def _mla_skip_host_io(self) -> bool:
+        """Non-src dedup ranks: dummy host pools, no D2H backup or L3 reads."""
+        return self.mla_broadcaster is not None and not self.mla_broadcaster.is_src
 
     def _destroy_mla_broadcast_group(self) -> None:
-        if self.mla_bcast_group is not None:
-            try:
-                torch.distributed.destroy_process_group(self.mla_bcast_group)
-            except Exception:
-                pass
-            self.mla_bcast_group = None
+        if self.mla_broadcaster is not None:
+            self.mla_broadcaster.destroy()
+            self.mla_broadcaster = None
 
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
@@ -627,10 +389,8 @@ class HiCacheController:
         return 0, 1
 
     def _create_prefetch_sync_groups(self) -> None:
-        # If HiRadixCache prebuilt the gloo groups BEFORE the slow host KV
-        # alloc (to avoid the 600s NCCL watchdog race — see
-        # prebuild_mla_broadcast_state), reuse them and clear the slot so a
-        # later runtime detach→re-attach builds fresh.
+        # Reuse caller-prebuilt gloo groups (see maybe_prebuild_mla_host_dedup);
+        # clear the slot so a runtime detach→re-attach builds fresh.
         if self._prebuilt_prefetch_sync_groups is not None:
             self.prefetch_sync_groups = self._prebuilt_prefetch_sync_groups
             self._prebuilt_prefetch_sync_groups = None
@@ -756,25 +516,11 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
-        # Reject backends that cannot coexist with the active MLA/NSA
-        # host-memory dedup broadcast.
-        #
-        # When startup --hicache-storage-backend was unset (or "file"),
-        # storage_supports_host_dedup(...) was True, so this controller
-        # entered dedup mode on every attn-TP rank: rank 0 owns the host
-        # copy and broadcasts loaded GPU pages to non-rank-0 ranks that
-        # hold allocator-only dummy host pools (kv_buffer is None). The
-        # RDMA/registered backends -- mooncake / eic / simm / hf3fs / nixl
-        # / aibrix -- pin or register that buffer at construct or register
-        # time and would dereference None on the dummy ranks.
-        #
-        # Reject on EVERY dedup participant (self.mla_broadcast_enabled is
-        # True on rank 0 too because it is the broadcast source). Gating
-        # on self.mem_pool_host._is_dummy alone would be rank-asymmetric:
-        # rank 0's full pool would silently accept the attach while peers
-        # raise, and because attach_storage_backend is fanned out via the
-        # tokenizer with no rollback on partial failure, the server would
-        # be left in a half-attached state.
+        # While dedup is active, non-src ranks hold buffer-less dummy host
+        # pools that RDMA/registered backends would dereference. Reject on
+        # EVERY rank: attach is fanned out with no rollback on partial
+        # failure, so a rank-asymmetric reject would leave the server
+        # half-attached.
         if self.mla_broadcast_enabled and not storage_supports_host_dedup(
             storage_backend
         ):
@@ -821,10 +567,7 @@ class HiCacheController:
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
-            # A dummy (non-rank-0 dedup) host pool has no KV buffer to register;
-            # backends that pin/register the buffer (Mooncake/SiMM/EIC) would
-            # crash on the None buffer. Non-rank-0 never reads L3 anyway (see
-            # _page_transfer), so skip registration for it.
+            # Dummy host pool: no buffer to register; this rank never reads L3.
             if getattr(self.mem_pool_host, "_is_dummy", False):
                 logger.info(
                     "Skipping register_mem_pool_host on dummy (non-rank-0 dedup) "
@@ -1053,8 +796,8 @@ class HiCacheController:
         start_event = device_module.Event()
         finish_event = device_module.Event()
 
-        if self.mla_broadcast_enabled and self._mla_tp_rank != 0:
-            # Non-rank-0 ranks have a dummy host pool: skip D2H, just ack.
+        if self._mla_skip_host_io:
+            # Dummy host pool on this rank: skip D2H, just ack.
             start_event.record()
             finish_event.record()
             self.ack_write_queue.append(
@@ -1183,40 +926,23 @@ class HiCacheController:
         return producer_id
 
     def _start_loading_mla(self, producer_id: int, op: CacheOperation) -> int:
-        """Load MLA KV on rank 0, then broadcast it to the other TP ranks.
+        """Load on the dedup src rank, then broadcast to the peers.
 
-        H2D and broadcast are both enqueued on ``load_stream``: stream ordering
-        guarantees rank 0's H2D lands before the broadcast reads the KV buffer,
-        and the per-layer load events fire when the stream drains, so the normal
-        ``loading_check`` ack path finalizes the load with no extra polling.
+        Both are enqueued on ``load_stream``, so the per-layer load events
+        fire when the stream drains and the normal ack path finalizes.
         """
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            if self._mla_tp_rank == 0:
-                host_indices, device_indices = self.move_indices(
-                    op.host_indices, op.device_indices
-                )
-                for i in range(self.layer_num):
-                    self.mem_pool_host.load_to_device_per_layer(
-                        self.mem_pool_device,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
-                if host_indices.is_cuda:
-                    host_indices.record_stream(self.load_stream)
-                if device_indices.is_cuda:
-                    device_indices.record_stream(self.load_stream)
-                # The "direct" io backend may issue H2D off load_stream, so plain
-                # stream ordering is not enough; fully land rank 0's H2D before
-                # the broadcast reads the device KV buffer.
+            if self.mla_broadcaster.is_src:
+                self._load_mla_on_src_rank(op)
+                # "direct" may issue H2D off load_stream; land it fully
+                # before the broadcast reads the device KV buffer.
                 self.load_stream.synchronize()
 
-            self._broadcast_mla_kv(op.device_indices)
+            self.mla_broadcaster.broadcast_loaded(op.device_indices, self.load_stream)
             for i in range(self.layer_num):
                 producer_event.complete(i)
 
@@ -1229,62 +955,23 @@ class HiCacheController:
         )
         return producer_id
 
-    def _bcast_buf(self, buf_list, staging, target, elem) -> None:
-        """Broadcast one per-layer buffer set from rank 0, in row chunks.
-
-        ``target`` indexes dim 0 of each layer tensor (token indices for the KV
-        latent, page indices for the DSA indexer). Must run on load_stream.
-        """
-        is_src = self._mla_tp_rank == 0
-        n = target.shape[0]
-        for start in range(0, n, self._mla_bt_num_tokens):
-            cur = min(self._mla_bt_num_tokens, n - start)
-            idx = target[start : start + cur]
-            chunk = staging[: self.layer_num * cur * elem]
-            if is_src:
-                for layer_id in range(self.layer_num):
-                    o = layer_id * cur * elem
-                    chunk[o : o + cur * elem].copy_(buf_list[layer_id][idx].reshape(-1))
-            torch.distributed.broadcast(
-                chunk, src=self._mla_bcast_src, group=self.mla_bcast_group
-            )
-            if not is_src:
-                for layer_id in range(self.layer_num):
-                    o = layer_id * cur * elem
-                    buf_list[layer_id][idx] = chunk[o : o + cur * elem].view(
-                        buf_list[layer_id][idx].shape
-                    )
-
-    def _broadcast_mla_kv(self, device_indices: torch.Tensor) -> None:
-        """Broadcast loaded KV (and DSA indexer) pages from rank 0 to peers.
-
-        Coalesced layer-by-layer into reused staging buffers and sent in chunks,
-        one NCCL broadcast per chunk over the dedicated group. Must run on the
-        load stream.
-        """
-        indices = device_indices
-        if not indices.is_cuda:
-            indices = indices.to(self.device)
-        if indices.is_cuda:
-            indices.record_stream(self.load_stream)
-        self._bcast_buf(
-            self.mem_pool_device.kv_buffer,
-            self._mla_bt,
-            indices,
-            self.mem_pool_device.kv_cache_dim,
+    def _load_mla_on_src_rank(self, op: CacheOperation) -> None:
+        """Src-rank H2D; subclasses override to add their pool transfers."""
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
         )
-        if self._mla_idx_bufs is not None:
-            page_size = self.mem_pool_device.page_size
-            page_idx = (
-                torch.unique(torch.div(indices, page_size, rounding_mode="floor"))
-                if page_size > 1
-                else indices
+        for i in range(self.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                i,
+                self.io_backend,
             )
-            if page_idx.is_cuda:
-                page_idx.record_stream(self.load_stream)
-            self._bcast_buf(
-                self._mla_idx_bufs, self._mla_idx_bt, page_idx, self._mla_idx_elem
-            )
+        if host_indices.is_cuda:
+            host_indices.record_stream(self.load_stream)
+        if device_indices.is_cuda:
+            device_indices.record_stream(self.load_stream)
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
@@ -1423,13 +1110,9 @@ class HiCacheController:
                 break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
-        # MLA dedup: non-rank-0 ranks have a dummy host pool (no kv_buffer), so
-        # only rank 0 reads L3 into host; the other ranks receive the data via
-        # the load-time broadcast. Mark the prefetch complete here so the
-        # cross-rank accounting (already MIN-synced in _storage_hit_query) and
-        # host-slot bookkeeping stay consistent without touching the dummy pool.
-        # (Backup is already rank-0-only via self.backup_skip.)
-        if self.mla_broadcast_enabled and self._mla_tp_rank != 0:
+        # Dummy host pool: only the src rank reads L3; mark complete so the
+        # MIN-synced cross-rank accounting stays consistent.
+        if self._mla_skip_host_io:
             operation.completed_tokens += len(operation.hash_value) * self.page_size
             return
         # Transfer batch by batch
