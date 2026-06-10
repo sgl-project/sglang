@@ -798,7 +798,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TTFT</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
     </tr>
@@ -6915,7 +6915,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset with throughput focus (infinite request rate).
 
 ```bash
-python3 -m sglang.bench_serving --backend sglang --host <ROUTER_IP> --port 9903  --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random --random-input-len 32000 --random-output-len 1000 --request-rate inf --random-range-ratio 1 --num-prompts 128 --max-concurrency 64
+python3 -m sglang.bench_serving --backend sglang --host <ROUTER_IP> --port 9903  --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random --random-input-len 16000 --random-output-len 1 --request-rate inf --random-range-ratio 1 --num-prompts 128 --max-concurrency 64
 ```
 
 ### MiMo-V2-Flash 32K+1 2,147ms on A3 24 Cards Disaggregation Mode
