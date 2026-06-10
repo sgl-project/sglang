@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
@@ -17,14 +16,13 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixin):
     def __init__(
         self,
-        server_args: ServerArgs = None,
         draft_token: torch.Tensor = None,
         custom_mask: torch.Tensor = None,
         positions: torch.Tensor = None,
         retrieve_index: torch.Tensor = None,
         retrieve_next_token: torch.Tensor = None,
         retrieve_next_sibling: torch.Tensor = None,
-        draft_token_num: int = -1,
+        draft_token_num: int = None,
         grammar: BaseGrammarObject = None,
         future_indices: Optional[torch.Tensor] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
@@ -38,12 +36,7 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         self.retrieve_index = retrieve_index
         self.retrieve_next_token = retrieve_next_token
         self.retrieve_next_sibling = retrieve_next_sibling
-
-        self.draft_token_num = (
-            draft_token_num
-            if draft_token_num != -1
-            else server_args.speculative_num_draft_tokens
-        )
+        self.draft_token_num = draft_token_num
         self.grammar = grammar
 
         # Inputs for V2 overlap worker

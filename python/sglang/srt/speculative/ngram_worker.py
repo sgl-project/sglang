@@ -308,7 +308,6 @@ class NGRAMWorker:
             device=self.device,
         )
         batch.spec_info = NgramVerifyInput(
-            server_args=self.server_args,
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=positions,
@@ -471,7 +470,6 @@ class NGRAMWorker:
 
         # Construct the next draft input
         next_draft_input = NgramVerifyInput(
-            server_args=self.server_args,
             draft_token_num=self.draft_token_num,
             new_seq_lens=new_seq_lens,
             accept_tokens=accept_tokens,
