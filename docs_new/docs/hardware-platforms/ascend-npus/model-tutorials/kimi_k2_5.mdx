@@ -145,12 +145,13 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. The following command is based on the W4A8 quantized model.
 
+```bash Launch server
 #============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   DRAFT_PATH: path to the EAGLE3 draft model directory
 #============================================================
 
-```bash Launch server
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
@@ -179,7 +180,7 @@ export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 
 MODEL_PATH=/path/to/model-weights
-DRAFT_PATH=xxx
+DRAFT_PATH=/path/to/draft-model
 
 python3 -m sglang.launch_server \
     --model-path $MODEL_PATH --quantization modelslim --dtype bfloat16 \
