@@ -802,7 +802,16 @@ class ServerArgs:
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
-    triton_attention_num_kv_splits: int = 8
+    # Max flash-decoding KV splits; also sizes the per-step attn_logits/attn_lse split
+    # buffers. Raised 8->64 so long-context low-batch decode can fill the SMs (the grid
+    # is only batch*head_blocks blocks otherwise: 0.59/SM at bs=1 on an A100). The
+    # occupancy-aware heuristic (get_num_kv_splits_triton) gates this DOWN to the previous
+    # value (8) per-sequence below its long-context threshold, so any sequence shorter than
+    # the threshold stays bit-identical to the old default (even when co-scheduled with a
+    # long request); only genuinely long sequences open up to 64 (measured 1.2-3.5x decode
+    # speedup, bf16/fp8/quantized alike), and high batch still self-limits well below the
+    # cap via the grid divisor. (AMD/HIP keeps its own cap via _handle_amd_specifics.)
+    triton_attention_num_kv_splits: int = 64
     triton_attention_split_tile_size: Optional[int] = None
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
@@ -7016,7 +7025,11 @@ class ServerArgs:
             "--triton-attention-num-kv-splits",
             type=int,
             default=ServerArgs.triton_attention_num_kv_splits,
-            help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
+            help="Max number of KV splits in the flash-decoding Triton kernel; also sizes the "
+            "per-step attention split buffers. The occupancy-aware heuristic gates this down "
+            "per-sequence for short context (which stays bit-identical to the old default) and "
+            "only uses the full value for long context, where it fills otherwise-idle SMs. "
+            "Lower it to reduce the split-buffer footprint on memory-constrained GPUs.",
         )
         parser.add_argument(
             "--triton-attention-split-tile-size",

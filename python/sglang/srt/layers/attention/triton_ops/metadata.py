@@ -19,6 +19,8 @@ def get_num_kv_splits_triton(
     max_kv_splits,
     device_core_count,
     MAX_NUM_SEQ: tl.constexpr,
+    LONG_CTX_SPLIT_THRESHOLD: tl.constexpr = 24576,
+    SHORT_CTX_SPLIT_CAP: tl.constexpr = 8,
 ):
     # TODO: this method is tunable, we need more online serving data to tune it
     offs_seq = tl.arange(0, MAX_NUM_SEQ)
@@ -30,7 +32,28 @@ def get_num_kv_splits_triton(
     min_seq_len = tl.min(seq_lens)
     if max_seq_len * 8 < min_seq_len * 10:
         min_seq_len = max_seq_len
-    max_kv_splits_1 = tl.minimum(tl.cdiv(max_seq_len, min_seq_len), max_kv_splits)
+    # Per-sequence context-aware split cap. `max_kv_splits` (and the attn_logits/attn_lse
+    # buffers) are sized for the long-context maximum, but short-context decode is fast and
+    # not SM-underfilled enough to benefit from more splits (extra splits only perturb the
+    # fp reduce order with no speedup). Gate the effective cap DOWN to the previous value
+    # below LONG_CTX_SPLIT_THRESHOLD. The threshold is the LATEST per-dtype decode-speedup
+    # knee measured on A100 (bs=1): the heavier quantized kernels underfill earlier (~14k),
+    # bf16 ~20k, fp8 ~24k; 24576 is fp8's knee, so below it NO dtype benefits (-> gating it
+    # down costs nothing and keeps it bit-identical) and at/above it every dtype shows real
+    # speedup. Deployments that only run the heavier dtypes can lower this for extra 14-24k
+    # gains. Gate on each lane's OWN seq_lens, not the batch max: under continuous batching
+    # a short request is routinely co-scheduled with a long one, and keying off max_seq_len
+    # would drag every member onto the long path. Per-sequence gating keeps a short
+    # sequence's picked split count bit-identical to the previous default regardless of who
+    # it shares the batch with, while a genuinely long sequence still opens up to the full
+    # cap. Buffers are sized for the cap, so any per-lane value <= cap is safe; high batch
+    # still self-limits via the token_grid divisor below.
+    eff_max_kv_splits = tl.where(
+        seq_lens >= LONG_CTX_SPLIT_THRESHOLD,
+        max_kv_splits,
+        tl.minimum(max_kv_splits, SHORT_CTX_SPLIT_CAP),
+    )
+    max_kv_splits_1 = tl.minimum(tl.cdiv(max_seq_len, min_seq_len), eff_max_kv_splits)
     kv_chunk_size_1 = tl.cdiv(max_seq_len, max_kv_splits_1)
 
     # NOTE: this is a hack to let num_kv_split grows up with seqlen gradually
@@ -46,7 +69,7 @@ def get_num_kv_splits_triton(
         block_h = tl.minimum(block_h, num_kv_group)
         token_grid = num_seq * num_group * tl.cdiv(num_head, block_h)
     max_kv_splits_2 = tl.minimum(
-        tl.cdiv(ext_device_core_count, token_grid), max_kv_splits
+        tl.cdiv(ext_device_core_count, token_grid), eff_max_kv_splits
     )
     kv_chunk_size_2 = tl.cdiv(max_seq_len, max_kv_splits_2)
 
