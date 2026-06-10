@@ -7860,11 +7860,6 @@ class ServerArgs:
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
 
-        if self.enable_two_batch_overlap and self.enforce_shared_experts_fusion:
-            raise ValueError(
-                "--enable-two-batch-overlap and --enforce-shared-experts-fusion cannot be used together."
-            )
-
         # Check communications compression
         if self.enable_quant_communications and self.tp_size == 1:
             raise ValueError(
@@ -8455,41 +8450,3 @@ class PortArgs:
                 ).to_tcp(),
                 instance_id=instance_id,
             )
-
-
-def auto_choose_speculative_params(self: ServerArgs):
-    """
-    Automatically choose the parameters for speculative decoding.
-
-    You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
-    """
-    hf_config = self.get_model_config().hf_config
-    arch = hf_config.architectures[0]
-    if self.speculative_algorithm == "STANDALONE":
-        # The default value for standalone speculative decoding
-        return (3, 1, 4)
-    if arch in ["LlamaForCausalLM"]:
-        # The default value for llama
-        return (5, 4, 8)
-    elif arch in [
-        "DeepseekV32ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "DeepseekV2ForCausalLM",
-        "GptOssForCausalLM",
-        "Glm4MoeForCausalLM",
-        "Glm4MoeLiteForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        "BailingMoeForCausalLM",
-        "BailingMoeV2ForCausalLM",
-        "BailingMoeV2_5ForCausalLM",
-        "MistralLarge3ForCausalLM",
-        "PixtralForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    ]:
-        return (3, 1, 4)
-    elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
-        return (5, 4, 8)
-    else:
-        # The default value for all other models
-        return (3, 1, 4)

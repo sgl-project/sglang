@@ -528,6 +528,38 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestAdaptiveSpecArgs(CustomTestCase):
+    def test_adaptive_defaults_to_config_step_when_spec_params_omitted(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 3, 5]},
+                    "8": {"candidate_steps": [1]},
+                },
+                f,
+            )
+            f.flush()
+
+            args = ServerArgs(model_path="dummy")
+            args.speculative_algorithm = "EAGLE"
+            args.speculative_adaptive = True
+            args.speculative_adaptive_config = f.name
+            args.device = "cuda"
+            args.get_model_config = lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["LlamaForCausalLM"],
+                    get_text_config=lambda: SimpleNamespace(),
+                )
+            )
+
+            handle_speculative_decoding(args)
+
+        self.assertTrue(args.speculative_adaptive)
+        self.assertEqual(args.speculative_eagle_topk, 1)
+        self.assertEqual(args.speculative_num_steps, 3)
+        self.assertEqual(args.speculative_num_draft_tokens, 4)
+
+
 class TestDeepEPWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
