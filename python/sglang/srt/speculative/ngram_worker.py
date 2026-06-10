@@ -11,7 +11,6 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_info_v2 import move_accepted_tokens_to_target_kvcache
@@ -374,8 +373,6 @@ class NGRAMWorker:
                     verify_input.retrieve_next_token.shape
                 ).cpu()
 
-            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
-
             batch_result = self.target_worker.forward_batch_generation(
                 batch, is_verify=True
             )
@@ -447,16 +444,6 @@ class NGRAMWorker:
             if on_publish is not None:
                 on_publish(new_seq_lens)
 
-            if get_global_tracing_enabled():
-                for idx, req in enumerate(batch.reqs):
-                    num_correct_drafts = (
-                        verify_input.accept_lens[idx].item()
-                        if verify_input.accept_lens is not None
-                        else 0
-                    ) - 1
-                    req.time_stats.set_spec_verify_end_time(
-                        num_correct_drafts=num_correct_drafts
-                    )
             self._update_ngram_corpus(batch)
             # Clean up per-request match state for finished/retracted requests.
             finished_req_ids = []
