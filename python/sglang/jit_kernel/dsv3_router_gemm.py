@@ -18,6 +18,7 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -41,6 +42,25 @@ def _jit_dsv3_router_gemm_module(
     )
 
 
+@register_custom_op(
+    op_name="dsv3_router_gemm",
+    mutates_args=["output"],
+)
+def _dsv3_router_gemm_custom_op(
+    hidden_states: torch.Tensor,
+    router_weights: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    num_experts = router_weights.shape[0]
+    hidden_dim = hidden_states.shape[1]
+    out_float = output.dtype == torch.float32
+    module = _jit_dsv3_router_gemm_module(
+        num_experts, hidden_dim, is_arch_support_pdl(), out_float
+    )
+    module.dsv3_router_gemm(hidden_states, router_weights, output)
+    return None
+
+
 @debug_kernel_api
 def dsv3_router_gemm(
     hidden_states: torch.Tensor,
@@ -61,18 +81,12 @@ def dsv3_router_gemm(
     Returns:
         Output tensor of shape [num_tokens, num_experts].
     """
-    num_experts = router_weights.shape[0]
-    hidden_dim = hidden_states.shape[1]
-    out_float = out_dtype == torch.float32
     if output is None:
         output = torch.empty(
             hidden_states.shape[0],
-            num_experts,
+            router_weights.shape[0],
             device=hidden_states.device,
             dtype=out_dtype,
         )
-    module = _jit_dsv3_router_gemm_module(
-        num_experts, hidden_dim, is_arch_support_pdl(), out_float
-    )
-    module.dsv3_router_gemm(hidden_states, router_weights, output)
+    _dsv3_router_gemm_custom_op(hidden_states, router_weights, output)
     return output
