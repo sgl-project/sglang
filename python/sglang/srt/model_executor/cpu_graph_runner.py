@@ -123,6 +123,7 @@ def register_fake_ops():
         "gemma_fused_add_rmsnorm_cpu",
         "layernorm_cpu",
         "fused_add_layernorm_cpu",
+        "multimodal_rotary_embedding_cpu",
     ]
     for op in none_return_ops:
 
@@ -191,19 +192,6 @@ def register_fake_ops():
     @torch.library.register_fake("sgl_kernel::rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
         return torch.empty_like(query), torch.empty_like(key)
-
-    @torch.library.register_fake("sgl_kernel::multimodal_rotary_embedding_cpu")
-    def _(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        mrope_section,
-        mrope_interleaved,
-        is_neox,
-    ):
-        return query, key
 
     @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope_fused_weight")
     def _(
