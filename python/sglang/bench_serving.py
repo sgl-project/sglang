@@ -1004,6 +1004,8 @@ def calculate_metrics(
                 total_input += input_requests[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
                 total_input_vision += input_requests[i].vision_prompt_len
+            else:
+                total_input += outputs[i].prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
@@ -1230,9 +1232,12 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    if len(input_requests) == 0:
+        raise ValueError("input_requests is empty")
+
     # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
     # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
-    first_prompt = input_requests[0].prompt
+    first_prompt = getattr(input_requests[0], "prompt", None)
     is_multi_turn = (
         isinstance(first_prompt, list)
         and bool(first_prompt)
@@ -1254,8 +1259,9 @@ async def benchmark(
     # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
 
+    is_mooncake = args.dataset_name == "mooncake"
     # Handle the data structure difference for the warmup request
-    if args.dataset_name == "mooncake":
+    if is_mooncake:
         # For mooncake, input_requests is a list of dicts.
         # We need to build a temporary DatasetRow for the warmup phase.
         warmup_record = input_requests[0]
@@ -1353,9 +1359,8 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
-    if (
-        backend == "sglang" and args.dataset_name == "mooncake"
-    ):  # Assuming mooncake is mainly for sglang or similar backends
+    if backend == "sglang" and is_mooncake:
+        # Assuming mooncake is mainly for sglang or similar backends
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
         request_generator = get_mooncake_request_over_time(
             input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
@@ -1464,7 +1469,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=None if is_multi_turn else input_requests,
+        input_requests=None if is_multi_turn or is_mooncake else input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
