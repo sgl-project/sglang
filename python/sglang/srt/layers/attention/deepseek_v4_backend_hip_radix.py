@@ -1155,6 +1155,9 @@ class DeepseekV4HipRadixBackend(
             and kv.shape[0] == _cp_size * T
             and state_slot.shape[0] != T
         )
+        state_slot_full = state_slot
+        final_pos_full = final_pos
+        positions_full = positions
         if _cp_active:
             _sl = slice(get_attention_cp_rank(), None, _cp_size)
             state_slot = state_slot[_sl].contiguous()
@@ -1166,6 +1169,13 @@ class DeepseekV4HipRadixBackend(
             # (padded) global layout, so slice it the same way instead of taking
             # the first T entries (which would be the wrong, sequential 0..T-1).
             positions = forward_batch.positions.to(torch.int64)[_sl].contiguous()
+            # The SWA ring must hold the FULL window on EVERY rank (decode and
+            # later chunks read this rank's ring). kv was all-gathered to the full
+            # sequence, so write the full kv with full global positions/state_slot
+            # instead of only this rank's 1/cp_size tokens.
+            positions_full = forward_batch.positions.to(torch.int64)[
+                : state_slot_full.shape[0]
+            ].contiguous()
 
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,
@@ -1199,23 +1209,21 @@ class DeepseekV4HipRadixBackend(
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
         if save_kv_cache:
-            n_real = state_slot.shape[0]
-            # kv is the full all-gathered KV; the ring write is aligned to this
-            # rank's local round-robin tokens (matching state_slot/positions), so
-            # select them from the full KV under CP.
-            _ring_kv = (
-                kv[get_attention_cp_rank() :: _cp_size].contiguous()
-                if _cp_active
-                else kv
-            )
+            # Under CP, write the FULL all-gathered window so every rank's ring is
+            # complete (decode / later chunks read the local ring). Without CP this
+            # is just the local kv + local metadata as before.
+            _ring_state_slot = state_slot_full if _cp_active else state_slot
+            _ring_final_pos = final_pos_full if _cp_active else final_pos
+            _ring_positions = positions_full if _cp_active else positions
+            n_real = _ring_state_slot.shape[0]
             runtime.store_swa_into_unified(
-                kv=_ring_kv[:n_real],
-                state_slot=state_slot,
-                positions=positions[:n_real],
+                kv=kv[:n_real],
+                state_slot=_ring_state_slot,
+                positions=_ring_positions[:n_real],
                 unified_kv=unified,
                 win=win,
                 ring_stride=ring_stride,
-                final_pos=final_pos,
+                final_pos=_ring_final_pos,
             )
         return o
 
