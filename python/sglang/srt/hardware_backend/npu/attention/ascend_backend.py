@@ -989,53 +989,6 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
-    def _forward_extend_fia_paged_kv(
-        self,
-        q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        layer: "RadixAttention",
-    ) -> torch.Tensor:
-        """Run FIA extend attention against paged KV cache."""
-        query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-
-        if self.forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
-        else:
-            actual_seq_lengths_kv = (
-                self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
-            )
-
-        if self.forward_metadata.extend_seq_lens_cpu_int is None:
-            actual_seq_lengths = self.forward_metadata.seq_lens_list_cumsum
-        else:
-            actual_seq_lengths = (
-                torch.cumsum(self.forward_metadata.extend_seq_lens_cpu_int, dim=0)
-                .int()
-                .tolist()
-            )
-
-        #print(f"q dtype: {q.dtype}")
-        #print(f"k dtype: {k_cache.dtype}")
-        #print(f"v dtype: {v_cache.dtype}")
-        attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            query,
-            k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim),
-            v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim),
-            block_table=self.forward_metadata.block_tables,
-            block_size=self.page_size,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="TND",
-            atten_mask=self.fia_mask,
-            sparse_mode=3,
-            scale=layer.scaling,
-            actual_seq_lengths=actual_seq_lengths,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            next_tokens=0,
-        )
-        return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
     def forward_extend(
         self,
         q,
@@ -1125,16 +1078,8 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
             if (k_cache.dtype != k.dtype) and (k_cache.dtype == torch.int8):
-                #dequant cache back to model type for prefill
-                #print(f"dequantizing cache for prefill")
+                #dequant cache back to bf16 for prefill since FIA does not support pseudo-quant for seq_len > 16
                 k_cache, v_cache = layer.quant_method.anti_quant_int8(k_cache, v_cache, layer)
-                #print(f"k dtype after dequant: {k_cache.dtype}")
-                #print(f"v dtype after dequant: {v_cache.dtype}")
-            #k, k_scale = torch.ops.npu.npu_dynamic_quant(k)
-            #v, v_scale = torch.ops.npu.npu_dynamic_quant(v)
-            # print(f"k dtype: {k.dtype}")
-            # print(f"v dtype: {v.dtype}")
-
 
             if sinks is not None or (
                 self.is_hybrid_swa and layer.sliding_window_size != -1
@@ -1936,7 +1881,6 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
             num_tokens = query.shape[0]
-            #print(f"key antiquant scale: {layer.k_quant_scale.shape}", flush=True)
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query,
                 k_cache,
@@ -2036,8 +1980,8 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSND",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                # antiquant_mode=0,
-                # antiquant_scale=None,
+                antiquant_mode=0,
+                antiquant_scale=None,
                 sparse_mode=0,
             )
             output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
@@ -2056,8 +2000,8 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSND",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                # antiquant_mode=0,
-                # antiquant_scale=None,
+                antiquant_mode=0,
+                antiquant_scale=None,
                 sparse_mode=0,
                 workspace=workspace,
                 out=[output, softmax_lse],

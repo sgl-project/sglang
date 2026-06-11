@@ -152,7 +152,6 @@ class ModelSlimConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        print(f"Layer type: {type(layer).__name__}")
         if isinstance(layer, LinearBase):
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
@@ -180,7 +179,6 @@ class ModelSlimConfig(QuantizationConfig):
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
         elif isinstance(layer, RadixAttention):
-            print(f"In radix attention quant method")
             return ModelSlimKVCacheMethod(self)
         return None
 
@@ -442,8 +440,6 @@ class ModelSlimKVCacheMethod(BaseKVCacheMethod):
         layer.register_parameter("v_offset", v_offset)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        # print(f"-1 in k_scale: {(layer.k_scale == -1).all().item()}")
-        # print(f"-1 in v_scale: {(layer.v_scale == -1).all().item()}")
         device = layer.k_scale.device
         dtype = torch.bfloat16
 
@@ -478,6 +474,7 @@ class ModelSlimKVCacheMethod(BaseKVCacheMethod):
         return k_cache, v_cache
 
     def apply(self, k_cache, v_cache, layer):
+        #TODO: add dynamic quantization support
         old_shape = k_cache.shape
         k_cache = k_cache.view(-1, self.kv_size)
         v_cache = v_cache.view(-1, self.kv_size)
