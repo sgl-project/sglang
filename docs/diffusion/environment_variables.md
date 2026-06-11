@@ -36,7 +36,6 @@
 | Environment Variable | Default | Description |
 |----------------------|---------|-------------|
 | `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND` | not set | Optional FlashInfer FP4 GEMM backend override for diffusion NVFP4. When unset, SGLang defaults to `flashinfer_trtllm`. |
-| `SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM` | false | Experimental opt-in for fused W8A8 FP8 GEMM in diffusion weight-only FP8 linears. When disabled, FP8 weights are dequantized to the compute dtype before matmul. Enabling this dynamically quantizes activations to FP8 and may change output quality. |
 
 ## Caching Acceleration
 
