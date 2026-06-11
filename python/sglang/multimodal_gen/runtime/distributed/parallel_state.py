@@ -68,6 +68,7 @@ _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
+_USE_CFG_RANKS_FOR_DECODE_PARALLEL = False
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -283,6 +284,7 @@ def initialize_model_parallel(
     tensor_parallel_degree: int = 1,
     pipeline_parallel_degree: int = 1,
     vae_parallel_size: int = 0,
+    use_cfg_ranks_for_decode_parallel: bool = False,
     backend: Optional[str] = None,
 ) -> None:
     """
@@ -425,6 +427,9 @@ def initialize_model_parallel(
         ring_group=PROCESS_GROUP.RING_PG,
     )
 
+    global _USE_CFG_RANKS_FOR_DECODE_PARALLEL
+    _USE_CFG_RANKS_FOR_DECODE_PARALLEL = use_cfg_ranks_for_decode_parallel
+
     global _TP
     assert _TP is None, "Tensor parallel group is already initialized"
     _TP = init_parallel_group_coordinator(
@@ -478,6 +483,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     dp_size: int = 1,
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
+    use_cfg_ranks_for_decode_parallel: bool = False,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -518,6 +524,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
+        use_cfg_ranks_for_decode_parallel=use_cfg_ranks_for_decode_parallel,
     )
 
     # Only set CUDA device if we're on a CUDA platform
@@ -813,11 +820,9 @@ def get_vae_parallel_rank() -> int:
 
 
 def get_decode_parallel_group_coordinator() -> GroupCoordinator:
-    sp_group = get_sp_group()
-    cfg_group = get_cfg_group()
-    if sp_group.world_size == 1 and cfg_group.world_size > 1:
-        return cfg_group
-    return sp_group
+    if decode_parallel_group_uses_cfg_ranks():
+        return get_cfg_group()
+    return get_sp_group()
 
 
 def get_decode_parallel_world_size() -> int:
@@ -826,6 +831,14 @@ def get_decode_parallel_world_size() -> int:
 
 def get_decode_parallel_rank() -> int:
     return get_decode_parallel_group_coordinator().rank_in_group
+
+
+def decode_parallel_group_uses_cfg_ranks() -> bool:
+    return (
+        _USE_CFG_RANKS_FOR_DECODE_PARALLEL
+        and get_sp_group().world_size == 1
+        and get_cfg_group().world_size > 1
+    )
 
 
 def init_dit_group(
@@ -858,7 +871,7 @@ def init_vae_group(
 
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
-    global _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE
+    global _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE, _USE_CFG_RANKS_FOR_DECODE_PARALLEL
 
     for group in (_TP, _SP, _DP, _CFG, _PP):
         if group is not None:
@@ -869,3 +882,4 @@ def destroy_model_parallel() -> None:
             torch.distributed.destroy_process_group(group)
 
     _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE = (None,) * 7
+    _USE_CFG_RANKS_FOR_DECODE_PARALLEL = False
