@@ -83,7 +83,7 @@ class LightOnOCRForConditionalGeneration(nn.Module):
         # Build VisionEncoderArgs from config
         vision_config = config.vision_config
         config_dict = vision_config.to_dict()
-        if config_dict.get("rope_parameters"):  # transformers v5 compatibility
+        if config_dict.get("rope_parameters"):
             config_dict["rope_theta"] = config_dict["rope_parameters"].get("rope_theta")
         dataclass_fields = {field.name for field in fields(VisionEncoderArgs)}
         vision_args = {
