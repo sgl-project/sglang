@@ -12,7 +12,7 @@ this file is about the *mapping decisions*.
 | hardware radio | `match.hw` | Catalog ids as-is. Off-catalog hardware → `config.hardware` entry — e.g. A100 `{id:"a100", label:"A100", vram:"80GB", vendor:"nvidia"}` (merges into the NVIDIA row), Xeon `{id:"xeon", label:"Xeon", vram:"host RAM", vendor:"intel"}` (engine renders a new INTEL row; any vendor key works). A merged chip like GLM-5's "MI300X/MI325X" splits into two ids with duplicated cells (cells are denormalized by design). |
 | model-size / model-name radio | `variants` | One variant per deployable checkpoint family; single `{id:"default"}` when there's no variant axis (then `modelNames` keys drop the variant half). |
 | quantization radio | `quantizations` | Real precision ids (`bf16`/`fp8`/`fp4`/`int4`/…). One `fp4` id even when checkpoints differ per vendor — route via `hw\|variant\|quant` triple keys in `modelNames` (NVFP4 on Blackwell vs AMD MXFP4 is the precedent); per-hw greying falls out of which cells exist. |
-| toggle that **couples** with other parts of the command (changes TP/mem/EP) | `strategies` | The Playground applies pure flag diffs — it cannot do coupled changes. Example: Qwen3.5's MTP toggle bumps TP on three H100 combos → strategies `low-latency` (MTP on) / `high-throughput` (MTP off). GPU-count radios (GLM-4.7, MiniMax-M2.5/2.7) → budget-tier strategies with the legacy SUPPORT matrix preserved by which cells exist. `low-latency` + `high-throughput` are MANDATORY on every page (§4) — single-strategy pages are not acceptable. |
+| toggle that **couples** with other parts of the command (changes TP/mem/EP) | `strategies` | The Playground applies pure flag diffs — it cannot do coupled changes. Example: Qwen3.5's MTP toggle bumps TP on three H100 combos → strategies `low-latency` (MTP on) / `high-throughput` (MTP off). GPU-count radios (GLM-4.7, MiniMax-M2.5/2.7) → budget-tier strategies with the legacy SUPPORT matrix preserved by which cells exist. Strategy count follows the page's operating points: 1 → `balanced`, 2 → `low-latency`+`high-throughput`, 3 → the full trio (§4). |
 | toggle that only adds/removes its own flags | Playground axis (+ bake, EXCEPT parsers) | **Parsers (`--reasoning-parser` / `--tool-call-parser`) are NEVER baked into cells** — Deployment commands ship without them regardless of the legacy default or the measured command; the `parsers` axis adds them on top (DSv4 convention; cells mirror the legacy generator's parsers-OFF output). Other flag-only toggles: legacy default ON → bake into cells AND declare the axis so users can strip (red strikethrough); default OFF → keep cells clean, axis preset only. MTP/EAGLE presets → `speculative` axis; dp-attention → `attention.dpAttn` or a strategy (DSv4 semantics) depending on coupling. |
 | per-combo hidden option (e.g. spec hidden on Xeon) | absent cells | Don't create cells for combos the legacy widget couldn't produce; the engine greys them automatically. `# Error:` pseudo-commands → no cell + explanation in §2 tips and/or a chip `disable`/`disableReason`. |
 | coupled secondary knob with no axis (e.g. mamba cache V1/V2) | cells + prose | No new engine axis for a migration. Bake the correct value per cell following the legacy coupling (Qwen3.5: MTP ⇒ `--mamba-scheduler-strategy extra_buffer` on NVIDIA; AMD/Xeon ⇒ V1/no flag), document the knob in §2 tips. |
@@ -79,19 +79,22 @@ green addition, never a strikethrough.
 
 ## 4. Per-family strategy sets (pre-designed; adjust at inventory time)
 
-**Strategy-set rule:** the default is the full DeepSeek-V4 trio —
-`low-latency` / `balanced` / `high-throughput` — and **`low-latency` +
-`high-throughput` are MANDATORY on every page** (a single-strategy page is not
-acceptable; include `balanced` whenever the page has a third operating point).
-Ids reuse this canonical vocabulary — never model-specific ids like
-`mtp`/`no-mtp`. Map legacy toggles onto the serving semantics (MTP on →
-`low-latency`; MTP off / DP+EP → `high-throughput`). When the legacy page
-exposes no performance toggle at all (one recipe only), derive the mandatory
-pair with the maintainer — don't silently invent untested flag combinations.
-Deviations (e.g. pure GPU-budget tiers) also need maintainer sign-off. The
-MDX strategy bullets describe serving semantics in the DSv4 style (single-user
-chat / typical multi-user / batch jobs), with at most a one-line model-specific
-note — never toggle-/migration-centric explanations.
+**Strategy-set rule — the count follows the page's operating points** (ids
+always from the DeepSeek-V4 vocabulary, never model-specific ids like
+`mtp`/`no-mtp`):
+
+- **1 operating point** (a single recipe, no performance toggle) → a single
+  **`balanced`** strategy. Never invent a second recipe just to fill chips.
+- **2 operating points** → **`low-latency` + `high-throughput`** (map the
+  legacy toggle onto serving semantics: MTP on → `low-latency`; MTP off /
+  DP+EP → `high-throughput`).
+- **3 operating points** → the **full trio** (the ideal — e.g. GPU-budget
+  tiers 2/4/8).
+
+Deviations (e.g. how to name pure GPU-budget tiers) need maintainer sign-off.
+The MDX strategy bullets describe serving semantics in the DSv4 style
+(single-user chat / typical multi-user / batch jobs), with at most a one-line
+model-specific note — never toggle-/migration-centric explanations.
 
 | Family | strategies | Notes |
 |---|---|---|
@@ -102,7 +105,7 @@ note — never toggle-/migration-centric explanations.
 | Kimi-K2 | `low-latency` (tp8) / `high-throughput` (dp4+ep4) | variants = instruct/thinking; reasoning chip `hide` on instruct |
 | Kimi-K2.5, K2.6 | `low-latency` / `high-throughput` | K2.5 spec preset carries `--speculative-draft-model-path …eagle3-mla`, chip-gated to h200/b300 |
 | Qwen3.6, Qwen3-Next, Qwen3-Coder-Next | `low-latency` (MTP on, the legacy speculative toggle) / `high-throughput` (MTP off) | same pattern as the Qwen3.5 pilot |
-| Kimi-Linear, MiniMax-M2, Qwen3, Qwen3-Coder | mandatory pair still required — the legacy page has a single recipe with NO performance toggle; derive the `low-latency` / `high-throughput` split **with the maintainer** before authoring cells | no silent invented combos |
+| Kimi-Linear, MiniMax-M2, Qwen3, Qwen3-Coder | single `balanced` — one recipe, no performance toggle (rule above: 1 operating point → `balanced`) | renders as one chip |
 | MiniMax-M2.5, M2.7 | `low-latency`(2) / `balanced`(4) / `high-throughput`(8=tp8+ep8) — confirm naming, tiers are GPU budgets | Xeon (M2.7) cells under one tier only |
 | Qwen3.5 (DONE — pilot) | `low-latency` (MTP on) / `high-throughput` (MTP off) | see §5 |
 

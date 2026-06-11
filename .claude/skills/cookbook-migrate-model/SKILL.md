@@ -81,11 +81,10 @@ becomes a `strategies` entry (the Playground can't do coupled changes); a
 toggle that only adds/removes its own flags becomes a Playground axis with the
 flags baked into cells when the legacy default was ON — EXCEPT parsers:
 `--reasoning-parser`/`--tool-call-parser` are NEVER baked into cells, they are
-Playground-only (DSv4 convention). The strategy set
-defaults to the full trio `low-latency` / `balanced` / `high-throughput`;
-**`low-latency` and `high-throughput` are mandatory on every page** — a
-single-strategy page is not acceptable; include `balanced` whenever the page
-has a third operating point (see dimension-mapping.md §4).
+Playground-only (DSv4 convention). The strategy count follows the page's
+operating points: **one recipe → a single `balanced`; two → `low-latency` +
+`high-throughput`; three → the full trio (the ideal)**. Never invent a recipe
+just to fill strategy chips (see dimension-mapping.md §4).
 
 ### 3. Generate the config (codegen, then audit)
 - For >~30 cells, port the legacy `generateCommand()` into a throwaway Node

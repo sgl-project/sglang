@@ -32,7 +32,7 @@ the full contract):
 | `hardware` | `{id,label,vram,vendor}[]` | Optional. GPUs the shared `HARDWARE_CATALOG` doesn't carry (workstation / desktop / future chips, e.g. RTX PRO 6000). The engine merges these into the catalog, so a model-specific GPU is config data — **no engine-catalog edit**. Also add the id to `supportedHardware`. |
 | `variants` | `{id, label, subtitle?}[]` | 2nd-dim option list. Use `default` / single-element if the model has no variant axis. |
 | `quantizations` | `{id, label}[]` | 3rd-dim option list. |
-| `strategies` | `{id, label}[]` | 4th-dim option list. Defaults to the full trio `low-latency` / `balanced` / `high-throughput`; **`low-latency` + `high-throughput` are mandatory on every page** — drop `balanced` only when the page has no third operating point; single-strategy pages and model-specific ids (e.g. `mtp`) are not acceptable. |
+| `strategies` | `{id, label}[]` | 4th-dim option list. Canonical ids: `low-latency` / `balanced` / `high-throughput` (never model-specific ids like `mtp`). **The count follows the page's operating points**: one recipe → a single `balanced`; two → `low-latency` + `high-throughput`; three → the full trio (the ideal). Never invent a recipe just to fill chips. |
 | `nodesOptions` | `{id, label}[]` | 5th-dim option list. The `id` MUST be `single` or `multi-N` — the engine parses N from the id for `--nnodes`. |
 | `cells` | `{match, verified?, env, flags}[]` | One per supported (hw × variant × quant × strategy × nodes) combination. See §2.2. |
 | `modelNames` | `{[key]: string}` | HF slug lookup. Keys are either `hw\|variant\|quant` (most specific) or `variant\|quant` (fallback). |

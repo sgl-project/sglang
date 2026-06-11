@@ -48,8 +48,9 @@ export const config = {
     { id: "fp8",  label: "FP8"  },
     { id: "fp4",  label: "FP4"  },
   ],
-  // 4th dim. Full trio by default; low-latency + high-throughput are MANDATORY
-  // on every page — drop balanced only if there's no third operating point.
+  // 4th dim. The count follows the model's operating points: 1 recipe → a
+  // single "balanced"; 2 → low-latency + high-throughput; 3 → the full trio
+  // (the ideal). Never invent a recipe just to fill chips.
   strategies: [
     { id: "low-latency",     label: "Low-Latency"     },
     { id: "balanced",        label: "Balanced"        },
