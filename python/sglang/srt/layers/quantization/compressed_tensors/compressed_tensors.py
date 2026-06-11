@@ -451,6 +451,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_per_tensor_or_channel_weight = weight_quant.strategy in [
             QuantizationStrategy.TENSOR,
             QuantizationStrategy.CHANNEL,
+            QuantizationStrategy.BLOCK,
         ]
         if not (
             is_symmetric_weight
@@ -593,6 +594,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     return CompressedTensorsW8A16Fp8(
                         strategy=weight_quant.strategy,
                         is_static_input_scheme=not input_quant.dynamic,
+                        weight_block_size=weight_quant.block_structure,
                     )
 
             # note: input_quant can be None
@@ -601,6 +603,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return CompressedTensorsW8A16Fp8(
                     strategy=weight_quant.strategy,
                     is_static_input_scheme=is_static_input_scheme,
+                    weight_block_size=weight_quant.block_structure,
                 )
 
             if self._is_static_tensor_w8a8(weight_quant, input_quant):
@@ -715,7 +718,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return NPUCompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
             else:
                 raise NotImplementedError(
-                    f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                    "The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
                 )
         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
             if _is_npu:
@@ -723,7 +726,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
             else:
                 raise NotImplementedError(
-                    f"The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                    "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
                 )
         else:
             raise RuntimeError(
