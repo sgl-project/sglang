@@ -1589,6 +1589,7 @@ class Scheduler(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             scheduler=self,
+            drain_forward_pipeline=self.drain_forward_pipeline,
             metrics_collector=self.metrics_collector,
         )
 
@@ -3749,19 +3750,9 @@ class Scheduler(
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
 
-    def pause_generation(self, recv_req: PauseGenerationReqInput):
-        self._engine_paused = True
-
-        if recv_req.mode == "in_place":
-            # In-place pause: just set the flag and return immediately.
-            # All scheduler state (running_batch, last_batch, chunked_req,
-            # result_queue) is left untouched. On resume, the normal event
-            # loop (get_next_batch_to_run) handles last_batch merge,
-            # chunked_req cleanup, and overlap result processing through
-            # the standard code paths. This avoids duplicating batch
-            # manipulation logic and the accounting bugs that come with it.
-            return
-
+    def _drain_inflight_batches(self) -> None:
+        """Process queued overlap results and fold the last batch back into
+        the running batch, leaving the batch pipeline empty."""
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3787,6 +3778,36 @@ class Scheduler(
 
         self.last_batch = None
         self.cur_batch = None
+
+    def drain_forward_pipeline(self) -> None:
+        """Quiesce all in-flight forwards before a weight mutation.
+
+        ``pause_generation(mode="in_place")`` deliberately leaves the overlap
+        pipeline untouched, so a forward launched the iteration before the
+        pause can still be executing on ``forward_stream`` when a weight
+        update handler runs; mutating weights underneath it corrupts that
+        batch's outputs. Processing the queued overlap result waits its
+        ``copy_done`` event and flushes its tokens to clients; the device
+        synchronize then covers work on auxiliary streams (e.g. the spec-v2
+        draft ``plan_stream``).
+        """
+        self._drain_inflight_batches()
+        self.device_module.synchronize()
+
+    def pause_generation(self, recv_req: PauseGenerationReqInput):
+        self._engine_paused = True
+
+        if recv_req.mode == "in_place":
+            # In-place pause: just set the flag and return immediately.
+            # All scheduler state (running_batch, last_batch, chunked_req,
+            # result_queue) is left untouched. On resume, the normal event
+            # loop (get_next_batch_to_run) handles last_batch merge,
+            # chunked_req cleanup, and overlap result processing through
+            # the standard code paths. This avoids duplicating batch
+            # manipulation logic and the accounting bugs that come with it.
+            return
+
+        self._drain_inflight_batches()
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch()
