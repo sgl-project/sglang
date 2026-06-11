@@ -149,10 +149,11 @@ def _create_unified_radix_cache(
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     tree_components = [ComponentType.FULL]
-    if ctx.is_hybrid_swa or ctx.is_hybrid_ssm:
-        tree_components.append(
-            ComponentType.SWA if ctx.is_hybrid_swa else ComponentType.MAMBA
-        )
+    if ctx.is_hybrid_swa:
+        tree_components.append(ComponentType.SWA)
+    if ctx.is_hybrid_ssm:
+        tree_components.append(ComponentType.MAMBA)
+
     params.tree_components = tuple(tree_components)
     if use_mlx() and ctx.is_hybrid_ssm:
         from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
