@@ -108,7 +108,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
     </tr>
@@ -482,8 +482,8 @@ Hybrid attention also works with speculative decoding. The backend used for draf
 
 Constraints when combining hybrid attention with speculative decoding:
 
-- If any attention backend is `trtllm_mha`, speculative decoding supports only `--speculative-eagle-topk 1`.
-- For paged MHA backends with `--page-size > 1` and `--speculative-eagle-topk > 1`, only `flashinfer` is supported.
+- `trtllm_mha` supports `--speculative-eagle-topk > 1` on the trtllm-gen kernels (SM100/SM103); the XQA path (SM90/SM120) supports only `--speculative-eagle-topk 1`.
+- For paged MHA backends with `--page-size > 1` and `--speculative-eagle-topk > 1`, only `flashinfer` and `trtllm_mha` are supported.
 - CUDA Graph: the decode backend is always captured; the prefill backend is captured only when `--speculative-attention-mode prefill`.
 
 
