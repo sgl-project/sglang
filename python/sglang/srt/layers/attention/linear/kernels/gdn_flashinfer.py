@@ -97,7 +97,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
-        self.supports_target_verify = sm_major == 9
+        self.supports_target_verify = sm_major >= 9
 
         if sm_major == 9:
             if self._prefill_fn is None:
@@ -281,9 +281,61 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> torch.Tensor:
         if self.use_state_pool:
-            raise NotImplementedError(
-                "FlashInfer GDN MTP verify is not yet supported on SM100+."
+            # SM100 (Blackwell): bf16 state-pool MTP verify via the FlashInfer
+            # PR #3502 kernel (flashinfer.gdn_kernels.gdn_decode_bf16_state).
+            # cache_mode=none -> disable_state_update=True: the verify pass does
+            # NOT write the updated SSM state back to the persistent pool; the
+            # accepted final state is recomputed afterward by the recovery
+            # kernel (gdn_mtp_cache_mode=none).
+            if retrieve_parent_token is not None:
+                raise RuntimeError(
+                    "FlashInfer GDN verify kernel only supports topk=1 "
+                    "(retrieve_parent_token must be None)."
+                )
+            if a is None or b is None or A_log is None or dt_bias is None:
+                raise RuntimeError(
+                    "FlashInfer GDN MTP kernel requires a, b, A_log, dt_bias."
+                )
+
+            from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                gated_delta_rule_mtp as gated_delta_rule_mtp_bf16_state,
             )
+
+            seq_len = q.shape[1]
+            batch_size = query_start_loc.shape[0] - 1
+            draft_token_num = seq_len // batch_size
+            num_heads = q.shape[2]
+            head_k_dim = q.shape[3]
+            num_v_heads = v.shape[2]
+            head_v_dim = v.shape[3]
+
+            query_mtp = q.view(batch_size, draft_token_num, num_heads, head_k_dim)
+            key_mtp = k.view(batch_size, draft_token_num, num_heads, head_k_dim)
+            value_mtp = v.view(batch_size, draft_token_num, num_v_heads, head_v_dim)
+            a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
+            b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
+
+            # bf16 kernel expects: q/k/v/a/b bf16, A_log/dt_bias float32,
+            # initial_state_source bf16 pool [pool_size, HV, V, K]. Input prep
+            # mirrors decode() on SM100 so dtypes stay consistent.
+            output_fi = gated_delta_rule_mtp_bf16_state(
+                A_log=A_log.detach().float(),
+                a=a_mtp,
+                dt_bias=dt_bias.detach(),
+                q=query_mtp,
+                k=key_mtp,
+                v=value_mtp,
+                b=b_mtp,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices[:batch_size],
+                output_state_indices=None,
+                intermediate_states_buffer=None,
+                disable_state_update=True,
+                use_qk_l2norm_in_kernel=True,
+                scale=None,
+                output=None,
+            )
+            return output_fi.view(1, seq_len, num_v_heads, head_v_dim)
 
         # SM90: MTP verify using FlashInfer gated_delta_rule_mtp kernel.
         if retrieve_parent_token is not None:
