@@ -1026,23 +1026,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
         draft_input: EagleDraftInput = batch.spec_info
         bs = batch.seq_lens.shape[0]
         device = self.device
-        seq_lens_sum = (
-            batch.seq_lens_sum
-            if batch.seq_lens_sum is not None
-            else int(torch.sum(batch.seq_lens).item())
-        )
 
         retrieve_index = torch.arange(bs, dtype=torch.long, device=device).unsqueeze(1)
         retrieve_next_token = torch.full((bs, 1), -1, dtype=torch.long, device=device)
         retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
-        # FULL_MASK layout for verify: seq_lens_sum * num_verify + num_verify^2 * bs.
-        # With num_verify == 1 this collapses to seq_lens_sum + bs, all True.
-        custom_mask = torch.ones(seq_lens_sum + bs, dtype=torch.bool, device=device)
         positions = batch.seq_lens.to(torch.int64)
 
+        # With a single verify token the tree is one node, so there is no tree mask
+        # to apply (the token just attends causally to its own KV). Leaving it None
+        # avoids building the mask and the seq_lens_sum it would need -- which under
+        # fully-overlap backends (no seq_lens_cpu) would force a per-step D2H sync.
         return EagleVerifyInput(
             draft_token=draft_input.bonus_tokens,
-            custom_mask=custom_mask,
+            custom_mask=None,
             positions=positions,
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
