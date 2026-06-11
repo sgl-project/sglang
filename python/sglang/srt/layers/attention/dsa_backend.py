@@ -1079,17 +1079,14 @@ class DeepseekSparseAttnBackend(
                 page_indices, repeats=self.speculative_num_draft_tokens, dim=0
             )
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
-            seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(
-                    extend_seq_lens_cpu, dtype=torch.int32, device=self.device
-                ),
-                cache_seqlens,
-                self.speculative_num_draft_tokens * bs,
-                self.speculative_num_draft_tokens,
+            draft_tokens = self.speculative_num_draft_tokens
+            total_len = draft_tokens * bs
+            metadata.dsa_seqlens_expanded[:total_len].view(bs, draft_tokens).copy_(
+                (cache_seqlens - draft_tokens + 1).unsqueeze(1)
+                + self.get_device_int32_arange(draft_tokens).unsqueeze(0)
             )
-            metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
+            seqlens_expanded = metadata.dsa_seqlens_expanded[:total_len]
             dsa_cache_seqlens = compute_dsa_seqlens(
                 seqlens_expanded, self.dsa_index_topk
             )
@@ -1501,12 +1498,35 @@ class DeepseekSparseAttnBackend(
                     page_size=1,
                 )
 
-        # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
+            if forward_batch.forward_mode.is_target_verify():
+                num_reqs = forward_batch.req_pool_indices.shape[0]
+                num_steps = self.speculative_num_draft_tokens
+                assert (
+                    topk_indices is not None
+                ), "topk_indices is None in TARGET_VERIFY/DRAFT_EXTEND_V2"
+                assert topk_indices.shape == (
+                    num_reqs * num_steps,
+                    self.dsa_index_topk,
+                ), (
+                    f"topk_indices shape mismatch: {topk_indices.shape} vs expected "
+                    f"({num_reqs * num_steps}, {self.dsa_index_topk}), "
+                    f"forward_mode={forward_batch.forward_mode}, num_reqs={num_reqs}, num_steps={num_steps}"
+                )
+                page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+                    forward_batch.req_pool_indices,
+                    metadata.dsa_seqlens_expanded,
+                    topk_indices.view(num_reqs, num_steps, -1),
+                    layer.layer_id,
+                    token_position_space="full",
+                    num_steps=num_steps,
+                ).view(num_reqs * num_steps, -1)
+            else:
+                page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                    page_table_1
+                )
             # flash_mla_sparse_fwd / tilelang require int32 page indices.
-            page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                page_table_1
-            ).to(torch.int32)
+            page_table_1 = page_table_1.to(torch.int32)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -1665,6 +1685,7 @@ class DeepseekSparseAttnBackend(
                 forward_batch.seq_lens,
                 topk_indices,
                 layer.layer_id,
+                token_position_space="full",
             )
         elif envs.SGLANG_DSA_FUSE_TOPK.get():
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
@@ -2326,9 +2347,9 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = (
-            self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+        force_unfused = self.hisparse_coordinator is not None and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,

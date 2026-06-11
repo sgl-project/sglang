@@ -810,7 +810,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
-            if self.enable_hisparse:
+            # Init hisparse coordinator (must happen before CUDA graph capture).
+            # Only the target runner owns scheduler-populated staging state.
+            if self.enable_hisparse and not self.is_draft_worker:
                 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 

@@ -10,6 +10,8 @@ from sglang.jit_kernel.utils import load_jit, make_cpp_args
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+_HISPARSE_JIT_CACHE_VERSION = 6
+
 
 @functools.cache
 def _jit_sparse_module(
@@ -24,7 +26,13 @@ def _jit_sparse_module(
         block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
     )
     cache_args = make_cpp_args(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
+        _HISPARSE_JIT_CACHE_VERSION,
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla,
+        is_dsv4_layout,
     )
     return load_jit(
         "sparse_cache",
@@ -91,6 +99,7 @@ def _load_cache_to_device_buffer_mla(
     page_size: int,
     block_size: int,
     num_real_reqs: torch.Tensor | None,
+    num_steps: int = 1,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
@@ -128,6 +137,7 @@ def _load_cache_to_device_buffer_mla(
         num_real_reqs,
         page_size,
         item_size_bytes,
+        num_steps,
     )
 
 
@@ -148,6 +158,7 @@ def load_cache_to_device_buffer_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    num_steps: int = 1,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -168,6 +179,7 @@ def load_cache_to_device_buffer_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        num_steps=num_steps,
     )
 
 
@@ -188,6 +200,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    num_steps: int = 1,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -208,4 +221,5 @@ def load_cache_to_device_buffer_dsv4_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        num_steps=num_steps,
     )
