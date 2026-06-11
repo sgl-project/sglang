@@ -319,3 +319,55 @@ def test_all_selector_reset_shared_storage_independent_of_order():
     assert torch.equal(shared, sentinel)
     assert torch.equal(t_priv, sentinel)
     assert torch.equal(d_priv, sentinel)
+
+
+# ---------------------------------------------------------------------------
+# Action validation precedes the empty-draft-runner fast path
+# ---------------------------------------------------------------------------
+
+
+def test_draft_selector_rejects_unsupported_action_when_no_draft_runner():
+    # The empty-draft-runner fast path must NOT swallow an unsupported or deleted
+    # action (e.g. the removed "mark_reset_storage") as a success. Action is
+    # validated before the empty-runner return, so these fail and no runner runs.
+    target_runner = Mock()
+    target_runner.check_weights.side_effect = AssertionError("target must not be touched")
+    scheduler = _scheduler(
+        tp_worker=SimpleNamespace(model_runner=target_runner),
+        draft_worker=None,
+    )
+
+    for action in ("mark_reset_storage", "nonsense_action"):
+        out = _call(scheduler, action=action, selector="draft")
+        assert out.success is False, action
+        assert "Unsupported" in out.message, action
+
+    target_runner.check_weights.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# selector="draft" compare fans out only to draft runners (target excluded)
+# ---------------------------------------------------------------------------
+
+
+def test_draft_compare_scope_excludes_target_and_labels_draft():
+    # AC-3 / AC-3.1 at the scheduler fan-out level: selector="draft" compare must
+    # touch ONLY the draft runner(s); the target runner is never consulted, and a
+    # draft-side failure carries the [draft] role label.
+    target_runner = Mock()
+    target_runner.check_weights.side_effect = AssertionError(
+        "target must not be compared on a draft selection"
+    )
+    draft_runner = Mock()
+    draft_runner.check_weights.side_effect = AssertionError("draft-private stale")
+    scheduler = _scheduler(
+        tp_worker=SimpleNamespace(model_runner=target_runner),
+        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+    )
+
+    out = _call(scheduler, action="compare", selector="draft")
+
+    assert out.success is False
+    assert "[draft]" in out.message
+    draft_runner.check_weights.assert_called_once_with(action="compare")
+    target_runner.check_weights.assert_not_called()

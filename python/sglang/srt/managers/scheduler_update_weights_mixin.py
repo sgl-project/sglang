@@ -240,6 +240,18 @@ class SchedulerUpdateWeightsMixin:
                     f"invalid selector {selector!r}; expected one of target/draft/all"
                 )
 
+            # Validate the action up front: the empty-draft-runner fast path below
+            # returns without dispatching to WeightChecker.handle, so an unsupported
+            # or deleted action (e.g. the removed "mark_reset_storage") would
+            # otherwise slip through as a success on draft-only selections.
+            if recv_req.action not in (
+                "snapshot",
+                "reset_tensors",
+                "compare",
+                "checksum",
+            ):
+                raise Exception(f"Unsupported action={recv_req.action!r}")
+
             # Byte-identical fast path: the default /weights_checker payload keeps
             # its exact top-level shape ({"checksums","parallelism_info"}, no
             # "runners", target keys unprefixed).
