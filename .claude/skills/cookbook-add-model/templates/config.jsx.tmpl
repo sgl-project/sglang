@@ -108,10 +108,19 @@ sgl-eval run gsm8k \\
 
   // OPTIONAL — per-variant accuracy applied to EVERY cell of a variant (hardware-
   // independent, e.g. GPQA/AIME). Per-cell `accuracy` overrides. Keys must match
-  // ACCURACY_LABELS + benchmarkCommands.accuracy. Delete if no numbers yet.
+  // the effective accuracy labels + benchmarkCommands.accuracy. Delete if no numbers yet.
   defaultAccuracy: {
     default: { gsm8k_pct: null },
   },
+
+  // The eval set rendered in the benchmark card + "⚡ Reproduce" — the engine
+  // ships NO default; required whenever the benchmarks carry accuracy data
+  // (without it the accuracy rows silently don't render). [key, label, unit]
+  // tuples; keys must match benchmarks[].accuracy + defaultAccuracy +
+  // benchmarkCommands.accuracy. Delete only if there are no accuracy numbers.
+  accuracyLabels: [
+    ["gsm8k_pct", "GSM8K", "%"],
+  ],
 
   // OPTIONAL — `# ...` hint lines prepended to multi-node commands, ONLY for hw
   // whose fabric needs manual NIC env (e.g. gb200 NVL72/MNNVL). NOT every multi-N
