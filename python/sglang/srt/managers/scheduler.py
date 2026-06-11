@@ -1424,7 +1424,9 @@ class Scheduler(
         # DFLASH fences its shared req_to_token writes with verify_done /
         # plan-stream deps, so the global WAR barrier only serializes plan
         # overlap. TODO: generalize this global-barrier enablement policy.
-        self._war_barrier_enabled = is_cuda() and not self.spec_algorithm.is_dflash()
+        self._war_barrier_enabled = (
+            is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        ) and not self.spec_algorithm.is_dflash()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
