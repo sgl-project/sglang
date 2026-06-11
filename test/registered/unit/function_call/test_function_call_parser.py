@@ -3360,6 +3360,46 @@ class TestGlm47MoeDetector(unittest.TestCase):
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
 
+    def test_get_model_structural_tag(self):
+        """GLM-4.7/GLM-5 use xgrammar's native "glm_4_7" structural tag."""
+        import xgrammar as xgr
+
+        self.assertTrue(self.detector.supports_structural_tag())
+        self.assertEqual(self.detector.get_structural_tag_name(), "glm_4_7")
+
+        # thinking_mode=True keeps the </think> reasoning prefix.
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+        serialized = structural_tag.model_dump_json()
+        self.assertIn("glm_xml", serialized)
+        self.assertIn("<tool_call>", serialized)
+        self.assertIn("</think>", serialized)
+
+        # thinking_mode=False drops the reasoning prefix (ReasonerGrammarBackend
+        # owns </think> when --reasoning-parser is configured).
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+        self.assertNotIn("</think>", structural_tag.model_dump_json())
+
+        # tool_choice="required" must still compile to a grammar.
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=True, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        self.assertIsInstance(
+            xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
+        )
+
 
 class TestJsonArrayParser(unittest.TestCase):
     def setUp(self):
