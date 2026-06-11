@@ -14,8 +14,10 @@ from sglang.srt.layers.tilelang_gemm_wrapper.entrypoint import (
     get_candidate_configs,
     get_kernel_info,
     gemm_nt_f8f8bf16,
+    has_selected_config,
     list_available_configs,
     load_selected_configs,
+    merge_selected_configs,
     update_tilelang_config,
     warmup_or_autotune_shapes,
 )
@@ -31,9 +33,11 @@ __all__ = [
     "get_kernel_info",
     "gemm_nt_f8f8bf16",
     "get_availability_error",
+    "has_selected_config",
     "is_available",
     "list_available_configs",
     "load_selected_configs",
+    "merge_selected_configs",
     "update_tilelang_config",
     "warmup_or_autotune_shapes",
 ]

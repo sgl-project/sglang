@@ -5,12 +5,23 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
 from typing import Iterable, List
 
 import torch
 import triton
 
-from sglang.srt.layers.tilelang_gemm_wrapper.configs import KERNEL_TYPES
+from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
+    AUTOTUNE_SEARCH_POLICIES,
+    KERNEL_TYPES,
+    SelectedConfigStore,
+    write_selected_config_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +33,7 @@ def _tflops(M: int, N: int, K: int, latency_ms: float) -> float:
 def _do_bench(fn, rep: int, backend: str) -> float:
     quantiles = [0.5, 0.2, 0.8]
     if backend == "cudagraph":
-        result = triton.testing.do_bench_cudagraph(
-            fn, rep=rep, quantiles=quantiles
-        )
+        result = triton.testing.do_bench_cudagraph(fn, rep=rep, quantiles=quantiles)
     elif backend == "event":
         result = triton.testing.do_bench(fn, rep=rep, quantiles=quantiles)
     else:
@@ -40,9 +49,7 @@ def _per_block_cast_to_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     M, N = x.shape
     padded_m = triton.cdiv(M, 128) * 128
     padded_n = triton.cdiv(N, 128) * 128
-    x_padded = torch.zeros(
-        (padded_m, padded_n), dtype=x.dtype, device=x.device
-    )
+    x_padded = torch.zeros((padded_m, padded_n), dtype=x.dtype, device=x.device)
     x_padded[:M, :N] = x
     x_view = x_padded.view(padded_m // 128, 128, padded_n // 128, 128)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
@@ -53,7 +60,9 @@ def _per_block_cast_to_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
 
 
 def _prepare_data(M: int, N: int, K: int):
-    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
 
     A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
@@ -77,20 +86,44 @@ def _benchmark_one(
     autotune_rep: int,
     autotune_max_configs: int | None,
     kernel_types: list[str] | None,
+    autotune_policy: str,
+    checkpoint_config_path: str | None,
 ) -> dict:
     from sglang.srt.layers import tilelang_gemm_wrapper
 
     if autotune:
-        tilelang_gemm_wrapper.autotune_shape(
-            M,
-            N,
-            K,
-            warmup=autotune_warmup,
-            rep=autotune_rep,
-            backend=autotune_backend,
-            max_configs=autotune_max_configs,
-            kernel_types=kernel_types,
-        )
+        if tilelang_gemm_wrapper.has_selected_config(M, N, K):
+            logger.info(
+                "Skipping TileLang FP8 GEMM autotune for M=%s, N=%s, K=%s; "
+                "selected config already exists.",
+                M,
+                N,
+                K,
+            )
+        else:
+            tilelang_gemm_wrapper.autotune_shape(
+                M,
+                N,
+                K,
+                warmup=autotune_warmup,
+                rep=autotune_rep,
+                backend=autotune_backend,
+                max_configs=autotune_max_configs,
+                kernel_types=kernel_types,
+                search_policy=autotune_policy,
+            )
+        if checkpoint_config_path:
+            tilelang_gemm_wrapper.export_selected_configs(
+                checkpoint_config_path,
+                metadata=_autotune_metadata(
+                    autotune_backend,
+                    autotune_policy,
+                    autotune_warmup,
+                    autotune_rep,
+                    autotune_max_configs,
+                    kernel_types,
+                ),
+            )
 
     A_fp8, A_scale, B_fp8, B_scale = _prepare_data(M, N, K)
     C_tl = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
@@ -165,6 +198,213 @@ def _parse_shape_values(values: Iterable[str]) -> list[tuple[int, int]]:
     return shapes
 
 
+def _concrete_shapes(
+    nk_shapes: Iterable[tuple[int, int]], m_values: Iterable[int]
+) -> list[tuple[int, int, int]]:
+    return [(M, N, K) for N, K in nk_shapes for M in m_values]
+
+
+def _autotune_metadata(
+    autotune_backend: str,
+    autotune_policy: str,
+    autotune_warmup: int,
+    autotune_rep: int,
+    autotune_max_configs: int | None,
+    kernel_types: list[str] | None,
+) -> dict:
+    return {
+        "autotune_backend": autotune_backend,
+        "autotune_search_policy": autotune_policy,
+        "autotune_warmup": autotune_warmup,
+        "autotune_rep": autotune_rep,
+        "autotune_max_configs": autotune_max_configs,
+        "autotune_kernel_types": kernel_types,
+    }
+
+
+def _parse_gpus(value: str) -> list[str]:
+    gpus = [item.strip() for item in value.split(",") if item.strip()]
+    if not gpus:
+        raise ValueError("--gpus must contain at least one GPU id")
+    return gpus
+
+
+def _shape_label(M: int, N: int, K: int) -> str:
+    return f"M{M}_N{N}_K{K}"
+
+
+def _load_optional_store(paths: Iterable[str | None]) -> SelectedConfigStore:
+    store = SelectedConfigStore()
+    for path in paths:
+        if not path:
+            continue
+        if not os.path.exists(path):
+            continue
+        store.update(SelectedConfigStore.from_path(path))
+    return store
+
+
+def _tail(path: Path, max_chars: int = 4000) -> str:
+    try:
+        text = path.read_text(errors="replace")
+    except FileNotFoundError:
+        return ""
+    return text[-max_chars:]
+
+
+def _parallel_autotune(
+    args: argparse.Namespace, shapes: list[tuple[int, int, int]]
+) -> str:
+    gpus = _parse_gpus(args.gpus)
+    work_dir = Path(
+        tempfile.mkdtemp(
+            prefix="tilelang-autotune-", dir=os.environ.get("TMPDIR", "/tmp")
+        )
+    )
+    checkpoint_path = (
+        args.checkpoint_config_path
+        or args.export_config_path
+        or str(work_dir / "selected_configs.json")
+    )
+    metadata = _autotune_metadata(
+        args.autotune_backend,
+        args.autotune_policy,
+        args.autotune_warmup,
+        args.autotune_rep,
+        args.autotune_max_configs,
+        args.kernel_type,
+    )
+
+    store = _load_optional_store(
+        (args.config_path, args.resume_config_path, args.checkpoint_config_path)
+    )
+    pending = [
+        shape
+        for shape in shapes
+        if store.get_exact(shape[0], shape[1], shape[2]) is None
+    ]
+    if store.as_list():
+        write_selected_config_file(checkpoint_path, store.as_list(), metadata=metadata)
+
+    logger.info(
+        "Parallel TileLang autotune: %s pending shapes, %s already available, GPUs=%s",
+        len(pending),
+        len(shapes) - len(pending),
+        ",".join(gpus),
+    )
+
+    script = Path(__file__).resolve()
+    free_gpus = list(gpus)
+    running = []
+    failures = []
+
+    def launch(gpu: str, shape: tuple[int, int, int]) -> None:
+        M, N, K = shape
+        label = _shape_label(M, N, K)
+        child_config_path = work_dir / f"{label}.json"
+        log_path = work_dir / f"{label}.log"
+        cmd = [
+            sys.executable,
+            str(script),
+            "--shape",
+            f"{N},{K}",
+            "--m-values",
+            str(M),
+            "--autotune",
+            "--autotune-only",
+            "--autotune-backend",
+            args.autotune_backend,
+            "--autotune-policy",
+            args.autotune_policy,
+            "--autotune-warmup",
+            str(args.autotune_warmup),
+            "--autotune-rep",
+            str(args.autotune_rep),
+            "--export-config-path",
+            str(child_config_path),
+        ]
+        if args.autotune_max_configs is not None:
+            cmd.extend(["--autotune-max-configs", str(args.autotune_max_configs)])
+        for kernel_type in args.kernel_type or []:
+            cmd.extend(["--kernel-type", kernel_type])
+        if args.verbose:
+            cmd.append("--verbose")
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu
+        log_file = log_path.open("w")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=os.getcwd(),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        running.append(
+            {
+                "proc": proc,
+                "shape": shape,
+                "gpu": gpu,
+                "config_path": child_config_path,
+                "log_path": log_path,
+                "log_file": log_file,
+            }
+        )
+        logger.info("Launched TileLang autotune %s on GPU %s", label, gpu)
+
+    while pending or running:
+        while pending and free_gpus:
+            launch(free_gpus.pop(0), pending.pop(0))
+
+        time.sleep(1.0)
+        for item in list(running):
+            proc = item["proc"]
+            return_code = proc.poll()
+            if return_code is None:
+                continue
+
+            running.remove(item)
+            item["log_file"].close()
+            free_gpus.append(item["gpu"])
+            M, N, K = item["shape"]
+            label = _shape_label(M, N, K)
+            if return_code != 0:
+                failures.append((label, item["log_path"], return_code))
+                logger.error(
+                    "TileLang autotune %s failed with return code %s. Log: %s",
+                    label,
+                    return_code,
+                    item["log_path"],
+                )
+                continue
+
+            store.update(SelectedConfigStore.from_file(str(item["config_path"])))
+            write_selected_config_file(
+                checkpoint_path, store.as_list(), metadata=metadata
+            )
+            logger.info(
+                "TileLang autotune %s finished; checkpoint now has %s configs at %s",
+                label,
+                len(store.as_list()),
+                checkpoint_path,
+            )
+
+    if failures:
+        messages = []
+        for label, log_path, return_code in failures:
+            messages.append(
+                f"{label} failed with return code {return_code}. Log tail:\n"
+                f"{_tail(log_path)}"
+            )
+        raise RuntimeError("\n\n".join(messages))
+
+    if args.export_config_path and args.export_config_path != checkpoint_path:
+        write_selected_config_file(
+            args.export_config_path, store.as_list(), metadata=metadata
+        )
+    return checkpoint_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shape", action="append", required=True, help="N,K shape")
@@ -176,7 +416,17 @@ def main() -> None:
     )
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument("--config-path", help="Selected-config JSON file or directory")
-    parser.add_argument("--export-config-path", help="Export selected configs after benchmark")
+    parser.add_argument(
+        "--export-config-path", help="Export selected configs after benchmark"
+    )
+    parser.add_argument(
+        "--checkpoint-config-path",
+        help="Incrementally write selected configs after each tuned shape",
+    )
+    parser.add_argument(
+        "--resume-config-path",
+        help="Load selected configs and skip exact shapes that are already tuned",
+    )
     parser.add_argument("--output", "-o", help="CSV output path")
     parser.add_argument(
         "--bench-backend",
@@ -196,9 +446,27 @@ def main() -> None:
         choices=("event", "cupti", "cudagraph"),
         help="TileLang profiler backend to use while autotuning",
     )
+    parser.add_argument(
+        "--autotune-policy",
+        default="family_pruned",
+        choices=AUTOTUNE_SEARCH_POLICIES,
+        help="Candidate search policy to use while autotuning",
+    )
     parser.add_argument("--autotune-warmup", type=int, default=25)
     parser.add_argument("--autotune-rep", type=int, default=100)
     parser.add_argument("--autotune-max-configs", type=int)
+    parser.add_argument(
+        "--autotune-only",
+        action="store_true",
+        help="Tune/export selected configs without running final benchmarks",
+    )
+    parser.add_argument(
+        "--gpus",
+        help=(
+            "Comma-separated GPU ids for parallel autotune. Each concrete "
+            "(M,N,K) shape is tuned in a separate worker process."
+        ),
+    )
     parser.add_argument(
         "--kernel-type",
         action="append",
@@ -217,9 +485,56 @@ def main() -> None:
 
     if args.config_path:
         tilelang_gemm_wrapper.load_selected_configs(args.config_path)
+    if args.resume_config_path:
+        tilelang_gemm_wrapper.merge_selected_configs(args.resume_config_path)
+    if args.checkpoint_config_path and os.path.exists(args.checkpoint_config_path):
+        tilelang_gemm_wrapper.merge_selected_configs(args.checkpoint_config_path)
+
+    nk_shapes = _parse_shape_values(args.shape)
+    concrete_shapes = _concrete_shapes(nk_shapes, args.m_values)
+
+    if args.gpus and args.autotune:
+        config_path = _parallel_autotune(args, concrete_shapes)
+        if args.autotune_only:
+            return
+        tilelang_gemm_wrapper.load_selected_configs(config_path)
+        args.autotune = False
+
+    if args.autotune_only:
+        tilelang_gemm_wrapper.autotune_shapes(
+            concrete_shapes,
+            warmup=args.autotune_warmup,
+            rep=args.autotune_rep,
+            backend=args.autotune_backend,
+            kernel_types=args.kernel_type,
+            max_configs=args.autotune_max_configs,
+            search_policy=args.autotune_policy,
+            checkpoint_config_path=args.checkpoint_config_path,
+            export_metadata=_autotune_metadata(
+                args.autotune_backend,
+                args.autotune_policy,
+                args.autotune_warmup,
+                args.autotune_rep,
+                args.autotune_max_configs,
+                args.kernel_type,
+            ),
+        )
+        if args.export_config_path:
+            tilelang_gemm_wrapper.export_selected_configs(
+                args.export_config_path,
+                metadata=_autotune_metadata(
+                    args.autotune_backend,
+                    args.autotune_policy,
+                    args.autotune_warmup,
+                    args.autotune_rep,
+                    args.autotune_max_configs,
+                    args.kernel_type,
+                ),
+            )
+        return
 
     rows = []
-    for N, K in _parse_shape_values(args.shape):
+    for N, K in nk_shapes:
         for M in args.m_values:
             logger.info("Benchmarking M=%s, N=%s, K=%s", M, N, K)
             row = _benchmark_one(
@@ -235,6 +550,8 @@ def main() -> None:
                 args.autotune_rep,
                 args.autotune_max_configs,
                 args.kernel_type,
+                args.autotune_policy,
+                args.checkpoint_config_path,
             )
             rows.append(row)
             logger.info("%s", row)
@@ -243,7 +560,17 @@ def main() -> None:
         _write_csv(args.output, rows)
 
     if args.export_config_path:
-        tilelang_gemm_wrapper.export_selected_configs(args.export_config_path)
+        tilelang_gemm_wrapper.export_selected_configs(
+            args.export_config_path,
+            metadata=_autotune_metadata(
+                args.autotune_backend,
+                args.autotune_policy,
+                args.autotune_warmup,
+                args.autotune_rep,
+                args.autotune_max_configs,
+                args.kernel_type,
+            ),
+        )
 
 
 if __name__ == "__main__":

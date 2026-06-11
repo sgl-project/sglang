@@ -133,6 +133,8 @@ Autotuning can be enabled explicitly in tooling, or with
 `SGLANG_TILELANG_GEMM_AUTOTUNE=1` for precompile paths. The default profiling
 backend is `SGLANG_TILELANG_GEMM_AUTOTUNE_BACKEND=cudagraph`; this keeps
 small-`M` measurements aligned with decode-time CUDA graph execution.
+The default search policy is
+`SGLANG_TILELANG_GEMM_AUTOTUNE_POLICY=family_pruned`.
 
 ### Autotuning And Cache
 
@@ -153,6 +155,47 @@ should:
 
 The old JSON configs can be used as seed data or benchmark references, but they
 should not be required for correctness.
+
+The tuning path supports three search policies:
+
+- `full`: exhaustive search across all legal kernel families and parameters.
+  This is useful for offline exploration, but it can be too slow for routine
+  model config generation.
+- `family_pruned`: select kernel families from the concrete shape before
+  tuning. Current SM89/SM90 rules use `swapAB` for small-`M` large-`N`
+  decode shapes, `splitK_swapAB` for small-`M` `N=1024`/large-`K` decode
+  shapes, and `base` for `M >= 128`.
+- `fast_sm90`: use the same family pruning and also restrict each family to
+  the parameter ranges that have been validated on H20/SM90. This is intended
+  for reproducible CI benchmark config generation, not for discovering new
+  kernel families.
+
+Long autotune jobs should use checkpoint and resume paths so selected configs
+are not lost if a later shape is slow or fails:
+
+```bash
+python3 benchmark/kernels/tilelang_gemm/benchmark_tilelang_gemm.py \
+  --shape 4096,1024 --shape 1024,2048 \
+  --m-values 1 16 128 512 \
+  --autotune --autotune-policy fast_sm90 \
+  --checkpoint-config-path /tmp/tilelang_sm90_checkpoint.json \
+  --export-config-path /tmp/tilelang_sm90_selected.json
+```
+
+The benchmark tool can distribute autotune across multiple GPUs. Each concrete
+`(M, N, K)` shape runs in its own process with a single visible GPU, and the
+parent process merges per-shape configs into the checkpoint as soon as workers
+finish:
+
+```bash
+python3 benchmark/kernels/tilelang_gemm/benchmark_tilelang_gemm.py \
+  --shape 4096,1024 --shape 1024,2048 --shape 6144,1024 --shape 1024,3072 \
+  --m-values 1 16 128 512 \
+  --autotune --autotune-policy fast_sm90 --gpus 0,1,2,3,4,5,6,7 \
+  --checkpoint-config-path /tmp/tilelang_sm90_checkpoint.json \
+  --export-config-path /tmp/tilelang_sm90_selected.json \
+  --output /tmp/tilelang_sm90_benchmark.csv
+```
 
 ### Precompile
 

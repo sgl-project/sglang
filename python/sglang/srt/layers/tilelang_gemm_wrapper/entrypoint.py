@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, Iterable, Literal, Optional, Tuple
@@ -12,13 +11,14 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.tilelang_gemm_wrapper.configurer import assert_available
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
+    AUTOTUNE_SEARCH_POLICIES,
     KERNEL_TYPES,
-    SCHEMA_VERSION,
     SPLIT_K_KERNEL_TYPES,
     SWAP_AB_KERNEL_TYPES,
     SelectedConfigStore,
     default_config,
     generate_candidate_configs,
+    write_selected_config_file,
 )
 
 if TYPE_CHECKING:
@@ -34,6 +34,7 @@ _CONFIG_STORE = SelectedConfigStore()
 _CONFIG_PATH_LOADED: Optional[str] = None
 _AUTOTUNE_BACKENDS = ("event", "cupti", "cudagraph")
 _AUTOTUNE_BACKEND = Literal["event", "cupti", "cudagraph"]
+_AUTOTUNE_SEARCH_POLICY = Literal["full", "family_pruned", "fast_sm90"]
 
 
 def update_tilelang_config(gpu_id: int, server_args: "ServerArgs") -> None:
@@ -69,9 +70,26 @@ def load_selected_configs(path: str) -> None:
 
     _CONFIG_STORE = SelectedConfigStore.from_path(path)
     _CONFIG_PATH_LOADED = path
+    _SELECTED_CONFIGS.clear()
+    for config in _CONFIG_STORE.as_list():
+        _record_selected_config(config)
     logger.info(
         "Loaded %s TileLang FP8 GEMM selected configs from %s",
         len(_CONFIG_STORE.as_list()),
+        path,
+    )
+
+
+def merge_selected_configs(path: str) -> None:
+    """Merge selected configs into the current store without clearing it."""
+
+    store = SelectedConfigStore.from_path(path)
+    _CONFIG_STORE.update(store)
+    for config in store.as_list():
+        _record_selected_config(config)
+    logger.info(
+        "Merged %s TileLang FP8 GEMM selected configs from %s",
+        len(store.as_list()),
         path,
     )
 
@@ -233,6 +251,15 @@ def _validate_autotune_backend(backend: str) -> _AUTOTUNE_BACKEND:
     return backend  # type: ignore[return-value]
 
 
+def _validate_search_policy(search_policy: str) -> _AUTOTUNE_SEARCH_POLICY:
+    if search_policy not in AUTOTUNE_SEARCH_POLICIES:
+        raise ValueError(
+            "TileLang FP8 GEMM autotune search_policy must be one of "
+            f"{AUTOTUNE_SEARCH_POLICIES}, got {search_policy}."
+        )
+    return search_policy  # type: ignore[return-value]
+
+
 def _make_autotune_inputs(M: int, N: int, K: int) -> tuple[torch.Tensor, ...]:
     A_fp8 = torch.empty((M, K), dtype=torch.float8_e4m3fn, device="cuda")
     A_scale = torch.ones(
@@ -307,6 +334,7 @@ def autotune_shape(
     backend: str = "cudagraph",
     kernel_types: Optional[Iterable[str]] = None,
     max_configs: Optional[int] = None,
+    search_policy: str = "family_pruned",
 ) -> dict:
     """Tune one concrete shape with TileLang's profiler.
 
@@ -318,7 +346,8 @@ def autotune_shape(
     assert_available()
 
     profile_backend = _validate_autotune_backend(backend)
-    candidates = generate_candidate_configs(M, N, K, kernel_types)
+    policy = _validate_search_policy(search_policy)
+    candidates = generate_candidate_configs(M, N, K, kernel_types, policy)
     if max_configs is not None and max_configs > 0:
         candidates = candidates[:max_configs]
     if not candidates:
@@ -328,12 +357,13 @@ def autotune_shape(
 
     logger.info(
         "Autotuning TileLang FP8 GEMM shape M=%s, N=%s, K=%s with %s configs "
-        "using %s profiler backend",
+        "using %s profiler backend and %s search policy",
         M,
         N,
         K,
         len(candidates),
         profile_backend,
+        policy,
     )
 
     inputs = _make_autotune_inputs(M, N, K)
@@ -378,6 +408,7 @@ def autotune_shape(
         {
             "tuned_latency_ms": best_latency_ms,
             "tuned_profiler_backend": profile_backend,
+            "tuned_search_policy": policy,
             "tuned_warmup": warmup,
             "tuned_rep": rep,
         }
@@ -404,14 +435,39 @@ def autotune_shapes(
     backend: str = "cudagraph",
     kernel_types: Optional[Iterable[str]] = None,
     max_configs: Optional[int] = None,
+    search_policy: str = "family_pruned",
+    checkpoint_config_path: Optional[str] = None,
+    resume_config_path: Optional[str] = None,
+    export_metadata: Optional[dict] = None,
 ) -> list[dict]:
     """Tune concrete (M, N, K) shapes and return selected configs."""
 
     if not _DO_COMPILE:
         return []
 
+    if resume_config_path:
+        merge_selected_configs(resume_config_path)
+    if checkpoint_config_path:
+        try:
+            merge_selected_configs(checkpoint_config_path)
+        except FileNotFoundError:
+            pass
+
     selected = []
     for M, N, K in shapes:
+        existing_config = _CONFIG_STORE.get_exact(M, N, K)
+        if existing_config is not None:
+            logger.info(
+                "Skipping TileLang FP8 GEMM autotune for M=%s, N=%s, K=%s; "
+                "selected config already exists.",
+                M,
+                N,
+                K,
+            )
+            _record_selected_config(existing_config)
+            selected.append(existing_config)
+            continue
+
         selected.append(
             autotune_shape(
                 M,
@@ -422,8 +478,11 @@ def autotune_shapes(
                 backend=backend,
                 kernel_types=kernel_types,
                 max_configs=max_configs,
+                search_policy=search_policy,
             )
         )
+        if checkpoint_config_path:
+            export_selected_configs(checkpoint_config_path, metadata=export_metadata)
     return selected
 
 
@@ -476,6 +535,9 @@ def warmup_or_autotune_shapes(
     backend: Optional[str] = None,
     kernel_types: Optional[Iterable[str]] = None,
     max_configs: Optional[int] = None,
+    search_policy: Optional[str] = None,
+    checkpoint_config_path: Optional[str] = None,
+    resume_config_path: Optional[str] = None,
 ) -> None:
     """Compile kernels for concrete (M, N, K) shapes on the compile rank.
 
@@ -492,6 +554,8 @@ def warmup_or_autotune_shapes(
         autotune = envs.SGLANG_TILELANG_GEMM_AUTOTUNE.get()
     if backend is None:
         backend = envs.SGLANG_TILELANG_GEMM_AUTOTUNE_BACKEND.get()
+    if search_policy is None:
+        search_policy = envs.SGLANG_TILELANG_GEMM_AUTOTUNE_POLICY.get()
     if max_configs is None:
         env_max_configs = envs.SGLANG_TILELANG_GEMM_AUTOTUNE_MAX_CONFIGS.get()
         max_configs = env_max_configs if env_max_configs > 0 else None
@@ -504,6 +568,17 @@ def warmup_or_autotune_shapes(
             backend=backend,
             kernel_types=kernel_types,
             max_configs=max_configs,
+            search_policy=search_policy,
+            checkpoint_config_path=checkpoint_config_path,
+            resume_config_path=resume_config_path,
+            export_metadata={
+                "autotune_backend": backend,
+                "autotune_search_policy": search_policy,
+                "autotune_warmup": warmup,
+                "autotune_rep": rep,
+                "autotune_kernel_types": list(kernel_types) if kernel_types else None,
+                "autotune_max_configs": max_configs,
+            },
         )
         return
 
@@ -515,11 +590,22 @@ def warmup_or_autotune_shapes(
 
 
 def get_candidate_configs(
-    M: int, N: int, K: int, kernel_types: Optional[Iterable[str]] = None
+    M: int,
+    N: int,
+    K: int,
+    kernel_types: Optional[Iterable[str]] = None,
+    search_policy: str = "full",
 ) -> list[dict]:
     """Return legal configs for benchmark/autotune tooling."""
 
-    return generate_candidate_configs(M, N, K, kernel_types)
+    return generate_candidate_configs(M, N, K, kernel_types, search_policy)
+
+
+def has_selected_config(M: int, N: int, K: int) -> bool:
+    """Return whether an exact selected config is loaded for this shape."""
+
+    _ensure_selected_configs_loaded()
+    return _CONFIG_STORE.get_exact(M, N, K) is not None
 
 
 def get_kernel_info(M: int, N: int, K: int) -> dict:
@@ -537,17 +623,14 @@ def list_available_configs() -> list[Tuple[int, int]]:
     return sorted(_CONFIG_STORE.configs_by_nk)
 
 
-def export_selected_configs(path: str) -> None:
+def export_selected_configs(path: str, metadata: Optional[dict] = None) -> None:
     """Export selected configs for reproducible benchmark runs."""
 
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "backend": "tilelang_fp8_gemm",
-        "configs": [v for _, v in sorted(_SELECTED_CONFIGS.items())],
-    }
-    with open(path, "w") as fout:
-        json.dump(payload, fout, indent=2)
-        fout.write("\n")
+    write_selected_config_file(
+        path,
+        [v for _, v in sorted(_SELECTED_CONFIGS.items())],
+        metadata=metadata,
+    )
 
 
 def clear_cache() -> None:

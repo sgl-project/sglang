@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 KERNEL_TYPES = ("base", "swapAB", "splitK", "splitK_swapAB")
 SPLIT_K_KERNEL_TYPES = {"splitK", "splitK_swapAB"}
 SWAP_AB_KERNEL_TYPES = {"swapAB", "splitK_swapAB"}
+AUTOTUNE_SEARCH_POLICIES = ("full", "family_pruned", "fast_sm90")
 SCHEMA_VERSION = 1
 
 DEFAULT_M_VALUES = [
@@ -136,13 +137,83 @@ def _matmul_splitk_configs(M: int, N: int, K: int) -> List[dict]:
     return configs
 
 
+def _validate_search_policy(search_policy: str) -> str:
+    if search_policy not in AUTOTUNE_SEARCH_POLICIES:
+        raise ValueError(
+            "TileLang FP8 GEMM autotune search_policy must be one of "
+            f"{AUTOTUNE_SEARCH_POLICIES}, got {search_policy}."
+        )
+    return search_policy
+
+
+def _pruned_kernel_types(M: int, N: int, K: int) -> Tuple[str, ...]:
+    """Return a shape-specialized family shortlist for SM89/SM90 autotuning."""
+
+    if M >= 128:
+        return ("base",)
+    if M <= 32:
+        if N <= 2048 and K >= 2048:
+            return ("splitK_swapAB",)
+        if K <= 2048:
+            return ("swapAB",)
+        return ("swapAB", "splitK_swapAB")
+    return ("base", "splitK")
+
+
+def _select_kernel_types(
+    M: int,
+    N: int,
+    K: int,
+    search_policy: str,
+    kernel_types: Optional[Iterable[str]],
+) -> Tuple[str, ...]:
+    requested = tuple(kernel_types) if kernel_types is not None else None
+    if requested is not None:
+        return requested
+    if search_policy == "full":
+        return KERNEL_TYPES
+    return _pruned_kernel_types(M, N, K)
+
+
+def _fast_sm90_candidate_filter(config: dict) -> bool:
+    """Aggressive SM90 shortlist learned from H20 TileLang 0.1.9 tuning runs."""
+
+    kernel_type = config["kernel_type"]
+    if config["block_M"] != 64 or config["block_K"] != 128:
+        return False
+    if config["threads"] != 128 or not config["c_scale_local"]:
+        return False
+
+    if kernel_type == "base":
+        return config["block_N"] in (16, 32, 64) and config["num_stages"] in (2, 4)
+    if kernel_type == "swapAB":
+        return config["block_N"] == 16 and config["num_stages"] in (2, 4)
+    if kernel_type == "splitK_swapAB":
+        return (
+            config["block_N"] == 16
+            and config["num_stages"] == 2
+            and config["split_k"] in (4, 8)
+        )
+    if kernel_type == "splitK":
+        return (
+            config["block_N"] in (16, 32)
+            and config["num_stages"] in (1, 2)
+            and config["split_k"] in (2, 4, 8)
+        )
+    return False
+
+
 def generate_candidate_configs(
-    M: int, N: int, K: int, kernel_types: Optional[Iterable[str]] = None
+    M: int,
+    N: int,
+    K: int,
+    kernel_types: Optional[Iterable[str]] = None,
+    search_policy: str = "full",
 ) -> List[dict]:
     """Generate the legal TileLang FP8 GEMM config space for one shape."""
 
-    if kernel_types is None:
-        kernel_types = KERNEL_TYPES
+    search_policy = _validate_search_policy(search_policy)
+    kernel_types = _select_kernel_types(M, N, K, search_policy, kernel_types)
 
     configs = []
     for kernel_type in kernel_types:
@@ -161,7 +232,9 @@ def generate_candidate_configs(
             if kernel_type in SPLIT_K_KERNEL_TYPES
             else _matmul_configs(M, N, K)
         )
-        scale_key = "b_scale_shm" if kernel_type in SWAP_AB_KERNEL_TYPES else "a_scale_shm"
+        scale_key = (
+            "b_scale_shm" if kernel_type in SWAP_AB_KERNEL_TYPES else "a_scale_shm"
+        )
 
         for base in base_configs:
             for c_scale_local in (False, True):
@@ -175,6 +248,9 @@ def generate_candidate_configs(
                         "accum_dtype": "float32",
                     }
                     configs.append(normalize_config(candidate, M, N, K))
+
+    if search_policy == "fast_sm90":
+        configs = [config for config in configs if _fast_sm90_candidate_filter(config)]
 
     return configs
 
@@ -193,6 +269,12 @@ class SelectedConfigStore:
     def update(self, other: "SelectedConfigStore") -> None:
         for config in other.as_list():
             self.add(config)
+
+    def get_exact(self, M: int, N: int, K: int) -> Optional[dict]:
+        configs = self.configs_by_nk.get((N, K))
+        if not configs or M not in configs:
+            return None
+        return dict(configs[M])
 
     def select(self, M: int, N: int, K: int) -> dict:
         configs = self.configs_by_nk.get((N, K))
@@ -249,3 +331,34 @@ class SelectedConfigStore:
                 store.update(cls.from_file(os.path.join(path, filename)))
             return store
         return cls.from_file(path)
+
+
+def selected_config_payload(
+    configs: Iterable[dict],
+    metadata: Optional[dict] = None,
+) -> dict:
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "backend": "tilelang_fp8_gemm",
+        "configs": list(configs),
+    }
+    if metadata:
+        payload["metadata"] = metadata
+    return payload
+
+
+def write_selected_config_file(
+    path: str,
+    configs: Iterable[dict],
+    metadata: Optional[dict] = None,
+) -> None:
+    """Atomically write selected configs in the current export schema."""
+
+    payload = selected_config_payload(configs, metadata)
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = os.path.join(directory, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    with open(tmp_path, "w") as fout:
+        json.dump(payload, fout, indent=2)
+        fout.write("\n")
+    os.replace(tmp_path, path)

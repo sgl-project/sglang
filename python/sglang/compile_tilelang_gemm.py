@@ -12,6 +12,7 @@ import sys
 from typing import Iterable, Set, Tuple
 
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
+    AUTOTUNE_SEARCH_POLICIES,
     DEFAULT_M_VALUES,
     KERNEL_TYPES,
 )
@@ -72,10 +73,13 @@ def warmup_tilelang_shapes(
     export_config_path: str | None = None,
     autotune: bool = False,
     autotune_backend: str = "cudagraph",
+    autotune_policy: str = "family_pruned",
     autotune_warmup: int = 25,
     autotune_rep: int = 100,
     autotune_max_configs: int | None = None,
     kernel_types: Iterable[str] | None = None,
+    checkpoint_config_path: str | None = None,
+    resume_config_path: str | None = None,
 ) -> None:
     from sglang.srt.layers import tilelang_gemm_wrapper
 
@@ -96,10 +100,24 @@ def warmup_tilelang_shapes(
         backend=autotune_backend,
         max_configs=autotune_max_configs,
         kernel_types=kernel_types,
+        search_policy=autotune_policy,
+        checkpoint_config_path=checkpoint_config_path,
+        resume_config_path=resume_config_path,
     )
 
     if export_config_path:
-        tilelang_gemm_wrapper.export_selected_configs(export_config_path)
+        tilelang_gemm_wrapper.export_selected_configs(
+            export_config_path,
+            metadata={
+                "autotune": autotune,
+                "autotune_backend": autotune_backend,
+                "autotune_search_policy": autotune_policy,
+                "autotune_warmup": autotune_warmup,
+                "autotune_rep": autotune_rep,
+                "autotune_max_configs": autotune_max_configs,
+                "autotune_kernel_types": list(kernel_types) if kernel_types else None,
+            },
+        )
         logger.info("Exported selected TileLang configs to %s", export_config_path)
 
 
@@ -137,6 +155,12 @@ def main() -> None:
         help="TileLang profiler backend to use while autotuning",
     )
     parser.add_argument(
+        "--autotune-policy",
+        default="family_pruned",
+        choices=AUTOTUNE_SEARCH_POLICIES,
+        help="Candidate search policy to use while autotuning",
+    )
+    parser.add_argument(
         "--autotune-warmup",
         type=int,
         default=25,
@@ -158,6 +182,14 @@ def main() -> None:
         action="append",
         choices=KERNEL_TYPES,
         help="Restrict autotuning to one or more kernel families",
+    )
+    parser.add_argument(
+        "--checkpoint-config-path",
+        help="Incrementally write selected configs after each tuned shape",
+    )
+    parser.add_argument(
+        "--resume-config-path",
+        help="Load selected configs and skip exact shapes that are already tuned",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
@@ -189,10 +221,13 @@ def main() -> None:
         export_config_path=args.export_config_path,
         autotune=args.autotune,
         autotune_backend=args.autotune_backend,
+        autotune_policy=args.autotune_policy,
         autotune_warmup=args.autotune_warmup,
         autotune_rep=args.autotune_rep,
         autotune_max_configs=args.autotune_max_configs,
         kernel_types=args.kernel_type,
+        checkpoint_config_path=args.checkpoint_config_path,
+        resume_config_path=args.resume_config_path,
     )
 
 
