@@ -32,9 +32,7 @@ NUM_VERIFY_TOKENS_RANGE = get_benchmark_range(
     full_range=[1, 4, 8],
     ci_range=[8],
 )
-BENCHMARK_CONFIGS = list(
-    itertools.product(BATCH_SIZE_RANGE, NUM_VERIFY_TOKENS_RANGE)
-)
+BENCHMARK_CONFIGS = list(itertools.product(BATCH_SIZE_RANGE, NUM_VERIFY_TOKENS_RANGE))
 
 
 @dataclass
@@ -66,7 +64,9 @@ def make_seq_lens(batch_size: int, num_verify_tokens: int) -> torch.Tensor:
     return seq_lens.to(device=DEFAULT_DEVICE)
 
 
-def make_req_to_token(batch_size: int, max_seq_len: int, num_chunks: int) -> torch.Tensor:
+def make_req_to_token(
+    batch_size: int, max_seq_len: int, num_chunks: int
+) -> torch.Tensor:
     chunk_ids = torch.arange(max_seq_len, dtype=torch.int32) // SWA_PAGE_SIZE
     req_offsets = torch.arange(batch_size, dtype=torch.int32).unsqueeze(1) * num_chunks
     req_to_token = req_offsets + chunk_ids.unsqueeze(0)
@@ -75,7 +75,9 @@ def make_req_to_token(batch_size: int, max_seq_len: int, num_chunks: int) -> tor
 
 def make_case(batch_size: int, num_verify_tokens: int) -> BenchmarkCase:
     seq_lens = make_seq_lens(batch_size, num_verify_tokens)
-    req_pool_indices = torch.arange(batch_size, dtype=torch.int64, device=DEFAULT_DEVICE)
+    req_pool_indices = torch.arange(
+        batch_size, dtype=torch.int64, device=DEFAULT_DEVICE
+    )
 
     max_seq_len = int(seq_lens.max().item()) + num_verify_tokens + SWA_PAGE_SIZE
     num_chunks = round_up_div(max_seq_len, SWA_PAGE_SIZE)

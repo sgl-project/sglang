@@ -145,8 +145,7 @@ __global__ void online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePref
     if (step >= params.num_verify_tokens) break;
 
     const int64_t pos = (start_pos + step) & 127;
-    const float* const kv =
-        params.kv_score_input + (bid * params.num_verify_tokens + step) * params.kv_score_stride_b;
+    const float* const kv = params.kv_score_input + (bid * params.num_verify_tokens + step) * params.kv_score_stride_b;
     kv_steps[step] = kv[d];
     score_steps[step] = kv[kHeadDim + d] + params.ape[pos * params.ape_stride_r + d];
   }
