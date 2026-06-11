@@ -99,7 +99,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
-            seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
+            seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             out_cache_loc_swa = (
                 torch.zeros((max_num_token,), dtype=torch.int64)
@@ -177,7 +177,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         seq_lens_cpu = torch.full(
             (max_bs,),
             seq_len_fill_value,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device="cpu",
         )
 
