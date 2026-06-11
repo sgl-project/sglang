@@ -1,8 +1,8 @@
-from __future__ import annotations
-
 """
 Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
+
+from __future__ import annotations
 
 import logging
 import math
@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import triton
-import triton.language as tl
 
 from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.srt.environ import envs
@@ -19,11 +18,19 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.utils import (
-    concat_mla_absorb_q_general,
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
+)
+from sglang.srt.layers.attention.triton_ops.pad import (
+    pad_draft_extend_query as pad_draft_extend_query_triton,
+)
+from sglang.srt.layers.attention.triton_ops.pad import (
+    unpad_draft_extend_output as unpad_draft_extend_output_triton,
+)
+from sglang.srt.layers.attention.utils import (
+    concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -54,150 +61,6 @@ DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
 # (128 / block_size). We capture the 128 constant here so we can
 # compute the LCM with other padding constraints.
 TRTLLM_BLOCK_CONSTRAINT = 128
-
-
-@triton.jit
-def pad_draft_extend_query_kernel(
-    q_ptr,  # Input query tensor [total_seq_len, num_heads, head_dim]
-    padded_q_ptr,  # Output padded query tensor [batch_size, max_seq_len, num_heads, head_dim]
-    seq_lens_q_ptr,  # Sequence lengths for each sequence [batch_size]
-    cumsum_ptr,  # Cumulative sum of sequence lengths [batch_size + 1]
-    batch_size,
-    max_seq_len,
-    num_heads,
-    head_dim,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Triton kernel for padding draft extended query tensor with parallelized head and dim processing."""
-    # Use 3D program IDs: (batch_seq, head_block, dim_block)
-    batch_seq_pid = tl.program_id(0)
-    head_pid = tl.program_id(1)
-    dim_pid = tl.program_id(2)
-
-    batch_id = batch_seq_pid // max_seq_len
-    seq_pos = batch_seq_pid % max_seq_len
-
-    if batch_id >= batch_size:
-        return
-
-    # Load sequence length for this batch
-    seq_len = tl.load(seq_lens_q_ptr + batch_id)
-
-    if seq_pos >= seq_len:
-        return
-
-    # Load cumulative sum to get start position in input tensor
-    input_start = tl.load(cumsum_ptr + batch_id)
-    input_pos = input_start + seq_pos
-
-    # Calculate head and dim block ranges
-    head_start = head_pid * BLOCK_SIZE
-    head_end = tl.minimum(head_start + BLOCK_SIZE, num_heads)
-    head_mask = tl.arange(0, BLOCK_SIZE) < (head_end - head_start)
-
-    dim_start = dim_pid * BLOCK_SIZE
-    dim_end = tl.minimum(dim_start + BLOCK_SIZE, head_dim)
-    dim_mask = tl.arange(0, BLOCK_SIZE) < (dim_end - dim_start)
-
-    # Calculate input offset
-    input_offset = (
-        input_pos * num_heads * head_dim
-        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * head_dim
-        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
-    )
-
-    # Load data
-    data = tl.load(
-        q_ptr + input_offset,
-        mask=head_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
-
-    # Calculate output offset
-    output_offset = (
-        batch_id * max_seq_len * num_heads * head_dim
-        + seq_pos * num_heads * head_dim
-        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * head_dim
-        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
-    )
-
-    # Store data
-    tl.store(
-        padded_q_ptr + output_offset,
-        data,
-        mask=head_mask[:, None] & dim_mask[None, :],
-    )
-
-
-@triton.jit
-def unpad_draft_extend_output_kernel(
-    raw_out_ptr,  # Input raw output tensor (batch_size, token_per_batch, tp_q_head_num, v_head_dim)
-    output_ptr,  # Output tensor (-1, tp_q_head_num, v_head_dim)
-    num_accept_tokens_ptr,  # Accept lengths for each sequence [batch_size]
-    cumsum_ptr,  # Cumulative sum of accept lengths [batch_size + 1]
-    batch_size,
-    token_per_batch,
-    tp_q_head_num,
-    v_head_dim,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Triton kernel for unpadding draft extended output tensor with parallelized head and dim processing."""
-    batch_seq_pid = tl.program_id(0)
-    head_pid = tl.program_id(1)
-    dim_pid = tl.program_id(2)
-
-    batch_id = batch_seq_pid // token_per_batch
-    seq_pos = batch_seq_pid % token_per_batch
-
-    if batch_id >= batch_size:
-        return
-
-    # Load accept length for this batch
-    accept_len = tl.load(num_accept_tokens_ptr + batch_id)
-
-    if seq_pos >= accept_len:
-        return
-
-    # Load cumulative sum to get start position in output tensor
-    output_start = tl.load(cumsum_ptr + batch_id)
-    output_pos = output_start + seq_pos
-
-    # Calculate head and dim block ranges
-    head_start = head_pid * BLOCK_SIZE
-    head_end = tl.minimum(head_start + BLOCK_SIZE, tp_q_head_num)
-    head_mask = tl.arange(0, BLOCK_SIZE) < (head_end - head_start)
-
-    dim_start = dim_pid * BLOCK_SIZE
-    dim_end = tl.minimum(dim_start + BLOCK_SIZE, v_head_dim)
-    dim_mask = tl.arange(0, BLOCK_SIZE) < (dim_end - dim_start)
-
-    # Calculate input offset: (batch_id, seq_pos, head_id, dim_id)
-    input_offset = (
-        batch_id * token_per_batch * tp_q_head_num * v_head_dim
-        + seq_pos * tp_q_head_num * v_head_dim
-        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * v_head_dim
-        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
-    )
-
-    # Load data
-    data = tl.load(
-        raw_out_ptr + input_offset,
-        mask=head_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
-
-    output_offset = (
-        output_pos * tp_q_head_num * v_head_dim
-        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * v_head_dim
-        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
-    )
-
-    # Store data
-    tl.store(
-        output_ptr + output_offset,
-        data,
-        mask=head_mask[:, None] & dim_mask[None, :],
-    )
 
 
 def _quantize_fp8_qkv(q, k, v, layer):
@@ -593,7 +456,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         bs = forward_batch.batch_size
         if in_capture:
             num_tokens = forward_batch.positions.numel()
-            seq_lens_cpu = forward_batch.seq_lens.cpu()
             self._init_cuda_graph_metadata(
                 bs,
                 num_tokens,
@@ -718,29 +580,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cu_seqlens_q: torch.Tensor,
     ) -> torch.Tensor:
         """Pad draft extended query using Triton kernel."""
-        batch_size = cu_seqlens_q.shape[0] - 1
-        max_seq_len_q = padded_q.shape[1]
-        num_heads = padded_q.shape[2]
-        head_dim = padded_q.shape[3]
-
-        # Launch Triton kernel with 3D grid for parallelized head and dim processing
-        BLOCK_SIZE = 64
-        num_head_blocks = triton.cdiv(num_heads, BLOCK_SIZE)
-        num_dim_blocks = triton.cdiv(head_dim, BLOCK_SIZE)
-        grid = (batch_size * max_seq_len_q, num_head_blocks, num_dim_blocks)
-
-        pad_draft_extend_query_kernel[grid](
-            q_ptr=q,
-            padded_q_ptr=padded_q,
-            seq_lens_q_ptr=seq_lens_q,
-            cumsum_ptr=cu_seqlens_q,
-            batch_size=batch_size,
-            max_seq_len=max_seq_len_q,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            BLOCK_SIZE=BLOCK_SIZE,
+        return pad_draft_extend_query_triton(
+            q,
+            padded_q,
+            seq_lens_q,
+            cu_seqlens_q,
         )
-        return padded_q
 
     def unpad_draft_extend_output(
         self,
@@ -750,45 +595,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         sum_seq_lens_q: int,
     ) -> torch.Tensor:
         """Unpad draft extended output using Triton kernel."""
-        # raw_out: (batch_size, token_per_batch, layer.tp_q_head_num, layer.v_head_dim)
-        batch_size = seq_lens_q.shape[0]
-        token_per_batch = raw_out.shape[1]  # max_seq_len
-        tp_q_head_num = raw_out.shape[2]  # num_heads
-        v_head_dim = raw_out.shape[3]  # head_dim
-        total_tokens = sum_seq_lens_q
-
-        # Check if we're in CUDA graph mode (buffers are pre-allocated)
-        if self.unpad_output_buffer is not None:
-            # Use pre-allocated buffer for CUDA graph compatibility
-            output = self.unpad_output_buffer[:total_tokens, :, :].to(
-                dtype=raw_out.dtype
-            )
-        else:
-            # Dynamic allocation for non-CUDA graph mode
-            output = torch.empty(
-                (total_tokens, tp_q_head_num, v_head_dim),
-                dtype=raw_out.dtype,
-                device=raw_out.device,
-            )
-
-        # Launch Triton kernel with 3D grid for parallelized head and dim processing
-        BLOCK_SIZE = 64
-        num_head_blocks = triton.cdiv(tp_q_head_num, BLOCK_SIZE)
-        num_dim_blocks = triton.cdiv(v_head_dim, BLOCK_SIZE)
-        grid = (batch_size * token_per_batch, num_head_blocks, num_dim_blocks)
-
-        unpad_draft_extend_output_kernel[grid](
-            raw_out_ptr=raw_out,
-            output_ptr=output,
-            num_accept_tokens_ptr=seq_lens_q,
-            cumsum_ptr=cu_seqlens_q,
-            batch_size=batch_size,
-            token_per_batch=token_per_batch,
-            tp_q_head_num=tp_q_head_num,
-            v_head_dim=v_head_dim,
-            BLOCK_SIZE=BLOCK_SIZE,
+        return unpad_draft_extend_output_triton(
+            raw_out,
+            cu_seqlens_q,
+            seq_lens_q,
+            sum_seq_lens_q,
+            self.unpad_output_buffer,
         )
-        return output[:total_tokens, :, :]
 
     def _compute_decode_bmm1_scale(self, layer: RadixAttention) -> float:
         """BMM1 scale q_scale * k_scale * softmax_scale. k_scale only
