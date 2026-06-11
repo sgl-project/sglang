@@ -24,12 +24,10 @@ v0.5.10 or a later version.
 | Feature                       | Usage                                                                                         |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 4`                                                                                 |
-| Data Parallelism              | `--dp-size 2`                                                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 16384`                                        |
 | NPU Graph                     | `--cuda-graph-bs 1 4 8 16`                                                                    |
-| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
-| PrefixCache                   | `--disable-radix-cache`                                                                       |
+| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path <draft-model-path> --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 
 For feature compatibility and conflict information between features,
@@ -146,6 +144,7 @@ with limited hardware resources. The following command is based on the Qwen3-32B
 #============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the speculative draft model weights directory
 #============================================================
 
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -168,6 +167,7 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
 
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
@@ -189,7 +189,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
     --tp-size 4 --mem-fraction-static 0.843 --cuda-graph-bs 1 4 8 16 --dtype bfloat16
