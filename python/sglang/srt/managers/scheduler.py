@@ -161,6 +161,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
+    compose_weight_version_namespace,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -1590,6 +1591,7 @@ class Scheduler(
             is_fully_idle=self.is_fully_idle,
             scheduler=self,
             drain_forward_pipeline=self.drain_forward_pipeline,
+            on_weight_version_bump=self.sweep_dead_weight_version_namespaces,
             metrics_collector=self.metrics_collector,
         )
 
@@ -3793,6 +3795,48 @@ class Scheduler(
         """
         self._drain_inflight_batches()
         self.device_module.synchronize()
+
+    def sweep_dead_weight_version_namespaces(self) -> None:
+        """Evict KV namespaces of weight versions with no live requests.
+
+        Runs after the scheduler-side weight version bumps: new requests are
+        stamped with the new namespace, so an old version's subtrees can never
+        be matched again once its last request finishes. Best-effort by
+        design — namespaces kept alive by stragglers are reclaimed by the
+        sweep after the next commit, or by normal LRU eviction.
+        """
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        if not self.server_args.enable_weight_version_kv_isolation:
+            return
+        # Conservative gates: plain RadixCache only (subclasses tier nodes to
+        # host/storage and need their own write-back handling) and no
+        # PD-disaggregation (its inflight queues are not enumerated below).
+        if type(self.tree_cache) is not RadixCache:
+            return
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            return
+
+        current_prefix = compose_weight_version_namespace(
+            self.server_args.weight_version
+        )
+        live_keys = {req.extra_key for req in self.waiting_queue}
+        live_keys.update(req.extra_key for req in self.running_batch.reqs)
+        live_keys.update(req.extra_key for req in self.grammar_manager.grammar_queue)
+        if self.chunked_req is not None:
+            live_keys.add(self.chunked_req.extra_key)
+
+        def is_live(extra_key: Optional[str]) -> bool:
+            if extra_key is None or not extra_key.startswith("wv"):
+                # Only composed weight-version namespaces are swept.
+                return True
+            return extra_key.startswith(current_prefix) or extra_key in live_keys
+
+        num_evicted = self.tree_cache.evict_dead_namespaces(is_live)
+        if num_evicted:
+            logger.info(
+                f"Evicted {num_evicted} KV tokens from dead weight-version namespaces."
+            )
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True

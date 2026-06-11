@@ -537,6 +537,7 @@ class ServerArgs:
     admin_api_key: Optional[str] = None
     served_model_name: Optional[str] = None
     weight_version: str = "default"
+    enable_weight_version_kv_isolation: bool = False
     chat_template: Optional[str] = None
     hf_chat_template_name: Optional[str] = None
     completion_template: Optional[str] = None
@@ -5647,6 +5648,18 @@ class ServerArgs:
             type=str,
             default=ServerArgs.weight_version,
             help="Version identifier for the model weights. Defaults to 'default' if not specified.",
+        )
+        parser.add_argument(
+            "--enable-weight-version-kv-isolation",
+            action="store_true",
+            help="Namespace the KV cache by weight version: requests admitted "
+            "under different weight versions never share radix-cache entries. "
+            "Use with in-place weight updates (pause_generation mode='in_place' "
+            "+ update_weights_from_* with flush_cache=false and a weight_version) "
+            "so in-flight requests keep decoding on their existing KV while "
+            "new requests cannot reuse stale-version KV. The version must "
+            "change via the update_weights_from_* handlers to take effect on "
+            "the scheduler; /update_weight_version alone is tokenizer-local.",
         )
         parser.add_argument(
             "--chat-template",

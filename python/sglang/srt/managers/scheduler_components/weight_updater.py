@@ -82,6 +82,8 @@ class SchedulerWeightUpdaterManager:
     # Quiesces in-flight forwards before a weight mutation.
     drain_forward_pipeline: Callable[[], None]
     scheduler: Optional[Any] = None
+    # Optional hook run after the scheduler-side weight version changes.
+    on_weight_version_bump: Optional[Callable[[], None]] = None
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
@@ -113,11 +115,13 @@ class SchedulerWeightUpdaterManager:
     def bump_weight_version(self, recv_req) -> None:
         """Adopt the request's weight_version as the scheduler-side current
         version. Called only on full update success (target and draft), so
-        admission stamping in ``Req.__init__`` switches exactly when the new
-        weights become live."""
+        admission stamping in ``Req.__init__`` and the KV-isolation namespace
+        switch exactly when the new weights become live."""
         version = getattr(recv_req, "weight_version", None)
         if version is not None:
             get_global_server_args().weight_version = version
+            if self.on_weight_version_bump is not None:
+                self.on_weight_version_bump()
 
     def flush_cache_after_weight_update(self, recv_req) -> None:
         if recv_req.flush_cache:
