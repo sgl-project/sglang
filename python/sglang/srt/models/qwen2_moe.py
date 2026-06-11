@@ -127,9 +127,10 @@ def can_fuse_shared_expert(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
+    """Whether the shared expert may be fused as an extra MoE expert.
 
-    Caller must still gate on ``support_shared_expert_fusion`` and ``_use_aiter``.
+    Works on both CUDA (Triton kernel) and AMD/HIP (aiter).
+    Caller must still gate on ``support_shared_expert_fusion``.
     """
     if (
         get_global_server_args().disable_shared_experts_fusion is True
@@ -241,8 +242,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.num_shared_experts = 1
 
         self.enable_shared_expert_fusion = False  # default to False
-        if _use_aiter:
-            # enable shared expert fusion when use aiter
+        if _use_aiter or _is_cuda:
+            # enable shared expert fusion on AMD (aiter) and CUDA (Triton kernel)
             self.enable_shared_expert_fusion = (
                 support_shared_expert_fusion
                 and can_fuse_shared_expert(config, quant_config)
@@ -347,7 +348,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_out = self.shared_expert_gate(hidden_states)
         shared_logits = shared_out[0] if isinstance(shared_out, tuple) else shared_out
         w = F.sigmoid(shared_logits)
-        # This block runs only on the AMD AITER shared_expert_fusion path
         # Allreduce-EP path: the fused shared expert occupies a single global
         # slot loaded onto every EP rank (see FusedMoE.__init__: num_shared_slots
         # == num_fused_shared_experts when not is_deepep_class_backend()). Every
@@ -698,13 +698,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
+        _disable_fusion = get_global_server_args().disable_shared_experts_fusion
         if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
-                alt_stream=alt_stream,
+                alt_stream=(alt_stream if _disable_fusion else None),
                 prefix=add_prefix("mlp", prefix),
+                support_shared_expert_fusion=not _disable_fusion,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -953,6 +955,11 @@ class Qwen2MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+
+        # Track shared expert fusion state for weight loading
+        self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
@@ -1025,6 +1032,18 @@ class Qwen2MoeForCausalLM(nn.Module):
 
         return result
 
+    def _get_num_fused_shared_experts(self):
+        """Return the number of fused shared experts from the first sparse layer."""
+        if not (
+            hasattr(self.model, "layers")
+            and len(self.model.layers) > 0
+        ):
+            return 0
+        for layer in self.model.layers:
+            if layer is not None and hasattr(layer, "mlp") and hasattr(layer.mlp, "num_fused_shared_experts"):
+                return layer.mlp.num_fused_shared_experts
+        return 0
+
     @property
     def start_layer(self):
         return self.model.start_layer
@@ -1043,11 +1062,17 @@ class Qwen2MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        num_experts = self.config.num_experts
+
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=(
+                num_experts
+                if not self.enable_shared_expert_fusion
+                else num_experts + self.num_fused_shared_experts
+            ),
         )
 
         params_dict = dict(self.named_parameters())
@@ -1064,6 +1089,18 @@ class Qwen2MoeForCausalLM(nn.Module):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            # When shared expert fusion is enabled, redirect shared_expert
+            # weights into the fused expert slot (expert_id = num_experts).
+            # The shared_expert_gate weight is NOT redirected; it is still
+            # loaded as a standalone parameter for _get_shared_expert_weights.
+            if self.enable_shared_expert_fusion and "mlp.shared_expert." in name:
+                if "shared_expert_gate" not in name:
+                    name = name.replace(
+                        "mlp.shared_expert.",
+                        f"mlp.experts.{num_experts}.",
+                    )
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -1093,6 +1130,8 @@ class Qwen2MoeForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
