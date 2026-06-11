@@ -141,8 +141,10 @@ than restating.
   or unknown components. `<CardGroup>`/`<Card>` only on category `intro.mdx`, not model pages.
 - Code fences are **labeled** (e.g. `python Example` / `bash Command` / `text Output` after
   the opening fence); a fenced block nested inside another uses four backticks outside.
-- Every runnable invocation block is followed by `**Output Example:**` + a `text Output`
-  fenced block (real output, or `Pending update...` only with user acknowledgement).
+- §3 commands and outputs are **collapsible** (DeepSeek-V4 pattern): every runnable
+  example wrapped in an `<Accordion>`, its real output in a following
+  `<Accordion title="Example Output">` (`Pending update...` only with user
+  acknowledgement). Flag bare/inline example blocks and `**Output Example:**` headings.
 - Reasoning-parser example matches the parser's **output shape**: separate-field
   (`reasoning_content` + `content`) vs inline `<think>` tags parsed out of `content`.
 - No hardcoded sampling params (`temperature` / `top_p`) in sample code (SGLang uses

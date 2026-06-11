@@ -111,7 +111,10 @@ three-strategy boilerplate with this model's actual strategy explanation.
 Legacy §5 benchmark prose is deleted (numbers → benchmark card, commands →
 ⚡Reproduce); legacy prose deploy commands are deleted (doc↔config parity —
 fold their unique flags into §2 tips). Invocation examples + real outputs carry
-over verbatim.
+over verbatim, but **wrapped in Accordions** — §3 commands and outputs are
+collapsible (required, DeepSeek-V4 pattern): code in an
+`<Accordion title="… (Python)">`, output in a following
+`<Accordion title="Example Output">`; legacy pages kept them inline.
 
 ### 6. Delete the legacy generator
 Remove `docs_new/src/snippets/autoregressive/<slug>-deployment.jsx` and its
