@@ -547,6 +547,8 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
+            # NextN draft layers must not record routed-expert capture into the
+            # target's R3 buffer, so opt out at draft-only construction time.
             topk_kwargs = dict(
                 top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
                 layer_id=self.layer_id,
@@ -560,6 +562,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+                allow_routed_experts_capture=not is_nextn,
                 # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
                 # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
                 output_format=(

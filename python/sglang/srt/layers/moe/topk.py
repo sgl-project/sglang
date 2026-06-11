@@ -211,6 +211,10 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    # When False, RoutedExpertsCapturer.capture() is skipped at this layer's
+    # MoE topk site. Default True keeps target-model behavior; draft-side MoE
+    # blocks (NextN / MTP / EAGLE-MoE) set this to False at construction.
+    allow_routed_experts_capture: bool = True
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -330,6 +334,7 @@ class TopK(MultiPlatformOp):
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
+        allow_routed_experts_capture: bool = True,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -375,6 +380,7 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
     def _apply_deepep_waterfill(
@@ -1261,6 +1267,27 @@ def _remap_topk_for_deepep(
     return topk_ids, topk_weights
 
 
+def capture_routed_experts_if_allowed(
+    topk_config: TopKConfig,
+    layer_id: Optional[int],
+    topk_ids: torch.Tensor,
+) -> None:
+    """Single chokepoint that backends call after producing routed top-k ids.
+
+    Reads `topk_config.allow_routed_experts_capture` and the process-global
+    `RoutedExpertsCapturer`; calls `capture(...)` only when both consent.
+    Centralizing the gate means a future capture-aware backend cannot
+    accidentally bypass the per-`TopKConfig` opt-out used by draft MoE
+    layers (NextN / MTP / EAGLE-MoE).
+    """
+    if not topk_config.allow_routed_experts_capture:
+        return
+    cap = get_global_experts_capturer()
+    if cap is None:
+        return
+    cap.capture(layer_id=layer_id, topk_indices=topk_ids)
+
+
 def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1274,11 +1301,7 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    if (cap := get_global_experts_capturer()) is not None:
-        cap.capture(
-            layer_id=layer_id,
-            topk_indices=topk_ids,
-        )
+    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.

@@ -56,7 +56,10 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
         )
         self.pre_fc_norm_hidden = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.model = ExaoneMoEModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            allow_routed_experts_capture=False,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

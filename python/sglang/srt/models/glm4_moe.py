@@ -396,6 +396,8 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        *,
+        is_nextn: bool = False,
     ):
         nn.Module.__init__(self)
         self.top_k = config.num_experts_per_tok
@@ -450,6 +452,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             num_fused_shared_experts=self.num_fused_shared_experts,
+            allow_routed_experts_capture=not is_nextn,
             apply_routed_scaling_factor_on_output=getattr(
                 self.experts, "should_fuse_routed_scaling_factor_in_topk", False
             ),
@@ -846,6 +849,7 @@ class Glm4MoeDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
+                is_nextn=is_nextn,
             )
         else:
             if enable_moe_dense_fully_dp():

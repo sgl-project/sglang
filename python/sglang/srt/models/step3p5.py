@@ -118,6 +118,8 @@ class Step3p5MoEMLP(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        allow_routed_experts_capture: bool = True,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -149,6 +151,7 @@ class Step3p5MoEMLP(nn.Module):
             correction_bias=self.router_bias,
             apply_routed_scaling_factor_on_output=False,
             layer_id=layer_id,
+            allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -477,6 +480,8 @@ class Step3p5DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        *,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -547,6 +552,7 @@ class Step3p5DecoderLayer(nn.Module):
                 layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                allow_routed_experts_capture=allow_routed_experts_capture,
             )
             # reduce_results=False: share_expert output stays unreduced and is
             # combined with the (also unreduced) MoE output, then a single

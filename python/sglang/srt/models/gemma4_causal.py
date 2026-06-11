@@ -142,6 +142,8 @@ class Gemma4MoE(nn.Module):
         config: Gemma4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -178,6 +180,7 @@ class Gemma4MoE(nn.Module):
             top_k=config.top_k_experts,
             layer_id=layer_id,
             custom_routing_function=routing_function,
+            allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
         experts_type = get_moe_impl_class(quant_config)
@@ -432,6 +435,8 @@ class Gemma4DecoderLayer(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -528,6 +533,7 @@ class Gemma4DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("moe", prefix),
+                allow_routed_experts_capture=allow_routed_experts_capture,
             )
 
             self.post_feedforward_layernorm_1 = RMSNorm(
@@ -667,6 +673,8 @@ class Gemma4TextModel(PreTrainedModel):
         config: Gemma4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__(config=config)
         self.config = config
@@ -728,6 +736,7 @@ class Gemma4TextModel(PreTrainedModel):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
+                allow_routed_experts_capture=allow_routed_experts_capture,
             ),
             prefix=add_prefix("layers", prefix),
         )

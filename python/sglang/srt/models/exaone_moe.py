@@ -145,6 +145,8 @@ class ExaoneMoESparseMoEBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
+        *,
+        allow_routed_experts_capture: bool = True,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -195,6 +197,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
             scoring_func="sigmoid",
+            allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
         if config.num_shared_experts is not None:
@@ -451,6 +454,8 @@ class ExaoneMoEDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        *,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -494,6 +499,7 @@ class ExaoneMoEDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix),
+                allow_routed_experts_capture=allow_routed_experts_capture,
             )
         else:
             self.mlp = ExaoneMoEMLP(
@@ -544,6 +550,8 @@ class ExaoneMoEModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        *,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
@@ -568,6 +576,7 @@ class ExaoneMoEModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
+                allow_routed_experts_capture=allow_routed_experts_capture,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,

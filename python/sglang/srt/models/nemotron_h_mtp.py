@@ -122,11 +122,15 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         has_start_projections: bool = False,
         has_end_norm: bool = False,
     ) -> None:
+        # MTP draft layers must not capture routed experts into the target's
+        # R3 buffer; hardcode opt-out at the subclass boundary so the MoE
+        # block's `allow_routed_experts_capture` lands as False on the draft TopK.
         super().__init__(
             config=config,
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=prefix,
+            allow_routed_experts_capture=False,
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
