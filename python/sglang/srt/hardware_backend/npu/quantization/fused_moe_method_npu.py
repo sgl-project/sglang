@@ -143,7 +143,7 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
 
     def apply(
         self,
-        quant_info: TorchNpuQuantInfo,
+        quant_info: "TorchNpuQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         pertoken_scale: torch.Tensor,
@@ -219,7 +219,7 @@ class NPUW8A8Int8MoEMethod(_NPUFusedMoEMethodBase):
 
     def apply(
         self,
-        quant_info: TorchNpuQuantInfo,
+        quant_info: "TorchNpuQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         pertoken_scale: torch.Tensor,
@@ -366,7 +366,7 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
 
     def apply(
         self,
-        quant_info: TorchNpuQuantInfo,
+        quant_info: "TorchNpuQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         pertoken_scale: torch.Tensor,
@@ -519,7 +519,7 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
 
     def apply(
         self,
-        quant_info: TorchNpuQuantInfo,
+        quant_info: "TorchNpuQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         pertoken_scale: torch.Tensor,  # not used, but kept for interface consistency
@@ -572,7 +572,7 @@ class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
 
     def apply(
         self,
-        quant_info: TorchNpuQuantInfo,
+        quant_info: "TorchNpuQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         pertoken_scale: torch.Tensor,  # ignored
