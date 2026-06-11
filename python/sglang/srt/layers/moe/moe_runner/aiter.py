@@ -326,7 +326,7 @@ def _pre_permute_deepep_to_aiter(
         # gate_mode=INTERLEAVE, for which AITER picks a bf16/fp8 `q_dtype_a`
         # Refer to https://github.com/ROCm/aiter/blob/a2617c366dc7271a1662ecda2023d19f6ccefcec/aiter/fused_moe.py#L406-L412
         swiglu_interleave = quant_info.swiglu_limit > 0 and get_bool_env_var(
-            "SGLANG_USE_AITER_MOE_GU_ITLV"
+            "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
         )
 
         if is_w4a4 and a1_scale is not None and not is_fp4_dispatch:
