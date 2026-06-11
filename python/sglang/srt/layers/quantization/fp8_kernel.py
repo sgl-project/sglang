@@ -465,7 +465,7 @@ def create_per_token_group_quant_fp8_output_scale(
     if scale_outer_major:
         assert scale_ue8m0
         assert not column_major_scales and not scale_tma_aligned
-        assert len(x_shape) >= 3
+        assert len(x_shape) == 3
         *x_batch, x_s_mn, x_s_outer, x_q_k = x_shape
         # Store the outer axis as the leading allocation dim (each outer slice
         # stays contiguous); the returned view keeps the logical (mn, outer, K) shape.
