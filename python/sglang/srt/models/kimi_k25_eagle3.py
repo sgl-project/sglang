@@ -417,6 +417,7 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         cached_a_proj: dict[str, torch.Tensor] = {}
+        lm_head_loaded = False
 
         for name, loaded_weight in weights:
             if name == "d2t" or name.endswith(".d2t"):
@@ -482,6 +483,28 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
             param = params_dict[mapped_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
+            if mapped_name.startswith("lm_head."):
+                lm_head_loaded = True
+
+        # Some EAGLE3 checkpoints (e.g. nvidia/Kimi-K2.6-Eagle3) ship no lm_head
+        # weight and expect to reuse the target model's head, but declare
+        # draft_vocab_size (so the draft_vocab_size-is-None heuristic in __init__
+        # does not flag it). Without this, our freshly-allocated ParallelLMHead is
+        # never populated and the draft emits garbage logits -> accept rate 0.00.
+        # Borrow the target head when it is the right shape (full draft vocab).
+        if not self.config.tie_word_embeddings and not lm_head_loaded:
+            draft_vocab_size = getattr(self.config, "draft_vocab_size", None)
+            if draft_vocab_size not in (None, self.config.vocab_size):
+                raise ValueError(
+                    "Eagle3 MLA draft checkpoint provides no lm_head weight and uses "
+                    f"a reduced draft vocab ({draft_vocab_size} != "
+                    f"{self.config.vocab_size}); cannot borrow the target head."
+                )
+            self.load_lm_head_from_target = True
+            logger.info(
+                "Eagle3 MLA: checkpoint has no lm_head weight; loading lm_head from "
+                "the target model."
+            )
 
         self.post_load_weights()
 
