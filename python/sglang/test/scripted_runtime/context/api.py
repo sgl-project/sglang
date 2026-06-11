@@ -64,6 +64,8 @@ class ScriptedContext:
         return_logprob: bool = False,
         logprob_start_len: Optional[int] = None,
         top_logprobs_num: Optional[int] = None,
+        stop_token_ids: Optional[List[int]] = None,
+        temperature: Optional[float] = None,
         lora_path: Optional[str] = None,
     ) -> "ScriptedReqHandle":
         return self._req_starter.start_req(
@@ -77,6 +79,8 @@ class ScriptedContext:
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
+            stop_token_ids=stop_token_ids,
+            temperature=temperature,
             lora_path=lora_path,
         )
 
@@ -89,8 +93,8 @@ class ScriptedContext:
     def abort_all(self) -> None:
         return lifecycle.abort_all(self)
 
-    def abort(self, handle: "ScriptedReqHandle") -> None:
-        return lifecycle.abort(self, rid=handle.rid)
+    def abort(self, handle: "ScriptedReqHandle", *, await_arrival: bool = True) -> None:
+        return lifecycle.abort(self, rid=handle.rid, await_arrival=await_arrival)
 
     def flush_cache(self) -> None:
         return lifecycle.flush_cache(self)
