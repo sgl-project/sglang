@@ -281,7 +281,7 @@ class DSV4AttnMetadata:
                 f"!= pre_global_len={pre_global_len} (must remain global for compressor write path)"
             )
 
-    def init_flashmla_related(self):
+    def init_flashmla_related(self, is_prefill: bool = False):
         # c4_sparse_topk is set from model_config.index_topk per-model
         # (small model: 512, large model: 1024).
         assert self.c4_sparse_topk in (512, 1024), (
@@ -303,6 +303,8 @@ class DSV4AttnMetadata:
             device=self.c4_topk_lengths_clamp1.device,
         )
         self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
+        if is_prefill:
+            self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
         self.c1_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
@@ -1136,6 +1138,35 @@ class DeepseekV4HipRadixBackend(
         cu_q = core_attn_metadata.unified_pf_cu_q
         final_pos = core_attn_metadata.unified_pf_final_pos
 
+        # DSA CP (round-robin/interleave): unified_pf_* are built over the GLOBAL
+        # token layout, but under CP each rank owns only 1/cp_size of the queries
+        # (q/positions are local) while kv was all-gathered to the full sequence.
+        # Slice the per-query fields to this rank's tokens so their length matches
+        # the local query count T; values stay global so each local query still
+        # attends over the full all-gathered KV.
+        from sglang.srt.layers.attention.dsa.utils import (
+            is_dsa_prefill_cp_round_robin_split,
+        )
+
+        _cp_size = get_attention_cp_size()
+        _cp_active = (
+            _cp_size > 1
+            and is_dsa_prefill_cp_round_robin_split()
+            and kv.shape[0] == _cp_size * T
+            and state_slot.shape[0] != T
+        )
+        if _cp_active:
+            _sl = slice(get_attention_cp_rank(), None, _cp_size)
+            state_slot = state_slot[_sl].contiguous()
+            chunk_start = chunk_start[_sl].contiguous()
+            cu_q = cu_q[_sl].contiguous()
+            final_pos = final_pos[_sl].contiguous()
+            # positions for the local queries are this rank's round-robin global
+            # positions {r, r+cp, r+2cp, ...}; forward_batch.positions is the full
+            # (padded) global layout, so slice it the same way instead of taking
+            # the first T entries (which would be the wrong, sequential 0..T-1).
+            positions = forward_batch.positions.to(torch.int64)[_sl].contiguous()
+
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,
             state_slot=state_slot,
@@ -1169,8 +1200,16 @@ class DeepseekV4HipRadixBackend(
         # only the final-window tokens per request
         if save_kv_cache:
             n_real = state_slot.shape[0]
+            # kv is the full all-gathered KV; the ring write is aligned to this
+            # rank's local round-robin tokens (matching state_slot/positions), so
+            # select them from the full KV under CP.
+            _ring_kv = (
+                kv[get_attention_cp_rank() :: _cp_size].contiguous()
+                if _cp_active
+                else kv
+            )
             runtime.store_swa_into_unified(
-                kv=kv[:n_real],
+                kv=_ring_kv[:n_real],
                 state_slot=state_slot,
                 positions=positions[:n_real],
                 unified_kv=unified,
