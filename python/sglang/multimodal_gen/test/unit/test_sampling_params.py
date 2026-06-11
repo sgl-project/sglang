@@ -279,6 +279,32 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertIn("width", explicit_fields)
         self.assertIn("height", explicit_fields)
 
+    def test_cli_path_preserves_diffusers_kwargs_in_request_extra(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+        diffusers_kwargs = {"camera_to_world_path": "/tmp/camera.npy"}
+
+        with patch.object(
+            SamplingParams,
+            "from_pretrained",
+            side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+        ):
+            params = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                image_path="/tmp/in.png",
+                diffusers_kwargs=diffusers_kwargs,
+            )
+
+        self.assertEqual(params.diffusers_kwargs, diffusers_kwargs)
+        self.assertEqual(
+            params.build_request_extra()["diffusers_kwargs"],
+            diffusers_kwargs,
+        )
+
     def test_dataclasses_replace_preserves_explicit_fields(self):
         """`dataclasses.replace` drops `_explicit_fields`; DiffGenerator must restore it."""
         import dataclasses
