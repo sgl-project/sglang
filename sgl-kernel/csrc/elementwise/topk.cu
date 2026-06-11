@@ -18,24 +18,45 @@
 #include <cstdint>
 #include <optional>
 
+#include "utils.h"
+
 namespace {
 
 constexpr int TopK = 2048;
 constexpr int kThreadsPerBlock = 1024;
 
 #ifdef USE_ROCM
-// On ROCm, the per-workgroup LDS budget depends on the target arch, so we inject a
-// per-arch value from `setup_rocm.py` via `-DSGL_TOPK_DYNAMIC_SMEM_BYTES=...`.
-#ifdef SGL_TOPK_DYNAMIC_SMEM_BYTES
-constexpr size_t kSmem = static_cast<size_t>(SGL_TOPK_DYNAMIC_SMEM_BYTES);
+// For multi-arch ROCm builds, use conservative compile-time value for device arrays.
+// Runtime dispatch will select optimal size based on GPU architecture.
+// - gfx942 (MI300): hardware limit ~64KB total LDS, use 48KB for dynamic smem
+// - gfx950 (MI350): can handle 128KB, use 64KB for better performance
+// Compile-time value must be the MINIMUM to work on all archs.
+constexpr size_t kSmem = 48 * 1024;  // Conservative value for compile-time device arrays
+
+// Runtime GPU architecture detection (same as FP8 code)
+inline static bool is_gfx950_gpu() {
+  static int cached_result = -1;
+  if (cached_result == -1) {
+    hipDeviceProp_t prop;
+    hipGetDeviceProperties(&prop, 0);
+    cached_result = (strncmp(prop.gcnArchName, "gfx950", 6) == 0) ? 1 : 0;
+  }
+  return cached_result == 1;
+}
+
+// Cached shared memory size - initialized once, used for all subsequent calls
+inline static size_t get_ksmem_size() {
+  static const size_t smem_size = is_gfx950_gpu() ? (64 * 1024) : (48 * 1024);
+  return smem_size;
+}
 #else
-constexpr size_t kSmem = 48 * 1024;  // bytes
-#endif
-#else
-// Reduced from 128KB to 32KB to improve occupancy.
+// CUDA: Reduced from 128KB to 32KB to improve occupancy.
 // Each radix pass needs at most ~TopK candidates in the threshold bin,
 // so 4K entries per round (2 rounds = 8K entries = 32KB) is sufficient.
 constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (bytes)
+inline size_t get_ksmem_size() {
+  return kSmem;
+}
 #endif
 
 struct FastTopKParams {
@@ -87,13 +108,14 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
+template <size_t SMEM_SIZE>
 __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
   // An optimized topk kernel copied from tilelang kernel
   // We assume length > TopK here, or it will crash
   int topk = TopK;
   constexpr auto BLOCK_SIZE = 1024;
   constexpr auto RADIX = 256;
-  constexpr auto SMEM_INPUT_SIZE = kSmem / (2 * sizeof(int));
+  constexpr auto SMEM_INPUT_SIZE = SMEM_SIZE / (2 * sizeof(int));
 
   alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
   alignas(128) __shared__ int s_counter;
@@ -102,7 +124,10 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
 
   auto& s_histogram = s_histogram_buf[0];
   // allocate for two rounds
-  extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
+  // Use 1D extern declaration to avoid type conflicts between template instantiations,
+  // then cast to 2D pointer for convenient indexing
+  extern __shared__ int s_input_idx_1d[];
+  int (*s_input_idx)[SMEM_INPUT_SIZE] = (int (*)[SMEM_INPUT_SIZE])s_input_idx_1d;
 
   const int tx = threadIdx.x;
 
@@ -251,6 +276,7 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
   }
 }
 
+template <size_t SMEM_SIZE>
 __global__ __launch_bounds__(kThreadsPerBlock)  // topk
     void topk_kernel(const FastTopKParams params) {
   const auto& [input, row_starts, indices, lengths, input_stride] = params;
@@ -262,10 +288,11 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // topk
   if (length <= TopK) {
     return naive_topk_cuda(score, indice, length);
   } else {
-    return fast_topk_cuda_tl(score, indice, row_start, length);
+    return fast_topk_cuda_tl<SMEM_SIZE>(score, indice, row_start, length);
   }
 }
 
+template <size_t SMEM_SIZE>
 __global__ __launch_bounds__(kThreadsPerBlock)  // decode
     void topk_transform_decode_kernel(
         const FastTopKParams params,
@@ -284,7 +311,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
     return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
   } else {
     __shared__ int s_indices[TopK];
-    fast_topk_cuda_tl(score, s_indices, row_start, length);
+    fast_topk_cuda_tl<SMEM_SIZE>(score, s_indices, row_start, length);
     // copy src[s_indices] to dst, we manually unroll here
     static_assert(TopK % kThreadsPerBlock == 0);
     static_assert(TopK / kThreadsPerBlock == 2);
@@ -297,6 +324,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
   }
 }
 
+template <size_t SMEM_SIZE>
 __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
     void topk_transform_prefill_kernel(
         const FastTopKParams params,
@@ -336,7 +364,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
     return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
   } else {
     __shared__ int s_indices[TopK];
-    fast_topk_cuda_tl(score, s_indices, row_start, length);
+    fast_topk_cuda_tl<SMEM_SIZE>(score, s_indices, row_start, length);
     // copy src[s_indices] to dst, we manually unroll here
     static_assert(TopK % kThreadsPerBlock == 0);
     static_assert(TopK / kThreadsPerBlock == 2);
@@ -349,6 +377,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
   }
 }
 
+template <size_t SMEM_SIZE>
 __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
     void topk_transform_prefill_ragged_kernel(
         const FastTopKParams params,
@@ -367,7 +396,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
     return naive_topk_transform_ragged(score, length, dst_indices_entry, offset);
   } else {
     __shared__ int s_indices[TopK];
-    fast_topk_cuda_tl(score, s_indices, row_start, length);
+    fast_topk_cuda_tl<SMEM_SIZE>(score, s_indices, row_start, length);
     // copy src[s_indices] to dst, we manually unroll here
     static_assert(TopK % kThreadsPerBlock == 0);
     static_assert(TopK / kThreadsPerBlock == 2);
@@ -430,6 +459,19 @@ void setup_kernel_smem_once() {
   TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
 }
 
+// Runtime version for dynamic smem size
+template <auto* f>
+void setup_kernel_smem_runtime(size_t max_dynamic_smem) {
+  cudaError_t result;
+#ifdef USE_ROCM
+  result = ::cudaFuncSetAttribute(
+      reinterpret_cast<const void*>(f), ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+#else
+  result = ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+#endif
+  TORCH_CHECK(result == cudaSuccess, "setup_kernel_smem_runtime failed:", ::cudaGetErrorString(result));
+}
+
 }  // namespace
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
@@ -447,8 +489,23 @@ void fast_topk_interface(
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
-  setup_kernel_smem_once<topk_kernel, kSmem>();
-  topk_kernel<<<grid, block, kSmem, stream>>>(params);
+  const auto kSmem_runtime = get_ksmem_size();
+
+#ifdef USE_ROCM
+  // Runtime dispatch based on GPU architecture and cached shared memory size
+  if (kSmem_runtime == 64 * 1024) {
+    setup_kernel_smem_runtime<topk_kernel<64 * 1024>>(kSmem_runtime);
+    topk_kernel<64 * 1024><<<grid, block, kSmem_runtime, stream>>>(params);
+  } else {
+    setup_kernel_smem_runtime<topk_kernel<48 * 1024>>(kSmem_runtime);
+    topk_kernel<48 * 1024><<<grid, block, kSmem_runtime, stream>>>(params);
+  }
+#else
+  // CUDA: use compile-time constant for both template and runtime allocation
+  setup_kernel_smem_runtime<topk_kernel<kSmem>>(kSmem_runtime);
+  topk_kernel<kSmem><<<grid, block, kSmem_runtime, stream>>>(params);
+#endif
+
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
 }
@@ -489,14 +546,49 @@ void fast_topk_transform_interface(
   // extend and draft extend: row_starts_opt is not null, invokes the prefill kernel
   // decode: row_starts_opt is null, invokes the decode kernel
   // target verify: row_starts_opt is null, invokes the prefill kernel
+  const auto kSmem_runtime = get_ksmem_size();
   const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
+
+#ifdef USE_ROCM
+  if (kSmem_runtime == 64 * 1024) {
+    if (is_decode) {
+      setup_kernel_smem_runtime<topk_transform_decode_kernel<64 * 1024>>(kSmem_runtime);
+      topk_transform_decode_kernel<64 * 1024><<<grid, block, kSmem_runtime, stream>>>(
+          params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
+    } else {
+      setup_kernel_smem_runtime<topk_transform_prefill_kernel<64 * 1024>>(kSmem_runtime);
+      topk_transform_prefill_kernel<64 * 1024><<<grid, block, kSmem_runtime, stream>>>(
+          params,
+          dst_page_table.data_ptr<int32_t>(),
+          src_page_table.data_ptr<int32_t>(),
+          src_stride,
+          cu_seqlens_q.data_ptr<int32_t>(),
+          prefill_bs);
+    }
+  } else {
+    if (is_decode) {
+      setup_kernel_smem_runtime<topk_transform_decode_kernel<48 * 1024>>(kSmem_runtime);
+      topk_transform_decode_kernel<48 * 1024><<<grid, block, kSmem_runtime, stream>>>(
+          params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
+    } else {
+      setup_kernel_smem_runtime<topk_transform_prefill_kernel<48 * 1024>>(kSmem_runtime);
+      topk_transform_prefill_kernel<48 * 1024><<<grid, block, kSmem_runtime, stream>>>(
+          params,
+          dst_page_table.data_ptr<int32_t>(),
+          src_page_table.data_ptr<int32_t>(),
+          src_stride,
+          cu_seqlens_q.data_ptr<int32_t>(),
+          prefill_bs);
+    }
+  }
+#else
   if (is_decode) {
-    setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
-    topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
+    setup_kernel_smem_runtime<topk_transform_decode_kernel<kSmem>>(kSmem_runtime);
+    topk_transform_decode_kernel<kSmem><<<grid, block, kSmem_runtime, stream>>>(
         params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
   } else {
-    setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
-    topk_transform_prefill_kernel<<<grid, block, kSmem, stream>>>(
+    setup_kernel_smem_runtime<topk_transform_prefill_kernel<kSmem>>(kSmem_runtime);
+    topk_transform_prefill_kernel<kSmem><<<grid, block, kSmem_runtime, stream>>>(
         params,
         dst_page_table.data_ptr<int32_t>(),
         src_page_table.data_ptr<int32_t>(),
@@ -504,6 +596,7 @@ void fast_topk_transform_interface(
         cu_seqlens_q.data_ptr<int32_t>(),
         prefill_bs);
   }
+#endif
 
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
@@ -536,10 +629,23 @@ void fast_topk_transform_ragged_interface(
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
+  const auto kSmem_runtime = get_ksmem_size();
 
-  setup_kernel_smem_once<topk_transform_prefill_ragged_kernel, kSmem>();
-  topk_transform_prefill_ragged_kernel<<<grid, block, kSmem, stream>>>(
+#ifdef USE_ROCM
+  if (kSmem_runtime == 64 * 1024) {
+    setup_kernel_smem_runtime<topk_transform_prefill_ragged_kernel<64 * 1024>>(kSmem_runtime);
+    topk_transform_prefill_ragged_kernel<64 * 1024><<<grid, block, kSmem_runtime, stream>>>(
+        params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+  } else {
+    setup_kernel_smem_runtime<topk_transform_prefill_ragged_kernel<48 * 1024>>(kSmem_runtime);
+    topk_transform_prefill_ragged_kernel<48 * 1024><<<grid, block, kSmem_runtime, stream>>>(
+        params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+  }
+#else
+  setup_kernel_smem_runtime<topk_transform_prefill_ragged_kernel<kSmem>>(kSmem_runtime);
+  topk_transform_prefill_ragged_kernel<kSmem><<<grid, block, kSmem_runtime, stream>>>(
       params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+#endif
 
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));

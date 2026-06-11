@@ -374,19 +374,34 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 using FP8_TYPE = c10::Float8_e4m3fn;
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 #else  // USE_ROCM
-#if HIP_FP8_TYPE_FNUZ
+// Include both FP8 types for multi-arch support
+#include <c10/util/Float8_e4m3fn.h>
 #include <c10/util/Float8_e4m3fnuz.h>
+
+// Note: Runtime GPU architecture detection functions removed.
+// For multi-arch ROCm builds, use compile-time constants instead of runtime detection.
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+#endif  // USE_ROCM
+
+// FP8_TYPE definition for backward compatibility
+// NOTE: FP8_E4M3_MAX is deprecated for kernels with multi-arch support.
+// Kernels should use template parameters and runtime dispatch instead.
+// gfx942: E4M3FNUZ with max=224.0f, gfx950: E4M3FN with max=448.0f
+#if HIP_FP8_TYPE_FNUZ && HIP_FP8_TYPE_E4M3
+// Multi-arch build: Use gfx942 (E4M3FNUZ) type for legacy code paths.
+// Modern kernels (e.g., per_token_quant_fp8) use runtime dispatch to select the correct max.
 using FP8_TYPE = c10::Float8_e4m3fnuz;
 constexpr auto FP8_E4M3_MAX = 224.0f;
-#else
-#if HIP_FP8_TYPE_E4M3
-#include <c10/util/Float8_e4m3fn.h>
+#elif HIP_FP8_TYPE_FNUZ
+using FP8_TYPE = c10::Float8_e4m3fnuz;
+constexpr auto FP8_E4M3_MAX = 224.0f;
+#elif HIP_FP8_TYPE_E4M3
 using FP8_TYPE = c10::Float8_e4m3fn;
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 #else
 #error "fp8 is not supported in this processor (arch < gfx942)."
-#endif  // HIP_FP8_TYPE_E4M3
-#endif  // HIP_FP8_TYPE_FNUZ
+#endif  // FP8 type selection
 #endif  // USE_ROCM
 
 #define FULL_MASK 0xffffffff
