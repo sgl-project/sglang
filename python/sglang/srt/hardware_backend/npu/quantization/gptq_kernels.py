@@ -5,10 +5,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch_npu
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    npu_fused_experts,
-)
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
