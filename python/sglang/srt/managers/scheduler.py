@@ -2398,9 +2398,10 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
-        batch.req_pool_indices = torch.tensor(
-            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
+        batch.req_pool_indices_cpu = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64
         )
+        batch.req_pool_indices = batch.req_pool_indices_cpu.to(device=device)
         seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
         batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
