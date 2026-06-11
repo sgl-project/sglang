@@ -164,6 +164,7 @@ DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     dtype=torch.float32,
 )
 
+
 def cast_e2m1fn_to_e4m3fn(
     x: torch.Tensor, scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
