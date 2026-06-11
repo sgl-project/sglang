@@ -216,10 +216,10 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         stage_name = self._component_stage_name(stage_name)
         text_encoder_dtype = resolve_precision(
             server_args, "text_encoder", precision_attr="dit_precision"
-        ).dtype
+        )
         vae_dtype = resolve_precision(
             server_args, "vae", precision_attr="vae_precision"
-        ).dtype
+        )
         return [
             ComponentUse(
                 stage_name,

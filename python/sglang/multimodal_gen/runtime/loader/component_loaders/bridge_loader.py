@@ -64,7 +64,7 @@ class BridgeLoader(ComponentLoader):
 
         default_dtype = resolve_precision(
             server_args, component_name, precision_attr="dit_precision"
-        ).dtype
+        )
 
         logger.info(
             "Loading %s from %s safetensors files, default_dtype: %s",

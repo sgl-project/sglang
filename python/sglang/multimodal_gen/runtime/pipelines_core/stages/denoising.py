@@ -254,7 +254,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self.vae is not None:
             vae_dtype = resolve_precision(
                 server_args, "vae", precision_attr="vae_precision"
-            ).dtype
+            )
             uses.append(
                 ComponentUse(
                     stage_name=stage_name,
@@ -668,7 +668,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # Setup precision and autocast settings
         target_dtype = resolve_precision(
             server_args, "dit", precision_attr="dit_precision"
-        ).dtype
+        )
         autocast_enabled = precision_autocast_enabled(
             target_dtype, server_args.disable_autocast
         )
@@ -697,7 +697,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if should_preprocess_for_wan_ti2v:
             vae_dtype = resolve_precision(
                 server_args, "vae", precision_attr="vae_precision"
-            ).dtype
+            )
             with self.use_declared_component(
                 component_name="vae",
                 module=self.vae,

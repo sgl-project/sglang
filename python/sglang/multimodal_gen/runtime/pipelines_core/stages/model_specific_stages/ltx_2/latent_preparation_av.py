@@ -84,7 +84,7 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
             return batch.prompt_embeds.dtype
         return resolve_precision(
             server_args, "dit", precision_attr="dit_precision"
-        ).dtype
+        )
 
     @staticmethod
     def _packed_video_latent_shape(

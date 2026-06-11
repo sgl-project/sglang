@@ -188,7 +188,7 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
 
         default_dtype = resolve_precision(
             server_args, "dit", precision_attr="dit_precision"
-        ).dtype
+        )
         server_args.model_paths["transformer"] = os.path.dirname(self.model_path) or "."
         assert server_args.hsdp_shard_dim is not None, "hsdp_shard_dim must be set"
         logger.info(

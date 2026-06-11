@@ -617,4 +617,4 @@ def _resolve_target_param_dtype(
 ) -> Optional[torch.dtype]:
     if quant_config is not None or nunchaku_config is not None:
         return None
-    return resolve_precision(server_args, "dit", precision_attr="dit_precision").dtype
+    return resolve_precision(server_args, "dit", precision_attr="dit_precision")

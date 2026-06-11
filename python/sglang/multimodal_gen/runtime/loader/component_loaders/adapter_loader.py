@@ -53,7 +53,7 @@ class AdapterLoader(ComponentLoader):
         target_device = get_local_torch_device()
         default_dtype = resolve_precision(
             server_args, "connectors", precision_attr="dit_precision"
-        ).dtype
+        )
 
         with set_default_torch_dtype(default_dtype), skip_init_modules():
             connector_cfg = LTX2ConnectorConfig()

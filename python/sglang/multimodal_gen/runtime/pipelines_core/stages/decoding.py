@@ -107,7 +107,7 @@ class DecodingStage(PipelineStage):
     ) -> list[ComponentUse]:
         vae_dtype = resolve_precision(
             server_args, self.component_name, precision_attr="vae_precision"
-        ).dtype
+        )
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
@@ -165,11 +165,11 @@ class DecodingStage(PipelineStage):
         """
         latents = latents.to(get_local_torch_device())
         # Setup VAE precision from user policy.
-        vae_precision = resolve_precision(
+        vae_dtype = resolve_precision(
             server_args, self.component_name, precision_attr="vae_precision"
         )
         vae_autocast_enabled = autocast_enabled(
-            vae_precision.dtype, server_args.disable_autocast
+            vae_dtype, server_args.disable_autocast
         )
 
         # scale and shift
@@ -182,7 +182,7 @@ class DecodingStage(PipelineStage):
         # Decode latents
         with torch.autocast(
             device_type=current_platform.device_type,
-            dtype=vae_precision.dtype,
+            dtype=vae_dtype,
             enabled=vae_autocast_enabled,
         ):
             try:
@@ -191,11 +191,11 @@ class DecodingStage(PipelineStage):
                     self.vae.enable_tiling()
             except Exception:
                 pass
-            should_cast_vae = vae_precision.is_user_policy and not vae_autocast_enabled
+            should_cast_vae = not vae_autocast_enabled
             if not vae_autocast_enabled:
-                latents = latents.to(vae_precision.dtype)
+                latents = latents.to(vae_dtype)
             with temporary_module_dtype(
-                self.vae, vae_precision.dtype, enabled=should_cast_vae
+                self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
                 decode_output = vae.decode(latents)
                 image = _ensure_tensor_decode_output(decode_output)
@@ -238,7 +238,7 @@ class DecodingStage(PipelineStage):
 
         vae_dtype = resolve_precision(
             server_args, self.component_name, precision_attr="vae_precision"
-        ).dtype
+        )
         with self.use_declared_component(
             component_name=self.component_name,
             module=self.vae,

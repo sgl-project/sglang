@@ -128,10 +128,10 @@ class VAELoader(ComponentLoader):
             )
         vae_config = getattr(server_args.pipeline_config, pipeline_vae_config_attr)
         vae_precision = getattr(server_args.pipeline_config, pipeline_vae_precision)
-        vae_precision_spec = resolve_component_precision(server_args, component_name)
+        resolved_vae_dtype = resolve_component_precision(server_args, component_name)
         vae_dtype = (
-            vae_precision_spec.dtype
-            if vae_precision_spec is not None
+            resolved_vae_dtype
+            if resolved_vae_dtype is not None
             else PRECISION_TO_TYPE[vae_precision]
         )
         vae_config.update_model_arch(config)

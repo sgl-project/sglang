@@ -284,7 +284,7 @@ class ComponentLoader(ABC):
         )
         load_kwargs = {}
         if precision is not None:
-            load_kwargs["torch_dtype"] = precision.dtype
+            load_kwargs["torch_dtype"] = precision
 
         if transformers_or_diffusers == "transformers":
             from transformers import AutoModel

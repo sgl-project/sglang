@@ -48,10 +48,10 @@ class VocoderLoader(ComponentLoader):
         vocoder_config = LTXVocoderConfig()
         vocoder_config.update_model_arch(config)
 
-        vocoder_precision = resolve_component_precision(server_args, "vocoder")
+        resolved_vocoder_dtype = resolve_component_precision(server_args, "vocoder")
         vocoder_dtype = (
-            vocoder_precision.dtype
-            if vocoder_precision is not None
+            resolved_vocoder_dtype
+            if resolved_vocoder_dtype is not None
             else PRECISION_TO_TYPE["fp32"]
         )
 
