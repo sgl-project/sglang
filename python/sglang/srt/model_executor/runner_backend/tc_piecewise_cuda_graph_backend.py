@@ -27,6 +27,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -181,11 +182,10 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     def capture_one(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
-        num_tokens: Optional[int] = None,
     ) -> None:
         # Call 1 warms FX state; call 2 captures the cuda graph inside capture_session.
         # See cuda_piecewise_backend.py for the FX backend that drives the capture.
@@ -196,7 +196,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
+    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         # torch.compile manages its per-shape cache internally.
         # _run_compile_pass warms every shape in capture_num_tokens at __init__.
         return True
@@ -208,7 +208,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     def replay(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:

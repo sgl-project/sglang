@@ -23,6 +23,7 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
+    ShapeKey,
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
@@ -248,8 +249,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        # EAGLE doesn't use stream_idx / lora variants; key is just bs.
-        return bs
+        # EAGLE doesn't use stream_idx / lora variants.
+        return ShapeKey(size=bs * self.num_tokens_per_bs)
 
     # -----------------------------------------------------------------
     # can_run

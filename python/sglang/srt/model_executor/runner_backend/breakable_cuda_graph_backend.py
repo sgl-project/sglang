@@ -14,6 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -54,9 +55,9 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
-        # PR #27659: persistent output storage shared across capture sizes when
-        # the caller passes num_tokens. Allocated lazily inside the
-        # first capture_one of a session, reset at capture_session entry.
+        # PR #27659: persistent output storage shared across capture sizes.
+        # Allocated lazily inside the first capture_one of a session, reset
+        # at capture_session entry.
         self._shared_output_buffer: Optional[Any] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -85,11 +86,10 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
 
     def capture_one(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
-        num_tokens: Optional[int] = None,
     ) -> None:
         for _ in range(2):
             self._device_module.synchronize()
@@ -102,28 +102,26 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
+        size = shape_key.size
         with BreakableCUDAGraphCapture(
             cuda_graph=graph,
             pool=self._pool,
             stream=self._capture_stream,
         ):
             out = captured_fn()
-            # PR #27659: when num_tokens is provided, share a single
-            # persistent output buffer across capture sizes. The runner iterates
-            # capture sizes largest-first, so the first capture allocates the
-            # full-size buffer; subsequent captures copy their replay output
-            # into it (recorded inside the captured graph).
-            if num_tokens is not None and self._shared_output_buffer is not None:
-                self._copy_output_to_buffer(out, self._shared_output_buffer, num_tokens)
+            # PR #27659: share a single persistent output buffer across capture
+            # sizes. The runner iterates capture sizes largest-first, so the
+            # first capture allocates the full-size buffer; subsequent captures
+            # copy their replay output into it (recorded inside the captured
+            # graph).
+            if self._shared_output_buffer is not None:
+                self._copy_output_to_buffer(out, self._shared_output_buffer, size)
 
-        if num_tokens is None:
-            stored = out
+        if self._shared_output_buffer is None:
+            self._shared_output_buffer = out
+            stored = self._slice_output(out, size)
         else:
-            if self._shared_output_buffer is None:
-                self._shared_output_buffer = out
-                stored = self._slice_output(out, num_tokens)
-            else:
-                stored = self._slice_output(self._shared_output_buffer, num_tokens)
+            stored = self._slice_output(self._shared_output_buffer, size)
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
@@ -183,7 +181,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             f"{type(output)} vs {type(output_buffer)}"
         )
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
+    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
 
     @contextmanager
@@ -193,7 +191,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
 
     def replay(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
