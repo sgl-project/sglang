@@ -183,9 +183,8 @@ class StandardDispatcher(BaseDispatcher):
                     (self.num_experts,), -1, dtype=torch.int32, device=device
                 )
                 self.local_expert_mapping[
-                    self.moe_ep_rank * self.num_local_routed_experts : (
-                        self.moe_ep_rank + 1
-                    )
+                    self.moe_ep_rank
+                    * self.num_local_routed_experts : (self.moe_ep_rank + 1)
                     * self.num_local_routed_experts
                 ] = torch.arange(
                     0, self.num_local_routed_experts, dtype=torch.int32, device=device

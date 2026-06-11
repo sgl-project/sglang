@@ -157,7 +157,9 @@ def minimax_sparse_decode(
     dense_main_attn_fn: Optional[Callable] = None,
     page_size: int = 1,
     use_msa: bool = False,
-    msa_kv_indices: Optional[torch.Tensor] = None,  # per-forward MSA page table (cached)
+    msa_kv_indices: Optional[
+        torch.Tensor
+    ] = None,  # per-forward MSA page table (cached)
     msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Step 1: Flash decode with topk index (using index head). When the dense main

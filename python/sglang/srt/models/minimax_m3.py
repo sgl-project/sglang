@@ -237,6 +237,7 @@ def build_minimax_fused_qkv_index(model: nn.Module) -> None:
         if isinstance(module, MiniMaxM3Attention):
             module.maybe_build_fused_qkv_index()
 
+
 class MiniMaxM3MLP(nn.Module):
     def __init__(
         self,
@@ -564,9 +565,9 @@ class MiniMaxM3Attention(nn.Module):
                 f"sparse attention only supports qk_norm_type='per_head', "
                 f"got {self.qk_norm_type!r}"
             )
-            assert not self.attention_output_gate, (
-                "sparse attention does not support attention_output_gate"
-            )
+            assert (
+                not self.attention_output_gate
+            ), "sparse attention does not support attention_output_gate"
             sparse_cfg = config.sparse_attention_config
             self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
             self.idx_head_dim = sparse_cfg["sparse_index_dim"]
@@ -796,8 +797,7 @@ class MiniMaxM3Attention(nn.Module):
             self.is_sparse_attention_layer
             and _has_rocm_qk_norm_rope
             and self.use_gemma_norm
-            and self.index_q_norm.variance_epsilon
-            == self.index_k_norm.variance_epsilon
+            and self.index_q_norm.variance_epsilon == self.index_k_norm.variance_epsilon
             and hasattr(self.index_rotary_emb, "cos_sin_cache")
             and self.index_rotary_emb.rotary_dim == self.rotary_dim
             and self.rotary_dim <= self.idx_head_dim
@@ -1229,9 +1229,7 @@ class MiniMaxM3Attention(nn.Module):
                     # Main q/k were normed+roped by the fused base kernel
                     # above; only the index branch still needs norm+rope.
                     idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
-                    idx_q, idx_k = self._index_qk_norm_rope(
-                        positions, idx_q, idx_k
-                    )
+                    idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
             else:
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
                 # Prefer the PR's ROCm sparse cache-store + norm/rope fusion
@@ -1690,9 +1688,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             return
 
         self.num_fused_shared_experts = self.config.n_shared_experts
-        assert self.num_fused_shared_experts == 1, (
-            "Only 1 fused shared expert is supported for Glm4MoeForCausalLM"
-        )
+        assert (
+            self.num_fused_shared_experts == 1
+        ), "Only 1 fused shared expert is supported for Glm4MoeForCausalLM"
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):

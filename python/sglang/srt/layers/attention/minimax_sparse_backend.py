@@ -72,10 +72,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # for the main sparse-attention step when the kernel constraints hold.
         # The lightning indexer remains unchanged; missing fmha_sm100 keeps the
         # existing Triton path.
+        from sglang.srt.environ import envs
         from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
             msa_available,
         )
-        from sglang.srt.environ import envs
 
         self.use_msa = (
             not envs.SGLANG_DISABLE_MSA.get()
@@ -414,6 +414,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         attn_fn = None
         if self.use_dense_sparse_decode and k_cache.shape[1] == 1:
+
             def attn_fn(main_q, page_table, real_seq_lens):
                 return self._dense_sparse_main_decode(
                     main_q,

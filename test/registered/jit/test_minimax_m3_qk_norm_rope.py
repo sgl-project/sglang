@@ -19,6 +19,10 @@ from sglang.jit_kernel.minimax_m3.qk_norm_rope import (  # noqa: E402
     sparse_qk_index_gemma_rmsnorm_rope,
     sparse_qk_index_gemma_rmsnorm_rope_cache,
 )
+from sglang.test.ci.ci_register import register_amd_ci  # noqa: E402
+
+# ROCm-only fused kernel; runs in the AMD jit-kernel unit suite.
+register_amd_ci(est_time=30, suite="jit-kernel-unit-test-amd")
 
 DEVICE = "cuda"
 EPS = 1e-6
@@ -322,3 +326,9 @@ def test_sparse_qk_index_gemma_rmsnorm_rope_cache_matches_reference(
         atol=3e-2,
         rtol=3e-2,
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

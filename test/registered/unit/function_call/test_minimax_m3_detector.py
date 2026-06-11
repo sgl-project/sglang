@@ -143,9 +143,7 @@ def _stream_segments(segments, tools):
     for seg in _segments(*segments):
         all_calls.extend(detector.parse_streaming_increment(seg, tools).calls)
     collected = _collect_streamed_tool_calls(all_calls)
-    return [
-        {"name": c["name"], "args": json.loads(c["parameters"])} for c in collected
-    ]
+    return [{"name": c["name"], "args": json.loads(c["parameters"])} for c in collected]
 
 
 def _parse_segments(segments, tools):
@@ -162,11 +160,18 @@ class TestMinimaxM3HasToolCall(CustomTestCase):
         self.detector = MinimaxM3Detector()
 
     def test_has_tool_call_true(self):
-        text = _wire("<tool_call>", '<invoke name="get_current_date">', "</invoke>", "</tool_call>")
+        text = _wire(
+            "<tool_call>",
+            '<invoke name="get_current_date">',
+            "</invoke>",
+            "</tool_call>",
+        )
         self.assertTrue(self.detector.has_tool_call(text))
 
     def test_has_tool_call_false(self):
-        self.assertFalse(self.detector.has_tool_call("The weather in Beijing is sunny."))
+        self.assertFalse(
+            self.detector.has_tool_call("The weather in Beijing is sunny.")
+        )
 
 
 class TestMinimaxM3DetectAndParse(CustomTestCase):

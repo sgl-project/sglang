@@ -50,10 +50,16 @@ def _build_page_table(
     """
     P = page_size
     n_pages = (seq_lens.to(torch.int64) + (P - 1)) // P  # [batch]
-    offsets = torch.cumsum(n_pages, 0) - n_pages  # [batch] exclusive page offset per request
+    offsets = (
+        torch.cumsum(n_pages, 0) - n_pages
+    )  # [batch] exclusive page offset per request
     total = int(n_pages.sum().item())
-    idx = torch.arange(total, device=req_to_token.device)  # packed page slot -> (req, page)
-    req = torch.searchsorted(offsets + n_pages, idx, right=True)  # request id per packed slot
+    idx = torch.arange(
+        total, device=req_to_token.device
+    )  # packed page slot -> (req, page)
+    req = torch.searchsorted(
+        offsets + n_pages, idx, right=True
+    )  # request id per packed slot
     logical_first = (idx - offsets[req]) * P  # first logical position of that page
     rows = slot_ids[req].to(torch.int64)
     return (req_to_token[rows, logical_first] // P).to(torch.int32)
@@ -176,7 +182,12 @@ def build_msa_decode_meta(
 # (cos 1.0 vs eager, 0.99999 vs dense ref).
 # ---------------------------------------------------------------------------
 
-_MSA_CG_LEN_KEYS = ("kv_segment_lens", "kv_segment_offsets", "kv_page_indptr", "qo_offset")
+_MSA_CG_LEN_KEYS = (
+    "kv_segment_lens",
+    "kv_segment_offsets",
+    "kv_page_indptr",
+    "qo_offset",
+)
 
 
 def _check_cg_plan_layout(plan) -> None:
@@ -290,7 +301,9 @@ def msa_sparse_decode_main(
     seq_lens: torch.Tensor,  # [batch] cached KV length per request
     block_size_k: int,  # == page_size == 128
     sm_scale: Optional[float] = None,
-    kv_indices: Optional[torch.Tensor] = None,  # precomputed page table (per-forward cache)
+    kv_indices: Optional[
+        torch.Tensor
+    ] = None,  # precomputed page table (per-forward cache)
     plan=None,  # precomputed fmha_sm100 plan (per-forward cache)
 ) -> torch.Tensor:
     """Drop-in for flash_decode_with_gqa_share_sparse using MSA fmha_sm100.

@@ -209,6 +209,9 @@ def moe_fused_gate(
     assert bias.ndim == 1, "bias must be 1D"
     assert scores.size(1) == bias.size(0), "scores and bias must have same num_experts"
     assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
+    # Callers (e.g. step3p5) may pass routed_scaling_factor=None meaning "no scaling".
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
 
     M, N = scores.shape
     K = topk

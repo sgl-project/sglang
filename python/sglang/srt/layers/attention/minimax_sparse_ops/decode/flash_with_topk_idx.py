@@ -416,7 +416,9 @@ def _decode_score_attn_kernel(
                     s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1)
                 )
         else:
-            tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(
+                s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1)
+            )
         # max-of-max == max(qk), avoids re-scanning qk
         m_ij = tl.maximum(m_i, tl.max(sub_max, axis=1))
         p = tl.exp2(qk - m_ij[:, None])
