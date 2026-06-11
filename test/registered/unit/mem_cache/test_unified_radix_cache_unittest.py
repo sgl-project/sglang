@@ -1446,7 +1446,8 @@ class UnifiedRadixCacheSuite:
         tokens = self._make_seq(1, pre_len)
         req.origin_input_ids = tokens
         req.output_ids = []
-        req.fill_ids = tokens[:]
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
         kv_indices = self._alloc(allocator, pre_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv_committed_len = pre_len
@@ -1497,7 +1498,8 @@ class UnifiedRadixCacheSuite:
         tokens = self._make_seq(1, pre_len)
         req.origin_input_ids = tokens
         req.output_ids = []
-        req.fill_ids = tokens[:]
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
         kv_indices = self._alloc(allocator, pre_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv_committed_len = pre_len
