@@ -33,6 +33,14 @@ on:
         options:
           - mi300
           - mi325
+      rocm_version:
+        description: 'ROCm container variant (empty = Dockerfile default; rocm720 = ROCm 7.2.0)'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - rocm720
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
         required: false
@@ -47,6 +55,11 @@ on:
     inputs:
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      rocm_version:
+        description: 'ROCm container variant (empty = Dockerfile default; rocm720 = ROCm 7.2.0)'
         required: false
         type: string
         default: ''
@@ -100,7 +113,7 @@ jobs:
 
   # =============================================== extra-a (1-gpu-small) ===============================================
   extra-a-test-1-gpu-small-amd:
-    name: ${{ format('extra-a-test-1-gpu-small-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
+    name: ${{ format('extra-a-test-1-gpu-small-amd{0} (linux-{1}-1gpu-sglang, {2})', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     strategy:
@@ -118,7 +131,8 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        # `rocm_version` (e.g. rocm720) selects an alternate ROCm container; empty uses the Dockerfile default.
+        run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
