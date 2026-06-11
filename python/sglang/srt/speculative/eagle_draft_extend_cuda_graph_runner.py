@@ -167,7 +167,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
             )
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
             )
             extend_seq_lens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
@@ -221,7 +221,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32, device="cpu"
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
         self.buffers = EagleDraftExtendInputBuffers(

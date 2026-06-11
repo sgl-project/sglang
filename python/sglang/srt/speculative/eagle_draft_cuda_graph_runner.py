@@ -170,7 +170,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 else None
             )
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
             )
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
@@ -204,7 +204,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_for_logprob_gpu = None
 
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32, device="cpu"
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
         self.buffers = EagleDraftInputBuffers(

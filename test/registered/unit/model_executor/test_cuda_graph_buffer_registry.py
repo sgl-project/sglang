@@ -819,8 +819,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.tensor([0, 1], dtype=torch.int64),
             out_cache_loc=torch.tensor([100, 101], dtype=torch.int64),
             req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
-            seq_lens=torch.tensor([7, 8], dtype=torch.int32),
-            seq_lens_cpu=torch.tensor([7, 8], dtype=torch.int32),
+            seq_lens=torch.tensor([7, 8], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([7, 8], dtype=torch.int64),
             mrope_positions=torch.tensor([[0, 1], [0, 1], [0, 1]], dtype=torch.int64),
         )
         # Poison tails so resets are observable.
@@ -847,14 +847,16 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertTrue(torch.equal(rp[2:4], torch.tensor([0, 0])))
         # FILL_SENTINEL: head copied, tail = seq_len_fill_value.
         sl = reg.get_slot("seq_lens").buffer
-        self.assertTrue(torch.equal(sl[:2], torch.tensor([7, 8], dtype=torch.int32)))
+        self.assertEqual(sl.dtype, torch.int64)
+        self.assertTrue(torch.equal(sl[:2], torch.tensor([7, 8], dtype=torch.int64)))
         self.assertTrue(
-            torch.equal(sl[2:4], torch.tensor([FILL, FILL], dtype=torch.int32))
+            torch.equal(sl[2:4], torch.tensor([FILL, FILL], dtype=torch.int64))
         )
         slc = reg.get_slot("seq_lens_cpu").buffer
         self.assertEqual(slc.device.type, "cpu")
+        self.assertEqual(slc.dtype, torch.int64)
         self.assertTrue(
-            torch.equal(slc[2:4], torch.tensor([FILL, FILL], dtype=torch.int32))
+            torch.equal(slc[2:4], torch.tensor([FILL, FILL], dtype=torch.int64))
         )
         # 2D mrope via slice_fn.
         mr = reg.get_slot("mrope_positions").buffer
@@ -879,8 +881,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.zeros(8, dtype=torch.int64),
             out_cache_loc=torch.zeros(8, dtype=torch.int64),
             req_pool_indices=torch.zeros(4, dtype=torch.int64),
-            seq_lens=torch.full((4,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
@@ -915,8 +917,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.zeros(8, dtype=torch.int64),
             out_cache_loc=torch.zeros(8, dtype=torch.int64),
             req_pool_indices=torch.zeros(4, dtype=torch.int64),
-            seq_lens=torch.full((4,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             num_token_non_padded=ntnp,
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
@@ -976,8 +978,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.arange(2, dtype=torch.int64),
             out_cache_loc=torch.arange(2, dtype=torch.int64),
             req_pool_indices=torch.zeros(2, dtype=torch.int64),
-            seq_lens=torch.full((2,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((2,), 5, dtype=torch.int32),
+            seq_lens=torch.full((2,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((2,), 5, dtype=torch.int64),
             global_num_tokens_gpu=gnt,
             global_num_tokens_for_logprob_gpu=gntlp,
         )
@@ -1014,8 +1016,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.zeros(8, dtype=torch.int64),
             out_cache_loc=torch.zeros(8, dtype=torch.int64),
             req_pool_indices=torch.zeros(4, dtype=torch.int64),
-            seq_lens=torch.full((4,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
@@ -1062,8 +1064,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.zeros(8, dtype=torch.int64),
             out_cache_loc=torch.zeros(8, dtype=torch.int64),
             req_pool_indices=torch.zeros(4, dtype=torch.int64),
-            seq_lens=torch.full((4,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
@@ -1110,8 +1112,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             positions=torch.zeros(8, dtype=torch.int64),
             out_cache_loc=torch.zeros(8, dtype=torch.int64),
             req_pool_indices=torch.zeros(4, dtype=torch.int64),
-            seq_lens=torch.full((4,), 5, dtype=torch.int32),
-            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
