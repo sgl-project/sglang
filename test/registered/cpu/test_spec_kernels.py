@@ -6,13 +6,13 @@ import torch.nn.functional as F
 from torch.nn.functional import softplus
 from utils import precision
 
+from sglang.srt.speculative.eagle_utils import TreeMaskMode, organize_draft_results
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-torch.manual_seed(1234)
+register_cpu_ci(est_time=20, suite="base-b-test-cpu")
 
-# TreeMaskMode values (sglang.srt.speculative.eagle_utils.TreeMaskMode)
-FULL_MASK = 0
-QLEN_ONLY = 1
+torch.manual_seed(1234)
 
 PAD_SLOT_ID = -1
 
@@ -120,7 +120,7 @@ def _run_build_tree_kernel(
     parent_list, selected_index, seq_lens, topk, num_steps, draft_token_num, mode
 ):
     bs = seq_lens.numel()
-    if mode == QLEN_ONLY:
+    if mode == TreeMaskMode.QLEN_ONLY:
         tree_mask = torch.full(
             (bs * draft_token_num * draft_token_num,), True, dtype=torch.bool
         )
@@ -304,6 +304,65 @@ class TestVerifyTreeGreedy(CustomTestCase):
         self.assertEqual(accept_indices.tolist(), [[0, 1, 2, -1]])
         self.assertEqual(num_correct_drafts.tolist(), [2])
 
+    def test_verify_tree_greedy_upstream_golden(self):
+        # Golden fixture ported from the CUDA kernel UT
+        # sgl-kernel/tests/speculative/test_eagle_utils.py::test_verify_tree_greedy
+        # (device swapped to CPU); expected outputs are the CUDA kernel's.
+        candidates = torch.tensor(
+            [
+                [0, 1, 2, 3, 4, 5],
+                [7, 8, 9, 10, 11, 12],
+            ],
+            dtype=torch.int64,
+        )
+        retrieve_index = torch.tensor(
+            [
+                [0, 1, 2, 3, 4, 5],
+                [6, 7, 8, 9, 10, 11],
+            ],
+            dtype=torch.int64,
+        )
+        retrieve_next_token = torch.tensor(
+            [
+                [1, 2, -1, 4, 5, -1],
+                [4, 2, 3, -1, 5, -1],
+            ],
+            dtype=torch.int64,
+        )
+        retrieve_next_sibling = torch.tensor(
+            [
+                [-1, 3, -1, -1, -1, -1],
+                [-1, -1, -1, -1, 1, -1],
+            ],
+            dtype=torch.int64,
+        )
+
+        target_logits = torch.full((2, 6, 20), 1, dtype=torch.float32)
+        target_logits[0, 0, 3] = 10
+        target_logits[0, 3, 4] = 10
+        target_logits[0, 4, 5] = 10
+        target_logits[1, 0, 11] = 10
+        target_logits[1, 4, 12] = 10
+        for i in range(target_logits.shape[0]):
+            for j in range(target_logits.shape[1]):
+                if torch.max(target_logits[i][j]) < 10:
+                    target_logits[i][j][18] = 10
+        target_predict = torch.argmax(target_logits, dim=-1)
+
+        predicts, accept_indices, num_correct_drafts = self._run_and_check(
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
+            4,  # num_spec_step
+        )
+        self.assertEqual(
+            predicts.tolist(), [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18]
+        )
+        self.assertEqual(accept_indices.tolist(), [[0, 3, 4, 5], [6, 10, 11, -1]])
+        self.assertEqual(num_correct_drafts.tolist(), [3, 2])
+
     def test_verify_tree_greedy_tree_topk4(self):
         # EAGLE config: topk=4, steps=3, draft_token_num=16
         topk, num_steps, draft_token_num = 4, 3, 16
@@ -322,7 +381,7 @@ class TestVerifyTreeGreedy(CustomTestCase):
                         topk,
                         num_steps,
                         draft_token_num,
-                        QLEN_ONLY,
+                        TreeMaskMode.QLEN_ONLY,
                     )
                 )
                 # the random trees must branch, otherwise sibling traversal
@@ -378,7 +437,7 @@ class TestBuildTreeKernelEfficient(CustomTestCase):
             topk,
             num_steps,
             draft_token_num,
-            QLEN_ONLY,
+            TreeMaskMode.QLEN_ONLY,
         )
         torch.testing.assert_close(retrieve_index, retrieve_index_ref, atol=0, rtol=0)
         torch.testing.assert_close(
@@ -410,7 +469,7 @@ class TestBuildTreeKernelEfficient(CustomTestCase):
             topk,
             num_steps,
             draft_token_num,
-            FULL_MASK,
+            TreeMaskMode.FULL_MASK,
         )
         torch.testing.assert_close(retrieve_index_f, retrieve_index_ref, atol=0, rtol=0)
         torch.testing.assert_close(
@@ -476,7 +535,7 @@ class TestBuildTreeKernelEfficient(CustomTestCase):
             topk,
             num_steps,
             draft_token_num,
-            QLEN_ONLY,
+            TreeMaskMode.QLEN_ONLY,
         )
         self.assertEqual(retrieve_index.tolist(), [[0, 1, 2, 3]])
         self.assertEqual(retrieve_next_token.tolist(), [[1, 3, -1, -1]])
@@ -494,6 +553,173 @@ class TestBuildTreeKernelEfficient(CustomTestCase):
         # Cross-check the python reference on the same hand-built case.
         self._check_against_reference(
             parent_list, selected_index, seq_lens, topk, num_steps, draft_token_num
+        )
+
+    def test_build_tree_upstream_golden(self):
+        # Captured EAGLE trace ported from the CUDA UT
+        # test/registered/spec/utils/test_build_eagle_tree.py::TestBuildEagleTree::
+        # test_build_tree_kernel_efficient (device swapped to CPU). The inputs go
+        # through the same organize_draft_results; the expected positions and
+        # retrieve_* vectors are the CUDA kernel's.
+        score_list = [
+            torch.tensor(
+                [
+                    [[7.1127e-01, 2.8292e-01, 2.2995e-03, 1.7357e-03]],
+                    [[9.7476e-01, 2.2219e-02, 6.5031e-04, 1.3212e-04]],
+                ],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [
+                    [
+                        [6.9142e-01, 1.2863e-02, 1.6873e-03, 1.1871e-03],
+                        [2.4787e-01, 1.8818e-02, 1.4204e-02, 9.2235e-04],
+                        [2.2971e-03, 1.6700e-06, 1.8737e-07, 8.3146e-08],
+                        [1.2771e-03, 2.4374e-04, 1.7832e-04, 1.1947e-05],
+                    ],
+                    [
+                        [8.4832e-02, 6.6068e-02, 5.8304e-02, 5.7851e-02],
+                        [2.3616e-03, 1.1243e-03, 5.4368e-04, 2.7768e-04],
+                        [2.5286e-04, 1.5578e-04, 2.8817e-05, 1.2888e-05],
+                        [1.2834e-04, 2.5417e-06, 1.1279e-06, 1.6088e-08],
+                    ],
+                ],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [
+                    [
+                        [6.6438e-01, 2.6997e-02, 2.4236e-05, 4.0821e-06],
+                        [2.4402e-01, 2.8409e-03, 5.0935e-04, 2.9022e-04],
+                        [1.6178e-02, 2.0567e-03, 4.5892e-04, 3.0034e-05],
+                        [1.3023e-02, 5.0497e-04, 3.6371e-04, 8.7750e-05],
+                    ],
+                    [
+                        [2.3263e-02, 2.0054e-02, 9.3990e-03, 2.7783e-03],
+                        [6.4156e-02, 5.5506e-04, 1.0429e-04, 9.7211e-05],
+                        [4.9950e-02, 5.0630e-03, 9.0068e-04, 3.3656e-04],
+                        [7.5817e-03, 8.5731e-04, 6.9972e-04, 6.0793e-04],
+                    ],
+                ],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [
+                    [
+                        [6.6420e-01, 1.0525e-04, 6.5864e-05, 1.2253e-06],
+                        [1.3019e-01, 1.0461e-01, 5.2083e-03, 1.6777e-03],
+                        [2.0103e-02, 6.7335e-03, 1.2625e-04, 1.0364e-05],
+                        [1.5142e-02, 7.0819e-04, 9.6595e-05, 8.7951e-05],
+                    ],
+                    [
+                        [5.8608e-02, 1.8840e-03, 7.8535e-04, 4.4400e-04],
+                        [1.2185e-02, 2.0684e-03, 1.7418e-03, 1.4327e-03],
+                        [6.2455e-03, 6.1487e-03, 2.6862e-03, 1.8034e-03],
+                        [1.8590e-03, 1.6151e-03, 1.2481e-03, 3.6038e-04],
+                    ],
+                ],
+                dtype=torch.float32,
+            ),
+        ]
+        token_list = [
+            torch.tensor(
+                [[29896, 29906, 29900, 29945], [13, 2, 29871, 28956]],
+                dtype=torch.int64,
+            ),
+            # fmt: off
+            torch.tensor(
+                [
+                    [29889, 29974, 29945, 29900, 29974, 29922, 29930, 29958,
+                     29889, 29974, 29930, 29945, 29974, 29922, 29930, 29958],
+                    [22550, 4136, 16492, 8439, 29871, 2, 3001, 13,
+                     2, 13, 29906, 29946, 2, 13, 29871, 259],
+                ],
+            ),
+            torch.tensor(
+                [
+                    [29946, 29945, 29953, 29906, 29896, 29945, 29900, 29906,
+                     29896, 29945, 29906, 29953, 29896, 29945, 29906, 29946],
+                    [29871, 2, 29901, 29889, 29871, 2, 395, 259,
+                     29901, 29871, 2, 29889, 3001, 1234, 7146, 2186],
+                ],
+            ),
+            torch.tensor(
+                [
+                    [29946, 29974, 29945, 29930, 29889, 29922, 29974, 29930,
+                     29974, 29946, 29930, 29922, 29889, 29974, 29945, 29922],
+                    [29941, 29906, 2, 29946, 29871, 450, 319, 14990,
+                     29946, 29941, 2, 29906, 29871, 2, 3001, 13],
+                ],
+            ),
+            # fmt: on
+        ]
+        parents_list = [
+            torch.tensor([[-1, 0, 1, 2, 3], [-1, 0, 1, 2, 3]], dtype=torch.int64),
+            torch.tensor([[4, 8, 9, 10], [4, 5, 6, 7]], dtype=torch.int64),
+            torch.tensor([[20, 24, 21, 28], [24, 28, 20, 21]], dtype=torch.int64),
+            torch.tensor([[36, 40, 41, 44], [36, 40, 44, 45]], dtype=torch.int64),
+        ]
+        seq_lens = torch.tensor([5, 10], dtype=torch.int64)
+        topk, depth, draft_token_num = 4, 4, 8
+
+        parent_list, selected_index, draft_tokens = organize_draft_results(
+            score_list, token_list, parents_list, draft_token_num
+        )
+        # The CUDA golden interleaves the bonus tokens [29974, 13] at positions
+        # 0 and 8; on CPU that concat happens outside the kernel, so compare the
+        # drafts only.
+        self.assertEqual(
+            draft_tokens.tolist(),
+            [
+                [29896, 29906, 29889, 29974, 29946, 29896, 29946],
+                [13, 22550, 4136, 16492, 8439, 29871, 29941],
+            ],
+        )
+
+        (
+            _,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+        ) = _run_build_tree_kernel(
+            parent_list,
+            selected_index,
+            seq_lens,
+            topk,
+            depth,
+            draft_token_num,
+            TreeMaskMode.QLEN_ONLY,
+        )
+        self.assertEqual(
+            positions.tolist(),
+            [5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 12, 12, 12, 13, 14],
+        )
+        self.assertEqual(
+            retrieve_index.tolist(),
+            [
+                [0, 1, 2, 3, 4, 5, 6, 7],
+                [8, 9, 10, 11, 12, 13, 14, 15],
+            ],
+        )
+        self.assertEqual(
+            retrieve_next_token.tolist(),
+            [
+                [1, 3, 4, 5, 6, 7, -1, -1],
+                [1, 2, -1, 6, -1, -1, 7, -1],
+            ],
+        )
+        self.assertEqual(
+            retrieve_next_sibling.tolist(),
+            [
+                [-1, 2, -1, -1, -1, -1, -1, -1],
+                [-1, -1, 3, 4, 5, -1, -1, -1],
+            ],
+        )
+        # Cross-check the python reference (incl. tree masks, which the CUDA UT
+        # does not assert) on the same trace.
+        self._check_against_reference(
+            parent_list, selected_index, seq_lens, topk, depth, draft_token_num
         )
 
     def test_build_tree_topk4_random(self):
@@ -869,13 +1095,15 @@ class TestExtendAttentionTreeMask(CustomTestCase):
             topk,
             num_steps,
             draft_token_num,
-            QLEN_ONLY,
+            TreeMaskMode.QLEN_ONLY,
         )
         o_extend = self._run_kernel(inputs, draft_token_num, tree_mask)
         qlen_masks = tree_mask.view(bs, draft_token_num, draft_token_num)
         o_ref = self._ref_sdpa(
             inputs, draft_token_num, [qlen_masks[i] for i in range(bs)]
         )
+        # 2x the shared bf16 tolerance: the sparse tree mask leaves few terms
+        # per row, so single-element bf16 rounding differences dominate.
         torch.testing.assert_close(o_extend.float(), o_ref, atol=2e-2, rtol=2e-2)
 
 
