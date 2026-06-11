@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from typing import Dict, List, TypedDict
 
 import torch
@@ -59,7 +60,13 @@ def get_model_config(
         assert len(block_shape) == 2
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
-        config = config.get_text_config()
+        text_config = config.get_text_config()
+        # Some models (e.g. MiniMax-M3) carry text_config as a plain dict; wrap
+        # it so downstream attribute access works uniformly.
+        if isinstance(text_config, dict):
+            config = SimpleNamespace(**text_config)
+        else:
+            config = text_config
 
     hidden_size = config.hidden_size
     if architecture == "DbrxForCausalLM":
@@ -148,6 +155,10 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+    elif architecture == "MiniMaxM3SparseForConditionalGeneration":
+        E = config.num_local_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size
@@ -158,12 +169,24 @@ def get_model_config(
         intermediate_size, tp_size, ep_size
     )
 
+    # MiniMax-M3 ships an MXFP8 checkpoint (weight_block_size=[1,32]) but on
+    # gfx942 the weights are converted to block-fp8 [128,128] at load, so the
+    # serving MoE kernel looks up block_shape=[128,128] configs. Tune for that.
+    if architecture == "MiniMaxM3SparseForConditionalGeneration" and block_shape == [
+        1,
+        32,
+    ]:
+        block_shape = [128, 128]
+
+    # text_config may not carry torch_dtype; fall back to bf16.
+    torch_dtype = getattr(config, "torch_dtype", None) or torch.bfloat16
+
     return {
         "num_experts": E,
         "topk": topk,
         "hidden_size": hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
-        "dtype": config.torch_dtype,
+        "dtype": torch_dtype,
         "block_shape": block_shape,
         "architecture": architecture,
     }

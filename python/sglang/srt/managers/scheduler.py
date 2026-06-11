@@ -1058,8 +1058,8 @@ class Scheduler(
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
-        ):  # *2 for the headroom.
-            buffer_size = (self.req_to_token_pool.size) * 2
+        ):  # *8 for the headroom.
+            buffer_size = (self.req_to_token_pool.size) * 8
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )

@@ -1572,6 +1572,13 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
+        if self.reasoning_parser in ["minimax-m3"]:
+            # Models that thinking by default, and can be disabled by setting thinking_mode=disabled
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("thinking_mode") != "disabled"
+            )
+
         if self.reasoning_parser == "hunyuan":
             # Hy3-preview template emits no <think> when reasoning_effort is
             # "no_think" / "none" / unset; forcing reasoning would route all

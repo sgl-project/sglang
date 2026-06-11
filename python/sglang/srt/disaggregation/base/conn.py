@@ -18,6 +18,7 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     DSA = "dsa"
+    MINIMAX_INDEX_K = "minimax_index_k"
 
 
 @dataclasses.dataclass
