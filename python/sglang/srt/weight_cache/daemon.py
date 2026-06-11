@@ -531,11 +531,7 @@ def launch_weight_cache_daemons(
         if revision:
             cmd += ["--revision", revision]
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+        proc = subprocess.Popen(cmd)
         procs.append(proc)
         logger.info(
             f"Launched weight cache daemon gpu={i} rank={i} pid={proc.pid}"
