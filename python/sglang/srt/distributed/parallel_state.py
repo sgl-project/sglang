@@ -719,7 +719,7 @@ class GroupCoordinator:
                     input_, residual_inp_, weight_, eps, self.unique_name
                 )
             except Exception:
-                if is_in_piecewise_cuda_graph():
+                if is_in_tc_piecewise_cuda_graph():
                     raise
                 logger.debug(
                     "AITER registered fused allreduce+rmsnorm failed; "
