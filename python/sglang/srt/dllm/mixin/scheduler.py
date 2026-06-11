@@ -75,19 +75,8 @@ class SchedulerDllmMixin:
                 result.accept_length_per_req_cpu is not None
             ), "FDFO dLLM result is missing accept lengths."
 
-        def free_unresolved_block_kv(req: Req):
-            # Release the KV slots of the still-masked block so the next FDFO
-            # round can re-denoise it without leaking the previous allocation.
-            old_prefix_len = len(req.prefix_indices)
-            new_fill_len = req.fill_len
-            if new_fill_len > old_prefix_len:
-                kv_indices_to_free = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, old_prefix_len:new_fill_len
-                ]
-                self.token_to_kv_pool_allocator.free(kv_indices_to_free)
-
         # Sync mode emits tokens only once a block fully resolves; FDFO always
-        # commits (resolved blocks decode, unresolved blocks stash + free KV).
+        # commits (resolved blocks decode, unresolved blocks stash and retain KV).
         if fdfo_mode or result.next_token_ids:
             block_size = self.dllm_config.block_size
             algo_states = result.dllm_algo_state
@@ -119,12 +108,12 @@ class SchedulerDllmMixin:
                 assert len(next_token_ids) == block_size
 
                 if result.accept_length_per_req_cpu[idx] == 0:
-                    # Block unresolved: stash partial state and free its KV.
+                    # Block unresolved: stash partial state and retain the block's
+                    # req slot and KV so the next round re-denoises it in place.
                     req.dllm_incomplete_ids = array("q", next_token_ids)
                     req.dllm_algo_state = (
                         algo_states[idx] if algo_states is not None else None
                     )
-                    free_unresolved_block_kv(req)
                     continue
 
                 req.dllm_incomplete_ids = array("q")

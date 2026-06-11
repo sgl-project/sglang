@@ -2428,8 +2428,12 @@ class Scheduler(
             for req in self.dllm_manager.staging_queue:
                 if self.dllm_config.first_done_first_out_mode:
                     if not req.dllm_incomplete_ids:
+                        # Block resolved: cache it and release the req slot.
                         self.stash_chunked_request(req)
-                    self.req_to_token_pool.free(req)
+                        self.req_to_token_pool.free(req)
+                    # Block still unresolved: retain the req slot and its block KV
+                    # so the next denoise round reuses the same HBM in place
+                    # instead of freeing and reallocating it.
                 else:
                     self.stash_chunked_request(req)
 

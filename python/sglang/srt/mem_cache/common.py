@@ -356,6 +356,20 @@ def alloc_for_extend(
 
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
+    # dLLM FDFO in-place block reuse: a continuing (unresolved) request keeps the
+    # same physical KV slots for its in-flight block across denoise rounds, so the
+    # scheduler neither frees nor reallocates them. Such a request is identified by
+    # a retained req_pool_idx paired with a stashed incomplete block; its extend
+    # region reuses the slots already mapped in req_to_token instead of drawing new
+    # ones. Non-dLLM batches always take the original allocate-everything path.
+    if batch.is_dllm():
+        reuse_kv = [
+            r.req_pool_idx is not None and bool(r.dllm_incomplete_ids)
+            for r in batch.reqs
+        ]
+    else:
+        reuse_kv = None
+
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
@@ -370,7 +384,11 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
+    if reuse_kv is not None and any(reuse_kv):
+        out_cache_loc = _alloc_extend_loc_with_kv_reuse(
+            batch, reuse_kv, req_pool_indices_cpu, prefix_lens_cpu, extend_lens_cpu
+        )
+    elif batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
@@ -404,6 +422,87 @@ def alloc_for_extend(
     )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
+
+
+def _alloc_extend_loc_with_kv_reuse(
+    batch: ScheduleBatch,
+    reuse_kv: list[bool],
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    extend_lens_cpu: torch.Tensor,
+) -> torch.Tensor:
+    """Build a batch-order out_cache_loc when some requests reuse existing KV slots.
+
+    Reuse requests (dLLM FDFO continuing blocks) contribute the slots already
+    mapped in ``req_to_token`` for their extend region; the remaining requests draw
+    fresh slots from the allocator. Each block of a reuse request is page-aligned
+    (the dLLM scheduler forces ``page_size`` to a multiple of ``block_size``) and
+    was validly paged when the block was first created, so reusing it in place is
+    paging-safe. Slots are assembled in batch order so ``write_cache_indices`` and
+    the forward pass observe a contiguous tensor.
+    """
+    device = batch.device
+    req_to_token = batch.req_to_token_pool.req_to_token
+
+    # Fresh allocation only covers the non-reuse requests' extend tokens.
+    alloc_extend_lens = [
+        0 if reuse_kv[i] else int(extend_lens_cpu[i]) for i in range(len(reuse_kv))
+    ]
+    alloc_extend_num_tokens = sum(alloc_extend_lens)
+
+    fresh_slots = None
+    if alloc_extend_num_tokens > 0:
+        if batch.tree_cache.page_size == 1:
+            fresh_slots = alloc_token_slots(batch.tree_cache, alloc_extend_num_tokens)
+        else:
+            # The paged allocator sees prefix==seq for reuse requests, so it
+            # reserves no new pages for them, while the rest keep their real
+            # (prefix, seq) extents and last_loc continuity.
+            alloc_seq_lens_cpu = torch.tensor(
+                [
+                    (
+                        int(prefix_lens_cpu[i])
+                        if reuse_kv[i]
+                        else int(batch.seq_lens_cpu[i])
+                    )
+                    for i in range(len(reuse_kv))
+                ],
+                dtype=torch.int64,
+            )
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=device))
+                for t in (r.prefix_indices for r in batch.reqs)
+            ]
+            fresh_slots = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=prefix_lens_cpu.to(device, non_blocking=True),
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=alloc_seq_lens_cpu.to(device, non_blocking=True),
+                seq_lens_cpu=alloc_seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=alloc_extend_num_tokens,
+            )
+
+    reuse_dtype = fresh_slots.dtype if fresh_slots is not None else torch.int64
+    parts: list[torch.Tensor] = []
+    fresh_ptr = 0
+    for i in range(len(reuse_kv)):
+        prefix_len = int(prefix_lens_cpu[i])
+        extend_len = int(extend_lens_cpu[i])
+        if reuse_kv[i]:
+            req_idx = int(req_pool_indices_cpu[i])
+            # Copy (not view) so out_cache_loc never aliases the row that
+            # write_cache_indices is about to write back into.
+            parts.append(
+                req_to_token[req_idx, prefix_len : prefix_len + extend_len].to(
+                    reuse_dtype
+                )
+            )
+        else:
+            parts.append(fresh_slots[fresh_ptr : fresh_ptr + extend_len])
+            fresh_ptr += extend_len
+
+    return torch.cat(parts)
 
 
 def alloc_paged_token_slots_decode(
