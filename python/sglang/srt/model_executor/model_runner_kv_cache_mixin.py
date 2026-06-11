@@ -89,6 +89,7 @@ class ModelRunnerKVCacheMixin:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
+        intermediate_size = 0  # bytes; set below when spec decoding is enabled
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
@@ -180,6 +181,14 @@ class ModelRunnerKVCacheMixin:
             server_args.max_mamba_cache_size
             * config.mamba2_cache_params.mamba_cache_per_req
             / (1 << 30)
+        )
+        # Log the planned footprint before allocation; an OOM here can kill
+        # systems with shared memory.
+        logger.info(
+            f"Planned mamba state allocation: {server_args.max_mamba_cache_size} slots, "
+            f"main state ~{mamba_state_memory:.2f}GB, "
+            f"intermediate (spec) ~{intermediate_size / (1 << 30):.2f}GB, "
+            f"per-req {config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f}MB."
         )
         return total_rest_memory - mamba_state_memory
 
