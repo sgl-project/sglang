@@ -162,6 +162,8 @@ from sglang.srt.model_executor.forward_context import (
     has_forward_context,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+
+from sglang.srt.debug_utils.input_loader import register_input_loaders
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
@@ -866,6 +868,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
+
+        if server_args.load_input_dir:
+            register_input_loaders(self.model, server_args.load_input_dir)
 
         # Initialize piecewise CUDA graph
         self.init_prefill_cuda_graph()

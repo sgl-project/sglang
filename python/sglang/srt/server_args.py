@@ -918,6 +918,9 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
+    # For loading fixed module inputs from .pt files
+    load_input_dir: Optional[str] = None
+
     # For communications compression
     enable_quant_communications: Optional[bool] = False
 
@@ -7628,6 +7631,14 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+
+        parser.add_argument(
+            "--load-input-dir",
+            type=str,
+            default=ServerArgs.load_input_dir,
+            help="Directory containing .pt files to load as fixed module inputs. "
+            "Enables the load-input feature globally.",
         )
 
         parser.add_argument(

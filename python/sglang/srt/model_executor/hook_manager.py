@@ -8,6 +8,32 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def _ensure_pass_tracker(model: nn.Module) -> nn.Module:
+    """Install a forward-pass counter on the tracker module (model.model or root).
+
+    Returns the tracker module. Idempotent — safe to call multiple times.
+    """
+    tracker = None
+    for name, mod in model.named_modules():
+        if name == "model":
+            tracker = mod
+            break
+    if tracker is None:
+        tracker = model
+
+    if not hasattr(tracker, "_worker_forward_pass_id"):
+        tracker._worker_forward_pass_id = -1
+
+        def _pass_tracker(_module, _args, _kwargs):
+            _module._worker_forward_pass_id += 1
+            return _args, _kwargs
+
+        tracker.register_forward_pre_hook(_pass_tracker, with_kwargs=True)
+        logger.info("Installed forward-pass tracker on %s", type(tracker).__name__)
+
+    return tracker
+
+
 def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
     """
     hook_specs is a list of dicts from server_args.forward_hooks.
@@ -51,9 +77,15 @@ def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -
             )
             continue
 
+        hook_type = spec.get("hook_type", "forward")
         for module_name, module in matched:
-            _ = module.register_forward_hook(hook)
-            logger.info(f"Registered forward hook '{spec_name}' " f"on {module_name}")
+            if hook_type == "forward_pre":
+                module.register_forward_pre_hook(hook, with_kwargs=True)
+            else:
+                module.register_forward_hook(hook)
+            logger.info(
+                f"Registered {hook_type} hook '{spec_name}' on {module_name}"
+            )
 
 
 def resolve_callable(path: Optional[str]) -> Optional[Callable]:
