@@ -154,9 +154,12 @@ class AutoWeightsLoader:
             for weight_name, weight_data in weights
         )
         for prefix, group in itertools.groupby(weights_by_parts, key=lambda x: x[0][0]):
-            yield prefix, (
-                ("" if len(parts) == 1 else parts[1], weight_data)
-                for parts, weight_data in group
+            yield (
+                prefix,
+                (
+                    ("" if len(parts) == 1 else parts[1], weight_data)
+                    for parts, weight_data in group
+                ),
             )
 
     @staticmethod
@@ -375,7 +378,6 @@ def compute_cu_seqlens_from_grid_numpy(grid_thw: torch.Tensor) -> torch.Tensor:
 
 
 class RotaryPosMixin:
-
     @staticmethod
     @lru_cache(maxsize=1024)
     def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
@@ -592,6 +594,127 @@ def fused_qk_gemma_rmsnorm(
     )
 
     return q_out, k_out
+
+
+# ---------------------------------------------------------------------------
+# Fused QK GemmaRMSNorm + gate extraction kernel
+# For models with attn_output_gate (e.g. Qwen3.5) where q and gate are
+# interleaved per head: [q_h0, gate_h0, q_h1, gate_h1, ...].
+# Reads q from the interleaved buffer, normalizes it, and copies gate to a
+# contiguous output — all in a single kernel launch.  Eliminates two
+# elementwise copy kernels that would otherwise be needed to deinterleave.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fused_qk_gemma_rmsnorm_gate_kernel(
+    QG_ptr,
+    K_ptr,
+    Q_out_ptr,
+    K_out_ptr,
+    Gate_out_ptr,
+    QW_ptr,
+    KW_ptr,
+    qg_token_stride,
+    qg_head_stride,
+    k_token_stride,
+    k_head_stride,
+    num_heads,
+    num_kv_heads,
+    k_rows,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    EPS: tl.constexpr,
+    FP16: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_HD)
+    mask = cols < HEAD_DIM
+    out_dtype = tl.float16 if FP16 else tl.bfloat16
+
+    token_idx = pid // num_heads
+    head_idx = pid % num_heads
+
+    base = token_idx * qg_token_stride + head_idx * qg_head_stride
+
+    # Q norm
+    q = tl.load(QG_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+    w_q = tl.load(QW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    q_var = tl.sum(q * q, axis=0) / HEAD_DIM
+    q_normed = (q * tl.rsqrt(q_var + EPS) * (w_q + 1.0)).to(out_dtype)
+    out_off = pid * HEAD_DIM + cols
+    tl.store(Q_out_ptr + out_off, q_normed, mask=mask)
+
+    # Gate copy
+    gate = tl.load(QG_ptr + base + HEAD_DIM + cols, mask=mask, other=0.0)
+    tl.store(Gate_out_ptr + out_off, gate, mask=mask)
+
+    # K norm (first k_rows blocks only)
+    if pid < k_rows:
+        token_idx_k = pid // num_kv_heads
+        head_idx_k = pid % num_kv_heads
+        k_off = token_idx_k * k_token_stride + head_idx_k * k_head_stride + cols
+        k = tl.load(K_ptr + k_off, mask=mask, other=0.0).to(tl.float32)
+        w_k = tl.load(KW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        k_var = tl.sum(k * k, axis=0) / HEAD_DIM
+        k_normed = (k * tl.rsqrt(k_var + EPS) * (w_k + 1.0)).to(out_dtype)
+        k_out_off = pid * HEAD_DIM + cols
+        tl.store(K_out_ptr + k_out_off, k_normed, mask=mask)
+
+
+def fused_qk_gemma_rmsnorm_with_gate(
+    q_gate: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    head_dim: int,
+    num_heads: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused QK GemmaRMSNorm + gate extraction from interleaved q_gate buffer.
+
+    q_gate: (seq, q_size*2) where q and gate are interleaved per head,
+            i.e. [q_h0, gate_h0, q_h1, gate_h1, ...] with q_size = num_heads * head_dim.
+            Can be a non-contiguous view from qkv.split().
+    k: (seq, kv_size) — same as fused_qk_gemma_rmsnorm.
+
+    Returns (q_out, k_out, gate_out) all contiguous with shape
+    (seq*num_heads, head_dim), (seq*num_kv_heads, head_dim), (seq*num_heads, head_dim).
+    """
+    seq_len = q_gate.shape[0]
+    qg_3d = q_gate.view(seq_len, num_heads, 2 * head_dim)
+    num_kv_heads = k.shape[-1] // head_dim
+    k_3d = k.view(seq_len, num_kv_heads, head_dim)
+
+    q_rows = seq_len * num_heads
+    k_rows = seq_len * num_kv_heads
+
+    q_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
+    k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
+    gate_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
+
+    BLOCK_HD = triton.next_power_of_2(head_dim)
+
+    _fused_qk_gemma_rmsnorm_gate_kernel[(q_rows,)](
+        qg_3d,
+        k_3d,
+        q_out,
+        k_out,
+        gate_out,
+        q_weight,
+        k_weight,
+        qg_3d.stride(0),
+        qg_3d.stride(1),
+        k_3d.stride(0),
+        k_3d.stride(1),
+        num_heads,
+        num_kv_heads,
+        k_rows,
+        HEAD_DIM=head_dim,
+        BLOCK_HD=BLOCK_HD,
+        EPS=eps,
+        FP16=(q_gate.dtype == torch.float16),
+    )
+
+    return q_out, k_out, gate_out
 
 
 # Register the inplace op
