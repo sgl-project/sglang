@@ -1322,6 +1322,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 target_dtype,
                 seq_len,
                 reserved_frames_mask,
+                server_args.pipeline_config.dit_config.arch_config.patch_size,
             )
         else:
             timestep = t_device.repeat(bsz)
