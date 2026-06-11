@@ -207,9 +207,10 @@ def load_model_index_from_dir(model_dir: str) -> dict[str, Any]:
 
 
 def _component_has_weight_file(component_dir: str) -> bool:
-    for _, _, file_names in os.walk(component_dir):
+    for root, _, file_names in os.walk(component_dir):
         if any(
             file_name.endswith(_MATERIALIZED_WEIGHT_SUFFIXES)
+            and os.path.isfile(os.path.join(root, file_name))
             for file_name in file_names
         ):
             return True
