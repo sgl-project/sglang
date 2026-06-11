@@ -14,6 +14,13 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4MoEMethod,
 )
 
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig, GPTQMarlinConfig
