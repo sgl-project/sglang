@@ -7,13 +7,12 @@
 // `config.playgroundFeatures` — a keyed map where each present key opts that
 // axis in. Recognised axes:
 //   attention   — TP/CP/DP-Attention knobs
-//   moe         — backend + EP
+//   moe         — backend (+ MegaMoE quantization sub-select) + EP
 //   parsers     — per-item toggle flags
 //   speculative — single-select preset
 //   pdDisagg     — role + transfer backend + IB device + optional router
 //   hicache     — enable + backend + write policy
 //   hisparse    — enable + host ratio (decode-only)
-//   megamoe     — single-select, Blackwell-only
 //
 // Adding an axis = one entry in AXIS_HANDLERS below; nothing else switches on
 // an axis id. Each handler implements initState / revertHidden / apply /
@@ -354,18 +353,25 @@ export const Playground = ({ config }) => {
     },
 
     // ---- Axis: MoE Parallelism ----------------------------------------------
-    // Backend single-select + EP numeric knob; either is optional.
+    // Backend single-select + EP numeric knob; either is optional. Picking the
+    // "megamoe" backend reveals a Quantization sub-select (W4A8 / W4A4) in the same
+    // row — W4A4 adds the FP4-activations env vars.
     moe: {
-      initState: () => ({ backend: null, ep: null }),
+      initState: () => ({ backend: null, ep: null, mmQuant: null }),
 
       // Prefer --moe-a2a-backend over --moe-runner-backend when both present.
+      // mmQuant is derived from the base env (FP4 activations present → W4A4).
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
+        const baseEnv = (cell && cell.env) || [];
         const a2a    = h.findFlagArg(flags, "--moe-a2a-backend");
         const runner = h.findFlagArg(flags, "--moe-runner-backend");
+        const fp4Acts = baseEnv.some(
+          (e) => e.startsWith("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS"));
         return {
           backend: a2a || runner || null,
           ep: h.parseIntFlag(flags, "--ep"),
+          mmQuant: fp4Acts ? "w4a4" : "w4a8",
         };
       },
 
@@ -376,6 +382,15 @@ export const Playground = ({ config }) => {
             && h.isHidden(fc.backend.options, next.backend, base)) {
           next.backend = null; changed = true;
         }
+        // MegaMoE backend availability — gated by its option's requiresHw /
+        // excludesStrategy (this model gates by hw only; the check is generic).
+        const mmOpt = (fc.backend?.options || []).find((o) => o.id === "megamoe");
+        const mmAvail = !!mmOpt
+          && (!mmOpt.requiresHw || mmOpt.requiresHw.includes(base.hw))
+          && (!mmOpt.excludesStrategy || !mmOpt.excludesStrategy.includes(base.strategy));
+        if (next.backend === "megamoe" && !mmAvail) {
+          next.backend = null; changed = true;
+        }
         if (next.ep !== null && fc.ep?.values
             && h.isHidden(fc.ep.values, next.ep, base)) {
           next.ep = null; changed = true;
@@ -383,7 +398,7 @@ export const Playground = ({ config }) => {
         return changed ? next : value;
       },
 
-      apply: ({ flags, env, value, fc, h }) => {
+      apply: ({ flags, env, value, fc, h, derived }) => {
         if (value.backend !== null) {
           flags = h.stripFlagsByFirstToken(flags, [
             "--moe-a2a-backend", "--moe-runner-backend",
@@ -391,6 +406,28 @@ export const Playground = ({ config }) => {
           const opt = (fc.backend?.options || []).find((o) => o.id === value.backend);
           if (opt?.flags?.length) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
+          }
+        }
+        // MegaMoE owns the MoE path: when the effective backend is megamoe, strip the
+        // DeepEP dispatch + any prior megamoe env, then re-add the selected quant's
+        // env. When the backend is explicitly switched away from megamoe, only drop
+        // the megamoe quant env (leave DeepEP dispatch intact).
+        const mq = fc.megamoeQuant;
+        if (mq) {
+          const quantKeys = [];
+          for (const o of (mq.options || [])) {
+            for (const e of (o.env || [])) quantKeys.push(e.split("=")[0]);
+          }
+          const effBackend = value.backend !== null
+            ? value.backend : (derived && derived.backend);
+          if (effBackend === "megamoe") {
+            env = h.stripEnvByPrefix(env, [...(mq.stripEnv || []), ...quantKeys]);
+            const quant = value.mmQuant != null
+              ? value.mmQuant : ((derived && derived.mmQuant) || "w4a8");
+            const opt = (mq.options || []).find((o) => o.id === quant);
+            if (opt?.env?.length) env = [...env, ...opt.env];
+          } else if (value.backend !== null) {
+            env = h.stripEnvByPrefix(env, quantKeys);
           }
         }
         if (value.ep !== null) {
@@ -416,6 +453,12 @@ export const Playground = ({ config }) => {
           const d = derived ? derived[k] : null;
           return (d !== null && d !== undefined) ? [null] : [];
         };
+        // Hide the MegaMoE backend option where its requiresHw / excludesStrategy exclude this base.
+        const mmOpt = (fc.backend?.options || []).find((o) => o.id === "megamoe");
+        const mmAvail = !!mmOpt
+          && (!mmOpt.requiresHw || mmOpt.requiresHw.includes(base.hw))
+          && (!mmOpt.excludesStrategy || !mmOpt.excludesStrategy.includes(base.strategy));
+        const backendIsMega = slotDisplay("backend") === "megamoe";
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -425,7 +468,16 @@ export const Playground = ({ config }) => {
                   <span style={s.fieldLabel}>Backend</span>
                   {renderSelect(slotDisplay("backend"), fc.backend.options || [],
                     (v) => setSlot("backend", v), base, undefined,
-                    { hideValues: hideNull("backend") })}
+                    { hideValues: [...hideNull("backend"), ...(mmAvail ? [] : ["megamoe"])] })}
+                </span>
+              )}
+              {fc.megamoeQuant && backendIsMega && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>Quantization</span>
+                  {renderSelect(
+                    value.mmQuant != null ? value.mmQuant : ((derived && derived.mmQuant) || "w4a8"),
+                    fc.megamoeQuant.options || [],
+                    (v) => setSlot("mmQuant", v), base)}
                 </span>
               )}
               {fc.ep && (
@@ -857,60 +909,6 @@ export const Playground = ({ config }) => {
                     (v) => setSlot("writePolicy", v), base)}
                 </span>
               )}
-            </div>
-          </div>
-        );
-      },
-    },
-
-    // ---- Axis: MegaMoE ------------------------------------------------------
-    // Single-select with axis-level gating (requiresHw / excludesStrategy)
-    // plus per-option hide constraints and env mutation (stripEnv + option.env).
-    megamoe: {
-      initState: () => "disabled",
-
-      revertHidden: (value, fc, base, h) => {
-        const hwGate    = !fc.requiresHw       || fc.requiresHw.includes(base.hw);
-        const stratGate = !fc.excludesStrategy || !fc.excludesStrategy.includes(base.strategy);
-        if (!hwGate || !stratGate) {
-          return value === "disabled" ? value : "disabled";
-        }
-        if (value !== "disabled" && h.isHidden(fc.options || [], value, base)) {
-          return "disabled";
-        }
-        return value;
-      },
-
-      apply: ({ flags, env, value, fc, h }) => {
-        if (!value || value === "disabled") return { flags, env };
-        const opt = (fc.options || []).find((o) => o.id === value);
-        if (!opt) return { flags, env };
-        flags = h.stripFlagsByFirstToken(flags, [
-          "--moe-a2a-backend", "--moe-runner-backend",
-        ]);
-        if (opt.flags?.length) {
-          flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
-        }
-        const ownedEnvKeys = [...(fc.stripEnv || [])];
-        for (const o of (fc.options || [])) {
-          for (const e of (o.env || [])) ownedEnvKeys.push(e.split("=")[0]);
-        }
-        env = h.stripEnvByPrefix(env, ownedEnvKeys);
-        if (opt.env?.length) env = [...env, ...opt.env];
-        return { flags, env };
-      },
-
-      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
-        const hwGate    = !fc.requiresHw       || fc.requiresHw.includes(base.hw);
-        const stratGate = !fc.excludesStrategy || !fc.excludesStrategy.includes(base.strategy);
-        if (!hwGate || !stratGate) return null;
-        return (
-          <div key={axisId} style={s.card}>
-            <div style={s.compactRow}>
-              <span style={s.axisTitle}>MegaMoE</span>
-              <span style={s.field}>
-                {renderSelect(value, fc.options || [], setValue, base)}
-              </span>
             </div>
           </div>
         );
@@ -1527,8 +1525,7 @@ export const Playground = ({ config }) => {
   const dpAttnOn = (effDpAttn === true)
     || (typeof effDpAttn === "number" && effDpAttn > 0);
   const pdMode = (deltas.pdDisagg && deltas.pdDisagg.mode) || "off";
-  const megamoeOn = !!(deltas.megamoe && deltas.megamoe !== "disabled");
-  const constraintBase = { ...base, dpAttnOn, pdMode, megamoeOn };
+  const constraintBase = { ...base, dpAttnOn, pdMode };
 
   let baseCommand = "";
   let playgroundCommand = "";
