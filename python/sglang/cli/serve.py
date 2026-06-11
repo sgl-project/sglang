@@ -94,7 +94,7 @@ def serve(args, extra_argv):
     model_path = get_model_path(dispatch_argv)
     try:
         if model_type == "auto":
-            is_diffusion_model = get_is_diffusion_model(model_path)
+            is_diffusion_model = get_is_diffusion_model(model_path, dispatch_argv)
             if is_diffusion_model:
                 logger.info("Diffusion model detected")
         else:

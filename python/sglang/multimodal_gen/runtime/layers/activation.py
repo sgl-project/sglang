@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 
 @CustomOp.register("silu_and_mul")
+@CustomOp.kernel_compile_autotune("activation")
 class SiluAndMul(CustomOp):
     """An activation function for SwiGLU.
 
@@ -72,6 +73,7 @@ class SiluAndMul(CustomOp):
 
 
 @CustomOp.register("gelu_and_mul")
+@CustomOp.kernel_compile_autotune("activation")
 class GeluAndMul(CustomOp):
     """An activation function for GeGLU.
 
@@ -110,6 +112,7 @@ class GeluAndMul(CustomOp):
 
 
 @CustomOp.register("gelu_new")
+@CustomOp.kernel_compile_autotune("activation")
 class NewGELU(CustomOp):
 
     def __init__(self):
@@ -128,6 +131,7 @@ class NewGELU(CustomOp):
 
 
 @CustomOp.register("quick_gelu")
+@CustomOp.kernel_compile_autotune("activation")
 class QuickGELU(CustomOp):
     # https://github.com/huggingface/transformers/blob/main/src/transformers/activations.py#L90
     def __init__(self):

@@ -60,6 +60,12 @@ async def _wait_for_active_session_slot(
     return not _ACTIVE_SESSION_IDS
 
 
+async def _wait_for_server_warmup(websocket: WebSocket) -> None:
+    warmup_done = getattr(websocket.app.state, "server_warmup_done", None)
+    if warmup_done is not None and not warmup_done.is_set():
+        await warmup_done.wait()
+
+
 def _log_realtime_chunk_timing(
     session: GenerateSession,
     chunk: RealtimeChunkContext,

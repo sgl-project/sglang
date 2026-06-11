@@ -7,7 +7,6 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
-import os
 import time
 import weakref
 from collections.abc import Callable
@@ -26,6 +25,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
+    torch_compile_autotune_config,
+    torch_compile_kwargs,
+)
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
@@ -59,6 +62,9 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     world_group_is_initialized,
+)
+from sglang.multimodal_gen.runtime.optimization.compile_autotune import (
+    install_torch_compile_autotune,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
@@ -180,6 +186,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._torch_compiled_module_ids: set[int] = set()
+        self.scheduler = scheduler
+        self.vae = vae
+        self.pipeline = weakref.ref(pipeline) if pipeline else None
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -190,10 +199,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # torch compile
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_enable_torch_compile(transformer)
-
-        self.scheduler = scheduler
-        self.vae = vae
-        self.pipeline = weakref.ref(pipeline) if pipeline else None
 
         selected_attention_backend = self._infer_transformer_attention_backend()
         self.attn_backend = get_attn_backend(
@@ -283,8 +288,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
-        Compile a module with torch.compile, and enable inductor overlap tweak if available.
-        No-op if torch compile is disabled or the object is not a nn.Module.
+        Install torch.compile acceleration for a transformer module.
+
+        CUDA uses a forward trampoline so warmup requests can compare eager
+        and compiled execution for the real shape before serving traffic.
         """
         if not self.server_args.enable_torch_compile or not isinstance(
             module, nn.Module
@@ -297,12 +304,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if module_id in self._torch_compiled_module_ids:
             return
 
-        compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
+        autotune_config = torch_compile_autotune_config(
+            self.server_args.acceleration_config
+        )
+        if autotune_config.policy in {"off", "force_eager"}:
+            logger.info(
+                "Skipping transformer torch.compile because torch_compile_policy=%s",
+                autotune_config.policy,
+            )
+            self._torch_compiled_module_ids.add(module_id)
+            return
 
         if current_platform.is_npu():
             backend = get_compiler_backend()
-            compile_kwargs["backend"] = backend
-            compile_kwargs["dynamic"] = False
+            compile_kwargs: dict[str, Any] = {
+                "backend": backend,
+                "fullgraph": False,
+                "dynamic": False,
+            }
             logger.info("Compiling transformer with torchair backend on NPU")
         else:
             try:
@@ -311,11 +330,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
             except ImportError:
                 pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-            )
-            compile_kwargs["mode"] = mode
-            logger.info(f"Compiling transformer with mode: {mode}")
+            compile_kwargs = torch_compile_kwargs()
 
         if self._needs_nvfp4_jit_prewarm(module):
             logger.info(
@@ -325,7 +340,30 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             prewarm_nvfp4_jit_modules()
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(**compile_kwargs)
+        if current_platform.is_cuda():
+            module_name = self._component_name_for_stage_module(
+                module, module.__class__.__name__
+            )
+            install_torch_compile_autotune(
+                module,
+                compile_kwargs,
+                autotune_config,
+                module_name,
+            )
+            logger.info(
+                "Installed torch.compile autotune for %s with policy=%s, warmup=%d, iters=%d, min_speedup=%.3f, live_miss=%s",
+                module_name,
+                autotune_config.policy,
+                autotune_config.warmup,
+                autotune_config.iters,
+                autotune_config.min_speedup,
+                autotune_config.live_miss,
+            )
+        else:
+            logger.info(
+                "Compiling transformer with torch.compile kwargs: %s", compile_kwargs
+            )
+            module.compile(**compile_kwargs)
         self._torch_compiled_module_ids.add(module_id)
 
     def _maybe_enable_cache_dit_and_torch_compile(
@@ -1461,6 +1499,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Unwrap any decorators (e.g. functools.wraps)
         target_func = inspect.unwrap(func)
+        if isinstance(target_func, functools.partial) and target_func.args:
+            target_func = getattr(target_func.args[0], "_original_forward", target_func)
         cache_target = (
             target_func.__func__ if inspect.ismethod(target_func) else target_func
         )

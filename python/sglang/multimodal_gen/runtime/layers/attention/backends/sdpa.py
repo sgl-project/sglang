@@ -7,6 +7,9 @@ from contextlib import nullcontext
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
+    attention_allows_cudnn_sdp,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
@@ -61,7 +64,7 @@ class SDPAImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
-        self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
+        self.allow_cudnn_sdp = attention_allows_cudnn_sdp(extra_impl_args)
 
     def forward(
         self,

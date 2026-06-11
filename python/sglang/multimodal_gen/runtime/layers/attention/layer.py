@@ -2,7 +2,9 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import os
+from collections.abc import Callable
 from contextlib import nullcontext
+from statistics import median
 from typing import Type
 
 import torch
@@ -15,6 +17,10 @@ from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
     fused_scatter_to_padded,
 )
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
+    attention_allows_cudnn_sdp,
+    attention_autotune_config,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     sequence_model_parallel_all_to_all_4D,
@@ -48,6 +54,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import get_compute_dtype
 
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
@@ -60,6 +67,8 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 # Set ``SGLANG_VARLEN_FA=0`` to disable the varlen FA fast path in
 # USPAttention masked branch and fall back to SDPA.
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
+_LOCAL_ATTENTION_AUTOTUNE_CACHE: dict[tuple, str] = {}
+logger = init_logger(__name__)
 
 
 def build_varlen_mask_meta(
@@ -132,6 +141,7 @@ class UlyssesAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
+        self.causal = causal
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
 
@@ -300,7 +310,14 @@ class LocalAttention(nn.Module):
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
         impl_cls = attn_backend.get_impl_cls()
-        self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
+        self.allow_cudnn_sdp = attention_allows_cudnn_sdp(extra_impl_args)
+        (
+            self.enable_attention_autotune,
+            self.attention_autotune_warmup,
+            self.attention_autotune_iters,
+            self.attention_autotune_min_speedup,
+            self.attention_autotune_live_miss,
+        ) = attention_autotune_config(extra_impl_args)
         self.attn_impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
@@ -313,8 +330,176 @@ class LocalAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
+        self.causal = causal
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
+
+    def _sdpa_forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        allow_cudnn_sdp: bool,
+    ) -> torch.Tensor:
+        q_ = q.transpose(1, 2)
+        k_ = k.transpose(1, 2)
+        v_ = v.transpose(1, 2)
+        attn_kwargs = {
+            "attn_mask": None,
+            "dropout_p": 0.0,
+            "is_causal": self.causal,
+            "scale": self.softmax_scale,
+        }
+        if q_.shape[1] != k_.shape[1]:
+            attn_kwargs["enable_gqa"] = True
+        sdpa_context = (
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            if allow_cudnn_sdp
+            else sdpa_kernel(
+                [
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ]
+            )
+        )
+        with sdpa_context:
+            output = torch.nn.functional.scaled_dot_product_attention(
+                q_, k_, v_, **attn_kwargs
+            )
+        return output.transpose(1, 2)
+
+    def _can_autotune_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> bool:
+        return (
+            self.enable_attention_autotune
+            and self.backend
+            in (
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.FA2,
+                AttentionBackendEnum.TORCH_SDPA,
+            )
+            and not torch.is_grad_enabled()
+            and q.device.type == "cuda"
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and q.dim() == 4
+            and k.dim() == 4
+            and v.dim() == 4
+            and max(q.shape[1], k.shape[1]) > 256
+            and q.shape[-1] <= 256
+        )
+
+    def _autotune_key(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple:
+        device_index = (
+            q.device.index
+            if q.device.index is not None
+            else torch.cuda.current_device()
+        )
+        capability = torch.cuda.get_device_capability(device_index)
+        return (
+            capability,
+            self.backend.name,
+            q.dtype,
+            tuple(q.shape),
+            tuple(k.shape),
+            tuple(v.shape),
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            self.causal,
+        )
+
+    def _time_attention_candidate_once(
+        self, fn, iters: int, *, allow_failure: bool = False
+    ) -> float | None:
+        try:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                fn()
+            end.record()
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) / iters
+        except RuntimeError:
+            if not allow_failure:
+                raise
+            torch.cuda.synchronize()
+            return None
+
+    def _time_attention_candidates(
+        self, candidates: dict[str, Callable[[], torch.Tensor]]
+    ) -> dict[str, float]:
+        active = []
+        for name, fn in candidates.items():
+            try:
+                for _ in range(self.attention_autotune_warmup):
+                    fn()
+                torch.cuda.synchronize()
+                active.append(name)
+            except RuntimeError:
+                if name == "native":
+                    raise
+                torch.cuda.synchronize()
+
+        rounds = 5
+        iters_per_round = max(1, self.attention_autotune_iters)
+        samples: dict[str, list[float]] = {name: [] for name in active}
+        for round_idx in range(rounds):
+            order = active[round_idx:] + active[:round_idx]
+            for name in order:
+                elapsed = self._time_attention_candidate_once(
+                    candidates[name],
+                    iters_per_round,
+                    allow_failure=name != "native",
+                )
+                if elapsed is not None:
+                    samples[name].append(elapsed)
+        return {
+            name: median(values) for name, values in samples.items() if len(values) > 0
+        }
+
+    def _select_attention_backend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_metadata,
+    ) -> str:
+        key = self._autotune_key(q, k, v)
+        selected = _LOCAL_ATTENTION_AUTOTUNE_CACHE.get(key)
+        if selected is not None:
+            return selected
+
+        candidates = {
+            "native": lambda: self.attn_impl.forward(
+                q, k, v, attn_metadata=attn_metadata
+            ),
+            "sdpa_cudnn": lambda: self._sdpa_forward(q, k, v, True),
+            "sdpa_no_cudnn": lambda: self._sdpa_forward(q, k, v, False),
+        }
+        timings = self._time_attention_candidates(candidates)
+
+        selected = min(timings, key=timings.get) if timings else "native"
+        speedup = 1.0
+        if selected != "native" and "native" in timings:
+            speedup = timings["native"] / timings[selected]
+            if speedup < self.attention_autotune_min_speedup:
+                selected = "native"
+        logger.info(
+            "LocalAttention autotune selected %s for q=%s, k=%s, dtype=%s, backend=%s; timings=%s, speedup=%.3fx, threshold=%.3fx",
+            selected,
+            tuple(q.shape),
+            tuple(k.shape),
+            q.dtype,
+            self.backend.name,
+            ", ".join(f"{name}={elapsed:.4f}ms" for name, elapsed in timings.items()),
+            speedup,
+            self.attention_autotune_min_speedup,
+        )
+        _LOCAL_ATTENTION_AUTOTUNE_CACHE[key] = selected
+        return selected
 
     def forward(
         self,
@@ -375,8 +560,25 @@ class LocalAttention(nn.Module):
                     scale=self.softmax_scale,
                 ).transpose(1, 2)
 
-        output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
-        return output
+        if self._can_autotune_attention(q, k, v):
+            key = self._autotune_key(q, k, v)
+            selected = _LOCAL_ATTENTION_AUTOTUNE_CACHE.get(key)
+            if selected is None:
+                forward_batch = forward_context.forward_batch
+                if self.attention_autotune_live_miss or getattr(
+                    forward_batch, "is_warmup", False
+                ):
+                    selected = self._select_attention_backend(
+                        q, k, v, ctx_attn_metadata
+                    )
+                else:
+                    selected = "native"
+            if selected == "sdpa_cudnn":
+                return self._sdpa_forward(q, k, v, True)
+            if selected == "sdpa_no_cudnn":
+                return self._sdpa_forward(q, k, v, False)
+
+        return self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
 
 
 class USPAttention(nn.Module):
@@ -436,7 +638,7 @@ class USPAttention(nn.Module):
                     f"Please ensure your platform supports these backends."
                 )
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
-        self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
+        self.allow_cudnn_sdp = attention_allows_cudnn_sdp(extra_impl_args)
         self.attn_impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,

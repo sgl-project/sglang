@@ -16,7 +16,7 @@ def generate(args, extra_argv):
         return
 
     model_path = get_model_path(extra_argv)
-    is_diffusion_model = get_is_diffusion_model(model_path)
+    is_diffusion_model = get_is_diffusion_model(model_path, extra_argv)
     if is_diffusion_model:
         from sglang.multimodal_gen.runtime.entrypoints.cli.generate import (
             add_multimodal_gen_generate_args,

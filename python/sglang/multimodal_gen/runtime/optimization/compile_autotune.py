@@ -1,0 +1,258 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Warmup-time torch.compile autotune for whole diffusion modules.
+
+The controller benchmarks eager and compiled module forwards on warmup requests,
+commits the selected callable for steady-state execution, and avoids live
+compilation on real request cache misses unless explicitly enabled.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from functools import wraps
+from typing import Any
+
+import torch
+import torch.nn as nn
+
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
+    TorchCompileAutotuneConfig,
+    suppress_kernel_compile_autotune,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
+from sglang.multimodal_gen.runtime.optimization.tensor_keys import (
+    value_key,
+    value_summary,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class TorchCompileDecision:
+    selected: str
+    eager_ms: float | None
+    compiled_ms: float | None
+    reason: str
+
+
+class _TorchCompileAutotuner:
+    def __init__(
+        self,
+        module: nn.Module,
+        eager_forward: Callable[..., Any],
+        compile_kwargs: Mapping[str, Any],
+        config: TorchCompileAutotuneConfig,
+        module_name: str,
+    ) -> None:
+        self._module = module
+        self._eager_forward = eager_forward
+        self._compile_kwargs = dict(compile_kwargs)
+        self._config = config
+        self._module_name = module_name
+        self._compiled_forward: Callable[..., Any] | None = None
+        self._decisions: dict[tuple, TorchCompileDecision] = {}
+        self._compile_failure_logged = False
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self._config.policy == "force_compile":
+            return self._get_compiled_forward()(*args, **kwargs)
+        if self._config.policy in {"off", "force_eager"}:
+            return self._eager_forward(*args, **kwargs)
+
+        key = self._cache_key(args, kwargs)
+        decision = self._decisions.get(key)
+        is_warmup_forward = self._is_warmup_forward()
+        if decision is None:
+            if self._config.live_miss or is_warmup_forward:
+                decision = self._select_forward(
+                    key, args, kwargs, commit=is_warmup_forward
+                )
+            else:
+                return self._eager_forward(*args, **kwargs)
+
+        if decision.selected == "compiled":
+            return self._get_compiled_forward()(*args, **kwargs)
+        return self._eager_forward(*args, **kwargs)
+
+    def _get_compiled_forward(self) -> Callable[..., Any]:
+        if self._compiled_forward is None:
+            if hasattr(self._eager_forward, "_torchdynamo_orig_callable"):
+                self._compiled_forward = self._eager_forward
+            else:
+                self._compiled_forward = torch.compile(
+                    self._eager_forward, **self._compile_kwargs
+                )
+        return self._compiled_forward
+
+    def _is_warmup_forward(self) -> bool:
+        forward_context = get_forward_context_or_none()
+        if forward_context is None:
+            return False
+        return bool(getattr(forward_context.forward_batch, "is_warmup", False))
+
+    def _select_forward(
+        self,
+        key: tuple,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        commit: bool,
+    ) -> TorchCompileDecision:
+        # transformer compile must see stable fused custom ops; nested kernel
+        # compile decisions can make the outer graph fail or benchmark the wrong path
+        with suppress_kernel_compile_autotune():
+            eager_ms = self._time_candidate(
+                lambda: self._eager_forward(*args, **kwargs)
+            )
+            try:
+                compiled_forward = self._get_compiled_forward()
+                compiled_ms = self._time_candidate(
+                    lambda: compiled_forward(*args, **kwargs)
+                )
+            except Exception as e:
+                torch.cuda.synchronize()
+                decision = TorchCompileDecision(
+                    selected="eager",
+                    eager_ms=eager_ms,
+                    compiled_ms=None,
+                    reason=f"compile_failed:{type(e).__name__}",
+                )
+                self._decisions[key] = decision
+                self._commit_if_ready(decision, commit)
+                self._run_kernel_autotune_for_eager_fallback(
+                    decision, args, kwargs, commit
+                )
+                if not self._compile_failure_logged:
+                    logger.warning(
+                        "torch.compile autotune failed for %s, falling back to eager: %s",
+                        self._module_name,
+                        e,
+                    )
+                    self._compile_failure_logged = True
+                return decision
+
+        speedup = eager_ms / compiled_ms if compiled_ms > 0 else math.inf
+        if speedup >= self._config.min_speedup:
+            decision = TorchCompileDecision(
+                selected="compiled",
+                eager_ms=eager_ms,
+                compiled_ms=compiled_ms,
+                reason="compiled_fastest",
+            )
+        else:
+            decision = TorchCompileDecision(
+                selected="eager",
+                eager_ms=eager_ms,
+                compiled_ms=compiled_ms,
+                reason="speedup_below_threshold",
+            )
+        self._decisions[key] = decision
+        logger.info(
+            "torch.compile autotune selected %s for %s (%s): eager=%.3f ms, compiled=%.3f ms, speedup=%.3fx, threshold=%.3fx",
+            decision.selected,
+            self._module_name,
+            self._shape_summary(args, kwargs),
+            eager_ms,
+            compiled_ms,
+            speedup,
+            self._config.min_speedup,
+        )
+        self._commit_if_ready(decision, commit)
+        self._run_kernel_autotune_for_eager_fallback(decision, args, kwargs, commit)
+        return decision
+
+    def _run_kernel_autotune_for_eager_fallback(
+        self,
+        decision: TorchCompileDecision,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        commit: bool,
+    ) -> None:
+        if not commit:
+            return
+        if decision.selected != "eager":
+            return
+        # if the outer transformer stays eager, give kernel-wise autotune one
+        # warmup forward to commit decisions for the eager path
+        self._eager_forward(*args, **kwargs)
+        torch.cuda.synchronize()
+
+    def _commit_if_ready(self, decision: TorchCompileDecision, commit: bool) -> None:
+        if not commit or self._config.live_miss:
+            return
+        if decision.selected == "compiled":
+            self._module.forward = self._get_compiled_forward()
+        else:
+            self._module.forward = self._eager_forward
+            self._compiled_forward = None
+        logger.info(
+            "torch.compile autotune committed %s forward for %s",
+            decision.selected,
+            self._module_name,
+        )
+
+    def _time_candidate(self, fn: Callable[[], Any]) -> float:
+        result = None
+        for _ in range(self._config.warmup):
+            result = fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(self._config.iters):
+            result = fn()
+        end.record()
+        torch.cuda.synchronize()
+        del result
+        return start.elapsed_time(end) / self._config.iters
+
+    def _cache_key(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple:
+        return (
+            self._module_name,
+            torch.is_grad_enabled(),
+            torch.is_inference_mode_enabled(),
+            tuple(value_key(arg) for arg in args),
+            tuple((key, value_key(value)) for key, value in sorted(kwargs.items())),
+        )
+
+    def _shape_summary(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+        values = [value_summary(arg) for arg in args]
+        values.extend(
+            f"{key}={value_summary(value)}"
+            for key, value in sorted(kwargs.items())
+        )
+        values = [value for value in values if value]
+        return ", ".join(values[:8])
+
+
+def install_torch_compile_autotune(
+    module: nn.Module,
+    compile_kwargs: Mapping[str, Any],
+    config: TorchCompileAutotuneConfig,
+    module_name: str,
+) -> bool:
+    forward = module.forward
+    if getattr(forward, "_sglang_torch_compile_autotune", None) is not None:
+        return False
+
+    controller = _TorchCompileAutotuner(
+        module=module,
+        eager_forward=forward,
+        compile_kwargs=compile_kwargs,
+        config=config,
+        module_name=module_name,
+    )
+
+    @wraps(forward)
+    def autotuned_forward(*args: Any, **kwargs: Any) -> Any:
+        return controller(*args, **kwargs)
+
+    autotuned_forward._sglang_torch_compile_autotune = controller
+    module.forward = autotuned_forward
+    return True

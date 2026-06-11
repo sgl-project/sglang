@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
+    configure_acceleration_policy,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -132,6 +135,7 @@ class ServerArgs(DisaggServerArgsMixin):
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
+    acceleration_config: addict.Dict | dict[str, Any] | str | None = None
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
@@ -226,7 +230,7 @@ class ServerArgs(DisaggServerArgsMixin):
     warmup: bool = False
     server_warmup: bool = False
     warmup_resolutions: list[str] = None
-    warmup_steps: int = 1
+    warmup_steps: int = 2
 
     disable_autocast: bool | None = None
 
@@ -355,6 +359,7 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
         self._adjust_quant_config()
+        self._adjust_acceleration_config()
         self._adjust_warmup()
         self._adjust_network_ports()
         # adjust parallelism before attention backend
@@ -541,8 +546,12 @@ class ServerArgs(DisaggServerArgsMixin):
         )
 
     def _adjust_attention_backend(self):
-        if self.attention_backend in ["fa3", "fa4"]:
-            self.attention_backend = "fa"
+        if isinstance(self.attention_backend, str):
+            normalized_backend = self.attention_backend.strip().lower()
+            if normalized_backend == "auto":
+                self.attention_backend = None
+            elif normalized_backend in ["fa3", "fa4"]:
+                self.attention_backend = "fa"
         self.component_attention_backends = (
             self._normalize_component_attention_backends(
                 self.component_attention_backends
@@ -692,6 +701,13 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.warmup_resolutions is not None:
             self.warmup = True
             self.server_warmup = False
+
+        if (
+            self.enable_torch_compile
+            and not self.warmup
+            and not self.is_arg_explicitly_set("warmup")
+        ):
+            self.warmup = True
 
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
@@ -967,6 +983,18 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.disable_autocast is None:
             self.disable_autocast = not self.pipeline_config.enable_autocast
 
+    def _adjust_acceleration_config(self):
+        if self.acceleration_config is None:
+            self.acceleration_config = addict.Dict()
+        elif isinstance(self.acceleration_config, str):
+            self.acceleration_config = addict.Dict(
+                self._parse_attention_backend_config(self.acceleration_config)
+            )
+        else:
+            self.acceleration_config = addict.Dict(self.acceleration_config)
+        if self.acceleration_config:
+            configure_acceleration_policy(self.acceleration_config)
+
     def _parse_attention_backend_config(self, config_str: str) -> dict[str, Any]:
         """parse attention backend config from string."""
         if not config_str:
@@ -987,10 +1015,24 @@ class ServerArgs(DisaggServerArgsMixin):
         except json.JSONDecodeError:
             pass
 
-        # 3. treat as k=v pairs (simple implementation). e.g., "sparsity=0.5,enable_x=true"
+        # 3. treat as k=v pairs. Values may contain commas, e.g.
+        # "kernel_compile_ops=activation,rotary,attention_autotune=false".
         try:
             config = {}
-            pairs = config_str.split(",")
+            pairs = []
+            current_pair = None
+            for segment in config_str.split(","):
+                if "=" in segment:
+                    if current_pair is not None:
+                        pairs.append(current_pair)
+                    current_pair = segment
+                elif current_pair is not None:
+                    current_pair += f",{segment}"
+                else:
+                    raise ValueError
+            if current_pair is not None:
+                pairs.append(current_pair)
+
             for pair in pairs:
                 k, v = pair.split("=", 1)
                 k = k.strip()
@@ -1090,6 +1132,17 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.cache_dit_config,
             help="Path to a Cache-DiT YAML/JSON config. Enables cache-dit for diffusers backend.",
+        )
+        parser.add_argument(
+            "--acceleration-config",
+            type=str,
+            default=ServerArgs.acceleration_config,
+            help=(
+                "Experimental diffusion acceleration policy. Accepts a JSON/YAML path, "
+                "JSON string, or comma-separated key=value pairs. Common keys: "
+                "allow_cudnn_sdp, attention_autotune, torch_compile_policy, "
+                "kernel_compile_policy, kernel_compile_ops."
+            ),
         )
 
         # HuggingFace specific parameters
@@ -1236,8 +1289,13 @@ class ServerArgs(DisaggServerArgsMixin):
             "--enable-torch-compile",
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
-            help="Use torch.compile to speed up DiT inference."
-            + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+            help=(
+                "Use torch.compile to speed up DiT inference. Native denoising "
+                "pipelines autotune eager vs compiled DiT forward during warmup "
+                "by default; warmup is enabled automatically unless explicitly "
+                "disabled. However, this may cause precision drifts. See "
+                "(https://github.com/pytorch/pytorch/issues/145213)"
+            ),
         )
 
         parser.add_argument(

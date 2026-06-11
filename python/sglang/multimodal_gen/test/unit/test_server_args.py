@@ -6,6 +6,7 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
+from sglang.cli.utils import get_is_diffusion_model
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
@@ -36,6 +37,30 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.entrypoints.cli.routing import (
+    has_registered_pipeline_class,
+)
+from sglang.multimodal_gen.runtime.layers.activation import (
+    GeluAndMul,
+    NewGELU,
+    QuickGELU,
+)
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
+    KERNEL_COMPILE_ITERS_ENV,
+    KERNEL_COMPILE_LIVE_MISS_ENV,
+    KERNEL_COMPILE_MIN_SPEEDUP_ENV,
+    KERNEL_COMPILE_OPS_ENV,
+    KERNEL_COMPILE_POLICY_ENV,
+    KERNEL_COMPILE_WARMUP_ENV,
+    attention_allows_cudnn_sdp,
+    attention_autotune_config,
+    custom_op_kernel_compile_policy,
+    kernel_compile_autotune_config,
+    torch_compile_autotune_config,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
 )
@@ -153,6 +178,209 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         self.assertEqual(backend.name, "TORCH_SDPA")
         self.assertEqual(matched_key, "text_encoder")
+
+    def test_attention_backend_auto_is_accepted(self):
+        args = self._from_dict_without_model_resolution(
+            {"model_path": "/data/my-model", "attention_backend": "auto"}
+        )
+
+        self.assertNotEqual(args.attention_backend, "auto")
+
+    def test_acceleration_config_sets_kernel_compile_policy(self):
+        with patch.dict(os.environ, {}, clear=False):
+            args = self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "acceleration_config": "kernel_compile_policy=auto,kernel_compile_ops=rotary_embedding,kernel_compile_warmup=4,kernel_compile_iters=8,kernel_compile_min_speedup=1.04,kernel_compile_live_miss=true,allow_cudnn_sdp=true",
+                }
+            )
+
+            self.assertEqual(args.acceleration_config.kernel_compile_policy, "auto")
+            self.assertTrue(args.acceleration_config.allow_cudnn_sdp)
+            self.assertEqual(os.environ[KERNEL_COMPILE_POLICY_ENV], "auto")
+            self.assertEqual(os.environ[KERNEL_COMPILE_OPS_ENV], "rotary_embedding")
+            self.assertEqual(os.environ[KERNEL_COMPILE_WARMUP_ENV], "4")
+            self.assertEqual(os.environ[KERNEL_COMPILE_ITERS_ENV], "8")
+            self.assertEqual(os.environ[KERNEL_COMPILE_MIN_SPEEDUP_ENV], "1.04")
+            self.assertEqual(os.environ[KERNEL_COMPILE_LIVE_MISS_ENV], "True")
+
+            config = kernel_compile_autotune_config(args.acceleration_config)
+            self.assertEqual(config.policy, "auto")
+            self.assertEqual(config.warmup, 4)
+            self.assertEqual(config.iters, 8)
+            self.assertEqual(config.min_speedup, 1.04)
+            self.assertTrue(config.live_miss)
+            self.assertEqual(
+                custom_op_kernel_compile_policy("rotary_embedding", RotaryEmbedding),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("mul_add", MulAdd),
+                "force_fused",
+            )
+
+    def test_kernel_compile_ops_accepts_groups(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "acceleration_config": "kernel_compile_policy=auto,kernel_compile_ops=activation,norm,elementwise",
+                }
+            )
+
+            self.assertEqual(
+                custom_op_kernel_compile_policy("gelu_new", NewGELU),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("quick_gelu", QuickGELU),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("rms_norm", RMSNorm),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("mul_add", MulAdd),
+                "auto",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("rotary_embedding", RotaryEmbedding),
+                "force_fused",
+            )
+
+    def test_acceleration_config_accepts_attention_autotune(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "acceleration_config": "attention_autotune=true,attention_autotune_iters=20,attention_autotune_min_speedup=1.03,attention_autotune_live_miss=true",
+            }
+        )
+
+        self.assertTrue(args.acceleration_config.attention_autotune)
+        self.assertEqual(args.acceleration_config.attention_autotune_iters, 20)
+        self.assertEqual(args.acceleration_config.attention_autotune_min_speedup, 1.03)
+        self.assertTrue(args.acceleration_config.attention_autotune_live_miss)
+
+    def test_generate_cli_accepts_registered_pipeline_class(self):
+        self.assertTrue(
+            has_registered_pipeline_class(
+                [
+                    "--model-path",
+                    "/data/LTX-2.3",
+                    "--pipeline-class-name",
+                    "LTX2Pipeline",
+                ]
+            )
+        )
+        self.assertTrue(
+            has_registered_pipeline_class(
+                ["--model-path", "/data/LTX-2.3", "--pipeline-class-name=LTX2Pipeline"]
+            )
+        )
+        self.assertFalse(
+            has_registered_pipeline_class(
+                [
+                    "--model-path",
+                    "/data/LTX-2.3",
+                    "--pipeline-class-name",
+                    "MissingPipeline",
+                ]
+            )
+        )
+        self.assertTrue(
+            get_is_diffusion_model(
+                "/data/LTX-2.3",
+                [
+                    "--model-path",
+                    "/data/LTX-2.3",
+                    "--pipeline-class-name",
+                    "LTX2Pipeline",
+                ],
+            )
+        )
+
+    def test_acceleration_config_accepts_torch_compile_autotune(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "acceleration_config": "torch_compile_policy=force_eager,torch_compile_warmup=2,torch_compile_iters=4,torch_compile_min_speedup=1.02,torch_compile_live_miss=true",
+            }
+        )
+
+        config = torch_compile_autotune_config(args.acceleration_config)
+        self.assertEqual(config.policy, "force_eager")
+        self.assertEqual(config.warmup, 2)
+        self.assertEqual(config.iters, 4)
+        self.assertEqual(config.min_speedup, 1.02)
+        self.assertTrue(config.live_miss)
+
+    def test_attention_acceleration_defaults_to_auto(self):
+        self.assertTrue(attention_allows_cudnn_sdp({}))
+        enabled, warmup, iters, min_speedup, live_miss = attention_autotune_config({})
+        self.assertTrue(enabled)
+        self.assertEqual(warmup, 5)
+        self.assertEqual(iters, 20)
+        self.assertEqual(min_speedup, 1.03)
+        self.assertFalse(live_miss)
+        compile_config = torch_compile_autotune_config({})
+        self.assertEqual(compile_config.policy, "auto")
+        self.assertEqual(compile_config.warmup, 1)
+        self.assertEqual(compile_config.iters, 3)
+        self.assertEqual(compile_config.min_speedup, 1.05)
+        self.assertFalse(compile_config.live_miss)
+        with patch.dict(os.environ, {}, clear=True):
+            kernel_config = kernel_compile_autotune_config({})
+            self.assertEqual(kernel_config.policy, "auto")
+            self.assertEqual(kernel_config.warmup, 3)
+            self.assertEqual(kernel_config.iters, 10)
+            self.assertEqual(kernel_config.min_speedup, 1.03)
+            self.assertFalse(kernel_config.live_miss)
+            self.assertEqual(
+                custom_op_kernel_compile_policy("mul_add", MulAdd), "force_fused"
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("rotary_embedding", RotaryEmbedding),
+                "force_fused",
+            )
+            self.assertEqual(
+                custom_op_kernel_compile_policy("gelu_and_mul", GeluAndMul),
+                "force_fused",
+            )
+
+    def test_attention_acceleration_can_be_disabled(self):
+        self.assertFalse(attention_allows_cudnn_sdp({"allow_cudnn_sdp": False}))
+        enabled, _, _, _, _ = attention_autotune_config({"attention_autotune": False})
+        self.assertFalse(enabled)
+        _, _, _, _, live_miss = attention_autotune_config(
+            {"attention_autotune_live_miss": "false"}
+        )
+        self.assertFalse(live_miss)
+
+    def test_torch_compile_enables_implicit_warmup(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "enable_torch_compile": True,
+            }
+        )
+
+        self.assertTrue(args.warmup)
+        self.assertFalse(args.server_warmup)
+        self.assertFalse(args.is_arg_explicitly_set("warmup"))
+
+    def test_torch_compile_preserves_explicit_warmup_false(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "enable_torch_compile": True,
+                "warmup": False,
+            }
+        )
+
+        self.assertFalse(args.warmup)
+        self.assertFalse(args.server_warmup)
+        self.assertTrue(args.is_arg_explicitly_set("warmup"))
 
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):
@@ -408,6 +636,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         server_args = dispatch_launch.call_args.args[0]
         self.assertTrue(server_args.warmup)
         self.assertTrue(server_args.server_warmup)
+        self.assertEqual(server_args.warmup_steps, 2)
         self.assertFalse(server_args.is_arg_explicitly_set("warmup"))
         self.assertFalse(server_args.is_arg_explicitly_set("server_warmup"))
 

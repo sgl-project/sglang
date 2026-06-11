@@ -4,6 +4,8 @@ from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kern
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 
+@CustomOp.register("mul_add")
+@CustomOp.kernel_compile_autotune("elementwise")
 class MulAdd(CustomOp):
     """
     Fuse elementwise mul and add

@@ -8,6 +8,7 @@ from .utils import _apply_rotary_emb
 
 
 @CustomOp.register("rotary_embedding")
+@CustomOp.kernel_compile_autotune("rotary")
 class RotaryEmbedding(CustomOp):
     """Original rotary positional embedding."""
 
