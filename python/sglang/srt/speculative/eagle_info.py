@@ -117,7 +117,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             spec_steps=spec_steps,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=0,
-            seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
@@ -935,8 +935,8 @@ class EagleDraftExtendInput(SpecInput):
             num_accept_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             num_accept_tokens_cpu=[],
             input_ids=torch.empty((0,), device=device, dtype=torch.long),
-            seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
-            seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
+            seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
             req_pool_indices=torch.empty((0,), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
         )
