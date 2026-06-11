@@ -889,6 +889,18 @@ def _merged_experts_fused_moe_lora_add_impl(
                 "num_warps": 4,
                 "num_stages": 4,
             }
+        # F1-① prefill routing reuse: the A stage routes with BLOCK_SIZE_M 32 at prefill
+        # but the B stage with the tuned fused-moe config (typically 64), so the
+        # (num_experts, shared_outer, block_size) routing_cache key never matches across
+        # stages and the align/sort pipeline reruns per stage (4x/layer at prefill).
+        # Matching the A stage's routing block to the B stage's collapses them to one
+        # align/sort per layer-forward. Decode (<512 tokens) keeps the opt1 fused
+        # merged-align path and its tuned shrink block untouched.
+        if (
+            lora_envs.SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE.get()
+            and token_lora_mapping.shape[0] >= 512
+        ):
+            a_stage_config["BLOCK_SIZE_M"] = b_stage_config["BLOCK_SIZE_M"]
         (
             sorted_token_ids,
             expert_ids,

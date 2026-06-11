@@ -72,6 +72,14 @@ class _LoraEnvs:
         "SGLANG_OPT_LORA_FUSED_TOPK_PACK", True
     )
     SGLANG_OPT_LORA_QKV_B_STORE = _GatedBool("SGLANG_OPT_LORA_QKV_B_STORE", True)
+    # F1-①: prefill routing reuse — unify the A (shrink) stage's routing BLOCK_SIZE_M with
+    # the B stage's at prefill (>=512 tokens) so the per-layer routing_cache key matches
+    # across stages and the Triton align/sort runs once per layer-forward instead of once
+    # per stage (4x at prefill). Dtype-agnostic (the chain is shared by fp8/nvfp4/bf16).
+    # Decode (<512) keeps the opt1 fused merged-align path and its tuned shrink block.
+    SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE = _GatedBool(
+        "SGLANG_OPT_LORA_PREFILL_ROUTING_REUSE", True
+    )
     # opt3: cache the layer-static fields of LoRAInfo so _get_lora_info rebuilds only the
     # per-batch fields each forward — cuts the per-layer Python cost paid on the eager
     # prefill path (decode runs under cuda-graph, so it sees this only at capture).
