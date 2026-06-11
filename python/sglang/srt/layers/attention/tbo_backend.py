@@ -194,6 +194,7 @@ def _build_tbo_child_replay_fb_view(
         seq_lens=fb_view.seq_lens[seq_slice],
         seq_lens_sum=int(child_seq_lens_cpu.sum()),
         seq_lens_cpu=child_seq_lens_cpu,
+        seq_len_cpu_ub=getattr(fb_view, "seq_len_cpu_ub", None),
         encoder_lens=None,
         out_cache_loc=(
             parent_out_cache_loc[tok_slice]

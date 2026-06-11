@@ -153,7 +153,12 @@ def build_replay_fb_view(
             if forward_batch.seq_lens_sum is None
             else forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value
         ),
-        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        seq_lens_cpu=(
+            buffers.seq_lens_cpu[:bs]
+            if forward_batch.seq_lens_cpu is not None
+            else None
+        ),
+        seq_len_cpu_ub=forward_batch.seq_len_cpu_ub,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         spec_info=forward_batch.spec_info,
@@ -712,7 +717,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu=(seq_lens_cpu if attn_backend.needs_cpu_seq_lens else None),
+            seq_len_cpu_ub=(
+                None if attn_backend.needs_cpu_seq_lens else int(seq_lens.max().item())
+            ),
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,

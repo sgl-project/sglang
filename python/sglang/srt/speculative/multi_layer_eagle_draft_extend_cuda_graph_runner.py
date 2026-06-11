@@ -573,9 +573,16 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             input_ids=getattr(forward_batch, "input_ids", None),
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum
-            + (bs - raw_bs) * self.seq_len_fill_value,
-            seq_lens_cpu=buffers.seq_lens_cpu,
+            seq_lens_sum=(
+                None
+                if forward_batch.seq_lens_sum is None
+                else forward_batch.seq_lens_sum
+                + (bs - raw_bs) * self.seq_len_fill_value
+            ),
+            seq_lens_cpu=(
+                buffers.seq_lens_cpu if forward_batch.seq_lens_cpu is not None else None
+            ),
+            seq_len_cpu_ub=forward_batch.seq_len_cpu_ub,
             encoder_lens=None,
             # per-step write target (advanced in-graph by assign_new_state);
             # forward_batch.out_cache_loc is frozen at step 0.

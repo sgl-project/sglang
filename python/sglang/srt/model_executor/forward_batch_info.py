@@ -354,6 +354,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
+    # Host-side scalar upper bound on max(seq_lens), used by bound-safe attention
+    # backends (needs_cpu_seq_lens=False) to size attention metadata without the
+    # seq_lens_cpu D2H sync. Populated by resolve_seq_lens_cpu only when that sync
+    # is skipped; None otherwise (seq_lens_cpu carries the exact value instead).
+    seq_len_cpu_ub: Optional[int] = None
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
@@ -629,6 +634,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
+            seq_len_cpu_ub=batch.seq_len_cpu_ub,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
@@ -1374,6 +1380,7 @@ def build_inner_fb_view(
         seq_lens=forward_batch.seq_lens,
         seq_lens_sum=forward_batch.seq_lens_sum,
         seq_lens_cpu=forward_batch.seq_lens_cpu,
+        seq_len_cpu_ub=getattr(forward_batch, "seq_len_cpu_ub", None),
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         spec_info=forward_batch.spec_info,

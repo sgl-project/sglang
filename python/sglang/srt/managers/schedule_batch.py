@@ -1736,6 +1736,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
+    # Host-side scalar upper bound on max(seq_lens). resolve_seq_lens_cpu sets this
+    # (from kv_allocated_len) when a backend skips the seq_lens_cpu D2H sync
+    # (needs_cpu_seq_lens=False), so the backend can size attention metadata without
+    # syncing; None otherwise (seq_lens_cpu carries the exact value instead).
+    seq_len_cpu_ub: Optional[int] = None
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None

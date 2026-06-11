@@ -320,6 +320,7 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
                 if forward_batch.seq_lens_cpu is not None
                 else None
             ),
+            seq_len_cpu_ub=forward_batch.seq_len_cpu_ub,
             encoder_lens=None,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             spec_info=None,
