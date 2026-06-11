@@ -39,6 +39,7 @@ export const config = {
   modelNames: {
     "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
+    "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
@@ -585,7 +586,7 @@ sgl-eval run aime25 \\
     },
 
     // ====================================================================
-    // B200 + NVFP4 (nvidia/DeepSeek-V4-Pro-NVFP4)
+    // B200 + NVFP4
     // ====================================================================
     {
       match: { hw: "b200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
@@ -603,7 +604,27 @@ sgl-eval run aime25 \\
         "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
-        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "b200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--chunked-prefill-size 4096",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
