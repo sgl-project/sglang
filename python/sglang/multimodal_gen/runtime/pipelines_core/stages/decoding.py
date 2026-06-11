@@ -168,9 +168,7 @@ class DecodingStage(PipelineStage):
         vae_dtype = resolve_precision(
             server_args, self.component_name, precision_attr="vae_precision"
         )
-        vae_autocast_enabled = autocast_enabled(
-            vae_dtype, server_args.disable_autocast
-        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         # scale and shift
         latents = self.scale_and_shift(latents, server_args)

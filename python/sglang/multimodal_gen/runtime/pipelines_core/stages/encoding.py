@@ -93,9 +93,7 @@ class EncodingStage(PipelineStage):
         vae_dtype = resolve_precision(
             server_args, "vae", precision_attr="vae_precision"
         )
-        vae_autocast_enabled = autocast_enabled(
-            vae_dtype, server_args.disable_autocast
-        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         # Normalize input to [-1, 1] range (reverse of decoding normalization)
         latents = (batch.latents * 2.0 - 1.0).clamp(-1, 1)
@@ -117,9 +115,7 @@ class EncodingStage(PipelineStage):
                     self.vae.enable_tiling()
                 # if server_args.vae_sp:
                 #     self.vae.enable_parallel()
-                should_cast_vae = (
-                    not vae_autocast_enabled
-                )
+                should_cast_vae = not vae_autocast_enabled
                 if not vae_autocast_enabled:
                     latents = latents.to(vae_dtype)
                 with temporary_module_dtype(

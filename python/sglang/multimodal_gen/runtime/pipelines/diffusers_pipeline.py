@@ -664,9 +664,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         Determine the dtype to use for model loading.
         """
         if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
-            return resolve_precision(
-                server_args, "dit", precision_attr="dit_precision"
-            )
+            return resolve_precision(server_args, "dit", precision_attr="dit_precision")
 
         # precision-constraint: legacy fallback for callers without pipeline_config;
         # prefer explicit dit_precision policy when available.

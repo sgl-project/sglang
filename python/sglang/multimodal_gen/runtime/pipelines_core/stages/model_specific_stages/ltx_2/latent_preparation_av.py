@@ -82,9 +82,7 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
             return batch.prompt_embeds[0].dtype
         if isinstance(batch.prompt_embeds, torch.Tensor):
             return batch.prompt_embeds.dtype
-        return resolve_precision(
-            server_args, "dit", precision_attr="dit_precision"
-        )
+        return resolve_precision(server_args, "dit", precision_attr="dit_precision")
 
     @staticmethod
     def _packed_video_latent_shape(

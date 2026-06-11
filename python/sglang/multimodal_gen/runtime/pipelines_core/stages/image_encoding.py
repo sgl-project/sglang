@@ -607,9 +607,7 @@ class LTX2ImageEncodingStage(PipelineStage):
         vae_dtype = resolve_precision(
             server_args, "vae", precision_attr="vae_precision"
         )
-        vae_autocast_enabled = autocast_enabled(
-            vae_dtype, server_args.disable_autocast
-        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         with torch.autocast(
             device_type=current_platform.device_type,
@@ -652,9 +650,7 @@ class LTX2ImageEncodingStage(PipelineStage):
         vae_dtype = resolve_precision(
             server_args, "vae", precision_attr="vae_precision"
         )
-        vae_autocast_enabled = autocast_enabled(
-            vae_dtype, server_args.disable_autocast
-        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         with torch.autocast(
             device_type=current_platform.device_type,
@@ -898,9 +894,7 @@ class ImageVAEEncodingStage(PipelineStage):
         vae_dtype = resolve_precision(
             server_args, self.component_name, precision_attr="vae_precision"
         )
-        vae_autocast_enabled = autocast_enabled(
-            vae_dtype, server_args.disable_autocast
-        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         with self.use_declared_component(
             component_name=self.component_name,
@@ -947,9 +941,7 @@ class ImageVAEEncodingStage(PipelineStage):
                         self.vae.enable_tiling()
                     # if server_args.vae_sp:
                     #     self.vae.enable_parallel()
-                    should_cast_vae = (
-                        not vae_autocast_enabled
-                    )
+                    should_cast_vae = not vae_autocast_enabled
                     if not vae_autocast_enabled:
                         video_condition = video_condition.to(vae_dtype)
                     video_condition = server_args.pipeline_config.preprocess_vae_encode(
