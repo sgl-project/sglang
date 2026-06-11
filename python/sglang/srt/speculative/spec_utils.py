@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -14,13 +14,12 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.triton_ops.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_draft_cache_locs as assign_draft_cache_locs,
+    assign_extend_cache_locs as assign_extend_cache_locs,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_req_to_token_pool as assign_req_to_token_pool,
@@ -43,7 +42,11 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.cache_locs import (
     get_target_cache_loc as get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.speculative.triton_ops.eagle import (
+    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
+)
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -52,7 +55,8 @@ _is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -155,9 +159,9 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
         server_args = get_global_server_args()
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
-    # multi_layer_eagle handles hidden_states internally, not via FutureMap.
+    # multi_layer_eagle and DFLASH don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm == "STANDALONE":
+    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH"):
         return False
     return not server_args.enable_multi_layer_eagle
 
@@ -339,13 +343,13 @@ def traverse_tree(
             is_accepted = True
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
-            curr_token_id = draft_tokens[curr]
-            if vocab_size and curr_token_id >= vocab_size:
+            current_token = draft_tokens[curr]
+            if vocab_size and current_token >= vocab_size:
                 is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
                 is_accepted = (
-                    parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
+                    parent_bitmask[current_token // 32] & (1 << (current_token % 32))
                 ) != 0
 
         if is_accepted:
@@ -470,37 +474,65 @@ def draft_tp_context(tp_group: GroupCoordinator):
         yield
 
 
-# Disable torch.compile for this function because it will be
-# even slower.
-# @torch.compile(dynamic=True)
-def get_last_loc_large_page_size_large_top_k(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    speculative_num_steps: int,
-    topk: int,
-    page_size: int,
+def spec_stage_span(name: str):
+    """Profiler span for a coarse speculative-decoding stage (``draft`` /
+    ``draft_extend`` / ``verify``).
+    """
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(name)
+    return nullcontext()
+
+
+def move_accept_tokens_to_target_kvcache(
+    batch: ScheduleBatch,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ):
-    prefix_lens = seq_lens
-    last_page_lens = prefix_lens % page_size
-    num_new_pages_per_topk = (
-        last_page_lens + speculative_num_steps + page_size - 1
-    ) // page_size
-    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
-        page_size * topk
-    )
-    extend_lens = seq_lens - prefix_lens
-    last_loc = get_last_loc(
-        req_to_token,
-        req_pool_indices,
-        prefix_lens,
+    """
+    Move accepted tokens (drafts + bonus) to the target KV cache.
+
+    Args:
+        batch: The batch to run.
+        accept_index: The index of the accepted tokens (incl. bonus).
+        num_correct_drafts: Per-req count of correct drafts (excludes bonus);
+            seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
+    """
+    bs = len(batch.seq_lens)
+    device = batch.seq_lens.device
+    # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the
+    # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
+    size = bs * accept_index.shape[1]
+
+    # fill_accept_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
+    maybe_detect_oob(
+        accept_index,
+        -1,
+        batch.out_cache_loc.size(0),
+        "spec v2 move_accept_tokens accept_index",
     )
 
-    return (
-        prefix_lens,
-        seq_lens,
-        last_loc,
-        num_new_pages_per_topk,
-        extend_lens,
-        last_page_lens,
+    tgt_cache_loc = torch.zeros(
+        size,
+        dtype=torch.int64,
+        device=device,
+    )
+    accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
+    assign_extend_cache_locs[(bs,)](
+        batch.req_pool_indices,
+        batch.req_to_token_pool.req_to_token,
+        batch.seq_lens,
+        batch.seq_lens + num_correct_drafts + 1,
+        tgt_cache_loc,
+        batch.req_to_token_pool.req_to_token.shape[1],
+        next_power_of_2(bs),
+    )
+    fill_accept_out_cache_loc[(size,)](
+        accept_index,
+        batch.out_cache_loc,
+        accept_out_cache_loc,
+        next_power_of_2(size),
+    )
+    token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+        tgt_cache_loc, accept_out_cache_loc
     )

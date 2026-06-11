@@ -32,7 +32,7 @@ class FP4GemmSM120Base:
             "modelopt_fp4",
             "--fp4-gemm-backend",
             cls.backend,
-            "--disable-piecewise-cuda-graph",
+            "--cuda-graph-backend-prefill=disabled",
         ]
         cls.process = popen_launch_server(
             cls.model,
