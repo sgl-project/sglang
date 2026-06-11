@@ -122,19 +122,38 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+        self,
+        layer: torch.nn.Module,
+        moe_runner_config: "MoeRunnerConfig",
+        **extra_weight_attrs,
     ):
-        self.kernel.create_moe_runner(layer, moe_runner_config)
+        self.moe_runner_config = moe_runner_config
+        layer.w13_kernel = NPUW4A16Int4MoEMethod()
+        layer.w2_kernel = NPUW4A16Int4MoEMethod()
+        moe_runner_config.layer = layer
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.TORCH_NPU
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
-
+        
     def apply_weights(
         self,
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
-    ):
-        return self.kernel.apply(layer, dispatch_output)
+    ) -> "CombineInput":
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_offset=layer.w13_weight_offset,
+            w2_offset=layer.w2_weight_offset,
+        )
+        return self.runner.run(dispatch_output, quant_info)
 
 
 class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
