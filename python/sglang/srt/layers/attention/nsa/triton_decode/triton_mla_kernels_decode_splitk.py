@@ -19,53 +19,28 @@ import triton.language as tl
 from .triton_mla_kernels_decode_common import _bucket_total_tokens
 
 
-# gfx942 (MI300) has a 64KB LDS limit per workgroup; the default
-# BLOCK_N=256 / num_stages=2 pipeline needs ~68KB and overflows shared memory.
-# gfx950 (MI350) has a larger LDS and keeps the original high-throughput config.
-def _splitk_decode_arch_config():
-    try:
-        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-    except Exception:
-        arch = ""
-    if arch == "gfx942":
-        return 128, 1  # BLOCK_N, num_stages -> fits within 64KB LDS
-    return 256, 2
-
-
-_SPLITK_BLOCK_N, _SPLITK_NUM_STAGES = _splitk_decode_arch_config()
-
-
 # ============================================================================
 # Split-K Attention Kernel
 # ============================================================================
 @triton.autotune(
     configs=[
         # Split-K attention on already-gathered BF16 KV.
-        # - BLOCK_N: amortizes memory access over KV tokens (memory-bound kernel).
+        # - BLOCK_N=256: amortizes memory access over KV tokens (memory-bound kernel).
         # - BLOCK_D=128: matches KV tile structure.
-        # - num_warps=8: memory-bound kernel benefits from more warps.
-        # - BLOCK_N / num_stages are arch-tuned (see _splitk_decode_arch_config)
-        #   so the LDS footprint stays within the gfx942 64KB limit.
+        # - num_warps=8, num_stages=2: memory-bound kernel benefits from more warps
+        #   and software pipelining (overlaps memory loads with compute).
         # - BLOCK_H varies for different batch sizes:
         triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": _SPLITK_BLOCK_N, "BLOCK_D": 128},
-            num_warps=8,
-            num_stages=_SPLITK_NUM_STAGES,
+            {"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
         ),
         triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": _SPLITK_BLOCK_N, "BLOCK_D": 128},
-            num_warps=8,
-            num_stages=_SPLITK_NUM_STAGES,
+            {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
         ),
         triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": _SPLITK_BLOCK_N, "BLOCK_D": 128},
-            num_warps=8,
-            num_stages=_SPLITK_NUM_STAGES,
+            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
         ),
         triton.Config(
-            {"BLOCK_H": 128, "BLOCK_N": _SPLITK_BLOCK_N, "BLOCK_D": 128},
-            num_warps=8,
-            num_stages=_SPLITK_NUM_STAGES,
+            {"BLOCK_H": 128, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
         ),
     ],
     key=["total_tokens_bucket", "h_q", "topk_per_split", "d_qk"],
