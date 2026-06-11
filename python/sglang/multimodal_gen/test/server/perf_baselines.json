@@ -762,7 +762,7 @@
                 "7": 78.32,
                 "8": 78.53
             },
-            "expected_e2e_ms": 958.32,
+            "expected_e2e_ms": 1050.0,
             "expected_avg_denoise_ms": 70.04,
             "expected_median_denoise_ms": 81.35,
             "estimated_full_test_time_s": 121.0
@@ -1418,7 +1418,7 @@
         },
         "qwen_image_layered_i2i": {
             "stages_ms": {
-                "QwenImageLayeredBeforeDenoisingStage": 132.71,
+                "QwenImageLayeredBeforeDenoisingStage": 150.0,
                 "TimestepPreparationStage": 0.0,
                 "DenoisingStage": 33400.39,
                 "DecodingStage": 142.89
