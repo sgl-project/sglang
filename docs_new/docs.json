@@ -976,7 +976,8 @@
                   {
                     "group": "Google",
                     "pages": [
-                      "cookbook/autoregressive/Google/Gemma4"
+                      "cookbook/autoregressive/Google/Gemma4",
+                      "cookbook/autoregressive/Google/DiffusionGemma"
                     ]
                   },
                   {

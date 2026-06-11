@@ -680,6 +680,11 @@ class TboForwardBatchPreparer:
             ):
                 output_dict[key] = None
                 continue
+            elif key == "rids" and len(old_value) != num_seqs:
+                output_dict[key] = old_value[
+                    start_seq_index : min(end_seq_index, len(old_value))
+                ]
+                continue
             assert (
                 len(old_value) == num_seqs
             ), f"{key=} {old_value=} {num_seqs=} {batch=}"

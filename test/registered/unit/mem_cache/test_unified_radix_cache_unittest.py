@@ -62,10 +62,11 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 @dataclass(frozen=True)
@@ -2450,6 +2451,36 @@ class UnifiedRadixCacheSuite:
             mamba_cache.temporal[:, mamba_indices].float().cpu().clone(),
             [conv[:, mamba_indices].float().cpu().clone() for conv in mamba_cache.conv],
         )
+
+    def test_hicache_evict_device_leaf_aborts_demote_when_backup_fails(self):
+        """when write_backup cannot allocate host pool,
+        _evict_device_leaf should not evict it to host."""
+        if self._skip_unsupported_hicache_test():
+            return
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+        ct = ComponentType.FULL
+
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        self.assertIsNot(node, tree.root_node)
+        self.assertFalse(node.backuped)
+        self.assertFalse(node.evicted)
+
+        tracker = {c: 0 for c in tree.tree_components}
+        with mock.patch.object(tree, "write_backup", return_value=0):
+            tree._evict_device_leaf(node, tracker)
+
+        self.assertFalse(node.evicted)
+        self.assertIsNotNone(node.component_data[ct].value)
+        self.assertIsNone(node.component_data[ct].host_value)
+
+        with self.assertRaises(AssertionError):
+            tree._evict_to_host(node, {c: 0 for c in tree.tree_components})
+
+        tree.sanity_check()
 
     def test_hicache_node_states(self):
         """Verify device-only to device+host transition after real backup."""

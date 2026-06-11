@@ -287,6 +287,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
+        self.use_per_token_activation = False
 
     def _get_quant_method(
         self,
@@ -1177,6 +1178,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         group_size: int = None,
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        use_per_token_activation: Optional[bool] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -1186,6 +1188,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "format is experimental and subject to change."
             )
         self.group_size = group_size
+        self.use_per_token_activation = (
+            use_per_token_activation
+            or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+        )
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -1746,11 +1752,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not self.quant_config.is_checkpoint_nvfp4_serialized:
+        is_nvfp4_online = getattr(self.quant_config, "is_nvfp4_online", False)
+        if not self.quant_config.is_checkpoint_nvfp4_serialized and not is_nvfp4_online:
             raise ValueError(
                 "NVFP4 quantization was selected, "
                 " dynamic quantization is not supported."
             )
+        # `nvfp4_online` is not a serialized checkpoint format, but after the
+        # online loader converts each expert it uses the same packed NVFP4
+        # weights, block scales, and per-tensor scales as serialized ModelOpt
+        # NVFP4 checkpoints. Reuse this layout and swap only the weight loader.
+        if is_nvfp4_online:
+            if not self.enable_flashinfer_trtllm_moe:
+                raise ValueError(
+                    "--quantization nvfp4_online supports only "
+                    "--moe-runner-backend flashinfer_trtllm or "
+                    "flashinfer_trtllm_routed."
+                )
 
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
@@ -1760,6 +1778,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
         weight_loader = extra_weight_attrs.get("weight_loader")
+        if is_nvfp4_online:
+            weight_loader = self.get_online_weight_loader(layer, weight_loader)
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
@@ -1858,6 +1878,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
 
+        if is_nvfp4_online and self.quant_config.is_checkpoint_fp8_serialized:
+            # FP8 checkpoints usually store expert scales as weight_scale_inv.
+            # Online NVFP4 consumes them in the loader and writes the generated
+            # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.
+            w13_source_weight_scale_inv = PerTensorScaleParameter(
+                data=torch.empty(0, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter(
+                "w13_weight_scale_inv", w13_source_weight_scale_inv
+            )
+            w2_source_weight_scale_inv = PerTensorScaleParameter(
+                data=torch.empty(0, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("w2_weight_scale_inv", w2_source_weight_scale_inv)
+
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
@@ -1945,10 +1982,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        if (
-            self.enable_flashinfer_trtllm_moe
-            and envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
-        ):
+        if self.quant_config.use_per_token_activation:
+            # FlashInfer computes activation scales dynamically per token, so
+            # the static checkpoint activation scale is intentionally neutral.
             w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
             w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
 
@@ -2273,6 +2309,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 local_num_experts=layer.num_local_experts,
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
+                use_per_token_activation=self.quant_config.use_per_token_activation,
             )
 
             return self.runner.run(dispatch_output, quant_info)

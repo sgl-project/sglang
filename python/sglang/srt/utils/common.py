@@ -2523,8 +2523,18 @@ def kill_itself_when_parent_died():
         PR_SET_PDEATHSIG = 1
         libc = ctypes.CDLL("libc.so.6")
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    elif sys.platform == "darwin":
+        # macOS has no PR_SET_PDEATHSIG equivalent; the MLX backend provides a
+        # kqueue-based watchdog that SIGKILLs this worker once it is orphaned.
+        from sglang.srt.hardware_backend.mlx.parent_watchdog import (
+            start_parent_death_watcher,
+        )
+
+        start_parent_death_watcher()
     else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+        logger.warning(
+            "kill_itself_when_parent_died is only supported on linux and macOS."
+        )
 
 
 class UvicornAccessLogFilter(logging.Filter):

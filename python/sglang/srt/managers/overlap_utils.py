@@ -171,6 +171,9 @@ class FutureMap:
             )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+        if self.spec_algo.is_ngram():
+            # FIXME: remove once precomputed draft is supported.
+            return
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
@@ -256,6 +259,9 @@ class FutureMap:
         future_indices: torch.Tensor,
         payload: Union[torch.Tensor, EagleDraftInput],
     ) -> None:
+        if self.spec_algo.is_ngram():
+            # FIXME: remove once precomputed draft is supported.
+            return
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.

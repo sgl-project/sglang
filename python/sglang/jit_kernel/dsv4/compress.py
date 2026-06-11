@@ -44,11 +44,14 @@ def _jit_compress_norm_rope_module(
 @cache_once
 def _jit_compress_module(
     head_dim: int,
+    dtype_buf: torch.dtype,
     dtype_in: torch.dtype,
     dtype_out: torch.dtype,
     ratio: Literal[4, 128],
 ) -> Module:
-    args = make_cpp_args(head_dim, dtype_in, dtype_out, is_arch_support_pdl())
+    args = make_cpp_args(
+        head_dim, dtype_buf, dtype_in, dtype_out, is_arch_support_pdl()
+    )
     kernel_class = f"FlashCompress{ratio}Kernel<{args}>"
     return load_jit(
         make_name(f"compress_{ratio}_v2"),
@@ -324,8 +327,17 @@ def compress_forward(
         assert compress_ratio == 128 and head_dim == 512
         module = _jit_compress_128_online_module(512)
     else:
-        dtype_in, dtype_out = kv_score_input.dtype, out.dtype
-        module = _jit_compress_module(head_dim, dtype_in, dtype_out, compress_ratio)
+        # kv_score_buffer (fp32 runtime state pool) may differ from input/ape, so
+        # the kernel keeps a BufFloat template and casts the buffer to fp32 at
+        # load. ape/weight are cast to bf16 at load (apply_ape_hotfix), matching
+        # kv_score_input's dtype, so they need no extra template params.
+        module = _jit_compress_module(
+            head_dim,
+            kv_score_buffer.dtype,
+            kv_score_input.dtype,
+            out.dtype,
+            compress_ratio,
+        )
     fn = module.decode if plan.is_decode else module.prefill
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out

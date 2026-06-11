@@ -812,6 +812,7 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     intermediate_size_per_partition: int
 
     routing_method_type: int
+    use_per_token_activation: bool = False
 
 
 def quantize_hidden_states_fp4(
@@ -875,7 +876,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     topk_output = dispatch_output.topk_output
 
     # Quantize hidden states to FP4
-    if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
+    if quant_info.use_per_token_activation:
         from flashinfer import SfLayout, nvfp4_quantize
 
         e4m3_max = 448.0

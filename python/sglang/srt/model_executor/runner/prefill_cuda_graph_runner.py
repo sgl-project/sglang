@@ -72,6 +72,8 @@ from sglang.srt.model_executor.runner_utils.buffers import (
 )
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
+    is_hip,
     is_npu,
     log_info_on_rank0,
     require_attn_tp_gather,
@@ -81,6 +83,9 @@ from sglang.srt.utils import (
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions.
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 # Names of the static prefill input tensors a Breakable-backed prefill
 # runner owns. Each is a 1-D int64 tensor of length max_bs; captured
@@ -246,6 +251,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     f"this model architecture."
                 )
 
+        # --- aiter chip info pre-warming (AMD) -------------------------
+        if _use_aiter:
+            self._pre_warm_aiter_chip_info()
+
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
@@ -265,6 +274,41 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
+
+    _aiter_chip_info_cached = False
+
+    @classmethod
+    def _pre_warm_aiter_chip_info(cls):
+        """Pre-populate aiter chip info env vars before CUDA graph capture.
+
+        aiter's get_cu_num_custom_op and get_gfx_custom_op call
+        subprocess.run(rocminfo) to query GPU info. During CUDA graph capture
+        the GPU context is locked, so rocminfo hangs indefinitely. Pre-calling
+        them here caches the results as environment variables so the subprocess
+        is never invoked during capture. Only runs once per process.
+        """
+        if cls._aiter_chip_info_cached:
+            return
+        cls._aiter_chip_info_cached = True
+
+        import os
+
+        try:
+            from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+            if not os.environ.get("CU_NUM"):
+                cu_num = get_cu_num()
+                os.environ["CU_NUM"] = str(cu_num)
+                logger.info(f"Pre-warmed aiter CU_NUM={cu_num}")
+
+            if not os.environ.get("GPU_ARCHS"):
+                gfx = get_gfx()
+                os.environ["GPU_ARCHS"] = gfx
+                logger.info(f"Pre-warmed aiter GPU_ARCHS={gfx}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to pre-warm aiter chip info: {e}")
 
     @torch.no_grad()
     def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
@@ -765,6 +809,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with self.backend.replay_session():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            static_num_tokens = len(static_forward_batch.input_ids)
+            raw_num_tokens = self.raw_num_tokens
 
             if self.layer_model is not None:
                 # BCG path. The captured graph is a bs=1 replay of
@@ -793,6 +839,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         self.moe_layers,
                         self.moe_fusions,
                         dsa_indexers=self.dsa_indexers,
+                        num_tokens=static_num_tokens,
+                        raw_num_tokens=raw_num_tokens,
                     ):
                         output = self.model_runner.model.forward(
                             static_forward_batch.input_ids,
@@ -815,6 +863,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.moe_layers,
                     self.moe_fusions,
                     dsa_indexers=self.dsa_indexers,
+                    num_tokens=static_num_tokens,
+                    raw_num_tokens=raw_num_tokens,
                 ):
                     output = self.backend.replay(
                         self._static_num_tokens, static_forward_batch, **kwargs
