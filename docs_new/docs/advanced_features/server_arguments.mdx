@@ -1772,6 +1772,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>bf16</code>, <code>fp8</code>, <code>int8</code>, <code>nvfp4</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--flashinfer-a2a-dispatch-type</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select FlashInfer A2A dispatcher activation dtype. When omitted, it falls back to the <code>SGLANG_MOE_NVFP4_DISPATCH</code> environment variable. Explicit <code>auto</code> selects <code>mxfp8</code> for <code>--quantization mxfp8</code>, <code>nvfp4</code> for modelopt FP4 or hybrid NVFP4 MoE checkpoints, and <code>bf16</code> otherwise. The <code>SGLANG_MOE_NVFP4_DISPATCH</code> environment variable cannot be set with this argument.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>bf16</code>, <code>nvfp4</code>, <code>mxfp8</code></td>
+    </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ep-num-redundant-experts`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allocate this number of redundant experts in expert parallel.</td>

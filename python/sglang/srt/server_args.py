@@ -1934,6 +1934,10 @@ class ServerArgs:
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
         "Select DeepEP dispatcher output dtype",
     ] = "auto"
+    flashinfer_a2a_dispatch_type: A[
+        Optional[Literal["auto", "bf16", "nvfp4", "mxfp8"]],
+        "Select FlashInfer A2A dispatcher activation dtype.",
+    ] = None
     ep_num_redundant_experts: A[
         int,
         "Allocate this number of redundant experts in expert parallel.",
@@ -5512,6 +5516,52 @@ class ServerArgs:
                 f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
             )
 
+    def _handle_flashinfer_a2a_dispatch_type(self):
+        cli_dispatch_type = self.flashinfer_a2a_dispatch_type
+        nvfp4_dispatch_env_is_set = envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
+
+        if nvfp4_dispatch_env_is_set:
+            raise ValueError(
+                "SGLANG_MOE_NVFP4_DISPATCH cannot be set together with "
+                "--flashinfer-a2a-dispatch-type."
+            )
+
+        if nvfp4_dispatch_env_is_set:
+            dispatch_type = "nvfp4" if envs.SGLANG_MOE_NVFP4_DISPATCH.get() else "bf16"
+        else:
+            dispatch_type = cli_dispatch_type or "auto"
+
+        supports_nvfp4_dispatch = (
+            self.quantization == "modelopt_fp4"
+            or self.get_model_config().nvfp4_moe_meta is not None
+        )
+        if dispatch_type == "auto":
+            if self.quantization == "mxfp8":
+                dispatch_type = "mxfp8"
+            elif supports_nvfp4_dispatch:
+                dispatch_type = "nvfp4"
+            else:
+                dispatch_type = "bf16"
+
+        if dispatch_type == "mxfp8":
+            if self.quantization != "mxfp8":
+                raise ValueError(
+                    "--flashinfer-a2a-dispatch-type mxfp8 requires "
+                    "--quantization mxfp8."
+                )
+            if self.moe_runner_backend != "flashinfer_trtllm_routed":
+                raise ValueError(
+                    "--flashinfer-a2a-dispatch-type mxfp8 requires "
+                    "--moe-runner-backend flashinfer_trtllm_routed."
+                )
+        elif dispatch_type == "nvfp4" and not supports_nvfp4_dispatch:
+            raise ValueError(
+                "--flashinfer-a2a-dispatch-type nvfp4 requires NVFP4/"
+                "modelopt-FP4 quantization or hybrid NVFP4 MoE metadata."
+            )
+
+        self.flashinfer_a2a_dispatch_type = dispatch_type
+
     def _handle_a2a_moe(self):
         # The backend overrides and the ep_size=tp_size adjustments moved to
         # the resolution pipeline (arg_groups/overrides.py:
@@ -5538,6 +5588,14 @@ class ServerArgs:
             self.enforce_shared_experts_fusion = True
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
 
+        if a2a_backend != "flashinfer" and self.flashinfer_a2a_dispatch_type not in (
+            None,
+            "auto",
+        ):
+            raise ValueError(
+                "--flashinfer-a2a-dispatch-type requires "
+                "--moe-a2a-backend flashinfer."
+            )
         if a2a_backend == "megamoe":
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
@@ -5584,14 +5642,25 @@ class ServerArgs:
             )
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
-                resolved_view(self).quantization == "modelopt_fp4"
-                or self.get_model_config().nvfp4_moe_meta is not None
-            ):
-                envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
-                logger.warning(
-                    "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
-                )
+            if self.flashinfer_a2a_dispatch_type is None:
+                if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
+                    resolved_view(self).quantization == "modelopt_fp4"
+                    or self.get_model_config().nvfp4_moe_meta is not None
+                ):
+                    envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
+                    logger.warning(
+                        "SGLANG_MOE_NVFP4_DISPATCH is set to True for "
+                        "Flashinfer MoE A2A"
+                    )
+            else:
+                if self.moe_runner_backend == "flashinfer_trtllm":
+                    self.moe_runner_backend = "flashinfer_trtllm_routed"
+                    logger.warning(
+                        "Flashinfer MoE A2A is enabled with flashinfer_trtllm. "
+                        "Using flashinfer_trtllm_routed because A2A dispatch "
+                        "provides top-k ids and weights."
+                    )
+                self._handle_flashinfer_a2a_dispatch_type()
             assert resolved_view(self).moe_runner_backend in [
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",

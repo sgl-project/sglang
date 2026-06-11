@@ -16,10 +16,13 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
+    FlashinferA2ADispatchType,
+    get_flashinfer_a2a_dispatch_type,
     is_flashinfer_cutedsl_v1_path,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -257,6 +260,12 @@ def slice_nvfp4_output(
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
+
+
+def _use_nvfp4_dispatch() -> bool:
+    if not get_moe_a2a_backend().is_flashinfer():
+        return MOE_NVFP4_DISPATCH
+    return get_flashinfer_a2a_dispatch_type() == FlashinferA2ADispatchType.NVFP4
 
 
 _SUPPORTED_ACT_STRS = ("silu", "relu2", "gelu")
@@ -2111,6 +2120,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
             # the gate/up columns to the gate scale here. Other backends keep the
@@ -2165,7 +2175,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = _slice_scale(w13_input_scale)
             w2_input_scale = _slice_scale(w2_input_scale)
 
-            if MOE_NVFP4_DISPATCH:
+            if use_nvfp4_dispatch:
                 assert torch.all(w13_input_scale == w13_input_scale[0])
                 w13_input_scale = w13_input_scale[0]
         else:
@@ -2220,7 +2230,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {
                 "input_global_scale": (
                     layer.w13_input_scale_quant
-                    if MOE_NVFP4_DISPATCH
+                    if use_nvfp4_dispatch
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else None
                 )

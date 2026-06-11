@@ -202,6 +202,40 @@ class DispatcherOutputDtype(Enum):
     INT8 = "int8"
     NVFP4 = "nvfp4"
 
+class FlashinferA2ADispatchType(Enum):
+    BF16 = "bf16"
+    NVFP4 = "nvfp4"
+    MXFP8 = "mxfp8"
+
+
+def get_flashinfer_a2a_dispatch_type() -> FlashinferA2ADispatchType:
+    server_args = get_server_args()
+    dispatch_type = getattr(server_args, "flashinfer_a2a_dispatch_type", None)
+
+    if dispatch_type is None:
+        if envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
+            return (
+                FlashinferA2ADispatchType.NVFP4
+                if envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+                else FlashinferA2ADispatchType.BF16
+            )
+        return FlashinferA2ADispatchType.BF16
+
+    if dispatch_type != "auto":
+        return FlashinferA2ADispatchType(dispatch_type)
+
+    assert not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
+
+    quantization = getattr(server_args, "quantization", None)
+    if quantization == "mxfp8":
+        dispatch_type = "mxfp8"
+    elif quantization == "modelopt_fp4":
+        dispatch_type = "nvfp4"
+    else:
+        dispatch_type = "bf16"
+
+    return FlashinferA2ADispatchType(dispatch_type)
+
 
 def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     """

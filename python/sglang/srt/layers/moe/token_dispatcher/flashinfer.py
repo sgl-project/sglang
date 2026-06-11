@@ -6,7 +6,6 @@ from typing import NamedTuple, Optional
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     is_dp_attention_enabled,
@@ -26,7 +25,11 @@ from sglang.srt.layers.moe.topk import (
     TopKOutput,
     TopKOutputChecker,
 )
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    FlashinferA2ADispatchType,
+    get_flashinfer_a2a_dispatch_type,
+    get_moe_runner_backend,
+)
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
@@ -45,8 +48,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
-
 
 class FlashinferDispatchOutput(NamedTuple):
     """Flashinfer EP dispatch output."""
@@ -56,6 +57,7 @@ class FlashinferDispatchOutput(NamedTuple):
     topk_output: StandardTopKOutput
     # Provide an output tensor to fused_moe so it writes directly to our buffer
     moe_output: Optional[torch.Tensor] = None
+    output_dtype: Optional[torch.dtype] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -110,6 +112,7 @@ class FlashinferDispatcher(BaseDispatcher):
         )
         # TODO: Can other moe runners use payload_in_workspace too?
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.dispatch_type = get_flashinfer_a2a_dispatch_type()
 
         # FlashInfer sizes the workspace from the maximum dispatched tokens per
         # EP rank. See FlashInfer's moe_a2a_get_workspace_size_per_rank(),
@@ -129,15 +132,27 @@ class FlashinferDispatcher(BaseDispatcher):
             "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK",
             default_max_tokens,
         )
-
-        # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
         speculative_algo = SpeculativeAlgorithm.from_string(
             get_server_args().speculative_algorithm
         )
-        if MOE_NVFP4_DISPATCH and not speculative_algo.is_eagle():
+        can_use_quantized_dispatch = not speculative_algo.is_eagle()
+        if (
+            self.dispatch_type == FlashinferA2ADispatchType.NVFP4
+            and can_use_quantized_dispatch
+        ):
             total_dispatch_payload_size_per_token = (
                 hidden_size // 2  # nvfp4 hidden states
-                + hidden_size // 16  # fp8 scaling factors
+                + hidden_size // 16  # uint8 scaling factors
+                + self.router_topk * 4  # int32 topks ids
+                + self.router_topk * 4  # float32 topk weights
+            )
+        elif (
+            self.dispatch_type == FlashinferA2ADispatchType.MXFP8
+            and can_use_quantized_dispatch
+        ):
+            total_dispatch_payload_size_per_token = (
+                hidden_size  # fp8 hidden states
+                + hidden_size // 32  # ue8m0 scaling factors
                 + self.router_topk * 4  # int32 topks ids
                 + self.router_topk * 4  # float32 topk weights
             )
@@ -178,6 +193,7 @@ class FlashinferDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> FlashinferDispatchOutput:
         output_dtype = hidden_states.dtype
+        dispatch_type = self.dispatch_type
         x = hidden_states
         x_sf = None
         # FlashInfer dispatch requires materialized top-k IDs and weights.
@@ -188,14 +204,31 @@ class FlashinferDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights
 
-        global_scale = self.quant_config.get("input_global_scale", None)
-        if global_scale is not None:
+        if dispatch_type == FlashinferA2ADispatchType.NVFP4:
+            global_scale = (self.quant_config or {}).get("input_global_scale", None)
+            assert global_scale is not None
             if x.shape[0] > 0:
                 x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
             else:
-                x_col = x.shape[1]
-                x = torch.zeros(0, x_col // 2, dtype=torch.uint8, device=x.device)
-                x_sf = torch.zeros(0, x_col // 16, dtype=torch.uint8, device=x.device)
+                x = torch.zeros(
+                    0, self.hidden_size // 2, dtype=torch.uint8, device=x.device
+                )
+                x_sf = torch.zeros(
+                    0, self.hidden_size // 16, dtype=torch.uint8, device=x.device
+                )
+        elif dispatch_type == FlashinferA2ADispatchType.MXFP8:
+            if x.shape[0] > 0:
+                from flashinfer import mxfp8_quantize
+
+                x, x_sf = mxfp8_quantize(x, False)
+                x_sf = x_sf.view(torch.uint8).reshape(
+                    x.shape[0], self.hidden_size // 32
+                )
+            else:
+                x = torch.zeros(0, self.hidden_size, dtype=torch.uint8, device=x.device)
+                x_sf = torch.zeros(
+                    0, self.hidden_size // 32, dtype=torch.uint8, device=x.device
+                )
 
         payloads = []
         payloads.append(x)
@@ -275,12 +308,17 @@ class FlashinferDispatcher(BaseDispatcher):
         if x_sf is not None:
             x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
             x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
-            # TODO: fuse interleave into cutlass moe
-            if get_moe_runner_backend().is_flashinfer_cutlass():
+            # TODO: Fuse interleave into cutlass moe when FlashInfer supports it.
+            if (
+                dispatch_type == FlashinferA2ADispatchType.NVFP4
+                and get_moe_runner_backend().is_flashinfer_cutlass()
+            ):
                 x_sf = nvfp4_block_scale_interleave(x_sf)
         else:
             x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
         x = x_recv.view(-1, x_recv.shape[-1])
+        if dispatch_type == FlashinferA2ADispatchType.MXFP8:
+            x = x.view(torch.float8_e4m3fn)
         topk_ids = topk_ids_recv.view(-1, topk_ids_recv.shape[-1])
         topk_weights = topk_weights_recv.view(-1, topk_weights_recv.shape[-1])
 
@@ -295,6 +333,7 @@ class FlashinferDispatcher(BaseDispatcher):
             x_sf,
             StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits),
             moe_output,
+            output_dtype,
         )
 
     @debug_kernel_api
