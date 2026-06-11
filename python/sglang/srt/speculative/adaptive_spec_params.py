@@ -49,7 +49,10 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             f"speculative_algorithm={server_args.speculative_algorithm} "
             "(only EAGLE/EAGLE3 are supported)"
         )
-    if server_args.speculative_eagle_topk != 1:
+    if (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk != 1
+    ):
         return (
             f"speculative_eagle_topk={server_args.speculative_eagle_topk} "
             "(only topk=1 is supported)"
@@ -62,7 +65,7 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     if server_args.enable_multi_layer_eagle:
         return (
             "enable_multi_layer_eagle=True is not supported "
-            "(MultiLayerEagleWorker does not implement adaptive)"
+            "(MultiLayerEagleWorkerV2 does not implement adaptive)"
         )
     if server_args.enable_two_batch_overlap:
         return (
@@ -124,19 +127,6 @@ def resolve_candidate_steps_from_config(
     for entry in bs_entries.values():
         all_steps.update(entry["candidate_steps"])
     return sorted(all_steps)
-
-
-def validate_adaptive_initial_steps(
-    initial_steps: int,
-    cfg_path: str | None = None,
-) -> None:
-    """Require the initial step to be a candidate of some BS slot."""
-    candidate_steps = resolve_candidate_steps_from_config(cfg_path)
-    if initial_steps not in candidate_steps:
-        raise ValueError(
-            f"--speculative-num-steps={initial_steps} is not in the adaptive "
-            f"config candidate_steps {candidate_steps}. Pass one of those values."
-        )
 
 
 class AdaptiveStepSlot:
