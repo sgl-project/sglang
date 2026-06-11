@@ -1404,7 +1404,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     scale_param.data = torch.stack(new_scales).float()
                     scale_param.format_ue8m0 = False
                 self.is_fp4_expert = False
-                logger.info("Dequantized FP4 expert weights to FP8.")
+                logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
             if self.is_fp4_expert:
                 if get_moe_runner_backend().is_marlin():
