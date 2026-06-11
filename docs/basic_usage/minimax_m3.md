@@ -12,7 +12,7 @@ python -m sglang.launch_server \
     --model-path MiniMaxAI/Minimax-M3-preview \
     --tp-size 8 \
     --chunked-prefill-size 8192 \
-    --tool-call-parser minimax-m3-nom \
+    --tool-call-parser minimax-m3 \
     --reasoning-parser minimax-m3 \
     --host 0.0.0.0 \
     --trust-remote-code \
