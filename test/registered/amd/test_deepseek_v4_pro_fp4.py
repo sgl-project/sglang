@@ -133,6 +133,10 @@ class TestDeepseekV4ProFp4(CustomTestCase):
             )
             self.assertGreater(metrics["accuracy"], 0.92)
 
+    @unittest.skipIf(
+        os.environ.get("SGLANG_DSV4_ACCURACY_ONLY") == "1",
+        "SGLANG_DSV4_ACCURACY_ONLY=1: accuracy-only run (skipping perf)",
+    )
     def test_b_perf_8k_1k(self):
         json_output = "/tmp/deepseek_v4_pro_fp4_perf.json"
         if os.path.exists(json_output):
