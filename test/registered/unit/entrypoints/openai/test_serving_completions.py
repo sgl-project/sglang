@@ -101,6 +101,14 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(internal.cache_salt, "tenant-a")
         self.assertEqual(internal.extra_key, "classification")
 
+    def test_session_params_forwarded(self):
+        # Regression test for #23579: session_params was silently dropped.
+        req = CompletionRequest(
+            model="x", prompt="Hello", max_tokens=100, session_params={"id": "s1"}
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertEqual(internal.session_params, {"id": "s1"})
+
     def test_single_request_rejects_batched_cache_salt(self):
         req = CompletionRequest(
             model="x",
