@@ -27,7 +27,7 @@ v0.5.10 or a later version.
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto` (`--ep-size` is automatically set to `--tp`)    |
 | PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| NPU Graph                     | `--cuda-graph-bs 4 8 20 21 22`                                                                |
+| NPU Graph                     | `--cuda-graph-bs-decode 4 8 20 21 22`                                                         |
 | Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
@@ -194,7 +194,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 --quantization modelslim \
 --watchdog-timeout 9000 \
 --host 127.0.0.1 --port 6699 \
---cuda-graph-bs 4 8 20 21 22 \
+--cuda-graph-bs-decode 4 8 20 21 22 \
 --mem-fraction-static 0.78 \
 --max-running-requests 352 \
 --disable-radix-cache --chunked-prefill-size -1 --max-prefill-tokens 1500 \
@@ -300,7 +300,7 @@ do
         --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 16 \
         --mem-fraction-static 0.8 --max-running-requests 448 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
-        --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
         --load-balance-method round_robin
@@ -379,12 +379,12 @@ on the Best Practice page.
 
 | Scenario                      | Deployment mode     | Total NPUs  | Weight version  |
 |-------------------------------|---------------------|-------------|-----------------|
-| Low latency (6K+1.6K)         | PD disaggregation   | 32 (A3)     | W8A8 INT8       |
-| Low latency (3.9K+1K)         | PD disaggregation   | 32 (A3)     | W8A8 INT8       |
-| Low latency (3.5K+1.5K)       | PD disaggregation   | 32 (A3)     | W8A8 INT8       |
-| Low latency (3.5K+1K)         | PD disaggregation   | 32 (A3)     | W8A8 INT8       |
-| High throughput (3.5K+1.5K)   | PD disaggregation   | 32 (A3)     | W8A8 INT8       |
-| High throughput (2K+2K)       | PD disaggregation   | 24 (A3)     | W8A8 INT8       |
+| Low latency (6K+1.6K)         | PD disaggregation   | 32 (A3)     | W8A8       |
+| Low latency (3.9K+1K)         | PD disaggregation   | 32 (A3)     | W8A8       |
+| Low latency (3.5K+1.5K)       | PD disaggregation   | 32 (A3)     | W8A8       |
+| Low latency (3.5K+1K)         | PD disaggregation   | 32 (A3)     | W8A8       |
+| High throughput (3.5K+1.5K)   | PD disaggregation   | 32 (A3)     | W8A8       |
+| High throughput (2K+2K)       | PD disaggregation   | 24 (A3)     | W8A8       |
 | High throughput (3.5K+1.5K)   | PD mixed            | 8 (A3)      | W4A8 INT8       |
 | High throughput (2K+2K)       | PD mixed            | 8 (A3)      | W4A8 INT8       |
 | High throughput (2K+2K)       | PD disaggregation   | 16 (A3)     | W4A8 INT8       |

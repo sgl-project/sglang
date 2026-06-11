@@ -29,7 +29,7 @@ v0.5.10 or a later version.
 | PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 8192`                                          |
-| NPU Graph                     | `--cuda-graph-bs 8 16 24 32 48 64 80`                                                         |
+| NPU Graph                     | `--cuda-graph-bs-decode 8 16 24 32 48 64 80`                                                         |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 
@@ -169,7 +169,7 @@ python -m sglang.launch_server \
    --prefill-delayer-max-delay-passes 500 \
    --enable-prefill-delayer \
    --chunked-prefill-size -1 --max-prefill-tokens 8192 \
-   --cuda-graph-bs 8 16 24 32 48 64 80 \
+   --cuda-graph-bs-decode 8 16 24 32 48 64 80 \
    --moe-a2a-backend ascend_fuseep --deepep-mode auto --quantization modelslim \
    --speculative-algorithm EAGLE3 \
    --speculative-draft-model-path $EAGLE_MODEL_PATH \
@@ -288,7 +288,7 @@ do
         export SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=96
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --cuda-graph-bs 8 16 24 32 40 \
+        --cuda-graph-bs-decode 8 16 24 32 40 \
         --port 33000 --trust-remote-code \
         --tp-size 16 --mem-fraction-static 0.76 --attention-backend ascend --device npu --quantization modelslim \
         --nnodes 1 --node-rank $i --dist-init-addr $D_MASTER \
