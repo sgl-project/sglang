@@ -119,6 +119,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
         x = runner_input.hidden_states
+        original_dtype = x.dtype
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
 
@@ -128,7 +129,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             x,
             expert_tokens,
             pertoken_scale=runner_input.hidden_states_scale,
-            output_dtype=torch.bfloat16,
+            output_dtype=original_dtype,
             weight_prefix="w13",
             group_list_type=group_list_type,
         )
@@ -152,7 +153,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             hidden_states,
             expert_tokens,
             pertoken_scale=pertoken_scale,
-            output_dtype=torch.bfloat16,
+            output_dtype=original_dtype,
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
