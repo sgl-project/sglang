@@ -467,7 +467,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.alt_stream is not None
             and get_is_capture_mode()
             and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
-            and _gdn_use_alt_stream
+            and (_is_cuda or _gdn_use_alt_stream)
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -589,7 +589,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
-                alt_stream=(alt_stream if _disable_shared_experts_fusion() else None),
+                alt_stream=(alt_stream if (_is_cuda or _disable_shared_experts_fusion()) else None),
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
@@ -801,7 +801,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
-                alt_stream=(alt_stream if _disable_shared_experts_fusion() else None),
+                alt_stream=(alt_stream if (_is_cuda or _disable_shared_experts_fusion()) else None),
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
@@ -845,7 +845,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and _qknorm_use_alt_stream
+            and (_is_cuda or _qknorm_use_alt_stream)
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -2085,3 +2085,4 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+
