@@ -137,9 +137,11 @@ Decisions log, in the order they came up:
    hisparse (DSA-only), MegaMoE (DSv4 Blackwell-only). The legacy
    `--expert-parallel-size 8` flag is normalized to `--ep 8` for the EP knob.
 6. **Benchmarks**: one entry (the measured cell) only — entry-less cells render
-   "pending" without stubs. `tokens_per_sec_per_gpu` = output tok/s ÷ 8.
-   `sglang_version: "main branch"` verbatim. MMMU via `accuracyLabels` +
-   sample-count detail in `notes`.
+   "pending" without stubs. The legacy speed numbers were DROPPED: they were
+   measured on a drifting "main branch" build, which is no version anchor
+   (speed migrates only under an exact release tag / commit hash — hard rule
+   2), so the entry carries accuracy only (GSM8K + MMMU via `accuracyLabels`,
+   sample counts in `notes`) and no `sglang_version`.
 7. **Codegen + audit scripts** (adapt per model): a generator-port script that
    emits the cells literal, and an independent audit that `git show`s the
    ORIGINAL generator, stubs `useState`/`useEffect`, calls its

@@ -55,3 +55,9 @@ defect. Inherited recipes that look memory-infeasible by the TP/VRAM formula
 kept verbatim, stay yellow, and get listed in the PR body. A separate
 re-verification track (devbox benchmarking + Playground Submit ↗) turns cells
 green over time; it does not block migrations.
+
+**Speed numbers migrate only under an exact pinned build** (release tag or
+commit hash — SKILL.md hard rule 2). Pages whose measurements cite drifting
+version strings keep accuracy only: Qwen3.5 ("main branch" — done, speed
+dropped); Qwen3-Coder-Next cites "0.5.8+" — confirm with the maintainer
+before migrating its speed blocks.

@@ -29,10 +29,16 @@ Migration-specific references in this skill:
    serve`, `--model`→`--model-path`, `--tp-size`→`--tp`, abbreviated
    `--speculative-algo`→`--speculative-algorithm`,
    `--expert-parallel-size`→`--ep`).
-2. **Never invent versions or numbers.** `sglang_version` is the legacy page's
-   string verbatim — including "main branch", "0.5.8+", or a commit hash.
-   Benchmark numbers only from the legacy page's measured blocks. Docker tags
-   only the ones the legacy page pinned (unmapped hw falls back to `:dev`).
+2. **Never invent versions or numbers.** Benchmark numbers only from the
+   legacy page's measured blocks. **Speed measurements migrate ONLY when the
+   legacy page pins an exact, reproducible build** (a release tag or a commit
+   hash) — drifting strings like "main branch" are no version anchor: drop the
+   speed numbers AND the entry's `sglang_version`, keep accuracy (far less
+   build-sensitive) and `benchmarkCommands` so ⚡Reproduce guides
+   re-measurement against a pinned release; confirm ambiguous strings (e.g.
+   "0.5.8+") with the maintainer. When kept, `sglang_version` is the legacy
+   page's string verbatim. Docker tags only the ones the legacy page pinned
+   (unmapped hw falls back to `:dev`).
 3. **Verified policy (strictest tier).** `verified: true` ONLY when (a) the
    legacy page has concrete measured data for that exact 5-dim combo AND
    (b) the cell's flags equal the deployment command used for that measurement
