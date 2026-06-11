@@ -116,6 +116,16 @@ class DllmAlgorithm:
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
 
+        # In-place re-loop: if no block resolved this round, keep denoising on the
+        # same batch instead of paying a scheduler round-trip (the unresolved
+        # blocks' KV stays in place). Yield as soon as any block resolves so FDFO
+        # can free it promptly. Bounded by the per-block step budget.
+        for _ in range(self.max_steps(self.block_size) - 1):
+            if any(done):
+                break
+            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            done = self.step(forward_batch, out.logits_output.full_logits, states)
+
         accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
         next_token_ids_list = forward_batch.input_ids.view(
             batch_size, self.block_size
