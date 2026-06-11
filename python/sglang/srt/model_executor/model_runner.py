@@ -756,7 +756,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
-        if is_tp_invariant_target():
+        if is_tp_invariant_target(server_args):
             from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
 
             enable_tp_invariant_mode()
@@ -2144,12 +2144,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self,
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         load_format: Optional[str] = None,
+        weight_version: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(
-                flattened_tensor_bucket_dict=named_tensors
+                flattened_tensor_bucket_dict=named_tensors,
+                weight_version=weight_version,
             )
 
         # We need to get device after patch otherwise the device would be wrong
@@ -2174,6 +2176,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _update_weights_from_flattened_bucket(
         self,
         flattened_tensor_bucket_dict,
+        weight_version: Optional[str] = None,
     ):
         """Handle flattened bucket format for weight updates"""
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
