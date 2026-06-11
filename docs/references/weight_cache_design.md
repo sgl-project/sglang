@@ -6,7 +6,7 @@ SGLang loads model weights from storage into GPU memory during engine startup. F
 
 ## Solution
 
-A persistent **Weight Cache Daemon** process that holds post-quantized, TP-sharded weights in GPU memory. On engine restart, the new engine process maps or copies weights from the daemon via CUDA IPC handles, reducing restart time from minutes to sub-second.
+A persistent **Weight Cache Daemon** process that holds post-quantized, TP-sharded weights in GPU memory. On engine restart, the new engine process maps weights from the daemon via CUDA IPC handles, reducing restart time from minutes to sub-second.
 
 ## Architecture
 
@@ -17,9 +17,9 @@ A persistent **Weight Cache Daemon** process that holds post-quantized, TP-shard
 │  │ Weight Cache      │─────────────────────►│ Engine  │ │
 │  │ Daemon (rank i)   │   (zero-copy)        │ Rank i  │ │
 │  │                   │                      │         │ │
-│  │ Holds:            │   or copy_()         │         │ │
-│  │ - TP-sharded      │────── ~0.3s ────────►│         │ │
-│  │   weights (fp8)   │   (copy mode)        │         │ │
+│  │ Holds:            │                      │         │ │
+│  │ - TP-sharded      │                      │         │ │
+│  │   weights (fp8)   │                      │         │ │
 │  │ - weight_scale    │                      │         │ │
 │  │ - workspace       │                      │         │ │
 │  │ - all post-quant  │                      │         │ │
@@ -33,12 +33,7 @@ Coordination: Unix Socket /tmp/sglang_weight_cache_gpu{i}.sock
 
 Each GPU runs one daemon process holding only its own TP rank's shard. The daemon caches the **complete post-quantization state** (after `process_weights_after_loading()`), including new parameters like `weight_scale`, `workspace`, repacked weights, etc.
 
-## Two Mapping Modes
-
-| Mode | Flow | Restart Time (70B FP16) | GPU Memory | Use Case |
-|------|------|-------------------------|------------|----------|
-| **Zero-copy** | import IPC handle → use as param.data | < 0.1s | 1x (shared) | Multi-instance, memory-constrained |
-| **Copy** | import IPC handle → copy_() → release | ~0.3s | 2x (daemon+engine) | General, engine-independent |
+The engine and daemon share the same physical GPU memory via CUDA IPC. Only 1x model memory is needed on each GPU.
 
 ## Design Details
 
@@ -53,11 +48,11 @@ Each daemon process:
 
 ### 2. IPC Model Loader
 
-A new `BaseModelLoader` subclass that:
+A `BaseModelLoader` subclass that:
 1. Connects to the daemon's Unix socket
 2. Validates `CacheConfig` compatibility
-3. On match: imports IPC tensors, replaces model parameters
-4. On mismatch: falls back to `DefaultModelLoader` (disk load)
+3. On match: imports IPC tensors, replaces model parameters (zero-copy)
+4. On mismatch: falls back to `DefaultModelLoader` (disk load) in client mode; raises error in daemon mode
 
 ### 3. Config Validation (Critical)
 
@@ -91,10 +86,10 @@ Daemon Restart:
 
 ### 5. Integration Points
 
-- `LoadFormat.IPC_CACHE` — new load format enum value
-- `--weight-cache-mode` — server arg: `off` | `daemon` | `client` | `copy`
+- `LoadFormat.IPC_CACHE` — load format enum value
+- `--weight-cache-mode` — server arg: `off` | `daemon` | `client`
 - `--weight-cache-socket` — server arg: path to daemon socket (for client mode)
-- `IpcModelLoader` — new `BaseModelLoader` subclass
+- `IpcModelLoader` — `BaseModelLoader` subclass
 - `ModelRunner.load_model()` — dispatches to `IpcModelLoader` when cache mode is set
 - `WeightCacheDaemon` — standalone process, launched by engine or independently
 
@@ -108,22 +103,50 @@ Daemon Restart:
 | `torch-memory-saver` | Pause/resume within single process; cache daemon persists across process lifetimes |
 | `HostSharedMemoryManager` | CPU-side shared memory; cache daemon is GPU-side shared memory |
 
+## Launching Daemons
+
+### Single command (all TP ranks)
+
+```bash
+python3 -m sglang.srt.weight_cache.daemon \
+    --model-path /path/to/model \
+    --tp-size 4 \
+    --load-format auto --dtype auto
+```
+
+This automatically:
+- Spawns one daemon process per GPU (gpu 0..3)
+- Allocates a free port for NCCL distributed init
+- Waits for all daemons to become ready
+- Monitors processes — if any exits, terminates all
+
+### Single rank (manual)
+
+```bash
+DIST_PORT=29500
+
+python3 -m sglang.srt.weight_cache.daemon \
+    --model-path /path/to/model \
+    --gpu-id 0 --tp-size 4 --tp-rank 0 \
+    --dist-init-method tcp://127.0.0.1:$DIST_PORT &
+```
+
 ## File Layout
 
 ```
 python/sglang/srt/weight_cache/
 ├── __init__.py
-├── daemon.py          # WeightCacheDaemon process
+├── daemon.py          # WeightCacheDaemon process + launch_weight_cache_daemons
 ├── ipc_loader.py      # IpcModelLoader (BaseModelLoader subclass)
 └── protocol.py        # CacheConfig, socket protocol, serialization helpers
 ```
 
 ## Performance Expectations
 
-| Model | Weight Size | Disk Load | IPC Copy | IPC Zero-copy |
-|-------|-------------|-----------|----------|---------------|
-| 7B FP16 | ~14 GB | ~30s | ~0.03s | < 0.01s |
-| 70B FP16 | ~140 GB | ~3-5min | ~0.3s | < 0.1s |
-| 235B FP8 | ~235 GB | ~5-10min | ~0.25s | < 0.1s |
+| Model | Weight Size | Disk Load | IPC Zero-copy |
+|-------|-------------|-----------|---------------|
+| 7B FP16 | ~14 GB | ~30s | < 0.01s |
+| 70B FP16 | ~140 GB | ~3-5min | < 0.1s |
+| 235B FP8 | ~235 GB | ~5-10min | < 0.1s |
 
-GPU-internal copy bandwidth: ~500-900 GB/s (H20 HBM). IPC handle mapping: ~10k handles/ms.
+IPC handle mapping: ~10k handles/ms.
