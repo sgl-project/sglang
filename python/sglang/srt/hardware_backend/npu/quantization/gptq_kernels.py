@@ -84,7 +84,7 @@ class GPTQLinearAscendKernel:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
-        layer.qweight_offset = torch.nn.Parameter(
+        layer.qzeros = torch.nn.Parameter(
             unpack_from_int32(
                 layer.qzeros.data.contiguous(),
                 self.quant_config.weight_bits,
@@ -129,15 +129,15 @@ class GPTQLinearAscendKernel:
 
         # 4bit weight is packed to int32(8 x int4)
         if self.quant_config.weight_bits == 4:
-            out_shape = x.shape[:-1] + (weight.shape[-1] * 8,)
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * 8,)
         else:
-            out_shape = x.shape[:-1] + (weight.shape[-1],)
+            out_shape = x.shape[:-1] + (qweight.shape[-1],)
 
         out = torch_npu.npu_weight_quant_batchmatmul(
             reshaped_x,
-            weight,
+            qweight,
             antiquant_scale=scales,
-            antiquant_offset=weight_offset,
+            antiquant_offset=qzeros,
             antiquant_group_size=self.quant_config.group_size,
             bias=bias,
         )
