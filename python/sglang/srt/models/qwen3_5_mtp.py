@@ -58,7 +58,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         config = copy.deepcopy(config)
 
         # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() == "modelopt_fp4":
+        if quant_config and quant_config.get_name() in (
+            "modelopt_fp4",
+            "modelopt_mixed",
+        ):
             quant_config = None
         if (
             is_npu()
@@ -132,6 +135,34 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_lm_head_from_target(self, target_lm_head):
+        if self.config.tie_word_embeddings:
+            return
+
+        for param_name, param in target_lm_head.named_parameters(recurse=False):
+            if hasattr(self.lm_head, param_name):
+                delattr(self.lm_head, param_name)
+            self.lm_head.register_parameter(param_name, param)
+
+        for buffer_name, buffer in target_lm_head.named_buffers(recurse=False):
+            if hasattr(self.lm_head, buffer_name):
+                delattr(self.lm_head, buffer_name)
+            self.lm_head.register_buffer(buffer_name, buffer)
+
+        for attr_name in (
+            "quant_method",
+            "quant_config",
+            "logical_widths",
+            "input_size_per_partition",
+            "output_size_per_partition",
+            "params_dtype",
+            "weights_padding_cols",
+            "workspace",
+            "_accepts_prequantized_fp4",
+        ):
+            if hasattr(target_lm_head, attr_name):
+                setattr(self.lm_head, attr_name, getattr(target_lm_head, attr_name))
 
     @torch.no_grad()
     def forward(

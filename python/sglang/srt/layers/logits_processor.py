@@ -880,9 +880,21 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
+        elif (
+            quant_method is not None
+            and callable(getattr(quant_method, "apply", None))
+            and type(quant_method).__name__
+            not in (
+                "UnquantizedEmbeddingMethod",
+                "UnquantizedLinearMethod",
+                "PackWeightMethod",
+            )
+        ):
+            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if self.use_fp32_lm_head:

@@ -275,6 +275,14 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def init_lm_head(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
+
+        def maybe_share_lm_head_quant_attrs():
+            if target_lm_head is not None and hasattr(
+                self.draft_runner.model, "set_lm_head_from_target"
+            ):
+                self.draft_runner.model.set_lm_head_from_target(target_lm_head)
+
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
@@ -283,6 +291,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 and self.draft_runner.model.load_lm_head_from_target
             ):
                 self.draft_runner.model.set_embed_and_head(embed, head)
+                maybe_share_lm_head_quant_attrs()
             else:
                 self.draft_runner.model.set_embed(embed)
 
@@ -300,6 +309,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
+            maybe_share_lm_head_quant_attrs()
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
