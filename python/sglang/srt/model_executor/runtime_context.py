@@ -28,8 +28,16 @@ process resolves its context once at init.
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Optional
+
+# M0.5: fields a model may declaratively override via ctx.config.set(). Bounded
+# (G5 — not the whole config). M0.5 ships exactly one; P2 extends to the full set.
+_CONFIG_OVERRIDE_WHITELIST = frozenset({"use_mla_backend"})
+
+# sentinel for "key absent" so override() can restore an absent key by deleting it
+_MISSING = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,10 +88,56 @@ class ConfigSection:
     """The ``.config`` sub-struct: raw/resolved process-static inputs. M0.1 fills
     only ``.parallel``; ``.attn`` / ``.moe`` / ``.kv`` … land in later steps.
 
-    Later steps (M0.5) add the controlled write surface (``set`` / ``freeze`` /
-    ``override``) to this type."""
+    M0.5 adds the G3 controlled write surface — ``set`` (whitelist-bounded
+    declarative-override) / ``freeze`` / ``override`` (scoped) — plus the
+    ``_overrides`` store holding the resolved model-override values. The
+    resolved value is stored in this independent slot, NOT written back onto a
+    same-named ``ServerArgs`` attribute (avoids the ``use_mla_backend``
+    method-vs-attribute shadowing hazard; m0.5 R6)."""
 
     parallel: ParallelConfig
+    _overrides: dict = field(default_factory=dict)
+    _frozen: bool = False
+
+    def set(self, name: str, value) -> None:
+        """G3(a) declarative-override write. Whitelist-bounded; raises after
+        ``freeze()`` (the sanctioned post-freeze path is ``override``)."""
+        if name not in _CONFIG_OVERRIDE_WHITELIST:
+            raise KeyError(
+                f"{name!r} not in config override whitelist "
+                f"{sorted(_CONFIG_OVERRIDE_WHITELIST)}"
+            )
+        if self._frozen:
+            raise RuntimeError(
+                f"config is frozen; cannot set {name!r} "
+                f"(use RuntimeContext.override(...) for a scoped test/debug override)"
+            )
+        self._overrides[name] = value
+
+    def get(self, name: str):
+        return self._overrides[name]
+
+    def freeze(self) -> None:
+        self._frozen = True
+
+    @contextmanager
+    def override(self, **kwargs):
+        """G3(b) scoped set-with-restore. Bypasses ``freeze`` (the only sanctioned
+        post-freeze mutation). ``try/finally`` so the restore also runs on
+        exception (fixes the ``EnvField.override`` bare-yield gap; m0.5 R4)."""
+        for name in kwargs:
+            if name not in _CONFIG_OVERRIDE_WHITELIST:
+                raise KeyError(f"{name!r} not in config override whitelist")
+        backup = {name: self._overrides.get(name, _MISSING) for name in kwargs}
+        self._overrides.update(kwargs)
+        try:
+            yield
+        finally:
+            for name, old in backup.items():
+                if old is _MISSING:
+                    self._overrides.pop(name, None)
+                else:
+                    self._overrides[name] = old
 
 
 @dataclass(slots=True)
@@ -95,15 +149,24 @@ class RuntimeContext:
     _frozen: bool = False
 
     def apply_model_overrides(self, model) -> None:
-        """G3(a) declarative model-override hook — placeholder. The ``freeze``
-        primitive is filled in M0.5; the declarative hook itself in Stage-B P2."""
+        """G3(a) declarative model-override *hook* — placeholder. M0.5 builds the
+        underlying ``ctx.config.set`` primitive (wired directly at the
+        use_mla_backend resolution point); the per-model declarative hook that
+        *calls* set() is Stage-B P2. This stub stays a stub through M0.5."""
         ...
 
     def freeze(self) -> None:
-        """G1/G3 freeze — placeholder; M0.5 makes ``.config`` immutable here.
-        M0.1 only flips the sentinel (does NOT actually freeze, so the two-stage
-        attention fill can re-publish — see module docstring)."""
+        """G1/G3 freeze — M0.5 fills it: close the ``.config`` write surface
+        (subsequent ``config.set`` raises; ``override`` still bypasses). Lands
+        after ``init_memory_pool`` per resolution cycle; a second ModelRunner
+        re-publishes a fresh (unfrozen) context, so multi-runner is safe (m0.5 R2)."""
         self._frozen = True
+        self.config.freeze()
+
+    def override(self, **kwargs):
+        """G3(b) scoped test/debug override over ``.config`` — set-with-restore,
+        bypasses freeze. ``with ctx.override(use_mla_backend=True): ...``."""
+        return self.config.override(**kwargs)
 
 
 # Single process-static instance. See module docstring on concurrency.
@@ -220,3 +283,14 @@ def get_local_attn_dp_size() -> Optional[int]:
 
 def get_local_attn_dp_rank() -> Optional[int]:
     return _parallel().local_attn_dp_rank
+
+
+# --- model-override accessors (M0.5 read surface) --------------------------
+# Read the resolved model-override value off .config (NOT the same-named
+# ServerArgs method — avoids the shadowing hazard; m0.5 R6).
+
+
+def get_use_mla_backend() -> bool:
+    """Whether the model uses the MLA attention arch — resolved model override,
+    read from ``.config`` (set once at the ModelRunner resolution point)."""
+    return get_runtime_context().config.get("use_mla_backend")

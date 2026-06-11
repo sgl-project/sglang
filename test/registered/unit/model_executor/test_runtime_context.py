@@ -28,6 +28,7 @@ from sglang.srt.model_executor.runtime_context import (
     get_runtime_context,
     get_tp_rank,
     get_tp_size,
+    get_use_mla_backend,
     has_runtime_context,
     init_runtime_context,
     reset_runtime_context,
@@ -198,6 +199,80 @@ class TestPlaceholders(unittest.TestCase):
         ctx.apply_model_overrides(model=object())  # no-op placeholder, no raise
         ctx.freeze()  # placeholder, only flips sentinel
         self.assertTrue(ctx._frozen)
+
+
+class TestOverrideFreeze(unittest.TestCase):
+    """M0.5: G3 ctx.config.set (whitelist-bounded) / freeze / override (scoped)."""
+
+    def setUp(self):
+        reset_runtime_context()
+
+    def tearDown(self):
+        reset_runtime_context()
+
+    def test_set_whitelisted_then_get(self):
+        _publish(_engine_parallel())
+        get_runtime_context().config.set("use_mla_backend", True)
+        self.assertTrue(get_use_mla_backend())
+        get_runtime_context().config.set("use_mla_backend", False)
+        self.assertFalse(get_use_mla_backend())
+
+    def test_set_offwhitelist_raises(self):
+        _publish(_engine_parallel())
+        with self.assertRaises(KeyError):
+            get_runtime_context().config.set("not_whitelisted", 1)
+
+    def test_set_after_freeze_raises(self):
+        _publish(_engine_parallel())
+        ctx = get_runtime_context()
+        ctx.config.set("use_mla_backend", True)
+        ctx.freeze()
+        with self.assertRaises(RuntimeError):
+            ctx.config.set("use_mla_backend", False)
+        self.assertTrue(get_use_mla_backend())  # unchanged
+
+    def test_override_round_trip_and_bypasses_freeze(self):
+        _publish(_engine_parallel())
+        ctx = get_runtime_context()
+        ctx.config.set("use_mla_backend", True)
+        ctx.freeze()  # frozen — override must still work
+        with ctx.override(use_mla_backend=False):
+            self.assertFalse(get_use_mla_backend())
+        self.assertTrue(get_use_mla_backend())  # restored
+
+    def test_override_restores_on_exception(self):
+        _publish(_engine_parallel())
+        ctx = get_runtime_context()
+        ctx.config.set("use_mla_backend", True)
+
+        class _Boom(Exception):
+            pass
+
+        with self.assertRaises(_Boom):
+            with ctx.override(use_mla_backend=False):
+                self.assertFalse(get_use_mla_backend())
+                raise _Boom()
+        self.assertTrue(get_use_mla_backend())  # restored despite exception
+
+    def test_override_offwhitelist_raises(self):
+        _publish(_engine_parallel())
+        with self.assertRaises(KeyError):
+            with get_runtime_context().override(not_whitelisted=1):
+                pass
+
+    def test_multi_runner_overwrite_publishes_fresh_unfrozen(self):
+        # m0.5 R2: a second ModelRunner re-publishes a fresh context, so its
+        # config.set does not hit the first runner's frozen config.
+        _publish(_engine_parallel())
+        c1 = get_runtime_context()
+        c1.config.set("use_mla_backend", True)
+        c1.freeze()
+        # second runner publishes fresh (overwrite) → unfrozen
+        _publish(_engine_parallel())
+        c2 = get_runtime_context()
+        self.assertIsNot(c2, c1)
+        c2.config.set("use_mla_backend", False)  # must NOT raise
+        self.assertFalse(get_use_mla_backend())
 
 
 if __name__ == "__main__":

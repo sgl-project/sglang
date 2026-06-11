@@ -574,6 +574,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         )
 
+        # M0.5 declarative-override (G3a): route use_mla_backend through the
+        # whitelist-bounded ctx.config.set, replacing the role of the hacky
+        # `global_server_args.use_mla_backend = ...` above. Dual-write for now
+        # (the line above stays so non-flipped readers still work; P2 retires it).
+        get_runtime_context().config.set("use_mla_backend", self.use_mla_backend)
+
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
@@ -824,6 +830,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
+
+        # M0.5 config-driven freeze (G3): the process-static config is resolved
+        # by this point, so close the .config write surface (subsequent
+        # config.set raises; ctx.override still bypasses for tests). Only
+        # use_mla_backend is whitelisted in M0.5; weight-driven kv_cache_dtype /
+        # capture-driven enable_torch_compile are intentionally NOT frozen here
+        # (they re-resolve later — the two-resolution-point evidence for P2).
+        get_runtime_context().freeze()
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_device_graphs so warmup
