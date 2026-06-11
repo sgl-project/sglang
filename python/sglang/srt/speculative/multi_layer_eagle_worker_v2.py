@@ -19,6 +19,9 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
+    MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
+)
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import (
@@ -28,6 +31,11 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -52,12 +60,15 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
     select_top_k_tokens,
 )
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
@@ -122,8 +133,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        backup_decode_mode = server_args.cuda_graph_config.decode.backend
+        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
@@ -176,8 +187,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Init attention backend and cuda graphs
         for i in range(self.speculative_num_steps):
-            self.draft_runner_list[i].server_args.disable_cuda_graph = (
-                backup_disable_cuda_graph
+            self.draft_runner_list[i].server_args.cuda_graph_config.decode.backend = (
+                backup_decode_mode
             )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
@@ -224,12 +235,17 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
-        self.cuda_graph_runner_for_draft_extend = (
-            MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
-        )
+        if not _is_npu:
+            self.cuda_graph_runner_for_draft_extend = (
+                MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
+            )
+        else:
+            self.cuda_graph_runner_for_draft_extend = (
+                MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(self)
+            )
 
     def reset_cuda_graph_buffers(self, forward_batch, batch_result):
         if self.cuda_graph_runner_for_draft_extend:
@@ -523,7 +539,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.reset_cuda_graph_buffers(forward_batch, batch_result)
         else:
             logger.warning_once(
-                f"can't use cuda graph for draft extend! may have correctness issue!"
+                "can't use cuda graph for draft extend! may have correctness issue!"
             )
             select_index = (
                 torch.arange(len(batch.seq_lens), device=self.device)
@@ -785,7 +801,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 verify_input,
                 (
-                    self.target_worker.model_runner.graph_runner.bs
+                    self.target_worker.model_runner.decode_cuda_graph_runner.bs
                     if can_run_cuda_graph
                     else None
                 ),
