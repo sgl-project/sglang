@@ -978,6 +978,8 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        env:
+          AITER_COMMIT_OVERRIDE: ${{ matrix.part == 3 && '7a8ff7dd4ae3063ff1a18622a46460125c84370e' || '' }}
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Test RCCL multi-GPU communication
