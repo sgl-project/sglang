@@ -10,6 +10,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
+# NPU utility for NZ format conversion
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
 
 def unpack_from_int32(
     weight: torch.Tensor,
@@ -53,7 +56,6 @@ def unpack_from_int32(
     offset = pow(2, num_bits) // 2
     unpacked_weight = (unpacked_weight - offset).to(torch.int8)
     return unpacked_weight
-
 
 class GPTQLinearAscendKernel:
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
@@ -129,6 +131,7 @@ class GPTQMoEAscendKernel:
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # ---------- w13 ----------
         w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
             -1, layer.w13_qzeros.shape[-1]
         )
@@ -145,6 +148,52 @@ class GPTQMoEAscendKernel:
         if not self.use_v2_format:
             layer.w13_qzeros += 1
 
+        w13_qweight_2d = (
+            layer.w13_qweight.data.transpose(-1, -2)
+            .contiguous()
+            .reshape(-1, layer.w13_qweight.shape[-2])
+        )
+        w13_qweight_tmp = unpack_from_int32(
+            w13_qweight_2d, self.quant_config.weight_bits, packed_dim=1
+        )  # shape (E * N_packed, in_features * pack_factor)
+
+        pack_factor = 32 // self.quant_config.weight_bits
+        # original packed shape: [E, in_features, out_features // pack_factor]
+        N_packed = layer.w13_qweight.shape[2]   # out_features // pack_factor
+        in_features = layer.w13_qweight.shape[1]  # original in_features
+        out_features = N_packed * pack_factor
+
+        # Handle negative scales for 4-bit
+        if self.quant_config.weight_bits == 4:
+            group_size = self.quant_config.group_size
+            scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)
+            neg_mask = scale_expanded < 0
+            if neg_mask.any():
+                neg_mask = neg_mask.transpose(-1, -2)
+                neg_mask = neg_mask.contiguous().reshape(w13_qweight_tmp.shape)
+                w13_qweight_tmp[neg_mask] = -w13_qweight_tmp[neg_mask]
+                if w13_qweight_tmp.max() > 7:
+                    w13_qweight_tmp.clamp_(max=7)
+                layer.w13_scales.data.abs_()
+
+        # Reshape to [E, out_features, in_features]
+        w13_weight = w13_qweight_tmp.reshape(
+            layer.w13_qweight.shape[0], N_packed, pack_factor, in_features
+        ).permute(0, 1, 3, 2).reshape(layer.w13_qweight.shape[0], out_features, in_features)
+
+        # NZ format cast (must be done before any view change)
+        w13_weight = npu_format_cast(w13_weight)
+
+        # Pack to int32 for 4-bit (int8 for 8-bit)
+        if self.quant_config.weight_bits == 4:
+            # 4 int8 -> 1 int32
+            assert w13_weight.shape[-1] % 4 == 0, "in_features must be divisible by 4"
+            w13_weight = w13_weight.contiguous().view(torch.int32)
+        # else keep int8 (already NZ)
+
+        layer.w13_qweight = torch.nn.Parameter(w13_weight, requires_grad=False)
+
+        # ---------- w2 ----------
         w2_qzeros_2d = layer.w2_qzeros.data.contiguous().reshape(
             -1, layer.w2_qzeros.shape[-1]
         )
@@ -161,56 +210,6 @@ class GPTQMoEAscendKernel:
         if not self.use_v2_format:
             layer.w2_qzeros += 1
 
-        w13_qweight_2d = (
-            layer.w13_qweight.data.transpose(-1, -2)
-            .contiguous()
-            .reshape(-1, layer.w13_qweight.shape[-2])
-        )
-        w13_qweight_tmp = unpack_from_int32(
-            w13_qweight_2d, self.quant_config.weight_bits, packed_dim=1
-        )
-
-        if self.quant_config.weight_bits == 4:
-            group_size = self.quant_config.group_size
-            scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)
-
-            neg_mask = scale_expanded < 0
-
-            if neg_mask.any():
-                neg_mask = neg_mask.transpose(-1, -2)
-                neg_mask = neg_mask.contiguous().reshape(w13_qweight_tmp.shape)
-                w13_qweight_tmp[neg_mask] = -w13_qweight_tmp[neg_mask]
-
-                if w13_qweight_tmp.max() > 7:
-                    w13_qweight_tmp.clamp_(max=7)
-
-                layer.w13_scales.data.abs_()
-
-            layer.w13_qweight = torch.nn.Parameter(
-                torch_npu.npu_convert_weight_to_int4pack(
-                    w13_qweight_tmp.reshape(
-                        layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
-                    )
-                    .transpose(-1, -2)
-                    .contiguous()
-                    .reshape(-1, layer.w13_qweight.shape[2])
-                    .to(torch.int32)
-                )
-                .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
-                .contiguous(),
-                requires_grad=False,
-            )
-        # use int8 to store weight by default
-        else:
-            layer.w13_qweight = torch.nn.Parameter(
-                w13_qweight_tmp.reshape(
-                    layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
-                )
-                .transpose(-1, -2)
-                .contiguous(),
-                requires_grad=False,
-            )
-
         w2_qweight_2d = (
             layer.w2_qweight.data.transpose(-1, -2)
             .contiguous()
@@ -220,43 +219,30 @@ class GPTQMoEAscendKernel:
             w2_qweight_2d, self.quant_config.weight_bits, packed_dim=1
         )
 
+        N_packed = layer.w2_qweight.shape[2]
+        in_features = layer.w2_qweight.shape[1]
+        out_features = N_packed * pack_factor
+
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
             scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)
-
             neg_mask = scale_expanded < 0
-
             if neg_mask.any():
                 neg_mask = neg_mask.transpose(-1, -2)
                 neg_mask = neg_mask.contiguous().reshape(w2_qweight_tmp.shape)
                 w2_qweight_tmp[neg_mask] = -w2_qweight_tmp[neg_mask]
-
                 if w2_qweight_tmp.max() > 7:
                     w2_qweight_tmp.clamp_(max=7)
-
                 layer.w2_scales.data.abs_()
 
-            layer.w2_qweight = torch.nn.Parameter(
-                torch_npu.npu_convert_weight_to_int4pack(
-                    w2_qweight_tmp.reshape(
-                        layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
-                    )
-                    .transpose(-1, -2)
-                    .contiguous()
-                    .reshape(-1, layer.w2_qweight.shape[2])
-                    .to(torch.int32)
-                )
-                .reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1)
-                .contiguous(),
-                requires_grad=False,
-            )
-        # use int8 to store weight by default
-        else:
-            layer.w2_qweight = torch.nn.Parameter(
-                w2_qweight_tmp.reshape(
-                    layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
-                )
-                .transpose(-1, -2)
-                .contiguous(),
-                requires_grad=False,
-            )
+        w2_weight = w2_qweight_tmp.reshape(
+            layer.w2_qweight.shape[0], N_packed, pack_factor, in_features
+        ).permute(0, 1, 3, 2).reshape(layer.w2_qweight.shape[0], out_features, in_features)
+
+        w2_weight = npu_format_cast(w2_weight)
+
+        if self.quant_config.weight_bits == 4:
+            assert w2_weight.shape[-1] % 4 == 0
+            w2_weight = w2_weight.contiguous().view(torch.int32)
+
+        layer.w2_qweight = torch.nn.Parameter(w2_weight, requires_grad=False)
