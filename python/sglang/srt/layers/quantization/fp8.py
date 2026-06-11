@@ -849,7 +849,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
         self.is_fp4_expert = self.quant_config.is_fp4_experts
-        self.gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
@@ -1148,6 +1147,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
+            gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
 
             # CK FP4 MoE kernel requires K_packed divisible by 128
@@ -1233,9 +1233,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 num_experts, num_rows, _ = scale.shape
                 is_w13_scale = scale_name == "w13_weight_scale_inv"
                 scale_2d = scale.reshape(-1, scale.shape[-1])
-                scale.data = shuffle_scale(
-                    scale_2d, num_experts, self.gu_intv, is_w13_scale
-                )
+                scale.data = shuffle_scale(scale_2d, num_experts, gu_intv, is_w13_scale)
 
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
             layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
@@ -1244,12 +1242,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if is_shuffled:
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight,
-                    is_guinterleave=self.gu_intv,
+                    is_guinterleave=gu_intv,
                     gate_up=True,
                 )
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight,
-                    is_guinterleave=self.gu_intv,
+                    is_guinterleave=gu_intv,
                     gate_up=False,
                 )
             layer.w13_weight.is_shuffled = is_shuffled
