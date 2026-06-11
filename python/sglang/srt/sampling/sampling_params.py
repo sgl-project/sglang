@@ -28,7 +28,9 @@ TOP_K_ALL = 1 << 30
 logger = logging.getLogger(__name__)
 
 
-def raise_if_tokenizer_required(tokenizer, stop_strs, stop_regex_strs, min_new_tokens=0):
+def raise_if_tokenizer_required(
+    tokenizer, stop_strs, stop_regex_strs, min_new_tokens=0
+):
     """Raise ValueError if tokenizer-dependent features are used without a tokenizer.
 
     String-based stop conditions (stop_strs, stop_regex_strs) require tokenizer.decode()

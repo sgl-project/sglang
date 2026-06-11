@@ -4690,7 +4690,8 @@ class ServerArgs:
                 from sglang.srt.sampling.sampling_params import SamplingParams
 
                 test_params = SamplingParams(**self.preferred_sampling_params)
-                test_params.normalize(None)  # raises if tokenizer-dependent features used
+                # raises if tokenizer-dependent features used
+                test_params.normalize(None)
 
     def _handle_crash_dump_env(self):
         if not self.crash_dump_folder:
