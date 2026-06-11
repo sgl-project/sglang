@@ -25,7 +25,7 @@ pub async fn spawn_discovery(
     cfg: &Config,
 ) -> Result<(mpsc::Receiver<DiscoveryEvent>, tokio::task::JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel(DISCOVERY_CHANNEL_CAP);
-    let handle = match &cfg.discovery.backend {
+    let handle = match &cfg.discovery {
         DiscoveryBackend::StaticUrls(s) => static_urls::spawn(s.clone(), tx).await?,
         DiscoveryBackend::K8s(k) => k8s::spawn(k.clone(), tx).await?,
     };
