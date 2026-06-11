@@ -55,7 +55,10 @@ than restating.
   `low-latency`; no slant → `balanced`, e.g. a CPU platform) — **flag a no-slant recipe
   parked under low-latency/high-throughput as a toggle-mapping side effect**. Mixed unions
   like [low-latency, balanced, high-throughput] with per-selection greying are fine. Also
-  flag model-specific ids (e.g. `mtp`). The MDX strategy bullets describe serving semantics
+  flag model-specific ids (e.g. `mtp`), and flag an INVERTED speculative mapping — the
+  deterministic default is MTP/spec-decoding ON → `low-latency`, OFF → `high-throughput`
+  (at saturation the draft+verify overhead outweighs the speedup); the reverse needs an
+  explicit maintainer-confirmed justification in the PR. The MDX strategy bullets describe serving semantics
   in the DSv4 style (single-user chat / typical multi-user / batch jobs), not internal
   toggles.
 - `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback).

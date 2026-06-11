@@ -85,9 +85,16 @@ always from the DeepSeek-V4 vocabulary, never model-specific ids like
 
 - **1 operating point** (a single recipe, no performance toggle) → a single
   **`balanced`** strategy. Never invent a second recipe just to fill chips.
-- **2 operating points** → **`low-latency` + `high-throughput`** (map the
-  legacy toggle onto serving semantics: MTP on → `low-latency`; MTP off /
-  DP+EP → `high-throughput`).
+- **2 operating points** → **`low-latency` + `high-throughput`**. When the
+  legacy toggle is MTP / speculative decoding, the mapping is a
+  **deterministic default — apply it without asking**: MTP on →
+  `low-latency`, MTP off → `high-throughput`. (Why it's near-certain:
+  speculative decoding cuts per-token latency at low concurrency, but at
+  saturation the draft+verify overhead costs more than it saves — DSv4's
+  high-throughput recipes disable MTP for the same reason.) Other toggles
+  map by the same serving semantics (e.g. DP+EP on → `high-throughput`).
+  Only if a legacy page documents the OPPOSITE slant (e.g. "enable MTP for
+  high throughput") stop and confirm with the maintainer.
 - **3 operating points** → the **full trio** (the ideal — e.g. GPU-budget
   tiers 2/4/8).
 

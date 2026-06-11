@@ -86,7 +86,10 @@ operating points: **one recipe → a single `balanced`; two → `low-latency` +
 `high-throughput`; three → the full trio (the ideal)**. The tiers apply per
 (hw × variant × quant) combination — a single-recipe combination on a
 multi-strategy page parks under its semantically honest tier (no
-latency/throughput slant → `balanced`; the page's list is the union). Never
+latency/throughput slant → `balanced`; the page's list is the union). When the
+legacy toggle is MTP / speculative decoding, the direction is a deterministic
+default — apply without asking: **MTP on → `low-latency`, MTP off →
+`high-throughput`** (reversed only with maintainer confirmation). Never
 invent a recipe just to fill strategy chips (see dimension-mapping.md §4).
 
 ### 3. Generate the config (codegen, then audit)
