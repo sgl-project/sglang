@@ -1,5 +1,4 @@
 import io
-import json
 import random
 import warnings
 from argparse import Namespace
@@ -12,18 +11,13 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from sglang.benchmark.datasets.common import (
-    SHAREGPT_FILENAME,
-    SHAREGPT_REPO_ID,
     BaseDataset,
     DatasetRow,
     compute_random_lens,
     gen_mm_prompt,
+    load_sharegpt_prompts,
 )
-from sglang.benchmark.utils import (
-    download_and_cache_hf_file,
-    get_processor,
-    is_file_valid_json,
-)
+from sglang.benchmark.utils import get_processor
 
 
 @dataclass
@@ -201,30 +195,7 @@ def _gen_sharegpt_text_prompts(
     If there are not enough conversations to cover all requests, the dataset is
     reshuffled and reused cyclically.
     """
-    # Download sharegpt if necessary
-    if not is_file_valid_json(dataset_path):
-        dataset_path = download_and_cache_hf_file(
-            repo_id=SHAREGPT_REPO_ID,
-            filename=SHAREGPT_FILENAME,
-        )
-
-    # Load the dataset
-    with open(dataset_path) as f:
-        dataset = json.load(f)
-
-    # Filter out conversations with less than 2 turns
-    dataset = [
-        data
-        for data in dataset
-        if len(data.get("conversations", data.get("conversation", []))) >= 2
-    ]
-    # Only keep the first turn's user message
-    dataset = [
-        data.get("conversations", data.get("conversation", []))[0]["value"]
-        for data in dataset
-    ]
-    # Shuffle the dataset
-    random.shuffle(dataset)
+    dataset = load_sharegpt_prompts(dataset_path)
 
     prompts: List[str] = []
     data_iter = iter(dataset)
@@ -236,12 +207,10 @@ def _gen_sharegpt_text_prompts(
             try:
                 candidate = next(data_iter)
             except StopIteration:
-                # Re-shuffle and restart
                 random.shuffle(dataset)
                 data_iter = iter(dataset)
                 candidate = next(data_iter)
-            prompt_token_ids = tokenizer.encode(candidate)
-            if len(prompt_token_ids) == 0:
+            if len(tokenizer.encode(candidate)) == 0:
                 continue
             prompt = candidate
 
