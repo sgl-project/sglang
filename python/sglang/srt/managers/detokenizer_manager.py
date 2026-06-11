@@ -421,6 +421,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             cached_tokens_details=recv_obj.cached_tokens_details,
+            weight_version_start=recv_obj.weight_version_start,
+            weight_version_end=recv_obj.weight_version_end,
             spec_verify_ct=recv_obj.spec_verify_ct,
             spec_num_correct_drafts=recv_obj.spec_num_correct_drafts,
             spec_correct_drafts_histogram=recv_obj.spec_correct_drafts_histogram,

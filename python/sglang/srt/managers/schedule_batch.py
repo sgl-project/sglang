@@ -747,6 +747,16 @@ class Req(ReqDllmMixin):
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
 
+        # Admission-time weight version stamp. Always set in a live
+        # scheduler; bare unit-test contexts may lack global server args.
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            server_args = None
+        self.weight_version_start = (
+            server_args.weight_version if server_args is not None else None
+        )
+
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
             extra_key = (

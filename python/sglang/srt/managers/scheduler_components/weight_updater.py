@@ -39,6 +39,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,16 @@ class SchedulerWeightUpdaterManager:
 
         if mm_utils.embedding_cache is not None:
             mm_utils.embedding_cache.clear()
+        self.bump_weight_version(recv_req)
+
+    def bump_weight_version(self, recv_req) -> None:
+        """Adopt the request's weight_version as the scheduler-side current
+        version. Called only on full update success (target and draft), so
+        admission stamping in ``Req.__init__`` switches exactly when the new
+        weights become live."""
+        version = getattr(recv_req, "weight_version", None)
+        if version is not None:
+            get_global_server_args().weight_version = version
 
     def flush_cache_after_weight_update(self, recv_req) -> None:
         if recv_req.flush_cache:

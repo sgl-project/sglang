@@ -163,6 +163,10 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            weight_version_start=_extract_field_by_index(
+                output, "weight_version_start", i
+            ),
+            weight_version_end=output.weight_version_end,
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -253,6 +257,10 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            weight_version_start=_extract_field_by_index(
+                output, "weight_version_start", i
+            ),
+            weight_version_end=output.weight_version_end,
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),

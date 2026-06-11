@@ -1171,6 +1171,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
+    # Weight version at admission (per request) and at batch emission.
+    weight_version_start: Optional[List[str]] = None
+    weight_version_end: Optional[str] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1237,6 +1240,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
+    # Weight version at admission (per request) and at batch emission.
+    weight_version_start: Optional[List[str]] = None
+    weight_version_end: Optional[str] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None

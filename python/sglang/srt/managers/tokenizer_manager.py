@@ -1879,6 +1879,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
                         i
                     ]
+                # Scheduler-stamped weight versions: admission (start) and
+                # batch emission (end). Authoritative across in-place weight
+                # updates, unlike the tokenizer-local "weight_version" above.
+                if getattr(recv_obj, "weight_version_start", None):
+                    meta_info["weight_version_start"] = recv_obj.weight_version_start[i]
+                    meta_info["weight_version_end"] = recv_obj.weight_version_end
                 if recv_obj.customized_info is not None:
                     for k, v in recv_obj.customized_info.items():
                         if k not in state.customized_info_accumulated:
