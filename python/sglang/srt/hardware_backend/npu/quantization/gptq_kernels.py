@@ -129,14 +129,6 @@ class GPTQMoEAscendKernel:
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
         self.moe_runner_config: Optional["MoeRunnerConfig"] = None
 
-    def create_moe_runner(
-        self,
-        layer: torch.nn.Module,
-        moe_runner_config: "MoeRunnerConfig",
-        **extra_weight_attrs,
-    ):
-        self.moe_runner_config = moe_runner_config
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
             -1, layer.w13_qzeros.shape[-1]
