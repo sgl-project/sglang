@@ -46,6 +46,10 @@ def load_sharegpt_conversations(dataset_path: str) -> List[Tuple[str, str]]:
         )
         for data in dataset
     ]
+    if not dataset:
+        raise ValueError(
+            f"No valid conversations with at least 2 turns found in dataset: {dataset_path}"
+        )
     random.shuffle(dataset)
     return dataset
 
