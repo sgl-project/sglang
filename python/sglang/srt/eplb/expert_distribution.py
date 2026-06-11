@@ -311,6 +311,9 @@ class _SinglePassGatherer(ABC):
                 server_args, expert_location_metadata, rank
             )
 
+        if server_args.moe_a2a_backend == "mori":
+            return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
+
         if server_args.expert_distribution_recorder_mode == "stat_approx":
             if server_args.moe_a2a_backend != "none" and (
                 server_args.deepep_mode == "normal"
@@ -419,7 +422,11 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             dict(
                 layer_id=layer_idx,
                 num_tokens_per_rank=num_tokens_per_rank.cpu().tolist(),
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.cpu().tolist(),
+                num_tokens_per_rdma_rank=(
+                    num_tokens_per_rdma_rank.cpu().tolist()
+                    if num_tokens_per_rdma_rank is not None
+                    else None
+                ),
                 num_tokens_per_expert=num_tokens_per_expert.cpu().tolist(),
             )
         )
