@@ -625,6 +625,33 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     device=self.device,
                 )
             )
+            # Surface the extra_buffer memory footprint at startup. Each tracked
+            # request reserves `ping_pong_slots` mamba state slots (vs 1 for
+            # no_buffer), drawn from the fixed mamba pool of `mamba_size` slots,
+            # so this is the per-request memory cost of running radix cache with
+            # extra_buffer (lazy reserves 1 + allocs the 2nd on demand).
+            ping_pong_slots = (
+                1
+                if self.enable_mamba_extra_buffer_lazy
+                else self.mamba_ping_pong_track_buffer_size
+            )
+            per_slot_bytes = (
+                get_tensor_size_bytes(self.mamba_pool.mamba_cache.conv)
+                + get_tensor_size_bytes(self.mamba_pool.mamba_cache.temporal)
+            ) / (mamba_size + 1)
+            mode = (
+                "extra_buffer_lazy"
+                if self.enable_mamba_extra_buffer_lazy
+                else "extra_buffer"
+            )
+            logger.info(
+                f"Mamba {mode} enabled: {ping_pong_slots} ping-pong state slot(s) "
+                f"per tracked request, per-slot state size "
+                f"{per_slot_bytes / (1024 * 1024):.2f}MB "
+                f"(~{ping_pong_slots * per_slot_bytes / (1024 * 1024):.2f}MB extra "
+                f"per request); mamba pool = {mamba_size} slots / "
+                f"{self.mamba_pool.mem_usage:.2f}GB total."
+            )
 
     def register_layer_transfer_counter(
         self, layer_transfer_counter: "LayerDoneCounter"
