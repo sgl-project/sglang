@@ -134,6 +134,11 @@ class TRTLLMMHAMetadata:
     # Draft tree mask for target verify with topk > 1, shape
     # [bs, draft_token_num, draft_token_num] (QLEN_ONLY layout view)
     tree_mask: torch.Tensor = None
+    # Tree verify on SWA layers: page-trimmed swa_page_table and clamped
+    # seqlens presenting only the in-window KV (lazily built once per
+    # forward by _swa_verify_views)
+    swa_verify_page_table: torch.Tensor = None
+    swa_verify_seqlens: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -232,6 +237,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # backends through these attributes.
         self.draft_branch_page_tables: Optional[torch.Tensor] = None
         self.draft_branch_page_table_buf: Optional[torch.Tensor] = None
+        # SWA hybrid + topk > 1: tree verify on SWA layers folds the sliding
+        # window into the packed custom mask (the trtllm-gen custom-mask
+        # cubins have no SlidingWindow+Custom mask type), presenting only the
+        # in-window KV via a page-trimmed SWA table so the mask region stays
+        # ~window-sized. See _swa_verify_views.
+        self.sliding_window_size = model_runner.sliding_window_size
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
@@ -393,6 +404,54 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         v_scale = self._get_scalar_scale(layer, "v_scale_float", "v_scale")
         return q_scale * k_scale * layer.scaling, v_scale
 
+    def _layer_is_swa(self, layer: RadixAttention) -> bool:
+        if self._swa_kv_pool is None:
+            return False
+        _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+        return is_swa
+
+    def _swa_verify_max_pages(self) -> int:
+        """Static page bound for the trimmed SWA verify table: window + draft
+        tail + one page of trim alignment slack. Constant per server config
+        (window, draft tokens, page size), so CUDA-graph safe."""
+        nv = self.speculative_num_draft_tokens
+        return (
+            self.sliding_window_size + nv + self.page_size - 1
+        ) // self.page_size + 1
+
+    def _fill_swa_verify_views(self, metadata: TRTLLMMHAMetadata):
+        """Fill the trimmed (page_table, seqlens) for tree verify on SWA layers.
+
+        The window is folded into flashinfer's packed custom mask, whose
+        region covers the whole presented KV range, so present only the pages
+        from the window start of the shallowest draft row onward. Runs in the
+        metadata init/apply paths (NOT inside the captured forward): the
+        CUDA-graph capture warmup would otherwise pre-populate a lazy cache
+        and leave the gather out of the captured graph, replaying stale
+        capture-time trims.
+        """
+        if self._swa_kv_pool is None or self.topk <= 1:
+            return
+        window = self.sliding_window_size
+        nv = metadata.max_seq_len_q
+        seqlens_full = metadata.cache_seqlens_int32
+        first_keep_page = (
+            torch.clamp(seqlens_full - nv - window, min=0) // self.page_size
+        )
+        seqlens = (seqlens_full - first_keep_page * self.page_size).to(torch.int32)
+        cols = first_keep_page.to(torch.int64).unsqueeze(1) + torch.arange(
+            self._swa_verify_max_pages(), device=seqlens_full.device
+        )
+        cols.clamp_(max=metadata.swa_page_table.shape[1] - 1)
+        trimmed = torch.gather(metadata.swa_page_table, 1, cols)
+        if metadata.swa_verify_page_table is not None:
+            # CUDA-graph mode: write into the bound fixed-address buffers.
+            metadata.swa_verify_page_table.copy_(trimmed)
+            metadata.swa_verify_seqlens.copy_(seqlens)
+        else:
+            metadata.swa_verify_page_table = trimmed
+            metadata.swa_verify_seqlens = seqlens
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -478,6 +537,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+            if self._swa_kv_pool is not None and self.topk > 1:
+                # Trimmed SWA verify views; refilled before each replay in
+                # the apply path (see _fill_swa_verify_views).
+                self.target_verify_metadata["swa_verify_page_table"] = torch.zeros(
+                    max_bs,
+                    self._swa_verify_max_pages(),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.target_verify_metadata["swa_verify_seqlens"] = torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                )
 
             if self.topk > 1 and not self.skip_prefill:
                 # QLEN_ONLY tree mask written in place by the eagle worker
@@ -598,6 +669,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "swa_page_table",
                 bs,
             )
+            if "swa_verify_page_table" in self.target_verify_metadata:
+                metadata.swa_verify_page_table = self.target_verify_metadata[
+                    "swa_verify_page_table"
+                ][:bs, :]
+                metadata.swa_verify_seqlens = self.target_verify_metadata[
+                    "swa_verify_seqlens"
+                ][:bs]
             self.target_verify_metadata[bs] = metadata
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_bs = num_tokens // bs
@@ -728,6 +806,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             q_stride=q_stride,
             q_mode=q_mode,
         )
+
+        if forward_mode.is_target_verify():
+            # Reads the cache_seqlens and swa_page_table the fused kernel just
+            # rebuilt, so it must run after it.
+            self._fill_swa_verify_views(metadata)
 
         self.forward_metadata = metadata
 
@@ -983,6 +1066,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
             )
 
+        if forward_batch.forward_mode.is_target_verify():
+            self._fill_swa_verify_views(metadata)
+
         self.forward_metadata = metadata
 
     def forward_decode(
@@ -1140,13 +1226,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
+            seq_lens_arg = self.forward_metadata.cache_seqlens_int32
+            max_seq_len_arg = self.max_context_len
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and self.forward_metadata.tree_mask is not None
+                and self._layer_is_swa(layer)
+            ):
+                # Tree verify on a SWA layer: flashinfer folds the window
+                # into the packed custom mask (no SlidingWindow+Custom cubin;
+                # proper kernel support is a planned follow-up), and the mask
+                # region covers all presented KV, so present only the
+                # in-window pages (filled by _fill_swa_verify_views in the
+                # metadata init/apply paths).
+                page_table = self.forward_metadata.swa_verify_page_table
+                seq_lens_arg = self.forward_metadata.swa_verify_seqlens
+                max_seq_len_arg = self._swa_verify_max_pages() * self.page_size
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
                 workspace_buffer=self.workspace_buffer,
                 block_tables=page_table,
-                seq_lens=self.forward_metadata.cache_seqlens_int32,
-                max_seq_len=self.max_context_len,
+                seq_lens=seq_lens_arg,
+                max_seq_len=max_seq_len_arg,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 window_left=layer.sliding_window_size,

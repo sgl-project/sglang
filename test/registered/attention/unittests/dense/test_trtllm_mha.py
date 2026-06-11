@@ -275,6 +275,40 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
             ),
             2,  # topk
         ),
+        # SWA + tree verify: the window is folded into flashinfer's packed
+        # custom mask over a page-trimmed SWA table. Prefixes cover window
+        # entirely inside the prefix (trim > 0), window spanning the whole
+        # sequence (trim == 0), and a page-boundary prefix.
+        (
+            DenseAttentionCase(
+                name="runner_trtllm_mha_eagle_verify_tree_swa",
+                backend="trtllm_mha",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 14, 17, 32),
+                extend_lens=(3, 3, 3, 3),
+                sliding_window_size=4,
+                speculative_eagle_topk=2,
+            ),
+            2,  # topk
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_trtllm_mha_eagle_verify_tree_swa_gqa_page32",
+                backend="trtllm_mha",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=2,
+                page_size=32,
+                prefix_lens=(30, 60),
+                extend_lens=(3, 3),
+                sliding_window_size=5,
+                speculative_eagle_topk=2,
+            ),
+            2,  # topk
+        ),
     )
 
     SPEC_VERIFY_CUDA_GRAPH_CASES = (
@@ -288,6 +322,21 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                 page_size=16,
                 prefix_lens=(14, 15, 16),
                 extend_lens=(3, 3, 3),
+                speculative_eagle_topk=2,
+            ),
+            2,  # topk
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_trtllm_mha_eagle_verify_tree_swa",
+                backend="trtllm_mha",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 17, 32),
+                extend_lens=(3, 3, 3),
+                sliding_window_size=4,
                 speculative_eagle_topk=2,
             ),
             2,  # topk
