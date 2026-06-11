@@ -119,8 +119,15 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_rank,
+    get_attention_cp_size,
+    get_attention_dp_rank,
+    get_attention_dp_size,
     get_attention_tp_group,
+    get_attention_tp_rank,
     get_attention_tp_size,
+    get_local_attention_dp_rank,
+    get_local_attention_dp_size,
     initialize_dp_attention,
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -171,6 +178,15 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     _allocate_decode_buffers,
+)
+from sglang.srt.model_executor.runtime_context import (
+    ConfigSection,
+    ParallelConfig,
+    RuntimeContext,
+    get_runtime_context,
+    get_tp_rank,
+    get_tp_size,
+    init_runtime_context,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -533,6 +549,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # FIXME: hacky set `use_mla_backend`
         global_server_args.use_mla_backend = self.use_mla_backend
 
+        # Publish the process-static RuntimeContext (Global Context Object PoC,
+        # M0.1: parallelism). Engine-stage seed — resolved sizes/ranks read from
+        # self.* (already folded, e.g. self.dp_size). The attention dims are
+        # filled after initialize_dp_attention (see init_torch_distributed).
+        init_runtime_context(
+            RuntimeContext(
+                config=ConfigSection(
+                    parallel=ParallelConfig(
+                        tp_size=self.tp_size,
+                        tp_rank=self.tp_rank,
+                        pp_size=self.pp_size,
+                        pp_rank=self.pp_rank,
+                        dp_size=self.dp_size,
+                        dp_rank=self.dp_rank,
+                        moe_ep_size=self.moe_ep_size,
+                        moe_ep_rank=self.moe_ep_rank,
+                        moe_dp_size=self.moe_dp_size,
+                        moe_dp_rank=self.moe_dp_rank,
+                        attn_cp_size=self.attn_cp_size,
+                        attn_cp_rank=self.attn_cp_rank,
+                    )
+                )
+            )
+        )
+
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
@@ -756,7 +797,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
-        if self.tp_size > 1 and supports_torch_tp:
+        # M0.1 reader-flip: read tp size via the named accessor off the context
+        # (== self.tp_size, the engine-stage seed). Behaviour-preserving.
+        if get_tp_size() > 1 and supports_torch_tp:
             self.apply_torch_tp()
 
         # Init lora
@@ -1178,6 +1221,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
                 model_config=self.model_config,
             )
+            # Attention-stage fill (Global Context Object PoC, M0.1): the
+            # attention parallel dims are only resolved now (initialize_dp_attention
+            # + initialize_model_parallel above), so snapshot them into
+            # .config.parallel via with_attention + re-publish.
+            _gc_ctx = get_runtime_context()
+            init_runtime_context(
+                replace(
+                    _gc_ctx,
+                    config=replace(
+                        _gc_ctx.config,
+                        parallel=_gc_ctx.config.parallel.with_attention(
+                            attn_tp_size=get_attention_tp_size(),
+                            attn_tp_rank=get_attention_tp_rank(),
+                            attn_cp_size=get_attention_cp_size(),
+                            attn_cp_rank=get_attention_cp_rank(),
+                            attn_dp_size=get_attention_dp_size(),
+                            attn_dp_rank=get_attention_dp_rank(),
+                            local_attn_dp_size=get_local_attention_dp_size(),
+                            local_attn_dp_rank=get_local_attention_dp_rank(),
+                        ),
+                    ),
+                )
+            )
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
@@ -1332,7 +1398,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.server_args.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
-            if self.tp_rank == 0:
+            # M0.1 reader-flip: read tp rank via the named accessor (== self.tp_rank).
+            if get_tp_rank() == 0:
                 instance_ip = NetworkAddress.resolve_host(socket.gethostname())
                 t = threading.Thread(
                     target=trigger_init_weights_send_group_for_remote_instance_request,
