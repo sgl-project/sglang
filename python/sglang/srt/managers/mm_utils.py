@@ -692,6 +692,59 @@ def _get_multimodal_mask(
     return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
 
 
+def _get_multimodal_indices_from_offsets(
+    embedding_items: List[MultimodalDataItem],
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    input_token_starts: Optional[List[int]],
+    input_ids: torch.Tensor,
+    embedding_length: int,
+) -> Optional[torch.Tensor]:
+    if input_token_starts is None:
+        return None
+
+    indices = []
+    pad_values = []
+    max_iterations = min(
+        len(items_size) - 1,
+        len(prefix_length),
+        len(extend_length),
+        len(input_token_starts),
+    )
+    for i in range(max_iterations):
+        if items_size[i] == items_size[i + 1]:
+            continue
+
+        chunk_start = prefix_length[i]
+        chunk_end = chunk_start + extend_length[i]
+        token_start = input_token_starts[i]
+        for item in embedding_items[items_size[i] : items_size[i + 1]]:
+            if item.offsets is None or item.pad_value is None:
+                return None
+            for start, end in item.offsets:
+                overlap_start = max(start, chunk_start)
+                overlap_end = min(end + 1, chunk_end)
+                if overlap_start >= overlap_end:
+                    continue
+
+                local_start = token_start + overlap_start - chunk_start
+                local_end = token_start + overlap_end - chunk_start
+                if local_start < 0 or local_end > input_ids.shape[0]:
+                    return None
+                indices.extend(range(local_start, local_end))
+                pad_values.extend([item.pad_value] * (local_end - local_start))
+
+    if not indices or len(indices) != embedding_length:
+        return None
+
+    index_tensor = torch.tensor(indices, dtype=torch.long, device=input_ids.device)
+    pad_tensor = torch.tensor(pad_values, dtype=input_ids.dtype, device=input_ids.device)
+    if not torch.equal(input_ids[index_tensor], pad_tensor):
+        return None
+    return index_tensor
+
+
 def _adjust_embedding_length(
     embedding: torch.Tensor,
     mask: torch.Tensor,
@@ -733,7 +786,13 @@ def get_embedding_and_mask(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
-) -> Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+    input_token_starts: Optional[List[int]] = None,
+) -> Tuple[
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
     """
     Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
 
@@ -768,14 +827,27 @@ def get_embedding_and_mask(
             input_ids,
         )
         if embedding is None:
-            return None, None, input_ids
+            return None, None, input_ids, None
+
+    placement_indices = _get_multimodal_indices_from_offsets(
+        embedding_items=embedding_items,
+        items_size=items_size,
+        prefix_length=prefix_length,
+        extend_length=extend_length,
+        input_token_starts=input_token_starts,
+        input_ids=input_ids,
+        embedding_length=embedding.shape[0],
+    )
+    if placement_indices is not None:
+        return embedding, None, input_ids, placement_indices
+
     # 2. Get mask
     if _is_npu:
         torch.npu.current_stream().synchronize()
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
     embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
-    return embedding, special_multimodal_mask, input_ids
+    return embedding, special_multimodal_mask, input_ids, None
 
 
 def embed_mm_inputs(
@@ -788,6 +860,7 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    input_token_starts: Optional[List[int]] = None,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -814,7 +887,13 @@ def embed_mm_inputs(
         item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
 
     # deepstack_embeddings: per-modality
-    modalities, embeddings, masks, deepstack_embeddings = [], [], [], []
+    modalities, embeddings, masks, placement_indices, deepstack_embeddings = (
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
 
     # 2. Get multimodal embedding separately
     # Try get mm embedding if any
@@ -851,7 +930,7 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
 
-            embedding, mask, input_ids = get_embedding_and_mask(
+            embedding, mask, input_ids, indices = get_embedding_and_mask(
                 data_embedding_func=embedder,
                 embedding_items=items,
                 placeholder_tensor=placeholder_tensor,
@@ -860,6 +939,7 @@ def embed_mm_inputs(
                 prefix_length=extend_prefix_lens,
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
+                input_token_starts=input_token_starts,
             )
 
             if use_deepstack.get(modality, None) and embedding is not None:
@@ -872,6 +952,7 @@ def embed_mm_inputs(
             modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
+            placement_indices += [indices]
 
     # 3. Get input embeddings
     vocab_size = input_embedding.num_embeddings
@@ -899,14 +980,24 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
-    for i, modality, embedding, mask in zip(
-        range(len(embeddings)), modalities, embeddings, masks
+    for i, modality, embedding, mask, indices in zip(
+        range(len(embeddings)), modalities, embeddings, masks, placement_indices
     ):
-        if embedding is None or mask is None:
+        if embedding is None:
+            continue
+        embedding = embedding.to(input_embeds.device, input_embeds.dtype)
+        if indices is not None:
+            input_embeds[indices] = embedding
+            if use_deepstack.get(modality, None):
+                input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
+                    input_embeds.device, input_embeds.dtype
+                )
+            continue
+        if mask is None:
             continue
         # in-place update
         indices = torch.where(mask.squeeze(dim=-1))[0]
-        input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
+        input_embeds[indices] = embedding
         if use_deepstack.get(modality, None):
             input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
                 input_embeds.device, input_embeds.dtype
@@ -926,6 +1017,7 @@ def _embed_mm_inputs_with_split(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    input_token_starts: Optional[List[int]] = None,
 ):
     """Split batch into precomputed vs non-precomputed, embed each group, merge back."""
     precomputed_req_indices = []
@@ -953,6 +1045,7 @@ def _embed_mm_inputs_with_split(
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             input_ids=input_ids,
+            input_token_starts=input_token_starts,
             **embed_kwargs,
         )
 
@@ -991,12 +1084,18 @@ def _embed_mm_inputs_with_split(
             for bi in group_batch_indices
         ]
         sub_input_ids = torch.cat(sub_slices)
+        sub_token_starts = []
+        sub_token_offset = 0
+        for bi in group_batch_indices:
+            sub_token_starts.append(sub_token_offset)
+            sub_token_offset += all_seq_lens[bi]
 
         sub_embeds, sub_info = embed_mm_inputs(
             mm_inputs_list=sub_mm_inputs,
             extend_prefix_lens=sub_prefix_lens,
             extend_seq_lens=sub_seq_lens,
             input_ids=sub_input_ids,
+            input_token_starts=sub_token_starts,
             **embed_kwargs,
         )
 
@@ -1055,6 +1154,16 @@ def general_mm_embed_routine(
             mm_inputs_list = [
                 mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
             ]
+            token_starts = []
+            token_offset = 0
+            for seq_len in forward_batch.extend_seq_lens_cpu:
+                token_starts.append(token_offset)
+                token_offset += seq_len
+            mm_input_token_starts = [
+                token_starts[i]
+                for i, mm_input in enumerate(forward_batch.mm_inputs)
+                if mm_input is not None
+            ]
             extend_prefix_lens = [
                 prefix_len
                 for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
@@ -1079,6 +1188,7 @@ def general_mm_embed_routine(
                     data_embedding_func_mapping=data_embedding_funcs,
                     placeholder_tokens=placeholder_tokens,
                     use_deepstack=use_deepstack,
+                    input_token_starts=mm_input_token_starts,
                 )
             else:
                 input_embeds, other_info = embed_mm_inputs(
@@ -1091,6 +1201,7 @@ def general_mm_embed_routine(
                     data_embedding_func_mapping=data_embedding_funcs,
                     placeholder_tokens=placeholder_tokens,
                     use_deepstack=use_deepstack,
+                    input_token_starts=mm_input_token_starts,
                 )
 
             # add for qwen3_vl deepstack
