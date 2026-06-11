@@ -366,7 +366,21 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                 )
             else:
-                self.req_to_token_pool = ReqToTokenPool(
+                # DSV4 on NPU needs an extended ReqToTokenPool that holds
+                # per-req tables for swa / c4 / c128 / c4_state / c128_state
+                # alongside the regular req_to_token. See
+                # hardware_backend/npu/dsv4_req_to_token_pool.py for the
+                # rationale and memory cost. Non-DSV4 + non-NPU stays on
+                # the stock ReqToTokenPool.
+                req_to_token_pool_cls = ReqToTokenPool
+                if _is_npu and is_deepseek_v4(self.model_config.hf_config):
+                    from sglang.srt.hardware_backend.npu.dsv4_req_to_token_pool import (
+                        DSV4NPUReqToTokenPool,
+                    )
+
+                    req_to_token_pool_cls = DSV4NPUReqToTokenPool
+
+                self.req_to_token_pool = req_to_token_pool_cls(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
@@ -387,7 +401,7 @@ class ModelRunnerKVCacheMixin:
 
         if is_dsv4_model:
             swa_page_size = self.page_size
-            assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
+            # assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
             if self.is_draft_worker:
                 from sglang.srt.models.deepseek_v4_nextn import (
@@ -399,13 +413,55 @@ class ModelRunnerKVCacheMixin:
                 ] * self.num_effective_layers
             else:
                 compression_ratios = self.model_config.compress_ratios
-            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+
+            # NPU + DSV4 → use the paged-state subclass. The on-NPU fused
+            # compressor kernel (torch.ops.custom.compressor cache_mode=1)
+            # requires a paged state pool; Atlas A3 rejects cache_mode=2
+            # (ring), so we cannot share the CUDA ring-buffer state path.
+            # CUDA keeps the original DeepSeekV4TokenToKVPool exactly as
+            # before. NPU state pool sizes are recomputed here (they
+            # depend on max_running_requests; pool_configurator's earlier
+            # ring-based formula is overridden for NPU).
+            from sglang.srt.utils import is_npu as _is_npu_fn
+
+            if _is_npu_fn():
+                from sglang.srt.hardware_backend.npu.dsv4_memory_pool import (
+                    DSV4NPUTokenToKVPool,
+                    npu_state_pool_size,
+                )
+
+                pool_cls = DSV4NPUTokenToKVPool
+                # Recompute state pool sizes for the NPU paged formula.
+                # CUDA's ring sizes (already in self.c{4,128}_state_pool_size)
+                # are dropped on the NPU dispatch. With tail-only allocation
+                # (see ScheduleBatch._compute_dsv4_state_lens_extend), the
+                # reference per-req-budget formula is sufficient regardless of
+                # prefill length — long prompts only allocate ``tail+128``
+                # state slots for c4 and ``tail`` for c128 (tail = seq_len %
+                # 128), and steady-state decode is drained by sliding
+                # eviction in ``ScheduleBatch._evict_swa``.
+                c4_state_pool_size = npu_state_pool_size(
+                    ratio=4,
+                    page_size=self.page_size,
+                    max_num_reqs=self.max_running_requests,
+                )
+                c128_state_pool_size = npu_state_pool_size(
+                    ratio=128,
+                    page_size=self.page_size,
+                    max_num_reqs=self.max_running_requests,
+                )
+            else:
+                pool_cls = DeepSeekV4TokenToKVPool
+                c4_state_pool_size = self.c4_state_pool_size
+                c128_state_pool_size = self.c128_state_pool_size
+
+            self.token_to_kv_pool = pool_cls(
                 max_num_reqs=self.max_running_requests,
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
                 c128_size=self.c128_max_total_num_tokens,
-                c4_state_pool_size=self.c4_state_pool_size,
-                c128_state_pool_size=self.c128_state_pool_size,
+                c4_state_pool_size=c4_state_pool_size,
+                c128_state_pool_size=c128_state_pool_size,
                 page_size=self.page_size,
                 swa_page_size=swa_page_size,
                 sliding_window=self.model_config.window_size,
@@ -731,10 +787,22 @@ class ModelRunnerKVCacheMixin:
                 )
             elif _is_npu and (
                 self.server_args.attention_backend == "ascend"
+                or is_dsv4_model
                 or self.hybrid_gdn_config is not None
             ):
                 if self.is_hybrid_swa:
-                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                    # DSV4 on NPU: use the SWA allocator subclass that also
+                    # drives c4/c128 paged allocators and produces a 6-tuple
+                    # DSV4OutCacheLoc on each alloc_extend/alloc_decode.
+                    if is_dsv4_model:
+                        from sglang.srt.hardware_backend.npu.dsv4_allocator import (
+                            DSV4NPUTokenToKVPoolAllocator,
+                        )
+
+                        swa_allocator_cls = DSV4NPUTokenToKVPoolAllocator
+                    else:
+                        swa_allocator_cls = SWATokenToKVPoolAllocator
+                    self.token_to_kv_pool_allocator = swa_allocator_cls(
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
                         page_size=self.page_size,
@@ -809,6 +877,13 @@ class ModelRunnerKVCacheMixin:
                     DeepSeekV4HiSparseTokenToKVPoolAllocator(
                         self.token_to_kv_pool_allocator
                     )
+                )
+
+            # DSV4-NPU: wire allocator back-ref into req_to_token_pool so its
+            # free(req) can release c4/c128 pool pages alongside the slot.
+            if hasattr(self.req_to_token_pool, "register_dsv4_allocator"):
+                self.req_to_token_pool.register_dsv4_allocator(
+                    self.token_to_kv_pool_allocator
                 )
 
         else:

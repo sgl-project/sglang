@@ -99,6 +99,14 @@ def init_npu_backend():
 
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
+    try:
+        import custom_ops  # noqa: F401
+    except ImportError:
+        logger.warning(
+            "custom_ops is not installed; NPU custom ops (torch.ops.custom.*) "
+            "are unavailable. DeepSeek-V4 NPU fused paths require the custom_ops "
+            "wheel shipped in the CANN image and will fail if exercised."
+        )
     import sgl_kernel_npu  # noqa: F401
     import torch_npu
     from torch_npu.contrib import transfer_to_npu  # noqa: F401

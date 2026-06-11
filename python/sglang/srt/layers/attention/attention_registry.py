@@ -126,7 +126,18 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
-    from sglang.srt.utils import is_hip
+    from sglang.srt.utils import is_hip, is_npu
+
+    if is_npu():
+        # V4's model code calls compressor/indexer/store_cache methods that
+        # AscendAttnBackend doesn't expose. Route to a subclass that mixes
+        # those in, keeping all the NPU-side ascend metadata & forward
+        # plumbing intact.
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+            DeepseekV4AscendAttnBackend,
+        )
+
+        return DeepseekV4AscendAttnBackend(runner)
 
     if is_hip():
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (

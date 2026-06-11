@@ -1684,6 +1684,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # DSV4-NPU: bundled per-pool slots produced by DSV4NPUTokenToKVPoolAllocator
+    # (None on non-DSV4 paths). See hardware_backend/npu/dsv4_common_hooks.py.
+    # The c4/c128 compress-state alloc lens ride on ``batch.dsv4_state_lens``,
+    # set dynamically by those hooks (read via getattr in mem_cache/common.py).
+    out_cache_loc_dsv4: Optional[Any] = None
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
@@ -1970,7 +1975,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # Allocate memory
+        # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
+        # the allocator, triggered from mem_cache/common.py.)
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
@@ -2584,7 +2590,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
-        # Allocate memory
+        # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
+        # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         # Update req-level memory management fields
@@ -2836,6 +2843,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if req.decode_batch_idx % eviction_interval == 1:
                         self._evict_swa(req, req.seqlen - 1)
 
+                    # DSV4-NPU only (no-op elsewhere): the small paged
+                    # compress-state pool needs draining every decode step,
+                    # independent of SWA evict cadence.
+                    from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
+                        maybe_evict_dsv4_state,
+                    )
+
+                    maybe_evict_dsv4_state(self, req, req.seqlen - 1)
+
                     # Once the decode position has moved past the sliding window,
                     # the SWA portion of the prefill-time tree lock is no longer
                     # needed by this request. Convert it from protected to
@@ -2902,6 +2918,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
+
+            # DSV4-NPU only (no-op elsewhere): compress-state slots at raw
+            # positions < swa_evicted_seqlen ride along with SWA eviction.
+            # For small-window models where sliding_window < c128 retention (192),
+            # this is the primary reclaim mechanism (the watermark-based eviction
+            # alone can't free fast enough). No-op on CUDA / non-V4 paths.
+            # See hardware_backend/npu/dsv4_common_hooks.py.
+            from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
+                maybe_evict_dsv4_state_on_swa,
+            )
+
+            maybe_evict_dsv4_state_on_swa(self, req, new_swa_evicted_seqlen)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def __str__(self):

@@ -26,8 +26,21 @@ def fused_topk_npu(
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
 
+    # norm_type=2: native sqrtsoftplus scoring (scores = sqrt(softplus(logits))),
+    if topk_config.scoring_func == "sqrtsoftplus":
+        topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+            x=router_logits,
+            k=topk_config.top_k,
+            bias=correction_bias,
+            input_ids=None,
+            tid2eid=None,
+            routed_scaling_factor=topk_config.routed_scaling_factor,
+            norm_type=2,
+        )
+        topk_weights = topk_weights.to(torch.float32)
+
     # Fast path: simple top-k without grouped routing and bias
-    if not use_grouped_topk and correction_bias is None:
+    elif not use_grouped_topk and correction_bias is None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
             k=topk_config.top_k,
@@ -88,5 +101,28 @@ def fused_topk_npu(
             layer_id=layer_id,
             topk_indices=topk_ids,
         )
+
+    return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
+
+def fused_hash_topk_npu(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    routed_scaling_factor: float,
+    expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
+) -> "TopKOutput":
+    topk = tid2eid.size(1)
+    topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+        x=router_logits,
+        k=topk,
+        bias=None,
+        input_ids=input_ids,
+        tid2eid=tid2eid,
+        routed_scaling_factor=routed_scaling_factor,
+        norm_type=2,
+    )
+    if expert_location_dispatch_info is not None:
+        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
