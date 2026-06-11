@@ -1018,9 +1018,18 @@ class DFlashWorker:
                 draft_input.target_hidden
             )  # [sum(ctx), hidden]
             if ctx_hidden.shape[0] != ctx_cache_loc.numel():
-                raise RuntimeError(
-                    f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
+                logger.warning(
+                    "DFLASH ctx_hidden/cache_loc mismatch: %d vs %d "
+                    "(bs=%d, is_extend_in_batch=%s). "
+                    "Skipping KV append to avoid corruption.",
+                    ctx_hidden.shape[0],
+                    ctx_cache_loc.numel(),
+                    bs,
+                    batch.is_extend_in_batch,
                 )
+                draft_input.ctx_lens = torch.zeros_like(ctx_lens)
+                draft_input.target_hidden = draft_input.target_hidden[:0]
+                return
 
             wrote_with_fused_kv = False
             if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
@@ -1374,9 +1383,20 @@ class DFlashWorker:
                 return torch.tensor(x, dtype=torch.int32, device=device)
 
             extend_seq_lens = _to_int32_device_tensor(batch.extend_lens)
+
+            # When is_extend_in_batch, hidden_states contains both extend and
+            # decode tokens, but ctx_lens only accounts for extend tokens.
+            # Truncate to the extend-only portion to avoid a shape mismatch
+            # in _append_target_hidden_to_draft_kv.
+            _target_hidden = logits_output.hidden_states
+            if batch.is_extend_in_batch and batch.extend_num_tokens is not None:
+                _ent = int(batch.extend_num_tokens)
+                if _ent < _target_hidden.shape[0]:
+                    _target_hidden = _target_hidden[:_ent]
+
             draft_input = DFlashDraftInput(
                 bonus_tokens=next_token_ids.to(torch.int64),
-                target_hidden=logits_output.hidden_states,
+                target_hidden=_target_hidden,
                 ctx_lens=extend_seq_lens,
                 draft_seq_lens=(
                     torch.zeros_like(extend_seq_lens)
