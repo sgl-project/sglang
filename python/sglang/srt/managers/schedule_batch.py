@@ -1550,13 +1550,17 @@ def retract_all(
 
 def _compute_chunked_req_next_prompt_token(
     chunked_req: Optional[Req],
+    vocab_size: int,
 ) -> Optional[int]:
     if chunked_req is None:
         return None
     fill_len = chunked_req.fill_len
-    if fill_len >= len(chunked_req.origin_input_ids):
-        return None
-    return int(chunked_req.origin_input_ids[fill_len])
+    origin_ids = chunked_req.origin_input_ids
+    for i in range(fill_len, len(origin_ids)):
+        token = int(origin_ids[i])
+        if token < vocab_size:
+            return token
+    return None
 
 
 @dataclasses.dataclass
@@ -1758,7 +1762,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
-                chunked_req
+                chunked_req,
+                model_config.vocab_size,
             ),
             dllm_config=dllm_config,
         )
