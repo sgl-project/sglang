@@ -145,8 +145,8 @@ python/sglang/srt/weight_cache/
 
 | Model | Weight Size | Disk Load | IPC Zero-copy |
 |-------|-------------|-----------|---------------|
-| 7B FP16 | ~14 GB | ~30s | < 0.01s |
-| 70B FP16 | ~140 GB | ~3-5min | < 0.1s |
-| 235B FP8 | ~235 GB | ~5-10min | < 0.1s |
+| 7B FP16 | ~14 GB | ~30s | < 1s |
+| 70B FP16 | ~140 GB | ~3-5min | < 1s |
+| 235B FP8 | ~235 GB | ~5-10min | < 1s |
 
 IPC handle mapping: ~10k handles/ms.
