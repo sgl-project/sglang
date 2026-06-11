@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_group,
@@ -13,7 +14,6 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 FP8_WEIGHT_DTYPE = torch.float8_e4m3fn
 W8A8_FP8_GEMM_ENV = "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
@@ -248,7 +248,7 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
 def _resolve_enable_fused_w8a8(value: bool | None) -> bool:
     if value is not None:
         return value
-    return get_bool_env_var(W8A8_FP8_GEMM_ENV)
+    return envs.SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM
 
 
 def _log_w8a8_fp8_gemm_warning_once() -> None:
