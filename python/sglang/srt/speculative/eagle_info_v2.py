@@ -45,7 +45,11 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
 )
-from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils.async_probe import (
+    maybe_detect_nan,
+    maybe_detect_oob,
+    sanitize_nan_logits,
+)
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu
 
 _is_cuda = is_cuda()
@@ -368,6 +372,19 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
+    @property
+    def max_tree_depth(self: EagleVerifyInput) -> int:
+        """Longest root-to-leaf chain of the verify tree, incl. the root;
+        bounds the accept_index row width. EAGLE trees are depth-bounded by
+        the draft loop. Algorithms with other tree shapes override this."""
+        return self.spec_steps + 1
+
+    @property
+    def tree_topk(self: EagleVerifyInput) -> int:
+        """Branching factor passed to the tree-verify kernels; -1 means an
+        irregular tree (no fixed per-level branching)."""
+        return self.topk
+
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,
@@ -461,6 +478,8 @@ class EagleVerifyInputV2Mixin:
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
 
+        sanitize_nan_logits(next_token_logits, "verify: target model logits")
+
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.
         if sampling_info.acc_additive_penalties is not None:
@@ -494,7 +513,7 @@ class EagleVerifyInputV2Mixin:
         predict_shape = list(next_token_logits.shape)[:-1]
         predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
         accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
+            (bs, self.max_tree_depth), -1, dtype=torch.int32, device=device
         )
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
@@ -511,7 +530,7 @@ class EagleVerifyInputV2Mixin:
                 retrieve_next_token=self.retrieve_next_token,
                 retrieve_next_sibling=self.retrieve_next_sibling,
                 target_predict=target_predict,
-                topk=self.topk,
+                topk=self.tree_topk,
             )
         else:
             # Apply temperature and get target probs
@@ -580,14 +599,16 @@ class EagleVerifyInputV2Mixin:
                 tp_group.broadcast(num_correct_drafts, src=0)
 
         if SIMULATE_ACC_LEN > 0:
-            # Do simulation
+            # Do simulation. The helper builds (and returns) a replacement
+            # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
+            # to keep the simulated width identical to the real one.
             accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
                 num_correct_drafts=num_correct_drafts,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
-                spec_steps=self.spec_steps,
+                spec_steps=self.max_tree_depth - 1,
             )
 
         # `num_correct_drafts` stays drafts-only inside this function; the returned
