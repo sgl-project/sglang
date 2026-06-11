@@ -697,8 +697,8 @@ class Req(ReqDllmMixin):
         # Each decode stage's output ids
         self.output_ids = array("q")
         # Full untruncated sequence: origin + output (+ DLLM mask block).
-        # Rebuilt at the top of each init_next_round_input; admission only
-        # updates fill_len, never mutates this array's length.
+        # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
+        # never mutates this array's length.
         self.full_untruncated_fill_ids = array("q")
         self.fill_len: int = 0
 
@@ -1068,6 +1068,19 @@ class Req(ReqDllmMixin):
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.fill_len]
 
+    def _refresh_fill_ids(self) -> None:
+        """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
+        appending only the new output tokens; full rebuild when the invariant
+        can't hold (fresh req, aliasing, or lengths disagree)."""
+        n_have_output = len(self.full_untruncated_fill_ids) - len(self.origin_input_ids)
+        if (
+            self.full_untruncated_fill_ids is not self.origin_input_ids
+            and 0 <= n_have_output <= len(self.output_ids)
+        ):
+            self.full_untruncated_fill_ids.extend(self.output_ids[n_have_output:])
+        else:
+            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
@@ -1077,7 +1090,7 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
-            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+            self._refresh_fill_ids()
 
         input_len = len(self.full_untruncated_fill_ids)
 
@@ -1097,14 +1110,16 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.full_untruncated_fill_ids[
-            : self._compute_max_prefix_len(input_len)
-        ]
+        # Pass the full array with a raw-token cap (limit) instead of slicing,
+        # avoiding an O(context) copy per prefill-batch build.
+        token_ids_to_match = self.full_untruncated_fill_ids
+        key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
             token_ids_to_match = array("q")
+            key_limit = None
 
         if tree_cache is not None:
             if cow_mamba is None:
@@ -1112,7 +1127,9 @@ class Req(ReqDllmMixin):
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
-                        token_ids=token_ids_to_match, extra_key=self.extra_key
+                        token_ids=token_ids_to_match,
+                        extra_key=self.extra_key,
+                        limit=key_limit,
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
@@ -2313,7 +2330,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+            req._refresh_fill_ids()
             req.fill_len = len(req.full_untruncated_fill_ids)
             req.set_extend_input_len(1)
 

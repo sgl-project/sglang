@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from array import array
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.managers.io_struct import (
@@ -163,6 +164,10 @@ class Session:
                         abort_message = "Session request is appending to a request that hasn't finished."
                         logging.warning(abort_message)
 
+        # Prebuilt full_untruncated_fill_ids the new req inherits on the
+        # streaming share path.
+        _carry_fill = None
+
         if last_req is not None:
             # trim bos token if it is an append
             if (
@@ -185,32 +190,74 @@ class Session:
                                 (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
                             ]
 
-            input_ids = (
-                last_req.origin_input_ids
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+            # Plain streaming append: extend the previous turn's arrays in
+            # place instead of concatenating fresh copies each turn. Safe
+            # because the old turn's req is finished and not read again before
+            # it is dropped by finish_req.
+            _share = (
+                self.streaming
+                and not session_params.drop_previous_output
+                and not (session_params.offset and session_params.offset != 0)
             )
-
-            if session_params.drop_previous_output:
-                input_ids = last_req.origin_input_ids[:]
-
-            if session_params.offset and session_params.offset != 0:
-                input_ids = input_ids[: session_params.offset] + req.input_ids
-            else:
-                input_ids += req.input_ids
-
-            input_ids_unpadded = (
-                last_req.origin_input_ids_unpadded
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
-            )
-            if session_params.drop_previous_output:
-                input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
-
-            if session_params.offset and session_params.offset != 0:
-                input_ids_unpadded = (
-                    input_ids_unpadded[: session_params.offset] + req.input_ids
+            if _share:
+                out_tail = last_req.output_ids[
+                    : last_req.sampling_params.max_new_tokens
+                ]
+                unpadded_aliases = (
+                    last_req.origin_input_ids_unpadded is last_req.origin_input_ids
                 )
+                # Carry last_req.full_untruncated_fill_ids (== old_origin +
+                # out_tail[:k], k = output tokens baked in by mix_with_running,
+                # often partial) forward to the new origin, sparing the next
+                # _refresh_fill_ids a full rebuild. Unexpected k: leave None.
+                _prev_origin_len = len(last_req.origin_input_ids)
+                _carry_fill = last_req.full_untruncated_fill_ids
+                _baked = (
+                    len(_carry_fill) - _prev_origin_len
+                    if isinstance(_carry_fill, array)
+                    else -1
+                )
+                input_ids = last_req.origin_input_ids
+                input_ids.extend(out_tail)
+                input_ids.extend(req.input_ids)
+                if 0 <= _baked <= len(out_tail):
+                    _carry_fill.extend(out_tail[_baked:])
+                    _carry_fill.extend(req.input_ids)
+                else:
+                    _carry_fill = None
+                if unpadded_aliases:
+                    input_ids_unpadded = input_ids
+                else:
+                    input_ids_unpadded = last_req.origin_input_ids_unpadded
+                    input_ids_unpadded.extend(out_tail)
+                    input_ids_unpadded.extend(req.input_ids)
             else:
-                input_ids_unpadded += req.input_ids
+                input_ids = (
+                    last_req.origin_input_ids
+                    + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+                )
+
+                if session_params.drop_previous_output:
+                    input_ids = last_req.origin_input_ids[:]
+
+                if session_params.offset and session_params.offset != 0:
+                    input_ids = input_ids[: session_params.offset] + req.input_ids
+                else:
+                    input_ids += req.input_ids
+
+                input_ids_unpadded = (
+                    last_req.origin_input_ids_unpadded
+                    + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+                )
+                if session_params.drop_previous_output:
+                    input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
+
+                if session_params.offset and session_params.offset != 0:
+                    input_ids_unpadded = (
+                        input_ids_unpadded[: session_params.offset] + req.input_ids
+                    )
+                else:
+                    input_ids_unpadded += req.input_ids
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
@@ -243,6 +290,8 @@ class Session:
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer
+        if _carry_fill is not None:
+            new_req.full_untruncated_fill_ids = _carry_fill
 
         if abort:
             new_req.set_finish_with_abort(abort_message)
