@@ -118,6 +118,12 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
+    def has_draft_kv(self) -> bool:
+        """Whether the draft phase writes KV chains. NGRAM does not (its tree
+        lives only in the verify mask), so per-decode KV sizing needs no
+        per-topk page rounding; see get_alloc_len_per_decode."""
+        return not self.is_ngram()
+
     def create_future_map(
         self,
         device: torch.device,
@@ -146,7 +152,7 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_ngram()
 
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
@@ -205,11 +211,6 @@ class SpeculativeAlgorithm(Enum):
 
             return StandaloneWorkerV2
         elif self.is_ngram():
-            if enable_overlap:
-                raise ValueError(
-                    f"Speculative algorithm {self.name} does not support overlap worker creation."
-                )
-
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
