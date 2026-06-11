@@ -773,6 +773,9 @@ class Envs:
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    # Keep MiMo-V2 mxfp4-stored experts packed (W4 runtime via flashinfer_mxfp4)
+    # instead of dequantizing them to block-FP8 at load.
+    SGLANG_MIMO_V2_FP4_EXPERTS = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

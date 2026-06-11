@@ -278,6 +278,19 @@ class ModelConfig:
         # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
         # FP8 expert tensor layout.
         self.is_fp4_experts: bool = False
+        if (
+            "MiMoV2ForCausalLM"
+            in (getattr(self.hf_config, "architectures", None) or [])
+            and (getattr(self.hf_config, "quantization_config", None) or {}).get(
+                "store_dtype"
+            )
+            == "mxfp4"
+        ):
+            self.is_fp4_experts = envs.SGLANG_MIMO_V2_FP4_EXPERTS.get()
+            if self.is_fp4_experts:
+                logger.info(
+                    "MiMoV2 store_dtype=mxfp4: keeping native fp4 expert layout"
+                )
         if is_deepseek_v4(self.hf_config):
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
             if not envs.SGLANG_DSV4_FP4_EXPERTS.is_set():

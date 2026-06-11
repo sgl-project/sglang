@@ -270,6 +270,7 @@ class MiMoV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             quant_config=quant_config,
             routed_scaling_factor=1.0,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
@@ -1421,6 +1422,16 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     )
                     skipped_mtp_weights = True
                 continue
+
+            # Native mxfp4 experts (is_fp4_experts): checkpoint ships uint8
+            # e2m1 nibbles + uint8 e8m0 block scales per expert, while the
+            # fp4-expert params are int8 nibbles + float32 *_weight_scale_inv.
+            if ".mlp.experts." in name and loaded_weight.dtype == torch.uint8:
+                if name.endswith(".weight_scale"):
+                    name = name + "_inv"
+                    loaded_weight = torch.exp2(loaded_weight.to(torch.float32) - 127.0)
+                elif name.endswith(".weight"):
+                    loaded_weight = loaded_weight.view(torch.int8)
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:

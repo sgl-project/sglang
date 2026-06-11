@@ -1706,7 +1706,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if self.quant_config.store_dtype == "mxfp4":
+        if (
+            self.quant_config.store_dtype == "mxfp4"
+            and not self.quant_config.is_fp4_experts
+        ):
             logger.info("store_dtype=mxfp4: dispatching to _mxfp4_dequant_to_block_fp8")
             self._mxfp4_dequant_to_block_fp8(layer)
             # Fall through to block_quant post-processing (deep_gemm ue8m0,
