@@ -199,6 +199,7 @@ class MockGDNModelRunner(ModelRunner):
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
+        enable_linear_compact_spec_cache: bool = False,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -223,6 +224,7 @@ class MockGDNModelRunner(ModelRunner):
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
             enable_mis=False,
+            enable_linear_compact_spec_cache=enable_linear_compact_spec_cache,
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
             linear_attn_prefill_backend=None,
@@ -262,6 +264,7 @@ class MockGDNModelRunner(ModelRunner):
             mamba_layer_ids=[0],
             enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=speculative_num_draft_tokens or None,
+            enable_linear_compact_spec_cache=enable_linear_compact_spec_cache,
             enable_overlap_schedule=False,
         )
         max_token_loc = case.page_size + pool_batch_size * max_context_len
@@ -535,6 +538,7 @@ def build_gdn_attention_fixture(
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
+    enable_linear_compact_spec_cache: bool = False,
 ) -> GDNAttentionFixture:
     seed = 4096 + len(case.name)
     torch.manual_seed(seed)
@@ -557,6 +561,7 @@ def build_gdn_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        enable_linear_compact_spec_cache=enable_linear_compact_spec_cache,
     )
     try:
         full_backend = ATTENTION_BACKENDS[case.backend](runner)

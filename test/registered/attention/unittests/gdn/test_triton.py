@@ -10,16 +10,23 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
+    GDN_ATOL,
+    GDN_RTOL,
     GDNAttentionCase,
+    build_gdn_attention_fixture,
+    gdn_fixture_inputs,
     make_gdn_cases,
     run_gdn_attention_case,
+    run_gdn_forward,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_gdn_cuda_graph_decode_case,
@@ -28,6 +35,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_r
     run_gdn_eagle_draft_extend_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+    _prepare_gdn_verify_batch,
     run_gdn_eagle_verify_case,
     run_gdn_eagle_verify_cuda_graph_case,
 )
@@ -286,6 +294,131 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 spec_kind=spec_kind,
             ):
                 run_gdn_eagle_verify_case(self, case, topk=topk, spec_kind=spec_kind)
+
+    LINEAR_COMPACT_VERIFY_CASES = (
+        (
+            GDNAttentionCase(
+                name="runner_linear_compact_eagle_verify_gdn_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "eagle",
+        ),
+    )
+
+    def test_runner_mode_linear_compact_eagle_verify_cases(self):
+        for case, topk, spec_kind in self.LINEAR_COMPACT_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_gdn_eagle_verify_case(
+                    self,
+                    case,
+                    topk=topk,
+                    spec_kind=spec_kind,
+                    enable_linear_compact_spec_cache=True,
+                )
+
+    @staticmethod
+    def _run_gdn_verify_forward(fixture, case, *, topk: int, spec_kind: str):
+        _prepare_gdn_verify_batch(
+            case,
+            fixture.forward_batch,
+            topk=topk,
+            device=fixture.runner.device,
+            spec_kind=spec_kind,
+        )
+        inputs = gdn_fixture_inputs(fixture)
+        with torch.no_grad(), forward_context(
+            ForwardContext(attn_backend=fixture.backend)
+        ):
+            fixture.backend.init_forward_metadata(fixture.forward_batch)
+            return run_gdn_forward(fixture, fixture.forward_batch, inputs)
+
+    def test_linear_compact_verify_commit_matches_full_intermediate(self):
+        case = GDNAttentionCase(
+            name="runner_linear_compact_eagle_verify_gdn_commit_chain",
+            backend="triton",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=16,
+            prefix_lens=(4, 7),
+            extend_lens=(3, 3),
+        )
+        runner_batch_size = case.batch_size * 2
+        full_fixture = build_gdn_attention_fixture(
+            self,
+            case,
+            runner_batch_size=runner_batch_size,
+        )
+        compact_fixture = build_gdn_attention_fixture(
+            self,
+            case,
+            runner_batch_size=runner_batch_size,
+            enable_linear_compact_spec_cache=True,
+        )
+
+        full_cache = (
+            full_fixture.runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        )
+        compact_cache = (
+            compact_fixture.runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        )
+        self.assertIsInstance(full_cache, MambaPool.SpeculativeState)
+        self.assertIsInstance(compact_cache, MambaPool.LinearCompactSpeculativeState)
+
+        full_out = self._run_gdn_verify_forward(
+            full_fixture, case, topk=1, spec_kind="eagle"
+        )
+        compact_out = self._run_gdn_verify_forward(
+            compact_fixture, case, topk=1, spec_kind="eagle"
+        )
+        torch.testing.assert_close(compact_out, full_out, atol=GDN_ATOL, rtol=GDN_RTOL)
+
+        device = full_fixture.runner.device
+        accepted_steps = torch.tensor([2, 1], dtype=torch.int64, device=device)
+        track_indices = torch.tensor([3, 4], dtype=torch.int64, device=device)
+        track_steps = torch.tensor([1, -1], dtype=torch.int64, device=device)
+        for fixture in (full_fixture, compact_fixture):
+            fixture.backend.update_mamba_state_after_mtp_verify(
+                accepted_steps,
+                track_indices,
+                track_steps,
+                model=None,
+            )
+
+        mamba_indices = full_fixture.runner.req_to_token_pool.get_mamba_indices(
+            full_fixture.forward_batch.req_pool_indices
+        )
+        valid_track_indices = track_indices[track_steps >= 0].to(mamba_indices.dtype)
+        slots_to_compare = torch.cat((mamba_indices, valid_track_indices), dim=0).long()
+
+        full_cache = (
+            full_fixture.runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        )
+        compact_cache = (
+            compact_fixture.runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        )
+        torch.testing.assert_close(
+            compact_cache.temporal[:, slots_to_compare],
+            full_cache.temporal[:, slots_to_compare],
+            atol=GDN_ATOL,
+            rtol=GDN_RTOL,
+        )
+        torch.testing.assert_close(
+            compact_cache.conv[0][:, slots_to_compare],
+            full_cache.conv[0][:, slots_to_compare],
+        )
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
         for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:

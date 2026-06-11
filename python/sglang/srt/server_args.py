@@ -3225,6 +3225,18 @@ class ServerArgs:
             )
 
         if self.enable_linear_compact_spec_cache:
+            from sglang.srt.configs.kimi_linear import KimiLinearConfig
+
+            hf_config = self.get_model_config().hf_config
+            # KDA can use the compact replay cache after its verify path
+            # supports populating compact states. Until then, fail early.
+            if isinstance(hf_config, KimiLinearConfig):
+                raise ValueError(
+                    "--enable-linear-compact-spec-cache is not supported for "
+                    "KDA/KimiLinear yet because KDA verify does not populate "
+                    "compact states."
+                )
+
             decode = self.linear_attn_decode_backend or self.linear_attn_backend
             if decode != "triton":
                 logger.info(
@@ -6273,7 +6285,7 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_linear_compact_spec_cache,
             help="Enable compact K/V/decay replay cache for supported linear attention "
-            "backends during speculative target verification.",
+            "backends (currently GDN) during speculative target verification.",
         )
 
         # Hierarchical cache
