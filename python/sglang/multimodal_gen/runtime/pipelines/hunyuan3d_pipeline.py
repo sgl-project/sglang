@@ -28,7 +28,7 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d import (
     Hunyuan3DPaintPostprocessStage,
     Hunyuan3DPaintPreprocessStage,
     Hunyuan3DPaintTexGenStage,

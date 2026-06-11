@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
+    KVTransferError,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingContext,
@@ -60,16 +61,6 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
-
-
-class KVTransferError(Exception):
-    def __init__(self, bootstrap_room: int, failure_reason: str):
-        super().__init__(failure_reason)
-        self.bootstrap_room = bootstrap_room
-        self.failure_reason = failure_reason
-
-    def __str__(self):
-        return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
 
 
 # decode
@@ -265,6 +256,21 @@ class MooncakeKVManager(CommonKVManager):
         ):
             if ptrs and lens:
                 self.engine.batch_register(ptrs, lens)
+
+    def deregister_buffer_to_engine(self):
+        if self.kv_args.kv_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+
+        if self.kv_args.aux_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+
+        for ptrs in self.kv_args.state_data_ptrs or []:
+            if ptrs:
+                self.engine.batch_deregister(ptrs)
+
+        if hasattr(self, "connection_pool"):
+            with self.connection_lock:
+                self.connection_pool.clear()
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -1747,10 +1753,13 @@ class MooncakeKVSender(CommonKVSender):
         self.clear()
 
         with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(
-                self.bootstrap_room, "Failed due to an unknown reason from another rank"
-            )
-        raise KVTransferError(self.bootstrap_room, failure_reason)
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "Failed due to an unknown reason from another rank"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )
 
     def _init_trace_ctx(self):
         if self.kv_mgr.enable_trace:
@@ -1908,10 +1917,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.clear()
 
         with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(
-                self.bootstrap_room, "Failed due to an unknown reason from another rank"
-            )
-        raise KVTransferError(self.bootstrap_room, failure_reason)
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "Failed due to an unknown reason from another rank"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
