@@ -359,6 +359,11 @@ class LocalAttention(nn.Module):
                     mask = mask[:, None, :, :]
                 mask = (mask - 1.0) * torch.finfo(q_.dtype).max
 
+            if q_.shape[1] != k_.shape[1]:
+                repeat_factor = q_.shape[1] // k_.shape[1]
+                k_ = k_.repeat_interleave(repeat_factor, dim=1)
+                v_ = v_.repeat_interleave(repeat_factor, dim=1)
+
             sdpa_context = (
                 sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
                 if self.allow_cudnn_sdp and q_.device.type == "cuda"
@@ -370,8 +375,6 @@ class LocalAttention(nn.Module):
                 "is_causal": False,
                 "scale": self.softmax_scale,
             }
-            if q_.shape[1] != k_.shape[1]:
-                attn_kwargs["enable_gqa"] = True
             with sdpa_context:
                 return torch.nn.functional.scaled_dot_product_attention(
                     q_,
