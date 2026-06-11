@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sglang-diffusion Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-sr-v38" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-record-v49" />
   </head>
   <body>
     <main class="shell">
@@ -60,6 +60,18 @@
             </select>
           </label>
         </div>
+        <label>SR model
+          <select id="upscalingModel">
+            <option value="">Quality x2</option>
+            <option
+              value="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
+              selected
+            >
+              Fast general
+            </option>
+            <option value="/scratch/realesr-animevideov3.pth">Fast anime</option>
+          </select>
+        </label>
         <label class="toggle-row"><input id="frameInterpolation" type="checkbox" />Smooth 2x frames</label>
         <label class="toggle-row"><input id="continuous" type="checkbox" checked />Continuous session</label>
         <div class="actions">
@@ -75,6 +87,11 @@
             <span id="statusDot" class="dot"></span>
             <span id="statusText">Idle</span>
             <span id="chunkText">chunk -</span>
+            <button id="recordBtn" class="record-button" type="button" aria-pressed="false" title="Record preview">
+              <span class="record-button-icon" aria-hidden="true"></span>
+              <span id="recordLabel">Record</span>
+              <span id="recordDuration" class="record-button-duration">00:00</span>
+            </button>
             <span class="topbar-spacer"></span>
             <label class="preview-scale-control">Preview
               <input id="previewScale" type="range" min="80" max="170" value="120" />
@@ -82,8 +99,8 @@
             </label>
             <span class="stage-stat">output <b id="outputSizeText">832x480</b></span>
             <span class="stage-stat">render <b id="renderFps">0</b> fps</span>
-            <span class="stage-stat">theoretical <b id="theoreticalFpsText">-</b></span>
-            <span class="stage-stat">wait <b id="stageLatencyText">-</b></span>
+            <span class="stage-stat">source <b id="theoreticalFpsText">-</b></span>
+            <span class="stage-stat">buffer <b id="stageLatencyText">-</b></span>
           </div>
           <div class="preview-frame">
             <canvas id="viewport" width="1280" height="720"></canvas>
@@ -145,6 +162,7 @@
         </section>
       </section>
     </main>
-    <script src="./app.js?v=realtime-sr-v38"></script>
-  </body>
+  <script src="./playback_controller.js?v=realtime-playback-v13"></script>
+  <script src="./app.js?v=realtime-record-v72"></script>
+</body>
 </html>
