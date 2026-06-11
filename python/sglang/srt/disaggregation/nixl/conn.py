@@ -624,15 +624,20 @@ class NixlKVManager(CommonKVManager):
     ):
         device_id = _nixl_device_id(mem_kind, gpu_id)
         arrays = []
-        for base_ptr, item_len, data_len in zip(kv_ptrs, kv_item_lens, kv_data_lens):
+        # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set).
+        # Convert once at entry; all downstream arithmetic stays in uint64.
+        kv_ptrs_u64 = np.array(kv_ptrs, dtype=np.uint64)
+        for base_ptr, item_len, data_len in zip(
+            kv_ptrs_u64, kv_item_lens, kv_data_lens
+        ):
             n = num_slots if num_slots is not None else (data_len // item_len)
-            addrs = np.arange(n, dtype=np.int64) * item_len + base_ptr
+            addrs = np.arange(n, dtype=np.uint64) * np.uint64(item_len) + base_ptr
             arrays.append(
                 np.column_stack(
                     [
                         addrs,
-                        np.full(n, item_len, dtype=np.int64),
-                        np.full(n, device_id, dtype=np.int64),
+                        np.full(n, item_len, dtype=np.uint64),
+                        np.full(n, device_id, dtype=np.uint64),
                     ]
                 )
             )
@@ -732,28 +737,27 @@ class NixlKVManager(CommonKVManager):
         num_ptr_pairs = len(src_ptrs)
 
         num_slots = self.kv_args.kv_data_lens[0] // src_kv_item_len
-        slots = np.arange(num_slots, dtype=np.int64)
-        tokens = np.arange(page_size, dtype=np.int64)  # reused in dst dlist below
-        groups = np.arange(num_groups, dtype=np.int64)
+        slots = np.arange(num_slots, dtype=np.uint64)
+        tokens = np.arange(page_size, dtype=np.uint64)  # reused in dst dlist below
+        groups = np.arange(num_groups, dtype=np.uint64)
 
         # Src dlist built once and shared.
         if self.prep_handle_slice_src is None:
-            # (ptr, slot, token, group) → ravel; groups interleaved per token.
-            src_ptrs_arr = np.array(src_ptrs, dtype=np.int64)
+            src_ptrs_arr = np.array(src_ptrs, dtype=np.uint64)
             addrs = (
                 src_ptrs_arr[:, None, None, None]
-                + slots[None, :, None, None] * src_kv_item_len
-                + tokens[None, None, :, None] * bytes_per_token_src
-                + groups[None, None, None, :] * bytes_per_token_to_send
+                + slots[None, :, None, None] * np.uint64(src_kv_item_len)
+                + tokens[None, None, :, None] * np.uint64(bytes_per_token_src)
+                + groups[None, None, None, :] * np.uint64(bytes_per_token_to_send)
             ).ravel()
             src_array = np.column_stack(
                 [
                     addrs,
-                    np.full(len(addrs), bytes_per_token_to_send, dtype=np.int64),
+                    np.full(len(addrs), bytes_per_token_to_send, dtype=np.uint64),
                     np.full(
                         len(addrs),
                         _nixl_device_id(src_mem_kind, self.kv_args.gpu_id),
-                        dtype=np.int64,
+                        dtype=np.uint64,
                     ),
                 ]
             )
@@ -774,23 +778,23 @@ class NixlKVManager(CommonKVManager):
             if decode_kv_args.dst_num_slots is not None
             else num_slots
         )
-        dst_slots = np.arange(num_slots_dst, dtype=np.int64)
+        dst_slots = np.arange(num_slots_dst, dtype=np.uint64)
         # (ptr, slot, token) → ravel.
-        dst_ptrs_arr = np.array(dst_ptrs, dtype=np.int64)
+        dst_ptrs_arr = np.array(dst_ptrs, dtype=np.uint64)
         addrs = (
             dst_ptrs_arr[:, None, None]
-            + dst_slots[None, :, None] * dst_kv_item_len
-            + tokens[None, None, :] * bytes_per_token_dst
-            + dst_head_offset
+            + dst_slots[None, :, None] * np.uint64(dst_kv_item_len)
+            + tokens[None, None, :] * np.uint64(bytes_per_token_dst)
+            + np.uint64(dst_head_offset)
         ).ravel()
         dst_array = np.column_stack(
             [
                 addrs,
-                np.full(len(addrs), bytes_per_token_to_send, dtype=np.int64),
+                np.full(len(addrs), bytes_per_token_to_send, dtype=np.uint64),
                 np.full(
                     len(addrs),
                     _nixl_device_id(dst_mem_kind, decode_kv_args.gpu_id),
-                    dtype=np.int64,
+                    dtype=np.uint64,
                 ),
             ]
         )
