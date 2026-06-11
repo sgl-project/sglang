@@ -54,6 +54,7 @@ if not _is_cpu:
 
 # Copied and adapted from sglang
 @CustomOp.register("rms_norm")
+@CustomOp.kernel_compile_autotune("norm")
 class RMSNorm(CustomOp):
     """Root mean square normalization.
 
@@ -293,6 +294,7 @@ class RMSNorm(CustomOp):
 
 # Copied and adapted from sglang
 @CustomOp.register("layer_norm")
+@CustomOp.kernel_compile_autotune("norm")
 class LayerNorm(CustomOp):
     def __init__(
         self,
@@ -585,10 +587,12 @@ class _ScaleResidualNormScaleShift(CustomOp):
         return modulated, residual_output
 
 
+@CustomOp.kernel_compile_autotune("scale_shift")
 class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
     norm_type = "layer"
 
 
+@CustomOp.kernel_compile_autotune("scale_shift")
 class ScaleResidualRMSNormScaleShift(_ScaleResidualNormScaleShift):
     norm_type = "rms"
 
@@ -681,10 +685,12 @@ class _NormScaleShift(CustomOp):
         return modulated.to(x.dtype)
 
 
+@CustomOp.kernel_compile_autotune("scale_shift")
 class LayerNormScaleShift(_NormScaleShift):
     norm_type = "layer"
 
 
+@CustomOp.kernel_compile_autotune("scale_shift")
 class RMSNormScaleShift(_NormScaleShift):
     norm_type = "rms"
 
@@ -756,10 +762,12 @@ class _NormTanhMulAdd(CustomOp):
         return y.to(x.dtype)
 
 
+@CustomOp.kernel_compile_autotune("scale_shift")
 class LayerNormTanhMulAdd(_NormTanhMulAdd):
     norm_type = "layer"
 
 
+@CustomOp.kernel_compile_autotune("scale_shift")
 class RMSNormTanhMulAdd(_NormTanhMulAdd):
     norm_type = "rms"
 

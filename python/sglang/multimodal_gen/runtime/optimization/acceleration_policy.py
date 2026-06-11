@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.optimization.kernel_policy import (
     KERNEL_COMPILE_OP_GROUPS,
     KERNEL_COMPILE_POLICY_ENV,
     KERNEL_COMPILE_WARMUP_ENV,
-    SUPPORTED_KERNEL_COMPILE_OPS,
     KernelCompileAutotuneConfig,
     custom_op_kernel_compile_policy,
     kernel_compile_autotune_config,

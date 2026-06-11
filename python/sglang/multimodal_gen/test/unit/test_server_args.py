@@ -36,6 +36,14 @@ from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.entrypoints.cli.routing import (
     has_registered_pipeline_class,
 )
+from sglang.multimodal_gen.runtime.layers.activation import (
+    GeluAndMul,
+    NewGELU,
+    QuickGELU,
+)
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.multimodal_gen.runtime.optimization.acceleration_policy import (
     KERNEL_COMPILE_ITERS_ENV,
     KERNEL_COMPILE_LIVE_MISS_ENV,
@@ -199,11 +207,11 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             self.assertEqual(config.min_speedup, 1.04)
             self.assertTrue(config.live_miss)
             self.assertEqual(
-                custom_op_kernel_compile_policy("rotary_embedding", "RotaryEmbedding"),
+                custom_op_kernel_compile_policy("rotary_embedding", RotaryEmbedding),
                 "auto",
             )
             self.assertEqual(
-                custom_op_kernel_compile_policy("mul_add", "MulAdd"),
+                custom_op_kernel_compile_policy("mul_add", MulAdd),
                 "force_fused",
             )
 
@@ -217,25 +225,23 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             )
 
             self.assertEqual(
-                custom_op_kernel_compile_policy("gelu_new", "NewGELU"),
+                custom_op_kernel_compile_policy("gelu_new", NewGELU),
                 "auto",
             )
             self.assertEqual(
-                custom_op_kernel_compile_policy("quick_gelu", "QuickGELU"),
+                custom_op_kernel_compile_policy("quick_gelu", QuickGELU),
                 "auto",
             )
             self.assertEqual(
-                custom_op_kernel_compile_policy("rms_norm", "RMSNorm"),
+                custom_op_kernel_compile_policy("rms_norm", RMSNorm),
                 "auto",
             )
             self.assertEqual(
-                custom_op_kernel_compile_policy("mul_add", "MulAdd"),
+                custom_op_kernel_compile_policy("mul_add", MulAdd),
                 "auto",
             )
             self.assertEqual(
-                custom_op_kernel_compile_policy(
-                    "rotary_embedding", "RotaryEmbedding"
-                ),
+                custom_op_kernel_compile_policy("rotary_embedding", RotaryEmbedding),
                 "force_fused",
             )
 
@@ -327,14 +333,14 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             self.assertEqual(kernel_config.min_speedup, 1.03)
             self.assertFalse(kernel_config.live_miss)
             self.assertEqual(
-                custom_op_kernel_compile_policy("mul_add", "MulAdd"), "force_fused"
+                custom_op_kernel_compile_policy("mul_add", MulAdd), "force_fused"
             )
             self.assertEqual(
-                custom_op_kernel_compile_policy("rotary_embedding", "RotaryEmbedding"),
+                custom_op_kernel_compile_policy("rotary_embedding", RotaryEmbedding),
                 "force_fused",
             )
             self.assertEqual(
-                custom_op_kernel_compile_policy("gelu_and_mul", "GeluAndMul"),
+                custom_op_kernel_compile_policy("gelu_and_mul", GeluAndMul),
                 "force_fused",
             )
 

@@ -108,11 +108,10 @@ Key groups:
 - Full DiT compile: `torch_compile_policy=auto|force_compile|force_eager|off`, `torch_compile_warmup=1`, `torch_compile_iters=3`, `torch_compile_min_speedup=1.05`, `torch_compile_live_miss=true|false`. This is active when `--enable-torch-compile` is set; default live misses fall back to eager.
 - Kernel-wise `CustomOp` compile: `kernel_compile_policy=auto|force_torch_compile|force_fused`, `kernel_compile_ops=&#123;OPS&#125;`, `kernel_compile_warmup=3`, `kernel_compile_iters=10`, `kernel_compile_min_speedup=1.03`, `kernel_compile_live_miss=true|false`. No custom op is enabled by default until a full-model e2e win is validated.
 
-`kernel_compile_ops` accepts exact op names, class names, or groups:
+`kernel_compile_ops` selects `CustomOp` classes that are decorated as kernel-compile-autotune eligible. It accepts exact op names, class names, or groups:
 
 - Groups: `activation`, `rotary`, `elementwise`, `norm`, `scale_shift`, `fused_gate`, `all`.
-- Activation ops: `gelu_and_mul`, `silu_and_mul`, `gelu_new`, `quick_gelu`.
-- Other common ops: `rotary_embedding`, `mul_add`, `layer_norm`, `rms_norm`, `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidualLayerNormScaleShift`, `ScaleResidualRMSNormScaleShift`, `LayerNormTanhMulAdd`, `RMSNormTanhMulAdd`.
+- Common exact selectors include `gelu_and_mul`, `silu_and_mul`, `gelu_new`, `quick_gelu`, `rotary_embedding`, `mul_add`, `layer_norm`, `rms_norm`, `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidualLayerNormScaleShift`, `ScaleResidualRMSNormScaleShift`, `LayerNormTanhMulAdd`, and `RMSNormTanhMulAdd`.
 
 ### Sampling and output
 

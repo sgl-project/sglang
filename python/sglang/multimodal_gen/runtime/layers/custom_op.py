@@ -42,6 +42,10 @@ class CustomOp(nn.Module):
     Dispatches the forward method to the appropriate backend.
     """
 
+    kernel_compile_autotune_enabled = False
+    kernel_compile_groups = frozenset()
+    kernel_compile_names = frozenset()
+
     def __init__(self) -> None:
         super().__init__()
         self._compiled_forward_native: Callable | None = None
@@ -94,7 +98,7 @@ class CustomOp(nn.Module):
     def dispatch_forward(self) -> Callable:
         if _is_cuda:
             policy = custom_op_kernel_compile_policy(
-                getattr(self, "name", None), type(self).__name__
+                getattr(self, "name", None), type(self)
             )
             if policy == "force_torch_compile":
                 return self._get_compiled_forward_native()
@@ -117,7 +121,7 @@ class CustomOp(nn.Module):
             return self.forward_cuda(*args, **kwargs)
 
         policy = custom_op_kernel_compile_policy(
-            getattr(self, "name", None), type(self).__name__
+            getattr(self, "name", None), type(self)
         )
         if policy != "auto":
             return self.forward_cuda(*args, **kwargs)
@@ -382,7 +386,32 @@ class CustomOp(nn.Module):
         def decorator(op_cls):
             assert name not in cls.op_registry, f"Duplicate op name: {name}"
             op_cls.name = name
+            names = set(getattr(op_cls, "kernel_compile_names", ()))
+            names.add(name)
+            op_cls.kernel_compile_names = frozenset(names)
             cls.op_registry[name] = op_cls
+            return op_cls
+
+        return decorator
+
+    @classmethod
+    def kernel_compile_autotune(
+        cls, *groups: str, names: tuple[str, ...] = ()
+    ) -> Callable:
+        """Mark a CustomOp as eligible for warmup-time kernel compile autotune."""
+
+        def decorator(op_cls):
+            op_cls.kernel_compile_autotune_enabled = True
+            op_groups = set(getattr(op_cls, "kernel_compile_groups", ()))
+            op_groups.update(groups)
+            op_cls.kernel_compile_groups = frozenset(op_groups)
+
+            op_names = set(getattr(op_cls, "kernel_compile_names", ()))
+            op_names.update(names)
+            registered_name = getattr(op_cls, "name", None)
+            if registered_name is not None:
+                op_names.add(registered_name)
+            op_cls.kernel_compile_names = frozenset(op_names)
             return op_cls
 
         return decorator

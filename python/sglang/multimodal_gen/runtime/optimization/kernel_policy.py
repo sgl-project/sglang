@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kernel-wise fused-vs-compiled policy for diffusion CustomOp modules.
 
-This module only decides whether a CustomOp is eligible for torch.compile
-autotune. The actual benchmarking and commit logic lives in CustomOp itself so
-kernel selection stays close to the fused/native implementations being timed.
+This module only decides whether a CustomOp is selected for torch.compile
+autotune. Eligible ops declare selector metadata with
+`CustomOp.kernel_compile_autotune`; the actual benchmarking and commit logic
+lives in CustomOp itself so kernel selection stays close to the fused/native
+implementations being timed.
 """
 
 from __future__ import annotations
@@ -36,43 +38,17 @@ _KERNEL_COMPILE_SUPPRESSION_DEPTH = 0
 # kernel-wise compile stays opt-in until a full-model e2e win is validated
 DEFAULT_KERNEL_COMPILE_OPS = frozenset()
 
-KERNEL_COMPILE_OP_GROUPS = {
-    "activation": frozenset(
-        {
-            "gelu_and_mul",
-            "GeluAndMul",
-            "silu_and_mul",
-            "SiluAndMul",
-            "gelu_new",
-            "NewGELU",
-            "quick_gelu",
-            "QuickGELU",
-        }
-    ),
-    "rotary": frozenset({"rotary_embedding", "RotaryEmbedding"}),
-    "elementwise": frozenset({"mul_add", "MulAdd"}),
-    "norm": frozenset({"layer_norm", "LayerNorm", "rms_norm", "RMSNorm"}),
-    "scale_shift": frozenset(
-        {
-            "LayerNormScaleShift",
-            "RMSNormScaleShift",
-            "ScaleResidualLayerNormScaleShift",
-            "ScaleResidualRMSNormScaleShift",
-            "LayerNormTanhMulAdd",
-            "RMSNormTanhMulAdd",
-        }
-    ),
-    "fused_gate": frozenset(
-        {
-            "fuse_layernorm_scale_shift_gate_select01",
-            "FusedLayerNormScaleShiftGateSelect01",
-            "fuse_residual_layernorm_scale_shift_gate_select01",
-            "FusedResidualLayerNormScaleShiftGateSelect01",
-        }
-    ),
-}
-SUPPORTED_KERNEL_COMPILE_OPS = frozenset().union(*KERNEL_COMPILE_OP_GROUPS.values())
-KERNEL_COMPILE_OP_GROUPS["all"] = SUPPORTED_KERNEL_COMPILE_OPS
+KERNEL_COMPILE_OP_GROUPS = frozenset(
+    {
+        "activation",
+        "rotary",
+        "elementwise",
+        "norm",
+        "scale_shift",
+        "fused_gate",
+        "all",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -84,27 +60,37 @@ class KernelCompileAutotuneConfig:
     live_miss: bool
 
 
-def _expand_configured_kernel_compile_ops(configured_ops: str | None) -> set[str]:
+def _configured_kernel_compile_selectors(configured_ops: str | None) -> set[str]:
     if not configured_ops:
         return set(DEFAULT_KERNEL_COMPILE_OPS)
 
-    allowed_ops: set[str] = set()
-    for raw_op in configured_ops.split(","):
-        op = raw_op.strip()
-        if not op:
-            continue
-        if op in KERNEL_COMPILE_OP_GROUPS:
-            allowed_ops.update(KERNEL_COMPILE_OP_GROUPS[op])
-        elif op in SUPPORTED_KERNEL_COMPILE_OPS:
-            allowed_ops.add(op)
-    return allowed_ops
+    return {
+        selector.strip()
+        for selector in configured_ops.split(",")
+        if selector.strip()
+    }
 
 
-def _is_kernel_compile_op_allowed(op_name: str | None, class_name: str) -> bool:
-    allowed_ops = _expand_configured_kernel_compile_ops(
+def _is_kernel_compile_op_allowed(op_name: str | None, op_cls: type | str) -> bool:
+    if isinstance(op_cls, str):
+        return False
+    if not getattr(op_cls, "kernel_compile_autotune_enabled", False):
+        return False
+
+    configured_selectors = _configured_kernel_compile_selectors(
         os.environ.get(KERNEL_COMPILE_OPS_ENV)
     )
-    return class_name in allowed_ops or (op_name is not None and op_name in allowed_ops)
+    if "all" in configured_selectors:
+        return True
+
+    op_selectors = {op_cls.__name__}
+    if op_name is not None:
+        op_selectors.add(op_name)
+    op_selectors.update(getattr(op_cls, "kernel_compile_names", ()))
+    op_groups = set(getattr(op_cls, "kernel_compile_groups", ()))
+    return bool(
+        op_selectors & configured_selectors or op_groups & configured_selectors
+    )
 
 
 @contextmanager
@@ -201,19 +187,19 @@ def kernel_compile_autotune_config(
     )
 
 
-def custom_op_kernel_compile_policy(op_name: str | None, class_name: str) -> str:
+def custom_op_kernel_compile_policy(op_name: str | None, op_cls: type | str) -> str:
     if kernel_compile_autotune_suppressed():
         return "force_fused"
     config = kernel_compile_autotune_config()
     if config.policy != "auto":
         return config.policy
-    if _is_kernel_compile_op_allowed(op_name, class_name):
+    if _is_kernel_compile_op_allowed(op_name, op_cls):
         return "auto"
     return "force_fused"
 
 
-def should_torch_compile_custom_op(op_name: str | None, class_name: str) -> bool:
-    return custom_op_kernel_compile_policy(op_name, class_name) == "force_torch_compile"
+def should_torch_compile_custom_op(op_name: str | None, op_cls: type | str) -> bool:
+    return custom_op_kernel_compile_policy(op_name, op_cls) == "force_torch_compile"
 
 
 def kernel_compile_kwargs() -> dict[str, Any]:

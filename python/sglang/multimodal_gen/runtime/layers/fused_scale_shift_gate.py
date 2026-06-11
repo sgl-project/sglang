@@ -17,6 +17,7 @@ if _is_cuda:
 
 
 @CustomOp.register("fuse_layernorm_scale_shift_gate_select01")
+@CustomOp.kernel_compile_autotune("fused_gate")
 class FusedLayerNormScaleShiftGateSelect01(CustomOp):
     """Fused layernorm + scale/shift + gate with binary index selection.
 
@@ -82,6 +83,7 @@ class FusedLayerNormScaleShiftGateSelect01(CustomOp):
 
 
 @CustomOp.register("fuse_residual_layernorm_scale_shift_gate_select01")
+@CustomOp.kernel_compile_autotune("fused_gate")
 class FusedResidualLayerNormScaleShiftGateSelect01(CustomOp):
     """Fused residual + layernorm + scale/shift + gate with binary index selection.
 

@@ -5,6 +5,7 @@ from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 
 @CustomOp.register("mul_add")
+@CustomOp.kernel_compile_autotune("elementwise")
 class MulAdd(CustomOp):
     """
     Fuse elementwise mul and add
