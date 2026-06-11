@@ -73,6 +73,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     freeze_gc,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -112,18 +113,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-
-def _make_graph_key(bs, stream_idx=None, variant_label=None):
-    """Build a graph dict key from batch size, stream index, and lora variant.
-
-    Standalone function so speculative runners (which don't subclass
-    DecodeCudaGraphRunner) can use the same key encoding.
-    """
-    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-    if variant_label is not None:
-        key = f"{variant_label}_{key}"
-    return key
 
 
 def build_replay_fb_view(
@@ -499,7 +488,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        return _make_graph_key(bs, stream_idx, variant_label)
+        return ShapeKey(
+            size=bs,
+            stream_idx=stream_idx,
+            variant_label=variant_label,
+        )
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not getattr(self, "record_nolora_graph", False):
