@@ -847,11 +847,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if mapper is not None:
             weights = mapper.apply(weights)
 
-        vision_params = (
-            None
-            if self.config.language_only
-            else dict(self.named_parameters(remove_duplicate=False))
-        )
+        vision_params = dict(self.named_parameters(remove_duplicate=False))
 
         def stream_language_weights():
             for name, loaded_weight in weights:
