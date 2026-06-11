@@ -13,6 +13,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_sm100_supported, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ class CustomAllReduceV2:
         self.max_size = max(max_pull_size, max_push_size)
         self.override_shot(None)  # set default config based on world size
         self.override_algo: Optional[AllReduceAlgo] = None
+        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         self.obj = get_custom_all_reduce_cls()(
             rank=self.rank,
             world_size=self.world_size,
@@ -97,10 +99,15 @@ class CustomAllReduceV2:
             yield
             return
         try:
+            self.obj.set_cuda_graph_register_inputs(not self.tms_cudagraph)
             self.obj.set_cuda_graph_capture(True)
             yield
         finally:
             self.obj.set_cuda_graph_capture(False)
+            self.obj.set_cuda_graph_register_inputs(True)
+        if self.tms_cudagraph:
+            log_info_on_rank0(logger, "Registering 0 cuda graph addresses because tms is used")
+            return
         # cannot call when graph is capturing
         assert (
             torch.cuda.is_current_stream_capturing() == False
