@@ -2688,6 +2688,23 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        # CP KV-reshard: under per-rank pool sharding, allocator.available_size()
+        # differs across CP ranks (owner skew). Admit on the CP-MIN so every CP
+        # rank admits the SAME request set (SPMD); otherwise the mirrored radix
+        # trees and lock_ref diverge and the downstream eviction collective
+        # deadlocks. All CP ranks reach this point in lockstep -- the early
+        # returns above gate only on SPMD state (waiting_queue, batch_is_full,
+        # req-slot availability), never on per-rank KV-pool occupancy.
+        cp_available_override = None
+        if (
+            getattr(self.server_args, "enable_cp_kv_reshard", False)
+            and self.server_args.attn_cp_size > 1
+        ):
+            local_avail = int(self.token_to_kv_pool_allocator.available_size())
+            cp_available_override = min(
+                self.attn_cp_group.all_gather_object(local_avail)
+            )
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2705,6 +2722,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            cp_available_override=cp_available_override,
         )
 
         if self.chunked_req is not None:

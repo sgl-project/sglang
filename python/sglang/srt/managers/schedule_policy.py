@@ -479,10 +479,16 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        cp_available_override: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        # CP KV-reshard: a CP-agreed (MIN across CP ranks) physical pool
+        # availability, substituted for the per-rank ``available_size()`` in the
+        # token budget so every CP rank admits the SAME request set (SPMD). None
+        # outside reshard. See Scheduler._get_new_batch_prefill_raw.
+        self.cp_available_override = cp_available_override
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
@@ -567,10 +573,12 @@ class PrefillAdder:
                 + self.tree_cache.full_evictable_size()
             )
         else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
+            available = (
+                self.cp_available_override
+                if self.cp_available_override is not None
+                else self.token_to_kv_pool_allocator.available_size()
             )
+            available_and_evictable = available + self.tree_cache.evictable_size()
         return available_and_evictable - self.rem_total_token_offset
 
     @property
@@ -594,10 +602,12 @@ class PrefillAdder:
                 + self.tree_cache.full_evictable_size()
             )
         else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
+            available = (
+                self.cp_available_override
+                if self.cp_available_override is not None
+                else self.token_to_kv_pool_allocator.available_size()
             )
+            available_and_evictable = available + self.tree_cache.evictable_size()
 
         return available_and_evictable - self.cur_rem_token_offset
 

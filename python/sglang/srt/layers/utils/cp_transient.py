@@ -328,8 +328,10 @@ def cp_alloc_req_transient(
 
     Computes this request's non-owned positions for the forward range,
     allocates transient pool rows, scatters them into ``req_to_token``.
-    On allocator OOM, evicts from ``tree_cache`` (if provided) and
-    retries once.
+    Unit-test-only helper: does NOT evict on allocator OOM (per-request
+    eviction under CP-reshard would deadlock the CP collective; the
+    production path coordinates a single eviction per batch). ``tree_cache``
+    is accepted for signature compatibility but unused.
 
     Returns ``(rows, req_idxs_flat, positions)``:
 
@@ -359,16 +361,14 @@ def cp_alloc_req_transient(
         return empty, req_idxs, positions
 
     rows = cp_alloc_transient_rows(req_to_token, allocator, req_idxs, positions)
-    if rows is None and tree_cache is not None:
-        # Evict just enough to cover this request's deficit and retry once.
-        needed = req_idxs.numel()
-        deficit = needed - allocator.available_size()
-        if deficit > 0:
-            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
-            tree_cache.evict(EvictParams(num_tokens=deficit))
-        rows = cp_alloc_transient_rows(req_to_token, allocator, req_idxs, positions)
-
+    # NOTE: no per-request eviction here. Under CP-reshard tree_cache.evict()
+    # is a lockstep CP collective (broadcast_object); calling it from a
+    # per-request, per-rank-gated retry deadlocks the CP group (the deciding
+    # condition -- this rank's alloc failing -- differs across ranks). The
+    # production path (cp_alloc_extend_transient) does ONE coordinated eviction
+    # per batch via tree_cache.cp_coordinated_evict(). This helper is retained
+    # for unit tests only and must not trigger the collective; ``tree_cache``
+    # is accepted but no longer used for eviction.
     return rows, req_idxs, positions
 
 
@@ -383,7 +383,7 @@ def cp_alloc_extend_transient(
     cp_rank: int,
     page_size: int,
     tree_cache=None,
-) -> Tuple[CpTransientState, List[int]]:
+) -> Tuple[CpTransientState, List[int], bool]:
     """Pre-forward transient allocation for an extend batch (scheduler entry).
     For each CP-admitted request (``cp_owner_per_pages[s] is not None``),
     allocates transient pool rows for every non-owned position in
@@ -395,29 +395,32 @@ def cp_alloc_extend_transient(
     K/V via allgather. The extend subset is reachable implicitly through
     ``full_out_cache_loc``, which the extend save targets directly.
 
-    Returns ``(CpTransientState, dropped)``. The returned state holds only
-    the transient fields (``owner_per_pages`` stays ``None``); the consumer
-    on ``ForwardBatch`` fills owners in separately via
+    Returns ``(CpTransientState, dropped, satisfiable)``. The returned state
+    holds only the transient fields (``owner_per_pages`` stays ``None``); the
+    consumer on ``ForwardBatch`` fills owners in separately via
     :meth:`CpTransientState.attach_allocation`. ``dropped`` lists batch
-    indices whose allocation failed even after optional eviction via
-    ``tree_cache``; the caller drops those requests and re-queues them.
+    indices whose allocation still failed after the coordinated eviction
+    (diagnostic). ``satisfiable`` is the CP-broadcast verdict of whether the
+    single coordinated eviction freed enough rows on EVERY rank -- it is
+    identical across CP ranks, so the caller can raise consistently (no
+    asymmetric crash) on genuine OOM.
 
-    The function is a no-op (returns an empty state, ``[]``) when no
+    The function is a no-op (returns an empty state, ``[]``, ``True``) when no
     request in the batch is CP-admitted or the batch has no extend tokens.
     """
     allocation = CpTransientState()
     if not cp_owner_per_pages or all(o is None for o in cp_owner_per_pages):
-        return allocation, []
+        return allocation, [], True
 
     device = req_to_token.device
 
-    all_rows: List[torch.Tensor] = []
-    all_req_idxs: List[torch.Tensor] = []
-    all_positions: List[torch.Tensor] = []
-    all_is_prefix: List[torch.Tensor] = []
-    all_displaced: List[torch.Tensor] = []
-    dropped: List[int] = []
-
+    # First pass: compute this rank's non-owned (transient) positions for every
+    # CP-admitted request and the batch-total need, WITHOUT allocating yet.
+    # Eviction must be ONE lockstep CP collective per batch (see below), not a
+    # per-request call gated on per-rank alloc failure -- the latter deadlocks
+    # the CP group because allocator.available_size() differs per rank.
+    pending: List[Tuple[int, int, torch.Tensor, torch.Tensor]] = []
+    total_needed = 0
     for s, owner in enumerate(cp_owner_per_pages):
         if owner is None:
             continue
@@ -434,21 +437,38 @@ def cp_alloc_extend_transient(
             cp_rank=cp_rank,
             req_pool_indices=[req_pool_idx],
         )
+        if req_idxs.numel() == 0:
+            continue
         req_idxs = req_idxs.to(device=device)
         positions = positions.to(device=device)
+        total_needed += int(req_idxs.numel())
+        pending.append((s, prefix_len, req_idxs, positions))
 
-        total = req_idxs.numel()
-        if total == 0:
-            continue
+    # One coordinated, lockstep eviction sized to THIS rank's total transient
+    # deficit (token-rows). Every CP rank calls this unconditionally (deficit
+    # may be 0); rank 0 frees a victim set covering every rank's deficit and
+    # broadcasts it. ``satisfiable`` is identical on all ranks (broadcast), so
+    # the caller can raise consistently on genuine OOM. Skip when CP consensus
+    # is not active (non-reshard / single-rank), falling back to no eviction.
+    satisfiable = True
+    if (
+        tree_cache is not None
+        and getattr(tree_cache, "cp_attn_group", None) is not None
+    ):
+        deficit = max(0, total_needed - allocator.available_size())
+        satisfiable = tree_cache.cp_coordinated_evict(deficit)
 
-        rows = allocator.alloc(total)
-        if rows is None and tree_cache is not None:
-            deficit = total - allocator.available_size()
-            if deficit > 0:
-                from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    all_rows: List[torch.Tensor] = []
+    all_req_idxs: List[torch.Tensor] = []
+    all_positions: List[torch.Tensor] = []
+    all_is_prefix: List[torch.Tensor] = []
+    all_displaced: List[torch.Tensor] = []
+    dropped: List[int] = []
 
-                tree_cache.evict(EvictParams(num_tokens=deficit))
-            rows = allocator.alloc(total)
+    # Second pass: allocate + scatter. No per-request eviction -- the single
+    # coordinated evict above already freed enough owned rows on every rank.
+    for s, prefix_len, req_idxs, positions in pending:
+        rows = allocator.alloc(int(req_idxs.numel()))
         if rows is None:
             dropped.append(s)
             continue
@@ -486,7 +506,7 @@ def cp_alloc_extend_transient(
             allocation.prefix_req_indices = req_idxs_cat[prefix_mask]
             allocation.prefix_position_indices = positions_cat[prefix_mask]
 
-    return allocation, dropped
+    return allocation, dropped, satisfiable
 
 
 def cp_build_full_out_cache_loc_for_extend(
@@ -534,7 +554,7 @@ def cp_alloc_forward_transient(
         return []
     state: CpTransientState = forward_batch.cp_transient
     prefix_lens, extend_lens, req_pool_indices = ranges
-    allocation, dropped = cp_alloc_extend_transient(
+    allocation, dropped, _satisfiable = cp_alloc_extend_transient(
         req_to_token=forward_batch.req_to_token_pool.req_to_token,
         allocator=allocator,
         cp_owner_per_pages=state.owner_per_pages,

@@ -187,6 +187,17 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 
     allocator = tree_cache.token_to_kv_pool_allocator
 
+    if getattr(tree_cache, "cp_attn_group", None) is not None:
+        # CP KV-reshard: eviction is a lockstep collective entered by EVERY CP
+        # rank. The per-rank ``available_size() < num_tokens`` gate below would
+        # let one rank evict (and enter the broadcast) while a skewed peer skips
+        # it -> deadlock. Instead every rank unconditionally calls the
+        # coordinated path with its own deficit (possibly 0); rank 0 then frees a
+        # single victim set covering every rank's deficit. ``num_tokens`` is in
+        # token-rows, the same unit as ``available_size()``.
+        tree_cache.cp_coordinated_evict(max(0, num_tokens - allocator.available_size()))
+        return
+
     if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
         full_available_size = allocator.full_available_size()
@@ -374,7 +385,7 @@ def _maybe_alloc_cp_transient_for_extend(
 
     allocator = batch.token_to_kv_pool_allocator
     page_size = allocator.page_size
-    allocation, dropped = cp_alloc_extend_transient(
+    allocation, dropped, satisfiable = cp_alloc_extend_transient(
         req_to_token=batch.req_to_token_pool.req_to_token,
         allocator=allocator,
         cp_owner_per_pages=owners,
@@ -385,10 +396,16 @@ def _maybe_alloc_cp_transient_for_extend(
         page_size=page_size,
         tree_cache=batch.tree_cache,
     )
-    if dropped:
+    # ``satisfiable`` is the rank-0-broadcast verdict of the single coordinated
+    # eviction -> identical on every CP rank, so this raise fires on all ranks
+    # together (no asymmetric crash that would strand peers on the next
+    # collective). Gate the raise on ``satisfiable`` (SPMD), NOT on the per-rank
+    # ``dropped`` list; under exact accounting satisfiable=True => dropped==[].
+    if not satisfiable:
         raise RuntimeError(
-            f"cp_alloc_extend_transient dropped requests {dropped} in "
-            "CP-resharded extend; transient_reserve may be undersized"
+            "CP-resharded extend out of memory: requested transient rows exceed "
+            f"evictable capacity on at least one CP rank (dropped={dropped}). "
+            "Lower the batch size or chunked_prefill_size."
         )
     allocation.full_out_cache_loc = cp_build_full_out_cache_loc_for_extend(
         req_to_token=batch.req_to_token_pool.req_to_token,

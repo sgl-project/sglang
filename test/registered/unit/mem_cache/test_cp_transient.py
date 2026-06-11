@@ -315,18 +315,32 @@ class _StubTreeCache:
         self._next_row = 9000
         self._budget = capacity
         self.evict_calls: List[int] = []
+        # A truthy cp_attn_group activates the CP-reshard coordinated-eviction
+        # branch in cp_alloc_extend_transient (the only context it runs in
+        # production); cp_coordinated_evict below mimics RadixCache's effect.
+        self.cp_attn_group = object()
 
-    def evict(self, params):
-        from sglang.srt.mem_cache.base_prefix_cache import EvictResult
-
-        n = min(params.num_tokens, self._budget)
-        self.evict_calls.append(params.num_tokens)
+    def _free_n(self, n_req: int) -> int:
+        n = min(int(n_req), self._budget)
         if n > 0:
             rows = torch.arange(self._next_row, self._next_row + n, dtype=torch.int64)
             self._next_row += n
             self._budget -= n
             self._allocator.free(rows)
-        return EvictResult(num_tokens_evicted=n)
+        return n
+
+    def evict(self, params):
+        from sglang.srt.mem_cache.base_prefix_cache import EvictResult
+
+        self.evict_calls.append(params.num_tokens)
+        return EvictResult(num_tokens_evicted=self._free_n(params.num_tokens))
+
+    def cp_coordinated_evict(self, deficit_rows: int) -> bool:
+        """Lockstep coordinated-eviction stand-in: frees up to ``deficit_rows``
+        and reports whether the deficit was fully covered (``satisfiable``)."""
+        self.evict_calls.append(int(deficit_rows))
+        freed = self._free_n(deficit_rows)
+        return freed >= int(deficit_rows)
 
 
 def _make_forward_batch(
@@ -613,27 +627,31 @@ class TestAllocReqTransient(CustomTestCase):
         # No partial scatter happened.
         self.assertEqual(req_to_token.sum().item(), 0)
 
-    def test_retries_after_eviction(self):
+    def test_no_eviction_even_with_tree_cache(self):
+        # cp_alloc_req_transient is a unit-test-only helper that does NOT evict:
+        # per-request eviction under CP-reshard would deadlock the lockstep CP
+        # collective (the production path coordinates one eviction per batch via
+        # cp_alloc_extend_transient -> cp_coordinated_evict). So even when a
+        # tree_cache is supplied, OOM returns None and the tree is never driven.
         req_to_token = _make_req_to_token(num_reqs=1, max_context=16)
         allocator = _FakeAllocator(start=1, capacity=2)
         cache = _StubTreeCache(allocator, capacity=100)
         owner = torch.tensor([0, 1, 2, 3], dtype=torch.int8)
 
-        rows, req_idxs, positions = cp_alloc_req_transient(
+        rows, _, _ = cp_alloc_req_transient(
             req_to_token=req_to_token,
             allocator=allocator,
             cp_owner_per_page=owner,
             prefix_len=0,
-            extend_len=8,
+            extend_len=8,  # 6 non-owned, only 2 rows free -> OOM, no retry
             req_pool_idx=0,
             cp_rank=0,
             page_size=2,
             tree_cache=cache,
         )
-        self.assertIsNotNone(rows)
-        # need 6, available 2 -> deficit 4 evicted, then alloc succeeds.
-        self.assertEqual(cache.evict_calls, [4])
-        self.assertEqual(rows.numel(), 6)
+        self.assertIsNone(rows)
+        self.assertEqual(cache.evict_calls, [])  # tree_cache never driven
+        self.assertEqual(req_to_token.sum().item(), 0)  # no partial scatter
 
 
 if __name__ == "__main__":

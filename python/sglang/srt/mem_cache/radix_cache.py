@@ -664,13 +664,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             return self._evict_cp_consensus(params)
         return self._evict_local(params)
 
-    def _iter_eviction_victims(self, num_tokens: int) -> Iterator[TreeNode]:
-        """Yield evictable leaves in eviction-priority order until the
-        total ``len(victim.value)`` reaches ``num_tokens``. Mirrors
-        ``_evict_local``'s heap-pop loop without mutating the tree; the
-        caller captures whatever it needs from each yielded node. Kept
-        in sync with ``_evict_local`` so rank-0's CP victim selection
-        matches the local-eviction selection followers would compute.
+    def _walk_eviction_victims(self) -> Iterator[TreeNode]:
+        """Yield *all* evictable leaves in eviction-priority order, with
+        single-child parent promotion, without mutating the tree. This is
+        the shared heap walk; callers impose their own stop condition
+        (token count for ``_iter_eviction_victims``, per-rank deficit
+        vector for ``_pick_cp_victims_for_deficits``). Order matches
+        ``_evict_local``'s heap-pop loop so rank-0's CP victim selection
+        agrees with the local-eviction selection followers would compute.
 
         Parent-promotion is decided before each yield with
         ``len(parent.children) == 1`` (pre-removal) -- equivalent to
@@ -682,8 +683,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         ]
         heapq.heapify(eviction_heap)
 
-        num_evicted = 0
-        while num_evicted < num_tokens and eviction_heap:
+        while eviction_heap:
             _priority, x = heapq.heappop(eviction_heap)
 
             parent = x.parent
@@ -694,12 +694,24 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 and len(parent.children) == 1
             )
 
-            num_evicted += len(x.value)
             yield x
 
             if promote_parent:
                 new_priority = self.eviction_strategy.get_priority(parent)
                 heapq.heappush(eviction_heap, (new_priority, parent))
+
+    def _iter_eviction_victims(self, num_tokens: int) -> Iterator[TreeNode]:
+        """Yield evictable leaves (priority order) until the total
+        ``len(victim.value)`` reaches ``num_tokens``. Drives the shared
+        ``_walk_eviction_victims`` walk; behaviorally identical to the
+        previous inlined heap loop (stop checked before accumulating).
+        """
+        num_evicted = 0
+        for x in self._walk_eviction_victims():
+            if num_evicted >= num_tokens:
+                return
+            num_evicted += len(x.value)
+            yield x
 
     def _evict_local(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
@@ -763,6 +775,81 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             paths.append(self._full_path_token_ids(x))
             num_evicted += len(x.value)
         return paths, num_evicted
+
+    def cp_coordinated_evict(self, local_deficit_rows: int) -> bool:
+        """Lockstep CP eviction-on-OOM (rank-0 deficit-vector protocol).
+
+        MUST be entered by *every* CP rank in the group with no per-rank
+        gate -- that is the load-bearing fix: all ranks ``all_gather`` their
+        own physical row deficit, then (iff any rank is short) rank 0 selects
+        a single victim set that frees enough *owned* rows on EVERY rank
+        (computed from the mirrored ``cp_owner_per_page``), broadcasts the
+        victim paths, and all ranks apply them. Returns ``True`` iff the
+        agreed victim set covers every rank's deficit (or no rank had one).
+
+        ``local_deficit_rows`` and the gathered figures are KV-pool
+        token-rows (same unit as ``allocator.available_size()``). Falls back
+        to the local-only path when CP consensus is not active.
+        """
+        if self.cp_attn_group is None:
+            # No CP consensus active: best-effort local eviction. (Callers on
+            # the reshard path gate on cp_attn_group, so this is defensive.)
+            if local_deficit_rows > 0:
+                self.evict(EvictParams(num_tokens=int(local_deficit_rows)))
+            return True
+
+        # 1. Unconditional all_gather of per-rank deficits -> identical vector
+        #    on every rank, so the max(...) test below is all-or-none.
+        deficits = self.cp_attn_group.all_gather_object(int(max(0, local_deficit_rows)))
+        if max(deficits) <= 0:
+            return True
+
+        # 2. Rank 0 picks a victim set covering EVERY rank's deficit.
+        if self.cp_rank == 0:
+            paths, satisfiable = self._pick_cp_victims_for_deficits(deficits)
+            payload = {"paths": paths, "satisfiable": satisfiable}
+        else:
+            payload = None
+
+        # 3. Broadcast + apply on all ranks (same FIFO slot on every rank).
+        payload = self.cp_attn_group.broadcast_object(payload, src=0)
+        if os.environ.get("SGLANG_DEBUG_KV_RESHARD"):
+            self._assert_cp_eviction_consensus(payload["paths"])
+        self._apply_cp_eviction(payload["paths"])
+        return bool(payload["satisfiable"])
+
+    def _pick_cp_victims_for_deficits(
+        self, deficits: List[int]
+    ) -> Tuple[List[Tuple[int, ...]], bool]:
+        """Rank-0-only. Walk evictable leaves in priority order and select
+        victims until every rank's row deficit is covered (or the tree is
+        exhausted). For each victim the rows it frees on rank ``r`` are
+        ``(cp_owner_per_page == r).sum() * page_size`` -- exact because radix
+        nodes are page-aligned -- NOT ``len(node.value)`` (which counts the
+        slot-0 sentinels of non-owned pages and would under-credit the freed
+        rows). Returns ``(paths, satisfiable)``.
+        """
+        remaining = [int(d) for d in deficits]  # token-rows still needed per rank
+        cp_size = self.cp_size
+        paths: List[Tuple[int, ...]] = []
+        for node in self._walk_eviction_victims():
+            if all(rem <= 0 for rem in remaining):
+                break
+            owner = node.cp_owner_per_page
+            if owner is None:
+                # Non-reshard node (should not occur under SPMD); free it but
+                # credit nothing toward any rank's deficit (conservative).
+                paths.append(self._full_path_token_ids(node))
+                continue
+            freed = (
+                torch.bincount(owner.to(torch.int64), minlength=cp_size)
+                * self.page_size
+            )
+            for r in range(cp_size):
+                remaining[r] -= int(freed[r])
+            paths.append(self._full_path_token_ids(node))
+        satisfiable = all(rem <= 0 for rem in remaining)
+        return paths, satisfiable
 
     def _apply_cp_eviction(self, paths: List[Tuple[int, ...]]) -> None:
         """All-ranks: free and delete every node identified by ``paths``."""
