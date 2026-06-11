@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     transform_scale_ue8m0,
 )
 from sglang.srt.utils.weight_checker import (
+    _RESET_SENTINEL,
     ChecksumInfo,
     ParallelismInfo,
     WeightChecker,
@@ -33,7 +34,7 @@ from sglang.srt.utils.weight_checker import (
     _hash_tensor,
     _is_non_persistent_buffer_name,
     _postprocess_tensors,
-    _random_like,
+    _sentinel_like,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -126,51 +127,64 @@ class _FakeModelRunner:
 
 
 # ---------------------------------------------------------------------------
-# _random_like
+# _sentinel_like
 # ---------------------------------------------------------------------------
 
 
-class TestRandomLike(CustomTestCase):
+class TestSentinelLike(CustomTestCase):
 
-    def test_floating_point_preserves_dtype_shape_device(self):
+    def test_floating_point_is_the_fixed_sentinel(self):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             t = torch.zeros(8, 4, dtype=dtype)
-            out = _random_like(t)
+            out = _sentinel_like(t)
             self.assertEqual(out.dtype, dtype)
             self.assertEqual(out.shape, t.shape)
             self.assertEqual(out.device, t.device)
-            self.assertGreater(out.float().abs().sum().item(), 0)
+            torch.testing.assert_close(
+                out, torch.full_like(t, _RESET_SENTINEL)
+            )
 
-    def test_bool_returns_bool_with_both_values(self):
+    def test_fp8_e4m3_holds_the_sentinel(self):
+        # 88.0 is representable in fp8 e4m3 (max 448); reset must not saturate it.
+        t = torch.zeros(8, 4, dtype=torch.float8_e4m3fn, device="cuda")
+        out = _sentinel_like(t)
+        self.assertEqual(out.dtype, torch.float8_e4m3fn)
+        self.assertTrue(torch.all(out.float() == _RESET_SENTINEL))
+
+    def test_bool_is_all_true(self):
         t = torch.zeros(1024, dtype=torch.bool)
-        out = _random_like(t)
+        out = _sentinel_like(t)
         self.assertEqual(out.dtype, torch.bool)
         self.assertEqual(out.shape, t.shape)
         self.assertEqual(out.device, t.device)
-        self.assertTrue(out.any().item())
-        self.assertFalse(out.all().item())
+        self.assertTrue(out.all().item())
 
-    def test_int_returns_correct_dtype_in_range(self):
+    def test_int_is_the_fixed_sentinel_clamped_to_dtype_max(self):
         for dtype in (torch.int8, torch.int32, torch.int64):
             t = torch.zeros(256, dtype=dtype)
-            out = _random_like(t)
+            out = _sentinel_like(t)
             self.assertEqual(out.dtype, dtype)
             self.assertEqual(out.shape, t.shape)
-            info = torch.iinfo(dtype)
-            self.assertGreaterEqual(out.min().item(), info.min)
-            self.assertLessEqual(out.max().item(), info.max)
-            self.assertGreater(out.unique().numel(), 1)
+            expected = min(int(_RESET_SENTINEL), torch.iinfo(dtype).max)
+            self.assertTrue(torch.all(out == expected))
 
-    def test_floating_point_values_in_unit_range(self):
-        t = torch.zeros(1024, dtype=torch.float32)
-        out = _random_like(t)
-        self.assertGreaterEqual(out.min().item(), 0.0)
-        self.assertLess(out.max().item(), 1.0)
+    def test_sentinel_is_non_zero_and_not_one(self):
+        # Reset must avoid 0 (naturally-zero params) and 1.0 (norm weights) so a
+        # missed weight-sync cannot alias a stale value.
+        self.assertNotEqual(_RESET_SENTINEL, 0.0)
+        self.assertNotEqual(_RESET_SENTINEL, 1.0)
+
+    def test_is_idempotent(self):
+        for dtype in (torch.float32, torch.bfloat16, torch.int32, torch.bool):
+            t = torch.zeros(64, dtype=dtype)
+            once = _sentinel_like(t)
+            twice = _sentinel_like(once)
+            self.assertTrue(torch.equal(once, twice))
 
     def test_does_not_mutate_input(self):
         t = torch.full((16,), 5.0)
         before = t.clone()
-        _random_like(t)
+        _sentinel_like(t)
         torch.testing.assert_close(t, before)
 
 
@@ -400,13 +414,31 @@ class TestSnapshot(_WeightCheckerTestBase):
 
 class TestResetTensors(_WeightCheckerTestBase):
 
-    def test_changes_normal_params_in_place(self):
-        before_w = self.model.w.clone()
+    def test_sets_normal_params_to_sentinel_in_place(self):
         before_w_ptr = self.model.w.data_ptr()
         self.checker._reset_tensors()
         # In-place: storage pointer unchanged.
         self.assertEqual(self.model.w.data_ptr(), before_w_ptr)
-        self.assertFalse(torch.equal(self.model.w, before_w))
+        torch.testing.assert_close(
+            self.model.w, torch.full_like(self.model.w, _RESET_SENTINEL)
+        )
+        # A naturally-zero param (`b`) is also poisoned away from zero, so a
+        # missed sync over it cannot alias the original zeros.
+        torch.testing.assert_close(
+            self.model.b, torch.full_like(self.model.b, _RESET_SENTINEL)
+        )
+
+    def test_is_idempotent(self):
+        self.checker._reset_tensors()
+        first = {name: t.clone() for name, t in self.model.named_parameters()}
+        first.update(
+            {name: t.clone() for name, t in self.model.named_buffers()}
+        )
+        self.checker._reset_tensors()
+        for name, t in self.model.named_parameters():
+            self.assertTrue(torch.equal(t, first[name]), f"{name} changed on 2nd reset")
+        for name, t in self.model.named_buffers():
+            self.assertTrue(torch.equal(t, first[name]), f"{name} changed on 2nd reset")
 
     def test_skips_cos_sin_cache(self):
         before = self.model.rotary_emb_cos_sin_cache.clone()
@@ -460,6 +492,143 @@ class TestCompare(_WeightCheckerTestBase):
                 tensor.data.copy_(snapshot[name].to(tensor.device))
             for name, tensor in self.model.named_buffers():
                 tensor.data.copy_(snapshot[name].to(tensor.device))
+        self.checker._compare()
+
+
+class _NormModel(nn.Module):
+    """A single norm-style weight initialized to all 1.0 (RMSNorm/LayerNorm)."""
+
+    def __init__(self):
+        super().__init__()
+        self.norm_weight = nn.Parameter(torch.ones(16), requires_grad=False)
+
+
+class TestSentinelDistinctFromNormWeight(CustomTestCase):
+    """The reset sentinel must differ from a 1.0 norm weight, otherwise a missed
+    sync over a norm weight would alias its real value and pass compare."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.model = _NormModel().cuda()
+        self.checker = WeightChecker(model_runner=_FakeModelRunner(self.model))
+
+    def test_reset_then_unsynced_norm_weight_fails_compare(self):
+        self.checker._snapshot()
+        # Reset poisons the 1.0 weight to the sentinel; nothing re-syncs it.
+        self.checker._reset_tensors()
+        self.assertFalse(torch.equal(self.model.norm_weight, torch.ones(16).cuda()))
+        with self.assertRaises(Exception) as ctx:
+            self.checker._compare()
+        self.assertIn("name=norm_weight", str(ctx.exception))
+
+
+class _Fp8Model(nn.Module):
+    """Holds a real fp8 (qweight, int32 UE8M0 scale) pair under the names the
+    quant-dequant branch of _postprocess_tensors matches."""
+
+    def __init__(self, qweight, sf_packed_int32):
+        super().__init__()
+        self.register_buffer("x_weight", qweight)
+        self.register_buffer("x_weight_scale_inv", sf_packed_int32)
+
+    def named_parameters(self):
+        return []
+
+    def named_buffers(self):
+        # Names use dots so _postprocess_tensors forms the quant pair
+        # (`x.weight` + `x.weight_scale_inv`).
+        return [
+            ("x.weight", self.x_weight),
+            ("x.weight_scale_inv", self.x_weight_scale_inv),
+        ]
+
+
+class TestResetFp8QuantPair(CustomTestCase):
+    """Reset must poison the raw fp8 qweight + int32 scale and the
+    snapshot/compare dequant pipeline must stay crash-free (B200 UE8M0 path)."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        qweight, _, sf_packed_int32 = _build_fp8_quant_pair()
+        self.model = _Fp8Model(qweight, sf_packed_int32)
+        self.checker = WeightChecker(model_runner=_FakeModelRunner(self.model))
+
+    def test_reset_changes_dequant_without_crashing(self):
+        self.checker._snapshot()
+        snapshot = {k: v.clone() for k, v in self.checker._snapshot_tensors.items()}
+        self.checker._reset_tensors()
+
+        # Raw qweight + scale are poisoned to the sentinel.
+        self.assertTrue(torch.all(self.model.x_weight.float() == _RESET_SENTINEL))
+        self.assertTrue(torch.all(self.model.x_weight_scale_inv == int(_RESET_SENTINEL)))
+
+        # The UE8M0 int32-scale dequant runs without crashing, on both the
+        # snapshot and the post-reset state, and yields a different bf16 weight.
+        snap_dequant = next(
+            t
+            for name, should_compare, t in _postprocess_tensors(snapshot, set())
+            if name == "x.weight" and should_compare
+        )
+        live_dequant = next(
+            t
+            for name, should_compare, t in _postprocess_tensors(
+                dict(self.checker._model_state()), set()
+            )
+            if name == "x.weight" and should_compare
+        )
+        self.assertEqual(snap_dequant.dtype, torch.bfloat16)
+        self.assertEqual(live_dequant.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(live_dequant).all())
+        self.assertFalse(torch.equal(snap_dequant, live_dequant.cpu()))
+
+    def test_reset_then_compare_fails(self):
+        self.checker._snapshot()
+        self.checker._reset_tensors()
+        with self.assertRaises(Exception) as ctx:
+            self.checker._compare()
+        # The compared (dequant) entry is keyed by the weight name.
+        self.assertIn("name=x.weight", str(ctx.exception))
+
+
+class _SharedPrivateModel(nn.Module):
+    """Two named params: one standing in for embed/head shared with the target,
+    one draft-private. Lets a test simulate 'only the shared one was re-synced'."""
+
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Parameter(torch.randn(8), requires_grad=False)
+        self.private = nn.Parameter(torch.randn(8), requires_grad=False)
+
+
+class TestDraftStaleDetectedByCompare(CustomTestCase):
+    """Models the real DFlash case: a distributed update re-syncs the target
+    (and the shared embed/head) but leaves the draft-private weights stale.
+    snapshot -> reset -> only-shared re-synced -> compare must detect the
+    draft-private divergence (still at the sentinel)."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.model = _SharedPrivateModel().cuda()
+        self.checker = WeightChecker(model_runner=_FakeModelRunner(self.model))
+
+    def test_private_divergence_detected_and_clears_after_full_sync(self):
+        self.checker._snapshot()
+        embed_good = self.model.embed.detach().clone()
+        private_good = self.model.private.detach().clone()
+
+        self.checker._reset_tensors()
+
+        # Simulate "only the shared/target-owned storage re-synced": restore embed
+        # but leave the draft-private weight at the sentinel.
+        with torch.no_grad():
+            self.model.embed.data.copy_(embed_good)
+        with self.assertRaises(Exception) as ctx:
+            self.checker._compare()
+        self.assertIn("name=private", str(ctx.exception))
+
+        # Once the draft is fully synced, the same compare passes.
+        with torch.no_grad():
+            self.model.private.data.copy_(private_good)
         self.checker._compare()
 
 

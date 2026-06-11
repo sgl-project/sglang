@@ -251,8 +251,7 @@ class SchedulerUpdateWeightsMixin:
                     success=True, message="Success.", payload=payload
                 )
 
-            # Target first means its shared embed/head storage is the canonical one
-            # randomized once for reset, and its parallelism_info is the base.
+            # Target first so its parallelism_info is the checksum base.
             runners = []
             if selector == "all":
                 runners.append(("", self.tp_worker.model_runner))
@@ -278,23 +277,13 @@ class SchedulerUpdateWeightsMixin:
                     raise RuntimeError(f"[{role or 'target'}] {e}") from e
 
             if recv_req.action == "reset_tensors":
-                # Shared storage (embed/head) is randomized once by the first
-                # runner; later runners skip it via visited_storage.
-                visited_storage = set()
-                if selector == "draft":
-                    # Don't randomize target-owned storage (e.g. embed/head shared
-                    # with the draft via set_embed_and_head); draft-only reset
-                    # scrambles draft-private weights.
-                    self.tp_worker.model_runner.check_weights(
-                        action="mark_reset_storage", visited_storage=visited_storage
-                    )
+                # Selecting a runner resets its complete coverage, including any
+                # storage it shares with another runner (e.g. embed/head tied to
+                # the target via set_embed_and_head). The reset sentinel is
+                # idempotent, so a shared storage written by several selected
+                # runners ends at the same value regardless of order.
                 for role, r in runners:
-                    _check(
-                        role,
-                        r,
-                        action="reset_tensors",
-                        visited_storage=visited_storage,
-                    )
+                    _check(role, r, action="reset_tensors")
                 payload = None
             elif recv_req.action == "checksum":
                 merged = {}

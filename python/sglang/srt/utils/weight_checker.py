@@ -47,27 +47,17 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
     return any(pat in name for pat in _NON_PERSISTENT_BUFFER_PATTERNS)
 
 
-def _storage_key(param: torch.Tensor):
-    try:
-        storage = param.untyped_storage()
-        return (param.device, storage.data_ptr(), storage.nbytes())
-    except AttributeError:
-        return (param.device, param.data_ptr())
-
-
 class WeightChecker:
     def __init__(self, model_runner):
         self._model_runner = model_runner
         self._snapshot_tensors = None
 
-    def handle(self, action: str, visited_storage=None) -> Optional[Dict]:
+    def handle(self, action: str) -> Optional[Dict]:
         logger.info(f"[WeightChecker] handle action={action}")
         if action == "snapshot":
             return self._snapshot()
         elif action == "reset_tensors":
-            return self._reset_tensors(visited_storage)
-        elif action == "mark_reset_storage":
-            return self._mark_reset_storage(visited_storage)
+            return self._reset_tensors()
         elif action == "compare":
             return self._compare()
         elif action == "checksum":
@@ -84,27 +74,11 @@ class WeightChecker:
             named_tensors
         ), f"should not have duplicated tensor name"
 
-    def _reset_tensors(self, visited_storage=None):
+    def _reset_tensors(self):
         for name, param in self._model_state():
             if _is_non_persistent_buffer_name(name):
                 continue
-            # Randomize each storage at most once when fanning out across runners
-            # that may share a tensor's storage (e.g. embed/head tied to target).
-            if visited_storage is not None:
-                key = _storage_key(param)
-                if key in visited_storage:
-                    continue
-                visited_storage.add(key)
-            param.copy_(_random_like(param))
-
-    def _mark_reset_storage(self, visited_storage):
-        # Record the storages reset would touch without randomizing them, so a
-        # draft-only reset can skip target-owned storage (e.g. embed/head shared
-        # with the draft via set_embed_and_head).
-        for name, param in self._model_state():
-            if _is_non_persistent_buffer_name(name):
-                continue
-            visited_storage.add(_storage_key(param))
+            param.copy_(_sentinel_like(param))
 
     def _compare(self):
         assert self._snapshot_tensors is not None
@@ -224,21 +198,19 @@ def _check_tensors(
         raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
 
-def _random_like(t: torch.Tensor):
-    device = t.device
-    shape = t.shape
-    dtype = t.dtype
+# Deterministic non-zero "poison" for reset: must differ from real weights so a
+# missed weight-sync is caught by compare. Avoid 0 (naturally-zero params) and 1.0
+# (RMSNorm/LayerNorm weights), both of which would alias a stale weight and mask the miss.
+_RESET_SENTINEL = 88.0  # representable in fp8 e4m3 (max 448), far from typical weight magnitudes
 
-    if dtype.is_floating_point:
-        return torch.rand(shape, device=device, dtype=torch.float32).to(dtype)
 
-    if dtype == torch.bool:
-        return torch.rand(shape, device=device) > 0.5
-
-    info = torch.iinfo(dtype)
-    return torch.randint(
-        low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype
-    )
+def _sentinel_like(t: torch.Tensor) -> torch.Tensor:
+    if t.dtype == torch.bool:
+        return torch.ones_like(t)
+    if t.dtype.is_floating_point:
+        return torch.full_like(t, _RESET_SENTINEL)
+    info = torch.iinfo(t.dtype)
+    return torch.full_like(t, min(int(_RESET_SENTINEL), info.max))
 
 
 def _postprocess_tensors(
