@@ -1191,7 +1191,9 @@ class DeepseekV4AttnBackend(
         indices. Chunk-invariant scaffolding lives in
         ``self.forward_metadata.sparse_prefill_cache``.
         """
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        from sglang.srt.layers.attention.flash_mla_sparse_prefill_sm120 import (
+            flash_mla_sparse_fwd_sm120,
+        )
 
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
@@ -1263,7 +1265,7 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        o, _, _ = flash_mla_sparse_fwd(
+        o, _, _ = flash_mla_sparse_fwd_sm120(
             q=q_flat,
             kv=kv,
             indices=combined_indices.unsqueeze(1),
