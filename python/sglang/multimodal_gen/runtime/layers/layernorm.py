@@ -435,6 +435,36 @@ def _ensure_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]
     return tensor.contiguous() if tensor is not None else None
 
 
+def _fuse_scale_shift_native(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+) -> torch.Tensor:
+    """Pure PyTorch scale/shift used by HIP fallbacks."""
+    if scale.dim() == 4:
+        # [B, F, 1, C] -> [B, L, C]
+        batch_size, seq_len, hidden_size = x.shape
+        num_frames = scale.shape[1]
+        frame_seqlen = seq_len // num_frames
+        assert scale.size(2) == 1
+        scale = scale.expand(batch_size, num_frames, frame_seqlen, hidden_size).reshape(
+            batch_size, seq_len, hidden_size
+        )
+    elif scale.dim() == 2:
+        scale = scale.unsqueeze(1)
+
+    if shift.dim() == 4:
+        batch_size, seq_len, hidden_size = x.shape
+        num_frames = shift.shape[1]
+        frame_seqlen = seq_len // num_frames
+        assert shift.size(2) == 1
+        shift = shift.expand(batch_size, num_frames, frame_seqlen, hidden_size).reshape(
+            batch_size, seq_len, hidden_size
+        )
+    elif shift.dim() == 2:
+        shift = shift.unsqueeze(1)
+
+    return x * (1 + scale) + shift
+
+
 class _ScaleResidualNormScaleShift(CustomOp):
     """
     Fused kernel that combines:
@@ -516,7 +546,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not _use_rocm_flydsl:
-            return self.forward_native(residual, x, gate, shift, scale)
+            return self._forward_hip_native(residual, x, gate, shift, scale)
 
         try:
             from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
@@ -524,10 +554,10 @@ class _ScaleResidualNormScaleShift(CustomOp):
                 flydsl_fused_residual_norm_scale_shift,
             )
         except ImportError:
-            return self.forward_native(residual, x, gate, shift, scale)
+            return self._forward_hip_native(residual, x, gate, shift, scale)
 
         if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
-            return self.forward_native(residual, x, gate, shift, scale)
+            return self._forward_hip_native(residual, x, gate, shift, scale)
 
         return flydsl_fused_residual_norm_scale_shift(
             residual.contiguous(),
@@ -540,6 +570,33 @@ class _ScaleResidualNormScaleShift(CustomOp):
             self.norm_type,
             self.eps,
         )
+
+    def _forward_hip_native(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Keep HIP on a pure PyTorch path; avoid compiled/fused scale-shift.
+        if isinstance(gate, int):
+            assert gate == 1
+            residual_output = residual + x
+        elif isinstance(gate, torch.Tensor):
+            if gate.dim() == 4:
+                num_frames = gate.shape[1]
+                frame_seqlen = x.shape[1] // num_frames
+                residual_output = residual + (
+                    x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
+                ).flatten(1, 2)
+            else:
+                residual_output = residual + x * gate
+        else:
+            raise ValueError(f"Gate type {type(gate)} not supported")
+        normalized = self.norm(residual_output)
+        modulated = _fuse_scale_shift_native(normalized, scale, shift)
+        return modulated.to(x.dtype), residual_output
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
@@ -685,7 +742,7 @@ class _NormScaleShift(CustomOp):
         scale: torch.Tensor,
     ) -> torch.Tensor:
         if not _use_rocm_flydsl:
-            return self.forward_native(x, shift, scale)
+            return self._forward_hip_native(x, shift, scale)
 
         try:
             from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
@@ -693,10 +750,10 @@ class _NormScaleShift(CustomOp):
                 flydsl_norm_scale_shift,
             )
         except ImportError:
-            return self.forward_native(x, shift, scale)
+            return self._forward_hip_native(x, shift, scale)
 
         if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
-            return self.forward_native(x, shift, scale)
+            return self._forward_hip_native(x, shift, scale)
 
         result = flydsl_norm_scale_shift(
             x.contiguous(),
@@ -708,6 +765,14 @@ class _NormScaleShift(CustomOp):
             self.eps,
         )
         return result.to(x.dtype)
+
+    def _forward_hip_native(
+        self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        # Keep HIP on a pure PyTorch path; avoid compiled/fused scale-shift.
+        normalized = self.norm(x)
+        modulated = _fuse_scale_shift_native(normalized, scale, shift)
+        return modulated.to(x.dtype)
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,

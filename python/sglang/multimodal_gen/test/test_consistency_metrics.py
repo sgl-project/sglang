@@ -24,6 +24,7 @@ def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
     assert "/ci-data/main/" not in test_utils.SGL_TEST_FILES_CONSISTENCY_GT_ROOT
     assert revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
     assert revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
+    assert revision_path in test_utils.SGL_TEST_FILES_ROCM_CONSISTENCY_GT_BASE
 
 
 def test_pixel_metrics_identical_image():
@@ -172,3 +173,29 @@ def test_save_consistency_failure_artifact(tmp_path, monkeypatch):
     assert (
         tmp_path / "consistency_failures" / "generated" / "unit_image_fail_1gpu.png"
     ).exists()
+
+
+def test_use_rocm_consistency_gt(monkeypatch):
+    """Test that _use_rocm_consistency_gt follows current_platform.is_hip() and the allowlist."""
+    from sglang.multimodal_gen.test.test_utils import _use_rocm_consistency_gt
+
+    # Mock is_hip to return True
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.test.test_utils.current_platform.is_hip", lambda: True
+    )
+
+    # All cases in allowlist should return True
+    assert _use_rocm_consistency_gt("wan2_1_t2v_1.3b") is True
+    assert _use_rocm_consistency_gt("wan2_2_ti2v_5b") is True
+
+    # Case not in allowlist should return False
+    assert _use_rocm_consistency_gt("some_other_case") is False
+
+    # Mock is_hip to return False
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.test.test_utils.current_platform.is_hip", lambda: False
+    )
+
+    # Even with cases in allowlist, should return False when not on HIP
+    assert _use_rocm_consistency_gt("wan2_1_t2v_1.3b") is False
+    assert _use_rocm_consistency_gt("wan2_2_ti2v_5b") is False

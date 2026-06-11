@@ -278,6 +278,20 @@
             "mean_abs_diff_threshold": 47.0
         }
     },
+    "rocm_cases": {
+        "wan2_1_t2v_1.3b": {
+            "clip_threshold": 0.94,
+            "ssim_threshold": 0.85,
+            "psnr_threshold": 25.0,
+            "mean_abs_diff_threshold": 8.0
+        },
+        "wan2_2_ti2v_5b": {
+            "clip_threshold": 0.92,
+            "ssim_threshold": 0.88,
+            "psnr_threshold": 22.0,
+            "mean_abs_diff_threshold": 9.0
+        }
+    },
     "default_clip_threshold_image": 0.92,
     "default_clip_threshold_video": 0.90,
     "default_ssim_threshold_image": 0.95,

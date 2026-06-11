@@ -78,6 +78,16 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
         "ltx_2_3_two_stage_ti2v_2gpus",
     }
 )
+# ROCm cases compare against ROCm-specific GT (platform-keyed).
+SGL_TEST_FILES_ROCM_CONSISTENCY_GT_BASE = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated/rocm"
+)
+SGL_TEST_FILES_ROCM_CONSISTENCY_GT_CASES = frozenset(
+    {
+        "wan2_1_t2v_1.3b",
+        "wan2_2_ti2v_5b",
+    }
+)
 
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
@@ -712,6 +722,9 @@ def get_consistency_thresholds(
         metadata = _load_threshold_json()
 
     case_meta = metadata.get("cases", {}).get(case_id, {})
+    # Overlay ROCm-specific thresholds when running on HIP
+    if current_platform.is_hip():
+        case_meta = {**case_meta, **metadata.get("rocm_cases", {}).get(case_id, {})}
     suffix = "video" if is_video else "image"
 
     defaults = {
@@ -1020,13 +1033,24 @@ def _remote_file_exists(url: str) -> bool:
     return False
 
 
+def _use_rocm_consistency_gt(case_id: str) -> bool:
+    """Check if this case should use ROCm-specific ground truth."""
+    return (
+        current_platform.is_hip()
+        and case_id in SGL_TEST_FILES_ROCM_CONSISTENCY_GT_CASES
+    )
+
+
 def _find_remote_consistency_gt_files(
     case_id: str,
     num_gpus: int,
     is_video: bool,
     output_format: str | None = None,
 ) -> list[tuple[str, str]]:
-    if case_id in SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES:
+    if _use_rocm_consistency_gt(case_id):
+        # ROCm cases use platform-specific GT, takes priority
+        bases = (SGL_TEST_FILES_ROCM_CONSISTENCY_GT_BASE,)
+    elif case_id in SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES:
         bases = SGL_TEST_FILES_CONSISTENCY_GT_BASES
     else:
         # Avoid accidentally comparing non-comparable CI cases against official GT.

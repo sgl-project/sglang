@@ -241,6 +241,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
         ),
+        run_consistency_check_on_rocm=True,
     ),
     DiffusionTestCase(
         "cosmos3_nano_t2v",
@@ -371,6 +372,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST,
         ),
+        run_consistency_check_on_rocm=True,
     ),
     DiffusionTestCase(
         "fastwan2_2_ti2v_5b",
