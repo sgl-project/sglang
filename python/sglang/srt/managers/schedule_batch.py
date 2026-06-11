@@ -1552,14 +1552,16 @@ def _compute_chunked_req_next_prompt_token(
     chunked_req: Optional[Req],
     vocab_size: int,
 ) -> Optional[int]:
+    """Return the next real prompt token after the fill boundary, skipping
+    multimodal placeholder (hash) tokens that lie outside the model vocab."""
     if chunked_req is None:
         return None
     fill_len = chunked_req.fill_len
     origin_ids = chunked_req.origin_input_ids
-    for i in range(fill_len, len(origin_ids)):
-        token = int(origin_ids[i])
-        if token < vocab_size:
-            return token
+    if fill_len >= len(origin_ids):
+        return None
+    if origin_ids[fill_len] < vocab_size:
+        return int(origin_ids[fill_len])
     return None
 
 
