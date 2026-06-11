@@ -18,6 +18,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -817,19 +818,14 @@ class FlashAttentionBackend(AttentionBackend):
                             else None
                         ),
                     )
-                elif self.use_sliding_window_kv_pool:
+                else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        cache_loc,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                         k,
                         v,
                         layer.k_scale,
                         layer.v_scale,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                else:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
         # Use precomputed metadata across all layers
@@ -1269,19 +1265,14 @@ class FlashAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if self.use_sliding_window_kv_pool:
+                if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        cache_loc,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                         k,
                         v,
                         layer.k_scale,
                         layer.v_scale,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                elif not self.use_mla:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
                     self.token_to_kv_pool.set_mla_kv_buffer(

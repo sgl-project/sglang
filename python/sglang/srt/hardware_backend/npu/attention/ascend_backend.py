@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -265,21 +266,12 @@ def _cp_allgather_and_save_kv_npu(
     key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
     value_cache_full = kv_full[..., k_feat_size:].reshape(-1, *v_tail)
 
-    if swa_loc is not None:
-        token_to_kv_pool.set_kv_buffer(
-            layer,
-            cache_loc,
-            key_cache_full,
-            value_cache_full,
-            swa_loc=swa_loc,
-        )
-    else:
-        token_to_kv_pool.set_kv_buffer(
-            layer,
-            cache_loc,
-            key_cache_full,
-            value_cache_full,
-        )
+    token_to_kv_pool.set_kv_buffer(
+        layer,
+        KVWriteLoc(cache_loc, swa_loc),
+        key_cache_full,
+        value_cache_full,
+    )
 
 
 class AscendAttnBackend(AttentionBackend):
@@ -1119,11 +1111,7 @@ class AscendAttnBackend(AttentionBackend):
                         v,
                         self.attn_cp_size,
                         self.token_to_kv_pool,
-                        swa_loc=(
-                            self.forward_metadata.swa_out_cache_loc
-                            if self.use_sliding_window_kv_pool
-                            else None
-                        ),
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                     )
                 else:
                     # support cross attention
@@ -1132,16 +1120,14 @@ class AscendAttnBackend(AttentionBackend):
                         if not layer.is_cross_attention
                         else forward_batch.encoder_out_cache_loc
                     )
-                    if self.use_sliding_window_kv_pool and not layer.is_cross_attention:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer,
-                            cache_loc,
-                            k,
-                            v,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
-                        )
-                    else:
-                        self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    swa_loc = (
+                        self.forward_metadata.swa_out_cache_loc
+                        if not layer.is_cross_attention
+                        else None
+                    )
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                    )
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1652,18 +1638,15 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
-            if self.use_sliding_window_kv_pool:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(
                     forward_batch.out_cache_loc,
-                    k,
-                    v,
-                    swa_loc=self.forward_metadata.swa_out_cache_loc,
-                )
-            else:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
-                )
+                    self.forward_metadata.swa_out_cache_loc,
+                ),
+                k,
+                v,
+            )
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1725,17 +1708,15 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
-            elif self.use_sliding_window_kv_pool:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    forward_batch.out_cache_loc,
-                    k,
-                    v,
-                    swa_loc=self.forward_metadata.swa_out_cache_loc,
-                )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer,
+                    KVWriteLoc(
+                        forward_batch.out_cache_loc,
+                        self.forward_metadata.swa_out_cache_loc,
+                    ),
+                    k,
+                    v,
                 )
 
         if not self.use_mla:
@@ -1789,26 +1770,45 @@ class AscendAttnBackend(AttentionBackend):
                 mask = self.mtp_mask
                 sparse_mode = 4 if is_swa_layer else 3
 
-            attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                query,
-                k_cache,
-                v_cache,
-                block_table=block_table,
-                block_size=self.page_size,
-                num_query_heads=layer.tp_q_head_num,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="TND",
-                atten_mask=mask,
-                softmax_scale=layer.scaling,
-                actual_seq_qlen=actual_seq_lengths,
-                actual_seq_kvlen=actual_seq_lengths_kv,
-                sparse_mode=sparse_mode,
-                pre_tokens=(
-                    layer.sliding_window_size if is_swa_layer else FULL_ATTENTION_WINDOW
-                ),
-                next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
-                learnable_sink=sinks,
-            )
+            if self.is_hybrid_swa:
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=block_table,
+                    block_size=self.page_size,
+                    num_query_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    atten_mask=mask,
+                    softmax_scale=layer.scaling,
+                    actual_seq_qlen=actual_seq_lengths,
+                    actual_seq_kvlen=actual_seq_lengths_kv,
+                    sparse_mode=sparse_mode,
+                    pre_tokens=(
+                        layer.sliding_window_size
+                        if is_swa_layer
+                        else FULL_ATTENTION_WINDOW
+                    ),
+                    next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
+                    learnable_sink=sinks,
+                )
+            else:
+                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    atten_mask=mask,
+                    scale=layer.scaling,
+                    actual_seq_lengths=actual_seq_lengths,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    sparse_mode=sparse_mode,
+                )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
@@ -1944,17 +1944,15 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
-            elif self.use_sliding_window_kv_pool:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    forward_batch.out_cache_loc,
-                    k,
-                    v,
-                    swa_loc=self.forward_metadata.swa_out_cache_loc,
-                )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer,
+                    KVWriteLoc(
+                        forward_batch.out_cache_loc,
+                        self.forward_metadata.swa_out_cache_loc,
+                    ),
+                    k,
+                    v,
                 )
 
         if sinks is not None:
@@ -2285,16 +2283,17 @@ class AscendAttnBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if self.use_sliding_window_kv_pool and not layer.is_cross_attention:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        v,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                else:
-                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                # swa_out_cache_loc is the full->SWA write target, derived from
+                # out_cache_loc; it must not be applied to cross-attention writes
+                # (which target encoder_out_cache_loc) and is None for non-SWA pools.
+                swa_loc = (
+                    self.forward_metadata.swa_out_cache_loc
+                    if not layer.is_cross_attention
+                    else None
+                )
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                )
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -2586,18 +2585,15 @@ class AscendAttnBackend(AttentionBackend):
                 "3. When the environment variable ASCEND_USE_FIA is set to 0 and qk_head_dim exceeds 128 on Ascend NPU devices."
             )
         if save_kv_cache:
-            if self.use_sliding_window_kv_pool:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(
                     forward_batch.out_cache_loc,
-                    k,
-                    v,
-                    swa_loc=self.forward_metadata.swa_out_cache_loc,
-                )
-            else:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
-                )
+                    self.forward_metadata.swa_out_cache_loc,
+                ),
+                k,
+                v,
+            )
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         num_block, block_size, _, _ = k_cache.shape

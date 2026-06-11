@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
     prepare_swa_spec_page_table_triton,
 )
 from sglang.srt.managers.schedule_batch import get_global_server_args
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -476,19 +477,14 @@ class XPUAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if self.use_sliding_window_kv_pool:
+                if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        cache_loc,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                         k,
                         v,
                         layer.k_scale,
                         layer.v_scale,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                elif not self.use_mla:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
                     self.token_to_kv_pool.set_mla_kv_buffer(
@@ -788,19 +784,14 @@ class XPUAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if self.use_sliding_window_kv_pool:
+                if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        cache_loc,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                         k,
                         v,
                         layer.k_scale,
                         layer.v_scale,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                elif not self.use_mla:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
                     k_rope_val = (

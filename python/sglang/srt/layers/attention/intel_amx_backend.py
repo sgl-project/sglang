@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -128,12 +129,12 @@ class IntelAMXAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
         if save_kv_cache and k is not None and v is not None:
-            if self.use_sliding_window_kv_pool and not layer.is_cross_attention:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, swa_loc=self.swa_out_cache_loc
-                )
-            else:
-                self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            # Cross-attention never writes to the SWA pool, so only thread the
+            # full->SWA location for non-cross-attention layers.
+            swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, KVWriteLoc(cache_loc, swa_loc), k, v
+            )
 
         _, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
