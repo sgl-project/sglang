@@ -37,11 +37,10 @@ logger = logging.getLogger(__name__)
 
 
 class DFlashWorkerV2(DFlashWorker):
-    """DFLASH speculative decoding worker (spec-v2 overlap scheduling).
+    """DFLASH speculative decoding worker (spec-v2).
 
-    This is intentionally implemented as a *separate* worker from the existing
-    spec-v1 `DFlashWorker` (non-overlap), to keep the v1 path stable and to
-    minimize risk while bringing up overlap scheduling.
+    Drives both overlap and non-overlap scheduling, same as EAGLE: the
+    scheduler runs it synchronously when overlap is disabled.
     """
 
     def __init__(
