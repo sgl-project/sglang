@@ -50,6 +50,10 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
             str(cls.page_size),
             "--max-running-requests",
             str(cls.max_running_requests),
+            # Keep headroom for the draft KV pool + piecewise cuda graph
+            # private pools on 32GB CI cards.
+            "--mem-fraction-static",
+            "0.7",
             "--cuda-graph-bs",
             *[str(i) for i in range(1, cls.max_running_requests + 1)],
         ]
