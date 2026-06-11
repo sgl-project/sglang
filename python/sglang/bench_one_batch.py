@@ -591,15 +591,10 @@ class _SpecBenchRunner:
         )
 
     def clear(self):
+        # The draft worker shares the target's pools, so clearing the target's
+        # is sufficient.
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
-        draft_runner = self.spec_worker.draft_worker.draft_runner
-        draft_runner.token_to_kv_pool_allocator.clear()
-        if draft_runner.req_to_token_pool is not self.model_runner.req_to_token_pool:
-            # Currently the draft worker shares the target's req_to_token_pool;
-            # clear separately if that ever changes.
-            draft_runner.req_to_token_pool.clear()
-            draft_runner.req_to_token_pool.req_to_token.zero_()
 
         # The bench never finishes requests, so the previous run's
         # req_to_token rows survive `clear()` (it only resets the free
@@ -612,9 +607,8 @@ class _SpecBenchRunner:
         # committed lagging seq_lens, eagle_info_v2.prepare_for_decode
         # under-writes the rows and the draft/verify gathers read past the
         # written watermark, picking up stale slot ids. With the bookkeeping
-        # mirrored correctly (and asserted in prepare_for_decode), stale
-        # rows are never read; this zero_() is determinism hygiene, not a
-        # correctness fix.
+        # mirrored correctly, stale rows are never read; this zero_() is
+        # determinism hygiene, not a correctness fix.
         self.model_runner.req_to_token_pool.req_to_token.zero_()
 
     @torch.no_grad()
@@ -644,7 +638,12 @@ class _SpecBenchRunner:
         result = self.spec_worker.forward_batch_generation(batch)
         batch.spec_info = result.next_draft_input
         if result.new_seq_lens is not None:
+            # Mirror the scheduler's V2 sync update: seq_lens_cpu/seq_lens_sum
+            # feed prefix_lens and positions on every subsequent step.
             batch.seq_lens = result.new_seq_lens
+            if batch.seq_lens_cpu is not None:
+                batch.seq_lens_cpu = result.new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         logits = (
             result.logits_output.next_token_logits if result.logits_output else None
         )
@@ -658,7 +657,12 @@ class _SpecBenchRunner:
         result = self.spec_worker.forward_batch_generation(batch)
         batch.spec_info = result.next_draft_input
         if result.new_seq_lens is not None:
+            # Mirror the scheduler's V2 sync update: seq_lens_cpu/seq_lens_sum
+            # feed prefix_lens and positions on every subsequent step.
             batch.seq_lens = result.new_seq_lens
+            if batch.seq_lens_cpu is not None:
+                batch.seq_lens_cpu = result.new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         if result.accept_lens is not None:
             accept_lens = result.accept_lens.tolist()
             # Mirror the scheduler's KV bookkeeping: -1 because
@@ -985,6 +989,14 @@ def latency_test_run_once(
                     f"throughput: {new_tokens / latency:9.2f} token/s"
                 )
             step += 1
+
+        if enable_profile_decode and trace_filename_decode is None:
+            rank_print(
+                f"Decode profiling never started: SD ran {step} steps but the "
+                f"profile start step is {profile_start} (SD advances by the "
+                f"accept length each step; pass --profile-start-step to "
+                f"profile SD decode)."
+            )
 
         measurement_results["num_spec_steps"] = step
         total_req_steps = sum(decode_steps_per_req)
