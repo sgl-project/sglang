@@ -190,23 +190,22 @@ class TestLoadFormatAndDispatch(unittest.TestCase):
     def test_get_model_loader_returns_ipc_loader(self):
         config = LoadConfig(
             load_format=LoadFormat.IPC_CACHE,
-            weight_cache_mode="copy",
+            weight_cache_mode="client",
             weight_cache_socket="/tmp/test.sock",
         )
         loader = get_model_loader(config)
         self.assertIsInstance(loader, IpcModelLoader)
-        self.assertTrue(loader.copy_mode)
         self.assertEqual(loader.socket_path, "/tmp/test.sock")
 
-    def test_ipc_loader_zero_copy_mode(self):
+    def test_ipc_loader_daemon_mode(self):
         config = LoadConfig(
             load_format=LoadFormat.IPC_CACHE,
-            weight_cache_mode="client",
+            weight_cache_mode="daemon",
             weight_cache_socket="/tmp/test2.sock",
         )
         loader = get_model_loader(config)
         self.assertIsInstance(loader, IpcModelLoader)
-        self.assertFalse(loader.copy_mode)
+        self.assertEqual(loader.weight_cache_mode, "daemon")
 
 
 class TestCrossProcessCUDAIPC(unittest.TestCase):

@@ -279,16 +279,6 @@ def main():
             )
             del imported
 
-        # Test copy mode: clone and verify
-        first_entry = list(entries.values())[0]
-        imported = MultiprocessingSerializer.deserialize(first_entry["handle"])
-        cloned = imported.clone()
-        del imported
-        print(
-            f"\nCopy mode: cloned tensor shape={tuple(cloned.shape)}, "
-            f"dtype={cloned.dtype}, device={cloned.device}"
-        )
-
         print("\nIPC import OK!")
     else:
         print(f"ERROR: fetch_state returned {result}")

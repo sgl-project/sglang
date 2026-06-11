@@ -6697,17 +6697,16 @@ class ServerArgs:
             "--weight-cache-mode",
             type=str,
             default="off",
-            choices=["off", "daemon", "client", "copy"],
+            choices=["off", "daemon", "client"],
             help="Weight cache mode. 'off': normal disk loading. "
             "'daemon': launch weight cache daemon (holds weights in GPU memory). "
-            "'client': connect to existing daemon and load via IPC. "
-            "'copy': connect to daemon, copy weights to own allocation, then release IPC handle.",
+            "'client': connect to existing daemon and load via IPC.",
         )
         parser.add_argument(
             "--weight-cache-socket",
             type=str,
             default=None,
-            help="Unix socket path for weight cache daemon (client/copy mode). "
+            help="Unix socket path for weight cache daemon (client mode). "
             "If not set, uses /tmp/sglang_weight_cache_gpu{tp_rank}.sock",
         )
         parser.add_argument(

@@ -3161,11 +3161,9 @@ def get_model_loader(
             if load_config.weight_cache_socket
             else get_socket_path(gpu_id=load_config.tp_rank or 0)
         )
-        copy_mode = load_config.weight_cache_mode == "copy"
         return IpcModelLoader(
             load_config=load_config,
             socket_path=socket_path,
-            copy_mode=copy_mode,
             weight_cache_mode=load_config.weight_cache_mode,
         )
 

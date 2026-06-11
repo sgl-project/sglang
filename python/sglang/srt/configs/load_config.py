@@ -101,7 +101,7 @@ class LoadConfig:
     draft_model_idx: Optional[int] = None
 
     # Weight cache daemon options
-    weight_cache_mode: str = "off"  # "off", "daemon", "client", "copy"
+    weight_cache_mode: str = "off"  # "off", "daemon", "client"
     weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
 
     def __post_init__(self):

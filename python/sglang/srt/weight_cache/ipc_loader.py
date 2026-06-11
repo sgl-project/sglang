@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """IPC Model Loader — loads model weights from a Weight Cache Daemon via CUDA IPC.
 
-Two modes:
-- Copy mode: imports IPC handle, copies to own allocation, releases handle.
-  Engine is fully independent after loading. Requires 2x GPU memory during load.
-- Zero-copy mode (default for daemon/client): param.data points directly to IPC-mapped
-  GPU memory. Only 1x GPU memory needed — engine and daemon share the same
-  physical GPU memory via CUDA IPC. Engine depends on daemon staying alive.
+Zero-copy mode: param.data points directly to IPC-mapped GPU memory. Only 1x GPU
+memory needed — engine and daemon share the same physical GPU memory via CUDA IPC.
+Engine depends on daemon staying alive.
 """
 
 import logging
@@ -21,7 +18,6 @@ from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
     _post_load_weights,
-    device_loading_context,
 )
 from sglang.srt.utils import MultiprocessingSerializer
 
@@ -44,7 +40,7 @@ class IpcModelLoader(BaseModelLoader):
     processes would hold weights on the same GPU. Therefore, daemon mode
     raises an error if the daemon is unavailable instead of falling back.
 
-    In client/copy mode, fallback to DefaultModelLoader is allowed since the
+    In client mode, fallback to DefaultModelLoader is allowed since the
     daemon is optional.
     """
 
@@ -52,13 +48,11 @@ class IpcModelLoader(BaseModelLoader):
         self,
         load_config: LoadConfig,
         socket_path: str,
-        copy_mode: bool = False,
         fallback_loader_cls=None,
         weight_cache_mode: str = "client",
     ):
         super().__init__(load_config)
         self.socket_path = socket_path
-        self.copy_mode = copy_mode
         self.weight_cache_mode = weight_cache_mode
         self._fallback_loader_cls = fallback_loader_cls
 
@@ -72,7 +66,7 @@ class IpcModelLoader(BaseModelLoader):
 
         In daemon mode, raises RuntimeError if the daemon is unavailable
         (fallback to disk loading would cause OOM on shared GPUs).
-        In client/copy mode, falls back to DefaultModelLoader.
+        In client mode, falls back to DefaultModelLoader.
         """
         tic = time.perf_counter()
 
@@ -108,29 +102,19 @@ class IpcModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
-        if self.copy_mode:
-            model = self._load_copy_mode(
-                model_config,
-                device_config,
-                entries,
-                target_device,
-                quant_config,
-            )
-        else:
-            model = self._load_zero_copy_mode(
-                model_config,
-                device_config,
-                entries,
-                target_device,
-                quant_config,
-            )
+        model = self._load_zero_copy_mode(
+            model_config,
+            device_config,
+            entries,
+            target_device,
+            quant_config,
+        )
 
         # Post-load hooks (e.g., model-specific finalization)
         _post_load_weights(model)
 
         logger.info(
-            f"[IpcModelLoader] Loaded model via IPC (copy_mode={self.copy_mode}, "
-            f"mode={self.weight_cache_mode}), "
+            f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
             f"total={time.perf_counter() - tic:.2f}s"
         )
 
@@ -176,8 +160,7 @@ class IpcModelLoader(BaseModelLoader):
 
         The model is initialized on the meta device (no memory allocation),
         then each parameter's data is replaced with the IPC-mapped GPU tensor.
-        This avoids the 2x GPU memory overhead of copy mode — the engine and
-        daemon share the same physical GPU memory via CUDA IPC.
+        The engine and daemon share the same physical GPU memory via CUDA IPC.
         """
         from sglang.srt.model_loader.utils import set_default_torch_dtype
 
@@ -313,82 +296,6 @@ class IpcModelLoader(BaseModelLoader):
             pass
 
         return model
-
-    def _load_copy_mode(
-        self,
-        model_config,
-        device_config,
-        entries,
-        target_device,
-        quant_config,
-    ) -> nn.Module:
-        """Copy mode: initialize model on GPU, then copy IPC weights over.
-
-        This requires enough GPU memory for both the daemon's weights and
-        the engine's model during the copy phase. After copying, the daemon
-        can release its GPU memory.
-        """
-        from sglang.srt.model_loader.utils import set_default_torch_dtype
-
-        with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                    quant_config,
-                )
-                # Run quant post-processing to create parameters like weight_scale
-                for _, module in model.named_modules():
-                    quant_method = getattr(module, "quant_method", None)
-                    if quant_method is not None:
-                        with device_loading_context(module, target_device):
-                            quant_method.process_weights_after_loading(module)
-
-        # Replace parameter data with IPC-imported tensors (copy)
-        state_dict = model.state_dict()
-        imported_count = 0
-        skipped_count = 0
-        copy_tic = time.perf_counter()
-
-        for name, entry in entries.items():
-            if name not in state_dict:
-                skipped_count += 1
-                continue
-
-            imported_tensor = MultiprocessingSerializer.deserialize(entry["handle"])
-            state_dict[name].data.copy_(imported_tensor)
-            del imported_tensor
-            imported_count += 1
-
-        copy_elapsed = time.perf_counter() - copy_tic
-
-        # Tell the daemon to release GPU memory since we've copied all weights.
-        self._notify_daemon_release()
-
-        logger.info(
-            f"[IpcModelLoader] Copy: imported {imported_count} tensors, "
-            f"skipped {skipped_count}, time={copy_elapsed:.3f}s"
-        )
-
-        return model
-
-    def _notify_daemon_release(self):
-        """Tell the daemon to release its GPU memory after copy-mode load."""
-        import socket as socket_mod
-
-        try:
-            sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
-            sock.settimeout(10)
-            sock.connect(self.socket_path)
-            send_msg(sock, {"type": "release"})
-            result = recv_msg(sock)
-            sock.close()
-            if result.get("status") == "ok":
-                logger.info("[IpcModelLoader] Daemon released GPU memory after copy")
-            else:
-                logger.warning(f"[IpcModelLoader] Daemon release response: {result}")
-        except Exception as e:
-            logger.warning(f"[IpcModelLoader] Failed to notify daemon to release: {e}")
 
     def _fetch_from_cache(self, model_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles."""

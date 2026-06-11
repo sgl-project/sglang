@@ -9,10 +9,16 @@ Each GPU runs one daemon process for its TP rank. The daemon:
 4. Validates CacheConfig compatibility before serving
 
 Usage:
-    # Launched automatically by the engine, or standalone:
+    # Launch all TP rank daemons with a single command:
+    python -m sglang.srt.weight_cache.daemon \
+        --model-path /path/to/model --tp-size 4 \
+        --load-format auto --dtype auto --quantization fp8
+
+    # Or launch a single daemon for a specific rank:
     python -m sglang.srt.weight_cache.daemon \
         --model-path /path/to/model \
-        --gpu-id 0 --tp-size 4 --tp-rank 0
+        --gpu-id 0 --tp-size 4 --tp-rank 0 \
+        --dist-init-method tcp://127.0.0.1:29500
 """
 
 import logging
@@ -396,18 +402,6 @@ class WeightCacheDaemon:
         elif req.get("type") == "ping":
             send_msg(conn, {"status": "ok"})
 
-        elif req.get("type") == "release":
-            # Engine has copied weights; release GPU memory to free space.
-            # This should only be called in copy mode. In zero-copy mode,
-            # releasing the daemon's memory would invalidate the engine's
-            # IPC-mapped weights.
-            logger.info(
-                f"[WeightCacheDaemon gpu={self.gpu_id}] "
-                f"Release requested, freeing GPU memory"
-            )
-            self.shutdown()
-            send_msg(conn, {"status": "ok"})
-
         else:
             send_msg(
                 conn,
@@ -466,39 +460,207 @@ def run_weight_cache_daemon(
     daemon.serve()
 
 
+def launch_weight_cache_daemons(
+    model_path: str,
+    tp_size: int = 1,
+    dp_size: int = 1,
+    load_format: str = "auto",
+    dtype: str = "auto",
+    quantization: Optional[str] = None,
+    model_loader_extra_config: str = "{}",
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    dist_init_method: Optional[str] = None,
+    timeout: int = 1800,
+):
+    """Launch weight cache daemon processes for all TP ranks.
+
+    Spawns one daemon process per GPU (gpu_id == tp_rank), waits for all
+    to become ready, then monitors them. If any daemon exits, all are
+    terminated.
+
+    This is the single-command entry point — instead of launching each
+    rank manually, run:
+
+        python -m sglang.srt.weight_cache.daemon \\
+            --model-path /path/to/model --tp-size 4 \\
+            --load-format auto --dtype auto --quantization fp8
+
+    and all 4 daemons will be started automatically.
+    """
+    import multiprocessing as mp
+    import socket as sock_mod
+
+    from .protocol import get_ready_path
+
+    # Auto-allocate a free port for the distributed init method
+    if dist_init_method is None:
+        with sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            free_port = s.getsockname()[1]
+        dist_init_method = f"tcp://127.0.0.1:{free_port}"
+
+    mp.set_start_method("spawn", force=True)
+
+    procs = []
+    for i in range(tp_size):
+        proc = mp.Process(
+            target=run_weight_cache_daemon,
+            kwargs=dict(
+                model_path=model_path,
+                gpu_id=i,
+                tp_size=tp_size,
+                tp_rank=i,
+                dp_size=dp_size,
+                load_format=load_format,
+                dtype=dtype,
+                quantization=quantization,
+                model_loader_extra_config=model_loader_extra_config,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                dist_init_method=dist_init_method,
+            ),
+            name=f"weight_cache_daemon_gpu{i}",
+        )
+        proc.start()
+        procs.append(proc)
+        logger.info(
+            f"Launched weight cache daemon gpu={i} rank={i} pid={proc.pid}"
+        )
+
+    # Wait for all daemons to become ready
+    check_interval = 2
+    elapsed = 0
+    for i in range(tp_size):
+        ready_path = get_ready_path(i)
+        while not os.path.exists(ready_path):
+            time.sleep(check_interval)
+            elapsed += check_interval
+            if elapsed > timeout:
+                logger.error(
+                    f"Weight cache daemon gpu={i} did not become ready "
+                    f"within {timeout}s"
+                )
+                for p in procs:
+                    if p.is_alive():
+                        p.terminate()
+                raise TimeoutError(
+                    f"Weight cache daemon gpu={i} did not become ready "
+                    f"within {timeout}s"
+                )
+            # Check if any daemon exited prematurely
+            for p in procs:
+                if not p.is_alive():
+                    logger.error(
+                        f"Weight cache daemon exited prematurely "
+                        f"with code {p.exitcode}"
+                    )
+                    for other in procs:
+                        if other.is_alive():
+                            other.terminate()
+                    raise RuntimeError(
+                        f"Weight cache daemon exited prematurely "
+                        f"with code {p.exitcode}"
+                    )
+        logger.info(f"Weight cache daemon gpu={i} is ready")
+
+    logger.info(
+        f"All {tp_size} weight cache daemons are ready "
+        f"(dist_init_method={dist_init_method})"
+    )
+
+    # Monitor daemons — if any exits, terminate all and raise
+    try:
+        for proc in procs:
+            proc.join()
+    except KeyboardInterrupt:
+        logger.info("Received KeyboardInterrupt, shutting down daemons")
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in procs:
+            proc.join(timeout=5)
+        logger.info("All weight cache daemons have been terminated")
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="SGLang Weight Cache Daemon")
     parser.add_argument("--model-path", required=True, help="Path to model weights")
-    parser.add_argument("--gpu-id", type=int, required=True, help="GPU device ID")
     parser.add_argument("--tp-size", type=int, default=1, help="Tensor parallel size")
-    parser.add_argument("--tp-rank", type=int, default=0, help="This daemon's TP rank")
+    parser.add_argument(
+        "--gpu-id",
+        type=int,
+        default=None,
+        help="GPU device ID for a single daemon. "
+        "If omitted, launches daemons for all TP ranks (0..tp_size-1).",
+    )
+    parser.add_argument(
+        "--tp-rank",
+        type=int,
+        default=None,
+        help="TP rank for a single daemon. "
+        "If omitted, launches daemons for all TP ranks.",
+    )
     parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
     parser.add_argument("--load-format", default="auto", help="Weight load format")
     parser.add_argument("--dtype", default="auto", help="Model dtype")
     parser.add_argument("--quantization", default=None, help="Quantization method")
+    parser.add_argument(
+        "--model-loader-extra-config",
+        default="{}",
+        help="Extra config for model loader (JSON string)",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--revision", default=None, help="Model revision")
     parser.add_argument(
         "--dist-init-method",
         default=None,
         help="Distributed init method (e.g. tcp://127.0.0.1:PORT). "
-        "Required for tp_size > 1. All daemons must share the same address.",
+        "Auto-assigned when launching all ranks. "
+        "Required for tp_size > 1 when launching a single rank.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=1800,
+        help="Timeout in seconds to wait for all daemons to become ready (default: 1800)",
     )
 
     args = parser.parse_args()
 
-    run_weight_cache_daemon(
-        model_path=args.model_path,
-        gpu_id=args.gpu_id,
-        tp_size=args.tp_size,
-        tp_rank=args.tp_rank,
-        dp_size=args.dp_size,
-        load_format=args.load_format,
-        dtype=args.dtype,
-        quantization=args.quantization,
-        trust_remote_code=args.trust_remote_code,
-        revision=args.revision,
-        dist_init_method=args.dist_init_method,
-    )
+    if args.gpu_id is not None or args.tp_rank is not None:
+        # Single-rank mode: launch one daemon for the specified rank
+        gpu_id = args.gpu_id if args.gpu_id is not None else args.tp_rank
+        tp_rank = args.tp_rank if args.tp_rank is not None else args.gpu_id
+        run_weight_cache_daemon(
+            model_path=args.model_path,
+            gpu_id=gpu_id,
+            tp_size=args.tp_size,
+            tp_rank=tp_rank,
+            dp_size=args.dp_size,
+            load_format=args.load_format,
+            dtype=args.dtype,
+            quantization=args.quantization,
+            model_loader_extra_config=args.model_loader_extra_config,
+            trust_remote_code=args.trust_remote_code,
+            revision=args.revision,
+            dist_init_method=args.dist_init_method,
+        )
+    else:
+        # Multi-rank mode: launch daemons for all TP ranks
+        launch_weight_cache_daemons(
+            model_path=args.model_path,
+            tp_size=args.tp_size,
+            dp_size=args.dp_size,
+            load_format=args.load_format,
+            dtype=args.dtype,
+            quantization=args.quantization,
+            model_loader_extra_config=args.model_loader_extra_config,
+            trust_remote_code=args.trust_remote_code,
+            revision=args.revision,
+            dist_init_method=args.dist_init_method,
+            timeout=args.timeout,
+        )

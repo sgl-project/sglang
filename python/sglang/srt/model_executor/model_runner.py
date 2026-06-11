@@ -1350,10 +1350,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # In zero-copy IPC mode, the weights are shared with the daemon via
         # CUDA IPC and must not be offloaded/reloaded by the memory saver.
-        is_ipc_zero_copy = (
-            self.server_args.weight_cache_mode != "off"
-            and self.server_args.weight_cache_mode != "copy"
-        )
+        is_ipc_zero_copy = self.server_args.weight_cache_mode != "off"
         if is_ipc_zero_copy and enable_cpu_backup:
             logger.warning(
                 "[ModelRunner] Disabling weights CPU backup in zero-copy IPC mode — "
