@@ -873,10 +873,12 @@ class HiSparseCoordinator:
             radix_prefix_len = self.radix_cache.req_prefix_len(req.req_pool_idx)
             all_token_ids = req.origin_input_ids + req.output_ids
             backed_cache_len = min(req.kv_committed_len, len(all_token_ids))
+            prompt_len = len(req.origin_input_ids)
+            has_decode_token = backed_cache_len > prompt_len
             # The last decoded token is normally backed up by the next decode
             # step. At request finish there is no next step, so do not insert
             # that token/page into the radix tree or issue backup I/O here.
-            if backed_cache_len > len(req.origin_input_ids):
+            if has_decode_token:
                 backed_cache_len -= 1
             cache_key_len = (backed_cache_len // self.page_size) * self.page_size
 
