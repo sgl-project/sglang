@@ -223,10 +223,11 @@ class TestAdaptiveStepSlot(unittest.TestCase):
 class TestAdaptiveSpeculativeParams(unittest.TestCase):
     def test_default_config_loads(self):
         params = AdaptiveSpeculativeParams(initial_steps=3)
-        self.assertEqual(params._bs_list, [1, 8, 32])
+        self.assertEqual(params._bs_list, [1, 8, 32, 64])
         self.assertEqual(params._slots[1].candidate_steps, [1, 3, 7])
         self.assertEqual(params._slots[8].candidate_steps, [1, 3])
         self.assertEqual(params._slots[32].candidate_steps, [1])
+        self.assertEqual(params._slots[64].candidate_steps, [0])
 
     def test_config_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
@@ -287,13 +288,6 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
             with self.assertRaises(ValueError):
                 AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
 
-    def test_zero_steps_raises(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump({"1": {"candidate_steps": [0]}}, f)
-            f.flush()
-            with self.assertRaises(ValueError):
-                AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
-
     def test_global_hysteresis_inherited(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(
@@ -336,7 +330,7 @@ class TestBatchSizeRouting(unittest.TestCase):
         self.assertEqual(params._route(8).candidate_steps, [1, 3])
         self.assertEqual(params._route(31).candidate_steps, [1, 3])
         self.assertEqual(params._route(32).candidate_steps, [1])
-        self.assertEqual(params._route(1000).candidate_steps, [1])
+        self.assertEqual(params._route(1000).candidate_steps, [0])
 
     def test_cuda_graph_bs_pads_batch_up_before_routing(self):
         params = self._params()
@@ -346,7 +340,7 @@ class TestBatchSizeRouting(unittest.TestCase):
         # bs=17 pads up to 32 -> slot bs=32.
         self.assertEqual(params._route(17).candidate_steps, [1])
         # A batch larger than every captured BS keeps its own value -> top slot.
-        self.assertEqual(params._route(100).candidate_steps, [1])
+        self.assertEqual(params._route(100).candidate_steps, [0])
 
     def test_cuda_graph_bs_for_step_prunes_unreachable_graphs(self):
         params = self._params()
