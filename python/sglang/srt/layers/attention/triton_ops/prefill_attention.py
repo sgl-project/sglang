@@ -177,7 +177,13 @@ def context_attention_fwd(
     out: [b * s, head, head_dim]
     sm_scale: softmax scale, defaults to 1/sqrt(head_dim)
     """
-    if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
+    if _is_cuda and CUDA_CAPABILITY[0] == 12:
+        # sm120 workstation/consumer Blackwell (RTX PRO 6000, RTX 50xx) has a
+        # much smaller shared memory size (~100KB) than sm90/sm100; BLOCK=128
+        # needs 128KB+ and raises triton OutOfResources (same class of issue
+        # as the extend_attention fix in #14311).
+        BLOCK = 64
+    elif (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
         BLOCK = 128
     else:
         BLOCK = 64
