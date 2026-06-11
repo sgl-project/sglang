@@ -368,6 +368,19 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
+    @property
+    def max_tree_depth(self: EagleVerifyInput) -> int:
+        """Longest root-to-leaf chain of the verify tree, incl. the root;
+        bounds the accept_index row width. EAGLE trees are depth-bounded by
+        the draft loop. Algorithms with other tree shapes override this."""
+        return self.spec_steps + 1
+
+    @property
+    def tree_topk(self: EagleVerifyInput) -> int:
+        """Branching factor passed to the tree-verify kernels; -1 means an
+        irregular tree (no fixed per-level branching)."""
+        return self.topk
+
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,
@@ -493,17 +506,8 @@ class EagleVerifyInputV2Mixin:
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         predict_shape = list(next_token_logits.shape)[:-1]
         predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-        # Longest root-to-leaf chain of the verify tree, incl. the root; bounds
-        # the accept_index row width. EAGLE trees are depth-bounded by the draft
-        # loop (spec_steps + 1); NGRAM trees are node-budgeted with no depth cap
-        # (a single corpus match can chain all draft_token_num nodes).
-        max_tree_depth = (
-            self.draft_token_num
-            if batch.spec_algorithm.is_ngram()
-            else self.spec_steps + 1
-        )
         accept_index = torch.full(
-            (bs, max_tree_depth), -1, dtype=torch.int32, device=device
+            (bs, self.max_tree_depth), -1, dtype=torch.int32, device=device
         )
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
@@ -520,7 +524,7 @@ class EagleVerifyInputV2Mixin:
                 retrieve_next_token=self.retrieve_next_token,
                 retrieve_next_sibling=self.retrieve_next_sibling,
                 target_predict=target_predict,
-                topk=-1 if batch.spec_algorithm.is_ngram() else self.topk,
+                topk=self.tree_topk,
             )
         else:
             # Apply temperature and get target probs
@@ -598,7 +602,7 @@ class EagleVerifyInputV2Mixin:
                 num_correct_drafts=num_correct_drafts,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
-                spec_steps=max_tree_depth - 1,
+                spec_steps=self.max_tree_depth - 1,
             )
 
         # `num_correct_drafts` stays drafts-only inside this function; the returned

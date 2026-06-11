@@ -12,6 +12,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 USE_FULL_MASK = True
 
 
-class NGRAMWorker:
+class NGRAMWorker(BaseSpecWorker):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -45,7 +46,7 @@ class NGRAMWorker:
     ):
         self.server_args = server_args
         self.enable_overlap = not server_args.disable_overlap_schedule
-        self.target_worker = target_worker
+        self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
         self.page_size = server_args.page_size
@@ -98,6 +99,15 @@ class NGRAMWorker:
                 corpus_path,
                 loaded,
             )
+
+    @property
+    def target_worker(self) -> TpModelWorker:
+        return self._target_worker
+
+    @property
+    def draft_worker(self) -> Optional[BaseDraftWorker]:
+        # NGRAM has no draft model; drafts come from the CPU-side corpus.
+        return None
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
