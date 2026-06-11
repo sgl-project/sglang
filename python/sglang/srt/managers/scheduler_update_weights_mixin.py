@@ -241,9 +241,9 @@ class SchedulerUpdateWeightsMixin:
                 )
 
             # Validate the action up front: the empty-draft-runner fast path below
-            # returns without dispatching to WeightChecker.handle, so an unsupported
-            # or deleted action (e.g. the removed "mark_reset_storage") would
-            # otherwise slip through as a success on draft-only selections.
+            # returns without dispatching to WeightChecker.handle, so an action that
+            # handle would reject (unsupported or since-removed) must be caught here
+            # too, or it would slip through as a success on draft-only selections.
             if recv_req.action not in (
                 "snapshot",
                 "reset_tensors",
