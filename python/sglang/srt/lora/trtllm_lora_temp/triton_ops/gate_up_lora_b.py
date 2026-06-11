@@ -210,7 +210,7 @@ def gate_up_lora_b_fwd(
     if (
         lora_envs.SGLANG_OPT_LORA_CUBLAS.get()
         or lora_envs.SGLANG_OPT_LORA_CUBLAS_GATE_UP.get()
-    ) and s * r >= _CUBLAS_MIN_S_RANK:
+    ) and s * r >= _CUBLAS_MIN_S_RANK and gate_up_lora_b.shape[0] == 1:  # single-adapter fast path: only valid with one resident slot
         return _gate_up_lora_b_cublas(
             x, gate_up_lora_b, batch_info, output_dim, base_output
         )
