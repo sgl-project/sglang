@@ -47,6 +47,8 @@ def _make_batch_str_output() -> BatchStrOutput:
         placeholder_tokens_idx=[None, None],
         placeholder_tokens_val=[None, None],
         retraction_counts=[0, 0],
+        weight_version_start=["v1", "v2"],
+        weight_version_end="v2",
     )
 
 
@@ -62,6 +64,14 @@ class TestMultiTokenizerMixin(unittest.TestCase):
             single_output.cached_tokens_details,
             [{"device": 1, "host": 3}],
         )
+
+    def test_batch_str_output_preserves_weight_version_stamps(self):
+        output = _make_batch_str_output()
+
+        single_output = _handle_output_by_index(output, 1)
+
+        self.assertEqual(single_output.weight_version_start, ["v2"])
+        self.assertEqual(single_output.weight_version_end, "v2")
 
 
 if __name__ == "__main__":
