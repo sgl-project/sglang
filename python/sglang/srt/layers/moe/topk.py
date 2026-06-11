@@ -1506,6 +1506,9 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_hip:
+        topk_ids = _biased_grouped_topk_postprocess(
+            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        )
         # On AMD HIP, the aiter MoE kernels do not handle topk_ids=-1 safely
         # (negative indices cause illegal memory access). Instead, zero the
         # routing weights for padded tokens so their MoE output contributes

@@ -19,6 +19,9 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
+    assign_extend_cache_locs as assign_extend_cache_locs,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_req_to_token_pool as assign_req_to_token_pool,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
@@ -39,7 +42,11 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.cache_locs import (
     get_target_cache_loc as get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.speculative.triton_ops.eagle import (
+    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
+)
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -48,7 +55,8 @@ _is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -151,9 +159,9 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
         server_args = get_global_server_args()
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
-    # multi_layer_eagle handles hidden_states internally, not via FutureMap.
+    # multi_layer_eagle and DFLASH don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm == "STANDALONE":
+    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH"):
         return False
     return not server_args.enable_multi_layer_eagle
 
@@ -473,3 +481,58 @@ def spec_stage_span(name: str):
     if torch.autograd._profiler_enabled():
         return torch.profiler.record_function(name)
     return nullcontext()
+
+
+def move_accept_tokens_to_target_kvcache(
+    batch: ScheduleBatch,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+):
+    """
+    Move accepted tokens (drafts + bonus) to the target KV cache.
+
+    Args:
+        batch: The batch to run.
+        accept_index: The index of the accepted tokens (incl. bonus).
+        num_correct_drafts: Per-req count of correct drafts (excludes bonus);
+            seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
+    """
+    bs = len(batch.seq_lens)
+    device = batch.seq_lens.device
+    # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the
+    # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
+    size = bs * accept_index.shape[1]
+
+    # fill_accept_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
+    maybe_detect_oob(
+        accept_index,
+        -1,
+        batch.out_cache_loc.size(0),
+        "spec v2 move_accept_tokens accept_index",
+    )
+
+    tgt_cache_loc = torch.zeros(
+        size,
+        dtype=torch.int64,
+        device=device,
+    )
+    accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
+    assign_extend_cache_locs[(bs,)](
+        batch.req_pool_indices,
+        batch.req_to_token_pool.req_to_token,
+        batch.seq_lens,
+        batch.seq_lens + num_correct_drafts + 1,
+        tgt_cache_loc,
+        batch.req_to_token_pool.req_to_token.shape[1],
+        next_power_of_2(bs),
+    )
+    fill_accept_out_cache_loc[(size,)](
+        accept_index,
+        batch.out_cache_loc,
+        accept_out_cache_loc,
+        next_power_of_2(size),
+    )
+    token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+        tgt_cache_loc, accept_out_cache_loc
+    )

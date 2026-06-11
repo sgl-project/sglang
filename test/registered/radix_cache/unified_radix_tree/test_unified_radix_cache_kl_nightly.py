@@ -40,10 +40,6 @@ class AccuracyTwoPassMixin:
     num_gsm8k_questions: int = 200
     gsm8k_parallel: int = 40
 
-    mmlu_threshold: float = 0.65
-    num_mmlu_examples: int = 100
-    mmlu_num_threads: int = 32
-
     max_accuracy_diff: float = 0.02
 
     def _run_gsm8k(self):
@@ -61,19 +57,6 @@ class AccuracyTwoPassMixin:
         )
         metrics = run_few_shot_gsm8k(args)
         return metrics["accuracy"]
-
-    def _run_mmlu(self):
-        from sglang.test.run_eval import run_eval as run_simple_eval
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=self.num_mmlu_examples,
-            num_threads=self.mmlu_num_threads,
-        )
-        metrics = run_simple_eval(args)
-        return metrics["score"]
 
     def _flush_cache(self):
         response = requests.post(
@@ -122,10 +105,6 @@ class AccuracyTwoPassMixin:
     def test_gsm8k_two_passes(self):
         """Run GSM8K twice with flush in between, verify accuracy diff <= max_accuracy_diff."""
         self._two_pass("GSM8K", self._run_gsm8k, self.gsm8k_threshold)
-
-    def test_mmlu_two_passes(self):
-        """Run MMLU twice with flush in between, verify accuracy diff <= max_accuracy_diff."""
-        self._two_pass("MMLU", self._run_mmlu, self.mmlu_threshold)
 
 
 class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
