@@ -904,6 +904,8 @@ class MooncakeKVManager(CommonKVManager):
                 f"ZMQ send timeout to {endpoint}, disconnecting stale socket"
             )
             self.disconnect_endpoint(endpoint)
+        except Exception:
+            pass
 
     def _handle_aux_data(self, msg: List[bytes]):
         """Handle AUX_DATA messages received by the decode thread."""
@@ -1164,6 +1166,8 @@ class MooncakeKVManager(CommonKVManager):
                 f"ZMQ send timeout to {endpoint}, disconnecting stale socket"
             )
             self.disconnect_endpoint(endpoint)
+        except Exception:
+            pass
 
     def transfer_worker(
         self,
