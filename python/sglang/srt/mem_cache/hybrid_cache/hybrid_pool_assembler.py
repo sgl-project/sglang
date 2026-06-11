@@ -1280,8 +1280,7 @@ def build_minimax_sparse_hicache_stack(
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
-        pp_rank=pp_rank,
-        pp_size=pp_size,
+        pp_group=params.pp_cache_group,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
