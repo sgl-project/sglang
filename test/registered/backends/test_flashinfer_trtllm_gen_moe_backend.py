@@ -155,6 +155,56 @@ class FlashinferTrtllmGenMoeBackendMXFP8Base:
         self.assertGreater(metrics["score"], 0.93)
 
 
+class FlashinferTrtllmGenMoeBackendMXFP8A2ABase:
+    backend = "flashinfer_trtllm_routed"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "zianglih/Qwen3-30B-A3B-Instruct-2507-MXFP8"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={**os.environ, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
+            other_args=[
+                "--quantization",
+                "mxfp8",
+                "--enable-dp-attention",
+                "--dp-size",
+                "4",
+                "--tp-size",
+                "4",
+                "--moe-a2a-backend",
+                "flashinfer",
+                "--moe-runner-backend",
+                cls.backend,
+                "--flashinfer-a2a-dispatch-type",
+                "mxfp8",
+                "--mem-fraction-static",
+                "0.7",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.93)
+
+
 class FlashinferTrtllmGenMoeBackendMXFP8MixedBF16Base:
     backend = None
 
@@ -311,6 +361,12 @@ class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
     FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm_routed"
+
+
+class TestFlashinferTrtllmGenMoeBackendMXFP8A2A(
+    FlashinferTrtllmGenMoeBackendMXFP8A2ABase, CustomTestCase
+):
+    pass
 
 
 class TestFlashinferTrtllmRoutedMxfp8MixedBF16(

@@ -11,6 +11,10 @@ import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
+from sglang.srt.layers.moe.utils import (
+    FlashinferA2ADispatchType,
+    get_flashinfer_a2a_dispatch_type,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -605,6 +609,134 @@ class TestContextParallelServerArgs(CustomTestCase):
                 self.assertEqual(
                     server_args.enable_prefill_context_parallel, expect_generic
                 )
+
+
+class TestFlashinferA2ADispatchType(CustomTestCase):
+    def setUp(self):
+        self._nvfp4_env_backup = os.environ.get("SGLANG_MOE_NVFP4_DISPATCH")
+        envs.SGLANG_MOE_NVFP4_DISPATCH.clear()
+
+    def tearDown(self):
+        if self._nvfp4_env_backup is None:
+            envs.SGLANG_MOE_NVFP4_DISPATCH.clear()
+        else:
+            os.environ["SGLANG_MOE_NVFP4_DISPATCH"] = self._nvfp4_env_backup
+
+    def _make_args(
+        self,
+        quantization=None,
+        dispatch_type=None,
+        runner_backend="flashinfer_trtllm_routed",
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            quantization=quantization,
+            moe_a2a_backend="flashinfer",
+            moe_runner_backend=runner_backend,
+            flashinfer_a2a_dispatch_type=dispatch_type,
+            enable_dp_attention=True,
+            dp_size=4,
+            tp_size=4,
+        )
+        server_args.get_model_config = MagicMock(
+            return_value=SimpleNamespace(nvfp4_moe_meta=None)
+        )
+        return server_args
+
+    def test_auto_resolves_mxfp8_and_normalizes_trtllm(self):
+        server_args = self._make_args(
+            quantization="mxfp8",
+            dispatch_type="auto",
+            runner_backend="flashinfer_trtllm",
+        )
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.moe_runner_backend, "flashinfer_trtllm_routed")
+        self.assertEqual(server_args.flashinfer_a2a_dispatch_type, "mxfp8")
+
+    def test_auto_resolves_modelopt_fp4_to_nvfp4(self):
+        server_args = self._make_args(quantization="modelopt_fp4", dispatch_type="auto")
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.flashinfer_a2a_dispatch_type, "nvfp4")
+
+    def test_auto_resolves_hybrid_nvfp4_metadata_to_nvfp4(self):
+        server_args = self._make_args(quantization="fp8", dispatch_type="auto")
+        server_args.get_model_config = MagicMock(
+            return_value=SimpleNamespace(nvfp4_moe_meta={})
+        )
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.flashinfer_a2a_dispatch_type, "nvfp4")
+
+    def test_unspecified_preserves_legacy_nvfp4_auto_enable(self):
+        server_args = self._make_args(quantization="modelopt_fp4")
+        server_args._handle_a2a_moe()
+
+        self.assertIsNone(server_args.flashinfer_a2a_dispatch_type)
+        self.assertTrue(envs.SGLANG_MOE_NVFP4_DISPATCH.get())
+
+    @patch("sglang.srt.layers.moe.utils.get_server_args")
+    def test_unspecified_getter_preserves_legacy_bf16_fallback(self, get_server_args):
+        get_server_args.return_value = SimpleNamespace(
+            flashinfer_a2a_dispatch_type=None,
+            quantization="mxfp8",
+        )
+
+        self.assertEqual(
+            get_flashinfer_a2a_dispatch_type(),
+            FlashinferA2ADispatchType.BF16,
+        )
+
+    def test_explicit_nvfp4_checks_hybrid_metadata_for_mxfp8_quantization(self):
+        server_args = self._make_args(quantization="mxfp8", dispatch_type="nvfp4")
+        server_args.get_model_config = MagicMock(
+            return_value=SimpleNamespace(nvfp4_moe_meta={})
+        )
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.flashinfer_a2a_dispatch_type, "nvfp4")
+
+    def test_explicit_bf16_overrides_auto(self):
+        server_args = self._make_args(quantization="modelopt_fp4", dispatch_type="bf16")
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.flashinfer_a2a_dispatch_type, "bf16")
+
+    def test_legacy_env_maps_to_dispatch_type(self):
+        with envs.SGLANG_MOE_NVFP4_DISPATCH.override("1"):
+            server_args = self._make_args(quantization="modelopt_fp4")
+            server_args._handle_a2a_moe()
+        self.assertIsNone(server_args.flashinfer_a2a_dispatch_type)
+
+        with envs.SGLANG_MOE_NVFP4_DISPATCH.override("0"):
+            server_args = self._make_args(quantization="modelopt_fp4")
+            server_args._handle_a2a_moe()
+        self.assertIsNone(server_args.flashinfer_a2a_dispatch_type)
+
+    def test_legacy_env_conflicts_with_explicit_cli(self):
+        with envs.SGLANG_MOE_NVFP4_DISPATCH.override("1"):
+            server_args = self._make_args(
+                quantization="modelopt_fp4", dispatch_type="bf16"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_MOE_NVFP4_DISPATCH cannot be set"
+            ):
+                server_args._handle_a2a_moe()
+
+    def test_mxfp8_dispatch_requires_mxfp8_quantization(self):
+        server_args = self._make_args(quantization="fp8", dispatch_type="mxfp8")
+        with self.assertRaisesRegex(ValueError, "requires --quantization mxfp8"):
+            server_args._handle_a2a_moe()
+
+    def test_explicit_dispatch_type_requires_flashinfer_a2a(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="none",
+            flashinfer_a2a_dispatch_type="bf16",
+        )
+        with self.assertRaisesRegex(ValueError, "requires --moe-a2a-backend"):
+            server_args._handle_a2a_moe()
 
 
 class TestPortArgs(unittest.TestCase):
