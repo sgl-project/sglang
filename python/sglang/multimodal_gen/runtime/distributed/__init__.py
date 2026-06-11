@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_group,
     get_tp_rank,
     get_tp_world_size,
+    get_vae_parallel_group_coordinator,
+    get_vae_parallel_rank,
+    get_vae_parallel_world_size,
     get_world_group,
     get_world_rank,
     get_world_size,
@@ -51,6 +54,10 @@ __all__ = [
     "get_tp_group",
     "get_tp_rank",
     "get_tp_world_size",
+    # VAE parallel group
+    "get_vae_parallel_group_coordinator",
+    "get_vae_parallel_rank",
+    "get_vae_parallel_world_size",
     # Get torch device
     "get_local_torch_device",
 ]

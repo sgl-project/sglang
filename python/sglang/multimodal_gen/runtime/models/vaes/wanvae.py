@@ -26,8 +26,8 @@ from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_sp_parallel_rank,
-    get_sp_world_size,
+    get_vae_parallel_rank,
+    get_vae_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.models.vaes.common import (
@@ -325,7 +325,7 @@ class WanEncoder3d(nn.Module):
 
         world_size = 1
         if dist.is_initialized():
-            world_size = get_sp_world_size()
+            world_size = get_vae_parallel_world_size()
 
         if use_parallel_encode and world_size > 1:
             CausalConv3d = WanDistCausalConv3d
@@ -386,8 +386,8 @@ class WanEncoder3d(nn.Module):
         self.world_size = 1
         self.rank = 0
         if dist.is_initialized():
-            self.world_size = get_sp_world_size()
-            self.rank = get_sp_parallel_rank()
+            self.world_size = get_vae_parallel_world_size()
+            self.rank = get_vae_parallel_rank()
 
     def forward(self, x):
         expected_local_height = None
@@ -623,7 +623,7 @@ class WanDecoder3d(nn.Module):
 
         world_size = 1
         if dist.is_initialized():
-            world_size = get_sp_world_size()
+            world_size = get_vae_parallel_world_size()
 
         if use_parallel_decode and world_size > 1:
             CausalConv3d = WanDistCausalConv3d
@@ -692,8 +692,8 @@ class WanDecoder3d(nn.Module):
         self.world_size = 1
         self.rank = 0
         if dist.is_initialized():
-            self.world_size = get_sp_world_size()
-            self.rank = get_sp_parallel_rank()
+            self.world_size = get_vae_parallel_world_size()
+            self.rank = get_vae_parallel_rank()
 
     def forward(self, x):
         expected_height = None

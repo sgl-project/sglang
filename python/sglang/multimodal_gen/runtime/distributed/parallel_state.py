@@ -68,6 +68,7 @@ _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
+_VAE_COORDINATOR: GroupCoordinator | None = None
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -423,6 +424,13 @@ def initialize_model_parallel(
         parallel_mode="sequence",
         ulysses_group=PROCESS_GROUP.ULYSSES_PG,
         ring_group=PROCESS_GROUP.RING_PG,
+    )
+
+    global _VAE_COORDINATOR
+    _VAE_COORDINATOR = (
+        _CFG
+        if classifier_free_guidance_degree > 1 and sequence_parallel_degree == 1
+        else _SP
     )
 
     global _TP
@@ -798,18 +806,29 @@ def get_dit_world_size() -> int:
 
 
 def get_vae_parallel_group() -> ProcessGroup:
-    assert _VAE is not None, "VAE parallel group is not initialized"
-    return _VAE
+    if _VAE is not None:
+        return _VAE
+    return get_vae_parallel_group_coordinator().device_group
+
+
+def get_vae_parallel_group_coordinator() -> GroupCoordinator:
+    if _VAE_COORDINATOR is not None:
+        return _VAE_COORDINATOR
+    return get_sp_group()
 
 
 def get_vae_parallel_world_size() -> int:
     """Return world size for the VAE parallel group."""
-    return torch.distributed.get_world_size(group=get_vae_parallel_group())
+    if _VAE is not None:
+        return torch.distributed.get_world_size(group=_VAE)
+    return get_vae_parallel_group_coordinator().world_size
 
 
 def get_vae_parallel_rank() -> int:
     """Return my rank for the VAE parallel group."""
-    return torch.distributed.get_rank(group=get_vae_parallel_group())
+    if _VAE is not None:
+        return torch.distributed.get_rank(group=_VAE)
+    return get_vae_parallel_group_coordinator().rank_in_group
 
 
 def init_dit_group(
@@ -842,7 +861,7 @@ def init_vae_group(
 
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
-    global _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE
+    global _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE, _VAE_COORDINATOR
 
     for group in (_TP, _SP, _DP, _CFG, _PP):
         if group is not None:
@@ -852,4 +871,4 @@ def destroy_model_parallel() -> None:
         if group is not None:
             torch.distributed.destroy_process_group(group)
 
-    _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE = (None,) * 7
+    _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE, _VAE_COORDINATOR = (None,) * 8

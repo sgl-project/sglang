@@ -15,7 +15,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
-    get_sp_world_size,
+    get_vae_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -963,7 +963,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         return posterior
 
     def _decode_with_parallel_dispatch(self, z: torch.Tensor) -> DecoderOutput:
-        if self.use_parallel_decode and get_sp_world_size() > 1:
+        if self.use_parallel_decode and get_vae_parallel_world_size() > 1:
             num_frame = z.shape[2]
             num_sample_frames = (num_frame - 1) * self.temporal_compression_ratio + 1
             tile_latent_min_height = (

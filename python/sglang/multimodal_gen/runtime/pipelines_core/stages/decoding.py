@@ -9,7 +9,11 @@ import weakref
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_vae_parallel_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -114,9 +118,21 @@ class DecodingStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        if get_global_server_args().enable_cfg_parallel:
+        server_args = get_global_server_args()
+        if server_args.enable_cfg_parallel:
+            if self._can_use_parallel_vae_decode(server_args):
+                return StageParallelismType.REPLICATED
             return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
+
+    def _can_use_parallel_vae_decode(self, server_args: ServerArgs) -> bool:
+        return (
+            server_args.performance_mode == "speed"
+            and server_args.sp_degree == 1
+            and model_parallel_is_initialized()
+            and get_vae_parallel_world_size() > 1
+            and self.vae.use_parallel_decode
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify decoding stage inputs."""
