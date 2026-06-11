@@ -263,7 +263,9 @@ class HiSparseCoordinator:
                     self.mem_pool_device,
                     suffix_host_indices,
                     suffix_device_indices,
-                    indexer_ranges=[(req.req_pool_idx, radix_prefix_len, prefill_len)],
+                    non_sparse_pool_offload_ranges=[
+                        (req.req_pool_idx, radix_prefix_len, prefill_len)
+                    ],
                 )
                 finish_event.record()
                 if suffix_host_indices.is_cuda:
@@ -618,7 +620,7 @@ class HiSparseCoordinator:
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
         host_locs_list = []
-        completed_indexer_pages = []
+        non_sparse_pool_offload_lens = []
         for i in backup_indices:
             req_idx = int(req_pool_indices_cpu[i])
             start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
@@ -630,7 +632,7 @@ class HiSparseCoordinator:
                 1,
             )
             host_locs_list.append(host_locs)
-            completed_indexer_pages.append((req_idx, start_pos + 1))
+            non_sparse_pool_offload_lens.append((req_idx, start_pos + 1))
         host_locs = torch.cat(host_locs_list)
 
         self.wait_for_pending_backup()
@@ -643,7 +645,7 @@ class HiSparseCoordinator:
                 self.mem_pool_device,
                 host_locs,
                 device_locs,
-                completed_indexer_pages=completed_indexer_pages,
+                non_sparse_pool_offload_lens=non_sparse_pool_offload_lens,
             )
             self._backup_done_event.record()
             if host_locs.is_cuda:
@@ -837,7 +839,7 @@ class HiSparseCoordinator:
                 self.mem_pool_device,
                 host_locs,
                 device_locs,
-                completed_indexer_pages=[(req.req_pool_idx, cache_len)],
+                non_sparse_pool_offload_lens=[(req.req_pool_idx, cache_len)],
             )
 
         # release memory -- only free actually-allocated buffer indices
