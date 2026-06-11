@@ -16,6 +16,7 @@ from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logp
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.async_probe import maybe_detect_nan
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
@@ -83,9 +84,18 @@ class Sampler(nn.Module):
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
     ) -> torch.Tensor:
-        """Apply custom logit processors."""
+        """Apply custom logit processors and sanitize non-finite logits."""
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
+        # Detect first (gated on SGLANG_ENABLE_ASYNC_ASSERT, on in CI), then
+        # sanitize unconditionally: NaN logits (e.g. fp16 activation overflow)
+        # fed to sampling kernels are undefined behavior and can come back as
+        # out-of-vocab token ids; +Inf turns into NaN probs after softmax.
+        # NaN/-Inf -> dtype min (-Inf vocab masks stay effectively excluded;
+        # a fully poisoned row degrades to uniform), +Inf -> dtype max.
+        # No Inf detection here: -Inf is legitimate in logits (vocab masks).
+        maybe_detect_nan(logits, "sampler: next_token_logits")
+        torch.nan_to_num_(logits, nan=torch.finfo(logits.dtype).min)
         return logits
 
     def forward(

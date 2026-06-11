@@ -61,7 +61,11 @@ class SpecEagleServerBase(CustomTestCase):
     mem_fraction_static = 0.75
     max_running_requests = 8
     chunked_prefill_size = 128
-    dtype = "float16"
+    # bf16 rather than fp16: fp16 inference can overflow the fp16 range on
+    # degenerate draft branches in verify (massive-activation channels reach
+    # ~5e4, vs the 65504 fp16 max), which becomes Inf -> NaN under RMSNorm and
+    # trips the CI NaN asserts. bf16 has fp32-equivalent range.
+    dtype = "bfloat16"
     cuda_graph_max_bs = None
     trust_remote_code = True
 
