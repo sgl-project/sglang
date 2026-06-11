@@ -123,6 +123,21 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
+def _shared_expert_excluded_from_quant(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """True when the checkpoint excludes shared-expert weights from quantization."""
+    if quant_config is None:
+        return False
+    exclude_layers = getattr(quant_config, "exclude_layers", [])
+    return any(
+        "shared_expert" in layer
+        and "shared_expert_gate" not in layer
+        and not layer.startswith("mtp.")
+        for layer in exclude_layers
+    )
+
+
 def can_fuse_shared_expert(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
@@ -130,6 +145,10 @@ def can_fuse_shared_expert(
     """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
 
     Caller must still gate on ``support_shared_expert_fusion`` and ``_use_aiter``.
+
+    When the shared expert is excluded from quantization (BF16 in an MXFP4
+    checkpoint), fusion is still allowed on AMD/HIP because the BF16 weights
+    are online-quantized to FP4 during ``load_weights()``.
     """
     if (
         get_global_server_args().disable_shared_experts_fusion is True
@@ -139,17 +158,8 @@ def can_fuse_shared_expert(
     ):
         return False
 
-    # If the shared expert is excluded from quantization (stored as FP32 in the
-    # checkpoint), fusing it into the quantized MoE weight tensor requires online
-    # quantization which is not supported. Disable fusion in this case.
-    if quant_config is not None:
-        exclude_layers = getattr(quant_config, "exclude_layers", [])
-        if any(
-            "shared_expert" in layer
-            and "shared_expert_gate" not in layer
-            and not layer.startswith("mtp.")
-            for layer in exclude_layers
-        ):
+    if _shared_expert_excluded_from_quant(quant_config):
+        if not _use_aiter:
             return False
 
     return True
@@ -953,6 +963,13 @@ class Qwen2MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+
+        self._needs_shared_expert_online_quant = (
+            _use_aiter
+            and _shared_expert_excluded_from_quant(quant_config)
+            and self._has_fused_shared_experts()
+        )
+
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
@@ -1025,6 +1042,34 @@ class Qwen2MoeForCausalLM(nn.Module):
 
         return result
 
+    def _has_fused_shared_experts(self):
+        """Check if any layer has fused shared experts enabled."""
+        if not hasattr(self.model, "layers"):
+            return False
+        for layer in self.model.layers:
+            if (
+                layer is not None
+                and hasattr(layer, "mlp")
+                and hasattr(layer.mlp, "num_fused_shared_experts")
+                and layer.mlp.num_fused_shared_experts > 0
+            ):
+                return True
+        return False
+
+    def _online_quant_bf16_to_mxfp4(
+        self, weight: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize a BF16 weight to MXFP4 (packed uint8) + E8M0 scales."""
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+        orig_shape = weight.shape
+        w = weight.view(-1, orig_shape[-1]) if weight.dim() != 2 else weight
+        w_quant, scales = dynamic_mxfp4_quant(w)
+        if weight.dim() != 2:
+            w_quant = w_quant.view(orig_shape[:-1] + (w_quant.shape[-1],))
+            scales = scales.view(orig_shape[:-1] + (scales.shape[-1],))
+        return w_quant, scales
+
     @property
     def start_layer(self):
         return self.model.start_layer
@@ -1043,11 +1088,14 @@ class Qwen2MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        num_experts = self.config.num_experts
+        needs_online_quant = self._needs_shared_expert_online_quant
+
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=num_experts,
         )
 
         params_dict = dict(self.named_parameters())
@@ -1063,6 +1111,52 @@ class Qwen2MoeForCausalLM(nn.Module):
             ):
                 continue
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            # Redirect shared_expert weights into the fused expert slot.
+            # BF16 weights are online-quantized to MXFP4 before storage.
+            # The shared_expert_gate is NOT redirected; it stays standalone.
+            if (
+                needs_online_quant
+                and "mlp.shared_expert." in name
+                and "shared_expert_gate" not in name
+            ):
+                if "gate_proj" in name:
+                    shard_id = "w1"
+                elif "up_proj" in name:
+                    shard_id = "w3"
+                elif "down_proj" in name:
+                    shard_id = "w2"
+                else:
+                    continue
+
+                w_quant, w_scales = self._online_quant_bf16_to_mxfp4(
+                    loaded_weight
+                )
+
+                # Build the FusedMoE param name (e.g., model.layers.0.mlp.experts.w13_weight)
+                layer_prefix = name.split("mlp.shared_expert.")[0]
+                if shard_id in ("w1", "w3"):
+                    w_param_name = layer_prefix + "mlp.experts.w13_weight"
+                    s_param_name = layer_prefix + "mlp.experts.w13_weight_scale"
+                else:
+                    w_param_name = layer_prefix + "mlp.experts.w2_weight"
+                    s_param_name = layer_prefix + "mlp.experts.w2_weight_scale"
+
+                shared_expert_id = num_experts
+
+                if w_param_name in params_dict:
+                    param = params_dict[w_param_name]
+                    param.weight_loader(
+                        param, w_quant, w_param_name,
+                        shard_id=shard_id, expert_id=shared_expert_id,
+                    )
+                if s_param_name in params_dict:
+                    scale_param = params_dict[s_param_name]
+                    scale_param.weight_loader(
+                        scale_param, w_scales, s_param_name,
+                        shard_id=shard_id, expert_id=shared_expert_id,
+                    )
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
