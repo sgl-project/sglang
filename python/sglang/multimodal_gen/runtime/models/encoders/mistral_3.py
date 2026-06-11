@@ -166,6 +166,7 @@ class MistralAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -176,7 +177,22 @@ class MistralAttention(nn.Module):
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        attn_output = self.attn(q, k, v)
+        attn_mask = None
+        if attention_mask is not None:
+            attn_mask = torch.tril(
+                torch.ones(
+                    (seq_len, seq_len), device=hidden_states.device, dtype=torch.bool
+                )
+            )
+            attn_mask = attn_mask[None, None, :, :].expand(
+                batch_size, 1, seq_len, seq_len
+            )
+            padding_mask = attention_mask.to(
+                device=hidden_states.device, dtype=torch.bool
+            )
+            attn_mask = attn_mask & padding_mask[:, None, None, :]
+
+        attn_output = self.attn(q, k, v, attn_mask=attn_mask)
         attn_output = attn_output.reshape(
             batch_size, seq_len, self.num_heads * self.head_dim
         )
@@ -233,13 +249,18 @@ class MistralDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+        )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -306,7 +327,12 @@ class MistralModel(nn.Module):
                     if residual is None
                     else (hidden_states + residual,)
                 )
-            hidden_states, residual = layer(position_ids, hidden_states, residual)
+            hidden_states, residual = layer(
+                position_ids,
+                hidden_states,
+                residual,
+                attention_mask=attention_mask,
+            )
 
         hidden_states, _ = self.norm(hidden_states, residual)
         if all_hidden_states is not None:
