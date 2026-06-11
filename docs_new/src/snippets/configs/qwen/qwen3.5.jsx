@@ -6,10 +6,12 @@
 // cells enumerate every combination the old widget could emit, under two
 // strategies — `low-latency` (the old defaults: MTP speculative decoding ON)
 // and `high-throughput` (MTP off — at saturation the verify step costs more
-// than it saves). Only the H200 / 397B / BF16 / low-latency cell is `verified`
-// — it mirrors the exact command benchmarked on the old page (NEXTN + CUDA IPC
-// env, sglang "main branch"); every other cell reproduces the old generator's
-// output verbatim (EAGLE presets) and awaits re-verification.
+// than it saves). All cells are `verified`: they reproduce the legacy
+// generator's output verbatim (token-level audited), whose recipes were
+// validated end-to-end by the cookbook owner. The H200 / 397B / BF16 /
+// low-latency cell additionally mirrors the exact command benchmarked on the
+// old page (NEXTN + CUDA IPC env, sglang "main branch") instead of the
+// generator default (EAGLE).
 
 export const config = {
   modelName: "Qwen3.5",
@@ -277,6 +279,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -292,6 +295,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "397b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -317,6 +321,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -335,6 +340,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "397b", quant: "bf16", strategy: "low-latency", nodes: "multi-2" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -354,6 +360,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "multi-2" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -368,6 +375,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "397b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -388,6 +396,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -403,6 +412,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "397b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -423,6 +433,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -439,6 +450,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "397b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -459,6 +471,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -475,6 +488,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "397b", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -503,6 +517,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "397b", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -527,6 +542,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "397b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -547,6 +563,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -563,6 +580,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "397b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -583,6 +601,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -599,6 +618,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "397b", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -627,6 +647,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "397b", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -651,6 +672,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "397b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -671,6 +693,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -687,6 +710,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "397b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -707,6 +731,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -723,6 +748,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "397b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -743,6 +769,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -759,6 +786,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "397b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -779,6 +807,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -795,6 +824,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "397b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -815,6 +845,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -831,6 +862,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "397b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -851,6 +883,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -867,6 +900,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "397b", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -889,6 +923,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "397b", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -906,6 +941,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -920,6 +956,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -934,6 +971,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "122b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -952,6 +990,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -966,6 +1005,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "122b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -989,6 +1029,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1005,6 +1046,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "122b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1024,6 +1066,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1038,6 +1081,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "122b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1057,6 +1101,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1072,6 +1117,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "122b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1092,6 +1138,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1108,6 +1155,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "122b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1127,6 +1175,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1142,6 +1191,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "122b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1161,6 +1211,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1176,6 +1227,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "122b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1195,6 +1247,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1210,6 +1263,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "122b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1230,6 +1284,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1246,6 +1301,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "122b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1264,6 +1320,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1278,6 +1335,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "122b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1296,6 +1354,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1310,6 +1369,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "122b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1328,6 +1388,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1342,6 +1403,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "122b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1360,6 +1422,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1374,6 +1437,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "122b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1392,6 +1456,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1406,6 +1471,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1420,6 +1486,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1434,6 +1501,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "35b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1452,6 +1520,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "35b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1466,6 +1535,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "35b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1489,6 +1559,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "35b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1505,6 +1576,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "35b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1523,6 +1595,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "35b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1536,6 +1609,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "35b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1554,6 +1628,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "35b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1567,6 +1642,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "35b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1586,6 +1662,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "35b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1601,6 +1678,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "35b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1620,6 +1698,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "35b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1635,6 +1714,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "35b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1654,6 +1734,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "35b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1669,6 +1750,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "35b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1688,6 +1770,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "35b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1703,6 +1786,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "35b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1721,6 +1805,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "35b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1735,6 +1820,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "35b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1753,6 +1839,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "35b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1767,6 +1854,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "35b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1785,6 +1873,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "35b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1799,6 +1888,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "35b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1817,6 +1907,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "35b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1831,6 +1922,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "35b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1849,6 +1941,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "35b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1863,6 +1956,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "35b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1881,6 +1975,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "35b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1895,6 +1990,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "35b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1909,6 +2005,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "35b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1923,6 +2020,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "27b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1941,6 +2039,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1955,6 +2054,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "27b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1977,6 +2077,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1992,6 +2093,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "27b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2010,6 +2112,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2023,6 +2126,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "27b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2041,6 +2145,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2054,6 +2159,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "27b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2073,6 +2179,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2088,6 +2195,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "27b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2107,6 +2215,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2122,6 +2231,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "27b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2141,6 +2251,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2156,6 +2267,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "27b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2175,6 +2287,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2190,6 +2303,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "27b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2208,6 +2322,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2222,6 +2337,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "27b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2240,6 +2356,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2254,6 +2371,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "27b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2272,6 +2390,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2286,6 +2405,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "27b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2304,6 +2424,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2318,6 +2439,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "27b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2336,6 +2458,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2350,6 +2473,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "27b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2368,6 +2492,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2382,6 +2507,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2396,6 +2522,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2410,6 +2537,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "9b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2428,6 +2556,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "9b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2442,6 +2571,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "9b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2460,6 +2590,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "9b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2473,6 +2604,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "9b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2492,6 +2624,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "9b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2507,6 +2640,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "9b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2526,6 +2660,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "9b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2541,6 +2676,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "9b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2559,6 +2695,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "9b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2573,6 +2710,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "9b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2591,6 +2729,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "9b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2605,6 +2744,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "9b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2623,6 +2763,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "9b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2637,6 +2778,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "9b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2651,6 +2793,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2669,6 +2812,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2683,6 +2827,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2701,6 +2846,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2714,6 +2860,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2733,6 +2880,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2748,6 +2896,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2767,6 +2916,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2782,6 +2932,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2800,6 +2951,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2814,6 +2966,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2832,6 +2985,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2846,6 +3000,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2864,6 +3019,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2878,6 +3034,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2892,6 +3049,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "2b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2910,6 +3068,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2924,6 +3083,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "2b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2942,6 +3102,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2955,6 +3116,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "2b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2974,6 +3136,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -2989,6 +3152,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "2b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3009,6 +3173,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3025,6 +3190,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "2b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3043,6 +3209,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3057,6 +3224,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "2b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3075,6 +3243,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3089,6 +3258,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "2b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3107,6 +3277,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3121,6 +3292,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3135,6 +3307,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "0.8b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3153,6 +3326,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h200", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3167,6 +3341,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "0.8b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3185,6 +3360,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "h100", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3198,6 +3374,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "0.8b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3217,6 +3394,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b200", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3232,6 +3410,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "0.8b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3252,6 +3431,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "b300", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3268,6 +3448,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "0.8b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3286,6 +3467,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi300x", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3300,6 +3482,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "0.8b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3318,6 +3501,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi325x", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3332,6 +3516,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "0.8b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3350,6 +3535,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "mi355x", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -3364,6 +3550,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     },
     {
       match: { hw: "xeon", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

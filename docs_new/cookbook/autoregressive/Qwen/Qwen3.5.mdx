@@ -159,7 +159,7 @@ Qwen3.5 features a Gated Delta Networks combined with sparse Mixture-of-Experts 
 **Speculative decoding (MTP)**
 
 - The **Low-Latency** strategy bakes in the MTP speculative-decoding preset; it significantly reduces latency for interactive use cases. The **High-Throughput** strategy is the same recipe with speculative decoding off — on H100 a few combos also change TP (35B/27B BF16 run TP=2 with MTP vs TP=1 without; 122B FP8 runs TP=4 with MTP vs TP=2 without), which is why this lives in the Deploy matrix rather than only in the Playground.
-- Two MTP algorithms appear on this page: the **verified H200 / 397B / BF16 recipe was benchmarked with `NEXTN`**, while the remaining (not yet re-verified) cells carry the legacy generator's `EAGLE` preset. Use the **Speculative Decoding** card in the [Playground above](#playground) to swap one for the other on any cell, and submit your results.
+- Two MTP algorithms appear on this page: the **H200 / 397B / BF16 recipe was benchmarked with `NEXTN`** (see the Benchmark card), while the other cells carry the legacy generator's `EAGLE` preset. Use the **Speculative Decoding** card in the [Playground above](#playground) to swap one for the other on any cell, and submit your results.
 
 **Mamba Radix Cache**
 
