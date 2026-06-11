@@ -122,6 +122,14 @@ sgl-eval run aime25 \\
     pro:   { gpqa_pct: 90.1, aime25_pct: 97.5, gsm8k_pct: 96.13 },
   },
 
+  // The eval set rendered in the benchmark card + "⚡ Reproduce" (the engine
+  // ships no default — every config declares its own).
+  accuracyLabels: [
+    ["gpqa_pct",   "GPQA Diamond",   "%"],
+    ["aime25_pct", "AIME25",         "%"],
+    ["gsm8k_pct",  "GSM8K (1-shot)", "%"],
+  ],
+
   // Prepended as `# ...` comments above multi-node commands.
   multiNodeHints: {
     gb200: [
