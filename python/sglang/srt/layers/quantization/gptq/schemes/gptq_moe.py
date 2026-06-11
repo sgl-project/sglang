@@ -73,7 +73,7 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight", w13_qweight)
+        layer.register_parameter("w13_qweight", w13_qweight)
         set_weight_attrs(w13_qweight, extra_weight_attrs)
 
         w2_qweight = torch.nn.Parameter(
@@ -85,7 +85,7 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight", w2_qweight)
+        layer.register_parameter("w2_qweight", w2_qweight)
         set_weight_attrs(w2_qweight, extra_weight_attrs)
 
         w13_scales = torch.nn.Parameter(
@@ -97,7 +97,7 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight_scale", w13_scales)
+        layer.register_parameter("w13_qweight_scale", w13_scales)
         set_weight_attrs(w13_scales, extra_weight_attrs)
 
         w2_scales = torch.nn.Parameter(
@@ -109,7 +109,7 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight_scale", w2_scales)
+        layer.register_parameter("w2_qweight_scale", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
 
         w13_qzeros = torch.nn.Parameter(
@@ -121,7 +121,7 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight_offset", w13_qzeros)
+        layer.register_parameter("w13_qweight_offset", w13_qzeros)
         set_weight_attrs(w13_qzeros, extra_weight_attrs)
 
         w2_qzeros = torch.nn.Parameter(
@@ -133,7 +133,7 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight_offset", w2_qzeros)
+        layer.register_parameter("w2_qweight_offset", w2_qzeros)
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
     def create_moe_runner(
@@ -161,12 +161,12 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
     ) -> "CombineInput":
         backend = self.runner.runner_backend
         quant_info = TorchNpuQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            w13_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            w13_offset=layer.w13_weight_offset,
-            w2_offset=layer.w2_weight_offset,
+            w13_qweight=layer.w13_qweight,
+            w2_qweight=layer.w2_qweight,
+            w13_scale=layer.w13_qweight_scale,
+            w2_scale=layer.w2_qweight_scale,
+            w13_offset=layer.w13_qweight_offset,
+            w2_offset=layer.w2_qweight_offset,
         )
         return self.runner.run(dispatch_output, quant_info)
 
