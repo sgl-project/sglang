@@ -163,6 +163,11 @@ class GenerateReqInput(BaseReq):
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    # Per-position token ids to return logprob for; one id-list per input position.
+    # Folded into token_ids_logprob during normalization.
+    token_ids_logprob_positions: Optional[
+        Union[List[List[List[int]]], List[List[int]]]
+    ] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Whether to stream output.
@@ -298,6 +303,20 @@ class GenerateReqInput(BaseReq):
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
+
+        # Keep the public per-position field single-request only, then reuse the
+        # existing token_ids_logprob path internally.
+        if self.token_ids_logprob_positions is not None:
+            if self.token_ids_logprob is not None:
+                raise ValueError(
+                    "Set only one of token_ids_logprob or token_ids_logprob_positions, not both."
+                )
+            if not self.is_single:
+                raise ValueError(
+                    "token_ids_logprob_positions supports only a single request; send one per sample."
+                )
+            self.token_ids_logprob = self.token_ids_logprob_positions
+            self.token_ids_logprob_positions = None
 
         if self.is_single:
             self._normalize_single_inputs()
