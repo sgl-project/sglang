@@ -364,15 +364,20 @@ class LocalAttention(nn.Module):
                 if self.allow_cudnn_sdp and q_.device.type == "cuda"
                 else nullcontext()
             )
+            attn_kwargs = {
+                "attn_mask": mask,
+                "dropout_p": 0.0,
+                "is_causal": False,
+                "scale": self.softmax_scale,
+            }
+            if q_.shape[1] != k_.shape[1]:
+                attn_kwargs["enable_gqa"] = True
             with sdpa_context:
                 return torch.nn.functional.scaled_dot_product_attention(
                     q_,
                     k_,
                     v_,
-                    attn_mask=mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=self.softmax_scale,
+                    **attn_kwargs,
                 ).transpose(1, 2)
 
         output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
