@@ -114,14 +114,17 @@ find_latest_image() {
 if [[ -n "${CUSTOM_IMAGE}" ]]; then
   IMAGE="${CUSTOM_IMAGE}"
   echo "Using custom image: ${IMAGE}"
-  retry_with_backoff 6 docker pull "${IMAGE}"
 else
   IMAGE=$(find_latest_image)
-  if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  else
-    echo "Image ${IMAGE} already present locally; skipping pull"
-  fi
+fi
+# Always pull so each stage runs the registry's current image; the cleanup
+# step removes the image after the stage so the runner doesn't accumulate
+# stale layers across runs.
+retry_with_backoff 6 docker pull "${IMAGE}"
+
+# Export the resolved image so the cleanup step can rmi the exact tag used.
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  echo "CI_SGLANG_XPU_IMAGE=${IMAGE}" >> "${GITHUB_ENV}"
 fi
 
 # Remove any stale container of the same name so re-runs are idempotent.
