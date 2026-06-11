@@ -867,38 +867,18 @@ class HiSparseCoordinator:
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv_allocated_len
 
+        radix_prefix_len = 0
         cache_key_len = 0
-        old_protected = 0
         if self.radix_cache is not None:
+            radix_prefix_len = self.radix_cache.req_prefix_len(req.req_pool_idx)
             all_token_ids = req.origin_input_ids + req.output_ids
-            cache_len = min(req.kv_committed_len, len(all_token_ids))
-            cache_key_len = (cache_len // self.page_size) * self.page_size
-            old_protected = self.radix_cache.req_prefix_len(req.req_pool_idx)
-            if (
-                len(req.output_ids) > 0
-                and cache_key_len > old_protected
-                and cache_key_len == cache_len
-            ):
-                last_pos = cache_len - 1
-                host_locs = self.mem_pool_host.alloc_paged_token_slots(
-                    self.req_to_host_pool,
-                    self.req_to_host_pool_allocated_len,
-                    req.req_pool_idx,
-                    last_pos,
-                    1,
-                )
-                device_slot = min(last_pos, self.device_buffer_size)
-                device_locs = self.req_to_device_buffer[
-                    req.req_pool_idx, device_slot : device_slot + 1
-                ]
-                self.radix_cache.backup_from_device_all_layer(
-                    self.mem_pool_device,
-                    host_locs,
-                    device_locs,
-                    non_sparse_pool_offload_ranges=[
-                        (req.req_pool_idx, cache_len - self.page_size, cache_len)
-                    ],
-                )
+            backed_cache_len = min(req.kv_committed_len, len(all_token_ids))
+            # The last decoded token is normally backed up by the next decode
+            # step. At request finish there is no next step, so do not insert
+            # that token/page into the radix tree or issue backup I/O here.
+            if backed_cache_len > len(req.origin_input_ids):
+                backed_cache_len -= 1
+            cache_key_len = (backed_cache_len // self.page_size) * self.page_size
 
         # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
@@ -916,7 +896,7 @@ class HiSparseCoordinator:
         )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
 
-        if self.radix_cache is not None and cache_key_len > old_protected:
+        if self.radix_cache is not None and cache_key_len > radix_prefix_len:
             token_ids = all_token_ids[:cache_key_len]
             host_indices = self.req_to_host_pool[req.req_pool_idx, :cache_key_len]
             _, duplicate_indices, _ = self.radix_cache.insert_req_host_indices(
@@ -936,7 +916,7 @@ class HiSparseCoordinator:
                 allocated_host_len,
             )
         else:
-            free_tail_start = max(cache_key_len, old_protected)
+            free_tail_start = max(cache_key_len, radix_prefix_len)
             host_indices = self.mem_pool_host.allocated_host_indices(
                 self.req_to_host_pool[:, free_tail_start:],
                 req.req_pool_idx,
