@@ -6,12 +6,15 @@ import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -324,6 +327,17 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=self.draft_token_num,
             device=self.device,
         )
+
+        # Mirror EagleVerifyInputV2Mixin.prepare_for_v2_verify: spec batches skip
+        # the prepare_for_decode refresh and filter/merge null these fields, so
+        # rebuild track indices from reqs before verify. Clearing the mask also
+        # keeps a stale extend-time mask from triggering in-forward tracking
+        # during TARGET_VERIFY; tracking is done in _mamba_verify_update instead.
+        if get_global_server_args().enable_mamba_extra_buffer():
+            set_mamba_track_indices_from_reqs(batch)
+            batch.mamba_track_mask = None
+            batch.mamba_track_seqlens = None
+
         batch.spec_info = NgramVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
