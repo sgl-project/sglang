@@ -58,11 +58,11 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
     organize_draft_results,
     per_step_draft_out_cache_loc,
+    resolve_tree_mask_mode,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -219,7 +219,9 @@ class EagleDraftWorker(BaseDraftWorker):
         if (c := self.draft_runner.canary_manager) is not None:
             c.mark_init_finished()
 
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.tree_mask_mode = resolve_tree_mask_mode(
+            self.target_worker.model_runner.attn_backend
+        )
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
@@ -322,7 +324,9 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.tree_mask_mode = resolve_tree_mask_mode(
+            self.target_worker.model_runner.attn_backend
+        )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""

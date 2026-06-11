@@ -45,7 +45,10 @@ from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWor
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
+from sglang.srt.speculative.eagle_utils import (
+    build_tree_kernel_efficient,
+    resolve_tree_mask_mode,
+)
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
@@ -200,7 +203,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.tree_mask_mode = resolve_tree_mask_mode(
+            self.target_worker.model_runner.attn_backend
+        )
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
