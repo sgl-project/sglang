@@ -191,9 +191,7 @@ jobs:
       - name: Run stage-b tests
         timeout-minutes: 60
         run: |
-          # --continue-on-error: run every file even if an earlier one fails,
-          # so a single regression doesn't hide the status of the rest.
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu --continue-on-error"
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu"
 
       - name: Cleanup container
         if: always()
