@@ -1712,6 +1712,20 @@ class SlowDownReqOutput(BaseReq):
 
 
 @dataclass
+class PdRoleSwitchReqInput(BaseReq):
+    # Target disaggregation role: "prefill" or "decode".
+    new_role: str = ""
+
+
+@dataclass
+class PdRoleSwitchReqOutput(BaseReq):
+    success: bool = False
+    message: str = ""
+    old_role: str = ""
+    new_role: str = ""
+
+
+@dataclass
 class AbortReq(BaseReq):
     # Whether to abort all requests
     abort_all: bool = False

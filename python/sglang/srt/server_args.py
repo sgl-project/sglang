@@ -866,6 +866,10 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
     optimistic_prefill_retries: int = 0
+    # PoC: allow runtime P<->D role switching for this instance. When enabled,
+    # the bootstrap server is always started (so a flipped-to-prefill instance
+    # can serve bootstrap) and the /pd_role_switch control endpoint is active.
+    enable_pd_role_switch: bool = False
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -7353,6 +7357,13 @@ class ServerArgs:
             default=ServerArgs.disaggregation_transfer_backend,
             choices=DISAGG_TRANSFER_BACKEND_CHOICES,
             help="The backend for disaggregation transfer. Default is mooncake.",
+        )
+        parser.add_argument(
+            "--enable-pd-role-switch",
+            action="store_true",
+            help="(PoC) Allow runtime switching of this instance's disaggregation "
+            "role (prefill<->decode) via the /pd_role_switch control endpoint. "
+            "Currently only validated with the mori transfer backend.",
         )
         parser.add_argument(
             "--disaggregation-bootstrap-port",

@@ -303,7 +303,14 @@ class ModelRunnerKVCacheMixin:
             max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
             extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
-            if self.server_args.disaggregation_mode == "decode":
+            if (
+                self.server_args.disaggregation_mode == "decode"
+                or self.server_args.enable_pd_role_switch
+            ):
+                # With runtime P<->D role switching the pool must be role-agnostic.
+                # DecodeReqToTokenPool is a superset of ReqToTokenPool (same alloc
+                # interface + pre_alloc headroom), so a prefill-starting instance
+                # can also use it and later flip to decode without reallocation.
                 from sglang.srt.disaggregation.decode import (
                     DecodeReqToTokenPool,
                     HybridMambaDecodeReqToTokenPool,

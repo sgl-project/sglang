@@ -128,6 +128,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PdRoleSwitchReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -1431,6 +1432,22 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
         await _global_state.tokenizer_manager.slow_down(obj, request)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.api_route("/pd_role_switch", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pd_role_switch(obj: PdRoleSwitchReqInput, request: Request):
+    """(PoC) Switch this instance's PD disaggregation role at runtime
+    ("prefill" <-> "decode"). The instance must be idle. Requires the server to
+    be launched with --enable-pd-role-switch."""
+    try:
+        result = await _global_state.tokenizer_manager.pd_role_switch(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        result,
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
