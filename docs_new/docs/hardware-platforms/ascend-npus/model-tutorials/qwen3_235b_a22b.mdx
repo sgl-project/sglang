@@ -13,7 +13,7 @@ logical reasoning, text comprehension, mathematics, science, coding, and tool us
 and thinking/reasoning-enhanced editions.
 
 This document demonstrates the deployment of Qwen3-235B-A22B on Ascend NPUs using SGLang, including single-node PD mixed
-mode, multi-node PD disaggregation mode, feature configuration, and performance optimization.
+mode, multi-node PD mixed mode, multi-node PD disaggregation mode, feature configuration, and performance optimization.
 
 This document is validated and written based on **SGLang v0.5.10**. The current model (Qwen3-235B-A22B) is fully supported in
 this version. To use the latest features (e.g., PD disaggregation, speculative decoding), it is recommended to use
@@ -30,7 +30,7 @@ v0.5.10 or a later version.
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size 94208 --max-prefill-tokens 458880`                                    |
 | NPU Graph                     | `--cuda-graph-bs 1 2 4 8 16 20 24 26 27`                                                      |
-| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
+| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 
@@ -42,7 +42,7 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_opti
 ### Model weights
 
 <Warning>
-If you need to download model weights, check the model size before downloading to reserve enough space.
+Before downloading model weights, check the model size to reserve enough disk space.
 </Warning>
 
 - [Qwen3-235B-A22B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507) (BF16)
@@ -56,7 +56,7 @@ It is recommended to download the model weights to a shared directory across mul
 ## Installation
 
 <Warning>
-Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+The Docker image requires at least **30 GB** of free space. Ensure sufficient disk space before pulling images.
 </Warning>
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
@@ -101,6 +101,33 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 ```
 
   </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+docker run -itd --shm-size=16g --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+```
+
+  </Tab>
 </Tabs>
 
 <Tip>
@@ -120,6 +147,7 @@ with limited hardware resources. The following command is based on the W8A8 quan
 #============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the speculative draft model weights directory
 #============================================================
 
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -141,6 +169,7 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
 
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
@@ -167,13 +196,91 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --attention-backend ascend --device npu --quantization modelslim  \
     --max-running-requests 432 --context-length 8192 --dtype bfloat16 \
     --chunked-prefill-size 94208 --max-prefill-tokens 458880 --sampling-backend ascend \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --disable-radix-cache --moe-a2a-backend ascend_fuseep --speculative-draft-model-quantization unquant \
     --tp-size 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.8 --cuda-graph-bs 1 2 4 8 16 20 24 26 27
 ```
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
+
+### Multi-node online deployment
+
+Multi-node deployment distributes tensor parallelism across multiple nodes for models that require more compute resources.
+The following command is based on the W8A8 quantized model with 2 Atlas 800I A3 nodes.
+
+#### 2 x Atlas 800I A3
+
+This configuration uses 2 nodes with TP=32 and DP=32 across both nodes.
+
+```bash Launch server
+#============================================================
+# Before running, update the following variables:
+#   MIX_IP: IP addresses of the two nodes
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the speculative draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+#============================================================
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export SGLANG_SET_CPU_AFFINITY=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+export HCCL_BUFFSIZE=1600
+export HCCL_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_OP_EXPANSION_MODE="AIV"
+
+MIX_IP=(<your node1 ip> <your node2 ip>)
+
+for i in "${!MIX_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${MIX_IP[$i]}" || "$LOCAL_HOST2" == "${MIX_IP[$i]}" ]];
+    then
+        echo "${MIX_IP[$i]}"
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        --host 127.0.0.1 --port 7439 --trust-remote-code \
+        --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --mem-fraction-static 0.8 --max-running-requests 768 \
+        --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
+        --moe-a2a-backend deepep --deepep-mode auto --cuda-graph-bs 6 8 10 12 18 24 \
+        --dist-init-addr ${MIX_IP[0]}:5000 --chunked-prefill-size 131072 --max-prefill-tokens 458880 \
+        --speculative-algorithm EAGLE3 --speculative-draft-model-path ${DRAFT_MODEL_PATH} --speculative-draft-model-quantization unquant \
+        --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+        --context-length 8192 --disable-radix-cache \
+        --enable-dp-lm-head --dtype bfloat16
+        NODE_RANK=$i
+        break
+    fi
+done
+```
 
 ### Multi-node PD disaggregation deployment
 
@@ -182,9 +289,141 @@ throughput for high-concurrency scenarios. The following command is based on the
 
 #### 3 x Atlas 800I A3
 
-This configuration uses 1 node for prefill (TP=16) and 2 nodes for decode (TP=32 across 2 nodes). For the full
-deployment script and benchmark commands, see the
-[3.5K+1.5K high-throughput 24-card disaggregation configuration](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#qwen3-235b-a22b-3_5k-1_5k-50ms-on-a3-24-cards-disaggregation-mode).
+This configuration uses 1 node for prefill (TP=16) and 2 nodes for decode (TP=32 across 2 nodes).
+
+1. Run the following command on all prefill and decode nodes.
+
+```bash Prefill node
+#============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP addresses
+#   ASCEND_MF_STORE_URL: prefill node IP with port (e.g., tcp://192.168.1.1:24667)
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the speculative draft model weights directory
+#   HCCL_SOCKET_IFNAME (decode section): network interface name for HCCL
+#   GLOO_SOCKET_IFNAME (decode section): network interface name for Gloo
+#============================================================
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+
+export SGLANG_SET_CPU_AFFINITY=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_DP_ROUND_ROBIN=1
+export SGLANG_NPU_FUSED_MOE_MODE=2
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+P_IP=(<your prefill ip>)
+D_IP=(<your decode ip1> <your decode ip2>)
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24667"
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        source /usr/local/Ascend/ascend-toolkit/set_env.sh
+        source /usr/local/Ascend/nnal/atb/set_env.sh
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
+        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+        export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
+        export HCCL_BUFFSIZE=4300
+        export TASK_QUEUE_ENABLE=2
+        export HCCL_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=lo
+        export STREAMS_PER_DEVICE=32
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
+        --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
+        --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --mem-fraction-static 0.6 \
+        --disable-radix-cache \
+        --attention-backend ascend --device npu --quantization modelslim --disaggregation-transfer-backend ascend \
+        --speculative-algorithm EAGLE3 --speculative-draft-model-path ${DRAFT_MODEL_PATH} \
+        --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+        --speculative-draft-model-quantization unquant \
+        --max-running-requests 128 --chunked-prefill-size 94208 --max-prefill-tokens 262144 \
+        --enable-dp-attention \
+        --moe-a2a-backend ascend_fuseep --dtype bfloat16
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        source /usr/local/Ascend/ascend-toolkit/set_env.sh
+        source /usr/local/Ascend/nnal/atb/set_env.sh
+        export DP_ROUND_ROBIN=1
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=65536
+        export HCCL_BUFFSIZE=800
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
+        export STREAMS_PER_DEVICE=32
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode \
+        --host ${D_IP[$i]} --port 8001 --trust-remote-code \
+        --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --mem-fraction-static 0.83 --max-running-requests 768 \
+        --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
+        --moe-a2a-backend ascend_fuseep --cuda-graph-bs 6 8 12 15 18 20 22 24 \
+        --speculative-algorithm EAGLE3 --speculative-draft-model-path ${DRAFT_MODEL_PATH} \
+        --speculative-draft-model-quantization unquant \
+        --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+        --dist-init-addr <your decode ip1>:5000 \
+        --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --enable-dp-lm-head --dtype bfloat16 --tokenizer-worker-num 4 \
+        --load-balance-method round_robin
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+2. Launch the SGLang Router (on any reachable node):
+
+```bash Router
+#============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+#============================================================
+
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://<your prefill ip>:8000 8995 \
+    --decode http://<your decode ip>:8001 \
+    --host 127.0.0.1 \
+    --port 7439 \
+    --mini-lb
+```
+
+The full sglang server will serve on `http://127.0.0.1:7439`.
 
 ## Functional verification
 
