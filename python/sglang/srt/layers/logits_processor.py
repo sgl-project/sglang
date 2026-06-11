@@ -66,6 +66,36 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
+_UNQUANTIZED_LM_HEAD_METHODS = {
+    "UnquantizedEmbeddingMethod",
+    "UnquantizedLinearMethod",
+    "PackWeightMethod",
+}
+
+
+def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    if (
+        quant_method is None
+        or not hasattr(lm_head, "weight")
+        or not callable(getattr(quant_method, "apply", None))
+    ):
+        return False
+
+    method_name = type(quant_method).__name__
+    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
+    # Some draft models share an unquantized target lm_head tensor while still
+    # carrying the draft model's stale ModelOpt quant_method. Only use the
+    # ModelOpt lm_head kernel when the actual weight layout matches it.
+    if method_name in ("ModelOptFp4LinearMethod", "ModelOptFp4W4A16LinearMethod"):
+        return lm_head.weight.dtype == torch.uint8
+    if method_name == "ModelOptFp8LinearMethod":
+        return lm_head.weight.dtype == torch.float8_e4m3fn
+
+    return True
+
+
 # When set, LogitsProcessor.forward returns an empty output and skips the
 # LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
 # attention/MoE/GEMM kernels, so the LM-head all-gather is wasted work --
@@ -884,17 +914,7 @@ class LogitsProcessor(nn.Module):
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
-        elif (
-            quant_method is not None
-            and hasattr(lm_head, "weight")
-            and callable(getattr(quant_method, "apply", None))
-            and type(quant_method).__name__
-            not in (
-                "UnquantizedEmbeddingMethod",
-                "UnquantizedLinearMethod",
-                "PackWeightMethod",
-            )
-        ):
+        elif should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
