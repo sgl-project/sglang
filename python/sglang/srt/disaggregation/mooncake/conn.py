@@ -12,7 +12,6 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
-import zmq
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
@@ -361,25 +360,20 @@ class MooncakeKVManager(CommonKVManager):
         """Notify decode that a non-last staging chunk RDMA is complete."""
         try:
             na = NetworkAddress(req.endpoint, req.dst_port)
-            endpoint = na.to_tcp()
-            sock, lock = self._connect(endpoint, is_ipv6=na.is_ipv6)
-            with lock:
-                sock.send_multipart(
-                    [
-                        b"CHUNK_READY",
-                        str(req.room).encode("ascii"),
-                        str(chunk_idx).encode("ascii"),
-                        str(kv_chunk.index_slice.start).encode("ascii"),
-                        str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                        req.mooncake_session_id.encode("ascii"),
-                        str(prefill_unique_rank).encode("ascii"),
-                    ]
-                )
-        except zmq.Again:
-            logger.warning(
-                f"ZMQ send timeout to {endpoint}, disconnecting stale socket"
+            self._connect(
+                na.to_tcp(),
+                is_ipv6=na.is_ipv6,
+            ).send_multipart(
+                [
+                    b"CHUNK_READY",
+                    str(req.room).encode("ascii"),
+                    str(chunk_idx).encode("ascii"),
+                    str(kv_chunk.index_slice.start).encode("ascii"),
+                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                    req.mooncake_session_id.encode("ascii"),
+                    str(prefill_unique_rank).encode("ascii"),
+                ]
             )
-            self.disconnect_endpoint(endpoint)
         except Exception:
             pass
 
@@ -885,27 +879,18 @@ class MooncakeKVManager(CommonKVManager):
         data: bytes,
     ):
         na = NetworkAddress(remote, dst_port)
-        endpoint = na.to_tcp()
-        try:
-            sock, lock = self._connect(endpoint, is_ipv6=na.is_ipv6)
-            with lock:
-                sock.send_multipart(
-                    [
-                        MooncakeKVManager.AUX_DATA_HEADER,
-                        str(room).encode("ascii"),
-                        str(buffer_index).encode("ascii"),
-                        str(aux_index).encode("ascii"),
-                        struct.pack(">I", len(data)),
-                        data,
-                    ]
-                )
-        except zmq.Again:
-            logger.warning(
-                f"ZMQ send timeout to {endpoint}, disconnecting stale socket"
-            )
-            self.disconnect_endpoint(endpoint)
-        except Exception:
-            pass
+        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
+
+        socket.send_multipart(
+            [
+                MooncakeKVManager.AUX_DATA_HEADER,
+                str(room).encode("ascii"),
+                str(buffer_index).encode("ascii"),
+                str(aux_index).encode("ascii"),
+                struct.pack(">I", len(data)),
+                data,
+            ]
+        )
 
     def _handle_aux_data(self, msg: List[bytes]):
         """Handle AUX_DATA messages received by the decode thread."""
@@ -1150,24 +1135,13 @@ class MooncakeKVManager(CommonKVManager):
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         na = NetworkAddress(remote, dst_port)
-        endpoint = na.to_tcp()
-        try:
-            sock, lock = self._connect(endpoint, is_ipv6=na.is_ipv6)
-            with lock:
-                sock.send_multipart(
-                    [
-                        str(room).encode("ascii"),
-                        str(status).encode("ascii"),
-                        str(prefill_rank).encode("ascii"),
-                    ]
-                )
-        except zmq.Again:
-            logger.warning(
-                f"ZMQ send timeout to {endpoint}, disconnecting stale socket"
-            )
-            self.disconnect_endpoint(endpoint)
-        except Exception:
-            pass
+        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+            [
+                str(room).encode("ascii"),
+                str(status).encode("ascii"),
+                str(prefill_rank).encode("ascii"),
+            ]
+        )
 
     def transfer_worker(
         self,

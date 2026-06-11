@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from collections import defaultdict
+from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -127,18 +128,15 @@ class CommonKVManager(BaseKVManager):
         )
 
         # bind zmq socket
-        self._zmq_ctx = zmq.Context()
+        context = zmq.Context()
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            self._zmq_ctx, zmq.PULL, host=self.local_ip
+            context, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
-        self._push_socket_cache: Dict[str, zmq.Socket] = {}
-        self._push_socket_lock = threading.Lock()
-        self._push_endpoint_locks: Dict[str, threading.Lock] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
@@ -427,43 +425,13 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
+    @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
-        with self._push_socket_lock:
-            if endpoint in self._push_socket_cache:
-                return (
-                    self._push_socket_cache[endpoint],
-                    self._push_endpoint_locks[endpoint],
-                )
-            sock = self._zmq_ctx.socket(zmq.PUSH)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.RECONNECT_IVL, -1)
-            sock.setsockopt(zmq.SNDTIMEO, 30000)
-            sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
-            if is_ipv6:
-                sock.setsockopt(zmq.IPV6, 1)
-            sock.connect(endpoint)
-            lock = threading.Lock()
-            self._push_endpoint_locks[endpoint] = lock
-            self._push_socket_cache[endpoint] = sock
-            return (
-                self._push_socket_cache[endpoint],
-                self._push_endpoint_locks[endpoint],
-            )
-
-    def disconnect_endpoint(self, endpoint: str):
-        with self._push_socket_lock:
-            sock = self._push_socket_cache.pop(endpoint, None)
-            lock = self._push_endpoint_locks.pop(endpoint, None)
-        if sock:
-            if lock:
-                with lock:
-                    sock.close()
-            else:
-                sock.close()
-            logger.debug(f"Disconnected stale ZMQ PUSH socket: {endpoint}")
+        socket = zmq.Context().socket(zmq.PUSH)
+        if is_ipv6:
+            socket.setsockopt(zmq.IPV6, 1)
+        socket.connect(endpoint)
+        return socket
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -1064,13 +1032,6 @@ class CommonKVReceiver(BaseKVReceiver):
         with cls._global_lock:
             if endpoint not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
-                sock.setsockopt(zmq.LINGER, 0)
-                sock.setsockopt(zmq.RECONNECT_IVL, -1)
-                sock.setsockopt(zmq.SNDTIMEO, 30000)
-                sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
-                sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
-                sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
-                sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
                 sock.connect(endpoint)
