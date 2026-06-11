@@ -21,6 +21,10 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 
+from sglang.srt.layers.moe.moe_runner.torch_npu import (
+    TorchNpuQuantInfo,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig, GPTQMarlinConfig
