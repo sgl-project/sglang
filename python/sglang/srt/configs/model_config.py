@@ -1679,6 +1679,11 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     Used by DeepSeek, BailingMoe, SarvamMLA and similar MLA models.
     Warns if 'factor' is missing from rope_scaling (common in v5 configs).
     """
+    if not rope_scaling.get("apply_yarn_scaling", True) or not rope_scaling.get(
+        "apply_scale", True
+    ):
+        return base_scaling
+
     mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
     if "factor" not in rope_scaling:
         logger.warning(

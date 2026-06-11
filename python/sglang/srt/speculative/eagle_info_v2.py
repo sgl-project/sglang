@@ -45,7 +45,11 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
 )
-from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils.async_probe import (
+    maybe_detect_nan,
+    maybe_detect_oob,
+    sanitize_nan_logits,
+)
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu
 
 _is_cuda = is_cuda()
@@ -473,6 +477,8 @@ class EagleVerifyInputV2Mixin:
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
+
+        sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.

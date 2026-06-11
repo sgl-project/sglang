@@ -621,6 +621,7 @@ class Envs:
     # Overlap Spec V2
     SGLANG_ENABLE_SPEC_V2 = EnvBool(True)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    SGLANG_DFLASH_PREFILL_REFILL_TARGET = EnvInt(None)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
@@ -628,6 +629,9 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    # Sanitize NaN logits before sampling kernels and log a throttled warning
+    # (see sanitize_nan_logits).
+    SGLANG_SANITIZE_NAN_LOGITS = EnvBool(True)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
