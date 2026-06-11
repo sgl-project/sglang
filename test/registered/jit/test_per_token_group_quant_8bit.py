@@ -29,10 +29,26 @@ register_cuda_ci(est_time=16, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=16, suite="jit-kernel-unit-test-amd")
 
+# On ROCm the jit-kernel CI step has a 10-min budget; the full 1872-case
+# matrix takes ~31 min there (~1s/case), so trim the two largest sweeps
+# (num_tokens, hidden_dim) for AMD while keeping every group_size + flag
+# combination so all kernel paths stay covered. CUDA keeps the full matrix.
+_num_tokens = (
+    [1, 64, 128, 1024] if _is_hip else [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192]
+)
+_hidden_dim = (
+    [128, 512, 2048, 7168]
+    if _is_hip
+    else [128, 256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384]
+)
+_num_tokens_fused = (
+    [1, 32, 512] if _is_hip else [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8]
+)
+
 configs = list(
     itertools.product(
-        [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
-        [128, 256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384],  # hidden_dim
+        _num_tokens,  # num_tokens
+        _hidden_dim,  # hidden_dim
         [16, 32, 64, 128],  # group_size
         [None],  # num_ranks
         [fp8_type_],  # dtype
@@ -69,7 +85,7 @@ configs = list(
     )
 ) + list(
     itertools.product(
-        [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+        _num_tokens_fused,
         [2048],
         [128],
         [8, 16, 32, 48],
