@@ -60,6 +60,8 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    reprocessed_log_input_tokens: int = 0
+    reprocessed_log_hit_tokens: int = 0
     num_pending_tokens: int = 0
 
     @classmethod
@@ -73,6 +75,8 @@ class PrefillStats:
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
+            reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
+            reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -578,9 +582,16 @@ class SchedulerMetricsReporter:
                 )
 
             priority_enabled = self.scheduler.enable_priority_scheduling
-            total_tokens = prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
+            effective_input_tokens = (
+                prefill_stats.log_input_tokens
+                - prefill_stats.reprocessed_log_input_tokens
+            )
+            effective_hit_tokens = (
+                prefill_stats.log_hit_tokens - prefill_stats.reprocessed_log_hit_tokens
+            )
+            total_tokens = effective_input_tokens + effective_hit_tokens
             cache_hit_rate = (
-                prefill_stats.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
+                effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
 
             # Basics
@@ -979,17 +990,19 @@ class SchedulerMetricsReporter:
         self.forward_pass_device_timer._report()
         now = time.perf_counter()
         if self._device_timer_window_batch_count == 0:
+            # Window start: keep the last published value instead of NaN-ing
+            # the gauge. Readers sample it asynchronously, and the window
+            # boundary can phase-lock with the decode-log cadence, turning a
+            # one-tick NaN into NaN on every log line. NaN is published only
+            # when truly stale (reset_device_timer_window after idle).
             self._device_timer_window_start = now
             self._device_timer_window_gpu_time = 0.0
-            cpu_time = 0
-            self.fwd_occupancy = float("nan")
         else:
             cpu_time = now - self._device_timer_window_start
-            self.fwd_occupancy = min(
-                self._device_timer_window_gpu_time / cpu_time * 100, 100
-            )
-        # ratio = self._device_timer_window_gpu_time / cpu_time if cpu_time > 0 else float("nan")
-        # print(f"{self._device_timer_window_batch_count=} {self.fwd_occupancy=}, {self._device_timer_window_gpu_time=}, {cpu_time=}, {ratio=}")
+            if cpu_time > 0:
+                self.fwd_occupancy = min(
+                    self._device_timer_window_gpu_time / cpu_time * 100, 100
+                )
         self._device_timer_window_batch_count += 1
         if (
             self._device_timer_window_batch_count

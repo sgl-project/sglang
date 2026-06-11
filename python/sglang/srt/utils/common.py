@@ -94,6 +94,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -283,6 +284,11 @@ is_sm100_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
 )
+is_sm80_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
+    )
+)
 is_sm90_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
@@ -300,9 +306,9 @@ except:
     is_intel_amx_backend_available = False
 
 try:
-    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
-    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+    is_amx_tile_supported = torch.cpu._is_amx_tile_supported()
 except:
     is_amx_tile_supported = False
 
@@ -653,8 +659,6 @@ def get_available_gpu_memory(
     elif device == "mps":
         free_gpu_memory = psutil.virtual_memory().available
     else:
-        from sglang.srt.platforms import current_platform
-
         if not current_platform.is_out_of_tree():
             raise ValueError(
                 f"Unsupported device type: {device!r}. "
@@ -755,6 +759,8 @@ def get_dispatch_device_backend():
         dispatch_key = "CUDA"
     elif is_xpu():
         dispatch_key = "XPU"
+    elif is_npu():
+        dispatch_key = "NPU"
     else:
         raise RuntimeError("No supported accelerator (CUDA/XPU) available")
     return dispatch_key
@@ -1154,7 +1160,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.11.post1")
+        min_version: Minimum version required (e.g., "0.6.12")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1888,8 +1894,6 @@ def get_mtgpu_memory_capacity():
 
 def get_device_memory_capacity(device: str = None):
     # OOT platforms provide their own memory query via the platform class.
-    from sglang.srt.platforms import current_platform
-
     if current_platform.is_out_of_tree():
         mem_bytes = current_platform.get_device_total_memory()
         if mem_bytes:
@@ -2074,7 +2078,12 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "mps"
         return "mps:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
+    try:
+        return current_platform.get_device(device_id)
+    except Exception:
+        raise RuntimeError(
+            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+        )
 
 
 @lru_cache(maxsize=1)
@@ -2140,8 +2149,6 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
 def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
-    from sglang.srt.platforms import current_platform
-
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
 
@@ -2510,30 +2517,24 @@ def human_readable_int(value: str) -> int:
         )
 
 
-def pyspy_dump_schedulers():
-    """py-spy dump on all scheduler in a local node."""
-    pid = psutil.Process().pid
-    for attempt, native_flag in enumerate(["--native", ""]):
-        try:
-            cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, check=True
-            )
-            logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
-            return
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
-    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
-
-
 def kill_itself_when_parent_died():
     if sys.platform == "linux":
         # sigkill this process when parent worker manager dies
         PR_SET_PDEATHSIG = 1
         libc = ctypes.CDLL("libc.so.6")
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    elif sys.platform == "darwin":
+        # macOS has no PR_SET_PDEATHSIG equivalent; the MLX backend provides a
+        # kqueue-based watchdog that SIGKILLs this worker once it is orphaned.
+        from sglang.srt.hardware_backend.mlx.parent_watchdog import (
+            start_parent_death_watcher,
+        )
+
+        start_parent_death_watcher()
     else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+        logger.warning(
+            "kill_itself_when_parent_died is only supported on linux and macOS."
+        )
 
 
 class UvicornAccessLogFilter(logging.Filter):
@@ -3083,13 +3084,14 @@ def dispose_tensor(x: torch.Tensor):
     interfering with torch.compile's memory tracking and graph recording.
     """
 
-    # Skip disposal during piecewise CUDA graph to avoid torch.compile issues
-    # we do local import to avoid circular import
-    from sglang.srt.compilation.piecewise_context_manager import (
-        is_in_piecewise_cuda_graph,
+    # Skip disposal during piecewise CUDA graph capture/replay: freeing the
+    # backing storage would invalidate addresses recorded in the graph.
+    # Local import avoids a circular dependency.
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        is_in_tc_piecewise_cuda_graph,
     )
 
-    if is_in_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph():
         return
 
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
@@ -3647,6 +3649,18 @@ def is_gfx95_supported():
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx942_supported():
+    """
+    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx942"])
     else:
         return False
 
