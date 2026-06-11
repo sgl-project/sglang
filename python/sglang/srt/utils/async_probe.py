@@ -59,9 +59,8 @@ _nan_warner = _AsyncNanWarner()
 
 
 def maybe_warn_nan(tensor: Optional[torch.Tensor], msg: str = ""):
-    """Non-fatal counterpart of maybe_detect_nan, gated on
-    SGLANG_LOG_NAN_LOGITS: warn (throttled, sync-free) instead of crashing.
-    Callers are expected to sanitize the tensor themselves."""
+    """Non-fatal counterpart of maybe_detect_nan: throttled sync-free warning
+    instead of crashing. Callers sanitize the tensor themselves."""
     if not envs.SGLANG_LOG_NAN_LOGITS.get():
         return
     if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
@@ -73,15 +72,15 @@ def maybe_warn_nan(tensor: Optional[torch.Tensor], msg: str = ""):
 
 
 def sanitize_nan_logits(logits: torch.Tensor, msg: str = ""):
-    """Detect NaN (assert in CI; opt-in throttled warning in prod via
-    SGLANG_LOG_NAN_LOGITS), then sanitize in place: NaN logits (e.g. fp16
-    activation overflow) are undefined behavior in sampling kernels and can
-    come back as out-of-vocab token ids. Replacement is +-1e30 rather than
-    dtype min/max because callers divide logits by temperature, which would
-    overflow dtype min/max to +-Inf and softmax back to NaN."""
+    """Detect NaN (assert in CI, throttled warning in prod), then sanitize in
+    place: NaN logits (e.g. fp16 activation overflow) are undefined behavior
+    in sampling kernels and can come back as out-of-vocab token ids. +-1e30
+    rather than dtype min/max because callers divide logits by temperature,
+    which would overflow dtype min/max to +-Inf and softmax back to NaN."""
     maybe_detect_nan(logits, msg)
     maybe_warn_nan(logits, msg)
-    torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
+    if envs.SGLANG_SANITIZE_NAN_LOGITS.get():
+        torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
 
 
 def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
