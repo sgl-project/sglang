@@ -138,6 +138,7 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
         self._push_socket_cache: Dict[str, zmq.Socket] = {}
         self._push_socket_lock = threading.Lock()
+        self._push_endpoint_locks: Dict[str, threading.Lock] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
@@ -441,14 +442,22 @@ class CommonKVManager(BaseKVManager):
             if is_ipv6:
                 sock.setsockopt(zmq.IPV6, 1)
             sock.connect(endpoint)
+            lock = threading.Lock()
+            self._push_endpoint_locks[endpoint] = lock
             self._push_socket_cache[endpoint] = sock
-            return sock
+            return sock, lock
 
     def disconnect_endpoint(self, endpoint: str):
         with self._push_socket_lock:
             sock = self._push_socket_cache.pop(endpoint, None)
+            lock = self._push_endpoint_locks.pop(endpoint, None)
         if sock:
-            sock.close()
+            if lock:
+                with lock:
+                    sock.close()
+            else:
+                sock.close()
+            logger.debug(f"Disconnected stale ZMQ PUSH socket: {endpoint}")
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -1067,9 +1076,14 @@ class CommonKVReceiver(BaseKVReceiver):
     def disconnect_endpoint(cls, endpoint: str):
         with cls._global_lock:
             sock = cls._socket_cache.pop(endpoint, None)
-            cls._socket_locks.pop(endpoint, None)
+            lock = cls._socket_locks.pop(endpoint, None)
         if sock:
-            sock.close()
+            if lock:
+                with lock:
+                    sock.close()
+            else:
+                sock.close()
+            logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):

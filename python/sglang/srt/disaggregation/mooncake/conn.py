@@ -362,19 +362,26 @@ class MooncakeKVManager(CommonKVManager):
         try:
             na = NetworkAddress(req.endpoint, req.dst_port)
             endpoint = na.to_tcp()
-            self._connect(endpoint, is_ipv6=na.is_ipv6).send_multipart(
-                [
-                    b"CHUNK_READY",
-                    str(req.room).encode("ascii"),
-                    str(chunk_idx).encode("ascii"),
-                    str(kv_chunk.index_slice.start).encode("ascii"),
-                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                    req.mooncake_session_id.encode("ascii"),
-                    str(prefill_unique_rank).encode("ascii"),
-                ]
-            )
+            sock, lock = self._connect(endpoint, is_ipv6=na.is_ipv6)
+            with lock:
+                sock.send_multipart(
+                    [
+                        b"CHUNK_READY",
+                        str(req.room).encode("ascii"),
+                        str(chunk_idx).encode("ascii"),
+                        str(kv_chunk.index_slice.start).encode("ascii"),
+                        str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                        req.mooncake_session_id.encode("ascii"),
+                        str(prefill_unique_rank).encode("ascii"),
+                    ]
+                )
         except zmq.Again:
+            logger.warning(
+                f"ZMQ send timeout to {endpoint}, disconnecting stale socket"
+            )
             self.disconnect_endpoint(endpoint)
+        except Exception:
+            pass
 
     def _do_staging_transfer(
         self,
@@ -880,17 +887,22 @@ class MooncakeKVManager(CommonKVManager):
         na = NetworkAddress(remote, dst_port)
         endpoint = na.to_tcp()
         try:
-            self._connect(endpoint, is_ipv6=na.is_ipv6).send_multipart(
-                [
-                    MooncakeKVManager.AUX_DATA_HEADER,
-                    str(room).encode("ascii"),
-                    str(buffer_index).encode("ascii"),
-                    str(aux_index).encode("ascii"),
-                    struct.pack(">I", len(data)),
-                    data,
-                ]
-            )
+            sock, lock = self._connect(endpoint, is_ipv6=na.is_ipv6)
+            with lock:
+                sock.send_multipart(
+                    [
+                        MooncakeKVManager.AUX_DATA_HEADER,
+                        str(room).encode("ascii"),
+                        str(buffer_index).encode("ascii"),
+                        str(aux_index).encode("ascii"),
+                        struct.pack(">I", len(data)),
+                        data,
+                    ]
+                )
         except zmq.Again:
+            logger.warning(
+                f"ZMQ send timeout to {endpoint}, disconnecting stale socket"
+            )
             self.disconnect_endpoint(endpoint)
 
     def _handle_aux_data(self, msg: List[bytes]):
@@ -1138,14 +1150,19 @@ class MooncakeKVManager(CommonKVManager):
         na = NetworkAddress(remote, dst_port)
         endpoint = na.to_tcp()
         try:
-            self._connect(endpoint, is_ipv6=na.is_ipv6).send_multipart(
-                [
-                    str(room).encode("ascii"),
-                    str(status).encode("ascii"),
-                    str(prefill_rank).encode("ascii"),
-                ]
-            )
+            sock, lock = self._connect(endpoint, is_ipv6=na.is_ipv6)
+            with lock:
+                sock.send_multipart(
+                    [
+                        str(room).encode("ascii"),
+                        str(status).encode("ascii"),
+                        str(prefill_rank).encode("ascii"),
+                    ]
+                )
         except zmq.Again:
+            logger.warning(
+                f"ZMQ send timeout to {endpoint}, disconnecting stale socket"
+            )
             self.disconnect_endpoint(endpoint)
 
     def transfer_worker(
@@ -1589,37 +1606,6 @@ class MooncakeKVManager(CommonKVManager):
             self.failed_session_probe_interval
         ):
             self._run_one_probe_pass()
-
-    def _handle_node_failure(self, failed_bootstrap_addr):
-        with self.connection_lock:
-            keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
-            ]
-            for k in keys_to_remove:
-                del self.connection_pool[k]
-
-            possible_affected_rooms = self.addr_to_rooms_tracker.get(
-                failed_bootstrap_addr, []
-            )
-            self.prefill_info_table.pop(failed_bootstrap_addr, None)
-            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
-
-        # Report the requests associated with the failed bootstrap addr and mark their status as KVPoll.Failed
-        affected_rooms = []
-        for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != KVPoll.Success
-            ):
-                self.record_failure(
-                    room,
-                    f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
-                )
-                self.update_status(room, KVPoll.Failed)
-                affected_rooms.append(room)
-        logger.error(
-            f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), {len(affected_rooms)} requests affected"
-        )
 
 
 class MooncakeKVSender(CommonKVSender):
