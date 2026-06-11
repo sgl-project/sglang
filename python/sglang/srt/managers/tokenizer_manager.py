@@ -1640,6 +1640,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
+            self._pause_epoch = getattr(self, "_pause_epoch", 0) + 1
+            self._maybe_arm_pause_watchdog(self._pause_epoch)
             if obj.mode != "abort":
                 await self.send_to_scheduler.send_pyobj(obj)
             else:
@@ -1651,6 +1653,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if not is_locked:
                         break
                     await asyncio.sleep(1.0)
+
+    def _maybe_arm_pause_watchdog(self, epoch: int) -> None:
+        """Auto-continue if the pause controller dies between pause and
+        continue, which otherwise gates new requests forever while /health
+        stays green. The watchdog lives here rather than in the scheduler
+        because the tokenizer's ``is_pause`` gate is what holds traffic, and
+        ``continue_generation`` clears both it and the engine pause."""
+        timeout = envs.SGLANG_ENGINE_PAUSE_TIMEOUT.get()
+        if timeout <= 0:
+            return
+
+        async def watchdog() -> None:
+            await asyncio.sleep(timeout)
+            async with self.is_pause_cond:
+                still_same_pause = (
+                    self.is_pause and getattr(self, "_pause_epoch", 0) == epoch
+                )
+            if not still_same_pause:
+                return
+            logger.error(
+                f"Engine has been paused for more than {timeout:.0f}s; "
+                "auto-continuing. The pause controller likely died between "
+                "pause_generation and continue_generation."
+            )
+            await self.continue_generation(ContinueGenerationReqInput())
+
+        asyncio.create_task(watchdog())
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:

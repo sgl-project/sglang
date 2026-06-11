@@ -648,6 +648,12 @@ class TokenizerWorker(TokenizerManager):
         async with self.is_pause_cond:
             if obj.is_pause:
                 self.is_pause = True
+                # pause_generation() is overridden above and never sets the
+                # local gate, so the watchdog must be armed here instead.
+                # Every worker arms one; whichever fires first broadcasts the
+                # continue (via the override) and the rest see is_pause False.
+                self._pause_epoch = getattr(self, "_pause_epoch", 0) + 1
+                self._maybe_arm_pause_watchdog(self._pause_epoch)
             else:
                 self.is_pause = False
                 self.is_pause_cond.notify_all()
