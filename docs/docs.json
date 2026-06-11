@@ -690,6 +690,10 @@
       "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1"
     },
     {
+      "source": "/platforms/cambricon_mlu.html",
+      "destination": "/docs/hardware-platforms/cambricon_mlu"
+    },
+    {
       "source": "/platforms/cpu_server.html",
       "destination": "/docs/hardware-platforms/cpu_server"
     },
@@ -1183,6 +1187,7 @@
                   "docs/hardware-platforms/ascend-npus/faq"
                 ]
               },
+              "docs/hardware-platforms/cambricon_mlu",
               "docs/hardware-platforms/cpu_server",
               {
                 "group": "Edge & Embedded",
