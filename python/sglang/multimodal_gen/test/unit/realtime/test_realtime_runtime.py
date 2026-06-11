@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+    realtime_adapter,
     realtime_video_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
@@ -38,22 +39,22 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_diffusion import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.base import (
     RealtimeDiffusionStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.input_validation import (
     RealtimeInputValidationStage,
     RealtimeInputValidationState,
 )
-from sglang.multimodal_gen.runtime.realtime.causal_state import (
-    RealtimeCausalDecodeState,
-)
-from sglang.multimodal_gen.runtime.realtime.condition_events import (
+from sglang.multimodal_gen.runtime.realtime.control_signals import (
     ControlStateTransition,
 )
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
     RealtimeSessionCache,
+)
+from sglang.multimodal_gen.runtime.realtime.states import (
+    RealtimeCausalDecodeState,
 )
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
@@ -74,8 +75,14 @@ class _State(BaseRealtimeState):
         self.disposed = True
 
 
+class _TestRealtimeDiffusionStage(RealtimeDiffusionStage):
+    def forward(self, batch, component_manager=None):
+        del batch, component_manager
+        raise NotImplementedError
+
+
 def test_realtime_diffusion_stage_declares_long_lived_components():
-    stage = RealtimeDiffusionStage()
+    stage = _TestRealtimeDiffusionStage()
     server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(dit_precision="bf16", vae_precision="fp32")
     )
@@ -93,7 +100,7 @@ def test_realtime_diffusion_stage_declares_long_lived_components():
 
 
 def test_realtime_diffusion_stage_requires_session():
-    stage = RealtimeDiffusionStage(default_height=480, default_width=832)
+    stage = _TestRealtimeDiffusionStage(default_height=480, default_width=832)
     req = _Req(session=None)
 
     try:
@@ -147,11 +154,11 @@ def test_realtime_session_cache_rejects_missing_nonzero_chunk():
         raise AssertionError("expected missing realtime session to fail")
 
 
-def test_lingbot_realtime_state_uses_generic_condition_queue():
+def test_lingbot_realtime_state_uses_control_script_and_prompt_queues():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 
     assert state.sample_camera_actions(3) == [[], [], []]
-    state.receive_camera_actions([["w"], ["a"], ["s"], ["d"]])
+    state.receive_camera_action_script([["w"], ["a"], ["s"], ["d"]])
     assert state.sample_camera_actions(3) == [["w"], ["a"], ["s"]]
     assert state.sample_camera_actions(3) == [["d"], [], []]
     assert state.sample_camera_actions(3) == [[], [], []]
@@ -160,6 +167,17 @@ def test_lingbot_realtime_state_uses_generic_condition_queue():
     assert state.has_prompt()
     assert state.sample_prompt() == "turn left"
     assert not state.has_prompt()
+
+
+def test_lingbot_realtime_camera_script_replaces_state_queue():
+    state = lingbot_realtime.LingBotWorldRealtimeState()
+
+    state.receive_camera_state(["w"], event_id=7)
+    state.receive_camera_action_script([["d"]], event_id=8)
+
+    assert state.sample_camera_actions(3) == [["d"], [], []]
+    assert state.latest_sampled_event_id == 8
+    assert state.sample_camera_actions(3) == [[], [], []]
 
 
 def test_lingbot_realtime_camera_events_preserve_short_presses():
@@ -204,7 +222,7 @@ def test_lingbot_realtime_camera_state_compacts_multiple_pending_updates():
 
 def test_sana_wm_realtime_camera_state_uses_sana_normalizer():
     state = sana_wm_realtime.SanaWMRealtimeAdapterState()
-    result = state.receive_camera_event_payload(
+    result = state.receive_camera_control_event_payload(
         {
             "mode": "state",
             "transitions": [
@@ -224,10 +242,10 @@ def test_sana_wm_realtime_adapter_preserves_requested_size():
     async def fake_save_image_to_path(image, target_path):
         return target_path
 
-    old_save_image_to_path = sana_wm_realtime.save_image_to_path
-    old_get_global_server_args = sana_wm_realtime.get_global_server_args
-    sana_wm_realtime.save_image_to_path = fake_save_image_to_path
-    sana_wm_realtime.get_global_server_args = lambda: SimpleNamespace(
+    old_save_image_to_path = realtime_adapter.save_image_to_path
+    old_get_global_server_args = realtime_adapter.get_global_server_args
+    realtime_adapter.save_image_to_path = fake_save_image_to_path
+    realtime_adapter.get_global_server_args = lambda: SimpleNamespace(
         input_save_path=None
     )
     try:
@@ -245,8 +263,8 @@ def test_sana_wm_realtime_adapter_preserves_requested_size():
 
         assert request.size == "832x480"
     finally:
-        sana_wm_realtime.save_image_to_path = old_save_image_to_path
-        sana_wm_realtime.get_global_server_args = old_get_global_server_args
+        realtime_adapter.save_image_to_path = old_save_image_to_path
+        realtime_adapter.get_global_server_args = old_get_global_server_args
 
 
 def test_lingbot_realtime_adapter_ingests_generic_events():
@@ -590,15 +608,16 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
             prompt=sampling_params.prompt,
             condition_inputs=dict(sampling_params.condition_inputs),
             realtime_chunk_size=sampling_params.realtime_chunk_size,
+            session=None,
         )
 
     monkeypatch.setattr(
-        lingbot_realtime,
+        realtime_adapter,
         "build_sampling_params",
         fake_build_sampling_params,
     )
     monkeypatch.setattr(
-        lingbot_realtime,
+        realtime_adapter,
         "prepare_request",
         fake_prepare_backend_request,
     )
@@ -617,7 +636,7 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
     assert batch.request_id == chunk.request_id
     assert batch.condition_inputs == {"camera_actions": [["w"], ["w"], ["w"]]}
     assert batch.realtime_chunk_size == 3
-    assert batch.session is session.realtime_session
+    assert batch.session is None
     assert batch.realtime_session_id == session.id
     assert batch.block_idx == 0
     assert batch.return_raw_frames is True
@@ -743,7 +762,7 @@ def test_lingbot_realtime_adapter_sends_stale_output_for_client_cutover():
     session = GenerateSession()
     session.set_adapter(adapter)
     state = adapter._state(session)
-    state.receive_camera_actions([["d"]], event_id=7)
+    state.receive_camera_action_script([["d"]], event_id=7)
     calls = []
 
     async def fake_send(ws, session_arg, result_arg, batch_arg):
@@ -884,7 +903,7 @@ def test_realtime_chunk_latent_preparation_uses_chunk_spec():
 
     import torch
 
-    from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
         RealtimeChunkLatentPreparationStage,
     )
 
