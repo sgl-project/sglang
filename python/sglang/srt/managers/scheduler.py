@@ -234,7 +234,11 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dflash_utils import (
+    resolve_dflash_prefill_refill_target,
+    should_delay_dflash_prefill_for_batching,
+    validate_dflash_request,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -838,6 +842,11 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.dflash_prefill_refill_target = (
+            resolve_dflash_prefill_refill_target(self.max_running_requests)
+            if self.spec_algorithm.is_dflash()
+            else 1
+        )
         if not get_global_server_args().pp_max_micro_batch_size:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // self.ps.pp_size, 1
@@ -1412,8 +1421,10 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        # WAR barrier is CUDA-only; other platforms keep the pre-barrier behavior.
-        self._war_barrier_enabled = is_cuda()
+        # DFLASH fences its shared req_to_token writes with verify_done /
+        # plan-stream deps, so the global WAR barrier only serializes plan
+        # overlap. TODO: generalize this global-barrier enablement policy.
+        self._war_barrier_enabled = is_cuda() and not self.spec_algorithm.is_dflash()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -2029,13 +2040,12 @@ class Scheduler(
             return
 
         if self.spec_algorithm.is_dflash():
-            error_msg = validate_dflash_request(req)
+            error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
-
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
@@ -2544,6 +2554,19 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _should_delay_dflash_prefill_for_batching(self, running_bs: int) -> bool:
+        if not self.spec_algorithm.is_dflash():
+            return False
+        if running_bs <= 0 or self.chunked_req is not None:
+            return False
+
+        return should_delay_dflash_prefill_for_batching(
+            running_bs=running_bs,
+            num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
+            max_running_requests=self.max_running_requests,
+            prefill_refill_target=self.dflash_prefill_refill_target,
+        )
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2586,6 +2609,8 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
+        if self._should_delay_dflash_prefill_for_batching(running_bs):
+            return None
 
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
