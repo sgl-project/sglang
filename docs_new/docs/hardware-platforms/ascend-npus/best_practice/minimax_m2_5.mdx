@@ -259,7 +259,7 @@ do
         export SGLANG_NPU_FUSED_MOE_MODE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        --port 8001 \
         --trust-remote-code \
         --tp-size 16 \
         --mem-fraction-static 0.76 \
@@ -435,7 +435,7 @@ do
         export SGLANG_NPU_FUSED_MOE_MODE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        --port 8001 \
         --trust-remote-code \
         --tp-size 16 \
         --mem-fraction-static 0.76 \

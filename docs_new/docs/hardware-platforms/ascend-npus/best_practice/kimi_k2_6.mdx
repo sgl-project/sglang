@@ -271,7 +271,7 @@ do
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        --port 8001 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -433,7 +433,7 @@ do
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        --port 8001 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -597,7 +597,7 @@ do
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        --port 8001 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -759,7 +759,7 @@ do
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        --port 8001 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
