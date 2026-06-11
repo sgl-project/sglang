@@ -453,6 +453,7 @@ class Scheduler(
             tp_group=self.tp_group,
             pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
+            on_device_pools_ready=self._init_prefill_disaggregation_before_hicache,
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -527,8 +528,12 @@ class Scheduler(
         # Init profiler
         self.init_profiler()
 
-        # Init prefill-decodedisaggregation
-        self.init_disaggregation()
+        # Init prefill-decode disaggregation. Prefill is brought up earlier, via
+        # the build_kv_cache on_device_pools_ready callback, so its libfabric
+        # buffer registration precedes the HiCache host-buffer pin. Decode and
+        # the non-disaggregated case are initialized here.
+        if self.server_args.disaggregation_mode != "prefill":
+            self.init_disaggregation()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1035,6 +1040,22 @@ class Scheduler(
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
+
+    def _init_prefill_disaggregation_before_hicache(
+        self, req_to_token_pool, token_to_kv_pool_allocator
+    ):
+        # Invoked by build_kv_cache after the device KV buffers are allocated
+        # but before the host KV buffer is pinned. NIXL registers the device
+        # buffers with libfabric during disaggregation init; running it after
+        # the HiCache host pin (cudaHostRegister) can OOM libfabric, which needs
+        # contiguous physical memory for completion queues and other structures.
+        # The prefill bootstrap queue needs only the device pool, not the radix
+        # tree, so it is safe to initialize here. Decode keeps its init in
+        # __init__ since its queues require the tree cache.
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        if self.server_args.disaggregation_mode == "prefill":
+            self.init_disaggregation()
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(

@@ -5,7 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -143,6 +143,7 @@ def build_kv_cache(
     tp_group: "GroupCoordinator",
     pp_group: "GroupCoordinator",
     enable_hierarchical_cache: bool,
+    on_device_pools_ready: Optional[Callable[[object, object], None]] = None,
 ) -> "KVCacheBuildResult":
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -171,6 +172,15 @@ def build_kv_cache(
         )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
+
+    # Hook for setup that must observe the freshly-allocated device KV buffers
+    # but must run before the host KV buffer is allocated below. NIXL
+    # disaggregation registers the device buffers with libfabric during this
+    # step; if it runs after HiCache pins (cudaHostRegister) its large host
+    # buffer, libfabric can fail to allocate the contiguous physical memory it
+    # needs for completion queues and other structures.
+    if on_device_pools_ready is not None:
+        on_device_pools_ready(req_to_token_pool, token_to_kv_pool_allocator)
 
     disable_radix_cache = server_args.disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
