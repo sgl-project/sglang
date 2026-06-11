@@ -774,9 +774,14 @@ class Engine(EngineScoreMixin, EngineBase):
         logger.info(f"{server_args=}")
 
         # Start the engine info bootstrap server if per-rank info is needed.
+        # RDT (NIXL) enables it via enable_engine_info_bootstrap without the mooncake
+        # P2P seeding that the start_seed_via_transfer_engine path also triggers.
         engine_info_bootstrap_server = None
         if (
-            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
+            (
+                server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
+                or server_args.enable_engine_info_bootstrap
+            )
             and server_args.node_rank == 0
         ):
             bootstrap_port = server_args.engine_info_bootstrap_port

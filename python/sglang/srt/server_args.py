@@ -831,6 +831,10 @@ class ServerArgs:
         "transfer_engine", "nccl", "modelexpress"
     ] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    # Start the EngineInfoBootstrapServer and register per-rank parallelism config
+    # WITHOUT the mooncake/verbs P2P transfer-engine seeding. Used by RDT (NIXL)
+    # weight sync, which needs /parallelism_config but not P2P memory registration.
+    enable_engine_info_bootstrap: bool = False
     engine_info_bootstrap_port: int = 6789
     modelexpress_config: Optional[str] = None
 

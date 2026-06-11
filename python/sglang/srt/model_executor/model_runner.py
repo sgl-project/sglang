@@ -623,6 +623,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.parallelism_config = RankParallelismConfig.from_parallel_state(
                 self.tp_rank
             )
+        elif self.server_args.enable_engine_info_bootstrap:
+            # RDT (NIXL): need the per-rank parallelism config for the bootstrap server,
+            # but NOT the mooncake/verbs transfer engine (P2P seeding).
+            self.parallelism_config = RankParallelismConfig.from_parallel_state(
+                self.tp_rank
+            )
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
@@ -678,15 +684,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.remote_instance_transfer_engine is not None
             and self.remote_instance_transfer_engine_weight_info is None
         ):
-            # Register memory and upstream the transfer engine info to the bootstrap server
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                self.model, self.remote_instance_transfer_engine
-            )
-            self._register_to_engine_info_bootstrap()
+            # Register memory and upstream the transfer engine info to the bootstrap server.
+            # This mooncake/verbs-RDMA seeding is only used by the P2P weight loader; the RDT
+            # (NIXL) path does not need it. On clusters where verbs RDMA can't register memory
+            # (e.g. AWS EFA -> "register memory failed ... error: -202") this must not crash the
+            # scheduler -- the parallelism-config bootstrap below is what RDT actually requires.
+            try:
+                self.remote_instance_transfer_engine_weight_info = register_memory_region(
+                    self.model, self.remote_instance_transfer_engine
+                )
+                self._register_to_engine_info_bootstrap()
+            except Exception as e:
+                logger.warning(
+                    "Skipping transfer-engine memory registration (P2P seeding) due to: %s. "
+                    "RDT/NIXL weight sync does not require it.",
+                    e,
+                )
 
         # Register parallelism config with the bootstrap server
         if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            (
+                self.server_args.remote_instance_weight_loader_use_transfer_engine()
+                or self.server_args.enable_engine_info_bootstrap
+            )
             and self.parallelism_config is not None
         ):
             self._register_parallelism_config_to_bootstrap()
