@@ -118,6 +118,12 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
+    def has_draft_kv(self) -> bool:
+        """Whether the draft phase writes KV chains. NGRAM does not (its tree
+        lives only in the verify mask), so per-decode KV sizing needs no
+        per-topk page rounding; see get_alloc_len_per_decode."""
+        return not self.is_ngram()
+
     def create_future_map(
         self,
         device: torch.device,
@@ -146,7 +152,20 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone() or self.is_ngram()
+        from sglang.srt.environ import envs
+
+        # DFLASH still ships a V1 worker; SGLANG_ENABLE_SPEC_V2=0 selects it
+        # and must flip the scheduler schema together with the worker.
+        # TODO: drop the env gate once the DFLASH V1 worker is removed.
+        return (
+            self.is_eagle()
+            or self.is_standalone()
+            or self.is_ngram()
+            or (self.is_dflash() and envs.SGLANG_ENABLE_SPEC_V2.get())
+        )
+
+    def need_topk(self) -> bool:
+        return self.is_eagle() or self.is_standalone()
 
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
@@ -165,13 +184,14 @@ class SpeculativeAlgorithm(Enum):
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
 
-        enable_overlap = not server_args.disable_overlap_schedule
-
         if self.is_dflash():
-            if enable_overlap:
-                raise ValueError(
-                    "DFLASH does not support overlap scheduling (spec v2)."
-                )
+            # Keyed off the same env gate as supports_spec_v2() so the worker
+            # and the scheduler schema always agree. With the gate on, the V2
+            # worker drives both overlap and non-overlap, same as EAGLE.
+            if self.supports_spec_v2():
+                from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+                return DFlashWorkerV2
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker

@@ -570,7 +570,7 @@ def build_decode_registry(
         GraphSlot(
             "seq_lens",
             _bs,
-            torch.int32,
+            torch.int64,
             axis="bs",
             padding_policy=PaddingPolicy.FILL_SENTINEL,
             pad_value=seq_len_fill_value,
@@ -578,7 +578,7 @@ def build_decode_registry(
         GraphSlot(
             "seq_lens_cpu",
             _bs,
-            torch.int32,
+            torch.int64,
             axis="bs",
             device=torch.device("cpu"),
             padding_policy=PaddingPolicy.FILL_SENTINEL,
