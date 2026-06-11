@@ -626,14 +626,56 @@ class TestParseQuantHfConfig(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
-    def test_nemotron_mixed_precision_uses_modelopt_mixed(self):
+    def test_nemotron_mixed_precision_with_nvfp4_layers_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = MagicMock()
         model_config.hf_config.model_type = "nemotron_h"
         model_config.hf_config.architectures = ["NemotronHForCausalLM"]
 
         result = model_config._parse_modelopt_quant_config(
-            {"quantization": {"quant_algo": "MIXED_PRECISION"}}
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+                        "backbone.layers.0.mixer.out_proj": {"quant_algo": "FP8"},
+                        "backbone.layers.1.mixer.experts.0.up_proj": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                        "backbone.layers.1.mixer.experts.0.down_proj": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_mixed")
+
+    def test_qwen_mixed_precision_with_w4a16_nvfp4_layers_uses_modelopt_mixed(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "qwen3_5_moe"
+        model_config.hf_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+                        "model.language_model.layers.0.mlp.shared_expert.up_proj": {
+                            "quant_algo": "W4A16_NVFP4",
+                            "group_size": 16,
+                        },
+                        "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                            "quant_algo": "FP8"
+                        },
+                    },
+                }
+            }
         )
 
         self.assertEqual(result["quant_method"], "modelopt_mixed")
