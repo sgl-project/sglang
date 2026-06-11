@@ -2,7 +2,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
+    NopeBf16RopeBf16Pack,
+    NopeFp8RopeBf16Pack,
+)
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
@@ -118,3 +121,15 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
         k_rope_bf16=k_rope_bf16,
         scale_k_nope_ue8m0=scale_k_nope_ue8m0,
     )
+
+
+def split_nope_bf16_rope_bf16(k_bf16: torch.Tensor) -> NopeBf16RopeBf16Pack:
+    """BF16 KV cache: split nope/rope without quantization."""
+    assert k_bf16.dtype == torch.bfloat16
+    num_tokens, hidden_dim = k_bf16.shape
+    assert hidden_dim == 512
+    dim_nope = 448
+    dim_rope = 64
+    k_nope_bf16 = k_bf16[:, :dim_nope].contiguous()
+    k_rope_bf16 = k_bf16[:, dim_nope:].contiguous()
+    return NopeBf16RopeBf16Pack(k_nope_bf16=k_nope_bf16, k_rope_bf16=k_rope_bf16)

@@ -342,6 +342,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.c4_shrink_factor > 1:
             logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
 
+        self.is_bf16_kv_cache = mr.server_args.kv_cache_dtype == "bfloat16"
         self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
         self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)
 
@@ -370,7 +371,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             logger.info("DSV4 compressed attention: online c128 enabled (ring_size=1)")
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        if self.is_bf16_kv_cache:
+            # BF16 mode: KV elements stored as 2 bytes, no quantization scales
+            kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
+        else:
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
         quant_block_size = 128
         indexer_bytes = (
