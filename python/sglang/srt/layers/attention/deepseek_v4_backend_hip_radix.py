@@ -1426,6 +1426,8 @@ class DeepseekV4HipRadixBackend(
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
+        seq_lens_casual = seq_lens_casual.to(torch.int32)
+
         swa_page_indices = self.get_swa_page_indices(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_pool_indices_repeated,
