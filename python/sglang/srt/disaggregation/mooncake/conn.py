@@ -257,6 +257,21 @@ class MooncakeKVManager(CommonKVManager):
             if ptrs and lens:
                 self.engine.batch_register(ptrs, lens)
 
+    def deregister_buffer_to_engine(self):
+        if self.kv_args.kv_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+
+        if self.kv_args.aux_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+
+        for ptrs in self.kv_args.state_data_ptrs or []:
+            if ptrs:
+                self.engine.batch_deregister(ptrs)
+
+        if hasattr(self, "connection_pool"):
+            with self.connection_lock:
+                self.connection_pool.clear()
+
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
     # ------------------------------------------------------------------

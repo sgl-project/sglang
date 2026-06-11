@@ -135,7 +135,8 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
    - `supportedHardware` + the EXAMPLE cells: keep your tested families; **delete the
      `mi*` ids + AMD example cell if no AMD recipe**, etc. A GPU not in the shared catalog
      (e.g. RTX PRO 6000) → declare it in `config.hardware` and add its id here.
-   - `playgroundFeatures` axes: delete `megamoe` (non-Blackwell-MoE), `hisparse`
+   - `playgroundFeatures` axes: remove the `megamoe` backend option + the
+     `megamoeQuant` block from the `moe` axis (non-Blackwell-MoE), delete `hisparse`
      (non-DSA), `pdDisagg`/`router` (no PD), the `parsers` axis (no parsers), etc.
    - `quantizations` / `variants`: drop what the model doesn't ship; collapse `variants`
      to single `default` if there's no variant axis (then drop the `variant` half of
