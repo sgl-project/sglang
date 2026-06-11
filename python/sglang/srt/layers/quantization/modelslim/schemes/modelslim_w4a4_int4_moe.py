@@ -51,90 +51,78 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
     def create_weights(
         self,
         layer: torch.nn.Module,
+        weight_prefix: str,
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
+        extra_weight_attrs: dict,
     ) -> None:
-
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
-        self.num_experts = num_experts
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
-        )
+        """
+        Create and register weight, scale, and offset parameters for the layer.
+        Shape depends on the W4A4 packing environment flag and whether the weight
+        prefix is "w13" or "w2".
+        """
+        # --- compute shapes based on the packing path and prefix ---
         if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
-            # Determine dimensions based on weight group
-            if self.weight_prefix == "w13":
+            if weight_prefix == "w13":
                 out_features = intermediate_size_per_partition
                 in_features = hidden_size
             else:  # w2
                 out_features = hidden_size // 2
                 in_features = intermediate_size_per_partition
 
-            prefix = self.weight_prefix
-
-            # ---- weight ----
-            weight = torch.nn.Parameter(
-                torch.empty(num_experts, out_features, in_features, dtype=torch.int8),
-                requires_grad=False,
-            )
-            layer.register_parameter(f"{prefix}_weight", weight)
-            set_weight_attrs(weight, extra_weight_attrs)
-
-            # ---- scale ----
-            scale = torch.nn.Parameter(
-                torch.empty(num_experts, 2 * out_features, 1, dtype=torch.float32),
-                requires_grad=False,
-            )
-            layer.register_parameter(f"{prefix}_weight_scale", scale)
-            set_weight_attrs(scale, extra_weight_attrs)
-
-            # ---- offset (always present) ----
-            offset = torch.nn.Parameter(
-                torch.empty(num_experts, 2 * out_features, 1, dtype=torch.float32),
-                requires_grad=False,
-            )
-            layer.register_parameter(f"{prefix}_weight_offset", offset)
-            set_weight_attrs(offset, extra_weight_attrs)
+            weight_shape = (num_experts, out_features, in_features)
+            scale_shape = (num_experts, 2 * out_features, 1)
         else:
-            # Determine shape based on weight group
-            if self.weight_prefix == "w13":
+            if weight_prefix == "w13":
                 a_dim = 2 * intermediate_size_per_partition
                 b_dim = hidden_size
             else:  # w2
                 a_dim = hidden_size
                 b_dim = intermediate_size_per_partition
 
-            prefix = self.weight_prefix
+            weight_shape = (num_experts, a_dim, b_dim)
+            scale_shape = (num_experts, a_dim, 1)
 
-            # Create and register weight
-            weight_name = f"{prefix}_weight"
-            weight = torch.nn.Parameter(
-                torch.empty(num_experts, a_dim, b_dim, dtype=torch.int8),
-                requires_grad=False,
-            )
-            layer.register_parameter(weight_name, weight)
-            set_weight_attrs(weight, extra_weight_attrs)
+        offset_shape = scale_shape  # offset always matches scale
 
-            # Create and register scale
-            scale_name = f"{prefix}_weight_scale"
-            scale = torch.nn.Parameter(
-                torch.empty(num_experts, a_dim, 1, dtype=torch.float32),
-                requires_grad=False,
-            )
-            layer.register_parameter(scale_name, scale)
-            set_weight_attrs(scale, extra_weight_attrs)
+        self._create_weight_params(
+            layer, weight_prefix, weight_shape, scale_shape, offset_shape, extra_weight_attrs
+        )
 
-            # Create and register offset
-            offset_name = f"{prefix}_weight_offset"
-            offset = torch.nn.Parameter(
-                torch.empty(num_experts, a_dim, 1, dtype=torch.float32),
-                requires_grad=False,
-            )
-            layer.register_parameter(offset_name, offset)
-            set_weight_attrs(offset, extra_weight_attrs)
+    @staticmethod
+    def _create_weight_params(
+        layer: torch.nn.Module,
+        prefix: str,
+        weight_shape: tuple,
+        scale_shape: tuple,
+        offset_shape: tuple,
+        extra_weight_attrs: dict,
+    ) -> None:
+        """Helper that registers weight, scale, and offset as parameters."""
+        # Weight
+        weight = torch.nn.Parameter(
+            torch.empty(weight_shape, dtype=torch.int8),
+            requires_grad=False,
+        )
+        layer.register_parameter(f"{prefix}_weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+        # Scale
+        scale = torch.nn.Parameter(
+            torch.empty(scale_shape, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter(f"{prefix}_weight_scale", scale)
+        set_weight_attrs(scale, extra_weight_attrs)
+
+        # Offset
+        offset = torch.nn.Parameter(
+            torch.empty(offset_shape, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter(f"{prefix}_weight_offset", offset)
+        set_weight_attrs(offset, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """
