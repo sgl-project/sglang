@@ -27,7 +27,7 @@ v0.5.10 or a later version.
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 35000`                                        |
 | NPU Graph                     | `--cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162`                    |
-| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
+| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | PrefixCache                   | `--disable-radix-cache`                                                                       |
 
@@ -39,7 +39,7 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_opti
 ### Model weights
 
 <Warning>
-If you need to download model weights, check the model size before downloading to reserve enough space.
+Before downloading model weights, check the model size to reserve enough disk space.
 </Warning>
 
 - [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) (BF16)
@@ -53,7 +53,7 @@ It is recommended to download the model weights to a shared directory across mul
 ## Installation
 
 <Warning>
-Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+The Docker image requires at least **30 GB** of free space. Ensure sufficient disk space before pulling images.
 </Warning>
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
@@ -77,10 +77,51 @@ docker run -itd --shm-size=16g --name ${NAME} \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --device=/dev/davinci0:/dev/davinci0  \
 --device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci8:/dev/davinci8  \
+--device=/dev/davinci9:/dev/davinci9  \
+--device=/dev/davinci10:/dev/davinci10  \
+--device=/dev/davinci11:/dev/davinci11  \
+--device=/dev/davinci12:/dev/davinci12  \
+--device=/dev/davinci13:/dev/davinci13  \
+--device=/dev/davinci14:/dev/davinci14  \
+--device=/dev/davinci15:/dev/davinci15  \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
 quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+docker run -itd --shm-size=16g --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ```
 
   </Tab>
@@ -103,6 +144,7 @@ with limited hardware resources. The following command is based on the W8A8 quan
 #============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the speculative draft model weights directory
 #============================================================
 
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -121,6 +163,7 @@ source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env
 export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
 
 export SGLANG_SET_CPU_AFFINITY=1
 export ASCEND_LAUNCH_BLOCKING=0
@@ -148,7 +191,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 162 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 35000 \
     --tp-size 2 --mem-fraction-static 0.87 --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
