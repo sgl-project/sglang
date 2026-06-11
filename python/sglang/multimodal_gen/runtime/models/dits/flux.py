@@ -28,6 +28,10 @@ from diffusers.models.normalization import (
 from torch.nn import LayerNorm as LayerNorm
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
@@ -411,9 +415,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             query = torch.cat([encoder_query, query], dim=1)
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
-            num_replicated_prefix = (
-                num_replicated_prefix or encoder_hidden_states.shape[1]
-            )
         else:
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
@@ -538,6 +539,7 @@ class FluxSingleTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         text_seq_len = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
@@ -545,7 +547,6 @@ class FluxSingleTransformerBlock(nn.Module):
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
         joint_attention_kwargs = joint_attention_kwargs or {}
-        joint_attention_kwargs.setdefault("num_replicated_prefix", text_seq_len or 0)
 
         if self.use_nunchaku_structure:
             if _nunchaku_fused_ops_available:
@@ -560,6 +561,7 @@ class FluxSingleTransformerBlock(nn.Module):
             attn_output = self.attn(
                 x=norm_hidden_states,
                 freqs_cis=freqs_cis,
+                num_replicated_prefix=num_replicated_prefix,
                 **joint_attention_kwargs,
             )
             if isinstance(attn_output, tuple):
@@ -576,6 +578,7 @@ class FluxSingleTransformerBlock(nn.Module):
             attn_output = self.attn(
                 x=norm_hidden_states,
                 freqs_cis=freqs_cis,
+                num_replicated_prefix=num_replicated_prefix,
                 **joint_attention_kwargs,
             )
 
@@ -660,6 +663,7 @@ class FluxTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
             hidden_states, emb=temb
@@ -679,6 +683,7 @@ class FluxTransformerBlock(nn.Module):
             x=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
+            num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
 
@@ -920,7 +925,30 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         else:
             temb = self.time_text_embed(timestep, pooled_projections)
 
+        num_txt_tokens = encoder_hidden_states.shape[1]
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
+
+        # Shard text tokens for Ulysses SP when evenly divisible.
+        sp_size = get_sp_world_size()
+        num_replicated_prefix = num_txt_tokens
+        if sp_size > 1 and num_txt_tokens % sp_size == 0:
+            sp_rank = get_sp_parallel_rank()
+            encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_size, dim=1)[
+                sp_rank
+            ]
+            if freqs_cis is not None:
+                cos, sin = freqs_cis
+                txt_cos_local = torch.chunk(cos[:num_txt_tokens], sp_size, dim=0)[
+                    sp_rank
+                ]
+                txt_sin_local = torch.chunk(sin[:num_txt_tokens], sp_size, dim=0)[
+                    sp_rank
+                ]
+                freqs_cis = (
+                    torch.cat([txt_cos_local, cos[num_txt_tokens:]], dim=0),
+                    torch.cat([txt_sin_local, sin[num_txt_tokens:]], dim=0),
+                )
+            num_replicated_prefix = 0
 
         if (
             joint_attention_kwargs is not None
@@ -939,6 +967,7 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 temb=temb,
                 freqs_cis=freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
+                num_replicated_prefix=num_replicated_prefix,
             )
         for block in self.single_transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -947,6 +976,7 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 temb=temb,
                 freqs_cis=freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
+                num_replicated_prefix=num_replicated_prefix,
             )
 
         hidden_states = self.norm_out(hidden_states, temb)

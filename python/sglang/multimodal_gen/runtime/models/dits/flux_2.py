@@ -21,7 +21,12 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
-from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    get_tp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
@@ -295,6 +300,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        num_replicated_prefix: int = 0,
     ) -> torch.Tensor:
         (
             query,
@@ -363,10 +369,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-        num_rep = (
-            encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+        hidden_states = self.attn(
+            query, key, value, num_replicated_prefix=num_replicated_prefix
         )
-        hidden_states = self.attn(query, key, value, num_replicated_prefix=num_rep)
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -600,6 +605,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         split_hidden_states: bool = False,
         text_seq_len: Optional[int] = None,
+        num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # If encoder_hidden_states is None, hidden_states is assumed to have encoder_hidden_states already
         # concatenated
@@ -616,7 +622,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             freqs_cis=freqs_cis,
-            num_replicated_prefix=text_seq_len or 0,
+            num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
 
@@ -700,6 +706,7 @@ class Flux2TransformerBlock(nn.Module):
         ],
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         joint_attention_kwargs = joint_attention_kwargs or {}
 
@@ -728,6 +735,7 @@ class Flux2TransformerBlock(nn.Module):
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
+            num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
 
@@ -1060,9 +1068,33 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_states, _ = self.x_embedder(hidden_states)
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 
-        # 3. Calculate RoPE embeddings from image and text tokens
-        # NOTE: the below logic means that we can't support batched inference with images of different resolutions or
-        # text prompts of different lengths. Is this a use case we want to support?
+        # 3. Shard text tokens for Ulysses SP when evenly divisible.
+        # Instead of replicating text on every SP rank (which causes redundant
+        # GEMMs), shard text along the sequence dimension so each rank only
+        # processes S_text/SP tokens. The standard USP all-to-all path
+        # (num_replicated_prefix=0) then gathers text+image together.
+        sp_size = get_sp_world_size()
+        num_replicated_prefix = num_txt_tokens
+        if sp_size > 1 and num_txt_tokens % sp_size == 0:
+            sp_rank = get_sp_parallel_rank()
+            encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_size, dim=1)[
+                sp_rank
+            ]
+            if freqs_cis is not None:
+                cos, sin = freqs_cis
+                txt_cos_local = torch.chunk(cos[:num_txt_tokens], sp_size, dim=0)[
+                    sp_rank
+                ]
+                txt_sin_local = torch.chunk(sin[:num_txt_tokens], sp_size, dim=0)[
+                    sp_rank
+                ]
+                freqs_cis = (
+                    torch.cat([txt_cos_local, cos[num_txt_tokens:]], dim=0),
+                    torch.cat([txt_sin_local, sin[num_txt_tokens:]], dim=0),
+                )
+            num_replicated_prefix = 0
+            num_txt_tokens = num_txt_tokens // sp_size
+
         # 4. Double Stream Transformer Blocks
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -1072,6 +1104,7 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 temb_mod_params_txt=double_stream_mod_txt,
                 freqs_cis=freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
+                num_replicated_prefix=num_replicated_prefix,
             )
         # Concatenate text and image streams for single-block inference
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
@@ -1085,6 +1118,7 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 freqs_cis=freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
                 text_seq_len=num_txt_tokens,
+                num_replicated_prefix=num_replicated_prefix,
             )
         # Remove text tokens from concatenated stream
         hidden_states = hidden_states[:, num_txt_tokens:, ...]
