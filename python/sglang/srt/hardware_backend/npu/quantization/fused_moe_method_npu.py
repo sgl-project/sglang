@@ -6,10 +6,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.layers.moe.moe_runner.torch_npu import TorchNpuQuantInfo
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.layers.moe.moe_runner.torch_npu import TorchNpuQuantInfo
 
 from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import (
     HiddenStatesDynamicQuant,
