@@ -886,6 +886,7 @@ class LogitsProcessor(nn.Module):
             logits = lm_head(hidden_states)
         elif (
             quant_method is not None
+            and hasattr(lm_head, "weight")
             and callable(getattr(quant_method, "apply", None))
             and type(quant_method).__name__
             not in (

@@ -1031,7 +1031,7 @@ class ModelConfig:
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
-            quantized_layers = json_quant_configs.get("quantized_layers", {})
+            quantized_layers = json_quant_configs.get("quantized_layers") or {}
             has_modelopt_nvfp4_layers = any(
                 str(layer_info.get("quant_algo", "")).upper()
                 in ("NVFP4", "W4A16_NVFP4")
