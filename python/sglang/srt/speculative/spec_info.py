@@ -152,16 +152,11 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def supports_spec_v2(self) -> bool:
-        from sglang.srt.environ import envs
-
-        # DFLASH still ships a V1 worker; SGLANG_ENABLE_SPEC_V2=0 selects it
-        # and must flip the scheduler schema together with the worker.
-        # TODO: drop the env gate once the DFLASH V1 worker is removed.
         return (
             self.is_eagle()
             or self.is_standalone()
             or self.is_ngram()
-            or (self.is_dflash() and envs.SGLANG_ENABLE_SPEC_V2.get())
+            or self.is_dflash()
         )
 
     def need_topk(self) -> bool:
@@ -185,16 +180,11 @@ class SpeculativeAlgorithm(Enum):
         ), "Cannot create worker for NONE speculative algorithm."
 
         if self.is_dflash():
-            # Keyed off the same env gate as supports_spec_v2() so the worker
-            # and the scheduler schema always agree. With the gate on, the V2
-            # worker drives both overlap and non-overlap, same as EAGLE.
-            if self.supports_spec_v2():
-                from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+            # V2 worker drives both overlap and non-overlap (scheduler runs it
+            # synchronously when overlap is disabled), same as EAGLE.
+            from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
-                return DFlashWorkerV2
-            from sglang.srt.speculative.dflash_worker import DFlashWorker
-
-            return DFlashWorker
+            return DFlashWorkerV2
 
         if self.is_frozen_kv_mtp():
             # V2 worker drives both overlap and non-overlap (scheduler runs it

@@ -4,7 +4,7 @@ description: "Experimental spectral progressive resolution growing for selected 
 tag: "approx"
 ---
 
-Progressive resolution growing is an experimental feature for selected SGLang Diffusion pipelines. It runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. On the benchmark setup below, this reduces the quadratic attention cost of the DiT transformer and yields up to **1.63× speedup on FLUX.1**, **1.93× speedup on FLUX.2**, **2.33× speedup on Z-Image**, **2.78× speedup on Wan 2.1 T2V**, and **1.69× speedup on Qwen-Image**.
+Progressive resolution growing is an experimental feature for selected SGLang Diffusion pipelines. It runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. On the benchmark setup below, this reduces the quadratic attention cost of the DiT transformer and yields up to **1.63× speedup on FLUX.1**, **1.93× speedup on FLUX.2**, **2.33× speedup on Z-Image**, **2.78× speedup on Wan 2.1 T2V**, **1.69× speedup on Qwen-Image**, and **1.56× speedup on Ideogram 4**.
 
 Based on [Spectral Progressive Diffusion (arXiv 2605.18736)](https://arxiv.org/abs/2605.18736).
 
@@ -20,6 +20,7 @@ The transition point — how many steps to run at each resolution — is compute
 | FLUX.2 1024×1024 | 4,096 | 1,024 | 4.0× |
 | Z-Image 1024×1024 | 4,096 | 1,024 | 4.0× |
 | Wan 2.1 T2V 480×832 (81 frames) | 6,240 | 1,560 | 4.0× |
+| Ideogram 4 1024×1024 | 4,096 | 1,024 | 4.0× |
 
 ## Parameters
 
@@ -279,6 +280,86 @@ Hardware: RTX A6000 48 GB, `--dit-cpu-offload false`. Timing = denoising loop on
 | dct_rewind L1 δ=0.05 | 13@64² + 17@128² | 33.25 s | **1.29×** |
 | dct_rewind L1 δ=0.10 | 16@64² + 14@128² | 33.86 s | **1.27×** |
 | dct_rewind L1 δ=0.20 | 19@64² + 11@128² | 25.40 s | **1.69×** |
+
+## Ideogram 4
+
+Supports `ideogram-ai/ideogram-4`. Ideogram 4 uses a **dual-transformer architecture**: a conditional transformer (text + image tokens) and a separately-weighted unconditional transformer (image tokens only, zero LLM features). Both transformers shrink at coarse resolution, providing the same token-ratio benefit as single-transformer models.
+
+> **Note:** Ideogram 4's logit-normal noise schedule (`std=1.75`, `mu=0`) concentrates steps near the mid-sigma range. Fewer steps fall in the high-sigma coarse-eligible region compared to FLUX, which limits the achievable speedup at a given δ.
+
+### Usage
+
+**20-step (V4_DEFAULT_20 preset)**
+
+```bash
+sglang generate \
+    --model-path ideogram-ai/ideogram-4 \
+    --prompt "A serene mountain lake at golden hour, photorealistic" \
+    --height 1024 --width 1024 \
+    --num-inference-steps 20 \
+    --dit-cpu-offload false \
+    --progressive-mode dct_rewind \
+    --progressive-levels 1 \
+    --progressive-delta 0.05
+```
+
+**48-step (V4_QUALITY_48 preset)**
+
+```bash
+sglang generate \
+    --model-path ideogram-ai/ideogram-4 \
+    --prompt "A serene mountain lake at golden hour, photorealistic" \
+    --height 1024 --width 1024 \
+    --num-inference-steps 48 \
+    --dit-cpu-offload false \
+    --progressive-mode dct_rewind \
+    --progressive-levels 1 \
+    --progressive-delta 0.05
+```
+
+### Benchmark
+
+Hardware: RTX A6000 48 GB, `torch_sdpa`, `--dit-cpu-offload false`. Timing = denoising loop only.
+
+**20-step (V4_DEFAULT_20)**
+
+| Config | Stage split | Denoise | Speedup |
+|--------|-------------|---------|---------|
+| Fullres (baseline) | 20 @ 64² | 53.99 s | 1.00× |
+| dct_rewind L1 δ=0.01 | 6 @ 32² + 14 @ 64² | 43.47 s | **1.24×** |
+| dct_rewind L1 δ=0.05 | 9 @ 32² + 11 @ 64² | 38.14 s | **1.42×** |
+| dct_rewind L1 δ=0.10 | 11 @ 32² + 9 @ 64² | 34.60 s | **1.56×** |
+
+**48-step (V4_QUALITY_48)**
+
+| Config | Stage split | Denoise | Speedup |
+|--------|-------------|---------|---------|
+| Fullres (baseline) | 48 @ 64² | 130.92 s | 1.00× |
+| dct_rewind L1 δ=0.01 | 12 @ 32² + 36 @ 64² | 109.79 s | **1.19×** |
+| dct_rewind L1 δ=0.05 | 21 @ 32² + 27 @ 64² | 93.83 s | **1.40×** |
+| dct_rewind L1 δ=0.10 | 26 @ 32² + 22 @ 64² | 84.94 s | **1.54×** |
+
+### Python API
+
+```python
+from sglang.multimodal_gen import DiffGenerator
+
+gen = DiffGenerator.from_pretrained(
+    model_path="ideogram-ai/ideogram-4",
+    dit_cpu_offload=False,
+)
+result = gen.generate(sampling_params_kwargs={
+    "prompt": "A serene mountain lake at golden hour, photorealistic",
+    "num_inference_steps": 48,
+    "height": 1024,
+    "width": 1024,
+    "progressive_mode": "dct_rewind",
+    "progressive_levels": 1,
+    "progressive_delta": 0.05,
+})
+```
+
+---
 
 ## Limitations
 
