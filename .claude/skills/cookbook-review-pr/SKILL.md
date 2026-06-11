@@ -51,7 +51,10 @@ than restating.
 - `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback).
 - `multiNodeHints` present ONLY for hw whose fabric needs manual NIC env (e.g. `gb200`
   NVL72) — NOT every `multi-N` hw (standard-IB DeepEP / Marlin multi-node don't need it).
-- `github.cookbookModel` matches the issue-template `model` dropdown value.
+- `github.cookbookModel` is set to the model's HF id (`<hf-org>/<model-slug>`). The issue
+  template's `model` field is a free-form input prefilled from this value; if the config
+  omits the `github` block, the engine falls back to `deepseek-ai/deepseek-v4` and the
+  page's submissions get mislabeled.
 - `playgroundFeatures` axes are pruned to what the model supports — no empty/stub axes
   (the `moe` axis's MegaMoE backend option + `megamoeQuant` block only on Blackwell MoE,
   gated by `requiresHw`; `hisparse` only DSA-style; `pdDisagg.router` only with a PD topology).
@@ -75,7 +78,10 @@ than restating.
 
 ### 4. Benchmarks
 - Each `benchmarks[]` entry's `match` tuple corresponds to a real cell.
-- `defaultAccuracy` keys ∈ `ACCURACY_LABELS` (and `benchmarkCommands.accuracy`).
+- `accuracyLabels` is present whenever the benchmarks carry accuracy data — the engine
+  ships NO default eval set; without it the accuracy rows silently don't render.
+  `defaultAccuracy` / per-cell `accuracy` / `benchmarkCommands.accuracy` keys all
+  ∈ `config.accuracyLabels`.
 - A benchmark's quantization must match a variant actually listed — `(BF16)` on a model
   that only released FP8/FP4 is a factual bug.
 - `benchmarkCommands.speed` is `python3 -m sglang.bench_serving` (the workload), separate

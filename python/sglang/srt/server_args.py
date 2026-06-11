@@ -831,14 +831,18 @@ class ServerArgs:
     kv_canary: str = "none"
     kv_canary_real_data: str = "none"
     kv_canary_sweep_interval: int = 0
-    # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
-    enable_dsa_prefill_context_parallel: bool = False
-    dsa_prefill_cp_mode: str = "round-robin-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
 
-    # Context parallelism
+    # Context parallelism (unified API)
+    enable_prefill_cp: bool = False
+    # "zigzag" is former in-seq-split; "interleave" is former round-robin-split.
+    cp_strategy: Optional[str] = None
+
+    # Context parallelism (deprecated aliases)
+    enable_dsa_prefill_context_parallel: bool = False
+    dsa_prefill_cp_mode: str = "round-robin-split"
     enable_prefill_context_parallel: bool = False
     prefill_cp_mode: str = "in-seq-split"
 
@@ -944,8 +948,9 @@ class ServerArgs:
 
         handle_pd_disaggregation(self)
 
-        # Validate --prefill-only-disable-kv-cache args early (before dummy-model
-        # short-circuit). The backend check is run later after backends settle.
+        # Normalize deprecated CP aliases before validations or model-specific
+        # defaults inspect enable_prefill_cp/cp_strategy.
+        self._handle_legacy_cp_arguments()
         self._validate_prefill_only_disable_kv_cache_args()
 
         if self.model_path.lower() in ["none", "dummy"]:
@@ -1028,6 +1033,10 @@ class ServerArgs:
 
         # Handle data parallelism.
         self._handle_data_parallelism()
+
+        # Re-apply after model-specific defaults resolve attention_backend so
+        # canonical CP mirrors to the right legacy runtime aliases.
+        self._handle_legacy_cp_arguments()
 
         # Handle context parallelism.
         self._handle_context_parallelism()
@@ -2022,25 +2031,23 @@ class ServerArgs:
                     )
 
                 if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
-                    if self.enable_dsa_prefill_context_parallel:
+                    if self.enable_prefill_cp:
                         logger.warning(
                             "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                         )
-                        if self.dsa_prefill_cp_mode == "in-seq-split":
-                            # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
-                            self.enable_dp_attention = True
-                            self.moe_dense_tp_size = 1
+                        self.enable_dp_attention = True
+                        self.moe_dense_tp_size = 1
+                        if self.cp_strategy == "zigzag":
                             self.moe_a2a_backend = "deepep"
                             self.ep_size = self.tp_size
                             logger.warning(
-                                "For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
+                                "zigzag DSA CP requires moe_dense_tp_size=1, "
+                                "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
                             )
                         else:
-                            self.enable_dp_attention = True
-                            self.moe_dense_tp_size = 1
                             assert (
                                 self.dp_size == 1
-                            ), "For round-robin split mode, dp attention is not supported."
+                            ), "interleave DSA CP does not support DP attention."
                         assert (
                             self.tp_size <= 8
                         ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
@@ -2050,13 +2057,13 @@ class ServerArgs:
                         self.attn_cp_size = self.tp_size // self.dp_size
                         self.cuda_graph_config.prefill.backend = Backend.DISABLED
                         logger.warning(
-                            f"Enable DSA Context Parallel opt, "
-                            f"Setting dp_size == {self.dp_size} and "
-                            f"moe_dense_tp_size == {self.moe_dense_tp_size}, "
-                            f"ep_size == {self.ep_size}, "
-                            f"tp_size == {self.tp_size}, "
-                            f"kv_cache_dtype == {self.kv_cache_dtype}, "
-                            f"moe_a2a_backend {self.moe_a2a_backend}, "
+                            "Enabled DSA context parallel: "
+                            f"strategy={self.cp_strategy}, dp_size={self.dp_size}, "
+                            f"moe_dense_tp_size={self.moe_dense_tp_size}, "
+                            f"ep_size={self.ep_size}, tp_size={self.tp_size}, "
+                            f"attn_cp_size={self.attn_cp_size}, "
+                            f"kv_cache_dtype={self.kv_cache_dtype}, "
+                            f"moe_a2a_backend={self.moe_a2a_backend}, "
                             f"cuda_graph_config[prefill].backend=disabled"
                         )
                     else:
@@ -2093,10 +2100,10 @@ class ServerArgs:
                     self._set_default_dsa_kv_cache_dtype(major, self.quantization)
                     self._set_default_dsa_backends(self.kv_cache_dtype, major)
 
-                if self.enable_dsa_prefill_context_parallel:
+                if self.enable_prefill_cp:
                     assert (
                         self.disaggregation_mode != "decode"
-                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-dsa-prefill-context-parallel."
+                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
 
             else:
                 # DeepSeek V3/R1/V3.1
@@ -2116,7 +2123,7 @@ class ServerArgs:
 
                 # MLA prefill CP auto-config. Mirrors the NSA CP block above
                 # (minus the in-seq/round-robin mode split, which MLA CP does not support)
-                if self.enable_prefill_context_parallel and self.use_mla_backend():
+                if self.enable_prefill_cp and self.use_mla_backend():
                     logger.warning(
                         "MLA prefill context parallel is still experimental. "
                         "Verified on Hopper with the fa3 backend."
@@ -3415,7 +3422,54 @@ class ServerArgs:
                 f"got CUDA {cuda_version or 'unknown'}"
             )
 
+    def _handle_legacy_cp_arguments(self):
+        legacy_mode_to_strategy = {
+            "in-seq-split": "zigzag",
+            "round-robin-split": "interleave",
+        }
+        strategy_to_legacy_mode = {
+            "zigzag": "in-seq-split",
+            "interleave": "round-robin-split",
+        }
+
+        if (
+            self.enable_prefill_context_parallel
+            or self.enable_dsa_prefill_context_parallel
+        ):
+            self.enable_prefill_cp = True
+
+        if self.enable_prefill_context_parallel and self.cp_strategy is None:
+            self.cp_strategy = legacy_mode_to_strategy[self.prefill_cp_mode]
+        if self.enable_dsa_prefill_context_parallel and self.cp_strategy is None:
+            self.cp_strategy = legacy_mode_to_strategy[self.dsa_prefill_cp_mode]
+
+        if (
+            self.enable_prefill_context_parallel
+            and self.enable_dsa_prefill_context_parallel
+        ):
+            return
+
+        if not self.enable_prefill_cp or self.cp_strategy is None:
+            return
+
+        mode = strategy_to_legacy_mode[self.cp_strategy]
+        use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
+            self, "attention_backend", None
+        ) in ("dsa", "dsv4")
+        if use_dsa_legacy_aliases:
+            self.enable_dsa_prefill_context_parallel = True
+            self.enable_prefill_context_parallel = False
+        else:
+            self.enable_prefill_context_parallel = True
+        self.dsa_prefill_cp_mode = mode
+        self.prefill_cp_mode = mode
+
     def _handle_context_parallelism(self):
+        if self.enable_prefill_cp and self.cp_strategy is None:
+            raise ValueError(
+                "--cp-strategy must be set when --enable-prefill-cp is enabled."
+            )
+
         if (
             self.enable_prefill_context_parallel
             and self.enable_dsa_prefill_context_parallel
@@ -3901,10 +3955,10 @@ class ServerArgs:
                 "the context-parallel attention path writes K/V to the pool via set_kv_buffer, "
                 "which the no-op pool intentionally rejects."
             )
-        if self.enable_prefill_context_parallel:
+        if self.enable_prefill_cp:
             raise ValueError(
                 "--prefill-only-disable-kv-cache is incompatible with "
-                "--enable-prefill-context-parallel: the prefill-CP path stages K/V through "
+                "--enable-prefill-cp: the prefill-CP path stages K/V through "
                 "the paged cache, which the no-op pool does not support."
             )
 
@@ -7155,6 +7209,27 @@ class ServerArgs:
             help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
         )
         parser.add_argument(
+            "--enable-prefill-cp",
+            dest="enable_prefill_cp",
+            action="store_true",
+            help=(
+                "Enable context parallelism for the prefill phase. Select the "
+                "layout with --cp-strategy."
+            ),
+        )
+        parser.add_argument(
+            "--cp-strategy",
+            dest="cp_strategy",
+            type=str,
+            default=ServerArgs.cp_strategy,
+            choices=("zigzag", "interleave"),
+            help=(
+                "Sharding strategy for prefill CP. 'zigzag' is the former "
+                "in-seq-split mode; 'interleave' is the former "
+                "round-robin-split mode."
+            ),
+        )
+        parser.add_argument(
             "--disable-attn-tp-gather",
             action="store_true",
             help="Disable scheduler-side attn_tp_gather (the upstream SP path "
@@ -7169,46 +7244,60 @@ class ServerArgs:
         parser.add_argument(
             "--enable-dsa-prefill-context-parallel",
             dest="enable_dsa_prefill_context_parallel",
-            action="store_true",
-            help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
+            action=DeprecatedStoreTrueAction,
+            new_flag="--enable-prefill-cp",
+            help="[Deprecated] Use --enable-prefill-cp instead.",
         )
         parser.add_argument(
             "--enable-nsa-prefill-context-parallel",
             dest="enable_dsa_prefill_context_parallel",
             action=DeprecatedStoreTrueAction,
-            new_flag="--enable-dsa-prefill-context-parallel",
-            help="[Deprecated] Use --enable-dsa-prefill-context-parallel instead.",
+            new_flag="--enable-prefill-cp",
+            help="[Deprecated] Use --enable-prefill-cp instead.",
+        )
+        parser.add_argument(
+            "--enable-prefill-context-parallel",
+            dest="enable_prefill_context_parallel",
+            action=DeprecatedStoreTrueAction,
+            new_flag="--enable-prefill-cp",
+            help="[Deprecated] Use --enable-prefill-cp instead.",
         )
         parser.add_argument(
             "--dsa-prefill-cp-mode",
             dest="dsa_prefill_cp_mode",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--cp-strategy",
             type=str,
             default=ServerArgs.dsa_prefill_cp_mode,
             choices=DSA_PREFILL_CP_SPLIT_CHOICES,
-            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism.",
+            help=(
+                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
+                "'in-seq-split' maps to 'zigzag'; 'round-robin-split' maps to "
+                "'interleave'."
+            ),
         )
         parser.add_argument(
             "--nsa-prefill-cp-mode",
             dest="dsa_prefill_cp_mode",
             action=DeprecatedAliasStoreAction,
-            new_flag="--dsa-prefill-cp-mode",
-            default=argparse.SUPPRESS,
+            new_flag="--cp-strategy",
             type=str,
+            default=argparse.SUPPRESS,
             choices=DSA_PREFILL_CP_SPLIT_CHOICES,
-            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'round-robin-split'(default), 'in-seq-split'  "
-            "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
-        )
-        parser.add_argument(
-            "--enable-prefill-context-parallel",
-            action="store_true",
-            help="Enable context parallelism used in the prefill phase",
+            help="[Deprecated] Use --cp-strategy instead.",
         )
         parser.add_argument(
             "--prefill-cp-mode",
+            dest="prefill_cp_mode",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--cp-strategy",
             type=str,
             default=ServerArgs.prefill_cp_mode,
             choices=PREFILL_CP_SPLIT_CHOICES,
-            help="Token splitting mode for the prefill phase under context parallelism. Optional values: 'in-seq-split' (default)",
+            help=(
+                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
+                "'in-seq-split' maps to 'zigzag'."
+            ),
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",
