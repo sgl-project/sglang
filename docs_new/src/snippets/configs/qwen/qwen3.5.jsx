@@ -53,8 +53,13 @@ export const config = {
   // saturation the verify step costs more than it saves). A strategy rather
   // than a Playground knob because turning MTP off also changes TP/mem on
   // some H100 combos (a coupling the Playground can't do).
+  // Xeon (CPU) has a single operating point — the legacy widget hid the MTP
+  // toggle there and its one recipe has no latency/throughput slant — so its
+  // cells live under `balanced` (per-combination placement); the engine greys
+  // the unused chips per selection automatically.
   strategies: [
     { id: "low-latency",     label: "Low-Latency" },
+    { id: "balanced",        label: "Balanced" },
     { id: "high-throughput", label: "High-Throughput" },
   ],
 
@@ -874,7 +879,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "397b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -887,7 +892,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "397b", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -1344,7 +1349,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "122b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -1357,7 +1362,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "122b", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -1803,7 +1808,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "35b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "35b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -1816,7 +1821,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "35b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "35b", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -2260,7 +2265,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "27b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -2273,7 +2278,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "27b", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -2499,7 +2504,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "9b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "9b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -2725,7 +2730,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "4b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -2953,7 +2958,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "2b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -3181,7 +3186,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "xeon", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      match: { hw: "xeon", variant: "0.8b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
