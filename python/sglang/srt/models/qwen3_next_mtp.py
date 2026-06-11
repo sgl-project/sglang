@@ -91,6 +91,12 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         # not hardcode it — when the layer's MoE pre-fuses the shared expert,
         # load_weights must remap mlp.shared_expert.* into the fused slot.
         self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        if self.num_fused_shared_experts > 1:
+            raise ValueError(
+                "Qwen3-Next MTP shared expert fusion currently supports exactly one "
+                "shared expert because checkpoint weight remapping maps it into "
+                "a single fused MoE expert slot."
+            )
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
     @torch.no_grad()

@@ -37,8 +37,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -195,7 +200,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                     else {}
                 ),
             )
-            if not get_global_server_args().disable_piecewise_cuda_graph
+            if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             else FusedRMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
@@ -371,7 +376,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         if (
             _is_cpu
             or _is_npu
-            or not get_global_server_args().disable_piecewise_cuda_graph
+            or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
         ):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
@@ -1043,13 +1048,12 @@ class Qwen3NextForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def _get_num_fused_shared_experts(self) -> int:
-        if not (
-            hasattr(self.model, "layers")
-            and len(self.model.layers) > 0
-            and hasattr(self.model.layers[0].mlp, "num_fused_shared_experts")
-        ):
+        if not hasattr(self.model, "layers"):
             return 0
-        return self.model.layers[0].mlp.num_fused_shared_experts
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+                return layer.mlp.num_fused_shared_experts
+        return 0
 
     @torch.no_grad()
     def forward(

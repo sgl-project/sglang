@@ -1,11 +1,12 @@
 # Engine extension: add a new playground feature axis
 
 Loaded on demand by the `cookbook-add-model` skill. **Rare** — adding a model
-cookbook is data-only and never needs this. The current 8 built-in axes
+cookbook is data-only and never needs this. The current 7 built-in axes
 (`attention`, `moe`, `parsers`, `speculative`, `pdDisagg`, `hicache`,
-`hisparse`, `megamoe`) already cover the SGLang feature surface most cookbooks
-need. Only add a new axis if a real cookbook needs it and the feature does not
-fit any existing axis. Touches `_playground.jsx` only.
+`hisparse`) already cover the SGLang feature surface most cookbooks need.
+(MegaMoE is not its own axis — it lives inside `moe` as a backend option +
+a `megamoeQuant` sub-select.) Only add a new axis if a real cookbook needs it
+and the feature does not fit any existing axis. Touches `_playground.jsx` only.
 
 For the per-model config/cells/MDX reference see [authoring-reference.md](authoring-reference.md).
 
@@ -94,7 +95,7 @@ Template:
   // also receives the derived
   // value (as `derived`) and may use it as a no-op shortcut when the
   // user's pick matches base. Skip when your axis owns flags that never
-  // appear in base cells (PD-Disagg / HiCache / MegaMoE).
+  // appear in base cells (PD-Disagg / HiCache).
   // deriveFromBase: (cell, fc, h) => ({ ... }) | null,
 
   // Optional: hints for the renderer. Currently only pdDisagg uses this
@@ -103,7 +104,7 @@ Template:
 
   // Returns the axis card JSX. The outer div MUST have key={axisId} so
   // React can track it in the engine's map loop. Return null for
-  // axis-level gating (e.g. MegaMoE on Hopper). Lay out as a single
+  // axis-level gating (e.g. HiSparse when the live PD mode isn't `decode`). Lay out as a single
   // compact horizontal row: title on the left, fields after.
   render: ({ axisId, value, setValue, fc, base, s, h, renderChip, renderSelect, derived }) => {
     if (/* axis-level gating fails */) return null;
@@ -147,7 +148,7 @@ Template:
     the **default** compact control (a `<select>` dropdown). It filters
     hidden chips and disables greyed-out ones internally — no per-chip
     `evaluateChip` loop needed in the render body. Most axes use it
-    (attention, moe, pdDisagg, hisparse, hicache, megamoe). Pass
+    (attention, moe, pdDisagg, hisparse, hicache). Pass
     `{ hideValues: [<sentinel>] }` when your `deriveFromBase` resolved to
     a real value, so the inherit-sentinel ("Auto" / "Inherited" /
     "current") doesn't clutter the dropdown.
@@ -206,7 +207,8 @@ emits flags that should land somewhere specific, include the most likely
 anchor prefixes in your call. Order doesn't matter (set semantics).
 
 **Conditional strips** — Some axes strip ONLY when overridden
-(`attention.tp`, `moe.backend`, `speculative`, `megamoe`). Others strip
+(`attention.tp`, `moe.backend` (incl. the MegaMoE quant env), `speculative`).
+Others strip
 UNCONDITIONALLY whenever declared (`parsers`, `pdDisagg`, `hicache`). The
 header comment in `AXIS_HANDLERS` documents which policy each axis uses;
 follow the same pattern when adding a new axis. If unsure, prefer
@@ -214,9 +216,9 @@ conditional strip — it preserves base behavior when the user does not
 opt in.
 
 **Closure of `AXIS_HANDLERS`** — Inside a handler method, you can
-reference `AXIS_HANDLERS.<otherAxis>` for cross-handler calls (megamoe
-does this for `_gateOpen`). This works because `AXIS_HANDLERS` is in
-lexical scope. Do NOT use this for general logic — it tightly couples
+reference `AXIS_HANDLERS.<otherAxis>` for cross-handler calls (no built-in
+axis currently needs this, but it works because `AXIS_HANDLERS` is in
+lexical scope). Do NOT use this for general logic — it tightly couples
 handlers. Reserve it for one handler's helpers shared between its own
 `render` and `revertHidden`.
 

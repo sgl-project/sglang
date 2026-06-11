@@ -93,7 +93,6 @@ class TestCustomizedInfoStreaming(CustomTestCase):
             incremental_streaming_output=True,
             skip_tokenizer_init=True,
             disable_cuda_graph=True,
-            disable_piecewise_cuda_graph=True,
             disable_radix_cache=True,
             random_seed=0,
             log_level="error",
