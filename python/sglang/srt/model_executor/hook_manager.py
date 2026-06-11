@@ -78,14 +78,13 @@ def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -
             continue
 
         hook_type = spec.get("hook_type", "forward")
+        with_kwargs = spec.get("with_kwargs", False)
         for module_name, module in matched:
             if hook_type == "forward_pre":
-                module.register_forward_pre_hook(hook, with_kwargs=True)
+                module.register_forward_pre_hook(hook, with_kwargs=with_kwargs)
             else:
                 module.register_forward_hook(hook)
-            logger.info(
-                f"Registered {hook_type} hook '{spec_name}' on {module_name}"
-            )
+            logger.info(f"Registered {hook_type} hook '{spec_name}' on {module_name}")
 
 
 def resolve_callable(path: Optional[str]) -> Optional[Callable]:

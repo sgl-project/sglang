@@ -14,7 +14,6 @@ Module names use dots as separators (e.g., "model.layers.0.mlp.pt").
 """
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -22,6 +21,8 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+_logged_mismatches: set = set()
 
 
 def _discover_input_files(input_dir: str) -> Dict[str, str]:
@@ -32,56 +33,86 @@ def _discover_input_files(input_dir: str) -> Dict[str, str]:
         logger.error(f"[input_loader] Directory not found: {input_dir}")
         return result
     for f in input_path.glob("*.pt"):
-        # module name = filename without .pt extension
         module_name = f.stem
         result[module_name] = str(f)
     return result
 
 
+def _find_first_tensor(val: Any) -> Optional[torch.Tensor]:
+    """Recursively find the first tensor in a nested structure."""
+    if isinstance(val, torch.Tensor):
+        return val
+    elif isinstance(val, (list, tuple)):
+        for item in val:
+            t = _find_first_tensor(item)
+            if t is not None:
+                return t
+    elif isinstance(val, dict):
+        for item in val.values():
+            t = _find_first_tensor(item)
+            if t is not None:
+                return t
+    return None
+
+
+def _align_tensor(val: Any, device: torch.device, dtype: torch.dtype) -> Any:
+    """Recursively move tensors to the target device/dtype."""
+    if isinstance(val, torch.Tensor):
+        return val.to(
+            device=device, dtype=dtype if val.is_floating_point() else val.dtype
+        )
+    elif isinstance(val, list):
+        return [_align_tensor(v, device, dtype) for v in val]
+    elif isinstance(val, tuple):
+        return tuple(_align_tensor(v, device, dtype) for v in val)
+    elif isinstance(val, dict):
+        return {k: _align_tensor(v, device, dtype) for k, v in val.items()}
+    return val
+
+
 def _validate_shape(
     replacement: torch.Tensor, original: torch.Tensor, module_name: str
 ) -> bool:
-    """Check that replacement shape matches original. Returns True if valid."""
+    """Check that replacement shape matches original. Logs once per module."""
     if replacement.shape != original.shape:
-        logger.error(
-            f"[input_loader] Shape mismatch for '{module_name}': "
-            f"loaded {tuple(replacement.shape)} vs "
-            f"expected {tuple(original.shape)}"
-        )
+        if module_name not in _logged_mismatches:
+            logger.error(
+                f"[input_loader] Shape mismatch for '{module_name}': "
+                f"loaded {tuple(replacement.shape)} vs "
+                f"expected {tuple(original.shape)}"
+            )
+            _logged_mismatches.add(module_name)
         return False
     return True
 
 
-def _make_input_hook(
-    module_name: str, replacement_path: str
-) -> Any:
+def _make_input_hook(module_name: str, replacement_path: str) -> Any:
     """Create a forward_pre_hook that replaces the module's input."""
-    # Load once at registration time
     raw = torch.load(replacement_path, map_location="cpu", weights_only=True)
     logger.info(
         f"[input_loader] Loaded replacement for '{module_name}' "
         f"from {replacement_path}"
     )
 
-    # Cache device-aligned versions to avoid repeated .to() calls
     _aligned_cache: Dict[torch.device, Any] = {}
 
     def hook(module: nn.Module, args: Tuple, kwargs: Dict) -> Tuple[Tuple, Dict]:
         nonlocal _aligned_cache
 
-        # Determine the slot to replace (first positional arg or known kwarg)
+        # Determine the slot to replace
         original = None
-        slot_type = "args"  # "args" or kwarg name
-        slot_idx = 0
+        slot_type = "args"
 
-        if args and isinstance(args[0], torch.Tensor):
-            original = args[0]
-        else:
+        if args:
+            original = _find_first_tensor(args[0])
+
+        if original is None:
             for kw_name in ("hidden_states", "x", "input", "inputs_embeds"):
-                if kw_name in kwargs and isinstance(kwargs[kw_name], torch.Tensor):
-                    original = kwargs[kw_name]
-                    slot_type = kw_name
-                    break
+                if kw_name in kwargs:
+                    original = _find_first_tensor(kwargs[kw_name])
+                    if original is not None:
+                        slot_type = kw_name
+                        break
 
         if original is None:
             return args, kwargs
@@ -89,11 +120,7 @@ def _make_input_hook(
         # Get or create aligned replacement
         device = original.device
         if device not in _aligned_cache:
-            if isinstance(raw, torch.Tensor):
-                repl = raw.to(device=device, dtype=original.dtype)
-            else:
-                repl = raw
-            _aligned_cache[device] = repl
+            _aligned_cache[device] = _align_tensor(raw, device, original.dtype)
 
         repl = _aligned_cache[device]
 
@@ -137,7 +164,6 @@ def register_input_loaders(model: nn.Module, input_dir: str) -> int:
             continue
 
         target_module = name_to_module[module_name]
-        # Attach metadata for introspection
         target_module._forward_hook_target_name = module_name
         target_module._forward_hook_root_model = tracker
 

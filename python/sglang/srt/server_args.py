@@ -1417,6 +1417,10 @@ class ServerArgs:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
 
+        if self.load_input_dir:
+            _set(Phase.DECODE, "backend", Backend.DISABLED)
+            _set(Phase.PREFILL, "backend", Backend.DISABLED)
+
         # ---- Legacy convenience flags ----
         if self.disable_prefill_cuda_graph:
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
