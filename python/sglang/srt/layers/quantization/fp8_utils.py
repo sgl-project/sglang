@@ -395,16 +395,8 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     return _dispatch_auto_backend()
 
 
-def dispatch_w8a8_mxfp8_linear() -> Callable:
-    """Dispatch MXFP8 linear kernel by --fp8-gemm-backend.
-
-    For MXFP8, Triton remains the default path. We only route to FlashInfer
-    when backend is explicitly set to flashinfer_cutlass or flashinfer_trtllm.
-    """
-    backend = get_fp8_gemm_runner_backend()
-    if backend.is_flashinfer_trtllm():
-        return flashinfer_mxfp8_blockscaled_linear
-    elif backend.is_flashinfer_cutlass():
+def dispatch_w8a8_mxfp8_linear(backend: Fp8GemmRunnerBackend) -> Callable:
+    if backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
         return flashinfer_mxfp8_blockscaled_linear
     return triton_mxfp8_blockscaled_linear
 
@@ -511,6 +503,13 @@ def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
     if FP8_GEMM_RUNNER_BACKEND is None:
         FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend.AUTO
     return FP8_GEMM_RUNNER_BACKEND
+
+
+def resolve_mxfp8_linear_backend() -> Fp8GemmRunnerBackend:
+    backend = get_fp8_gemm_runner_backend()
+    if backend.is_auto() and _is_sm100_supported and is_flashinfer_available():
+        return Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+    return backend
 
 
 def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
@@ -1106,8 +1105,7 @@ def flashinfer_mxfp8_blockscaled_linear(
     # Ensure transposed tensors are contiguous for FlashInfer's internal runner.
     weight_t = weight.contiguous().t()
 
-    if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
-
+    if resolve_mxfp8_linear_backend().is_flashinfer_trtllm():
         weight_scale_t = weight_scale.contiguous().view(-1)
         output = flashinfer_mm_mxfp8(
             q_input,
@@ -1118,7 +1116,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             use_8x4_sf_layout=False,
             backend="trtllm",
         )
-    elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+    elif resolve_mxfp8_linear_backend().is_flashinfer_cutlass():
         weight_scale_t = (
             weight_scale.contiguous().t()
             if weight_scale.ndim == 2
