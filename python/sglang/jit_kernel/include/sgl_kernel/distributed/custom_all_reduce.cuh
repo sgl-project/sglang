@@ -213,6 +213,10 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     m_is_graph_capturing = enabled;
   }
 
+  void set_cuda_graph_register_inputs(bool enabled) {
+    m_register_graph_inputs = enabled;
+  }
+
   void free_ipc_handles() {
     for (const auto& pair : m_ipc_cache) {
       host::RuntimeDeviceCheck(cudaIpcCloseMemHandle(pair.second));
@@ -311,6 +315,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   uint32_t m_cta_size;
   // other states
   bool m_is_graph_capturing = false;
+  bool m_register_graph_inputs = true;
   int64_t m_cum_registered_count = 0;
   std::optional<PullController> m_pull_ctrl;
   std::optional<PushController> m_push_ctrl;

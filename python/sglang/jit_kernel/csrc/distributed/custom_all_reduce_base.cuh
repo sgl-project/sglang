@@ -21,6 +21,7 @@ inline void register_custom_all_reduce() {
       .def("post_init", &Class::post_init)
       .def("register_inputs", &Class::register_inputs)
       .def("set_cuda_graph_capture", &Class::set_cuda_graph_capture)
+      .def("set_cuda_graph_register_inputs", &Class::set_cuda_graph_register_inputs)
       .def("free_ipc_handles", &Class::free_ipc_handles)
       .def("free_storage", &Class::free_storage)
       .def("configure_pull", &Class::configure_pull);
