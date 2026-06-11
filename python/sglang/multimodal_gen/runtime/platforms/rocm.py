@@ -131,6 +131,10 @@ class RocmPlatform(Platform):
                     dtype,
                 )
 
+        elif selected_backend == AttentionBackendEnum.LITEATTENTION_ROCM:
+            logger.info("Using LiteAttentionROCM backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.liteattention_rocm.LiteAttentionROCMBackend"
+
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
