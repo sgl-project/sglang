@@ -10,6 +10,7 @@ VERSION_HELPER_PATH = REPO_ROOT / "python" / "tools" / "get_version_tag.py"
 PYPROJECT_PATHS = [
     REPO_ROOT / "python" / "pyproject.toml",
     REPO_ROOT / "python" / "pyproject_cpu.toml",
+    REPO_ROOT / "python" / "pyproject_mlu.toml",
     REPO_ROOT / "python" / "pyproject_npu.toml",
     REPO_ROOT / "python" / "pyproject_other.toml",
     REPO_ROOT / "python" / "pyproject_xpu.toml",

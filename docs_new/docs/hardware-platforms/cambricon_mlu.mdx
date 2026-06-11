@@ -1,0 +1,23 @@
+---
+title: Cambricon MLUs
+metatags:
+  description: "Run SGLang on Cambricon MLUs."
+---
+
+This document describes how to run SGLang on Cambricon MLUs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
+
+## Install SGLang
+
+Use a Cambricon PyTorch environment that provides the MLU runtime stack, including `torch_mlu`, `torch_mlu_ops`, CNCL, and matching driver/runtime libraries.
+
+### Install from Source
+
+```bash
+# Use the default branch
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+
+# Install sglang python package with the MLU-specific pyproject
+rm -f python/pyproject.toml && mv python/pyproject_mlu.toml python/pyproject.toml
+pip install -e "python[srt_mlu]"
+```
