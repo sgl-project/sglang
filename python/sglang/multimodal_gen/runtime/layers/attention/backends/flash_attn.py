@@ -1,36 +1,16 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
-    current_platform,
 )
-
-try:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
-
-    from sglang.jit_kernel.flash_attention_v4 import (
-        flash_attn_varlen_func as flash_attn_varlen_func_fa4,
-    )
-
-    def flash_attn_func(*args, ver: int = 3, **kwargs):
-        if ver == 4:
-            return flash_attn_varlen_func_fa4(*args, **kwargs)
-        return flash_attn_varlen_func(*args, ver=ver, **kwargs)
-
-except ImportError as e:
-    raise e
-
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 
 def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -213,7 +193,7 @@ def flash_attn_varlen_func_op(
             "flash_attn_varlen_func_op is out-only op; return_softmax_lse must be False. "
             "Use flash_attn_varlen_func_op_lse for (out, lse)."
         )
-    return flash_attn_func(
+    return flash_attn_varlen_func(
         q,
         k,
         v,
@@ -277,7 +257,7 @@ def flash_attn_varlen_func_op_lse(
             "flash_attn_varlen_func_op_lse is out+lse op; return_softmax_lse must be True. "
             "Use flash_attn_varlen_func_op for out-only."
         )
-    return flash_attn_func(
+    return flash_attn_varlen_func(
         q,
         k,
         v,
@@ -306,20 +286,6 @@ def flash_attn_varlen_func_op_lse(
     )
 
 
-try:
-    if current_platform.is_hopper():
-        from flash_attn_interface import (
-            flash_attn_varlen_func as flash_attn_varlen_func_upstream,
-        )
-    else:
-        flash_attn_varlen_func_upstream = None
-
-except Exception:
-    flash_attn_varlen_func_upstream = None
-    logger.warning(
-        "flash_attn 3 package is not installed. It's recommended to install flash_attn3 on hopper, otherwise performance is sub-optimal"
-    )
-
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -328,51 +294,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 
 fa_ver = 3
-
-
-@lru_cache(maxsize=128)
-def _get_cu_seqlens(device_index: int, bsz: int, seqlen: int) -> torch.Tensor:
-    return torch.arange(
-        0,
-        (bsz + 1) * seqlen,
-        step=seqlen,
-        device=torch.device("cuda", device_index),
-        dtype=torch.int32,
-    )
-
-
-@lru_cache(maxsize=256)
-def _should_use_upstream_flash_attention(
-    upstream_available: bool,
-    upstream_heads_ok: bool,
-    q_shape: tuple[int, ...],
-    k_shape: tuple[int, ...],
-    v_shape: tuple[int, ...],
-) -> bool:
-    if not upstream_available or not upstream_heads_ok:
-        return False
-
-    if len(q_shape) != 4 or len(k_shape) != 4 or len(v_shape) != 4:
-        return False
-
-    bsz, seqlen, nheads_q, d = q_shape
-    bsz_k, seqlen_k, nheads_k, d_k = k_shape
-    bsz_v, seqlen_v, nheads_v, d_v = v_shape
-
-    if (
-        bsz != bsz_k
-        or bsz != bsz_v
-        or seqlen != seqlen_k
-        or seqlen != seqlen_v
-        or d != d_k
-        or d != d_v
-    ):
-        return False
-    if nheads_k != nheads_v:
-        return False
-    if nheads_k == 0 or (nheads_q % nheads_k) != 0:
-        return False
-    return True
 
 
 def set_fa_ver(ver: int) -> None:
@@ -450,13 +371,6 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.attention_metadata = FlashAttentionMetadata()
-        if self.num_kv_heads is None:
-            self._upstream_heads_ok = True
-        else:
-            # For gqa, the num_heads must be a multiple of num_kv_heads
-            self._upstream_heads_ok = (
-                self.num_kv_heads > 0 and (self.num_heads % self.num_kv_heads) == 0
-            )
 
     def forward(
         self,
@@ -477,45 +391,11 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
 
-        q_shape = tuple(query.shape)
-        k_shape = tuple(key.shape)
-        v_shape = tuple(value.shape)
-
-        use_upstream = _should_use_upstream_flash_attention(
-            flash_attn_varlen_func_upstream is not None,
-            self._upstream_heads_ok,
-            q_shape,
-            k_shape,
-            v_shape,
-        )
-
-        if use_upstream:
-            bsz, seqlen, nheads_q, d = q_shape
-            q_ = query.contiguous()
-            k_ = key.contiguous()
-            v_ = value.contiguous()
-            out = flash_attn_varlen_func_upstream(
-                q_,
-                k_,
-                v_,
-                None,
-                None,
-                seqlen,
-                seqlen,
-                softmax_scale=self.softmax_scale,
-                causal=self.causal,
-                return_attn_probs=return_softmax_lse,
-            )
-            if return_softmax_lse:
-                out_tensor, softmax_lse = out
-                return out_tensor.reshape(bsz, seqlen, nheads_q, -1), softmax_lse
-            return out.reshape(bsz, seqlen, nheads_q, d)
-
         # FA version selection:
         # - fa_ver == 3: call python function (can return Tensor or (Tensor, Tensor) depending on flag)
         # - fa_ver == 4: call custom ops with FIXED return schema
         if fa_ver == 3:
-            flash_attn_op = flash_attn_func
+            flash_attn_op = flash_attn_varlen_func
             output = flash_attn_op(
                 q=query,
                 k=key,

@@ -96,6 +96,7 @@ def _run_benchmark_with_timeout(
             profile_path_prefix,
             json_output_file,
             extra_args=bench_args,
+            enable_profile=False,  # Disable profiling for AMD tests
         )
         _, cmd_success = runner.run_benchmark_command(command, model_description)
         if not cmd_success:

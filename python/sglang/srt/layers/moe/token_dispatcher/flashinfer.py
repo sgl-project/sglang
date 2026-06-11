@@ -5,6 +5,7 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.token_dispatcher import (
@@ -24,10 +25,12 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
 
 try:
-    from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
+    from flashinfer import nvfp4_block_scale_interleave
     from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
     from flashinfer.comm.mapping import Mapping
     from flashinfer.comm.mnnvl import MnnvlConfig
+
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     use_flashinfer = True
 except ImportError:
@@ -167,6 +170,7 @@ class FlashinferDispatcher(BaseDispatcher):
             (1, self.router_topk), dtype=torch.float32, device="cuda"
         )
 
+    @debug_kernel_api
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> FlashinferDispatchOutput:
@@ -208,15 +212,21 @@ class FlashinferDispatcher(BaseDispatcher):
         payloads.append(topk_ids)
         payloads.append(topk_weights)
 
-        self.runtime_max_tokens_per_rank = (
-            max(get_dp_global_num_tokens())
-            if get_dp_global_num_tokens() is not None
-            else x.shape[0]
-        )
+        dp_global = get_dp_global_num_tokens()
+        if dp_global is not None and len(dp_global) > 1:
+            # DP attention: multiple DP ranks with different token counts.
+            # Use the max across ranks so the A2A workspace fits the fattest.
+            self.runtime_max_tokens_per_rank = max(dp_global)
+        else:
+            # dp_size=1 or SP: use the actual input tensor size (post-scatter
+            # in SP mode, full batch otherwise).  Avoids the pre-scatter
+            # scheduler count which can exceed the workspace cap.
+            self.runtime_max_tokens_per_rank = x.shape[0]
         recv_tensors = self.moe_a2a.dispatch(
             self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
+            invalid_token_expert_id=-1,
             expert_id_payload_index=expert_id_payload_index,
         )
         if x_sf is not None:
@@ -243,6 +253,7 @@ class FlashinferDispatcher(BaseDispatcher):
             moe_output,
         )
 
+    @debug_kernel_api
     def combine(self, combine_input: FlashinferCombineInput) -> torch.Tensor:
         hidden_states = combine_input.hidden_states
         output_hidden_size = hidden_states.shape[-1]

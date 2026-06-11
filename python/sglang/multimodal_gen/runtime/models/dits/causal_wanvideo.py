@@ -13,7 +13,9 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -35,6 +37,9 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     get_rotary_pos_embed,
@@ -55,7 +60,6 @@ logger = init_logger(__name__)
 
 
 class CausalWanSelfAttention(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -248,7 +252,6 @@ class CausalWanSelfAttention(nn.Module):
 
 
 class CausalWanTransformerBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -262,16 +265,17 @@ class CausalWanTransformerBlock(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
+        self.to_q = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+        self.to_k = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+        self.to_v = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True)
+        self.to_out = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
         self.attn1 = CausalWanSelfAttention(
             dim,
             num_heads,
@@ -301,13 +305,25 @@ class CausalWanTransformerBlock(nn.Module):
 
         # 2. Cross-attention
         # Only T2V for now
-        self.attn2 = WanT2VCrossAttention(dim, num_heads, qk_norm=qk_norm, eps=eps)
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
+        self.attn2 = WanT2VCrossAttention(
+            dim,
+            num_heads,
+            qk_norm=qk_norm,
+            eps=eps,
+            supported_attention_backends=cross_attn_backends,
+            quant_config=quant_config,
+        )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
+        self.ffn = MLP(
+            dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
+        )
         self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -381,7 +397,7 @@ class CausalWanTransformerBlock(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeroes(
+        null_shift = null_scale = torch.zeros(
             (1,), device=hidden_states.device, dtype=hidden_states.dtype
         )
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
@@ -413,7 +429,7 @@ class CausalWanTransformerBlock(nn.Module):
         return hidden_states
 
 
-class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
+class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -421,7 +437,12 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
 
-    def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: WanVideoConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
@@ -466,6 +487,7 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
                     config.added_kv_proj_dim,
                     self._supported_attention_backends,
                     prefix=f"{config.prefix}.blocks.{i}",
+                    quant_config=quant_config,
                 )
                 for i in range(config.num_layers)
             ]
@@ -622,9 +644,9 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             self.num_attention_heads,
             rope_dim_list,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
             rope_theta=10000,
             start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
@@ -638,10 +660,13 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
             dim=0, sizes=timestep.shape
@@ -754,9 +779,9 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             self.num_attention_heads,
             rope_dim_list,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
             rope_theta=10000,
             start_frame=start_frame,
@@ -780,10 +805,13 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
             dim=0, sizes=timestep.shape

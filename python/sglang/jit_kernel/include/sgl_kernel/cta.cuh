@@ -1,3 +1,6 @@
+/// \file cta.cuh
+/// \brief CTA (Cooperative Thread Array / thread-block) level primitives.
+
 #pragma once
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -5,6 +8,21 @@
 
 namespace device::cta {
 
+/**
+ * \brief Compute the maximum of `value` across all threads in the CTA.
+ *
+ * Uses a two-level reduction: first within each warp via `warp::reduce_max`,
+ * then across warps using shared memory. The final result is stored in
+ * `smem[0]`.
+ *
+ * \tparam T Numeric type (must be supported by `warp::reduce_max`).
+ * \param value Per-thread input value.
+ * \param smem Shared memory buffer (must have at least `blockDim.x / 32`
+ *             elements).
+ * \param min_value Identity element for max (default 0.0f).
+ * \note This function does NOT issue a trailing `__syncthreads()`.
+ *       Callers must synchronize before reading `smem[0]`.
+ */
 template <typename T>
 SGL_DEVICE void reduce_max(T value, float* smem, float min_value = 0.0f) {
   const uint32_t warp_id = threadIdx.x / kWarpThreads;

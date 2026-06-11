@@ -13,6 +13,8 @@
 # ==============================================================================
 
 """Inference-only Qwen3Next MTP Speculative Decoding."""
+
+import copy
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -21,6 +23,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -28,7 +31,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +45,15 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        # Deep-copy so MTP mutations below don't leak into the target's config.
+        config = copy.deepcopy(config)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
+        if (
+            is_npu()
+            and get_global_server_args().speculative_draft_model_quantization is None
+        ):
+            quant_config = None
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
         self.pp_group = get_pp_group()
@@ -61,7 +71,10 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         config.num_hidden_layers = 1
         config.full_attention_interval = 1
         self.model = Qwen3NextModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            is_nextn=True,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -81,6 +94,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
 
@@ -91,12 +105,13 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
 
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            hidden_states,
-        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                hidden_states,
+            )
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

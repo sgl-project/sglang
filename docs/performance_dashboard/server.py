@@ -12,13 +12,19 @@ Usage:
     python server.py --port 8080
     python server.py --host 0.0.0.0  # Allow external access
     python server.py --fetch-on-start
+    python server.py --username admin --password secret  # Enable authentication
+    DASHBOARD_USERNAME=admin DASHBOARD_PASSWORD=secret python server.py  # Via env vars
+    python server.py --refresh-interval 12  # Auto-refresh data every 12 hours
 """
 
 import argparse
+import hashlib
+import hmac
 import http.server
 import io
 import json
 import os
+import secrets
 import socketserver
 import threading
 import time
@@ -43,6 +49,47 @@ metrics_cache = {
 
 CACHE_TTL = 300  # 5 minutes
 REQUEST_TIMEOUT = 30  # seconds
+
+# Authentication configuration (set via CLI flags)
+auth_config = {
+    "enabled": False,
+    "username": None,
+    "password_hash": None,  # SHA-256 hash of the password
+    "active_tokens": {},  # token -> expiry timestamp
+}
+auth_lock = threading.Lock()
+AUTH_TOKEN_TTL = 3600  # 1 hour
+
+
+def hash_password(password):
+    """Hash a password using SHA-256 for constant-time comparison."""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def create_auth_token():
+    """Create a new session token."""
+    token = secrets.token_hex(32)
+    with auth_lock:
+        # Clean up expired tokens
+        now = time.time()
+        auth_config["active_tokens"] = {
+            t: exp for t, exp in auth_config["active_tokens"].items() if exp > now
+        }
+        auth_config["active_tokens"][token] = now + AUTH_TOKEN_TTL
+    return token
+
+
+def verify_auth_token(token):
+    """Verify a session token is valid and not expired."""
+    if not token:
+        return False
+    with auth_lock:
+        expiry = auth_config["active_tokens"].get(token)
+        if expiry and expiry > time.time():
+            return True
+        # Remove expired token
+        auth_config["active_tokens"].pop(token, None)
+        return False
 
 
 def get_github_token():
@@ -187,11 +234,46 @@ def update_cache_async():
             metrics_cache["updating"] = False
 
 
+def start_periodic_refresh(interval_hours):
+    """Start a background thread that refreshes the cache periodically."""
+    interval_seconds = interval_hours * 3600
+
+    def refresh_loop():
+        while True:
+            time.sleep(interval_seconds)
+            print(f"Periodic refresh triggered (every {interval_hours}h)")
+            update_cache_async()
+
+    thread = threading.Thread(target=refresh_loop, daemon=True)
+    thread.start()
+    print(f"Periodic refresh enabled: every {interval_hours} hours")
+
+
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     """HTTP request handler for the dashboard."""
 
     def __init__(self, *args, directory=None, **kwargs):
         super().__init__(*args, directory=directory, **kwargs)
+
+    def _send_json(self, data, status=200):
+        """Send a JSON response."""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def _check_auth(self):
+        """Check if request is authenticated. Returns True if OK, sends 401 and returns False otherwise."""
+        if not auth_config["enabled"]:
+            return True
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            if verify_auth_token(token):
+                return True
+        self._send_json({"error": "Unauthorized"}, status=401)
+        return False
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -201,12 +283,54 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(400, "Invalid path")
             return
 
-        if parsed.path == "/api/metrics":
-            self.handle_metrics_api(parsed)
+        if parsed.path == "/api/auth-check":
+            self.handle_auth_check()
+        elif parsed.path == "/api/metrics":
+            if self._check_auth():
+                self.handle_metrics_api(parsed)
         elif parsed.path == "/api/refresh":
-            self.handle_refresh_api()
+            if self._check_auth():
+                self.handle_refresh_api()
         else:
             super().do_GET()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/api/login":
+            self.handle_login()
+        else:
+            self.send_error(404, "Not Found")
+
+    def handle_auth_check(self):
+        """Tell the frontend whether authentication is required."""
+        self._send_json({"auth_required": auth_config["enabled"]})
+
+    def handle_login(self):
+        """Validate username/password and return a session token."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0 or content_length > 4096:
+            self._send_json({"error": "Invalid request"}, status=400)
+            return
+
+        try:
+            body = json.loads(self.rfile.read(content_length))
+        except (json.JSONDecodeError, ValueError):
+            self._send_json({"error": "Invalid JSON"}, status=400)
+            return
+
+        username = body.get("username", "")
+        password = body.get("password", "")
+
+        if hmac.compare_digest(
+            username, auth_config["username"]
+        ) and hmac.compare_digest(
+            hash_password(password), auth_config["password_hash"]
+        ):
+            token = create_auth_token()
+            self._send_json({"token": token})
+        else:
+            self._send_json({"error": "Invalid username or password"}, status=401)
 
     def handle_metrics_api(self, parsed):
         """Handle /api/metrics endpoint."""
@@ -222,21 +346,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
             # Trigger background update
             threading.Thread(target=update_cache_async, daemon=True).start()
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self._send_json(data)
 
     def handle_refresh_api(self):
         """Handle /api/refresh endpoint."""
         threading.Thread(target=update_cache_async, daemon=True).start()
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps({"status": "refreshing"}).encode())
+        self._send_json({"status": "refreshing"})
 
     def log_message(self, format, *args):
         """Custom log format."""
@@ -254,7 +369,32 @@ def main():
     parser.add_argument(
         "--fetch-on-start", action="store_true", help="Fetch metrics on startup"
     )
+    parser.add_argument(
+        "--refresh-interval",
+        type=float,
+        default=12,
+        help="Auto-refresh interval in hours (default: 12, set to 0 to disable)",
+    )
+    parser.add_argument(
+        "--username",
+        default=os.environ.get("DASHBOARD_USERNAME"),
+        help="Username for dashboard authentication (or set DASHBOARD_USERNAME env var)",
+    )
+    parser.add_argument(
+        "--password",
+        default=os.environ.get("DASHBOARD_PASSWORD"),
+        help="Password for dashboard authentication (or set DASHBOARD_PASSWORD env var)",
+    )
     args = parser.parse_args()
+
+    # Configure authentication if both username and password are provided
+    if args.username and args.password:
+        auth_config["enabled"] = True
+        auth_config["username"] = args.username
+        auth_config["password_hash"] = hash_password(args.password)
+        print(f"Authentication enabled for user: {args.username}")
+    elif args.username or args.password:
+        parser.error("Both --username and --password must be provided together")
 
     # Change to dashboard directory
     dashboard_dir = Path(__file__).parent
@@ -263,6 +403,9 @@ def main():
     if args.fetch_on_start:
         print("Fetching initial metrics data...")
         update_cache_async()
+
+    if args.refresh_interval > 0:
+        start_periodic_refresh(args.refresh_interval)
 
     handler = lambda *a, **kw: DashboardHandler(*a, directory=str(dashboard_dir), **kw)
 

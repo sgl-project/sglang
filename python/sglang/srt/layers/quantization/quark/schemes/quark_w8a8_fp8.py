@@ -16,7 +16,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
+from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
@@ -29,7 +29,7 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
 
-class QuarkW8A8Fp8(QuarkScheme):
+class QuarkW8A8Fp8(QuarkLinearScheme):
 
     def __init__(
         self, weight_config: dict[str, Any], input_config: Optional[dict[str, Any]]

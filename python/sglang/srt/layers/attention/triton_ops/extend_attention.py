@@ -72,6 +72,14 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 32)
+        elif _is_cuda and CUDA_CAPABILITY[0] == 10:
+            # Blackwell data-center architecture (GB200, B200, sm_100a)
+            # sm_100a has different register constraints from Hopper; Hopper block sizes
+            # cause PTX register exhaustion (>255 regs) for large head dims (Lq=512).
+            if Lq <= 256:
+                BLOCK_M, BLOCK_N = (64, 64)
+            else:
+                BLOCK_M, BLOCK_N = (16, 64)
         elif _is_cuda and CUDA_CAPABILITY[0] >= 9:
             # Hopper architecture (H100, etc.)
             if Lq <= 256:
@@ -232,6 +240,8 @@ def _fwd_kernel(
     sink_ptr,
     window_kv_offset_ptr,
     sm_scale,
+    k_scale,
+    v_scale,
     kv_group_num,
     stride_qbs,
     stride_qh,
@@ -372,7 +382,6 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
-
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
@@ -386,7 +395,7 @@ def _fwd_kernel(
                     other=0.0,
                 )
                 qk += tl.dot(qpe.to(kpe.dtype), kpe)
-            qk *= sm_scale
+            qk *= sm_scale * k_scale
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
@@ -415,7 +424,7 @@ def _fwd_kernel(
                 other=0.0,
             )
             p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
 
             e_max = n_e_max
 
@@ -561,6 +570,8 @@ def extend_attention_fwd(
     is_causal,
     mask_indptr,
     max_len_extend,
+    k_scale,
+    v_scale,
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
@@ -617,6 +628,8 @@ def extend_attention_fwd(
         sinks,
         window_kv_offsets,
         sm_scale,
+        k_scale,
+        v_scale,
         kv_group_num,
         q_extend.stride(0),
         q_extend.stride(1),
@@ -702,7 +715,8 @@ def _fwd_kernel_unified(
     mask_indptr,
     sink_ptr,
     window_start_pos,
-    sm_scale,
+    sm_scale_withk,
+    v_scale,
     kv_group_num,
     stride_qbs,
     stride_qh,
@@ -872,7 +886,6 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
 
-            # Compute QK
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
@@ -887,7 +900,7 @@ def _fwd_kernel_unified(
                 )
                 qk += tl.dot(qpe.to(kpe.dtype), kpe)
 
-            qk *= sm_scale
+            qk *= sm_scale_withk
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
@@ -935,7 +948,7 @@ def _fwd_kernel_unified(
     )
     tl.store(
         O + offs_o,
-        acc / deno[:, None],
+        acc / deno[:, None] * v_scale,
         mask=mask_m[:, None] & mask_dv[None, :],
     )
 
@@ -945,6 +958,8 @@ def extend_attention_fwd_unified(
     o,
     k_buffer,
     v_buffer,
+    k_scale,
+    v_scale,
     qo_indptr,
     kv_indptr,
     kv_indices,
@@ -1024,7 +1039,8 @@ def extend_attention_fwd_unified(
         mask_indptr,
         sinks,
         window_start_pos,
-        sm_scale,
+        sm_scale * k_scale,
+        v_scale,
         kv_group_num,
         q.stride(0),
         q.stride(1),

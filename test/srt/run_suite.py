@@ -9,7 +9,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 # NOTE: per-commit-4-gpu, per-commit-8-gpu-h200, per-commit-8-gpu-h20, per-commit-4-gpu-b200,
 # per-commit-4-gpu-gb200, per-commit-4-gpu-deepep, and per-commit-8-gpu-h200-deepep suites
-# have been migrated to stage-c suites in test/registered/ using the CI registry system.
+# have been migrated to base-c suites in test/registered/ using the CI registry system.
 suites = {
     # quantization_test suite migrated to test/registered/quant/
     # All CUDA tests migrated to test/registered/
@@ -44,11 +44,27 @@ suite_amd = {
     # by test/run_suite.py using the registry system.
 }
 
+# Keep the Arm64 bootstrap suite limited to hosted-runner-safe unit kernels.
+# `test_extend.py`, `test_mamba.py`, and `test_mla.py` still hit the
+# x86-specific BF16 BRGEMM/VNNI path on Arm and need dedicated fallbacks.
+suite_arm64 = {
+    "per-commit-cpu-arm64": [
+        TestFile("cpu/test_activation.py"),
+        TestFile("cpu/test_decode.py"),
+        TestFile("cpu/test_norm.py"),
+        TestFile("cpu/test_qwen3.py"),
+        TestFile("cpu/test_rope.py"),
+        TestFile("cpu/test_server_args_backend.py"),
+        TestFile("cpu/test_topk.py"),
+    ],
+}
+
 # Add Intel Xeon tests
 suite_xeon = {
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
         TestFile("cpu/test_binding.py"),
+        TestFile("cpu/test_bmm.py"),
         TestFile("cpu/test_causal_conv1d.py"),
         TestFile("cpu/test_cpu_graph.py"),
         TestFile("cpu/test_decode.py"),
@@ -65,54 +81,26 @@ suite_xeon = {
         TestFile("cpu/test_qkv_proj_with_rope.py"),
         TestFile("cpu/test_qwen3.py"),
         TestFile("cpu/test_rope.py"),
+        TestFile("cpu/test_server_args_backend.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
     ],
 }
 
 # Add Intel XPU tests
+# NOTE: please sort the test cases alphabetically by the test file name
 suite_xpu = {
     "per-commit-xpu": [
+        TestFile("xpu/test_deepseek_ocr.py", 360),
+        TestFile("xpu/test_deepseek_ocr_triton.py", 360),
+        # TestFile("xpu/test_internvl.py"),
         TestFile("xpu/test_intel_xpu_backend.py"),
     ],
 }
 
-# Add Ascend NPU tests
-# TODO: Set accurate estimate time
-# NOTE: please sort the test cases alphabetically by the test file name
-suite_ascend = {
-    "per-commit-1-npu-a2": [
-        TestFile("ascend/test_ascend_gptq.py", 400),
-        TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
-        TestFile("ascend/test_ascend_hicache_mha.py", 400),
-        TestFile("ascend/test_ascend_sampling_backend.py", 400),
-        TestFile("ascend/test_ascend_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
-        TestFile("test_embed_interpolate_unittest.py", 400),
-    ],
-    "per-commit-2-npu-a2": [
-        TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
-    ],
-    "per-commit-4-npu-a2": [
-        TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_hicache_mla.py", 400),
-        TestFile("ascend/test_ascend_tp4_bf16.py", 400),
-    ],
-    "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 3600),
-        # TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
-        TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
-    ],
-}
-
 suites.update(suite_amd)
+suites.update(suite_arm64)
 suites.update(suite_xeon)
-suites.update(suite_ascend)
 suites.update(suite_xpu)
 
 
@@ -320,4 +308,9 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATION NOTICE: The folder `test/srt` should be deprecated as soon as possible. "
+        "Migrate tests to the new CI registry system described in `test/README.md`.",
+        flush=True,
+    )
     main()

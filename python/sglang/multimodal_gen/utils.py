@@ -11,7 +11,6 @@ import inspect
 import math
 import os
 import signal
-import socket
 import sys
 import threading
 import traceback
@@ -23,7 +22,6 @@ from typing import Any, TypeVar, cast
 import cloudpickle
 import torch
 import yaml
-from remote_pdb import RemotePdb
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 import sglang.multimodal_gen.envs as envs
@@ -35,6 +33,24 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 logger = init_logger(__name__)
 
 T = TypeVar("T")
+
+
+def expand_path_fields(obj) -> None:
+    """In-place expanduser on all dataclass fields whose name ends with '_path' or '_paths'."""
+    eu = os.path.expanduser
+    for f in fields(obj):
+        v = getattr(obj, f.name)
+        if f.name.endswith("_path") and isinstance(v, str):
+            setattr(obj, f.name, eu(v))
+        elif f.name.endswith("_path") and isinstance(v, list):
+            setattr(obj, f.name, [eu(x) if isinstance(x, str) else x for x in v])
+        elif f.name.endswith("_paths") and isinstance(v, dict):
+            setattr(
+                obj,
+                f.name,
+                {k: eu(p) if isinstance(p, str) else p for k, p in v.items()},
+            )
+
 
 # TODO(will): used to convert server_args.precision to torch.dtype. Find a
 # cleaner way to do this.
@@ -544,15 +560,6 @@ class TypeBasedDispatcher:
             if isinstance(obj, ty):
                 return fn(obj)
         raise ValueError(f"Invalid object: {obj}")
-
-
-# For non-torch.distributed debugging
-def remote_breakpoint() -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.
-        port = s.getsockname()[1]
-        RemotePdb(host="localhost", port=port).set_trace()
 
 
 @dataclass

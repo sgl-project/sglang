@@ -17,7 +17,7 @@ def cta_reduce_sum(
     val: cute.Numeric, num_warps: cutlass.Constexpr, tidx: cutlass.Int32
 ) -> cute.Numeric:
     smem = cutlass.utils.SmemAllocator()
-    acc = smem.allocate_tensor(cutlass.Float32, num_warps)
+    acc = smem.allocate_tensor(cutlass.Float32, num_warps + 1)
     warp_id = tidx >> 5
     lane_id = tidx & 31
     if lane_id == 0:
@@ -27,7 +27,7 @@ def cta_reduce_sum(
         val = acc[lane_id] if lane_id < num_warps else cutlass.Float32(0)
         val = warp_reduce_sum(val)
         if lane_id == 0:
-            acc[0] = val
+            acc[num_warps] = val
     cute.arch.sync_threads()
-    val = acc[0]
+    val = acc[num_warps]
     return val

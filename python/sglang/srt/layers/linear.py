@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/linear.py"""
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -18,6 +21,7 @@ from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_quant_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -36,6 +40,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -53,9 +58,7 @@ logger = logging.getLogger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
-    "AWQMarlinLinearMethod",
     "AWQLinearMethod",
-    "AWQLinearAscendMethod",
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
     "BlockInt8LinearMethod",
@@ -66,6 +69,9 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQLinearMethod",
     "FBGEMMFp8LinearMethod",
     "GPTQLinearAscendMethod",
+    "GPTQLinearIntelAMXMethod",
+    "GPTQMoEAscendMethod",
+    "GPTQMoEIntelAMXMethod",
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
@@ -175,6 +181,13 @@ class LinearBase(torch.nn.Module):
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
 
+        if self.quant_method is not None:
+            wrap_method_with_debug_kernel_once(
+                self.quant_method,
+                "apply",
+                op_name=f"sglang.quant_method.{self.quant_method.__class__.__name__}.apply",
+            )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
@@ -257,7 +270,9 @@ class ReplicatedLinear(LinearBase):
                     param.dtype == loaded_weight.dtype
                 ), "init para dtype and loaded weight dtype should be the same"
 
-        assert param.size() == loaded_weight.size()
+        assert (
+            param.size() == loaded_weight.size()
+        ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -379,7 +394,11 @@ class ColumnParallelLinear(LinearBase):
 
         # Materialize GGUF UninitializedParameter
         if is_gguf_weight and isinstance(param, UninitializedParameter):
-            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+            weight_shape = list(loaded_weight.shape)
+            if output_dim is not None:
+                weight_shape[output_dim] = weight_shape[output_dim] // self.tp_size
+            param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
+            param_data = param.data
 
         # bitsandbytes loads the weights of the specific portion
         # no need to narrow here
@@ -413,7 +432,9 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert param_data.shape == loaded_weight.shape
+        assert (
+            param_data.shape == loaded_weight.shape
+        ), f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -530,8 +551,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self,
         param: Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[int] = None,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
+        if isinstance(loaded_shard_id, tuple):
+            if hasattr(param, "load_merged_column_weight"):
+                return self.weight_loader_v2(param, loaded_weight, loaded_shard_id)
+            raise NotImplementedError(
+                "Shard id with multiple indices is not supported in weight_loader, "
+                "please use weight_loader_v2 instead."
+            )
 
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
@@ -575,8 +603,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             current_shard_offset = 0
             shard_offsets: List[Tuple[int, int, int]] = []
             for i, output_size in enumerate(self.output_sizes):
-                shard_offsets.append((i, current_shard_offset, output_size))
-                current_shard_offset += output_size
+                effective_size = (
+                    output_size // self.tp_size
+                    if self.use_presharded_weights
+                    else output_size
+                )
+                shard_offsets.append((i, current_shard_offset, effective_size))
+                current_shard_offset += effective_size
             packed_dim = getattr(param, "packed_dim", None)
 
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
@@ -693,7 +726,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
     def _load_fused_module_from_checkpoint(
-        self, param: BasevLLMParameter, loaded_weight: torch.Tensor
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        output_sizes: list[int] | None = None,
     ):
         """
         Handle special case for models where MLP layers are already
@@ -707,9 +743,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         current_shard_offset = 0
         shard_offsets: List[Tuple[int, int, int]] = []
-        for i, output_size in enumerate(self.output_sizes):
+        output_sizes = output_sizes or self.output_sizes
+        for i, output_size in enumerate(output_sizes):
             shard_offsets.append((i, current_shard_offset, output_size))
             current_shard_offset += output_size
+        if _is_cpu:
+            from sglang.srt.model_loader.weight_utils import (
+                pad_loaded_weight,
+            )
+
+            loaded_weight = pad_loaded_weight(
+                loaded_weight, param.output_dim, output_sizes
+            )
 
         for shard_id, shard_offset, shard_size in shard_offsets:
             # Special case for Quantization.
@@ -722,19 +767,72 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_size, shard_offset = param.adjust_shard_indexes_for_packing(
                     shard_size=shard_size, shard_offset=shard_offset
                 )
-
             loaded_weight_shard = loaded_weight.narrow(
                 param.output_dim, shard_offset, shard_size
             )
             self.weight_loader_v2(param, loaded_weight_shard, shard_id)
 
+    def _load_merged_block_scale(
+        self, param: BasevLLMParameter, loaded_weight: torch.Tensor
+    ):
+        """
+        Handle block-wise scale loading for MergedColumnParallelLinear.
+        Similar to QKVParallelLinear._load_qkv_block_scale, but for merged column layers.
+        """
+        weight_block_size = self.quant_method.quant_config.weight_block_size
+        block_n, _ = weight_block_size[0], weight_block_size[1]
+        block_n = 1 if getattr(param, "format_ue8m0", False) else block_n
+
+        # Calculate block sizes for each shard
+        shard_block_sizes = []
+        shard_block_offsets = []
+        current_block_offset = 0
+        for output_size in self.output_sizes:
+            shard_block_size = (output_size + block_n - 1) // block_n
+            shard_block_sizes.append(shard_block_size)
+            shard_block_offsets.append(current_block_offset)
+            current_block_offset += shard_block_size
+
+        if _is_cpu:
+            from sglang.srt.model_loader.weight_utils import (
+                pad_loaded_weight,
+            )
+
+            loaded_weight = pad_loaded_weight(
+                loaded_weight, param.output_dim, shard_block_sizes
+            )
+
+        # Load each shard
+        for shard_id, (shard_block_offset, shard_block_size) in enumerate(
+            zip(shard_block_offsets, shard_block_sizes)
+        ):
+            # Extract the shard from loaded_weight
+            loaded_weight_shard = loaded_weight.narrow(
+                param.output_dim, shard_block_offset, shard_block_size
+            )
+
+            # Calculate per-rank offset and size (considering TP)
+            rank_shard_offset = shard_block_offset // self.tp_size
+            rank_shard_size = shard_block_size // self.tp_size
+
+            # Load into the parameter
+            param.load_merged_column_weight(
+                loaded_weight=loaded_weight_shard,
+                shard_id=shard_id,
+                shard_offset=rank_shard_offset,
+                shard_size=rank_shard_size,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                use_presharded_weights=self.use_presharded_weights,
+            )
+
     def weight_loader_v2(
         self,
         param: BasevLLMParameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[int] = None,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
-        if loaded_shard_id is None:
+        if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
             if isinstance(param, PerTensorScaleParameter):
                 param.load_merged_column_weight(
                     loaded_weight=loaded_weight,
@@ -743,6 +841,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     tp_size=self.tp_size,
                 )
                 return
+            elif isinstance(param, BlockQuantScaleParameter):
+                self._load_merged_block_scale(param, loaded_weight)
+                return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_merged_column_weight(
                     loaded_weight=loaded_weight,
@@ -750,8 +851,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     tp_size=self.tp_size,
                 )
                 return
+            output_sizes = (
+                [self.output_sizes[idx] for idx in loaded_shard_id]
+                if loaded_shard_id
+                else None
+            )
             # TODO: @dsikka - move to parameter.py
-            self._load_fused_module_from_checkpoint(param, loaded_weight)
+            self._load_fused_module_from_checkpoint(
+                param, loaded_weight, output_sizes=output_sizes
+            )
             return
 
         assert loaded_shard_id < len(self.output_sizes)
@@ -947,7 +1055,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         block_n, _ = self.quant_method.quant_config.weight_block_size
         q_size = self.total_num_heads * self.head_size // block_n
         k_size = self.total_num_kv_heads * self.head_size // block_n
-        v_size = self.total_num_kv_heads * self.head_size // block_n
+        v_size = self.total_num_kv_heads * self.v_head_size // block_n
         shard_offsets = [
             # (shard_id, shard_offset, shard_size)
             ("q", 0, q_size),
@@ -1203,7 +1311,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                         output_dim, start_idx, shard_size
                     )
 
-        # Special case for for AQLM codebooks.
+        # Special case for AQLM codebooks.
         elif is_metadata:
             # metadata indicates fixed size concatenated along dim 0
             shard_size = loaded_weight.shape[0]
@@ -1409,7 +1517,7 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False):
+    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1423,16 +1531,31 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
+        if self.use_dp_attention_reduce:
+            symm_ctx = use_symmetric_memory(get_attention_tp_group())
+        else:
+            symm_ctx = use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            )
+        with symm_ctx:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
-                output = tensor_model_parallel_all_reduce(output_parallel)
+                quantize_communications = (
+                    (
+                        not forward_batch.forward_mode.is_decode_or_idle()
+                        and get_global_server_args().enable_quant_communications
+                    )
+                    if forward_batch is not None
+                    else False
+                )
+                if quantize_communications:
+                    output = tensor_model_parallel_quant_all_reduce(output_parallel)
+                else:
+                    output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 

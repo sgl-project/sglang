@@ -37,16 +37,23 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
+    is_sm100_supported,
+    is_sm120_supported,
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_musa = is_musa()
+_is_sm100_supported = is_sm100_supported()
+_is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda:
+if _is_cuda or _is_musa:
     from sgl_kernel import sgl_per_token_quant_fp8
 
     from sglang.jit_kernel.per_tensor_quant_fp8 import (
@@ -63,7 +70,12 @@ if _is_cuda:
 
         enable_sgl_per_token_group_quant_8bit = False
 
+    from sglang.jit_kernel.per_token_group_quant_8bit import (
+        per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
+    )
+
 if _is_hip:
+    _has_vllm = False
     if _use_aiter:
         try:
             from aiter import (  # v0.1.3
@@ -76,8 +88,29 @@ if _is_hip:
     else:
         try:
             import vllm._C  # noqa: F401
+
+            _has_vllm = True
         except ImportError:
-            raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
+            # Fallback: vllm not available, will use native PyTorch implementation
+            _has_vllm = False
+
+if _is_musa:
+
+    @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_8bit_v2")
+    def _(
+        input,
+        output_q,
+        output_s,
+        group_size,
+        eps,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        fuse_silu_and_mul,
+        masked_m,
+    ):
+        return
+
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +252,7 @@ def _per_token_group_quant_8bit_raw(
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tenosr with ndim >= 2.
+        x: The input tensor with ndim >= 2.
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
         dtype: The dype of output tensor.
@@ -309,10 +342,6 @@ def _per_token_group_quant_8bit_raw(
         )
 
     return x_q, x_s
-
-
-# backward compatibility
-per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
 
 
 def _per_token_group_quant_8bit_fuse_silu_and_mul(
@@ -494,27 +523,89 @@ def sglang_per_token_group_quant_fp8(
         scale_ue8m0=scale_ue8m0,
     )
 
+    # Enable v2 kernel by default on supported group sizes
+    _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
+    if enable_v2 is None:
+        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
+
     if x.shape[0] > 0:
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
-            sgl_per_token_group_quant_8bit(
-                x,
-                x_q,
-                x_s,
-                group_size,
-                eps,
-                fp8_min,
-                fp8_max,
-                scale_ue8m0,
-                fuse_silu_and_mul,
-                masked_m,
-                enable_v2=enable_v2,
-            )
+            if enable_v2:
+                sgl_per_token_group_quant_8bit(
+                    x,
+                    x_q,
+                    x_s,
+                    group_size,
+                    eps,
+                    fp8_min,
+                    fp8_max,
+                    scale_ue8m0,
+                    fuse_silu_and_mul,
+                    masked_m,
+                    enable_v2=True,
+                )
+            else:
+                sgl_per_token_group_quant_8bit_jit(
+                    input=x,
+                    output_q=x_q,
+                    output_s=x_s,
+                    group_size=group_size,
+                    eps=eps,
+                    fp8_min=fp8_min,
+                    fp8_max=fp8_max,
+                    scale_ue8m0=scale_ue8m0,
+                )
         else:
             assert not enable_v2
             sgl_per_token_group_quant_fp8(
                 x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
             )
+
+    return x_q, x_s
+
+
+def sglang_per_token_group_quant_fp8_ue8m0(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert (
+        x.shape[-1] % group_size == 0
+    ), f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
+    assert x.is_contiguous(), "x must be contiguous"
+    assert enable_sgl_per_token_group_quant_8bit, (
+        "sgl_per_token_group_quant_8bit is required (v2 kernel supports "
+        "group_size in {16, 32, 64, 128})"
+    )
+
+    *x_batch, x_q_mn, x_q_k = x.shape
+    x_q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
+
+    x_s_mn = x_q_mn
+    x_s_k = x_q_k // group_size
+    aligned_mn = ceil_align(x_s_mn, 4)
+    aligned_k = ceil_align(x_s_k, 4)
+    x_s = torch.empty(
+        (*x_batch, aligned_k // 4, aligned_mn),
+        device=x.device,
+        dtype=torch.int,
+    ).transpose(-1, -2)[..., :x_s_mn, :]
+
+    if x.shape[0] > 0:
+        sgl_per_token_group_quant_8bit(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            True,  # scale_ue8m0
+            False,  # fuse_silu_and_mul
+            None,  # masked_m
+            enable_v2=True,
+        )
 
     return x_q, x_s
 
@@ -581,6 +672,12 @@ def sglang_per_token_quant_fp8(
     return x_q, x_s
 
 
+if _is_cuda:
+    per_token_group_quant_fp8 = sglang_per_token_group_quant_fp8
+else:
+    per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
+
+
 @triton.jit
 def _static_quant_fp8(
     # Pointers to inputs and output
@@ -635,7 +732,7 @@ def static_quant_fp8(
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tenosr with ndim >= 2.
+        x: The input tensor with ndim >= 2.
         x_s: The quantization scale.
         repeat_scale: Whether to broadcast per-tensor scale to per-channel scale.
         dtype: The dype of output tensor.
@@ -737,7 +834,7 @@ def _w8a8_block_fp8_matmul(
     As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
-    scale_step_k = BLOCK_SIZE_K // group_k
+    n_tiles_k_per_group_k = group_k // BLOCK_SIZE_K
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -751,6 +848,7 @@ def _w8a8_block_fp8_matmul(
         a_s = tl.load(As_ptrs)
         b_s = tl.load(Bs_ptrs)
 
+        scale_step_k = tl.where((k + 1) % n_tiles_k_per_group_k == 0, 1, 0)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -961,6 +1059,11 @@ def get_w8a8_block_fp8_configs(
     be picked and the associated configuration chosen to invoke the kernel.
     """
 
+    # Skip config lookup during torch.compile to avoid non-Tensor ops (e.g., device name).
+    # Returning None forces the caller to use the default config path during compile.
+    if torch._dynamo.is_compiling():
+        return None
+
     # First look up if an optimized configuration is available in the configs
     # directory
     device_name = get_device_name().replace(" ", "_")
@@ -975,8 +1078,25 @@ def get_w8a8_block_fp8_configs(
                 logger,
                 f"Using configuration from {config_file_path} for W8A8 Block FP8 kernel.",
             )
-            # If a configuration has been found, return it
-            return {int(key): val for key, val in json.load(f).items()}
+            raw = {int(key): val for key, val in json.load(f).items()}
+
+        sanitized = {}
+        clamped_ms = []
+        for m_key, cfg in raw.items():
+            if cfg["BLOCK_SIZE_K"] < block_k:
+                clamped_ms.append((m_key, cfg["BLOCK_SIZE_K"]))
+                cfg = {**cfg, "BLOCK_SIZE_K": block_k}
+            sanitized[m_key] = cfg
+        if clamped_ms:
+            logger.warning(
+                "Clamped BLOCK_SIZE_K up to %d in tuned config %s for entries %s "
+                "(scale stepping requires BLOCK_SIZE_K >= block_k).",
+                block_k,
+                json_file_name,
+                clamped_ms,
+            )
+
+        return sanitized
 
     # If no optimized configuration is available, we will use the default
     # configuration
@@ -1261,9 +1381,16 @@ def mxfp8_block_scaled_matmul_triton(
     block_m: int = 128,
     block_n: int = 256,
     block_k: int = 128,
-    num_stages: int = 4,
+    num_stages: Optional[int] = None,
 ) -> torch.Tensor:
-    """Block-scaled matmul for MXFP8 using Triton dot_scaled."""
+    """Block-scaled matmul for MXFP8 using Triton dot_scaled.
+
+    Args:
+        num_stages: Number of pipeline stages. If None, auto-selects based on GPU:
+            SM120: 1, SM100: 4.
+    """
+    if num_stages is None:
+        num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
     M, K = a.shape
     N, K_b = b.shape
     assert K == K_b
@@ -1532,6 +1659,37 @@ Raises:
 """
 if _is_hip:
 
+    def _native_dynamic_per_token_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""
+        M, N = input.shape
+        eps = 1e-12
+        # Compute per-token scale
+        absmax = input.abs().max(dim=1, keepdim=True).values
+        absmax = torch.clamp(absmax, min=eps)
+        scale_val = absmax / fp8_max
+        scale.copy_(scale_val)
+        # Quantize
+        output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
+        output.copy_(output_data)
+
+    def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for dynamic per-tensor FP8 quantization when vLLM is unavailable."""
+        eps = 1e-12
+        absmax = input.abs().max()
+        absmax = torch.clamp(absmax, min=eps)
+        scale_val = absmax / fp8_max
+        # Use copy_ instead of fill_ with .item() to avoid CPU-GPU sync
+        scale.view(-1).copy_(scale_val.view(-1))
+        # Quantize
+        output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
+        output.copy_(output_data)
+
+    def _native_static_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for static FP8 quantization when vLLM is unavailable."""
+        # Use tensor directly instead of .item() to avoid CPU-GPU sync
+        output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
+        output.copy_(output_data)
+
     def scaled_fp8_quant(
         input: torch.Tensor,
         scale: Optional[torch.Tensor] = None,
@@ -1552,16 +1710,20 @@ if _is_hip:
                 )
                 if _use_aiter:
                     dynamic_per_token_scaled_quant(output, input, scale)
-                else:
+                elif _has_vllm:
                     torch.ops._C.dynamic_per_token_scaled_fp8_quant(
                         output, input.contiguous(), scale, None
                     )
+                else:
+                    _native_dynamic_per_token_quant_fp8(output, input, scale)
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                 if _use_aiter:
                     dynamic_per_tensor_quant(output, input, scale)
-                else:
+                elif _has_vllm:
                     torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
+                else:
+                    _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
             assert (
@@ -1569,8 +1731,10 @@ if _is_hip:
             ), f"Expected scalar scale, got numel={scale.numel()}"
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
-            else:
+            elif _has_vllm:
                 torch.ops._C.static_scaled_fp8_quant(output, input, scale)
+            else:
+                _native_static_quant_fp8(output, input, scale)
 
         return output, scale
 
@@ -1773,6 +1937,17 @@ def is_weak_contiguous(x: torch.Tensor):
     return is_transpose or is_not_transpose
 
 
+def _as_column_scale(scale: torch.Tensor, expected_len: int) -> torch.Tensor:
+    if scale.dim() <= 1:
+        return scale.reshape(-1, 1)
+    if scale.dim() == 2:
+        if scale.shape[1] == 1:
+            return scale
+        if scale.shape[0] == 1 and scale.shape[1] == expected_len:
+            return scale.t()
+    return scale
+
+
 @triton.jit
 def scaled_mm_kernel(
     a_ptr,
@@ -1916,9 +2091,10 @@ def triton_scaled_mm(
     assert weight.shape[0] == K
     assert input.dtype == weight.dtype
 
-    scale_a = scale_a.reshape(-1, 1) if scale_a.dim() <= 1 else scale_a
-    scale_b = scale_b.reshape(-1, 1) if scale_b.dim() <= 1 else scale_b
+    scale_a = _as_column_scale(scale_a, M)
+    scale_b = _as_column_scale(scale_b, N)
 
+    assert scale_a.dim() == 2 and scale_b.dim() == 2
     assert scale_a.dtype == scale_b.dtype and scale_a.is_floating_point()
     assert scale_a.shape[1] == 1 and (scale_a.shape[0] == 1 or scale_a.shape[0] == M)
     assert scale_b.shape[1] == 1 and (scale_b.shape[0] == 1 or scale_b.shape[0] == N)
@@ -1986,7 +2162,7 @@ def triton_scaled_mm(
 if _is_cuda:
     if enable_sgl_per_token_group_quant_8bit:
 
-        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_8bit")
+        @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_8bit")
         def _(
             input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
         ):
@@ -1994,12 +2170,12 @@ if _is_cuda:
 
     else:
 
-        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_fp8")
+        @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_fp8")
         def _(
             input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
         ):
             return
 
-    @torch.library.register_fake("sgl_kernel::sgl_per_token_quant_fp8")
+    @register_fake_if_exists("sgl_kernel::sgl_per_token_quant_fp8")
     def _(input, output_q, output_s):
         return

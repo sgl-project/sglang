@@ -5,11 +5,12 @@ import torch
 import torch.testing
 
 from sglang.srt.layers.quantization.fp8_kernel import triton_scaled_mm
+from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=12, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=12, suite="stage-b-test-1-gpu-small-amd")
 
 
 def torch_scaled_mm(
@@ -31,20 +32,25 @@ def torch_scaled_mm(
 class TestScaledMM(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("This test requires a CUDA device.")
-        torch.set_default_device("cuda")
+        if not (torch.cuda.is_available() or torch.xpu.is_available()):
+            raise unittest.SkipTest("No CUDA or XPU device available")
+        cls._device = get_device()
+        torch.set_default_device(cls._device)
 
     def _make_inputs(self, M, K, N, in_dtype):
         if in_dtype == torch.int8:
-            a = torch.randint(-8, 8, (M, K), dtype=in_dtype, device="cuda")
-            b = torch.randint(-8, 8, (K, N), dtype=in_dtype, device="cuda")
+            a = torch.randint(-8, 8, (M, K), dtype=in_dtype, device=self._device)
+            b = torch.randint(-8, 8, (K, N), dtype=in_dtype, device=self._device)
         else:  # fp8
             a = torch.clamp(
-                0.1 * torch.randn((M, K), dtype=torch.float16, device="cuda"), -0.3, 0.3
+                0.1 * torch.randn((M, K), dtype=torch.float16, device=self._device),
+                -0.3,
+                0.3,
             ).to(in_dtype)
             b = torch.clamp(
-                0.1 * torch.randn((K, N), dtype=torch.float16, device="cuda"), -0.3, 0.3
+                0.1 * torch.randn((K, N), dtype=torch.float16, device=self._device),
+                -0.3,
+                0.3,
             ).to(in_dtype)
         return a, b
 
@@ -52,12 +58,14 @@ class TestScaledMM(CustomTestCase):
         """Test core functionality with reduced precision requirements"""
         test_configs = [
             (32, 32, 32, torch.int8, torch.float16, False),
+            (17, 64, 96, torch.int8, torch.float16, False),
             (64, 64, 64, torch.int8, torch.float16, True),
         ]
 
         try:
-            torch.tensor([1.0], dtype=torch.float8_e4m3fn, device="cuda")
+            torch.tensor([1.0], dtype=torch.float8_e4m3fn, device=self._device)
             test_configs.append((32, 32, 32, torch.float8_e4m3fn, torch.float16, False))
+            test_configs.append((17, 64, 96, torch.float8_e4m3fn, torch.float16, False))
         except:
             print("FP8 not supported, skipping")
 
@@ -68,13 +76,13 @@ class TestScaledMM(CustomTestCase):
 
                 input, weight = self._make_inputs(M, K, N, in_dtype)
                 scale_a = 0.1 + 0.05 * torch.rand(
-                    (M, 1), dtype=torch.float32, device="cuda"
+                    (M, 1), dtype=torch.float32, device=self._device
                 )
                 scale_b = 0.1 + 0.05 * torch.rand(
-                    (N, 1), dtype=torch.float32, device="cuda"
+                    (N, 1), dtype=torch.float32, device=self._device
                 )
                 bias = (
-                    0.01 * torch.randn((M, N), dtype=out_dtype, device="cuda")
+                    0.01 * torch.randn((M, N), dtype=out_dtype, device=self._device)
                     if with_bias
                     else None
                 )
@@ -91,6 +99,14 @@ class TestScaledMM(CustomTestCase):
                 atol = 0.1 if in_dtype == torch.int8 else 0.15
 
                 torch.testing.assert_close(triton_out, ref_out, rtol=rtol, atol=atol)
+
+                scale_b_row = scale_b.t().contiguous()
+                triton_out_row_scale = triton_scaled_mm(
+                    input, weight, scale_a, scale_b_row, out_dtype, bias
+                )
+                torch.testing.assert_close(
+                    triton_out_row_scale, ref_out, rtol=rtol, atol=atol
+                )
 
 
 if __name__ == "__main__":
