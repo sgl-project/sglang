@@ -2032,6 +2032,19 @@ class ServerArgs:
                     f"moe_runner_backend={self.moe_runner_backend}."
                 )
 
+            # bf16: deep_gemm's grouped-masked GEMM is corrupt for M3 (only mxfp8 is
+            # validated), so pin triton whether the runner was left auto or set to deep_gemm.
+            if self.quantization is None and self.moe_runner_backend in (
+                "auto",
+                "deep_gemm",
+            ):
+                if self.moe_runner_backend == "deep_gemm":
+                    logger.warning(
+                        "MiniMax-M3: the deep_gemm MoE runner produces corrupted output "
+                        "on bf16 full weights; overriding --moe-runner-backend to 'triton'."
+                    )
+                self.moe_runner_backend = "triton"
+
         if model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
