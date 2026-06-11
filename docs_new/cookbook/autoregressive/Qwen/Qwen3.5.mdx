@@ -48,10 +48,10 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware + recipe to generate the launch command. The two serving strategies cover the legacy widget's speculative-decoding toggle:
+Pick your hardware + recipe to generate the launch command. The two serving strategies cover the common operating points:
 
-- **Low-Latency** — MTP (multi-token prediction speculative decoding) on, the recommended default. Fastest replies for interactive use; on a few H100 recipes it also changes the TP layout.
-- **High-Throughput** — MTP off. At saturation the speculative verify step costs more than it saves; also pick this when speculative decoding misbehaves on your build.
+- **Low-Latency** — fastest reply for a single user. Pick for chat. On this model it enables MTP (multi-token prediction speculative decoding).
+- **High-Throughput** — most tokens per second across many users. Best for batch jobs. MTP is off — at saturation the speculative verify step costs more than it saves.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/qwen/qwen3.5.jsx";
