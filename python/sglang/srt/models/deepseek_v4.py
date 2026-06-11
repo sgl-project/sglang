@@ -996,7 +996,7 @@ class MQALayer(nn.Module):
                 o.contiguous(),
                 group_size=128,
                 scale_ue8m0=True,
-                scale_group_major=True,
+                scale_outer_major=True,
             )
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(

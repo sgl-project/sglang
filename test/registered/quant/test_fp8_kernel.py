@@ -145,7 +145,7 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
             x=A,
             group_size=self.group_size,
             scale_ue8m0=True,
-            scale_group_major=True,
+            scale_outer_major=True,
         )
         A_quant_manual, scale_manual = per_token_group_quant_fp8(
             x=A.reshape(num_tokens * num_groups, hidden_size).contiguous(),

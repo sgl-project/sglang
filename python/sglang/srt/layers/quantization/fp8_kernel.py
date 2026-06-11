@@ -458,15 +458,19 @@ def create_per_token_group_quant_fp8_output_scale(
     column_major_scales: bool,
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
-    scale_group_major: bool = False,
+    scale_outer_major: bool = False,
 ):
-    if scale_group_major:
+    # TODO: replace the scale layout booleans with a single enum before adding
+    # more mutually exclusive scale layouts.
+    if scale_outer_major:
         assert scale_ue8m0
         assert not column_major_scales and not scale_tma_aligned
         assert len(x_shape) >= 3
-        *x_batch, x_s_mn, x_s_groups, x_q_k = x_shape
+        *x_batch, x_s_mn, x_s_outer, x_q_k = x_shape
+        # Store the outer axis as the leading allocation dim (each outer slice
+        # stays contiguous); the returned view keeps the logical (mn, outer, K) shape.
         return torch.empty(
-            (*x_batch, x_s_groups, x_s_mn, x_q_k // group_size),
+            (*x_batch, x_s_outer, x_s_mn, x_q_k // group_size),
             device=device,
             dtype=torch.float32,
         ).transpose(-3, -2)
@@ -528,7 +532,7 @@ def sglang_per_token_group_quant_fp8(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
-    scale_group_major: bool = False,
+    scale_outer_major: bool = False,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -545,7 +549,7 @@ def sglang_per_token_group_quant_fp8(
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
-        scale_group_major=scale_group_major,
+        scale_outer_major=scale_outer_major,
     )
 
     # Enable v2 kernel by default on supported group sizes
@@ -647,7 +651,7 @@ def sglang_per_token_group_quant_8bit(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
-    scale_group_major: bool = False,
+    scale_outer_major: bool = False,
 ):
     from sglang.srt.layers.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
@@ -676,7 +680,7 @@ def sglang_per_token_group_quant_8bit(
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
         enable_v2=enable_v2,
-        scale_group_major=scale_group_major,
+        scale_outer_major=scale_outer_major,
     )
 
 
