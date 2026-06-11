@@ -486,6 +486,10 @@
       "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance"
     },
     {
+      "source": "/platforms/cambricon_mlu.html",
+      "destination": "/docs/hardware-platforms/cambricon_mlu"
+    },
+    {
       "source": "/platforms/cpu_server.html",
       "destination": "/docs/hardware-platforms/cpu_server"
     },
@@ -933,6 +937,7 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development"
                 ]
               },
+              "docs/hardware-platforms/cambricon_mlu",
               "docs/hardware-platforms/cpu_server",
               {
                 "group": "Edge & Embedded",
