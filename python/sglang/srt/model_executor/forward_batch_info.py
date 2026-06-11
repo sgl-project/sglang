@@ -1138,7 +1138,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_draft_extend(include_v2=True)
             or self.forward_mode.is_idle()
         ):
-            if self.spec_info is not None and not self.spec_info.is_draft_input():
+            # Mamba-hybrid families need the fabricated-row idle conversion
+            # below; this includes their MTP draft workers, whose mamba-less
+            # "*E" pattern makes mambaish_config return None.
+            hybrid_ssm = model_runner.mambaish_config is not None or (
+                model_runner.is_draft_worker
+                and getattr(
+                    model_runner.model_config.hf_config,
+                    "mtp_hybrid_override_pattern",
+                    None,
+                )
+                is not None
+            )
+            if (
+                hybrid_ssm
+                and self.spec_info is not None
+                and not self.spec_info.is_draft_input()
+            ):
                 if self.forward_mode.is_idle():
                     self._original_forward_mode = self.forward_mode
                     self.forward_mode = ForwardMode.TARGET_VERIFY
@@ -1146,30 +1162,43 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
-                dev = self.seq_lens.device
-                assert (
-                    self.seq_lens.shape[0] == 0
-                ), "extend-idle conversion expects an empty rank"
-                self.extend_num_tokens = num_tokens
-                self.extend_seq_lens = torch.tensor(
-                    [num_tokens], dtype=torch.int32, device=dev
-                )
-                self.extend_prefix_lens = torch.zeros(
-                    1, dtype=self.seq_lens.dtype, device=dev
-                )
-                self.extend_start_loc = torch.zeros(1, dtype=torch.int32, device=dev)
-                self.seq_lens = torch.tensor(
-                    [num_tokens], dtype=self.seq_lens.dtype, device=dev
-                )
-                self.seq_lens_sum = int(num_tokens)
-                if self.seq_lens_cpu is not None:
-                    self.seq_lens_cpu = torch.tensor(
-                        [num_tokens], dtype=self.seq_lens.dtype
+                if hybrid_ssm:
+                    dev = self.seq_lens.device
+                    assert (
+                        self.seq_lens.shape[0] == 0
+                    ), "extend-idle conversion expects an empty rank"
+                    self.extend_num_tokens = num_tokens
+                    self.extend_seq_lens = torch.tensor(
+                        [num_tokens], dtype=torch.int32, device=dev
                     )
-                self.extend_prefix_lens_cpu = [0]
-                self.extend_seq_lens_cpu = [int(num_tokens)]
-                self.extend_logprob_start_lens_cpu = [0]
-                bs = self.batch_size = 1
+                    self.extend_prefix_lens = torch.zeros(
+                        1, dtype=self.seq_lens.dtype, device=dev
+                    )
+                    self.extend_start_loc = torch.zeros(
+                        1, dtype=torch.int32, device=dev
+                    )
+                    self.seq_lens = torch.tensor(
+                        [num_tokens], dtype=self.seq_lens.dtype, device=dev
+                    )
+                    self.seq_lens_sum = int(num_tokens)
+                    if self.seq_lens_cpu is not None:
+                        self.seq_lens_cpu = torch.tensor(
+                            [num_tokens], dtype=self.seq_lens.dtype
+                        )
+                    self.extend_prefix_lens_cpu = [0]
+                    self.extend_seq_lens_cpu = [int(num_tokens)]
+                    self.extend_logprob_start_lens_cpu = [0]
+                    bs = self.batch_size = 1
+                else:
+                    self.extend_num_tokens = bs
+                    self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
+                    self.extend_prefix_lens = self.seq_lens - 1
+                    self.extend_start_loc = torch.arange(
+                        bs, dtype=torch.int32, device=self.seq_lens.device
+                    )
+                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
+                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+                    self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 if self.spec_info is not None:
                     bs = self.batch_size = (
