@@ -629,10 +629,9 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
-    # Sanitize NaN logits before sampling kernels (see sanitize_nan_logits).
+    # Sanitize NaN logits before sampling kernels and log a throttled warning
+    # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(True)
-    # Throttled sync-free warning on NaN logits; no-op when the assert gate is on.
-    SGLANG_LOG_NAN_LOGITS = EnvBool(True)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
