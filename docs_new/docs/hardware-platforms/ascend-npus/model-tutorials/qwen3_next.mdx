@@ -24,13 +24,14 @@ v0.5.10 or a later version.
 | Feature                       | Usage                                                                                         |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 4`                                                                                 |
+| Data Parallelism              | `--enable-dp-attention --dp-size 2`                                                           |
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 28672`                                        |
-| NPU Graph                     | `--cuda-graph-bs 80`                                                                          |
-| Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant --speculative-draft-model-path xxx` |
+| Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 14080`                                        |
+| NPU Graph                     | `--cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150` |
+| Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant --speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
-| Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                                        |
+| DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
@@ -44,7 +45,7 @@ If you need to download model weights, check the model size before downloading t
 </Warning>
 
 - [Qwen3-Next-80B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) (BF16)
-- [Qwen3-Next-80B-A3B-Instruct-W8A8](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) (W8A8 quantized version) {/* TODO: Update W8A8 URL to correct quantized model path */}
+- [Qwen3-Next-80B-A3B-Instruct-W8A8](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) (W8A8 quantized version)
 
 Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
 refer to the [best practice configurations](#best-practices) which may require additional nodes or cards.
@@ -84,10 +85,45 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci5:/dev/davinci5  \
 --device=/dev/davinci6:/dev/davinci6  \
 --device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci8:/dev/davinci8  \
+--device=/dev/davinci9:/dev/davinci9  \
+--device=/dev/davinci10:/dev/davinci10  \
+--device=/dev/davinci11:/dev/davinci11  \
+--device=/dev/davinci12:/dev/davinci12  \
+--device=/dev/davinci13:/dev/davinci13  \
+--device=/dev/davinci14:/dev/davinci14  \
+--device=/dev/davinci15:/dev/davinci15  \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
 quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+docker run -itd --shm-size=16g --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ```
 
   </Tab>
@@ -110,6 +146,7 @@ with limited hardware resources. The following command is based on the W8A8 quan
 #============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   SPECULATIVE_DRAFT_MODEL_PATH: path to the draft model weights (BF16)
 #============================================================
 
 export cann_path=/usr/local/Ascend/ascend-toolkit/latest
@@ -126,8 +163,8 @@ sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
 export SGLANG_SET_CPU_AFFINITY=1
+export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.0/opp/vendors/custom_transformer/op_api/lib:${LD_LIBRARY_PATH}
 
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
@@ -135,25 +172,44 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_ALGO="level0:NA;level1:ring"
 
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=20
-export HCCL_BUFFSIZE=2000
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
+export ASCEND_USE_FIA=1
+export SGLANG_NPU_USE_MULTI_STREAM=0
+export SGLANG_WARMUP_TIMEOUT=3600
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export FORCE_DRAFT_MODEL_NON_QUANT=1
 
-python -m sglang.launch_server \
-        --model-path /path/to/Qwen3-Next-80B-A3B-Instruct-W8A8-3 \
-        --host 127.0.0.1 \
-        --port 6699 \
-        --tp-size 4 \
-        --device npu \
-        --attention-backend ascend \
-        --mem-fraction-static 0.685 \
-        --max-running-requests 80 \
-        --watchdog-timeout 3600 \
-        --disable-radix-cache \
-        --cuda-graph-bs 80 \
-        --max-prefill-tokens 28672  --max-total-tokens 450560 \
-        --moe-a2a-backend deepep --deepep-mode auto \
-        --quantization modelslim \
-        --chunked-prefill-size -1
+ZBAL_HCCL_OP="allreduce,_allgather_base,allgather,broadcast,scatter,reduce_scatter,_reduce_scatter_base,alltoall_base"
+export HCCL_BUFFSIZE=64
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+export ZBAL_ENABLE_GRAPH=1
+MODEL_PATH=/path/to/Qwen3-Next-80B-A3B-Instruct-W8A8
+
+python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
+    --page-size 128 \
+    --tp-size 4 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port 6699 \
+    --mem-fraction-static 0.75 \
+    --disable-radix-cache --max-prefill-tokens 14080 --context-length 26384 \
+    --chunked-prefill-size -1 --max-running-requests 300 \
+    --mamba-ssm-dtype bfloat16 \
+    --quantization modelslim \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  --speculative-draft-model-quantization  unquant \
+    --speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct \
+    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150
 ```
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
