@@ -148,7 +148,7 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     plan = CompressorDecodePlan.generate_legacy(
         compress_ratio, req_pool_indices, seq_lens
     )
-    loc = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+    loc = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
     freqs_cis = precompute_freqs_cis(
         64, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1
     ).to("cuda")
@@ -193,6 +193,51 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
         num_pages,
     )
     torch.testing.assert_close(cache, expected)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16, 96])
+def test_flashmla_fused_norm_rope_store_int64_loc(num_tokens: int) -> None:
+    # head_dim=512 (non-fp4) is the HiSparse C4 store path. Validate that an int64
+    # out_loc routes token i to slot loc[i] without narrowing: storing into a
+    # permuted slot set and gathering back must match a contiguous-slot store.
+    torch.manual_seed(num_tokens + 400)
+    head_dim = 512
+    page_size = 1
+    page_bytes = ((584 * page_size + 575) // 576) * 576
+    num_slots = 4 * num_tokens
+    compress_ratio = 4
+    kv = torch.randn(num_tokens, head_dim, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+    seq_lens = (
+        torch.arange(1, num_tokens + 1, device="cuda", dtype=torch.int64)
+        * compress_ratio
+    )
+    req_pool_indices = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+    plan = CompressorDecodePlan.generate_legacy(
+        compress_ratio, req_pool_indices, seq_lens
+    )
+    freqs_cis = precompute_freqs_cis(
+        64, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1
+    ).to("cuda")
+
+    def _store(loc: torch.Tensor) -> torch.Tensor:
+        cache = torch.zeros(num_slots, page_bytes, device="cuda", dtype=torch.uint8)
+        compress_norm_rope_store(
+            kv.clone(),
+            plan,
+            norm_weight=norm_weight,
+            norm_eps=1.0e-6,
+            freq_cis=freqs_cis,
+            out_loc=loc,
+            kvcache=cache,
+            page_size=page_size,
+        )
+        return cache
+
+    ref = _store(torch.arange(num_tokens, device="cuda", dtype=torch.int64))
+    perm = torch.randperm(num_slots, device="cuda")[:num_tokens].to(torch.int64)
+    out = _store(perm)
+    torch.testing.assert_close(out[perm], ref[:num_tokens])
 
 
 @pytest.mark.parametrize("batch_size", [1, 5, 17])
