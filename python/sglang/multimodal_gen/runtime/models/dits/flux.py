@@ -310,7 +310,9 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.pre_only = pre_only
         self.heads = out_dim // dim_head if out_dim is not None else num_heads
         self.tp_size = get_tp_world_size()
-        self.shard_qkv = not isinstance(quant_config, NunchakuConfig)
+        self.shard_qkv = self.tp_size > 1 and not isinstance(
+            quant_config, NunchakuConfig
+        )
         self.local_heads = divide(self.heads, self.tp_size)
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
@@ -594,24 +596,33 @@ class FluxSingleTransformerBlock(nn.Module):
             if is_nunchaku_available():
                 self.norm = NunchakuAdaLayerNormZeroSingle(self.norm, scale_shift=0)
         else:
+            shard_single_block = self.tp_size > 1
             self.proj_mlp = ColumnParallelLinear(
                 dim,
                 self.mlp_hidden_dim,
                 bias=True,
-                gather_output=False,
+                gather_output=not shard_single_block,
                 quant_config=quant_config,
                 prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
-            self.proj_out = RowParallelLinear(
+            proj_out_cls = (
+                RowParallelLinear if shard_single_block else ColumnParallelLinear
+            )
+            proj_out_kwargs = (
+                {"input_is_parallel": True}
+                if shard_single_block
+                else {"gather_output": True}
+            )
+            self.proj_out = proj_out_cls(
                 dim + self.mlp_hidden_dim,
                 dim,
                 bias=True,
-                input_is_parallel=True,
+                **proj_out_kwargs,
                 quant_config=quant_config,
                 prefix=f"{prefix}.proj_out" if prefix else "proj_out",
             )
-            if self.tp_size > 1:
+            if shard_single_block:
                 self._patch_proj_out_weight_loader()
             self.attn = FluxAttention(
                 query_dim=dim,
@@ -752,6 +763,7 @@ class FluxTransformerBlock(nn.Module):
             and is_nunchaku_available()
         )
         self.use_nunchaku_structure = nunchaku_enabled
+        self.tp_size = get_tp_world_size()
         if nunchaku_enabled:
             self.ff = FeedForward(
                 dim=dim, dim_out=dim, activation_fn="gelu-approximate"
@@ -772,7 +784,7 @@ class FluxTransformerBlock(nn.Module):
             self.norm1_context = NunchakuAdaLayerNormZero(
                 self.norm1_context, scale_shift=0
             )
-        else:
+        elif self.tp_size > 1:
             self.ff = FluxParallelFeedForward(
                 dim=dim,
                 dim_out=dim,
@@ -784,6 +796,15 @@ class FluxTransformerBlock(nn.Module):
                 dim_out=dim,
                 quant_config=quant_config,
                 prefix=f"{prefix}.ff_context" if prefix else "ff_context",
+            )
+        else:
+            self.ff = FeedForward(
+                dim=dim, dim_out=dim, activation_fn="gelu-approximate"
+            )
+            self.ff_context = FeedForward(
+                dim=dim,
+                dim_out=dim,
+                activation_fn="gelu-approximate",
             )
 
     def forward(
