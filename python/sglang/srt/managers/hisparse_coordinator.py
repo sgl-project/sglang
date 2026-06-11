@@ -784,10 +784,11 @@ class HiSparseCoordinator:
         # radix-cache entries owned by the unified tree.
         radix_prefix_len = self.radix_cache.req_prefix_len(req.req_pool_idx)
         allocated_len = int(self.req_to_host_pool_allocated_len[req.req_pool_idx])
-        host_indices = self.req_to_host_pool[
-            req.req_pool_idx, radix_prefix_len:allocated_len
-        ]
-        host_indices = host_indices[host_indices >= 0]
+        host_indices = self.mem_pool_host.allocated_host_indices(
+            self.req_to_host_pool[:, radix_prefix_len:],
+            req.req_pool_idx,
+            allocated_len - radix_prefix_len,
+        )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
@@ -853,10 +854,11 @@ class HiSparseCoordinator:
 
         allocated_host_len = int(self.req_to_host_pool_allocated_len[req.req_pool_idx])
         free_tail_start = max(cache_key_len, old_protected)
-        host_indices = self.req_to_host_pool[
-            req.req_pool_idx, free_tail_start:allocated_host_len
-        ]
-        host_indices = host_indices[host_indices >= 0]
+        host_indices = self.mem_pool_host.allocated_host_indices(
+            self.req_to_host_pool[:, free_tail_start:],
+            req.req_pool_idx,
+            allocated_host_len - free_tail_start,
+        )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
