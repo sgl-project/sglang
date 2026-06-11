@@ -1035,15 +1035,14 @@ impl PDRouter {
         AttachedBody::wrap_response(response, guards)
     }
 
-    // OpenAI-style body from prefill/decode is JSON; without this header, 
+    // OpenAI-style body from prefill/decode is JSON; without this header,
     // Axum's `(StatusCode, Bytes).into_response()` defaults to `application/octet-stream`.
     fn non_stream_pd_json_response(status: StatusCode, body: Bytes) -> Response {
         let mut response = Response::new(Body::from(body));
         *response.status_mut() = status;
-        response.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         response
     }
 
@@ -1085,7 +1084,7 @@ impl PDRouter {
 
         // Return merged response
         match serde_json::to_vec(&decode_json) {
-            OK(body) => Self::non_stream_pd_json_response(status, Bytes::from(body)),
+            Ok(body) => Self::non_stream_pd_json_response(status, Bytes::from(body)),
             Err(e) => {
                 error!("Failed to serialize merged response: {}", e);
                 Self::non_stream_pd_json_response(status, decode_body)
