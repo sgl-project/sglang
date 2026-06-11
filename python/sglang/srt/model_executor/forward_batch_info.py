@@ -347,7 +347,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
-    batch_size_before_padding: Optional[int] = None
 
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
@@ -651,7 +650,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
-            batch_size_before_padding=len(batch.seq_lens),
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
@@ -1139,7 +1137,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
-                self.batch_size_before_padding = self.batch_size
                 self.forward_mode = ForwardMode.EXTEND
                 self.extend_num_tokens = bs
                 self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
@@ -1151,7 +1148,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
                 self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
-                self.batch_size_before_padding = self.batch_size
+                setattr(self, "_original_batch_size", self.batch_size)
                 if self.spec_info is not None:
                     bs = self.batch_size = (
                         num_tokens // self.spec_info.num_tokens_per_req
@@ -1281,8 +1278,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
         self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
-        if self.batch_size_before_padding is not None:
-            self.batch_size = self.batch_size_before_padding
+        self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
         bs = self.batch_size
 
         if self.spec_info is not None:

@@ -140,7 +140,6 @@ def build_replay_fb_view(
     """
     return SimpleNamespace(
         batch_size=bs,
-        batch_size_before_padding=raw_bs,
         forward_mode=capture_forward_mode,
         actual_forward_mode=forward_batch.forward_mode,
         input_ids=buffers.input_ids[:num_tokens],

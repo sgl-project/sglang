@@ -88,6 +88,26 @@ def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     return getattr(forward_batch, "_original_forward_mode", forward_batch.forward_mode)
 
 
+def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
+    actual_forward_mode = getattr(
+        forward_batch, "actual_forward_mode", forward_batch.forward_mode
+    )
+    if actual_forward_mode.is_idle():
+        return 0
+
+    spec_info = getattr(forward_batch, "spec_info", None)
+    draft_token_num = getattr(spec_info, "draft_token_num", 0)
+    draft_token = getattr(spec_info, "draft_token", None)
+    if draft_token is None:
+        return forward_batch.batch_size
+    if draft_token_num <= 0:
+        return 0
+    draft_count = len(draft_token)
+    if draft_count % draft_token_num != 0:
+        return 0
+    return draft_count // draft_token_num
+
+
 T = TypeVar("T", bound=Optional[torch.Tensor])
 
 
@@ -989,7 +1009,7 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            verify_bs = forward_batch.batch_size_before_padding
+            verify_bs = _get_target_verify_bs(forward_batch)
             if self.online_c128_mtp.enabled() and verify_bs == 0:
                 self.online_c128_mtp.clear()
                 self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
@@ -1094,7 +1114,7 @@ class DeepseekV4AttnBackend(
             if max_seq_len_override is None
             else max_seq_len_override
         )
-        verify_bs = forward_batch.batch_size_before_padding
+        verify_bs = _get_target_verify_bs(forward_batch)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
             req_pool_indices,
