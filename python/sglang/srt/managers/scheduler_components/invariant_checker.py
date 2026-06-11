@@ -135,13 +135,12 @@ class SchedulerInvariantChecker:
             leaked_full_pages = (
                 expected_full_pages - free_full_pages - cached_full_pages
             )
-            free_mamba_pages = set(
-                self.req_to_token_pool.mamba_pool.free_slots.tolist()
-            )
+            mamba_allocator = self.req_to_token_pool.mamba_allocator
+            free_mamba_pages = set(mamba_allocator.free_slots.tolist())
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
-            expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
+            expected_mamba_pages = set(range(1, mamba_allocator.size + 1))
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )
