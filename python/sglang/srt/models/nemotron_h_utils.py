@@ -1,10 +1,4 @@
-"""DP-attention helpers for the Nemotron-H model.
-
-Kept out of the modeling file (``nemotron_h.py``) to keep that file focused on
-module definitions. These helpers deal with the token padding that DP-attention
-introduces for collective alignment, and with building the per-layer
-``LayerCommunicator``.
-"""
+"""DP-attention helpers for the Nemotron-H model."""
 
 from typing import Optional
 
@@ -23,11 +17,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 ATTN_LAYERS = (MAMBA, ATTENTION)
 
 
-def _is_attn_layer(layer_type: str) -> bool:
+def is_attn_layer(layer_type: str) -> bool:
     return layer_type in ATTN_LAYERS
 
 
-def _get_real_num_tokens(
+def get_real_num_tokens(
     hidden_states: torch.Tensor, forward_batch: ForwardBatch
 ) -> int:
     """Number of real (non DP-padding) rows in ``hidden_states``."""
@@ -44,17 +38,13 @@ def _get_real_num_tokens(
     return real_tokens
 
 
-def _zero_dp_padding_rows(
+def zero_dp_padding_rows(
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
     residual: Optional[torch.Tensor] = None,
 ):
-    """Zero the DP-padding rows of ``hidden_states`` (and ``residual``) in place.
-
-    Always returns the ``(hidden_states, residual)`` pair (``residual`` may be
-    None); callers that only need the hidden states can ignore the second value.
-    """
-    real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
+    """Zero the DP-padding rows of hidden_states (and residual) in place."""
+    real_tokens = get_real_num_tokens(hidden_states, forward_batch)
     if real_tokens < hidden_states.shape[0]:
         hidden_states[real_tokens:].zero_()
         if residual is not None and residual.shape[0] == hidden_states.shape[0]:
@@ -62,16 +52,14 @@ def _zero_dp_padding_rows(
     return hidden_states, residual
 
 
-def _zero_dp_global_padding_rows(
+def zero_dp_global_padding_rows(
     hidden_states: torch.Tensor, forward_batch: ForwardBatch
 ) -> torch.Tensor:
     """Zero the per-DP-group padding rows after a global (full-TP) gather."""
-    # global_num_tokens_non_padded_cpu: pre-DP-padding spec-adjusted row counts,
-    # snapshotted at ForwardBatch.init_new.
     actual_tokens = getattr(forward_batch, "global_num_tokens_non_padded_cpu", None)
     padded_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
     if actual_tokens is None or padded_tokens is None:
-        return _zero_dp_padding_rows(hidden_states, forward_batch)[0]
+        return zero_dp_padding_rows(hidden_states, forward_batch)[0]
 
     offset = 0
     for actual, padded in zip(actual_tokens, padded_tokens):
@@ -86,7 +74,7 @@ def _zero_dp_global_padding_rows(
     return hidden_states
 
 
-def _pad_to_original_num_tokens(
+def pad_to_original_num_tokens(
     output: torch.Tensor, original_num_tokens: int
 ) -> torch.Tensor:
     if output.shape[0] == original_num_tokens:
@@ -97,9 +85,6 @@ def _pad_to_original_num_tokens(
 
 
 def _build_layer_scatter_modes() -> LayerScatterModes:
-    # Nemotron-H uses attention/mamba as local-DP, attn-TP-partial producers.
-    # The following MLP/MoE layer is the only place that gathers/reduces that
-    # partial into the full TP layout before scattering back to the local DP slice.
     return LayerScatterModes(
         layer_input_mode=ScatterMode.TP_ATTN_FULL,
         attn_mode=ScatterMode.TP_ATTN_FULL,
@@ -109,17 +94,12 @@ def _build_layer_scatter_modes() -> LayerScatterModes:
     )
 
 
-def _make_layer_communicator(
+def make_layer_communicator(
     layer_norm: RMSNorm, *, for_attn: bool
 ) -> LayerCommunicator:
     return LayerCommunicator(
         layer_scatter_modes=_build_layer_scatter_modes(),
         input_layernorm=layer_norm if for_attn else nn.Identity(),
         post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
-        # Keep residual+RMSNorm at the same per-token boundary as normal TP
-        # execution. The DP gather should move already-normalized tokens into the
-        # global MLP/MoE TP layout, not change the residual-add boundary. With
-        # attn_tp_size > 1 this requires opting into layernorm-before-gather (the
-        # default for attn_tp_size > 1 is layernorm-after-gather).
         force_layernorm_before_dp_gather=True,
     )

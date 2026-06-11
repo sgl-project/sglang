@@ -81,8 +81,6 @@ class Mixer2RMSNormGated(MultiPlatformOp):
                 # Compute local sum and then reduce to obtain global sum
                 local_sums = x.pow(2).sum(dim=-1, keepdim=True)
                 if self.use_attn_tp_group:
-                    # NOTE: ProcessGroup.all_reduce is in-place and returns a Work
-                    # handle, so use attn_tp_all_reduce which returns the tensor.
                     global_sums = attn_tp_all_reduce(local_sums)
                 else:
                     global_sums = tensor_model_parallel_all_reduce(local_sums)
@@ -99,9 +97,7 @@ class Mixer2RMSNormGated(MultiPlatformOp):
                 # To handle the general case, redundantly apply the variance
                 if self.use_attn_tp_group:
                     parts = [torch.empty_like(x) for _ in range(self.tp_size)]
-                    get_attention_tp_group().all_gather(
-                        x, output_tensor_list=parts
-                    )
+                    get_attention_tp_group().all_gather(x, output_tensor_list=parts)
                     x = torch.cat(parts, dim=-1)
                 else:
                     x = tensor_model_parallel_all_gather(x, -1)

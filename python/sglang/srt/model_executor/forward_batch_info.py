@@ -377,9 +377,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     original_global_num_tokens_cpu: Optional[List[int]] = None
-    # Per-rank non-padded (spec-adjusted) row counts; independent copy that
-    # survives the in-place DP padding of global_num_tokens_cpu.
     global_num_tokens_non_padded_cpu: Optional[List[int]] = None
+    _original_batch_size: Optional[int] = None
+    _original_forward_mode: Optional[ForwardMode] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -523,18 +523,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
-            # Copy into independent lists: original_* is the pre-DP-padding
-            # snapshot, while global_num_tokens_cpu may be padded in place later
-            # (prepare_mlp_sync_batch). Without the copy both would alias the same
-            # schedule-batch list and the snapshot would be lost.
-            # original_* must be the SPEC-ADJUSTED actual row count
-            # (global_num_tokens), not the raw per-request count
-            # (batch.global_num_tokens): for a spec target_verify batch each
-            # request occupies num_draft_tokens rows, and _zero_dp_global_padding_rows
-            # treats rows in [original_, padded) as DP padding and zeros them. Using
-            # the raw count would wrongly zero the 2nd..Nth verify token of every
-            # request under dp-attention (corrupting all but position 0). For the
-            # non-spec path global_num_tokens is batch.global_num_tokens (no-op).
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_non_padded_cpu = list(global_num_tokens)
             ret.global_num_tokens_cpu = global_num_tokens
@@ -855,7 +843,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
-        setattr(self, "_original_batch_size", self.batch_size)
+        self._original_batch_size = self.batch_size
         global_num_tokens = self.global_num_tokens_cpu
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
@@ -906,33 +894,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_idle()
         ):
             if self.spec_info is not None and not self.spec_info.is_draft_input():
-                # Spec target-verify batch. Keep the num_tokens_per_req structure so
-                # every DP rank runs the SAME verify forward with identical collectives
-                # (the decode-style IDLE->EXTEND conversion below collapses verify's
-                # multi-token reqs and leaves idle ranks empty -> NCCL deadlock). An
-                # idle rank is promoted to TARGET_VERIFY; _pad_inputs_to_size then fills
-                # num_tokens fake rows / (num_tokens//ntpr) fake reqs whose req_pool
-                # indices drive generate_attn_arg_prefill (draft_token content is unused).
                 if self.forward_mode.is_idle():
-                    setattr(self, "_original_forward_mode", self.forward_mode)
+                    self._original_forward_mode = self.forward_mode
                     self.forward_mode = ForwardMode.TARGET_VERIFY
-                bs = self.batch_size = (
-                    num_tokens // self.spec_info.num_tokens_per_req
-                )
+                bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
-                setattr(self, "_original_forward_mode", self.forward_mode)
+                self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
-                # MAX_LEN reaches here only for an idle/empty rank (assert below).
-                # Build extend metadata sized by num_tokens (not bs) so seq_lens/
-                # req_pool_indices stay non-empty -> the attention plan never calls
-                # max() on a 0-size tensor and the idle rank issues the same
-                # collectives as busy ranks.
-                # Represent the rank as ONE fake request spanning all num_tokens tokens
-                # (prefix 0), NOT num_tokens single-token requests -- the latter
-                # inflates bs past the attention backend's per-rank kv_indptr buffer
-                # (sized for ~max_running/dp_size reqs) and overflows it. One fake req
-                # keeps bs == 1 while still producing num_tokens rows; the output is
-                # discarded downstream (real_tokens == 0).
                 dev = self.seq_lens.device
                 assert (
                     self.seq_lens.shape[0] == 0
@@ -944,9 +912,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.extend_prefix_lens = torch.zeros(
                     1, dtype=self.seq_lens.dtype, device=dev
                 )
-                self.extend_start_loc = torch.zeros(
-                    1, dtype=torch.int32, device=dev
-                )
+                self.extend_start_loc = torch.zeros(1, dtype=torch.int32, device=dev)
                 self.seq_lens = torch.tensor(
                     [num_tokens], dtype=self.seq_lens.dtype, device=dev
                 )
@@ -1079,8 +1045,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
 
-        self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
-        self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
+        if self._original_forward_mode is not None:
+            self.forward_mode = self._original_forward_mode
+        if self._original_batch_size is not None:
+            self.batch_size = self._original_batch_size
         bs = self.batch_size
 
         if self.spec_info is not None:

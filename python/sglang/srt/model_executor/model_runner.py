@@ -2159,10 +2159,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         del named_tensors
-        # Release cached CUDA-IPC imports so the colocated trainer's pending
-        # frees (the per-round conversion transients it shared with us) can be
-        # reaped on its side; without this they accumulate as unpausable
-        # memory under torch_memory_saver offload.
         torch.cuda.ipc_collect()
         return True, "Success"
 
@@ -3493,16 +3489,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
-        # Keep num_token_non_padded in the same (DP-local, pre-padding)
-        # semantics as num_token_non_padded_cpu. DP-attention model paths run
-        # attention/Mamba on TP-attn-full replicated local rows and gather only
-        # at the MLP/MoE boundary; slicing this scalar by attention TP rank makes
-        # TP rank 1 see zero real tokens for bs=1 decode under tp=8,dp=4.
+        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         if (
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
-            and not self.server_args.enable_dp_attention
             and not is_nsa_enable_prefill_cp()
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(

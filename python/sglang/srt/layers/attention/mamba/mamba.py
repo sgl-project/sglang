@@ -416,8 +416,6 @@ class MambaMixer2(torch.nn.Module):
             reduce_results=not is_dp_attention_enabled(),
             prefix=f"{prefix}.out_proj",
         )
-        if is_dp_attention_enabled():
-            self.out_proj.emulate_global_tp_chunks = True
 
         self.norm = Mixer2RMSNormGated(
             intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps
@@ -445,10 +443,6 @@ class MambaMixer2(torch.nn.Module):
 
         query_start_loc = metadata.query_start_loc
 
-        # DP attention can pad hidden_states for collective alignment. Keep the
-        # padded projection/gate shape, run kernels only on real tokens, then run
-        # norm/out_proj on the padded shape so the next collective sees the same
-        # row count as the layer input.
         padded_num_tokens = hidden_states.shape[0]
 
         # 1. Gated MLP's linear projection
@@ -512,9 +506,6 @@ class MambaMixer2(torch.nn.Module):
             [num_prefill_tokens, num_decode_tokens],
             dim=0,
         )
-        # Split along the real batch dimension. DP-attention may pad
-        # state_indices_tensor beyond num_prefills + num_decodes for collective
-        # alignment; fake decode rows must not update Mamba states.
         state_indices_tensor_p = state_indices_tensor[:num_prefills]
         state_indices_tensor_d = state_indices_tensor[
             num_prefills : num_prefills + num_decodes
@@ -533,10 +524,6 @@ class MambaMixer2(torch.nn.Module):
             device=hidden_states.device,
         )
         if projected_states.shape[0] > num_actual_tokens:
-            # DP-attention padding rows are not written by the prefill/decode
-            # kernels, but the gated RMSNorm / out_proj run on the padded shape;
-            # zero just those rows so they carry no uninitialized data. Non-DP
-            # (no padding) keeps the plain ``torch.empty`` with no extra work.
             preallocated_ssm_out[num_actual_tokens:].zero_()
         preallocated_ssm_out_active = preallocated_ssm_out[:num_actual_tokens]
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
@@ -686,9 +673,7 @@ class MambaMixer2(torch.nn.Module):
             D_d = self.D[:, None, ...].expand(-1, self.head_dim)
             B_d = B_d.view(-1, n_groups, B_d.shape[1] // n_groups)
             C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
-            hidden_states_d = hidden_states_d.view(
-                -1, local_num_heads, self.head_dim
-            )
+            hidden_states_d = hidden_states_d.view(-1, local_num_heads, self.head_dim)
 
             if is_target_verify:
                 selective_state_update(
@@ -747,12 +732,8 @@ class MambaMixer2(torch.nn.Module):
         # norm usage
         hidden_states = self.norm(preallocated_ssm_out, gate)
 
-        # 5. Final linear projection. Run out_proj on the padded shape so
-        # DP-attn collectives see the same row count as the layer input.
         output[:padded_num_tokens], _ = self.out_proj(hidden_states)
         if output.shape[0] > num_actual_tokens:
-            # Zero DP-attention padded rows so they do not carry uninitialized
-            # data (potentially NaN) into subsequent layers' residual additions.
             output[num_actual_tokens:].zero_()
 
     @property

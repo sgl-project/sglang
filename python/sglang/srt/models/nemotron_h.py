@@ -82,12 +82,12 @@ from sglang.srt.model_loader.weight_utils import (
     replace_substrings,
 )
 from sglang.srt.models.nemotron_h_utils import (
-    _get_real_num_tokens,
-    _is_attn_layer,
-    _make_layer_communicator,
-    _pad_to_original_num_tokens,
-    _zero_dp_global_padding_rows,
-    _zero_dp_padding_rows,
+    get_real_num_tokens,
+    is_attn_layer,
+    make_layer_communicator,
+    pad_to_original_num_tokens,
+    zero_dp_global_padding_rows,
+    zero_dp_padding_rows,
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
@@ -194,9 +194,6 @@ class NemotronHMoE(nn.Module):
             scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=1.0,
-            # Needed so the routed-experts capturer (rollout routing replay) indexes
-            # its per-layer buffer by this layer id; without it layer_id defaults to
-            # None and the capturer writes buffer[:, None, :] -> shape mismatch crash.
             layer_id=layer_idx,
         )
         self.experts = get_moe_impl_class(quant_config)(
@@ -319,13 +316,7 @@ class NemotronHMoE(nn.Module):
 
 
 class NemotronHMLPLikeDecoderLayer(nn.Module):
-    """Shared forward for the dense-MLP / MoE decoder layers.
-
-    Both apply ``self.mixer`` after norm (and, under DP attention, after the
-    gather to the full-TP layout). Subclasses only differ in ``__init__`` —
-    which mixer they build — and set ``self.mixer``, ``self.norm`` and
-    ``self.layer_communicator``.
-    """
+    """Shared forward for the dense-MLP / MoE decoder layers."""
 
     def forward(
         self,
@@ -335,13 +326,13 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if is_dp_attention_enabled():
-            hidden_states, residual = _zero_dp_padding_rows(
+            hidden_states, residual = zero_dp_padding_rows(
                 hidden_states, forward_batch, residual
             )
             hidden_states, residual = self.layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
-            hidden_states = _zero_dp_global_padding_rows(hidden_states, forward_batch)
+            hidden_states = zero_dp_global_padding_rows(hidden_states, forward_batch)
             hidden_states = self.mixer.forward(hidden_states)
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
@@ -389,9 +380,7 @@ class NemotronHMLPDecoderLayer(NemotronHMLPLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(
-            self.norm, for_attn=False
-        )
+        self.layer_communicator = make_layer_communicator(self.norm, for_attn=False)
 
 
 class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
@@ -413,22 +402,14 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(
-            self.norm, for_attn=False
-        )
+        self.layer_communicator = make_layer_communicator(self.norm, for_attn=False)
 
 
 class NemotronHAttnLikeDecoderLayer(nn.Module):
-    """Shared DP-attention input prep for the Mamba / full-attention layers.
-
-    Both run their mixer on the attn-TP group (DP-local) and only gather into
-    the full-TP layout at the next MLP/MoE boundary. Subclasses set ``self.norm``
-    and ``self.layer_communicator`` and call ``_set_prev_layer_is_attn`` in
-    ``__init__``.
-    """
+    """Shared DP-attention input prep for the Mamba / full-attention layers."""
 
     def _set_prev_layer_is_attn(self, config: NemotronHConfig, layer_idx: int) -> None:
-        self.prev_layer_is_attn = layer_idx > 0 and _is_attn_layer(
+        self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
             config.hybrid_override_pattern[layer_idx - 1]
         )
 
@@ -438,12 +419,9 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # A preceding attention layer leaves its output attn-TP-partial; reduce
-        # it before this layer reads it. Then drop the DP-padding rows and gather
-        # into the attn-TP-full layout the mixer runs in.
         if self.prev_layer_is_attn and residual is not None:
             hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states, residual = _zero_dp_padding_rows(
+        hidden_states, residual = zero_dp_padding_rows(
             hidden_states, forward_batch, residual
         )
         return self.layer_communicator.prepare_attn(
@@ -475,7 +453,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(self.norm, for_attn=True)
+        self.layer_communicator = make_layer_communicator(self.norm, for_attn=True)
         self._set_prev_layer_is_attn(config, layer_idx)
 
     def _forward_mamba(
@@ -484,7 +462,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         """Core Mamba forward logic, called directly or via split op."""
         original_num_tokens = hidden_states.shape[0]
         if forward_batch.forward_mode.is_extend():
-            real_num_tokens = _get_real_num_tokens(hidden_states, forward_batch)
+            real_num_tokens = get_real_num_tokens(hidden_states, forward_batch)
             if real_num_tokens < original_num_tokens:
                 hidden_states = hidden_states[:real_num_tokens]
         output = torch.empty_like(hidden_states)
@@ -498,7 +476,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             output=output,
             use_triton_causal_conv=True,
         )
-        return _pad_to_original_num_tokens(output, original_num_tokens)
+        return pad_to_original_num_tokens(output, original_num_tokens)
 
     def forward(
         self,
@@ -513,17 +491,12 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             )
             if (
                 forward_batch.forward_mode.is_idle()
-                or _get_real_num_tokens(hidden_states, forward_batch) == 0
+                or get_real_num_tokens(hidden_states, forward_batch) == 0
             ):
                 return torch.zeros_like(hidden_states), residual
 
-            # DP-attention may carry per-DP padding rows while Mamba metadata is
-            # built from real token counts. The CUDA graph custom op bypasses
-            # the Python path that trims real tokens and restores padded shape,
-            # so keep DP-attention on the explicit forward until the graph op
-            # learns the same padding contract.
             output = self._forward_mamba(hidden_states, forward_batch)
-            output, _ = _zero_dp_padding_rows(output, forward_batch)
+            output, _ = zero_dp_padding_rows(output, forward_batch)
             return output, residual
 
         if residual is None:
@@ -600,8 +573,6 @@ class NemotronHAttention(nn.Module):
             reduce_results=not is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",
         )
-        if is_dp_attention_enabled():
-            self.o_proj.emulate_global_tp_chunks = True
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -623,26 +594,14 @@ class NemotronHAttention(nn.Module):
             output, _ = self.o_proj(attn_output)
             return output
 
-        # DP attention pads each rank's batch to a common size for collective
-        # alignment. Those padding rows are fake: they must not write KV cache and
-        # must leave the layer as zeros. Prefill runs a varlen kernel keyed on the
-        # real cu_seqlens, so Q/K/V are trimmed to the real tokens; decode runs a
-        # wrapper captured at the padded batch size, so Q stays padded while K/V
-        # and the cache-write locations are trimmed.
-        # target_verify (spec/NEXTN) uses the SAME padded-batch wrapper as decode
-        # (qo_indptr is built at the padded length), so Q must stay padded there too —
-        # otherwise q.shape[0] (real) != qo_indptr[-1] (padded) in flashinfer prefill.
         padded_shape = hidden_states.shape[0]
-        real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
+        real_tokens = get_real_num_tokens(hidden_states, forward_batch)
         has_padding = real_tokens < padded_shape
         keep_q_padded = (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_idle()
-            # A decode/idle batch DP-padded into ForwardMode.EXTEND (MAX_LEN) still
-            # runs the padded-batch wrapper, so Q must stay padded. Genuine prefill
-            # has no _original_forward_mode and keeps trimming Q to the real tokens.
-            or getattr(forward_batch, "_original_forward_mode", None) is not None
+            or forward_batch._original_forward_mode is not None
         )
         original_out_cache_loc = forward_batch.out_cache_loc
 
@@ -654,23 +613,12 @@ class NemotronHAttention(nn.Module):
                 forward_batch.out_cache_loc = original_out_cache_loc[:real_tokens]
             if not keep_q_padded:
                 q = q[:real_tokens]
-        # real_tokens == 0: a fully-idle DP rank carrying a synthesized fake prefill
-        # (one req spanning all num_tokens padding tokens, prefix 0). Keep Q/K/V at the
-        # padded length so the prefill ragged kernel sees a well-formed self-attention
-        # (matching cu_seqlens); trimming K/V to 0 while Q stays padded makes the kernel
-        # read past K/V (TMA-descriptor / illegal-instruction failure). It must still run
-        # the attention collective but must NOT write KV: save_kv_cache is False below
-        # (a 0-row store_cache launches a 0-grid kernel -> CUDA invalid argument), and the
-        # output rows are zeroed afterwards.
         attn_output = self.attn.forward(
             q, k, v, forward_batch, save_kv_cache=real_tokens > 0
         )
-        # out_cache_loc is only consumed by self.attn.forward (KV write); restore it now.
         forward_batch.out_cache_loc = original_out_cache_loc
 
-        # Restore the padded row count (padding rows zeroed) before o_proj so the
-        # next collective sees the same shape as the layer input.
-        attn_output = _pad_to_original_num_tokens(attn_output, padded_shape)
+        attn_output = pad_to_original_num_tokens(attn_output, padded_shape)
         output, _ = self.o_proj(attn_output)
         if has_padding:
             output[real_tokens:].zero_()
@@ -695,7 +643,7 @@ class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(self.norm, for_attn=True)
+        self.layer_communicator = make_layer_communicator(self.norm, for_attn=True)
         self._set_prev_layer_is_attn(config, layer_idx)
 
     def forward(

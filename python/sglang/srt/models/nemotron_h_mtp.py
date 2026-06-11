@@ -40,7 +40,7 @@ from sglang.srt.models.nemotron_h import (
     NemotronHForCausalLM,
     NemotronHMoEDecoderLayer,
 )
-from sglang.srt.models.nemotron_h_utils import _is_attn_layer
+from sglang.srt.models.nemotron_h_utils import is_attn_layer
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -68,12 +68,6 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
             self.hnorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-            # Fusion layer to combine embeddings with target hidden states.
-            # Under dp-attention, eh_proj's input is per-DP-local (token count
-            # differs per DP rank), so a full-TP all-gather along the output
-            # dim would mismatch across DPs and deadlock. Scope the column
-            # split + gather to the attn-TP group instead; the result stays
-            # in TP_ATTN_FULL state (matching the rest of nemotron_h).
             _dp_attn = is_dp_attention_enabled()
             self.eh_proj = ColumnParallelLinear(
                 input_size=config.hidden_size * 2,
@@ -150,14 +144,8 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
-        # MTP draft pattern is [attention, moe]; this MoE layer consumes the
-        # preceding attention layer's attn-TP-partial output. Mirror the
-        # explicit attn_tp_all_reduce that NemotronHMambaDecoderLayer (and
-        # NemotronHAttentionDecoderLayer) does for prev_layer_is_attn — the
-        # base NemotronHMoEDecoderLayer omits it because in the target hybrid
-        # pattern a MoE layer never directly follows an attn (mamba) layer.
         _pat = config.mtp_hybrid_override_pattern
-        self.prev_layer_is_attn = layer_idx > 0 and _is_attn_layer(
+        self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
             _pat[(layer_idx - 1) % len(_pat)]
         )
 

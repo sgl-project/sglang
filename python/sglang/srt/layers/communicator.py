@@ -988,11 +988,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            # Default (attn_tp_size == 1): layernorm before the DP gather. Models with
-            # attn_tp_size > 1 keep the original layernorm-after-gather path unless they
-            # explicitly opt in via force_layernorm_before_dp_gather (Nemotron-H does, so
-            # the per-attn-TP-rank partial hidden states are all-reduced + normed before
-            # the replicate-gather).
             use_layer_norm_before_gather = (
                 context.attn_tp_size == 1 or context.force_layernorm_before_dp_gather
             )
