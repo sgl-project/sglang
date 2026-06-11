@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "setuptools-rust>=1.10", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -20,9 +20,10 @@ dependencies = [
   "apache-tvm-ffi==0.1.9",
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
-  "av",
   "build",
   "compressed-tensors",
+  "cuda-python>=13.0",
+  "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "datasets",
   "distro",
   "einops",
@@ -30,13 +31,12 @@ dependencies = [
   "flashinfer_python[cu13]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.6.12",
   "gguf",
-  "hf_transfer",
-  "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
   "msgspec",
   "ninja",
+  "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "numpy",
   "nvidia-cutlass-dsl[cu13]==4.5.2",
   "nvidia-ml-py",
@@ -92,6 +92,7 @@ default = true
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle==3.1.2",
@@ -135,22 +136,36 @@ fastokens = [
 
 test = [
   "accelerate",
+  "addict",
+  "bitsandbytes",
   "expecttest",
-  "gguf",
   "jsonlines",
+  "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   "pandas",
+  "parameterized",
   "peft>=0.18.0",
+  "polars",
   "pytest",
+  "pytest-cov",
+  "diff-cover",
   "sentence_transformers",
   "sglang[fastokens]",
   "tabulate",
+  "granian>=2.6.0",
 ]
 
-# https://docs.sglang.io/platforms/ascend_npu.html
-srt_npu = []
-all_npu = ["sglang[diffusion]"]
-dev_npu = ["sglang[all_npu]", "sglang[test]"]
+dev = ["sglang[test]"]
+
+all = [
+  "sglang[diffusion]",
+  "sglang[tracing]",
+  "sglang[http2]",
+]
+
+[tool.uv.extra-build-dependencies]
+st-attn = ["torch", "setuptools"]
+vsa = ["torch", "setuptools"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
@@ -158,6 +173,7 @@ dev_npu = ["sglang[all_npu]", "sglang[test]"]
 
 [project.scripts]
 sglang = "sglang.cli.main:main"
+killall_sglang = "sglang.cli.killall:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
@@ -194,3 +210,11 @@ version_file = "sglang/_version.py"
 git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
+
+[[tool.setuptools-rust.ext-modules]]
+target = "sglang.srt.grpc._core"
+path = "../rust/sglang-grpc/Cargo.toml"
+binding = "PyO3"
+
+[tool.kernels.dependencies]
+"kernels-community/sgl-flash-attn3" = 1
