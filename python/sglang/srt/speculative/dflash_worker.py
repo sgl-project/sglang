@@ -115,7 +115,7 @@ class DFlashWorker:
             _fb = "triton" if _torch.version.hip else "flashinfer"
             logger.warning(
                 "DFLASH draft worker does not support 'trtllm_mha' because the "
-                "draft path requires non-causal attention. Falling back to "
+                "draft path requires per-layer DFlash attention. Falling back to "
                 "'%s'.",
                 _fb,
             )
@@ -159,6 +159,8 @@ class DFlashWorker:
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
+        # Keep the same alias that other spec-v2 workers expose.
+        self.draft_worker.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -179,6 +181,7 @@ class DFlashWorker:
                     self.block_size,
                     model_block_size,
                 )
+        self.speculative_num_draft_tokens = int(self.block_size)
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -212,6 +215,9 @@ class DFlashWorker:
         self._draft_block_tokens_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
+        self._draft_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, block_size]
+        )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = DFlashVerifyInput(
@@ -224,11 +230,13 @@ class DFlashWorker:
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gather_cap: int = 0
+        self._draft_greedy_local_max_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_local_arg_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_local_cap: int = 0
         self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-
         self._use_fused_kv_materialize = is_cuda()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
@@ -296,6 +304,8 @@ class DFlashWorker:
                 num_kv_heads=first_attn.num_kv_heads,
                 head_dim=first_attn.head_dim,
                 device=self.device,
+                max_position_hint=self.target_worker.model_runner.model_config.context_len
+                + int(self.block_size),
             )
             if self.tp_rank == 0:
                 logger.info(
@@ -334,6 +344,9 @@ class DFlashWorker:
         self._draft_block_tokens_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
         )
+        self._draft_verify_out_cache_loc_buf = torch.empty(
+            (new_cap, block_size), dtype=torch.int64, device=device
+        )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
@@ -344,6 +357,11 @@ class DFlashWorker:
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        pass
 
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
@@ -562,7 +580,7 @@ class DFlashWorker:
                 "`shard_indices` attributes."
             )
 
-        # --- 2) Draft a non-causal block with the draft model.
+        # --- 2) Draft a fixed block with the draft model.
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
@@ -570,38 +588,40 @@ class DFlashWorker:
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
-        block_ids = self._draft_block_ids_buf[:bs]
-        block_ids.fill_(int(self._mask_token_id))
-        block_ids[:, 0].copy_(draft_input.bonus_tokens.to(torch.long))
-
-        noise_embedding = embed_module(block_ids)
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
-
-        # For spec-v1, the draft KV cache is always materialized before drafting the
-        # next block. `target_prefix_lens` stay absolute for RoPE; `draft_prefix_lens`
-        # are the logical resident lengths in the draft-local cache.
-        target_prefix_lens = batch.seq_lens  # int32, device
-        draft_prefix_lens = draft_input.draft_seq_lens
-        if draft_prefix_lens.dtype != torch.int32:
-            draft_prefix_lens = draft_prefix_lens.to(torch.int32)
-        if draft_prefix_lens.device != self.device:
-            draft_prefix_lens = draft_prefix_lens.to(self.device, non_blocking=True)
-
-        positions_2d = self._draft_block_positions_buf[:bs]
-        torch.add(
-            target_prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d
-        )
-        positions = positions_2d.reshape(-1)
-
-        block_start = draft_prefix_lens
-        block_end = self._draft_block_end_buf[:bs]
-        torch.add(block_start, int(self.block_size), out=block_end)
-
-        seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-        seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
+            block_ids = self._draft_block_ids_buf[:bs]
+            block_ids.fill_(int(self._mask_token_id))
+            block_ids[:, 0].copy_(draft_input.bonus_tokens.to(torch.long))
+
+            noise_embedding = embed_module(block_ids)
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+
+            # For spec-v1, the draft KV cache is always materialized before drafting the
+            # next block. `target_prefix_lens` stay absolute for RoPE; `draft_prefix_lens`
+            # are the logical resident lengths in the draft-local cache.
+            target_prefix_lens = batch.seq_lens  # int32, device
+            draft_prefix_lens = draft_input.draft_seq_lens
+            if draft_prefix_lens.dtype != torch.int32:
+                draft_prefix_lens = draft_prefix_lens.to(torch.int32)
+            if draft_prefix_lens.device != self.device:
+                draft_prefix_lens = draft_prefix_lens.to(self.device, non_blocking=True)
+
+            positions_2d = self._draft_block_positions_buf[:bs]
+            torch.add(
+                target_prefix_lens.unsqueeze(1),
+                self._block_pos_offsets,
+                out=positions_2d,
+            )
+            positions = positions_2d.reshape(-1)
+
+            block_start = draft_prefix_lens
+            block_end = self._draft_block_end_buf[:bs]
+            torch.add(block_start, int(self.block_size), out=block_end)
+
+            seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+            seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
             if self.page_size == 1:
                 block_cache_loc = allocator.alloc(bs * self.block_size)
             else:
@@ -744,18 +764,51 @@ class DFlashWorker:
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
+        def _ensure_local_reduce_buffers(
+            chunk_len: int,
+            value_dtype: torch.dtype,
+            device: torch.device,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if (
+                self._draft_greedy_local_cap < chunk_len
+                or self._draft_greedy_local_max_buf is None
+                or self._draft_greedy_local_arg_buf is None
+                or self._draft_greedy_local_max_buf.dtype != value_dtype
+                or self._draft_greedy_local_max_buf.device != device
+                or self._draft_greedy_local_arg_buf.device != device
+            ):
+                cap = max(int(chunk_size), chunk_len)
+                self._draft_greedy_local_max_buf = torch.empty(
+                    (cap,), dtype=value_dtype, device=device
+                )
+                self._draft_greedy_local_arg_buf = torch.empty(
+                    (cap,), dtype=torch.int64, device=device
+                )
+                self._draft_greedy_local_cap = cap
+            return (
+                self._draft_greedy_local_max_buf[:chunk_len],
+                self._draft_greedy_local_arg_buf[:chunk_len],
+            )
+
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
         # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
+        #
+        # DFLASH draft sampling only materializes a small fixed block of hidden states
+        # each step. On tp=1, splitting those states into many 256-token chunks adds
+        # extra matmul/argmax launches without reducing peak memory meaningfully.
         if tp_size == 1 and num_added == 0:
-            for start in range(0, num_tokens, int(chunk_size)):
-                end = min(num_tokens, start + int(chunk_size))
+            fast_chunk_size = max(int(chunk_size), 1024)
+            for start in range(0, num_tokens, fast_chunk_size):
+                end = min(num_tokens, start + fast_chunk_size)
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
-                    out_tokens[start:end] = (
-                        torch.argmax(base_logits, dim=-1).to(torch.long)
-                        + org_vocab_start
+                    local_max, local_arg = _ensure_local_reduce_buffers(
+                        end - start, base_logits.dtype, hs.device
                     )
+                    torch.max(base_logits, dim=-1, out=(local_max, local_arg))
+                    out_tokens[start:end].copy_(local_arg)
+                    out_tokens[start:end].add_(org_vocab_start)
                 else:
                     out_tokens[start:end] = 0
             return out_tokens
@@ -768,7 +821,10 @@ class DFlashWorker:
             # Base vocab logits.
             if num_org > 0:
                 base_logits = torch.matmul(hs, weight[:num_org].T)
-                local_max, local_arg = torch.max(base_logits, dim=-1)
+                local_max, local_arg = _ensure_local_reduce_buffers(
+                    chunk_len, base_logits.dtype, hs.device
+                )
+                torch.max(base_logits, dim=-1, out=(local_max, local_arg))
             else:
                 local_max = torch.full(
                     (chunk_len,),
@@ -966,11 +1022,13 @@ class DFlashWorker:
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
                 )
 
+            wrote_with_fused_kv = False
             if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
                 try:
                     self._append_target_hidden_fused(
                         ctx_hidden, ctx_positions, ctx_cache_loc
                     )
+                    wrote_with_fused_kv = True
                 except Exception as e:
                     logger.warning(
                         "DFLASH fused KV append failed; falling back to sequential path: %s",
@@ -978,10 +1036,7 @@ class DFlashWorker:
                     )
                     self._use_fused_kv_materialize = False
                     self._fused_kv_helper = None
-                    self._append_target_hidden_sequential(
-                        ctx_hidden, ctx_positions, ctx_cache_loc
-                    )
-            else:
+            if not wrote_with_fused_kv:
                 self._append_target_hidden_sequential(
                     ctx_hidden, ctx_positions, ctx_cache_loc
                 )
@@ -1010,6 +1065,160 @@ class DFlashWorker:
             draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
+
+    def _append_target_hidden_to_draft_kv_by_loc(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Materialize target context features into the draft KV cache at explicit slots.
+
+        For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
+        `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
+        only the live prefix rows without constructing masked/packed index tensors.
+        """
+        if target_hidden is None:
+            raise RuntimeError("DFLASH missing target hidden context features.")
+        if target_hidden.numel() == 0:
+            return
+        if target_hidden.ndim != 2:
+            raise ValueError(
+                "DFLASH target_hidden must be 2D, "
+                f"got shape={tuple(target_hidden.shape)}."
+            )
+
+        if cache_loc.ndim != 1:
+            raise ValueError(
+                f"DFLASH cache_loc must be 1D, got shape={tuple(cache_loc.shape)}."
+            )
+        if positions.ndim != 1:
+            raise ValueError(
+                f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
+            )
+        num_tokens = int(target_hidden.shape[0])
+        if int(cache_loc.numel()) != num_tokens:
+            raise ValueError(
+                "DFLASH cache_loc length mismatch: "
+                f"cache_loc={int(cache_loc.numel())}, target_hidden={num_tokens}."
+            )
+        if int(positions.numel()) != num_tokens:
+            raise ValueError(
+                "DFLASH positions length mismatch: "
+                f"positions={int(positions.numel())}, target_hidden={num_tokens}."
+            )
+        if cache_loc_2d is not None:
+            if cache_loc_2d.ndim != 2:
+                raise ValueError(
+                    "DFLASH cache_loc_2d must be 2D, "
+                    f"got shape={tuple(cache_loc_2d.shape)}."
+                )
+            if int(cache_loc_2d.numel()) != num_tokens:
+                raise ValueError(
+                    "DFLASH cache_loc_2d size mismatch: "
+                    f"cache_loc_2d={int(cache_loc_2d.numel())}, target_hidden={num_tokens}."
+                )
+            if commit_lens is None:
+                raise ValueError(
+                    "DFLASH cache_loc_2d requires commit_lens for prefix-valid writes."
+                )
+
+        device = self.model_runner.device
+        if cache_loc.device != device:
+            cache_loc = cache_loc.to(device, non_blocking=True)
+        if positions.device != device:
+            positions = positions.to(device, non_blocking=True)
+        if target_hidden.device != device:
+            target_hidden = target_hidden.to(device, non_blocking=True)
+
+        if cache_loc.dtype != torch.int64:
+            cache_loc = cache_loc.to(torch.int64)
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if cache_loc_2d is not None:
+            if cache_loc_2d.device != device:
+                cache_loc_2d = cache_loc_2d.to(device, non_blocking=True)
+            if cache_loc_2d.dtype != torch.int64:
+                cache_loc_2d = cache_loc_2d.to(torch.int64)
+        if commit_lens is not None:
+            if commit_lens.device != device:
+                commit_lens = commit_lens.to(device, non_blocking=True)
+            if commit_lens.dtype != torch.int32:
+                commit_lens = commit_lens.to(torch.int32)
+
+        with torch.inference_mode():
+            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+
+            if cache_loc_2d is not None:
+                bs = int(commit_lens.shape[0])
+                if int(cache_loc_2d.shape[0]) != bs:
+                    raise ValueError(
+                        "DFLASH cache_loc_2d batch size mismatch: "
+                        f"cache_loc_2d={tuple(cache_loc_2d.shape)}, commit_lens={tuple(commit_lens.shape)}."
+                    )
+                if bs == 0:
+                    return
+                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                    try:
+                        self._append_target_hidden_fused(
+                            ctx_hidden=ctx_hidden,
+                            ctx_positions=positions,
+                            ctx_cache_loc=cache_loc,
+                            ctx_cache_loc_2d=cache_loc_2d,
+                            commit_lens=commit_lens,
+                        )
+                        return
+                    except Exception as e:
+                        logger.warning(
+                            "DFLASH fused prefix-direct KV append failed; falling back to the per-layer prefix-direct path: %s",
+                            e,
+                        )
+                        self._use_fused_kv_materialize = False
+                        self._fused_kv_helper = None
+
+                for layer in self.draft_model.layers:
+                    attn = layer.self_attn
+                    k, v = attn.kv_proj_only(ctx_hidden)
+                    k = attn.apply_k_norm(k)
+                    k = attn.apply_k_rope(positions, k)
+                    k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+                    v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+
+                    self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
+                        attn.attn,
+                        cache_loc_2d,
+                        commit_lens,
+                        k,
+                        v,
+                        attn.attn.k_scale,
+                        attn.attn.v_scale,
+                    )
+                return
+
+            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                try:
+                    self._append_target_hidden_fused(
+                        ctx_hidden=ctx_hidden,
+                        ctx_positions=positions,
+                        ctx_cache_loc=cache_loc,
+                    )
+                    return
+                except Exception as e:
+                    logger.warning(
+                        "DFLASH fused KV append-by-loc failed; falling back to sequential path: %s",
+                        e,
+                    )
+                    self._use_fused_kv_materialize = False
+                    self._fused_kv_helper = None
+
+            self._append_target_hidden_sequential(
+                ctx_hidden=ctx_hidden,
+                ctx_positions=positions,
+                ctx_cache_loc=cache_loc,
+            )
 
     def _append_target_hidden_sequential(
         self,
@@ -1041,23 +1250,39 @@ class DFlashWorker:
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        ctx_cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
-        layers = self.draft_model.layers
+        if self._fused_kv_helper is None:
+            raise RuntimeError("DFLASH fused KV helper is not initialized.")
 
         def _write_layer_kv(
-            layer_idx: int, cache_k: torch.Tensor, cache_v: torch.Tensor
+            layer_idx: int,
+            cache_k: torch.Tensor,
+            cache_v: torch.Tensor,
         ) -> None:
-            attn = layers[layer_idx].self_attn.attn
-            token_to_kv_pool.set_kv_buffer(
-                attn,
-                ctx_cache_loc,
-                cache_k,
-                cache_v,
-                attn.k_scale,
-                attn.v_scale,
-            )
+            attn = self.draft_model.layers[layer_idx].self_attn.attn
+            if ctx_cache_loc_2d is not None and commit_lens is not None:
+                token_to_kv_pool.set_kv_buffer_prefix_valid(
+                    attn,
+                    ctx_cache_loc_2d,
+                    commit_lens,
+                    cache_k,
+                    cache_v,
+                    attn.k_scale,
+                    attn.v_scale,
+                )
+            else:
+                token_to_kv_pool.set_kv_buffer(
+                    attn,
+                    ctx_cache_loc,
+                    cache_k,
+                    cache_v,
+                    attn.k_scale,
+                    attn.v_scale,
+                )
 
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
