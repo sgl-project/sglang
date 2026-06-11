@@ -262,7 +262,7 @@ do
         --disable-radix-cache \
         --chunked-prefill-size -1 --max-prefill-tokens 68000 \
         --max-running-requests 32 \
-        --cuda-graph-max-bs 4 \
+        --cuda-graph-max-bs-decode 4 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
         --quantization modelslim \
@@ -339,7 +339,7 @@ on the Best Practice page.
 
 | Scenario               | Deployment mode   | Total NPUs | Weight version |
 |------------------------|-------------------|------------|----------------|
-| Low latency (128K+1K)  | PD disaggregation | 32 (A3)    | W8A8 INT8      |
+| Low latency (128K+1K)  | PD disaggregation | 32 (A3)    | W8A8           |
 
 `Total NPUs` indicates the total number of NPUs used across all nodes.
 

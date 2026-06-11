@@ -29,7 +29,8 @@ v0.5.10 or a later version.
 | PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size 94208 --max-prefill-tokens 458880`                                    |
-| NPU Graph                     | `--cuda-graph-bs 1 2 4 8 16 20 24 26 27`                                                      |
+| PrefixCache                   | `--disable-radix-cache`                                                                       |
+| NPU Graph                     | `--cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27`                                                      |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
@@ -199,7 +200,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --disable-radix-cache --moe-a2a-backend ascend_fuseep --speculative-draft-model-quantization unquant \
-    --tp-size 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.8 --cuda-graph-bs 1 2 4 8 16 20 24 26 27
+    --tp-size 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.8 --cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27
 ```
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
@@ -269,8 +270,8 @@ do
         python -m sglang.launch_server --model-path ${MODEL_PATH} \
         --host 127.0.0.1 --port 7439 --trust-remote-code \
         --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --mem-fraction-static 0.8 --max-running-requests 768 \
-        --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
-        --moe-a2a-backend deepep --deepep-mode auto --cuda-graph-bs 6 8 10 12 18 24 \
+        --attention-backend ascend --device npu --sampling-backend ascend --quantization modelslim --enable-dp-attention \
+        --moe-a2a-backend deepep --deepep-mode auto --cuda-graph-bs-decode 6 8 10 12 18 24 \
         --dist-init-addr ${MIX_IP[0]}:5000 --chunked-prefill-size 131072 --max-prefill-tokens 458880 \
         --speculative-algorithm EAGLE3 --speculative-draft-model-path ${DRAFT_MODEL_PATH} --speculative-draft-model-quantization unquant \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
@@ -359,7 +360,7 @@ do
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
         --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --mem-fraction-static 0.6 \
         --disable-radix-cache \
-        --attention-backend ascend --device npu --quantization modelslim --disaggregation-transfer-backend ascend \
+        --attention-backend ascend --device npu --sampling-backend ascend --quantization modelslim --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE3 --speculative-draft-model-path ${DRAFT_MODEL_PATH} \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --speculative-draft-model-quantization unquant \
@@ -379,7 +380,7 @@ do
         echo "${D_IP[$i]}"
         source /usr/local/Ascend/ascend-toolkit/set_env.sh
         source /usr/local/Ascend/nnal/atb/set_env.sh
-        export DP_ROUND_ROBIN=1
+        export SGLANG_DP_ROUND_ROBIN=1
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=65536
         export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
@@ -389,8 +390,8 @@ do
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode \
         --host ${D_IP[$i]} --port 8001 --trust-remote-code \
         --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --mem-fraction-static 0.83 --max-running-requests 768 \
-        --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
-        --moe-a2a-backend ascend_fuseep --cuda-graph-bs 6 8 12 15 18 20 22 24 \
+        --attention-backend ascend --device npu --sampling-backend ascend --quantization modelslim --enable-dp-attention \
+        --moe-a2a-backend ascend_fuseep --cuda-graph-bs-decode 6 8 12 15 18 20 22 24 \
         --speculative-algorithm EAGLE3 --speculative-draft-model-path ${DRAFT_MODEL_PATH} \
         --speculative-draft-model-quantization unquant \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
@@ -417,7 +418,7 @@ python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8995 \
-    --decode http://<your decode ip>:8001 \
+    --decode http://<your decode ip1>:8001 --decode http://<your decode ip2>:8001 \
     --host 127.0.0.1 \
     --port 7439 \
     --mini-lb

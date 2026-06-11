@@ -28,7 +28,7 @@ v0.5.10 or a later version.
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size 32768 --max-prefill-tokens 16384`                                     |
-| NPU Graph                     | `--cuda-graph-bs 1 2 4 8 12 16 24 32 48 64 96 120`                                            |
+| NPU Graph                     | `--cuda-graph-bs-decode 1 2 4 8 12 16 24 32 48 64 96 120`                                            |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | MLAPO                         | `export SGLANG_NPU_USE_MLAPO=1`                                                               |
@@ -192,7 +192,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal --mm-attention-backend ascend_attn --sampling-backend ascend \
     --enable-dp-attention --dp-size 16 \
     --moe-a2a-backend deepep --deepep-mode auto \
-    --cuda-graph-bs 1 2 4 8 12 16 24 32 48 64 96 120 --disable-radix-cache \
+    --cuda-graph-bs-decode 1 2 4 8 12 16 24 32 48 64 96 120 --disable-radix-cache \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_PATH \
     --speculative-num-steps 4 --speculative-eagle-topk 1 \

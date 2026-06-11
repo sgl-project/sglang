@@ -6,8 +6,8 @@ metatags:
 
 ## Introduction
 
-Qwen3-Next-80B-A3B-Instruct is a hybrid Mamba-Transformer Mixture-of-Experts (MoE) model developed by Alibaba,
-featuring 80B total parameters with 3B active parameters. It combines Mamba SSM layers with attention layers in a
+Qwen3-Next-80B-A3B-Instruct is a hybrid Gated DeltaNet-Transformer Mixture-of-Experts (MoE) model developed by Alibaba,
+featuring 80B total parameters with 3B active parameters. It combines Gated DeltaNet SSM layers with attention layers in a
 sparse MoE architecture, enabling efficient long-sequence modeling with linear complexity in the SSM layers. The model
 supports multi-token prediction (NEXTN) for speculative decoding, delivering strong performance in instruction
 following, reasoning, and text generation tasks.
@@ -28,7 +28,7 @@ v0.5.10 or a later version.
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 14080`                                        |
-| NPU Graph                     | `--cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150` |
+| NPU Graph                     | `--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150` |
 | Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant --speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
@@ -45,7 +45,7 @@ If you need to download model weights, check the model size before downloading t
 </Warning>
 
 - [Qwen3-Next-80B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) (BF16)
-- [Qwen3-Next-80B-A3B-Instruct-W8A8](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) (W8A8 quantized version)
+- [Qwen3-Next-80B-A3B-Instruct-W8A8](https://huggingface.co/RedHatAI/Qwen3-Next-80B-A3B-Instruct-quantized.w8a8) (W8A8 quantized version)
 
 Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
 refer to the [best practice configurations](#best-practices) which may require additional nodes or cards.
@@ -205,11 +205,11 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --chunked-prefill-size -1 --max-running-requests 300 \
     --mamba-ssm-dtype bfloat16 \
     --quantization modelslim \
-    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  --speculative-draft-model-quantization  unquant \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant \
     --speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct \
     --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
     --moe-a2a-backend deepep --deepep-mode auto \
-    --cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150
+    --cuda-graph-bs-decode 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150
 ```
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
@@ -256,10 +256,10 @@ on the Best Practice page.
 
 | Scenario                      | Deployment mode | Total NPUs | Weight version |
 |-------------------------------|-----------------|------------|----------------|
-| Low latency (1K+0.3K)         | PD mixed        | 2 (A3)     | W8A8 INT8      |
-| Low latency (6K+1.5K)         | PD mixed        | 2 (A3)     | W8A8 INT8      |
-| Low latency (3.5K+1.5K)       | PD mixed        | 1 (A3)     | W8A8 INT8      |
-| High throughput (3.5K+1.5K)   | PD mixed        | 2 (A3)     | W8A8 INT8      |
+| Low latency (1K+0.3K)         | PD mixed        | 2 (A3)     | W8A8      |
+| Low latency (6K+1.5K)         | PD mixed        | 2 (A3)     | W8A8      |
+| Low latency (3.5K+1.5K)       | PD mixed        | 1 (A3)     | W8A8      |
+| High throughput (3.5K+1.5K)   | PD mixed        | 2 (A3)     | W8A8      |
 
 `Total NPUs` indicates the total number of NPUs used across all nodes.
 

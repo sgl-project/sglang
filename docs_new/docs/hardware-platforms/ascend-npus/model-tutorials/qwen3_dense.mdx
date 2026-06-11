@@ -26,7 +26,7 @@ v0.5.10 or a later version.
 | Tensor Parallelism            | `--tp-size 4`                                                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 16384`                                        |
-| NPU Graph                     | `--cuda-graph-bs 1 4 8 16`                                                                    |
+| NPU Graph                     | `--cuda-graph-bs-decode 1 4 8 16`                                                                    |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path <draft-model-path> --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 
@@ -171,12 +171,6 @@ DRAFT_MODEL_PATH=/path/to/draft-model-weights
 
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
-LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
-LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
-
-echo "${LOCAL_HOST1}"
-echo "${LOCAL_HOST2}"
-
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -192,7 +186,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
-    --tp-size 4 --mem-fraction-static 0.843 --cuda-graph-bs 1 4 8 16 --dtype bfloat16
+    --tp-size 4 --mem-fraction-static 0.843 --cuda-graph-bs-decode 1 4 8 16 --dtype bfloat16
 ```
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
@@ -249,12 +243,10 @@ on the Best Practice page.
 | Low latency (1K+0.3K)         | PD mixed        | 1 (A3)     | W8A8 INT8      |
 | Low latency (6K+1.5K)         | PD mixed        | 1 (A3)     | W8A8 INT8      |
 | Low latency (3.5K+1.5K)       | PD mixed        | 1 (A3)     | W8A8 INT8      |
-| Low latency (3.5K+1.5K)       | PD mixed        | 1 (A3)     | W8A8 INT8      |
 | High throughput (3.5K+1.5K)   | PD mixed        | 2 (A3)     | W8A8 INT8      |
 | High throughput (2K+2K)       | PD mixed        | 2 (A3)     | W8A8 INT8      |
 | High throughput (3.5K+1.5K)   | PD mixed        | 8 (A2)     | W8A8 INT8      |
 | High throughput (2K+2K)       | PD mixed        | 8 (A2)     | W8A8 INT8      |
-| High throughput (3.5K+1.5K)   | PD mixed        | 1 (A3)     | W8A8 INT8      |
 | High throughput (3.5K+1.5K)   | PD mixed        | 1 (A3)     | W8A8 INT8      |
 
 `Total NPUs` indicates the total number of NPUs used across all nodes.

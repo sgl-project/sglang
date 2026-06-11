@@ -26,10 +26,10 @@ v0.5.10 or a later version.
 | Tensor Parallelism            | `--tp-size 2`                                                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 35000`                                        |
-| NPU Graph                     | `--cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162`                    |
+| NPU Graph                     | `--cuda-graph-bs-decode 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162`                    |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
-| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
-| PrefixCache                   | `--disable-radix-cache`                                                                       |
+| Overlap Schedule              | `SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                |
+| Disable Radix Cache           | `--disable-radix-cache`                                                                       |
 
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
@@ -170,12 +170,6 @@ export ASCEND_LAUNCH_BLOCKING=0
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
-LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
-
-echo "${LOCAL_HOST1}"
-echo "${LOCAL_HOST2}"
-
 export HCCL_BUFFSIZE=400
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
@@ -194,7 +188,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 35000 \
-    --tp-size 2 --mem-fraction-static 0.87 --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
+    --tp-size 2 --mem-fraction-static 0.87 --cuda-graph-bs-decode 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
     --dtype bfloat16
 ```
 
