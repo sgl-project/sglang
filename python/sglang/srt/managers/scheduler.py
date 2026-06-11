@@ -1172,9 +1172,9 @@ class Scheduler(
         self.device_module = torch.get_device_module(self.device)
 
         # FutureMap is always-on: input_ids relay used in both modes.
-        # Workers not on BaseSpecWorker (e.g. NGRAM / DFLASH) lack the
-        # override; fall back to target-only so the helper still produces a
-        # safe decision (no accidental opt-out for unaudited shapes).
+        # Workers without the spec_v2_attn_backends override fall back to
+        # target-only so the helper still produces a safe decision (no
+        # accidental opt-out for unaudited shapes).
         if self.draft_worker is not None:
             attn_backends = getattr(
                 self.draft_worker,
