@@ -169,10 +169,10 @@ class TorchNpuQuantInfo(MoeQuantInfo):
 
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
-    w13_weigh_scale: Optional[torch.Tensor] = None
-    w2_weigh_scale: Optional[torch.Tensor] = None
-    w13_weigh_offset: Optional[torch.Tensor] = None
-    w2_weigh_offset: Optional[torch.Tensor] = None
+    w13_weight_scale: Optional[torch.Tensor] = None
+    w2_weight_scale: Optional[torch.Tensor] = None
+    w13_weight_offset: Optional[torch.Tensor] = None
+    w2_weight_offset: Optional[torch.Tensor] = None
     w13_weight_bias: Optional[torch.Tensor] = None
     w2_weight_bias: Optional[torch.Tensor] = None
     w13_scale_bias: Optional[torch.Tensor] = None
