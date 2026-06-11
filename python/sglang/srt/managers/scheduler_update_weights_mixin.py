@@ -96,7 +96,11 @@ class SchedulerUpdateWeightsMixin:
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
         self._quiesce_for_weight_update()
-        success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+        if recv_req.disable_draft_model:
+            worker = self.tp_worker
+        else:
+            worker = self.draft_worker or self.tp_worker
+        success, message = worker.update_weights_from_distributed(recv_req)
         if success:
             self.flush_cache_after_weight_update(recv_req)
         else:
