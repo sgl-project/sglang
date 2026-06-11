@@ -39,7 +39,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
-if is_cuda() or is_xpu():
+if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn,
         causal_conv1d_update,
