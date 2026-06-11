@@ -198,6 +198,8 @@ Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling
 
 Qwen3.5 supports image and video inputs as a unified vision-language model. Here is an example with an image:
 
+<Accordion title="Image Input Example (Python)">
+
 ```python Example
 from openai import OpenAI
 
@@ -253,7 +255,9 @@ for chunk in response:
 print()
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 =============== Thinking =================
@@ -330,6 +334,8 @@ The image is a minimalist, black-and-white line drawing featuring geometric shap
 The arrangement creates a diagonal symmetry. The two largest circles are on a diagonal from bottom-left to top-right, while the two smallest circles are on a diagonal from top-left to bottom-right. The intersecting lines create a complex web of curves and angles in the center of the image.
 ```
 
+</Accordion>
+
 ### 3.2 Reasoning
 
 Qwen3.5 supports Thinking mode **by default**. The `qwen3` reasoning parser is part of every generated command (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground) to strip it); it separates the thinking and content sections, returning the thinking process via `reasoning_content` in the streaming response.
@@ -342,6 +348,8 @@ To disable thinking and use Instruct mode, pass `chat_template_kwargs` at reques
 **Example 1: Thinking Mode (Default)**
 
 Thinking mode is enabled by default. The model will reason step-by-step before answering, and the thinking process is returned via `reasoning_content`:
+
+<Accordion title="Thinking Mode — Streaming (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -389,7 +397,9 @@ for chunk in response:
 print()
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 =============== Thinking =================
@@ -516,9 +526,13 @@ $$3600 \rightarrow 36.00$$
 15% of 240 is **36**.
 ```
 
+</Accordion>
+
 **Example 2: Instruct Mode (Thinking Off)**
 
 To disable thinking and get a direct response, pass `{"enable_thinking": false}` via `chat_template_kwargs`:
+
+<Accordion title="Instruct Mode — Thinking Off (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -549,7 +563,9 @@ for chunk in response:
 print()
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 To find 15% of 240, you can follow these steps:
@@ -577,11 +593,13 @@ To find 15% of 240, you can follow these steps:
 15% of 240 is **36**.
 ```
 
+</Accordion>
+
 ### 3.3 Tool Calling
 
 Qwen3.5 supports tool calling capabilities. The `qwen3_coder` tool-call parser is part of every generated command (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground) to strip it). Thinking mode is on by default; to disable it for tool calling requests, pass `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
 
-**Python Example (with Thinking Process):**
+<Accordion title="Python Example with Thinking Process">
 
 ```python Example
 from openai import OpenAI
@@ -662,7 +680,9 @@ for chunk in response:
 print()
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 =============== Thinking =================
@@ -684,3 +704,5 @@ Tool Call: None
 Tool Call: None
    Arguments: }
 ```
+
+</Accordion>
