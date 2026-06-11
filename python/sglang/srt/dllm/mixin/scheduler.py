@@ -79,7 +79,7 @@ class SchedulerDllmMixin:
             # Release the KV slots of the still-masked block so the next FDFO
             # round can re-denoise it without leaking the previous allocation.
             old_prefix_len = len(req.prefix_indices)
-            new_fill_len = len(req.fill_ids)
+            new_fill_len = req.fill_len
             if new_fill_len > old_prefix_len:
                 kv_indices_to_free = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, old_prefix_len:new_fill_len
@@ -130,12 +130,17 @@ class SchedulerDllmMixin:
                 req.dllm_incomplete_ids = array("q")
                 req.dllm_algo_state = None
 
-                # Mirror the resolved block into fill_ids so the prefix cache
-                # keys on the real tokens, not the mask block, next round.
-                req.fill_ids[-block_size:] = array("q", next_token_ids)
+                # Mirror the resolved block into the committed fill ids so the
+                # prefix cache keys on the real tokens, not the mask block, next
+                # round. Index relative to fill_len (the truncated/committed
+                # length), which can be shorter than full_untruncated_fill_ids
+                # when the staging adder truncates the block to the KV budget.
+                req.full_untruncated_fill_ids[
+                    req.fill_len - block_size : req.fill_len
+                ] = array("q", next_token_ids)
 
                 len_input = len(req.origin_input_ids)
-                len_fill = len(req.fill_ids)
+                len_fill = req.fill_len
                 if len_fill <= len_input:
                     continue
 

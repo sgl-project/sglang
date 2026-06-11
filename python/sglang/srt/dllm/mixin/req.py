@@ -64,7 +64,10 @@ class ReqDllmMixin:
         if self.dllm_incomplete_ids:
             prefix_len = len(self.prefix_indices)
             assert len(self.dllm_incomplete_ids) == self.dllm_config.block_size
-            self.fill_ids = self.fill_ids[:prefix_len] + self.dllm_incomplete_ids
+            self.full_untruncated_fill_ids = (
+                self.full_untruncated_fill_ids[:prefix_len] + self.dllm_incomplete_ids
+            )
+            self.fill_len = len(self.full_untruncated_fill_ids)
             return
 
         self.dllm_block_offset = (
