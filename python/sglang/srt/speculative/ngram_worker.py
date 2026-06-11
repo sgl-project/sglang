@@ -6,6 +6,7 @@ import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
+from sglang.srt.managers.io_struct import UpdateWeightsFromDistributedReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -91,6 +92,11 @@ class NGRAMWorker:
         # without this method any caller of `update_weights_from_tensor`
         # under `--speculative-algorithm NGRAM` raises AttributeError.
         return self.target_worker.update_weights_from_tensor(recv_req)
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        return self.target_worker.update_weights_from_distributed(recv_req)
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
