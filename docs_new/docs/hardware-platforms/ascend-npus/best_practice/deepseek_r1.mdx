@@ -439,7 +439,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -608,7 +608,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.778 \
@@ -771,7 +771,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -935,7 +935,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -1099,7 +1099,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \

@@ -128,7 +128,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1')
+P_IP=('your prefill ip1' 'your prefill ip2')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -151,7 +151,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -288,7 +288,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1')
+P_IP=('your prefill ip1' 'your prefill ip2')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -311,7 +311,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -448,7 +448,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1')
+P_IP=('your prefill ip1' 'your prefill ip2')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -471,7 +471,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
