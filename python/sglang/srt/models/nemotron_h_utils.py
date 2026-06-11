@@ -1,7 +1,5 @@
 """DP-attention helpers for the Nemotron-H model."""
 
-from typing import Optional
-
 import torch
 from torch import nn
 
@@ -36,42 +34,6 @@ def get_real_num_tokens(
     ):
         real_tokens = min(real_tokens, int(sum(forward_batch.extend_seq_lens_cpu)))
     return real_tokens
-
-
-def zero_dp_padding_rows(
-    hidden_states: torch.Tensor,
-    forward_batch: ForwardBatch,
-    residual: Optional[torch.Tensor] = None,
-):
-    """Zero the DP-padding rows of hidden_states (and residual) in place."""
-    real_tokens = get_real_num_tokens(hidden_states, forward_batch)
-    if real_tokens < hidden_states.shape[0]:
-        hidden_states[real_tokens:].zero_()
-        if residual is not None and residual.shape[0] == hidden_states.shape[0]:
-            residual[real_tokens:].zero_()
-    return hidden_states, residual
-
-
-def zero_dp_global_padding_rows(
-    hidden_states: torch.Tensor, forward_batch: ForwardBatch
-) -> torch.Tensor:
-    """Zero the per-DP-group padding rows after a global (full-TP) gather."""
-    actual_tokens = getattr(forward_batch, "global_num_tokens_non_padded_cpu", None)
-    padded_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
-    if actual_tokens is None or padded_tokens is None:
-        return zero_dp_padding_rows(hidden_states, forward_batch)[0]
-
-    offset = 0
-    for actual, padded in zip(actual_tokens, padded_tokens):
-        actual = min(int(actual), int(padded))
-        padded = int(padded)
-        if offset + actual < hidden_states.shape[0]:
-            end = min(offset + padded, hidden_states.shape[0])
-            hidden_states[offset + actual : end].zero_()
-        offset += padded
-        if offset >= hidden_states.shape[0]:
-            break
-    return hidden_states
 
 
 def pad_to_original_num_tokens(
