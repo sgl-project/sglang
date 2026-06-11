@@ -1004,9 +1004,7 @@ class GptOssForCausalLM(nn.Module):
                 narrow_gate = weight[0::2][
                     moe_tp_rank_start:moe_tp_rank_end
                 ].contiguous()
-                narrow_up = weight[1::2][
-                    moe_tp_rank_start:moe_tp_rank_end
-                ].contiguous()
+                narrow_up = weight[1::2][moe_tp_rank_start:moe_tp_rank_end].contiguous()
 
                 param = params_dict[new_name]
                 intermediate_pad = param.data.shape[1] // 2
@@ -1046,9 +1044,7 @@ class GptOssForCausalLM(nn.Module):
                 narrow_gate = weight[0::2][
                     moe_tp_rank_start:moe_tp_rank_end
                 ].contiguous()
-                narrow_up = weight[1::2][
-                    moe_tp_rank_start:moe_tp_rank_end
-                ].contiguous()
+                narrow_up = weight[1::2][moe_tp_rank_start:moe_tp_rank_end].contiguous()
 
                 param = params_dict[new_name]
                 intermediate_pad = param.data.shape[1] // 2
@@ -1088,9 +1084,7 @@ class GptOssForCausalLM(nn.Module):
                 narrow_gate = weight[0::2][
                     moe_tp_rank_start:moe_tp_rank_end
                 ].contiguous()
-                narrow_up = weight[1::2][
-                    moe_tp_rank_start:moe_tp_rank_end
-                ].contiguous()
+                narrow_up = weight[1::2][moe_tp_rank_start:moe_tp_rank_end].contiguous()
 
                 param = params_dict[new_name]
                 intermediate_pad = param.data.shape[1] // 2
