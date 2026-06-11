@@ -48,9 +48,9 @@ _UP_PROJ_SHAPE = (3072, 1024)  # intermediate_size, hidden_size for Qwen3-0.6B
 class TestWeightCheckerE2E(CustomTestCase):
     """All cases share one launched server (setUpClass).
 
-    The reset case mutates weights to random; it is named to sort last so any
-    case that needs intact weights runs first. The server is torn down right
-    after, so leaving the engine in a corrupted state is harmless."""
+    The reset case mutates weights to a fixed sentinel; it is named to sort last
+    so any case that needs intact weights runs first. The server is torn down
+    right after, so leaving the engine in a corrupted state is harmless."""
 
     @classmethod
     def setUpClass(cls):
@@ -130,17 +130,17 @@ class TestWeightCheckerE2E(CustomTestCase):
         param_name = "model.layers.6.mlp.up_proj.weight"
         same_tensor = torch.full(_UP_PROJ_SHAPE, 0.25, device="cuda")
 
-        # Step 1: prime the param to a known value.
+        # Prime the param to a known value.
         self.assertTrue(
             self._update_weights([(param_name, same_tensor)]).json()["success"]
         )
-        # Step 2: snapshot the now-primed state.
+        # Snapshot the now-primed state.
         self.assertEqual(self._post("snapshot").status_code, 200)
-        # Step 3: push the exact same bytes again — should be a byte-perfect no-op.
+        # Push the exact same bytes again — should be a byte-perfect no-op.
         self.assertTrue(
             self._update_weights([(param_name, same_tensor)]).json()["success"]
         )
-        # Step 4: compare passes.
+        # Compare passes.
         resp = self._post("compare")
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.json()["success"])
@@ -214,7 +214,7 @@ class TestWeightCheckerE2E(CustomTestCase):
                 self.assertNotIn("_weight_fp32", name)
 
     def test_z_snapshot_reset_compare_detects_diff(self):
-        """Destructive: leaves weights randomized. Named test_z_* so it runs last."""
+        """Destructive: leaves weights at the reset sentinel. Named test_z_* so it runs last."""
         self.assertEqual(self._post("snapshot").status_code, 200)
         self.assertEqual(self._post("reset_tensors").status_code, 200)
 

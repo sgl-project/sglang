@@ -351,9 +351,9 @@ def test_draft_selector_rejects_unsupported_action_when_no_draft_runner():
 
 
 def test_draft_compare_scope_excludes_target_and_labels_draft():
-    # AC-3 / AC-3.1 at the scheduler fan-out level: selector="draft" compare must
-    # touch ONLY the draft runner(s); the target runner is never consulted, and a
-    # draft-side failure carries the [draft] role label.
+    # Scheduler fan-out scope: selector="draft" compare must touch ONLY the draft
+    # runner(s); the target runner is never consulted, and a draft-side failure
+    # carries the [draft] role label.
     target_runner = Mock()
     target_runner.check_weights.side_effect = AssertionError(
         "target must not be compared on a draft selection"
@@ -371,3 +371,55 @@ def test_draft_compare_scope_excludes_target_and_labels_draft():
     assert "[draft]" in out.message
     draft_runner.check_weights.assert_called_once_with(action="compare")
     target_runner.check_weights.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# explicit selector="target": target-only scope + verbatim payload shape
+# ---------------------------------------------------------------------------
+
+
+def test_target_selector_checksum_returns_target_payload_only():
+    # Explicit selector="target" takes the byte-identical fast path: only the
+    # target runner is consulted, the draft worker is never touched, and the
+    # checksum payload is the target's verbatim (no "runners" key, keys unprefixed).
+    target_payload = {"checksums": {"w": "a"}, "parallelism_info": {"tp_rank": 0}}
+    target_runner = Mock()
+    target_runner.check_weights.return_value = target_payload
+    draft_runner = Mock()
+    draft_runner.check_weights.side_effect = AssertionError(
+        "draft must not be touched on a target selection"
+    )
+    scheduler = _scheduler(
+        tp_worker=SimpleNamespace(model_runner=target_runner),
+        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+    )
+
+    out = _call(scheduler, action="checksum", selector="target")
+
+    assert out.success is True
+    assert out.payload is target_payload
+    assert "runners" not in out.payload
+    target_runner.check_weights.assert_called_once_with(action="checksum")
+    draft_runner.check_weights.assert_not_called()
+
+
+def test_target_selector_reset_and_compare_touch_target_only():
+    # selector="target" routes reset_tensors / compare to the target runner only;
+    # the draft runner is never consulted.
+    for action in ("reset_tensors", "compare"):
+        target_runner = Mock()
+        target_runner.check_weights.return_value = None
+        draft_runner = Mock()
+        draft_runner.check_weights.side_effect = AssertionError(
+            "draft must not be touched on a target selection"
+        )
+        scheduler = _scheduler(
+            tp_worker=SimpleNamespace(model_runner=target_runner),
+            draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+        )
+
+        out = _call(scheduler, action=action, selector="target")
+
+        assert out.success is True, action
+        target_runner.check_weights.assert_called_once_with(action=action)
+        draft_runner.check_weights.assert_not_called()

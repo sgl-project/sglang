@@ -233,7 +233,7 @@ class SchedulerUpdateWeightsMixin:
         try:
             selector = recv_req.selector if recv_req.selector is not None else "target"
             # Validate before mutating any runner so a bad selector cannot leave
-            # weights half-randomized (an empty string is rejected here, not
+            # weights partially reset (an empty string is rejected here, not
             # silently coerced to "target").
             if selector not in ("target", "draft", "all"):
                 raise ValueError(
