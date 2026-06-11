@@ -9,9 +9,11 @@
 // than it saves). All cells are `verified`: they reproduce the legacy
 // generator's output verbatim (token-level audited), whose recipes were
 // validated end-to-end by the cookbook owner. The H200 / 397B / BF16 /
-// low-latency cell additionally mirrors the exact command benchmarked on the
-// old page (NEXTN + CUDA IPC env, sglang "main branch") instead of the
-// generator default (EAGLE).
+// low-latency cell additionally mirrors the command benchmarked on the old
+// page (NEXTN + CUDA IPC env, sglang "main branch") instead of the generator
+// default (EAGLE). Parser flags are deliberately absent from every cell —
+// reasoning/tool-call parsers are a Playground feature, never part of
+// Deployment commands (DSv4 convention).
 
 export const config = {
   modelName: "Qwen3.5",
@@ -266,8 +268,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -284,8 +284,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--tokenizer-worker-num 6",
         "--mem-fraction-static 0.8",
@@ -301,8 +299,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--ep 8",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -327,8 +323,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--ep 8",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
@@ -345,8 +339,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -365,8 +357,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
@@ -380,8 +370,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -401,8 +389,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-symm-mem",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.8",
@@ -417,8 +403,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -438,8 +422,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -455,8 +437,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -476,8 +456,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -493,8 +471,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -522,8 +498,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
         "--quantization modelopt_fp4",
@@ -547,8 +521,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -568,8 +540,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -585,8 +555,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -606,8 +574,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -623,8 +589,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -652,8 +616,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
         "--quantization modelopt_fp4",
@@ -677,8 +639,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -698,8 +658,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--enable-aiter-allreduce-fusion",
@@ -715,8 +673,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -736,8 +692,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--enable-aiter-allreduce-fusion",
@@ -753,8 +707,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -774,8 +726,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--enable-aiter-allreduce-fusion",
@@ -791,8 +741,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -812,8 +760,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--enable-aiter-allreduce-fusion",
@@ -829,8 +775,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -850,8 +794,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--enable-aiter-allreduce-fusion",
@@ -867,8 +809,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -888,8 +828,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--enable-aiter-allreduce-fusion",
@@ -905,8 +843,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -928,8 +864,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--enable-aiter-allreduce-fusion",
@@ -948,8 +882,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 6",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -963,8 +895,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 6",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -976,8 +906,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -995,8 +923,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--tokenizer-worker-num 6",
         "--host {{HOST_IP}}",
@@ -1010,8 +936,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1034,8 +958,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
@@ -1051,8 +973,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1071,8 +991,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.88",
         "--host {{HOST_IP}}",
@@ -1086,8 +1004,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1106,8 +1022,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-symm-mem",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.8",
@@ -1122,8 +1036,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1143,8 +1055,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -1159,8 +1069,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1179,8 +1087,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -1196,8 +1102,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1216,8 +1120,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -1231,8 +1133,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1251,8 +1151,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -1268,8 +1166,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1289,8 +1185,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--enable-aiter-allreduce-fusion",
@@ -1305,8 +1199,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1324,8 +1216,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1339,8 +1229,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1358,8 +1246,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1373,8 +1259,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1392,8 +1276,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1407,8 +1289,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1426,8 +1306,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1441,8 +1319,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1460,8 +1336,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1478,8 +1352,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 6",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1493,8 +1365,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 6",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1505,8 +1375,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1524,8 +1392,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--tokenizer-worker-num 6",
         "--mem-fraction-static 0.8",
@@ -1539,8 +1405,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1563,8 +1427,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
@@ -1581,8 +1443,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1599,8 +1459,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.88",
         "--host {{HOST_IP}}",
@@ -1613,8 +1471,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1632,8 +1488,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
@@ -1646,8 +1500,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1666,8 +1518,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -1682,8 +1532,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1702,8 +1550,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -1718,8 +1564,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1738,8 +1582,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -1754,8 +1596,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1774,8 +1614,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -1790,8 +1628,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1809,8 +1645,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1824,8 +1658,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1843,8 +1675,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1858,8 +1688,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1877,8 +1705,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1892,8 +1718,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1911,8 +1735,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1926,8 +1748,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1945,8 +1765,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1960,8 +1778,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1979,8 +1795,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -1997,8 +1811,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 3",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -2012,8 +1824,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 3",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -2024,8 +1834,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2043,8 +1851,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--tokenizer-worker-num 6",
         "--mem-fraction-static 0.8",
@@ -2058,8 +1864,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2081,8 +1885,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend flashinfer",
         "--tokenizer-worker-num 6",
@@ -2098,8 +1900,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2116,8 +1916,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
@@ -2130,8 +1928,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2149,8 +1945,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
@@ -2163,8 +1957,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2183,8 +1975,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -2199,8 +1989,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2219,8 +2007,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -2235,8 +2021,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2255,8 +2039,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -2271,8 +2053,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2291,8 +2071,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -2307,8 +2085,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2326,8 +2102,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -2341,8 +2115,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2360,8 +2132,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -2375,8 +2145,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2394,8 +2162,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -2409,8 +2175,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2428,8 +2192,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -2443,8 +2205,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2462,8 +2222,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -2477,8 +2235,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2496,8 +2252,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -2514,8 +2268,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 6",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -2529,8 +2281,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 6",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -2541,8 +2291,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2560,8 +2308,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--tokenizer-worker-num 6",
         "--mem-fraction-static 0.8",
@@ -2575,8 +2321,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2594,8 +2338,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
@@ -2608,8 +2350,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2628,8 +2368,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -2644,8 +2382,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2664,8 +2400,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -2680,8 +2414,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2699,8 +2431,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -2714,8 +2444,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2733,8 +2461,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -2748,8 +2474,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2767,8 +2491,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -2785,8 +2507,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 3",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -2797,8 +2517,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2816,8 +2534,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--tokenizer-worker-num 6",
         "--mem-fraction-static 0.8",
@@ -2831,8 +2547,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2850,8 +2564,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
@@ -2864,8 +2576,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2884,8 +2594,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -2900,8 +2608,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2920,8 +2626,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -2936,8 +2640,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2955,8 +2657,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -2970,8 +2670,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2989,8 +2687,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -3004,8 +2700,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3023,8 +2717,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -3041,8 +2733,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 3",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -3053,8 +2743,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3072,8 +2760,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--tokenizer-worker-num 6",
         "--mem-fraction-static 0.8",
@@ -3087,8 +2773,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3106,8 +2790,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
@@ -3120,8 +2802,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3140,8 +2820,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -3156,8 +2834,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3177,8 +2853,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -3194,8 +2868,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3213,8 +2885,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -3228,8 +2898,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3247,8 +2915,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -3262,8 +2928,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3281,8 +2945,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -3299,8 +2961,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 3",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -3311,8 +2971,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3330,8 +2988,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--tokenizer-worker-num 6",
         "--mem-fraction-static 0.8",
@@ -3345,8 +3001,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3364,8 +3018,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
@@ -3378,8 +3030,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3398,8 +3048,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -3414,8 +3062,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3435,8 +3081,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
         "--tokenizer-worker-num 6",
@@ -3452,8 +3096,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3471,8 +3113,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -3486,8 +3126,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3505,8 +3143,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -3520,8 +3156,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -3539,8 +3173,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       env: ["SGLANG_USE_AITER=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.8",
@@ -3557,8 +3189,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--device cpu",
         "--disable-overlap-schedule",
         "--tp 3",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

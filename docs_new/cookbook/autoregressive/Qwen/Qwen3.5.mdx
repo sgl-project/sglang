@@ -338,7 +338,7 @@ The arrangement creates a diagonal symmetry. The two largest circles are on a di
 
 ### 3.2 Reasoning
 
-Qwen3.5 supports Thinking mode **by default**. The `qwen3` reasoning parser is part of every generated command (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground) to strip it); it separates the thinking and content sections, returning the thinking process via `reasoning_content` in the streaming response.
+Qwen3.5 supports Thinking mode **by default**. Enable the `qwen3` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate the thinking and content sections — the thinking process is returned via `reasoning_content` in the streaming response.
 
 To disable thinking and use Instruct mode, pass `chat_template_kwargs` at request time:
 
@@ -597,7 +597,7 @@ To find 15% of 240, you can follow these steps:
 
 ### 3.3 Tool Calling
 
-Qwen3.5 supports tool calling capabilities. The `qwen3_coder` tool-call parser is part of every generated command (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground) to strip it). Thinking mode is on by default; to disable it for tool calling requests, pass `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
+Qwen3.5 supports tool calling capabilities. Enable the `qwen3_coder` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. Thinking mode is on by default; to disable it for tool calling requests, pass `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
 
 <Accordion title="Python Example with Thinking Process">
 
