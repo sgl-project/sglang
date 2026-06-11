@@ -21,6 +21,7 @@ from sglang.srt.model_executor.runtime_context import (
     get_attn_tp_size,
     get_dp_rank,
     get_dp_size,
+    get_forward_stream,
     get_local_attn_dp_size,
     get_moe_dp_rank,
     get_moe_dp_size,
@@ -347,6 +348,65 @@ class TestFlagsMaterialize(unittest.TestCase):
         with mock.patch(self._PREDICATE, return_value=False):
             c2.freeze()
         self.assertFalse(c2.flags.moe.use_cutlass_fp4_allgather)
+
+
+class TestResources(unittest.TestCase):
+    """M0.3: ``.resources.streams.forward`` — a long-lived handle published into
+    the container, read via the thin ``get_forward_stream()`` accessor, and
+    dropped by an additive teardown at reset. A plain ``object()`` stands in for
+    the ``torch.Stream`` (the plumbing only checks identity / non-None)."""
+
+    def setUp(self):
+        reset_runtime_context()
+
+    def tearDown(self):
+        reset_runtime_context()
+
+    def test_get_forward_stream_unset_raises(self):
+        # published but stream not yet seeded → accessor asserts non-None
+        _publish(_engine_parallel())
+        with self.assertRaises(AssertionError):
+            get_forward_stream()
+
+    def test_resources_identity(self):
+        # Risk 1: the accessor returns the exact published object (identity).
+        _publish(_engine_parallel())
+        ctx = get_runtime_context()
+        stream = object()
+        ctx.resources.streams.forward = stream
+        self.assertIs(get_forward_stream(), stream)
+        self.assertIs(ctx.resources.streams.forward, stream)
+
+    def test_partial_population(self):
+        # Risk 4: resources seeded before .config is frozen — accessor works and
+        # the config-side read surface is unaffected.
+        _publish(_engine_parallel(tp_size=4))
+        ctx = get_runtime_context()
+        stream = object()
+        ctx.resources.streams.forward = stream
+        self.assertIs(get_forward_stream(), stream)
+        self.assertEqual(get_tp_size(), 4)  # config side still fine
+        self.assertFalse(ctx._frozen)
+
+    def test_reset_clears_stream(self):
+        # Risk 2: reset drops the stream reference (additive teardown, independent
+        # of group destroy) and the accessor then raises — no stale handle leaks.
+        _publish(_engine_parallel())
+        ctx = get_runtime_context()
+        ctx.resources.streams.forward = object()
+        reset_runtime_context()
+        self.assertIsNone(ctx.resources.streams.forward)  # explicit clear ran
+        self.assertFalse(has_runtime_context())
+        with self.assertRaises(ValueError):
+            get_forward_stream()
+
+    def test_republish_fresh_resources_slot(self):
+        # multi-runner (Risk 3): overwrite-publish gives the new runner a fresh,
+        # empty resources slot — it does not inherit the prior runner's stream.
+        _publish(_engine_parallel())
+        get_runtime_context().resources.streams.forward = object()
+        _publish(_engine_parallel())  # second runner
+        self.assertIsNone(get_runtime_context().resources.streams.forward)
 
 
 if __name__ == "__main__":

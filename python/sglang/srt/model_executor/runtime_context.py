@@ -165,13 +165,35 @@ class FlagsConfig:
 
 
 @dataclass(slots=True)
+class StreamResources:
+    """``.resources.streams`` — long-lived CUDA streams (process/device-level,
+    reused across forwards, not per-iter). M0.3 fills only ``forward`` (the
+    overlap-schedule forward stream); ``alt_stream`` / ``copy_stream`` etc. →
+    Stage-B P4. Mutable: ``forward`` is seeded post-publish in
+    ``ModelRunner.__init__`` and dropped in ``reset_runtime_context``."""
+
+    forward: Optional["torch.Stream"] = None
+
+
+@dataclass(slots=True)
+class RuntimeResources:
+    """The ``.resources`` sub-struct: long-lived handles (streams / groups / graph
+    pool …), nested per subsystem (G1 — not a flat bag). M0.3 fills only
+    ``.streams.forward``; ``.groups`` / ``.graph_pool`` / ``.eplb`` → Stage-B P4."""
+
+    streams: StreamResources = field(default_factory=StreamResources)
+
+
+@dataclass(slots=True)
 class RuntimeContext:
     """Process-static container skeleton (G1). M0.1 fills ``.config.parallel``;
-    M0.2 fills ``.flags.moe`` (materialized at ``freeze()``). ``.resources`` /
-    ``.buffers`` are reserved for M0.3–M0.4."""
+    M0.2 fills ``.flags.moe`` (materialized at ``freeze()``); M0.3 fills
+    ``.resources.streams.forward`` (seeded in ModelRunner.__init__). ``.buffers``
+    is reserved for M0.4."""
 
     config: ConfigSection
     flags: FlagsConfig = field(default_factory=FlagsConfig)
+    resources: RuntimeResources = field(default_factory=RuntimeResources)
     _frozen: bool = False
 
     def apply_model_overrides(self, model) -> None:
@@ -243,8 +265,17 @@ def has_runtime_context() -> bool:
 def reset_runtime_context() -> None:
     """Single teardown point (G1) — the legacy ``_global_server_args`` has no such
     primitive (multi-engine / test-isolation hazard). Used by tests today; P8
-    folds it next to ``destroy_model_parallel()``."""
+    folds it next to ``destroy_model_parallel()``.
+
+    M0.3: explicitly drop the long-lived ``.resources.streams.forward`` reference.
+    Kept strictly independent of ``destroy_model_parallel()``'s alias-aware group
+    teardown — streams have no ``destroy()`` and no aliasing, so only the
+    reference is released (nulling ``_runtime_context`` below would drop it anyway;
+    the explicit clear documents the distinct stream-vs-group teardown shape that
+    P8 must preserve)."""
     global _runtime_context
+    if _runtime_context is not None:
+        _runtime_context.resources.streams.forward = None
     _runtime_context = None
 
 
@@ -341,3 +372,23 @@ def get_use_mla_backend() -> bool:
     """Whether the model uses the MLA attention arch — resolved model override,
     read from ``.config`` (set once at the ModelRunner resolution point)."""
     return get_runtime_context().config.get("use_mla_backend")
+
+
+# --- resources accessors (M0.3 read surface) -------------------------------
+# Thin getters over .resources; mirror the forward_context.get_forward_context()
+# idiom (assert-non-None). Long-lived handles, so getter only — no per-call
+# save/restore (scoped override is M0.5; that is for .config, not handles).
+
+
+def get_forward_stream() -> "torch.Stream":
+    """The long-lived overlap-schedule forward stream (M0.3). Seeded in
+    ``ModelRunner.__init__`` (after ``init_torch_distributed``); call only after
+    ModelRunner construction. The same ``torch.Stream`` object backs
+    ``ModelRunner.forward_stream`` (a delegating property) and the
+    ``get_worker_info()`` tuple, so all propagated copies are identity-preserving."""
+    stream = get_runtime_context().resources.streams.forward
+    assert stream is not None, (
+        "forward stream not published — RuntimeContext.resources.streams.forward "
+        "is seeded in ModelRunner.__init__; call after ModelRunner construction."
+    )
+    return stream

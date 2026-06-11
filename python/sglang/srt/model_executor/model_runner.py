@@ -183,6 +183,7 @@ from sglang.srt.model_executor.runtime_context import (
     ConfigSection,
     ParallelConfig,
     RuntimeContext,
+    get_forward_stream,
     get_runtime_context,
     get_tp_rank,
     get_tp_size,
@@ -590,8 +591,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
 
-        # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        # Init forward stream for overlap schedule.
+        # M0.3: the forward stream is a long-lived handle → publish it into
+        # ctx.resources.streams.forward (single source of truth). self.forward_stream
+        # is the delegating property below, so get_worker_info()'s tuple and every
+        # propagated copy stay byte-identical (same torch.Stream object).
+        get_runtime_context().resources.streams.forward = torch.get_device_module(
+            self.device
+        ).Stream()
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
@@ -2220,6 +2227,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return result
 
     @property
+    def forward_stream(self):
+        """M0.3: delegating shim over the published forward stream. Returns the
+        same torch.Stream object seeded into ctx.resources.streams.forward in
+        __init__, so get_worker_info()'s tuple + all propagated copies preserve
+        identity. (Multi-ModelRunner-per-process, e.g. EAGLE draft+target, follows
+        the M0.1 overwrite-publish skeleton — the per-runner ctx is deferred to P2;
+        the only live reads here are captured-at-init or in-own-init, so the
+        overwrite does not corrupt either runner's stream usage.)"""
+        return get_runtime_context().resources.streams.forward
+
+    @property
     def qwen3_next_config(self):
         config = self.model_config.hf_config
         if isinstance(config, Qwen3NextConfig):
@@ -2572,15 +2590,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
-        self.forward_stream.wait_stream(torch.cuda.current_stream())
-        with torch.get_device_module(self.device).stream(self.forward_stream):
+        get_forward_stream().wait_stream(torch.cuda.current_stream())
+        with torch.get_device_module(self.device).stream(get_forward_stream()):
             with (
                 torch.inference_mode(),
                 autotune(True, cache=str(autotune_cache)),
                 autotune_dummy_run_mode(),
             ):
                 self._dummy_run(batch_size=self.req_to_token_pool.size)
-        torch.cuda.current_stream().wait_stream(self.forward_stream)
+        torch.cuda.current_stream().wait_stream(get_forward_stream())
         logger.info("FlashInfer autotune completed.")
 
     def _flashinfer_autotune_cache_path(self) -> Path:
@@ -3783,7 +3801,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         # Memory allocation is tied to a cuda stream, use the forward stream
-        with torch.get_device_module(self.device).stream(self.forward_stream):
+        with torch.get_device_module(self.device).stream(get_forward_stream()):
             logger.info(
                 f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
             )
