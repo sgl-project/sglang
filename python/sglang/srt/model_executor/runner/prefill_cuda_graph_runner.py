@@ -58,6 +58,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -658,7 +659,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
         self.backend.capture_one(
-            num_tokens,
+            ShapeKey(size=num_tokens),
             run_once,
             dummies=None,
             post_warmup_hook=post_warmup_hook,
@@ -820,7 +821,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # model.forward eagerly with the live multi-req
                 # static_forward_batch. The outer's logits_processor /
                 # pooler then runs on top with live multi-req metadata.
-                shape_key = self._static_num_tokens
+                shape_key = ShapeKey(size=self._static_num_tokens)
 
                 def replay_layer_forward(*args, **layer_kwargs):
                     return self.backend.replay(

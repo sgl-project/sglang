@@ -1172,9 +1172,9 @@ class Scheduler(
         self.device_module = torch.get_device_module(self.device)
 
         # FutureMap is always-on: input_ids relay used in both modes.
-        # Workers not on BaseSpecWorker (e.g. NGRAM / DFLASH) lack the
-        # override; fall back to target-only so the helper still produces a
-        # safe decision (no accidental opt-out for unaudited shapes).
+        # Workers without the spec_v2_attn_backends override fall back to
+        # target-only so the helper still produces a safe decision (no
+        # accidental opt-out for unaudited shapes).
         if self.draft_worker is not None:
             attn_backends = getattr(
                 self.draft_worker,
@@ -1424,7 +1424,9 @@ class Scheduler(
         # DFLASH fences its shared req_to_token writes with verify_done /
         # plan-stream deps, so the global WAR barrier only serializes plan
         # overlap. TODO: generalize this global-barrier enablement policy.
-        self._war_barrier_enabled = is_cuda() and not self.spec_algorithm.is_dflash()
+        self._war_barrier_enabled = (
+            is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        ) and not self.spec_algorithm.is_dflash()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
