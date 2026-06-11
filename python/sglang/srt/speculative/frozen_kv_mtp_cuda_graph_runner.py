@@ -5,18 +5,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
+import tqdm
 
-from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
-from sglang.srt.model_executor.cuda_graph_runner import (
-    CUDA_GRAPH_CAPTURE_FAILED_MSG,
-    CudaGraphRunner,
-    DeepEPCudaGraphRunnerAdapter,
-    get_batch_sizes_to_capture,
-    get_global_graph_memory_pool,
-    model_capture_mode,
-    set_global_graph_memory_pool,
+from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    set_dp_buffer_len,
     set_is_extend_in_batch,
-    set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -25,6 +22,17 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.runner import (
+    DeepEPCudaGraphRunnerAdapter,
+    freeze_gc,
+    get_batch_sizes_to_capture,
+    get_global_graph_memory_pool,
+    model_capture_mode,
+    set_global_graph_memory_pool,
+)
+from sglang.srt.model_executor.runner_backend_utils import (
+    CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -34,7 +42,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.frozen_kv_mtp_worker import FrozenKVMTPWorker
+    from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 
 
 @dataclass
@@ -47,7 +55,7 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: torch.Tensor
-    # Consumed by the captured seed iter; see `FrozenKVMTPWorker.draft_forward`.
+    # Consumed by the captured seed iter; see `FrozenKVMTPDraftWorker.draft_forward`.
     bonus_tokens: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -56,7 +64,7 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
 class FrozenKVMTPCudaGraphRunner:
     """CUDA graph runner for the Frozen-KV MTP recurrent draft-loop step."""
 
-    def __init__(self, frozen_kv_mtp_worker: FrozenKVMTPWorker):
+    def __init__(self, frozen_kv_mtp_worker: FrozenKVMTPDraftWorker):
         self.frozen_kv_mtp_worker = frozen_kv_mtp_worker
         self.model_runner = model_runner = frozen_kv_mtp_worker.draft_model_runner
         self.graphs = {}
@@ -90,7 +98,7 @@ class FrozenKVMTPCudaGraphRunner:
             self.draft_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         seq_lens_cpu = torch.full(
-            (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int32
+            (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int64
         )
 
         if self.enable_torch_compile:
@@ -101,7 +109,7 @@ class FrozenKVMTPCudaGraphRunner:
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
             seq_lens = torch.full(
-                (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int64
             )
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
@@ -192,7 +200,18 @@ class FrozenKVMTPCudaGraphRunner:
         self.graphs[self.bs].replay()
 
     def capture(self):
-        CudaGraphRunner.capture(self)
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+            with graph_capture() as graph_capture_context:
+                self.stream = graph_capture_context.stream
+                capture_range = (
+                    tqdm.tqdm(list(reversed(self.capture_bs)))
+                    if get_tensor_model_parallel_rank() == 0
+                    else reversed(self.capture_bs)
+                )
+                for bs in capture_range:
+                    graph, output_buffers = self.capture_one_batch_size(bs, None)
+                    self.graphs[bs] = graph
+                    self.output_buffers[bs] = output_buffers
 
     def capture_one_batch_size(
         self, num_seqs: int, forward: Callable, stream_idx: int = 0
@@ -280,15 +299,15 @@ class FrozenKVMTPCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             hidden_states_backup = forward_batch.spec_info.hidden_states
-            ret = self.frozen_kv_mtp_worker.draft_forward(
-                forward_batch, skip_attn_backend_init=True
-            )
+            # The capture batch is marked by the capture metadata helper
+            # below, so draft_forward skips its eager plan.
+            ret = self.frozen_kv_mtp_worker.draft_forward(forward_batch)
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
         # Swap the draft backend's token_to_kv_pool to the frozen target pool
         # for the capture; the single backend-attr swap is seen by both
-        # ``get_token_to_kv_pool()`` (via ``get_attn_backend()``) and the
+        # get_token_to_kv_pool() (via get_attn_backend()) and the
         # backend's own reads.
         target_pool = self.frozen_kv_mtp_worker.kv_context.target_token_to_kv_pool
         saved_backend_pool = self.draft_attn_backend.token_to_kv_pool

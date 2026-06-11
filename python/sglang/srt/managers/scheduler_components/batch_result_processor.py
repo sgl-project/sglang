@@ -524,12 +524,12 @@ class SchedulerBatchResultProcessor:
             logprob_pt += num_input_logprobs
         return logprob_pt
 
-    def _resolve_spec_overlap_tokens(
+    def _resolve_spec_v2_tokens(
         self,
         result: GenerationBatchResult,
         batch: ScheduleBatch,
     ) -> List[List[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
+        """Resolve the padded next token ids for spec-v2 (overlap and non-overlap)."""
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
@@ -541,7 +541,9 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(result.num_correct_drafts_per_req_cpu)
+        self.model_worker.on_verify_complete_cpu(
+            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+        )
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
@@ -559,12 +561,17 @@ class SchedulerBatchResultProcessor:
                 continue
 
             if req.finished():
-                # -1 because prepare_for_decode pre-claimed the bonus slot.
-                req.kv_committed_len -= 1
+                if not batch.spec_algorithm.is_dflash():
+                    # EAGLE prepare_for_decode pre-claimed the bonus slot.
+                    req.kv_committed_len -= 1
                 continue
 
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
+            if batch.spec_algorithm.is_dflash():
+                # DFLASH materialized accepted draft tokens plus the bonus token.
+                req.kv_committed_len += accept_lens[i]
+            else:
+                # EAGLE prepare_for_decode pre-claimed the bonus slot.
+                req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -710,7 +717,7 @@ class SchedulerBatchResultProcessor:
         next_token_logprobs = None
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
-                next_token_ids = self._resolve_spec_overlap_tokens(result, batch)
+                next_token_ids = self._resolve_spec_v2_tokens(result, batch)
             elif isinstance(next_token_ids, list):
                 pass  # MLX path: already a list[int], skip torch round-trip
             else:
@@ -936,7 +943,7 @@ class SchedulerBatchResultProcessor:
         other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
         if other_val != -1:
             pool = batch.req_to_token_pool
-            pool.mamba_pool.free(
+            pool.mamba_allocator.free(
                 req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)
