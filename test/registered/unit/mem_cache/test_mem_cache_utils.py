@@ -270,7 +270,17 @@ class TestComputeNodeHashValues(CustomTestCase):
 
         child = self._make_node(key_len=8, parent=parent, parent_hash_values=[])
         result = compute_node_hash_values(child, page_size=8)
-        self.assertEqual(len(result), 1)
+        self.assertEqual(result, ["p0-8"])
+
+    def test_parent_with_none_hash_value(self):
+        parent = MagicMock()
+        parent.key.__len__.return_value = 8
+        parent.hash_value = None
+        parent.key.hash_page = self.mock_hash_page
+
+        child = self._make_node(key_len=8, parent=parent, parent_hash_values=None)
+        result = compute_node_hash_values(child, page_size=8)
+        self.assertEqual(result, ["p0-8"])
 
 
 class TestSplitNodeHashValue(CustomTestCase):
