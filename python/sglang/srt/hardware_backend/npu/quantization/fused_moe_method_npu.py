@@ -152,6 +152,7 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
+        scale = getattr(quant_info, f"{weight_prefix}_weigh_scale", None)
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
                 hidden_states
@@ -227,6 +228,7 @@ class NPUW8A8Int8MoEMethod(_NPUFusedMoEMethodBase):
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
+        scale = getattr(quant_info, f"{weight_prefix}_weigh_scale", None)
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
                 hidden_states
@@ -373,6 +375,7 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
+        scale = getattr(quant_info, f"{weight_prefix}_weigh_scale", None)
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
                 hidden_states
@@ -382,7 +385,7 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
             "per_token_scale": [pertoken_scale],
         }
         if bias is None and self.activation_use_clip:
-            bias = getattr(layer, f"{weight_prefix}_scale_bias", None)
+            bias = getattr(quant_info, f"{weight_prefix}_scale_bias", None)
         if bias is not None:
             scale_args["bias"] = [bias]
         return self.matmul.forward(
@@ -524,6 +527,8 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
+        scale = getattr(quant_info, f"{weight_prefix}_weigh_scale", None)
+        offset = getattr(quant_info, f"{weight_prefix}_weigh_offset", None)
         scale_args: Dict[str, Any] = {
             "antiquant_scale": [scale],
             "antiquant_offset": [offset] if offset is not None else [],
