@@ -780,6 +780,8 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
+        self.w13_kernel = NPUW4A16Int4MoEMethod()
+        self.w2_kernel = NPUW4A16Int4MoEMethod()
 
     def create_weights(
         self,
@@ -920,119 +922,30 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        layer.w13_kernel = self.w13_kernel
+        layer.w2_kernel = self.w2_kernel
+        moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.TORCH_NPU
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        """Apply MoE forward pass on NPU using npu_grouped_matmul for maximum performance."""
-        from sglang.srt.distributed.communication_op import (
-            tensor_model_parallel_all_gather,
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_offset=layer.w13_weight_offset,
+            w2_offset=layer.w2_weight_offset,
         )
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-        topk_weights, topk_ids, _ = topk_output
-
-        # Check if pre-dequantized weights are available
-        use_pre_dequant = hasattr(layer, "w13_dequant") and hasattr(layer, "w2_dequant")
-
-        if not use_pre_dequant:
-            raise RuntimeError(
-                "GGUF MoE on NPU requires pre-dequantization (FusedMoE fix). Please report if this occurs."
-            )
-
-        w13 = layer.w13_dequant
-        w2 = layer.w2_dequant
-
-        num_experts = w13.shape[0]
-
-        tp_size = getattr(layer, "moe_tp_size", 1)
-
-        original_dtype = x.dtype
-        num_tokens = x.shape[0]
-        top_k = topk_ids.shape[1]
-
-        # Ensure correct dtypes for NPU ops
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-
-        #  MoE routing initialization - reorder tokens by expert
-        row_idx_len = num_tokens * top_k
-        row_idx = (
-            torch.arange(0, row_idx_len, dtype=torch.int32, device=x.device)
-            .view(top_k, -1)
-            .permute(1, 0)
-            .contiguous()
-        )
-
-        sorted_hidden_states, expanded_row_idx, expanded_expert_idx = (
-            torch.ops.npu.npu_moe_init_routing(
-                x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
-            )
-        )
-
-        # Compute tokens per expert
-        expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
-            expanded_expert_idx, num_experts
-        )
-        expert_tokens = expert_tokens.to(torch.int64)
-
-        w13_gmm = w13  # No transpose needed
-
-        hidden_states = torch.ops.npu.npu_grouped_matmul(
-            x=[sorted_hidden_states],
-            weight=[w13_gmm],
-            split_item=2,
-            group_list_type=0,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-        )[0]
-
-        #  Activation (SwiGLU)
-        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-
-        # TP all-gather for intermediate dimension if needed
-        if tp_size > 1:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
-
-        w2_gmm = w2
-
-        hidden_states = torch.ops.npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[w2_gmm],
-            split_item=2,
-            group_list_type=0,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-        )[0]
-
-        # Finalize routing - reorder back and apply weights
-        final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
-            hidden_states,
-            skip1=None,
-            skip2=None,
-            bias=None,
-            scales=topk_weights,
-            expanded_src_to_dst_row=expanded_row_idx,
-            export_for_source_row=topk_ids,
-        )
-
-        if tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_gather(
-                final_hidden_states, dim=-1
-            )
-
-        # Ensure output matches input dtype
-        final_hidden_states = final_hidden_states.to(dtype=original_dtype)
-
-        return StandardCombineInput(hidden_states=final_hidden_states)
-
+        return self.runner.run(dispatch_output, quant_info)
 
 class GGUFEmbeddingAscendMethod(GGUFLinearAscendMethod):
     """Embedding method for GGUF on Ascend NPU."""

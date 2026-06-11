@@ -10,6 +10,21 @@ from sglang.srt.layers.moe import MoeRunnerConfig
 
 from .gptq_scheme import GPTQMoESchemeBase
 
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A16Int4MoEMethod,
+)
+
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
+
+from sglang.srt.layers.moe.moe_runner.torch_npu import (
+    TorchNpuQuantInfo,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig, GPTQMarlinConfig
@@ -122,19 +137,38 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+        self,
+        layer: torch.nn.Module,
+        moe_runner_config: "MoeRunnerConfig",
+        **extra_weight_attrs,
     ):
-        self.kernel.create_moe_runner(layer, moe_runner_config)
+        self.moe_runner_config = moe_runner_config
+        layer.w13_kernel = NPUW4A16Int4MoEMethod()
+        layer.w2_kernel = NPUW4A16Int4MoEMethod()
+        moe_runner_config.layer = layer
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.TORCH_NPU
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
-
+        
     def apply_weights(
         self,
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
-    ):
-        return self.kernel.apply(layer, dispatch_output)
+    ) -> "CombineInput":
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuQuantInfo(
+            w13_weight=layer.w13_qweight,
+            w2_weight=layer.w2_qweight,
+            w13_weight_scale=layer.w13_scales,
+            w2_weight_scale=layer.w2_scales,
+            w13_weight_offset=layer.w13_qzeros,
+            w2_weight_offset=layer.w2_qzeros,
+        )
+        return self.runner.run(dispatch_output, quant_info)
 
 
 class GPTQMarlinMoEScheme(GPTQMoESchemeBase):

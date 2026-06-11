@@ -7,14 +7,27 @@ import torch
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4DynamicMoEMethod,
 )
+from sglang.srt.layers.moe.moe_runner.torch_npu import (
+    TorchNpuQuantInfo,
+)
 from sglang.srt.layers.quantization.utils import replace_parameter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 import torch_npu
 
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
 
 class AWQAscendLinearKernel:
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
@@ -74,7 +87,8 @@ class AWQAscendLinearKernel:
 class AWQAscendMoEKernel:
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         self.quant_config = quant_config
-        self.kernel = NPUW4A16Int4DynamicMoEMethod()
+        self.w13_kernel = NPUW4A16Int4DynamicMoEMethod()
+        self.w2_kernel = NPUW4A16Int4DynamicMoEMethod()
 
     @staticmethod
     def _register_or_replace_parameter(
@@ -146,29 +160,5 @@ class AWQAscendMoEKernel:
             ),
         )
 
-        self.kernel.process_weights_after_loading(layer)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> torch.Tensor:
-        return self.kernel.apply(layer, dispatch_output)
-
-    def apply_without_routing_weights(
-        self,
-        layer,
-        hidden_states,
-        hidden_states_scale,
-        group_list_type,
-        group_list,
-        output_dtype,
-    ):
-        return self.kernel.apply_without_routing_weights(
-            layer,
-            hidden_states,
-            hidden_states_scale,
-            group_list_type,
-            group_list,
-            output_dtype,
-        )
+        self.w13_kernel.process_weights_after_loading(layer, "w13")
+        self.w2_kernel.process_weights_after_loading(layer, "w2")
