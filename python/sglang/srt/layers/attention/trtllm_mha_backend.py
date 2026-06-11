@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runtime_context import BufferSpec, get_runtime_context
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
@@ -104,15 +105,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
-        # Allocate buffers
-        global global_zero_init_workspace_buffer
-        if global_zero_init_workspace_buffer is None:
-            global_zero_init_workspace_buffer = torch.zeros(
-                self.workspace_size,
+        # M0.4: register the workspace spec (metadata only) and lazily materialize
+        # it via the Global Context Object .buffers store. The cache makes every
+        # backend instance share one tensor (data_ptr stable) — equivalent to the
+        # old init-once global_zero_init_workspace_buffer below, byte-identical
+        # size/dtype/device. register is idempotent across backend instances.
+        ctx = get_runtime_context()
+        ctx.buffers.register(
+            BufferSpec(
+                name="trtllm.mha_workspace",
+                size_bytes=self.workspace_size,
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
-        self.workspace_buffer = global_zero_init_workspace_buffer
+        )
+        self.workspace_buffer = ctx.buffers.get_buffer("trtllm.mha_workspace")
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}

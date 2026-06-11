@@ -8,7 +8,11 @@ with_attention fills them).
 import unittest
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runtime_context import (
+    BufferSpec,
+    BufferStore,
     ConfigSection,
     FlagsConfig,
     MoeFlags,
@@ -407,6 +411,71 @@ class TestResources(unittest.TestCase):
         get_runtime_context().resources.streams.forward = object()
         _publish(_engine_parallel())  # second runner
         self.assertIsNone(get_runtime_context().resources.streams.forward)
+
+
+def _ws_spec() -> BufferSpec:
+    # tiny CPU stand-in for the trtllm workspace (the contract is device-agnostic)
+    return BufferSpec(
+        name="t.ws", size_bytes=16, dtype=torch.uint8, device=torch.device("cpu")
+    )
+
+
+class TestBuffers(unittest.TestCase):
+    """M0.4: BufferStore — lazy-materialize-at-get + cache + release. The trtllm
+    workspace is the real exemplar; here a tiny CPU buffer exercises the contract."""
+
+    def test_register_does_not_allocate(self):
+        # R2: register records metadata only — nothing allocated yet (lazy).
+        store = BufferStore()
+        store.register(_ws_spec())
+        self.assertEqual(store._cache, {})
+
+    def test_get_buffer_allocates_once_and_caches(self):
+        # init-once: first get allocates, every later get returns the same object.
+        store = BufferStore()
+        store.register(_ws_spec())
+        a = store.get_buffer("t.ws")
+        b = store.get_buffer("t.ws")
+        self.assertIs(a, b)
+
+    def test_byte_parity(self):
+        # R1: shape/dtype/device match the old torch.zeros(size, uint8, device).
+        store = BufferStore()
+        store.register(_ws_spec())
+        buf = store.get_buffer("t.ws")
+        self.assertEqual(tuple(buf.shape), (16,))
+        self.assertEqual(buf.dtype, torch.uint8)
+        self.assertEqual(buf.device.type, "cpu")
+
+    def test_release_reallocates(self):
+        # R4: release drops the cache; the next get returns a fresh object.
+        store = BufferStore()
+        store.register(_ws_spec())
+        a = store.get_buffer("t.ws")
+        store.release()
+        self.assertEqual(store._cache, {})
+        c = store.get_buffer("t.ws")
+        self.assertIsNot(a, c)
+
+    def test_register_idempotent(self):
+        # R3: re-registering the same name (multi backend instance) still allocs once.
+        store = BufferStore()
+        store.register(_ws_spec())
+        store.register(_ws_spec())
+        a = store.get_buffer("t.ws")
+        b = store.get_buffer("t.ws")
+        self.assertIs(a, b)
+
+    def test_reset_releases_buffers(self):
+        # lifecycle: reset_runtime_context() folds in buffers.release().
+        reset_runtime_context()
+        _publish(_engine_parallel())
+        ctx = get_runtime_context()
+        ctx.buffers.register(_ws_spec())
+        ctx.buffers.get_buffer("t.ws")
+        self.assertEqual(len(ctx.buffers._cache), 1)
+        reset_runtime_context()
+        self.assertEqual(ctx.buffers._cache, {})  # release ran at teardown
 
 
 if __name__ == "__main__":

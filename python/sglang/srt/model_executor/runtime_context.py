@@ -184,16 +184,67 @@ class RuntimeResources:
     streams: StreamResources = field(default_factory=StreamResources)
 
 
+@dataclass(frozen=True, slots=True)
+class BufferSpec:
+    """Metadata for a lazily-materialized static buffer (G1 — generate the tensor
+    at ``get_buffer`` time instead of pre-allocating, to save memory). Holds only
+    shape/dtype/device, NOT the physical tensor. trtllm workspaces are 1-D
+    ``[size_bytes]``."""
+
+    name: str  # layered namespace key, e.g. "trtllm.mha_workspace"
+    size_bytes: int
+    dtype: "torch.dtype"
+    device: "torch.device"
+
+
+class BufferStore:
+    """The ``.buffers`` sub-store: lazy-materialize-at-get + cache + release (G1).
+
+    ``register`` records only metadata (no allocation). The physical tensor is
+    allocated on the FIRST ``get_buffer(name)`` and cached, so every later caller
+    — and every backend instance — shares the one object (``data_ptr`` stable),
+    equivalent to the old ``global ... if None`` init-once pattern. ``release``
+    (folded into ``reset_runtime_context``) drops the cache so a fresh engine /
+    test re-allocates, closing the multi-engine dangling-buffer hazard (G1)."""
+
+    def __init__(self) -> None:
+        self._specs: dict = {}
+        self._cache: dict = {}
+
+    def register(self, spec: "BufferSpec") -> None:
+        # Pure addition: record metadata only, never allocate here. Idempotent —
+        # registering the same name again is harmless (alloc still happens once,
+        # lazily, in get_buffer), so multiple backend instances may re-register.
+        self._specs[spec.name] = spec
+
+    def get_buffer(self, name: str):
+        buf = self._cache.get(name)
+        if buf is None:  # lazy: allocate on first access, then cache (init-once)
+            import torch
+
+            spec = self._specs[name]
+            buf = torch.zeros(spec.size_bytes, dtype=spec.dtype, device=spec.device)
+            self._cache[name] = buf
+        return buf
+
+    def release(self) -> None:
+        # Drop cached tensors; the next get_buffer re-allocates. Wired ONLY into
+        # reset_runtime_context (teardown / test isolation), never mid-forward —
+        # a forward-scope release would need a stream barrier (deferred to P5/P7).
+        self._cache.clear()
+
+
 @dataclass(slots=True)
 class RuntimeContext:
     """Process-static container skeleton (G1). M0.1 fills ``.config.parallel``;
     M0.2 fills ``.flags.moe`` (materialized at ``freeze()``); M0.3 fills
-    ``.resources.streams.forward`` (seeded in ModelRunner.__init__). ``.buffers``
-    is reserved for M0.4."""
+    ``.resources.streams.forward`` (seeded in ModelRunner.__init__); M0.4 adds
+    ``.buffers`` (lazy ``get_buffer`` materialize)."""
 
     config: ConfigSection
     flags: FlagsConfig = field(default_factory=FlagsConfig)
     resources: RuntimeResources = field(default_factory=RuntimeResources)
+    buffers: BufferStore = field(default_factory=BufferStore)
     _frozen: bool = False
 
     def apply_model_overrides(self, model) -> None:
@@ -276,6 +327,7 @@ def reset_runtime_context() -> None:
     global _runtime_context
     if _runtime_context is not None:
         _runtime_context.resources.streams.forward = None
+        _runtime_context.buffers.release()  # M0.4: drop cached lazy buffers
     _runtime_context = None
 
 
