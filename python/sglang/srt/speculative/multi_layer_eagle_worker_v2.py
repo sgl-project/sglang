@@ -49,10 +49,10 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
+    resolve_tree_mask_mode,
 )
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -166,7 +166,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.tree_mask_mode = resolve_tree_mask_mode(
+            self.target_worker.model_runner.attn_backend
+        )
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     def alloc_memory_pool(
@@ -190,6 +192,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner_list[0].tp_group
         ), speculative_moe_backend_context():
             super().init_attention_backends()
+
+        self.tree_mask_mode = resolve_tree_mask_mode(
+            self.target_worker.model_runner.attn_backend
+        )
 
     def init_cuda_graphs(self):
         with self.draft_tp_context(

@@ -127,6 +127,9 @@ class TRTLLMMHAMetadata:
     swa_page_table: torch.Tensor = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
+    # Draft tree mask for target verify with topk > 1, shape
+    # [bs, draft_token_num, draft_token_num] (QLEN_ONLY layout view)
+    tree_mask: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -228,6 +231,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+
+        # Tree spec decoding (topk > 1): target verify consumes a draft-only
+        # QLEN_ONLY tree mask. The eagle workers read tree_mask_mode to pick
+        # the layout build_tree_kernel_efficient writes, and fill
+        # cuda_graph_custom_mask in place via
+        # get_verify_buffers_to_fill_after_draft.
+        self.cuda_graph_custom_mask: Optional[torch.Tensor] = None
+        if self.topk > 1:
+            if self.is_xqa_impl:
+                raise NotImplementedError(
+                    "trtllm_mha tree speculative decoding (topk > 1) requires "
+                    "the trtllm-gen kernels (SM100/SM103); the XQA path "
+                    "expects a different packed mask format"
+                )
+            from sglang.srt.speculative.eagle_utils import TreeMaskMode
+
+            self.tree_mask_mode = TreeMaskMode.QLEN_ONLY
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
@@ -457,6 +477,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
 
+            if self.topk > 1 and not self.skip_prefill:
+                # QLEN_ONLY tree mask written in place by the eagle worker
+                # after draft (see get_verify_buffers_to_fill_after_draft);
+                # the captured verify forward reads it at replay.
+                num_draft_tokens = self.speculative_num_draft_tokens
+                self.cuda_graph_custom_mask = torch.zeros(
+                    max_bs * num_draft_tokens * num_draft_tokens,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+
             self.draft_extend_metadata = {
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -542,7 +573,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
         elif forward_mode.is_target_verify():
-            # Target Verify (topk = 1)
+            # Target Verify (chain for topk = 1, tree mask for topk > 1)
             tokens_per_req = num_tokens // bs
             metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
                 :bs
@@ -555,6 +586,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.max_seq_len_q = tokens_per_req
             metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
+            if self.topk > 1:
+                metadata.tree_mask = self.cuda_graph_custom_mask[
+                    : bs * tokens_per_req * tokens_per_req
+                ].view(bs, tokens_per_req, tokens_per_req)
             self._bind_swa_page_table(
                 metadata,
                 self.target_verify_metadata,
@@ -645,7 +680,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata, req_pool_indices, metadata.cache_seqlens_int32
             )
         elif forward_mode.is_target_verify():
-            # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
             metadata.cu_seqlens_k[1:].copy_(
@@ -654,6 +688,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._fill_page_table_device(
                 metadata, req_pool_indices, metadata.cache_seqlens_int32
             )
+            if self.topk > 1:
+                self._sync_verify_tree_mask(spec_info, metadata)
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
@@ -680,10 +716,48 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         self.forward_metadata = metadata
 
+    def _sync_verify_tree_mask(
+        self, spec_info: Optional[SpecInput], metadata: TRTLLMMHAMetadata
+    ) -> None:
+        """Copy the QLEN_ONLY tree mask into the CUDA-graph buffer unless the
+        producer already wrote it there in place (the eagle worker writes
+        through get_verify_buffers_to_fill_after_draft)."""
+        mask = getattr(spec_info, "custom_mask", None)
+        if mask is None or metadata.tree_mask is None:
+            return
+        if mask.data_ptr() != self.cuda_graph_custom_mask.data_ptr():
+            numel = metadata.tree_mask.numel()
+            self.cuda_graph_custom_mask[:numel].copy_(mask.reshape(-1)[:numel])
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return [self.cuda_graph_custom_mask, None]
+
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        pass
+        """Re-sync mask-dependent state after the draft output is known.
+
+        The packed-mask conversion runs inside the captured verify forward and
+        reads the persistent QLEN_ONLY buffer at replay, so the CUDA-graph
+        path only needs a copy when the producer wrote a different tensor.
+        """
+        if self.topk <= 1:
+            return
+        metadata = self.forward_metadata
+        if metadata is None or metadata.tree_mask is None:
+            return
+        if cuda_graph_bs is not None:
+            self._sync_verify_tree_mask(spec_info, metadata)
+        else:
+            mask = getattr(spec_info, "custom_mask", None)
+            if mask is not None:
+                bs, num_draft_tokens = (
+                    metadata.tree_mask.shape[0],
+                    metadata.tree_mask.shape[1],
+                )
+                metadata.tree_mask = mask[
+                    : bs * num_draft_tokens * num_draft_tokens
+                ].view(bs, num_draft_tokens, num_draft_tokens)
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -829,12 +903,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
         elif forward_batch.forward_mode.is_target_verify():
-            # Only support topk = 1 for now.
+            # Chain verify for topk = 1; tree verify (topk > 1) additionally
+            # carries the QLEN_ONLY draft tree mask.
             tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
             metadata.cache_seqlens_int32 = (forward_batch.seq_lens + tokens_per_req).to(
                 torch.int32
             )
             metadata.max_seq_len_q = tokens_per_req
+            metadata.max_seq_len_k = (
+                forward_batch.seq_lens_cpu.max().item() + tokens_per_req
+            )
+            if self.topk > 1:
+                metadata.tree_mask = forward_batch.spec_info.custom_mask[
+                    : batch_size * tokens_per_req * tokens_per_req
+                ].view(batch_size, tokens_per_req, tokens_per_req)
             metadata.cu_seqlens_q = torch.arange(
                 0,
                 batch_size * tokens_per_req + 1,
@@ -1061,6 +1143,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                 out_dtype=self.q_data_type,  # model_runner.dtype
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
+                # Tree verify (topk > 1): draft tree mask over the KV tail;
+                # None selects the causal chain-verify path.
+                mask=self.forward_metadata.tree_mask,
             )
         else:
             o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(

@@ -65,13 +65,13 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
     organize_draft_results,
     per_step_draft_out_cache_loc,
+    resolve_tree_mask_mode,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -209,7 +209,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            self.init_attention_backend()
+            if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
+                self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
+            self.init_cuda_graphs()
+
+        if (c := self.draft_runner.canary_manager) is not None:
+            c.mark_init_finished()
+
+        self.tree_mask_mode = resolve_tree_mask_mode(
+            self.target_worker.model_runner.attn_backend
+        )
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
@@ -366,7 +381,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.tree_mask_mode = resolve_tree_mask_mode(
+            self.target_worker.model_runner.attn_backend
+        )
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""

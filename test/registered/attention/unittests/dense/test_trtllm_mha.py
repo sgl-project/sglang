@@ -26,6 +26,10 @@ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner i
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_dense_eagle_draft_cuda_graph_runner_case,
 )
+from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+    run_dense_spec_verify_case,
+    run_dense_spec_verify_cuda_graph_case,
+)
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
@@ -206,6 +210,93 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                 run_dense_cuda_graph_decode_case(
                     self,
                     case,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
+
+    # EAGLE verify: chain (topk=1) goes through the causal q_len_per_req
+    # path; tree (topk=2) passes the QLEN_ONLY tree mask to the trtllm-gen
+    # custom-mask kernels. The kit hardcodes draft_token_num=3 with parent
+    # indices (-1, 0, 0) for topk>1. prefix_lens straddle page boundaries.
+    SPEC_VERIFY_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_trtllm_mha_eagle_verify_chain",
+                backend="trtllm_mha",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,  # topk
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_trtllm_mha_eagle_verify_tree",
+                backend="trtllm_mha",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(14, 15, 16),
+                extend_lens=(3, 3, 3),
+                speculative_eagle_topk=2,
+            ),
+            2,  # topk
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_trtllm_mha_eagle_verify_tree_gqa_page32",
+                backend="trtllm_mha",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=2,
+                page_size=32,
+                prefix_lens=(30, 31),
+                extend_lens=(3, 3),
+                speculative_eagle_topk=2,
+            ),
+            2,  # topk
+        ),
+    )
+
+    SPEC_VERIFY_CUDA_GRAPH_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_trtllm_mha_eagle_verify_tree",
+                backend="trtllm_mha",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(14, 15, 16),
+                extend_lens=(3, 3, 3),
+                speculative_eagle_topk=2,
+            ),
+            2,  # topk
+        ),
+    )
+
+    def test_runner_mode_spec_verify_cases(self):
+        for case, topk in self.SPEC_VERIFY_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_dense_spec_verify_case(
+                    self,
+                    case,
+                    topk=topk,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
+
+    def test_runner_mode_spec_verify_cuda_graph_cases(self):
+        for case, topk in self.SPEC_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_dense_spec_verify_cuda_graph_case(
+                    self,
+                    case,
+                    topk=topk,
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )

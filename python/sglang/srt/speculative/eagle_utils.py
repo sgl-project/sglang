@@ -110,6 +110,13 @@ class TreeMaskMode(IntEnum):
     QLEN_ONLY_BITPACKING = 2
 
 
+def resolve_tree_mask_mode(target_attn_backend) -> TreeMaskMode:
+    """The verify tree-mask layout is a property of the target attention
+    backend (e.g. trtllm_mha consumes the draft-only QLEN_ONLY layout for
+    tree verify); default to the dense FULL_MASK layout."""
+    return getattr(target_attn_backend, "tree_mask_mode", TreeMaskMode.FULL_MASK)
+
+
 def build_tree_kernel_efficient(
     bonus_tokens: torch.Tensor,
     parent_list: List[torch.Tensor],
