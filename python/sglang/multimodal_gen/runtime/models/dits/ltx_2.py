@@ -362,28 +362,6 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             )
         self.double_precision = bool(double_precision)
 
-    def _bcg_const_tensor(self, key, values, dtype, device):
-        """Return a cached constant GPU tensor (built once per dtype/device).
-
-        Avoids a per-call torch.tensor(python_values, device=cuda) host->device
-        copy, which is illegal inside a breakable CUDA graph capture. The cache is
-        populated during the eager warmup pass and reused (same address) on replay.
-        """
-        cache = getattr(self, "_bcg_const_cache", None)
-        if cache is None:
-            cache = {}
-            self._bcg_const_cache = cache
-        ck = (key, dtype, str(device))
-        t = cache.get(ck)
-        if t is None:
-            t = (
-                torch.tensor(values, dtype=dtype, device=device)
-                if dtype is not None
-                else torch.tensor(values, device=device)
-            )
-            cache[ck] = t
-        return t
-
     def prepare_video_coords(
         self,
         batch_size: int,
@@ -420,10 +398,8 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         grid = torch.stack(grid, dim=0)
 
         patch_size = (self.patch_size_t, self.patch_size, self.patch_size)
-        # Cache constant on GPU (built during eager warmup, reused at capture) so
-        # this is not a host->device copy inside a breakable CUDA graph capture.
-        patch_size_delta = self._bcg_const_tensor(
-            ("patch_size_delta",) + tuple(patch_size), patch_size, grid.dtype, grid.device
+        patch_size_delta = torch.tensor(
+            patch_size, dtype=grid.dtype, device=grid.device
         )
         patch_ends = grid + patch_size_delta.view(3, 1, 1, 1)
 
@@ -431,9 +407,7 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         latent_coords = latent_coords.flatten(1, 3)
         latent_coords = latent_coords.unsqueeze(0).repeat(batch_size, 1, 1, 1)
 
-        scale_tensor = self._bcg_const_tensor(
-            ("scale_factors",) + tuple(self.scale_factors), tuple(self.scale_factors), None, latent_coords.device
-        )
+        scale_tensor = torch.tensor(self.scale_factors, device=latent_coords.device)
         broadcast_shape = [1] * latent_coords.ndim
         broadcast_shape[1] = -1
         pixel_coords = latent_coords * scale_tensor.view(*broadcast_shape)

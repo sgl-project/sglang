@@ -1630,17 +1630,6 @@ class LTX2DenoisingStage(DenoisingStage):
         server_args: ServerArgs,
     ) -> None:
         """Run one joint video/audio denoising step with LTX-2-specific guidance."""
-        # Breakable-CUDA-graph: route every step.current_model(**kwargs) call site
-        # (official CFG / STG / batched / guider passes) through one BCG runner,
-        # padding the prompt conditioning to a fixed bucket so the capture
-        # signature is invariant to prompt length (different prompts replay one
-        # captured graph). No-op when BCG is disabled.
-        if getattr(server_args, "enable_breakable_cuda_graph", False):
-            _bcg_runner = self._maybe_get_bcg_runner(step.current_model)
-            if _bcg_runner is not None:
-                def _bcg_current_model(__r=_bcg_runner, **__kw):
-                    return __r(**self._bcg_pad_prompt_kwargs(__kw))
-                step.current_model = _bcg_current_model
         if ctx.audio_latents is None:
             raise ValueError("LTX-2 requires audio latents for denoising.")
         if ctx.audio_scheduler is None:
