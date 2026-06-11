@@ -609,11 +609,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     if TopKOutputChecker.format_is_bypassed(topk_output):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(hidden_states.dtype)
-        )
+        correction_bias = topk_config.correction_bias
     else:
         router_logits = None
         topk_config = None
@@ -636,7 +632,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert quant_info.weight_block_k == 32
             from flashinfer import mxfp8_quantize
 
-            a_q, a_sf = mxfp8_quantize(hidden_states, False)
+            a_q, a_sf = mxfp8_quantize(hidden_states, False, backend="cute-dsl")
             # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
             # [num_tokens, hidden_size // 32] (no transpose).
             a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
@@ -1000,11 +996,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         topk_config = topk_output.topk_config
         routing_method_type = quant_info.routing_method_type
 
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(hidden_states.dtype)
-        )
+        correction_bias = topk_config.correction_bias
         result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=correction_bias,
