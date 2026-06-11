@@ -177,7 +177,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_fi = q.view(batch_size, 1, num_heads, head_k_dim)
         key_fi = k.view(batch_size, 1, num_heads, head_k_dim)
         value_fi = v.view(batch_size, 1, num_v_heads, head_v_dim)
-        a_fi = a.view(batch_size, 1, num_v_heads)
+        a_fi = a.view(batch_size, 1, num_v_heads).clone()
         b_fi = b.view(batch_size, 1, num_v_heads)
 
         if self.use_state_pool:
