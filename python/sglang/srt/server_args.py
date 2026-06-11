@@ -6673,8 +6673,22 @@ class ServerArgs:
 
         if self.pp_size > 1:
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
+            # PP supports SUFFIX speculative decoding ONLY: its draft is a
+            # CPU suffix tree (NGRAM family, no draft-model forward), built
+            # identically on every PP rank, so the last rank's verify result
+            # can simply be relayed on the existing PP output ring. EAGLE /
+            # EAGLE3 / NEXTN / STANDALONE need a draft-model forward that the
+            # PP relay path does not implement, so they stay forbidden.
+            assert (
+                self.speculative_algorithm is None
+                or self.speculative_algorithm == "SUFFIX"
+            ), (
+                "Pipeline parallelism with speculative decoding supports only "
+                "--speculative-algorithm SUFFIX (model-free CPU draft); got "
+                f"{self.speculative_algorithm}."
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

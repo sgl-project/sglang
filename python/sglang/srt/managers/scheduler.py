@@ -3242,8 +3242,18 @@ class Scheduler(
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
+                # PP + NGRAM-family (SUFFIX): the worker threads
+                # pp_proxy_tensors into target_worker.forward_batch_generation.
+                # Single-rank runs pass None, which is a no-op.
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.spec_algorithm.is_ngram()
+                    else {}
+                )
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3254,12 +3264,16 @@ class Scheduler(
                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
-                # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                if batch_result.next_token_ids is not None:
+                    # Sync D2H so the result processor can read CPU tensors.
+                    batch_result.copy_done = self.device_module.Event()
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
+                # else: non-last PP rank — the verify result arrives on the PP
+                # output ring; scheduler_pp_mixin builds the CPU-side result at
+                # delivery (see _pp_prep_batch_result).
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}

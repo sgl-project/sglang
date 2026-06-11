@@ -755,6 +755,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         assert (
             (not model_has_mtp_layers)
             or (self.spec_algorithm.is_none())
+            # SUFFIX uses a CPU suffix-tree draft, not the MTP layers, so
+            # PP-splitting an MTP-bearing model is fine for it.
+            or (self.server_args.speculative_algorithm == "SUFFIX")
             or (
                 (not self.spec_algorithm.is_none())
                 and (self.num_effective_layers == model_num_layers)

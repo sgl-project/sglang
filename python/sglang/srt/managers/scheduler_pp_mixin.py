@@ -970,9 +970,32 @@ class SchedulerPPMixin:
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> Dict[str, torch.Tensor]:
+        next_token_ids = result.next_token_ids
+        if next_token_ids is not None and next_token_ids.device.type == "cpu":
+            # Spec-v2 run_batch calls copy_to_cpu on the result before the PP
+            # send (extend and decode alike); the P2P tensor-dict transport
+            # requires device tensors.
+            next_token_ids = next_token_ids.to(batch.seq_lens.device)
         tensor_dict = {
-            "next_token_ids": result.next_token_ids,
+            "next_token_ids": next_token_ids,
         }
+
+        # PP spec-v2 (SUFFIX / NGRAM family): relay the last rank's verify
+        # result. For a decode (TARGET_VERIFY) batch, next_token_ids above is
+        # the padded (bs * num_draft_tokens) accept stream; spec_accept_lens
+        # slices it per req at delivery (_pp_prep_batch_result), where every
+        # rank replays the CPU-side bookkeeping (output_ids append,
+        # kv_committed_len advance, seq_lens on non-last ranks).
+        if (
+            self.spec_algorithm.is_ngram()
+            and batch.forward_mode.is_decode()
+            and result.accept_lens is not None
+        ):
+            # copy_to_cpu has already moved the spec result tensors to the
+            # host (next_token_ids is normalized above).
+            tensor_dict["spec_accept_lens"] = result.accept_lens.to(
+                device=batch.seq_lens.device, dtype=torch.int64
+            )
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1105,6 +1128,57 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
+        accept_lens = pp_outputs.tensors.get("spec_accept_lens")
+        if accept_lens is not None:
+            # PP spec-v2 verify result (see _pp_prepare_tensor_dict).
+            # next_token_ids is the padded (bs * K) accept stream. Normalize
+            # devices: non-attn-TP-0 ranks may reconstruct the relayed dict on
+            # the host, and batch.input_ids must stay a device tensor for the
+            # later filter_batch indexing.
+            #
+            # IMPORTANT: no synchronous D2H here — this runs on the copy
+            # stream, which has already waited on the schedule stream (the
+            # in-flight forward); a blocking .cpu() would serialize the whole
+            # pipeline. All host copies are non_blocking and gated by the
+            # caller's d2h_event before the result processor reads them; the
+            # seq_lens advance is deferred to _pp_process_batch_result for
+            # the same reason.
+            device = batch.seq_lens.device
+            accept_lens = accept_lens.to(device=device)
+            flat_tokens = pp_outputs["next_token_ids"].to(
+                device=device, dtype=torch.int64
+            )
+            bs = len(batch.reqs)
+            stride = self.server_args.speculative_num_draft_tokens
+            # The req's newest token = its LAST accepted token; this matches
+            # the one-token-per-req semantic of the non-spec relay below.
+            last_idx = (
+                torch.arange(bs, device=flat_tokens.device) * stride + accept_lens - 1
+            )
+            batch.input_ids = flat_tokens[last_idx]
+            self.future_map.stash(batch.req_pool_indices, batch.input_ids)
+            accept_lens_cpu = accept_lens.to("cpu", torch.int32, non_blocking=True)
+            output_result = GenerationBatchResult(
+                logits_output=logits_output,
+                pp_hidden_states_proxy_tensors=None,
+                next_token_ids=flat_tokens.to("cpu", non_blocking=True),
+                accept_lens=accept_lens_cpu,
+                speculative_num_draft_tokens=stride,
+                extend_input_len_per_req=extend_input_len_per_req,
+                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            )
+            if not self.pp_group.is_last_rank:
+                # Advance this rank's device seq_lens now (async GPU op),
+                # mirroring the last rank's run_batch consuming
+                # result.new_seq_lens. The CPU mirror is applied in
+                # _pp_process_batch_result after the d2h sync. The KV counters
+                # (kv_committed_len) advance in the result processor from
+                # accept_lens, identically on every rank.
+                batch.seq_lens = batch.seq_lens + accept_lens.to(batch.seq_lens.dtype)
+                output_result._pp_spec_seq_lens_batch = batch
+            return output_result
+
         batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
@@ -1123,6 +1197,15 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
+        # Deferred CPU-side seq_lens advance for PP spec-v2 (the caller has
+        # synchronized d2h_event, so output_result.accept_lens is readable).
+        spec_batch = getattr(output_result, "_pp_spec_seq_lens_batch", None)
+        if spec_batch is not None and spec_batch.seq_lens_cpu is not None:
+            spec_batch.seq_lens_cpu = (
+                spec_batch.seq_lens_cpu
+                + output_result.accept_lens.to(spec_batch.seq_lens_cpu.dtype)
+            )
+            spec_batch.seq_lens_sum = int(spec_batch.seq_lens_cpu.sum())
         self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(
