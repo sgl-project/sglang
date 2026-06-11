@@ -304,16 +304,10 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         non_sparse_pool_offload_ranges=None,
-        non_sparse_pool_offload_lens=None,
     ) -> None:
-        if non_sparse_pool_offload_ranges or non_sparse_pool_offload_lens:
+        if non_sparse_pool_offload_ranges:
             pool_transfers = list(pool_transfers or [])
             ranges = list(non_sparse_pool_offload_ranges or [])
-            ranges.extend(
-                (req_idx, written_end - self.page_size, written_end)
-                for req_idx, written_end in non_sparse_pool_offload_lens or []
-                if written_end > 0 and written_end % self.page_size == 0
-            )
             for req_idx, start_pos, end_pos in ranges:
                 transfer = self._indexer_pool_transfer(req_idx, start_pos, end_pos)
                 if transfer is not None:

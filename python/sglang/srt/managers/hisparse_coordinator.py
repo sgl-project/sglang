@@ -620,7 +620,7 @@ class HiSparseCoordinator:
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
         host_locs_list = []
-        non_sparse_pool_offload_lens = []
+        non_sparse_pool_offload_ranges = []
         for i in backup_indices:
             req_idx = int(req_pool_indices_cpu[i])
             start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
@@ -632,7 +632,11 @@ class HiSparseCoordinator:
                 1,
             )
             host_locs_list.append(host_locs)
-            non_sparse_pool_offload_lens.append((req_idx, start_pos + 1))
+            offload_end = start_pos + 1
+            if offload_end > 0 and offload_end % self.page_size == 0:
+                non_sparse_pool_offload_ranges.append(
+                    (req_idx, offload_end - self.page_size, offload_end)
+                )
         host_locs = torch.cat(host_locs_list)
 
         self.wait_for_pending_backup()
@@ -645,7 +649,7 @@ class HiSparseCoordinator:
                 self.mem_pool_device,
                 host_locs,
                 device_locs,
-                non_sparse_pool_offload_lens=non_sparse_pool_offload_lens,
+                non_sparse_pool_offload_ranges=non_sparse_pool_offload_ranges,
             )
             self._backup_done_event.record()
             if host_locs.is_cuda:
@@ -839,7 +843,9 @@ class HiSparseCoordinator:
                 self.mem_pool_device,
                 host_locs,
                 device_locs,
-                non_sparse_pool_offload_lens=[(req.req_pool_idx, cache_len)],
+                non_sparse_pool_offload_ranges=[
+                    (req.req_pool_idx, cache_len - self.page_size, cache_len)
+                ],
             )
 
         # release memory -- only free actually-allocated buffer indices
