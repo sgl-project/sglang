@@ -1482,21 +1482,21 @@
         },
         "fastwan2_2_ti2v_5b": {
             "stages_ms": {
-                "InputValidationStage": 23.7,
-                "TextEncodingStage": 329.25,
-                "TimestepPreparationStage": 29.82,
-                "LatentPreparationStage": 0.14,
-                "DmdDenoisingStage": 261.47,
-                "DecodingStage": 1499.72
+                "InputValidationStage": 400.0,
+                "TextEncodingStage": 685.05,
+                "TimestepPreparationStage": 36.07,
+                "LatentPreparationStage": 0.12,
+                "DmdDenoisingStage": 401.85,
+                "DecodingStage": 1524.82
             },
             "denoise_step_ms": {
-                "0": 112.79,
-                "1": 31.04,
-                "2": 111.66
+                "0": 35.0,
+                "1": 115.0,
+                "2": 130.0
             },
-            "expected_e2e_ms": 5042.34,
-            "expected_avg_denoise_ms": 85.16,
-            "expected_median_denoise_ms": 111.66,
+            "expected_e2e_ms": 3150.0,
+            "expected_avg_denoise_ms": 95.0,
+            "expected_median_denoise_ms": 120.0,
             "estimated_full_test_time_s": 125.2
         },
         "fast_hunyuan_video": {
