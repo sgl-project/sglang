@@ -202,6 +202,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    @staticmethod
+    def _is_sparse_kv_cached_by_fusion(
+        forward_batch: ForwardBatch, layer_id: int
+    ) -> bool:
+        layer_ids = forward_batch.minimax_m3_precached_sparse_layers
+        return layer_ids is not None and layer_id in layer_ids
+
     def forward(
         self,
         q,
@@ -242,14 +249,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_v: Optional[torch.Tensor],
     ):
         disable_value = layer.layer_id in self.disable_value_layer_ids
-        self.kv_pool.set_fused_kv_index_buffer(
-            layer,
-            forward_batch.out_cache_loc,
-            k,
-            v,
-            idx_k,
-            None if disable_value else idx_v,
+        kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
+            forward_batch, layer.layer_id
         )
+        if not kv_cached_by_fusion:
+            self.kv_pool.set_fused_kv_index_buffer(
+                layer,
+                forward_batch.out_cache_loc,
+                k,
+                v,
+                idx_k,
+                None if disable_value else idx_v,
+            )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
@@ -403,15 +414,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         attn_fn = None
         if self.use_dense_sparse_decode and k_cache.shape[1] == 1:
-            attn_fn = lambda main_q, page_table, real_seq_lens: self._dense_sparse_main_decode(
-                main_q,
-                page_table,
-                real_seq_lens,
-                k_cache,
-                v_cache,
-                layer,
-                forward_batch,
-            )
+            def attn_fn(main_q, page_table, real_seq_lens):
+                return self._dense_sparse_main_decode(
+                    main_q,
+                    page_table,
+                    real_seq_lens,
+                    k_cache,
+                    v_cache,
+                    layer,
+                    forward_batch,
+                )
 
         # The MSA decode page table + plan are built once per forward in
         # init_forward_metadata_out_graph (eager, outside graph capture) and shared

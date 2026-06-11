@@ -80,7 +80,12 @@ def test_mxfp8_quant_triton_matches_torch(shape, dtype):
 
 @pytest.mark.parametrize("m,inter", [(8, 512), (65, 2048)])
 @torch.inference_mode()
-def test_minimax_swiglu_mxfp8_quant_matches_two_kernel_path(m, inter):
+def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
+    # The fused swiglu+quant kernel keeps the activation in fp32 through the
+    # E8M0 scale selection (no bf16 round-trip; matches the vLLM/ame kernel), so
+    # the reference is the unfused fp32 swiglu followed by MXFP8 quant. Not
+    # bit-identical because the reference quant runs in torch vs the fused triton
+    # path, but numerically equivalent (tight relerr, scales agree within 1 ulp).
     from sglang.jit_kernel.minimax_m3 import (
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
@@ -92,16 +97,17 @@ def test_minimax_swiglu_mxfp8_quant_matches_two_kernel_path(m, inter):
     gate_up = torch.randn(m, 2 * inter, device=DEVICE, dtype=torch.bfloat16) * 0.5
 
     act = swiglu_oai_split(
-        gate_up, alpha=alpha, beta=beta, limit=limit, out_dtype=torch.bfloat16
+        gate_up, alpha=alpha, beta=beta, limit=limit, out_dtype=torch.float32
     )
     q_ref, s_ref = mxfp8_e4m3_quantize(act)
     q, s = swiglu_oai_mxfp8_quant(gate_up, alpha=alpha, beta=beta, limit=limit)
 
     assert q.shape == q_ref.shape
     assert s.shape == s_ref.shape
-    assert (s.int() - s_ref.int()).abs().max().item() == 0
+    # E8M0 block scales agree within one exponent step (last-bit amax differences).
+    assert (s.int() - s_ref.int()).abs().max().item() <= 1
     assert (
-        _relerr(dequant_mxfp8_to_bf16(q, s), dequant_mxfp8_to_bf16(q_ref, s_ref)) == 0
+        _relerr(dequant_mxfp8_to_bf16(q, s), dequant_mxfp8_to_bf16(q_ref, s_ref)) < 1e-2
     )
 
 

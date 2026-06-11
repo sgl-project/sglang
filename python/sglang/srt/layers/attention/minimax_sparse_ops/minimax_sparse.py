@@ -5,6 +5,7 @@ from typing import Callable, Optional, Tuple
 import torch
 
 from .common.index import topk_index_reduce
+from .common.utils import get_cu_seqblocks
 from .decode.flash_with_topk_idx import flash_decode_with_topk_idx
 from .decode.topk_sparse import flash_decode_with_gqa_share_sparse
 from .prefill.flash_with_topk_idx import flash_prefill_with_topk_index
@@ -39,7 +40,21 @@ def minimax_sparse_prefill(
     score_type: str = "max",
     disable_index_value: bool = False,
     use_msa: bool = False,
+    cu_seqblocks_q: Optional[torch.Tensor] = None,
+    max_seqblock_q: Optional[int] = None,
+    all_seqblock_q: Optional[int] = None,
 ):
+    """Run MiniMax-M3 sparse prefill.
+
+    ``cu_seqblocks_q``, ``max_seqblock_q``, and ``all_seqblock_q`` are optional
+    precomputed query-block metadata shared by the index and value sparse
+    kernels. Supplying them avoids recomputing the same block layout twice.
+    """
+    if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
+        cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
+            cu_seqlens, max_seqlen_q, block_size_q, block_size_k
+        )
+
     # All seqlen is less than topk, use full attention
     # Step 1: Flash attention with topk index (using index head)
     idx_o, topk_idx = flash_prefill_with_topk_index(
@@ -62,6 +77,9 @@ def minimax_sparse_prefill(
         sm_scale=idx_sm_scale,
         score_type=score_type,
         disable_index_value=disable_index_value,
+        cu_seqblocks_q=cu_seqblocks_q,
+        max_seqblock_q=max_seqblock_q,
+        all_seqblock_q=all_seqblock_q,
     )
     # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
     num_idx_heads = idx_q.shape[1]
@@ -106,6 +124,8 @@ def minimax_sparse_prefill(
             prefix_lens=prefix_lens,
             max_seqlen_q=max_seqlen_q,
             sm_scale=sm_scale,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
         )
     return idx_o, o
 

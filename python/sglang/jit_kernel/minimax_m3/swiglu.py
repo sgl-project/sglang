@@ -127,10 +127,10 @@ def _swiglu_oai_mxfp8_quant_kernel(
         gate = tl.minimum(gate, limit)
         up = tl.minimum(tl.maximum(up, -limit), limit)
 
-    # Match the old two-kernel path exactly: SwiGLU writes bf16/fp16 first, then
-    # the MXFP8 quant kernel reads that rounded activation.
+    # Keep the activation in fp32 all the way to the E8M0 scale selection (no
+    # bf16 round-trip to HBM). Matches the vLLM/ame fused swiglu+quant kernel:
+    # marginally more accurate than the unfused bf16 two-kernel chain.
     activated = gate * tl.sigmoid(alpha * gate) * (up + beta)
-    activated = activated.to(tl.bfloat16).to(tl.float32)
 
     groups: tl.constexpr = BLOCK_I // 32
     activated_2d = tl.reshape(activated, (groups, 32))
@@ -160,7 +160,11 @@ def swiglu_oai_mxfp8_quant(
     beta: float,
     limit: Optional[float],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """SwiGLU-OAI on split layout, then MiniMax MXFP8 quant, in one launch."""
+    """SwiGLU-OAI on split layout, then MiniMax MXFP8 quant, in one launch.
+
+    The activation stays in fp32 through the E8M0 scale selection (no bf16
+    round-trip), matching the vLLM/ame fused swiglu+quant kernel.
+    """
     orig_shape = gate_up.shape
     two_i = orig_shape[-1]
     n_inter = two_i // 2

@@ -309,9 +309,9 @@ def fused_moe_mxfp8_native(
     )  # [M, 2I]
 
     if _env_enabled("SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8"):
-        # SwiGLU-OAI (split layout) + MiniMax MXFP8 quant. This preserves the old
-        # bf16 activation rounding boundary before E8M0 scale selection, but is
-        # opt-in until full-model accuracy is re-qualified.
+        # SwiGLU-OAI (split layout) + MiniMax MXFP8 quant in one kernel, fp32 all
+        # the way to the E8M0 scale (no bf16 activation round-trip; matches the
+        # vLLM/ame fused kernel). Opt-in until full-model accuracy is re-qualified.
         act_q, act_s = swiglu_oai_mxfp8_quant(g1, alpha=alpha, beta=beta, limit=limit)
     else:
         # Default accuracy path: keep the historical two-kernel boundary.

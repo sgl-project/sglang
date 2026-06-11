@@ -76,6 +76,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import (
+    get_forward_context,
+    has_forward_context,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -96,10 +100,23 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _device_sm = get_device_sm()
 
+# fp8 main-K/V cache dtypes (index cache always stays bf16). When the sparse
+# pool is one of these, the bf16-only qknorm+rope+kv-insert fusion is skipped so
+# the backend's set_kv_buffer performs the bf16->fp8 cache write instead.
+_FP8_KV_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+    torch.float8_e4m3fnuz,
+)
+
 _has_rocm_qk_norm_rope = False
 if _is_hip:
     try:
-        from sglang.jit_kernel.minimax_m3.qk_norm_rope import qk_gemma_rmsnorm_rope
+        from sglang.jit_kernel.minimax_m3.qk_norm_rope import (
+            qk_gemma_rmsnorm_rope,
+            sparse_qk_index_gemma_rmsnorm_rope,
+            sparse_qk_index_gemma_rmsnorm_rope_cache,
+        )
 
         _has_rocm_qk_norm_rope = True
     except ImportError:
@@ -219,7 +236,6 @@ def build_minimax_fused_qkv_index(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, MiniMaxM3Attention):
             module.maybe_build_fused_qkv_index()
-
 
 class MiniMaxM3MLP(nn.Module):
     def __init__(
@@ -548,9 +564,9 @@ class MiniMaxM3Attention(nn.Module):
                 f"sparse attention only supports qk_norm_type='per_head', "
                 f"got {self.qk_norm_type!r}"
             )
-            assert (
-                not self.attention_output_gate
-            ), "sparse attention does not support attention_output_gate"
+            assert not self.attention_output_gate, (
+                "sparse attention does not support attention_output_gate"
+            )
             sparse_cfg = config.sparse_attention_config
             self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
             self.idx_head_dim = sparse_cfg["sparse_index_dim"]
@@ -761,23 +777,49 @@ class MiniMaxM3Attention(nn.Module):
                 (off_ik, 1),
             )
 
-    def _can_use_rocm_qk_norm_rope(
-        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
-    ) -> bool:
-        return (
+        # Static (init-time) ROCm fast-path eligibility caches. These avoid
+        # repeating the same attribute checks on every forward; per-call shape /
+        # dtype guards are applied where the cached value is consulted.
+        self._can_use_rocm_qk_norm_rope_static = (
             _has_rocm_qk_norm_rope
             and self.qk_norm_type == "per_head"
             and self.use_gemma_norm
             and not self.attention_output_gate
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+            and hasattr(self.rotary_emb, "cos_sin_cache")
+            and self.rotary_emb.rotary_dim == self.rotary_dim
+            and self.rotary_dim <= self.head_dim
+        )
+        self._can_use_rocm_index_qk_norm_rope_static = (
+            self.is_sparse_attention_layer
+            and _has_rocm_qk_norm_rope
+            and self.use_gemma_norm
+            and self.index_q_norm.variance_epsilon
+            == self.index_k_norm.variance_epsilon
+            and hasattr(self.index_rotary_emb, "cos_sin_cache")
+            and self.index_rotary_emb.rotary_dim == self.rotary_dim
+            and self.rotary_dim <= self.idx_head_dim
+        )
+        self._can_use_rocm_sparse_qk_index_norm_rope_static = (
+            self.is_sparse_attention_layer
+            and self._can_use_rocm_qk_norm_rope_static
+            and self._can_use_rocm_index_qk_norm_rope_static
+            and self.idx_head_dim == self.head_dim
+            and self.index_q_norm.variance_epsilon == self.q_norm.variance_epsilon
+            and self.index_k_norm.variance_epsilon == self.q_norm.variance_epsilon
+            and self.index_rotary_emb is self.rotary_emb
+        )
+
+    def _can_use_rocm_qk_norm_rope(
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+    ) -> bool:
+        return (
+            self._can_use_rocm_qk_norm_rope_static
             and positions.dim() == 1
             and q.dim() == 2
             and k.dim() == 2
             and q.dtype in (torch.bfloat16, torch.float16)
             and k.dtype == q.dtype
-            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
-            and hasattr(self.rotary_emb, "cos_sin_cache")
-            and self.rotary_emb.rotary_dim == self.rotary_dim
-            and self.rotary_dim <= self.head_dim
         )
 
     def _qk_norm_rope(
@@ -828,17 +870,12 @@ class MiniMaxM3Attention(nn.Module):
         self, positions: torch.Tensor, idx_q: torch.Tensor, idx_k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if (
-            _has_rocm_qk_norm_rope
-            and self.use_gemma_norm
+            self._can_use_rocm_index_qk_norm_rope_static
             and positions.dim() == 1
             and idx_q.dim() == 2
             and idx_k.dim() == 2
             and idx_q.dtype in (torch.bfloat16, torch.float16)
             and idx_k.dtype == idx_q.dtype
-            and self.index_q_norm.variance_epsilon == self.index_k_norm.variance_epsilon
-            and hasattr(self.index_rotary_emb, "cos_sin_cache")
-            and self.index_rotary_emb.rotary_dim == self.rotary_dim
-            and self.rotary_dim <= self.idx_head_dim
         ):
             return qk_gemma_rmsnorm_rope(
                 idx_q,
@@ -952,6 +989,134 @@ class MiniMaxM3Attention(nn.Module):
             (w, off, cnt) for w, (off, cnt) in zip(weights, self._qknorm_group_meta)
         ]
 
+    def _can_use_rocm_sparse_qk_index_norm_rope(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+    ) -> bool:
+        return (
+            self._can_use_rocm_sparse_qk_index_norm_rope_static
+            and positions.dim() == 1
+            and q.dim() == 2
+            and k.dim() == 2
+            and idx_q.dim() == 2
+            and idx_k.dim() == 2
+            and q.dtype in (torch.bfloat16, torch.float16)
+            and k.dtype == q.dtype
+            and idx_q.dtype == q.dtype
+            and idx_k.dtype == q.dtype
+        )
+
+    def _sparse_qk_index_norm_rope(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._can_use_rocm_sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k):
+            return sparse_qk_index_gemma_rmsnorm_rope(
+                q,
+                k,
+                idx_q,
+                idx_k,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.index_q_norm.weight.data,
+                self.index_k_norm.weight.data,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.variance_epsilon,
+                self.head_dim,
+                self.rotary_dim,
+                self.rotary_emb.is_neox_style,
+            )
+        q, k = self._qk_norm_rope(positions, q, k)
+        idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
+        return q, k, idx_q, idx_k
+
+    @staticmethod
+    def _mark_sparse_kv_cached_by_fusion(
+        forward_batch: ForwardBatch, layer_id: int
+    ) -> None:
+        layer_ids = forward_batch.minimax_m3_precached_sparse_layers
+        if layer_ids is None:
+            layer_ids = set()
+            forward_batch.minimax_m3_precached_sparse_layers = layer_ids
+        layer_ids.add(layer_id)
+
+    @staticmethod
+    def _get_sparse_kv_pool():
+        if not has_forward_context():
+            return None
+        attn_backend = get_forward_context().attn_backend
+        sparse_backend = getattr(attn_backend, "sparse", None)
+        return getattr(sparse_backend, "kv_pool", None)
+
+    def _sparse_qk_index_norm_rope_cache(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_v: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        kv_pool = self._get_sparse_kv_pool()
+        # The fused qknorm+rope+kv-insert kernel writes the (normed/roped) bf16
+        # K and raw bf16 V straight into the paged cache buffer. When the main
+        # K/V cache is fp8 (--kv-cache-dtype fp8_*) that buffer is fp8, so the
+        # fusion cannot do the write. Fall back to the norm+rope-only path here
+        # and let the sparse backend's set_kv_buffer do the bf16->fp8 cache
+        # write (the index cache stays bf16, so its fusion is unaffected but is
+        # bundled in the same kernel, hence the whole fusion is skipped).
+        main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
+        can_use_cache_fusion = (
+            not main_kv_is_fp8
+            and idx_v is None
+            and self._can_use_rocm_sparse_qk_index_norm_rope(
+                positions, q, k, idx_q, idx_k
+            )
+            and getattr(forward_batch, "out_cache_loc", None) is not None
+            and v.dim() == 2
+            and v.dtype == q.dtype
+            and v.shape == k.shape
+        )
+        if can_use_cache_fusion and kv_pool is not None:
+            layer_id = self.attn.layer_id
+            k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
+            idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
+            q, k, idx_q, idx_k = sparse_qk_index_gemma_rmsnorm_rope_cache(
+                q,
+                k,
+                v,
+                idx_q,
+                idx_k,
+                k_cache,
+                v_cache,
+                idx_k_cache,
+                forward_batch.out_cache_loc,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.index_q_norm.weight.data,
+                self.index_k_norm.weight.data,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.variance_epsilon,
+                self.head_dim,
+                self.rotary_dim,
+                self.rotary_emb.is_neox_style,
+            )
+            self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
+            return q, k, idx_q, idx_k
+        return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -1019,47 +1184,67 @@ class MiniMaxM3Attention(nn.Module):
             )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
+            main_qk_already_normed = True
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
-            q, k = self._qk_norm_rope(positions, q, k)
+            main_qk_already_normed = False
 
         if self.is_sparse_attention_layer:
-            use_fused_norm_rope = (
-                self._use_fused_qknorm_rope
-                and self.idx_head_dim == 128
-                and self.index_rotary_emb.cos_sin_cache.dtype == torch.float32
-            )
             if fused_out is not None:
                 idx_qkv = fused_out[:, self._fused_main_size :]
             else:
                 idx_qkv, _ = self.index_qkv_proj(hidden_states)
-            if use_fused_norm_rope:
-                # One fused GemmaRMSNorm + partial NeoX RoPE pass over the
-                # whole [q | k | v] tensor: q_weight norms the first
-                # num_idx_heads heads, k_weight norms the single k head,
-                # both get rope; the optional v head is left untouched.
-                from sglang.jit_kernel.minimax_qknorm_rope import (
-                    minimax_qknorm_rope,
-                )
 
-                minimax_qknorm_rope(
-                    idx_qkv,
-                    self.index_q_norm.weight,
-                    self.index_k_norm.weight,
-                    self.index_rotary_emb.cos_sin_cache,
-                    positions,
-                    self.num_idx_heads,
-                    1,
-                    0 if self.disable_index_value else 1,
-                    self.index_q_norm.variance_epsilon,
+            if main_qk_already_normed:
+                use_fused_index_norm_rope = (
+                    self._use_fused_qknorm_rope
+                    and self.idx_head_dim == 128
+                    and self.index_rotary_emb.cos_sin_cache.dtype == torch.float32
                 )
-                idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                if use_fused_index_norm_rope:
+                    # Preserve the existing CUDA sparse-index fast path when
+                    # main q/k were already normed+roped by the fused base
+                    # kernel. This runs only over idx_q/idx_k; idx_v is left
+                    # untouched.
+                    from sglang.jit_kernel.minimax_qknorm_rope import (
+                        minimax_qknorm_rope,
+                    )
+
+                    minimax_qknorm_rope(
+                        idx_qkv,
+                        self.index_q_norm.weight,
+                        self.index_k_norm.weight,
+                        self.index_rotary_emb.cos_sin_cache,
+                        positions,
+                        self.num_idx_heads,
+                        1,
+                        0 if self.disable_index_value else 1,
+                        self.index_q_norm.variance_epsilon,
+                    )
+                    idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                else:
+                    # Main q/k were normed+roped by the fused base kernel
+                    # above; only the index branch still needs norm+rope.
+                    idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                    idx_q, idx_k = self._index_qk_norm_rope(
+                        positions, idx_q, idx_k
+                    )
             else:
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
-                idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
+                # Prefer the PR's ROCm sparse cache-store + norm/rope fusion
+                # when it applies; it handles q/k/idx_q/idx_k norm+rope AND
+                # the sparse KV cache store in a single kernel. The helper
+                # falls back to _qk_norm_rope + _index_qk_norm_rope when
+                # preconditions fail.
+                q, k, idx_q, idx_k = self._sparse_qk_index_norm_rope_cache(
+                    positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
+                )
+
             inner_state = (q, k, v, gate, idx_q, idx_k, idx_v, forward_batch)
         else:
+            if not main_qk_already_normed:
+                q, k = self._qk_norm_rope(positions, q, k)
             inner_state = (q, k, v, gate, forward_batch)
         return None, forward_batch, inner_state
 
@@ -1503,9 +1688,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             return
 
         self.num_fused_shared_experts = self.config.n_shared_experts
-        assert (
-            self.num_fused_shared_experts == 1
-        ), "Only 1 fused shared expert is supported for Glm4MoeForCausalLM"
+        assert self.num_fused_shared_experts == 1, (
+            "Only 1 fused shared expert is supported for Glm4MoeForCausalLM"
+        )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):

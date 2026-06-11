@@ -6,7 +6,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hip
+
 from ..common.utils import get_cu_seqblocks, robust_allocator
+
+_is_hip = is_hip()
 
 
 @triton.heuristics(
@@ -96,6 +100,7 @@ def _gqa_share_sparse_fwd_kernel(
     # has sink
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # get batch id and head id
@@ -199,6 +204,10 @@ def _gqa_share_sparse_fwd_kernel(
                 mask=kd_mask[:, None] & pos_mask[None, :],
                 other=0.0,
             )
+            if IS_FP8:
+                # fp8 main K cache is unit-scaled; widen to the Q compute dtype
+                # before the tl.dot (compiled out when the cache is bf16).
+                k = k.to(q.dtype)
             # compute qk
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             # causal mask
@@ -225,6 +234,10 @@ def _gqa_share_sparse_fwd_kernel(
                 mask=pos_mask[:, None] & vd_mask[None, :],
                 other=0.0,
             )
+            if IS_FP8:
+                # Widen V so `p.to(v.dtype)` casts P to the compute dtype rather
+                # than to fp8 (which would wreck attention-weight precision).
+                v = v.to(q.dtype)
             p = p.to(v.dtype)
             acc_o += tl.dot(p, v)
             # update statistics
@@ -262,10 +275,22 @@ def flash_prefill_with_gqa_share_sparse(
     max_seqlen_q: int,
     sm_scale: Optional[float] = None,
     use_tma: bool = True,
+    cu_seqblocks_q: Optional[torch.Tensor] = None,
+    max_seqblock_q: Optional[int] = None,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
-    # dtype check
-    assert k_cache.dtype == q.dtype and v_cache.dtype == q.dtype
+    # dtype check. On HIP, the paged main K/V cache may be fp8 (unit-scaled)
+    # under --kv-cache-dtype fp8_*; the kernel widens it to the Q dtype on load.
+    # Keep CUDA's pre-existing sparse prefill dtype contract unchanged by
+    # accepting fp8 only on HIP.
+    assert q.dtype in (torch.bfloat16, torch.float16)
+    _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz)
+    is_fp8 = _is_hip and k_cache.dtype in _FP8_DTYPES
+    assert k_cache.dtype == q.dtype or is_fp8, (
+        f"sparse prefill expects K cache dtype == Q dtype ({q.dtype}) "
+        f"or fp8 on HIP, got {k_cache.dtype}"
+    )
+    assert v_cache.dtype == k_cache.dtype
     assert block_size_q in {1, 2, 4, 8, 16, 32, 64}
     assert block_size_k in {16, 32, 64, 128}
     # shape
@@ -282,9 +307,10 @@ def flash_prefill_with_gqa_share_sparse(
     assert gqa_group_size * block_size_q <= 128
     if sm_scale is None:
         sm_scale = qk_head_dim**-0.5
-    cu_seqblocks_q, max_seqblock_q, _, _, _, _ = get_cu_seqblocks(
-        cu_seqlens, max_seqlen_q, block_size_q, block_size_k
-    )
+    if cu_seqblocks_q is None or max_seqblock_q is None:
+        cu_seqblocks_q, max_seqblock_q, _, _, _, _ = get_cu_seqblocks(
+            cu_seqlens, max_seqlen_q, block_size_q, block_size_k
+        )
     # output tensor
     o = torch.empty(total_q, num_q_heads, v_head_dim, device=q.device, dtype=q.dtype)
     # launch kernel
@@ -340,5 +366,6 @@ def flash_prefill_with_gqa_share_sparse(
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
+        IS_FP8=is_fp8,
     )
     return o
