@@ -1639,7 +1639,7 @@ class MMEncoder:
                 else:
                     sock.send_multipart([serialized_data], copy=False)
             finally:
-                sock.close()
+                sock.close(linger=5000)
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
