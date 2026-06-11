@@ -520,9 +520,7 @@ class WanDistAttentionBlock(nn.Module):
 
     def forward(self, x):
         if self.world_size > 1:
-            x = self.decode_group.all_gather(
-                _maybe_contiguous_for_sp_gather(x), dim=-2
-            )
+            x = self.decode_group.all_gather(_maybe_contiguous_for_sp_gather(x), dim=-2)
             x = x.contiguous()
         x = attention_block_forward(self, x)
         if self.world_size > 1:
