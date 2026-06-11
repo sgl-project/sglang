@@ -53,7 +53,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    set_attn_forward_flag,
+)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -304,6 +308,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.moe_fusions,
             dsa_indexers=self.dsa_indexers,
         ):
+            # M0.6 boundary reconcile: the legacy set_is_extend_in_batch(False)
+            # above sits OUTSIDE this forward_context block; replay reads the ctx
+            # flag, so the dual-write must ride this scope (cf. decode runner,
+            # where the set already sits inside its block).
+            set_attn_forward_flag(is_extend_in_batch=False)
             if self.layer_model is not None:
                 return self.layer_model.forward(
                     forward_batch.input_ids,

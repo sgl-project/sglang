@@ -55,6 +55,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
+from sglang.srt.model_executor.forward_context import set_attn_forward_flag
 from sglang.srt.model_executor.triton_ops.position import compute_position_triton
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -1126,6 +1127,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
+        # M0.6 dual-write: also publish into the per-forward ForwardContext (the
+        # sole place the flag can be True; rides the _forward_raw forward_context
+        # scope this method is called within). Legacy global kept until P6/P8.
+        set_attn_forward_flag(is_extend_in_batch=self.is_extend_in_batch)
 
         bs = self.batch_size
 

@@ -167,6 +167,7 @@ from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     has_forward_context,
+    set_attn_forward_flag,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -2892,6 +2893,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
+            # M0.6 dual-write: run_once runs inside the forward_context block below.
+            set_attn_forward_flag(is_extend_in_batch=False)
 
             kwargs = {}
             if (

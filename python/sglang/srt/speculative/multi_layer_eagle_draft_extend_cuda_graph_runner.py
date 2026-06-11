@@ -42,6 +42,7 @@ from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_req_to_token_pool,
+    set_attn_forward_flag,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
@@ -427,6 +428,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch.global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
+            # M0.6 dual-write: run_once runs inside the forward_context block below.
+            set_attn_forward_flag(is_extend_in_batch=False)
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states

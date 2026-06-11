@@ -67,7 +67,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
 )
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    set_attn_forward_flag,
+)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -870,6 +874,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.global_num_tokens_cpu,
                 )
                 set_is_extend_in_batch(False)
+                # M0.6 dual-write: run_once executes inside the forward_context
+                # block above, so this rides that scope. (Capture forces False,
+                # which already equals the container default — belt-and-suspenders.)
+                set_attn_forward_flag(is_extend_in_batch=False)
 
                 kwargs = {}
                 if (

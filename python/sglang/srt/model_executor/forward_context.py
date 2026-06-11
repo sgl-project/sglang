@@ -23,12 +23,29 @@ worker threads ever share a process, migrate to contextvars.ContextVar.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+
+
+@dataclass(frozen=True, slots=True)
+class AttnForwardFlags:
+    """Per-forward attention-side control flags (M0.6 lands the first one,
+    is_extend_in_batch, lifted from the dp_attention.py module global)."""
+
+    is_extend_in_batch: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardFlags:
+    """Per-forward derived/control flags, nested per subsystem — mirrors the
+    process-static RuntimeContext.flags shape (G4 forward side). M0.6 fills
+    only .attn; frozen so the freeze invariant is not leaked by a mutable child."""
+
+    attn: AttnForwardFlags = field(default_factory=AttnForwardFlags)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +55,7 @@ class ForwardContext:
     write time — use dataclasses.replace for per-call overrides."""
 
     attn_backend: AttentionBackend
+    flags: ForwardFlags = field(default_factory=ForwardFlags)
 
 
 _current: Optional[ForwardContext] = None
@@ -65,6 +83,34 @@ def get_forward_context() -> ForwardContext:
 
 def get_attn_backend() -> AttentionBackend:
     return get_forward_context().attn_backend
+
+
+def get_forward_flags() -> ForwardFlags:
+    """Thin accessor for the per-forward flags tree (limits reader coupling to
+    the container shape). Readers may also read the leaf directly:
+    ``get_forward_context().flags.attn.is_extend_in_batch``."""
+    return get_forward_context().flags
+
+
+def set_attn_forward_flag(*, is_extend_in_batch: bool) -> None:
+    """M0.6: per-iter set of an attention-side forward flag. ForwardContext is
+    frozen, so rebuild it via dataclasses.replace and re-publish into the active
+    forward_context() scope — reset is automatic on scope exit (same shape as the
+    PDmux per-stream override). No-op when no context is active (a set point
+    outside any forward scope, e.g. a pre-forward global set that _forward_raw's
+    fresh context would overwrite anyway)."""
+    if not has_forward_context():
+        return
+    cur = get_forward_context()
+    set_forward_context(
+        replace(
+            cur,
+            flags=replace(
+                cur.flags,
+                attn=replace(cur.flags.attn, is_extend_in_batch=is_extend_in_batch),
+            ),
+        )
+    )
 
 
 def get_token_to_kv_pool() -> KVCache:

@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -439,7 +440,11 @@ class NixlEPDispatcher(BaseDispatcher):
         return self._get_impl().combine_b(*inner_state)
 
     def _get_impl(self) -> _NixlEPDispatcherImplBase:
-        is_extend_in_batch = get_is_extend_in_batch()
+        # M0.6: read the per-forward flag from ForwardContext (lifted from the
+        # dp_attention global). The assert is a transition guard, dropped with the
+        # legacy global in P6/P8.
+        is_extend_in_batch = get_forward_context().flags.attn.is_extend_in_batch
+        assert is_extend_in_batch == get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             raise NotImplementedError("Normal mode is not supported for Nixl EP yet.")
