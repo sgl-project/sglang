@@ -28,7 +28,8 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
     attention_backend = "flashinfer"
     page_size = 1
     other_launch_args = []
-    spec_v2 = False
+    # Base classes exercise the non-overlap (synchronous) scheduling path.
+    disable_overlap = True
     overlap_plan_stream = False
     model = DEFAULT_TARGET_MODEL_DFLASH
     draft_model = DEFAULT_DRAFT_MODEL_DFLASH
@@ -57,9 +58,10 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
             "--cuda-graph-bs",
             *[str(i) for i in range(1, cls.max_running_requests + 1)],
         ]
+        if cls.disable_overlap:
+            launch_args.append("--disable-overlap-schedule")
         launch_args.extend(cls.other_launch_args)
         with (
-            envs.SGLANG_ENABLE_SPEC_V2.override(cls.spec_v2),
             envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.override(cls.overlap_plan_stream),
             envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
             envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
@@ -150,7 +152,7 @@ class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
 
 
 class TestDFlashServerSpecV2(TestDFlashServerBase):
-    spec_v2 = True
+    disable_overlap = False
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)

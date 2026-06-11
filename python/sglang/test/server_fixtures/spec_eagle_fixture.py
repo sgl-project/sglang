@@ -234,5 +234,5 @@ class EagleLlama2Base(SpecEagleServerBase):
     gsm8k_score_thres = 0.20
     acc_length_thres = 3.0
     batch_accept_len_thres = 1.8
-    # EAGLE topk>1 already routes to v1; force it explicitly to preserve intent.
-    env_overrides = ((envs.SGLANG_ENABLE_SPEC_V2, False),)
+    # topk>1 tree verify runs on the synchronous (non-overlap) path.
+    disable_overlap = True
