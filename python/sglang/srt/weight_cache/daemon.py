@@ -475,9 +475,13 @@ def launch_weight_cache_daemons(
 ):
     """Launch weight cache daemon processes for all TP ranks.
 
-    Spawns one daemon process per GPU (gpu_id == tp_rank), waits for all
+    Spawns one daemon subprocess per GPU (gpu_id == tp_rank), waits for all
     to become ready, then monitors them. If any daemon exits, all are
     terminated.
+
+    Uses subprocess.Popen instead of multiprocessing.Process to avoid
+    initializing CUDA in the parent process, which can degrade CUDA IPC
+    performance in child processes.
 
     This is the single-command entry point — instead of launching each
     rank manually, run:
@@ -488,8 +492,10 @@ def launch_weight_cache_daemons(
 
     and all 4 daemons will be started automatically.
     """
-    import multiprocessing as mp
+    import shutil
     import socket as sock_mod
+    import subprocess
+    import sys
 
     from .protocol import get_ready_path
 
@@ -500,29 +506,36 @@ def launch_weight_cache_daemons(
             free_port = s.getsockname()[1]
         dist_init_method = f"tcp://127.0.0.1:{free_port}"
 
-    mp.set_start_method("spawn", force=True)
+    python_path = sys.executable
+    daemon_module = "sglang.srt.weight_cache.daemon"
 
     procs = []
     for i in range(tp_size):
-        proc = mp.Process(
-            target=run_weight_cache_daemon,
-            kwargs=dict(
-                model_path=model_path,
-                gpu_id=i,
-                tp_size=tp_size,
-                tp_rank=i,
-                dp_size=dp_size,
-                load_format=load_format,
-                dtype=dtype,
-                quantization=quantization,
-                model_loader_extra_config=model_loader_extra_config,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                dist_init_method=dist_init_method,
-            ),
-            name=f"weight_cache_daemon_gpu{i}",
+        cmd = [
+            python_path, "-m", daemon_module,
+            "--model-path", model_path,
+            "--gpu-id", str(i),
+            "--tp-size", str(tp_size),
+            "--tp-rank", str(i),
+            "--dp-size", str(dp_size),
+            "--load-format", load_format,
+            "--dtype", dtype,
+            "--dist-init-method", dist_init_method,
+        ]
+        if quantization:
+            cmd += ["--quantization", quantization]
+        if model_loader_extra_config and model_loader_extra_config != "{}":
+            cmd += ["--model-loader-extra-config", model_loader_extra_config]
+        if trust_remote_code:
+            cmd += ["--trust-remote-code"]
+        if revision:
+            cmd += ["--revision", revision]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
-        proc.start()
         procs.append(proc)
         logger.info(
             f"Launched weight cache daemon gpu={i} rank={i} pid={proc.pid}"
@@ -542,25 +555,25 @@ def launch_weight_cache_daemons(
                     f"within {timeout}s"
                 )
                 for p in procs:
-                    if p.is_alive():
-                        p.terminate()
+                    p.terminate()
                 raise TimeoutError(
                     f"Weight cache daemon gpu={i} did not become ready "
                     f"within {timeout}s"
                 )
             # Check if any daemon exited prematurely
             for p in procs:
-                if not p.is_alive():
+                retcode = p.poll()
+                if retcode is not None:
                     logger.error(
                         f"Weight cache daemon exited prematurely "
-                        f"with code {p.exitcode}"
+                        f"with code {retcode}"
                     )
                     for other in procs:
-                        if other.is_alive():
+                        if other.poll() is None:
                             other.terminate()
                     raise RuntimeError(
                         f"Weight cache daemon exited prematurely "
-                        f"with code {p.exitcode}"
+                        f"with code {retcode}"
                     )
         logger.info(f"Weight cache daemon gpu={i} is ready")
 
@@ -572,15 +585,18 @@ def launch_weight_cache_daemons(
     # Monitor daemons — if any exits, terminate all and raise
     try:
         for proc in procs:
-            proc.join()
+            proc.wait()
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, shutting down daemons")
     finally:
         for proc in procs:
-            if proc.is_alive():
+            if proc.poll() is None:
                 proc.terminate()
         for proc in procs:
-            proc.join(timeout=5)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         logger.info("All weight cache daemons have been terminated")
 
 
