@@ -21,7 +21,7 @@ class BaseMatmul(ABC):
 class GroupedMatmul(BaseMatmul):
     def forward(
         self,
-        layer: torch.nn.Module,
+        quant_info,
         weight_prefix: str,
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
