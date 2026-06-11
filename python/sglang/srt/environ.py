@@ -841,6 +841,10 @@ class Envs:
     # Falls back to the separate stores when the main and index caches do not
     # share a store dtype (e.g. fp8 KV cache) or on non-CUDA devices.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
+    # MiniMax-M3 main sparse attention: force the Triton path even when MiniMax's
+    # MSA kernel (fmha_sm100) is importable on Blackwell. Kill-switch for A/B and
+    # for falling back if MSA misbehaves; otherwise MSA auto-enables when available.
+    SGLANG_DISABLE_MSA = EnvBool(False)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

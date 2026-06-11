@@ -38,6 +38,7 @@ def minimax_sparse_prefill(
     idx_sm_scale: Optional[float] = None,
     score_type: str = "max",
     disable_index_value: bool = False,
+    use_msa: bool = False,
 ):
     # All seqlen is less than topk, use full attention
     # Step 1: Flash attention with topk index (using index head)
@@ -70,23 +71,42 @@ def minimax_sparse_prefill(
         topk_idx = topk_index_reduce(
             topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
         )
-    # Step 3: Sparse attention using topk index (main head)
-    o = flash_prefill_with_gqa_share_sparse(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        sink=sink,
-        req_to_token=req_to_token,
-        slot_ids=slot_ids,
-        topk_idx=topk_idx,
-        block_size_q=block_size_q,
-        block_size_k=block_size_k,
-        cu_seqlens=cu_seqlens,
-        seq_lens=seq_lens,
-        prefix_lens=prefix_lens,
-        max_seqlen_q=max_seqlen_q,
-        sm_scale=sm_scale,
-    )
+    # Step 3: Sparse attention using topk index (main head). The MSA path only
+    # replaces this step; the indexer above is unchanged. MSA has no attn-sink
+    # input, so keep the Triton path when sink is present.
+    if use_msa and sink is None:
+        from .msa import msa_sparse_prefill_main
+
+        o = msa_sparse_prefill_main(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            topk_idx=topk_idx,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            block_size_k=block_size_k,
+            sm_scale=sm_scale,
+        )
+    else:
+        o = flash_prefill_with_gqa_share_sparse(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            sink=sink,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            topk_idx=topk_idx,
+            block_size_q=block_size_q,
+            block_size_k=block_size_k,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=max_seqlen_q,
+            sm_scale=sm_scale,
+        )
     return idx_o, o
 
 
@@ -116,6 +136,9 @@ def minimax_sparse_decode(
     disable_index_value: bool = False,
     dense_main_attn_fn: Optional[Callable] = None,
     page_size: int = 1,
+    use_msa: bool = False,
+    msa_kv_indices: Optional[torch.Tensor] = None,  # per-forward MSA page table (cached)
+    msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Step 1: Flash decode with topk index (using index head). When the dense main
     # attention is used, the indexer emits the page table directly (fused
@@ -152,19 +175,35 @@ def minimax_sparse_decode(
             topk_idx = topk_index_reduce(
                 topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
             )
-        # Step 3: Sparse attention using topk index (main head). main_attn_fn, when
-        # provided, replaces the custom kernel with a dense paged backend driven by a
-        # per-query page table gathered from topk_idx (see MiniMaxSparseAttnBackend).
-        o = flash_decode_with_gqa_share_sparse(
-            q=q,
-            sink=sink,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            req_to_token=req_to_token,
-            seq_lens=seq_lens,
-            slot_ids=slot_ids,
-            block_size=block_size_k,
-            topk_idx=topk_idx,
-            sm_scale=sm_scale,
-        )
+        # Step 3: Sparse attention using topk index (main head). The MSA path
+        # only replaces this step; keep the Triton path when sink is present.
+        if use_msa and sink is None:
+            from .msa import msa_sparse_decode_main
+
+            o = msa_sparse_decode_main(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                topk_idx=topk_idx,
+                req_to_token=req_to_token,
+                slot_ids=slot_ids,
+                seq_lens=seq_lens,
+                block_size_k=block_size_k,
+                sm_scale=sm_scale,
+                kv_indices=msa_kv_indices,
+                plan=msa_plan,
+            )
+        else:
+            o = flash_decode_with_gqa_share_sparse(
+                q=q,
+                sink=sink,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                req_to_token=req_to_token,
+                seq_lens=seq_lens,
+                slot_ids=slot_ids,
+                block_size=block_size_k,
+                topk_idx=topk_idx,
+                sm_scale=sm_scale,
+            )
     return idx_o, o

@@ -68,12 +68,51 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             ) // self.block_size_k + 1
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
 
+        # NVIDIA Blackwell (SM100): use MiniMax's MSA kernel (fmha_sm100) only
+        # for the main sparse-attention step when the kernel constraints hold.
+        # The lightning indexer remains unchanged; missing fmha_sm100 keeps the
+        # existing Triton path.
+        from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
+            msa_available,
+        )
         from sglang.srt.environ import envs
+
+        self.use_msa = (
+            not envs.SGLANG_DISABLE_MSA.get()
+            and msa_available()
+            and self.block_size_k == 128
+            and self.kv_pool.page_size == self.block_size_k
+            and self.topk_blocks in (4, 8, 16, 32)
+        )
+        # Per-forward MSA decode metadata (page table + fmha plan), shared by every
+        # sparse layer of a forward; (re)built in init_forward_metadata_out_graph.
+        self._msa_dec_meta = None
+        if self.use_msa:
+            from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+            # Per-rank head counts for the decode plan (== runtime q.shape[1] /
+            # k_cache.shape[1]); needed in out_graph where q/k_cache aren't available.
+            self.num_q_heads = (
+                runner.model_config.num_attention_heads // get_attention_tp_size()
+            )
+            # KV head count lives on the main sub-pool (== runtime k_cache.shape[1]).
+            self.num_kv_heads = self.kv_pool.main_pool.head_num
+            # CUDA-graph decode: one persistent plan + page-table buffer per batch
+            # size, refreshed in place each step (worklist is length-independent).
+            self._msa_nb_max = (
+                self.max_context_len + self.block_size_k - 1
+            ) // self.block_size_k
+            self._msa_cg: dict[int, tuple] = {}
 
         self.page_size = self.kv_pool.page_size
         self.use_dense_sparse_decode = (
             envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
+        )
+        # MSA owns the main decode step unless dense-sparse-decode does; the dense
+        # path only engages when k_cache.shape[1] == 1 (see forward_decode).
+        self._msa_owns_decode = self.use_msa and not (
+            self.use_dense_sparse_decode and self.kv_pool.main_pool.head_num == 1
         )
         # The page table + effective KV length are allocated and returned by the
         # fused decode top-k kernel each layer, so the backend keeps no metadata.
@@ -82,6 +121,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
+            f"main_attn={'MSA' if self.use_msa else 'triton'}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
 
@@ -94,6 +134,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         # cuda-graph replay views are a SimpleNamespace without extend_seq_lens_cpu,
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
+        # New forward -> invalidate the cached per-forward MSA decode metadata.
+        self._msa_dec_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
@@ -103,6 +145,53 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+
+        # Build the MSA decode plan + page table here (eager, outside graph capture)
+        # so forward_decode — captured into the graph — only runs device-side ops.
+        # Runs at capture, replay, and eager, refreshing the persistent buffers the
+        # captured graph reads. Skipped when the dense-sparse-decode path owns decode.
+        if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
+            self._prepare_msa_decode_meta(forward_batch)
+
+    def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
+        """Refresh the persistent per-batch-size MSA decode plan + page table in place."""
+        from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
+            build_msa_decode_cg_plan,
+            update_msa_decode_cg_meta,
+        )
+
+        bs = forward_batch.seq_lens.shape[0]
+        if bs == 0:
+            return
+        entry = self._msa_cg.get(bs)
+        if entry is None:
+            device = forward_batch.seq_lens.device
+            plan = build_msa_decode_cg_plan(
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.block_size_k,
+                self.topk_blocks,
+                bs,
+                device=device,
+            )
+            kv_indices_buf = torch.zeros(
+                bs * self._msa_nb_max, dtype=torch.int32, device=device
+            )
+            entry = (plan, kv_indices_buf)
+            self._msa_cg[bs] = entry
+        plan, kv_indices_buf = entry
+        update_msa_decode_cg_meta(
+            plan,
+            kv_indices_buf,
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            self.block_size_k,
+            self.topk_blocks,
+            self.num_q_heads,
+            self.num_kv_heads,
+        )
+        self._msa_dec_meta = (kv_indices_buf, plan)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         pass
@@ -224,6 +313,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.local_blocks,
             score_type=self.score_type,
             disable_index_value=disable_value,
+            use_msa=self.use_msa,
         )
 
         # Pad output back to original size for DP communication
@@ -323,6 +413,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 forward_batch,
             )
 
+        # The MSA decode page table + plan are built once per forward in
+        # init_forward_metadata_out_graph (eager, outside graph capture) and shared
+        # across all sparse layers; here we just consume the cached metadata.
+        msa_kv_indices = msa_plan = None
+        if self.use_msa and attn_fn is None:
+            if self._msa_dec_meta is not None:
+                msa_kv_indices, msa_plan = self._msa_dec_meta
+            elif q.shape[0] > 0:
+                # Rebuilding the plan inline would run host-side code inside
+                # CUDA-graph capture; fail loudly instead.
+                raise RuntimeError(
+                    "MSA decode metadata missing: init_forward_metadata_out_graph "
+                    "did not prepare the plan for this forward (gate mismatch)."
+                )
+
         idx_o, o = minimax_sparse_decode(
             q,
             None,
@@ -345,6 +450,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_value,
             dense_main_attn_fn=attn_fn,
             page_size=self.page_size,
+            use_msa=self.use_msa,
+            msa_kv_indices=msa_kv_indices,
+            msa_plan=msa_plan,
         )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),

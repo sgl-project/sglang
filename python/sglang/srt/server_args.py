@@ -2004,6 +2004,24 @@ class ServerArgs:
                     self.enable_aiter_allreduce_fusion = False
                 if not self.enable_aiter_allreduce_fusion:
                     self.disable_custom_all_reduce = True
+            elif is_sm100_supported():
+                # SM100 family (sm_100 B200 / sm_103 B300): fa4 + page 128 let the MSA kernel
+                # (fmha_sm100) take the main sparse-attention step — its gate
+                # needs page_size == sparse block size == 128, while the
+                # trtllm_mha default pins page_size to 64. deep_gemm avoids
+                # the flashinfer_trtllm MoE grouped-routing assert
+                # (n_group != 0) on M3's plain top-k router.
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "fa4"
+                if self.page_size is None and self.attention_backend == "fa4":
+                    self.page_size = 128
+                if self.moe_runner_backend == "auto" and self.quantization == "mxfp8":
+                    self.moe_runner_backend = "deep_gemm"
+                logger.info(
+                    "MiniMax-M3 on SM100: attention_backend="
+                    f"{self.attention_backend}, page_size={self.page_size}, "
+                    f"moe_runner_backend={self.moe_runner_backend}."
+                )
 
         if model_arch in [
             "DeepseekV4ForCausalLM",
