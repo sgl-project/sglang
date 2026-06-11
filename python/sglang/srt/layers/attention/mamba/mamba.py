@@ -547,8 +547,6 @@ class MambaMixer2(torch.nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        if projected_states.shape[0] > num_actual_tokens:
-            preallocated_ssm_out[num_actual_tokens:].zero_()
         preallocated_ssm_out_active = preallocated_ssm_out[:num_actual_tokens]
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out_active,
@@ -766,8 +764,6 @@ class MambaMixer2(torch.nn.Module):
         hidden_states = self.norm(preallocated_ssm_out, gate)
 
         mixer_out, _ = self.out_proj(hidden_states)
-        if mixer_out.shape[0] > num_actual_tokens:
-            mixer_out[num_actual_tokens:].zero_()
         if output is not None:
             output[:padded_num_tokens].copy_(mixer_out)
 

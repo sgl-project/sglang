@@ -406,7 +406,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
-    global_num_tokens_non_padded_cpu: Optional[List[int]] = None
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None
     global_num_tokens_cpu: Optional[List[int]] = None
@@ -721,7 +720,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
-            ret.global_num_tokens_non_padded_cpu = list(global_num_tokens)
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64

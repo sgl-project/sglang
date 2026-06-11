@@ -87,8 +87,6 @@ from sglang.srt.models.nemotron_h_utils import (
     is_attn_layer,
     make_layer_communicator,
     pad_to_original_num_tokens,
-    zero_dp_global_padding_rows,
-    zero_dp_padding_rows,
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
@@ -328,13 +326,9 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if is_dp_attention_enabled():
-            hidden_states, residual = zero_dp_padding_rows(
-                hidden_states, forward_batch, residual
-            )
             hidden_states, residual = self.layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
-            hidden_states = zero_dp_global_padding_rows(hidden_states, forward_batch)
             hidden_states = self.mixer.forward(hidden_states)
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
@@ -424,9 +418,6 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.prev_layer_is_attn and residual is not None:
             hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states, residual = zero_dp_padding_rows(
-            hidden_states, forward_batch, residual
-        )
         return self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -499,7 +490,6 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
                 return torch.zeros_like(hidden_states), residual
 
             output = self._forward_mamba(hidden_states, forward_batch)
-            output, _ = zero_dp_padding_rows(output, forward_batch)
             return output, residual
 
         if residual is None:
@@ -624,8 +614,6 @@ class NemotronHAttention(nn.Module):
 
         attn_output = pad_to_original_num_tokens(attn_output, padded_shape)
         output, _ = self.o_proj(attn_output)
-        if has_padding:
-            output[real_tokens:].zero_()
         return output
 
 
