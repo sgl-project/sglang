@@ -158,9 +158,7 @@ class TestGetHashStr(CustomTestCase):
     def test_returns_64_char_hex(self):
         for tokens in [[], [1], [1, 2, 3], [(1, 2)], [1, 2, 3, 4, 5]]:
             result = get_hash_str(tokens)
-            self.assertIsInstance(result, str)
-            self.assertEqual(len(result), 64)
-            self.assertTrue(all(c in "0123456789abcdef" for c in result))
+            self.assertRegex(result, r"^[0-9a-f]{64}$")
 
 
 class TestHashStrToInt64(CustomTestCase):
