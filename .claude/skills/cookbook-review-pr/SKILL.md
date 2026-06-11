@@ -150,6 +150,16 @@ than restating.
   or `../`-relative links. `docs.sglang.io` is canonical.
 - No Google-Drive image links (don't render). Shell placeholders are `export VAR=<value>`,
   not `${VAR}` (a bash no-op).
+- **Parser ids must exist in the code registries** on the PR's target branch: every
+  `--reasoning-parser X` / `--tool-call-parser Y` named in prose or in
+  `playgroundFeatures.parsers` flags is a registered key in
+  `python/sglang/srt/parser/reasoning_parser.py` (DetectorMap) /
+  `python/sglang/srt/function_call/function_call_parser.py` (ToolCallParserEnum) —
+  prose naming a near-miss id (e.g. the reasoning id where the tool id differs) is a
+  factual bug. `--…-parser auto` is acceptable ONLY if the template-detection rules
+  (`python/sglang/srt/managers/template_detection.py`) actually resolve THIS model's
+  chat template to the right parser — no rule match means auto silently disables the
+  parser; when in doubt require explicit ids (the DSv4 page pins explicit ids).
 
 ### 9b. MDX authoring (Mintlify) — detail in `cookbook-add-model/references/mintlify-authoring.md`
 - **Forbidden syntax**: no Docusaurus admonitions (`:::`), `@site`/`@theme`, GitHub alert
