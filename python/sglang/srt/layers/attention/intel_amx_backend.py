@@ -15,10 +15,7 @@ if TYPE_CHECKING:
 
 
 class IntelAMXAttnBackend(AttentionBackend):
-    def __init__(
-        self,
-        model_runner: ModelRunner,
-    ):
+    def __init__(self, model_runner: ModelRunner):
         import sgl_kernel  # noqa: F401
 
         super().__init__()
@@ -58,13 +55,11 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         # speculative decoding params
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
 
         bs = forward_batch.batch_size
-        spec_info = forward_batch.spec_info
         attn_logits = torch.zeros(
             (
                 bs,
@@ -79,8 +74,6 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             max_extend_len = self.num_draft_tokens
-        elif forward_batch.forward_mode.is_draft_extend():
-            max_extend_len = torch.max(spec_info.num_accept_tokens).item()
         else:
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
         self.forward_metadata = (attn_logits, max_extend_len)
@@ -117,12 +110,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        if forward_mode.is_target_verify():
-            max_extend_len = self.num_draft_tokens
-        elif forward_mode.is_draft_extend(include_v2=True):
-            max_extend_len = self.speculative_num_steps + 1
-        else:
-            max_extend_len = None
+        max_extend_len = None
         self.forward_metadata = (attn_logits, max_extend_len)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -197,7 +185,6 @@ class IntelAMXAttnBackend(AttentionBackend):
         else:
             extend_start_loc = forward_batch.extend_start_loc
 
-        seq_lens = seq_lens.to(torch.int64)
         _, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -256,7 +243,6 @@ class IntelAMXAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-        seq_lens = seq_lens.to(torch.int64)
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),

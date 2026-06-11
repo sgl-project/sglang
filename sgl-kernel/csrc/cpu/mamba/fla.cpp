@@ -831,8 +831,6 @@ void fused_sigmoid_gating_delta_rule_update_impl(
     float* __restrict__ isb_ptr,
     const int32_t* __restrict__ isi_ptr,
     int64_t isb_cache_steps,
-    const int32_t* __restrict__ rpt_ptr,
-    int64_t rpt_stride,
     // Dimensions
     int64_t num_sequences,
     int64_t total_tokens,
@@ -931,14 +929,6 @@ void fused_sigmoid_gating_delta_rule_update_impl(
 
       for (int64_t t = 0; t < T; ++t) {
         int64_t pos = bos + t;
-
-        if (rpt_ptr != nullptr && t > 0 && cache_idx >= 0) {
-          int32_t parent_step = rpt_ptr[i_n * rpt_stride + t];
-          std::memcpy(
-              h,
-              isb_ptr + cache_idx * isb_cache_stride + parent_step * isb_step_stride + ni * state_entry_size,
-              state_entry_size * sizeof(float));
-        }
 
         float g_val = -std::exp(static_cast<float>(A_log_ptr[ni])) *
                       softplus(
@@ -1374,13 +1364,14 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
 
   float* isb_ptr = nullptr;
   const int32_t* isi_ptr = nullptr;
-  const int32_t* rpt_ptr = nullptr;
-  int64_t rpt_stride = 0;
   int64_t isb_cache_steps = 0;
 
+  // Accepted for call-site compatibility with the CUDA kernel and rejected:
+  // tree verify (topk > 1) is not supported for hybrid GDN models on CPU
+  // (the CPU causal-conv kernel is not tree-aware; server_args rejects it).
   TORCH_CHECK(
-      !retrieve_parent_token.has_value() || intermediate_states_buffer.has_value(),
-      "fused_sigmoid_gating_delta_rule_update_cpu: retrieve_parent_token requires intermediate_states_buffer");
+      !retrieve_parent_token.has_value(),
+      "fused_sigmoid_gating_delta_rule_update_cpu: retrieve_parent_token (tree verify) is not supported on CPU");
 
   if (intermediate_states_buffer.has_value()) {
     auto& isb = intermediate_states_buffer.value();
@@ -1402,16 +1393,6 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     CHECK_EQ(isi.scalar_type(), at::kInt);
     CHECK_EQ(isi.size(0), num_sequences);
     isi_ptr = isi.data_ptr<int32_t>();
-  }
-
-  if (retrieve_parent_token.has_value()) {
-    auto& rpt = retrieve_parent_token.value();
-    CHECK_DIM(2, rpt);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(rpt);
-    CHECK_EQ(rpt.scalar_type(), at::kInt);
-    CHECK_EQ(rpt.size(0), num_sequences);
-    rpt_stride = rpt.stride(0);
-    rpt_ptr = rpt.data_ptr<int32_t>();
   }
 
   int64_t q_stride_token = q.stride(1);
@@ -1445,8 +1426,6 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
               isb_ptr,
               isi_ptr,
               isb_cache_steps,
-              rpt_ptr,
-              rpt_stride,
               num_sequences,
               total_tokens,
               num_heads,
@@ -1479,8 +1458,6 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
               isb_ptr,
               isi_ptr,
               isb_cache_steps,
-              rpt_ptr,
-              rpt_stride,
               num_sequences,
               total_tokens,
               num_heads,

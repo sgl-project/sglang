@@ -69,7 +69,7 @@ void build_tree_kernel_efficient_cpu(
     int64_t depth,
     int64_t draft_token_num,
     int64_t tree_mask_mode) {
-  // tree_mask_mode: 0=FULL_MASK, 1=QLEN_ONLY, 2=QLEN_ONLY_BITPACKING
+  // tree_mask_mode: 0=FULL_MASK, 1=QLEN_ONLY (2=QLEN_ONLY_BITPACKING is rejected below)
   int64_t bs = parent_list.size(0);
 
   auto* parent_ptr = parent_list.data_ptr<int64_t>();
@@ -83,14 +83,9 @@ void build_tree_kernel_efficient_cpu(
   int64_t parent_stride = topk * (depth - 1) + 1;
   int64_t sel_stride = draft_token_num - 1;
 
-  // Determine bytes per item for bitpacking mode
-  size_t num_bytes_per_item = 1;
-  if (tree_mask_mode == 2) {  // QLEN_ONLY_BITPACKING
-    if (draft_token_num > 16)
-      num_bytes_per_item = 4;
-    else if (draft_token_num > 8)
-      num_bytes_per_item = 2;
-  }
+  // CPU workers always use FULL_MASK or QLEN_ONLY; QLEN_ONLY_BITPACKING has no
+  // CPU producer and is untested here.
+  TORCH_CHECK(tree_mask_mode != 2, "build_tree_kernel_efficient_cpu: QLEN_ONLY_BITPACKING is not supported on CPU");
 
   for (int64_t bid = 0; bid < bs; ++bid) {
     int64_t off = bid * draft_token_num;
@@ -126,31 +121,7 @@ void build_tree_kernel_efficient_cpu(
     }
 
     // Build tree_mask and positions for tid > 0
-    if (tree_mask_mode == 2) {  // QLEN_ONLY_BITPACKING
-      uint8_t* mask_base = reinterpret_cast<uint8_t*>(tree_mask.data_ptr());
-      for (int64_t tid = 0; tid < draft_token_num; ++tid) {
-        size_t item_offset = (off + tid) * num_bytes_per_item;
-        mask_base[item_offset] = 1;  // set self bit (little endian)
-      }
-      for (int64_t tid = 1; tid < draft_token_num; ++tid) {
-        size_t item_offset = (off + tid) * num_bytes_per_item;
-        int64_t position = 0;
-        int64_t cur = tid - 1;
-        while (true) {
-          position++;
-          int64_t byte_idx = (cur + 1) / 8;
-          int64_t bit_idx = (cur + 1) % 8;
-          mask_base[item_offset + byte_idx] |= (1 << bit_idx);
-          int64_t ptb = sel_ptr[bid * sel_stride + cur] / topk;
-          if (ptb == 0) break;
-          int64_t tok_idx = parent_ptr[bid * parent_stride + ptb];
-          for (cur = 0; cur < draft_token_num; ++cur) {
-            if (sel_ptr[bid * sel_stride + cur] == tok_idx) break;
-          }
-        }
-        pos_ptr[off + tid] = position + seq_len;
-      }
-    } else if (tree_mask_mode == 1) {  // QLEN_ONLY
+    if (tree_mask_mode == 1) {  // QLEN_ONLY
       bool* mask_ptr = tree_mask.data_ptr<bool>();
       int64_t mask_stride = draft_token_num;
       for (int64_t tid = 0; tid < draft_token_num; ++tid) {

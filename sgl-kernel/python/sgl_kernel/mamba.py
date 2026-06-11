@@ -89,9 +89,9 @@ def causal_conv1d_update_cpu(
     retrieve_parent_token=None,
 ):
     # retrieve_next_token / retrieve_next_sibling / retrieve_parent_token are
-    # accepted for call-site compatibility with the CUDA conv kernel (which
-    # builds the parent-token table fused in the conv update). On CPU the
-    # table is built once per verify step in GDNAttnBackend.init_forward_metadata.
+    # accepted for call-site compatibility with the CUDA conv kernel and
+    # ignored: tree verify (topk > 1) is rejected for hybrid GDN models on
+    # CPU in server_args, so they are always None here.
     return torch.ops.sgl_kernel.causal_conv1d_update_cpu(
         mixed_qkv,
         conv_states,
