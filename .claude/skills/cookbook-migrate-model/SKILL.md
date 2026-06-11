@@ -103,11 +103,12 @@ has a third operating point (see dimension-mapping.md §4).
 One entry per measured block only (cells without entries already render
 "pending" — bare `{match}` stubs are unnecessary). `tokens_per_sec_per_gpu` =
 output tok/s ÷ (tp × nnodes); TTFT/TPOT take the Mean rows; put the workload's
-`num_prompts` into `workload`. Evals outside the engine's default
-gpqa/aime25/gsm8k keys need `config.accuracyLabels` (engine support from
-PR #27842); extra context (sample counts, suites that don't fit) goes in the
-entry's `notes`. Zero-measured-data pages: skip the file and the `benchmarks`
-prop entirely, but keep `benchmarkCommands` so ⚡Reproduce still guides users.
+`num_prompts` into `workload`. **`config.accuracyLabels` is required whenever
+the benchmarks carry accuracy data** — the engine ships no default eval set
+(#27842), so missing labels means the accuracy rows silently don't render;
+extra context (sample counts, suites that don't fit) goes in the entry's
+`notes`. Zero-measured-data pages: skip the file and the `benchmarks` prop
+entirely, but keep `benchmarkCommands` so ⚡Reproduce still guides users.
 
 ### 5. Rewrite the MDX
 From `page.mdx.tmpl`: keep the original `title` (nav identity), write a fresh

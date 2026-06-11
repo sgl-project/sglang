@@ -71,10 +71,11 @@ green addition, never a strikethrough.
   fusion flags), the verified cell mirrors the measurement; the generator
   default lives on as the not-verified sibling cells. Offer BOTH as Playground
   `speculative` presets and explain the split in §2 tips.
-- Benchmarks accuracy keys outside gpqa/aime25/gsm8k need `config.accuracyLabels`
-  (engine PR #27842); until merged the card degrades gracefully to the keys it
-  knows. `defaultAccuracy` paints every *entry-bearing* cell of a variant — under
-  the strict policy prefer per-entry `accuracy` on the measured cell only.
+- `config.accuracyLabels` is REQUIRED whenever benchmarks carry accuracy data —
+  the engine ships no default eval set (#27842); without it the accuracy rows
+  silently don't render. `defaultAccuracy` paints every *entry-bearing* cell of
+  a variant — under the strict policy prefer per-entry `accuracy` on the
+  measured cell only.
 
 ## 4. Per-family strategy sets (pre-designed; adjust at inventory time)
 
