@@ -30,7 +30,7 @@ class GroupedMatmul(BaseMatmul):
         **scale_args,
     ) -> torch.Tensor:
         # Use cached weight attribute if available, otherwise fall back to direct getattr
-        weight = getattr(layer, f"{weight_prefix}_weight", None)
+        weight = getattr(quant_info, f"{weight_prefix}_weight", None)
         if weight is None:
             raise AttributeError(
                 f"Weight attribute '{weight_prefix}_weight' not found in layer"
