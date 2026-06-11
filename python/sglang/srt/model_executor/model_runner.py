@@ -172,6 +172,10 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     _allocate_decode_buffers,
 )
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    enable_tc_piecewise_cuda_graph,
+    set_tc_piecewise_forward_context,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -2979,6 +2983,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
                     attn_layer = layer.self_attn.attn_mqa
+                    if _is_hip and hasattr(layer.self_attn, "attn_mha"):
+                        attn_layer._pcg_mha_companion = layer.self_attn.attn_mha
             # For hybrid model
             elif hasattr(layer, "attn"):
                 attn_layer = layer.attn
@@ -3206,7 +3212,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch: ForwardBatch,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if not self.server_args.enable_pdmux and self.device == "cuda":
+        if not self.server_args.enable_pdmux:
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
         # Set extra arguments
         pdmux_override = False
@@ -3296,7 +3302,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ret = self.prefill_cuda_graph_runner.replay(forward_batch, **kwargs)
             return (ret, can_run_graph)
 
-        if not self.server_args.enable_pdmux and self.device == "cuda":
+        if not self.server_args.enable_pdmux:
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
 
         # Launch model forward
@@ -3313,12 +3319,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         with ctx:
-            ret = self.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
+            if _is_hip and self.prefill_cuda_graph_runner is not None:
+                # AMD/HIP: when PCG is enabled but the batch exceeds max captured
+                # size, run eagerly under enable_tc_piecewise_cuda_graph() and
+                # set_tc_piecewise_forward_context() so that (a) Dynamo guards on
+                # _in_tc_piecewise_cuda_graph stay consistent with the PCG-traced
+                # graph (preventing runtime recompilation) and (b) PCG-specific
+                # code paths (MoE, attention) can access their layer objects.
+                with (
+                    enable_tc_piecewise_cuda_graph(),
+                    set_tc_piecewise_forward_context(
+                        forward_batch,
+                        self.attention_layers,
+                        getattr(self.model, "quant_config", None),
+                        self.moe_layers,
+                        self.moe_fusions,
+                        dsa_indexers=self.dsa_indexers,
+                    ),
+                ):
+                    ret = self.model.forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
+            else:
+                ret = self.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
         return (ret, can_run_graph)
 
     def forward_idle(
@@ -3332,7 +3363,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # called from the idle path can re-read a prior batch's req_pool
         # indices and trigger SWA mapping use-after-free.
         if forward_batch.batch_size > 0:
-            if not self.server_args.enable_pdmux and self.device == "cuda":
+            if not self.server_args.enable_pdmux:
                 forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
             self.attn_backend.init_forward_metadata(forward_batch)
         else:
