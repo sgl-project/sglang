@@ -93,7 +93,6 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.plugins import load_plugins
 from sglang.srt.reasoning_utils import resolve_require_reasoning
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.structured_output_utils import apply_response_format_to_sampling_params
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
@@ -369,7 +368,6 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         reasoning_effort: Optional[str] = None,
-        response_format: Optional[Dict[str, Any]] = None,
         priority: Optional[int] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
@@ -383,10 +381,6 @@ class Engine(EngineScoreMixin, EngineBase):
             require_reasoning,
             chat_template_kwargs,
             reasoning_effort,
-        )
-        sampling_params = apply_response_format_to_sampling_params(
-            sampling_params,
-            response_format,
         )
 
         obj = GenerateReqInput(
@@ -483,7 +477,6 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         reasoning_effort: Optional[str] = None,
-        response_format: Optional[Dict[str, Any]] = None,
         priority: Optional[int] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
@@ -497,10 +490,6 @@ class Engine(EngineScoreMixin, EngineBase):
             require_reasoning,
             chat_template_kwargs,
             reasoning_effort,
-        )
-        sampling_params = apply_response_format_to_sampling_params(
-            sampling_params,
-            response_format,
         )
 
         obj = GenerateReqInput(
