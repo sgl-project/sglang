@@ -1151,7 +1151,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             prefill_input_ids_cpu=torch.tensor([1, 2, 3], dtype=torch.int64),
             input_ids=None,
             mix_running_indices=None,
-            is_spec_v2=False,
             device="cpu",
         )
         scheduler.get_next_batch_to_run = lambda: batch
