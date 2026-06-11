@@ -113,14 +113,14 @@ sgl-eval run gsm8k \\
     default: { gsm8k_pct: null },
   },
 
-  // OPTIONAL — replace the default eval set (gpqa_pct / aime25_pct / gsm8k_pct)
-  // when the model was measured on other benchmarks. [key, label, unit] tuples;
-  // keys must match benchmarks[].accuracy + benchmarkCommands.accuracy. Delete
-  // to keep the default three.
-  // accuracyLabels: [
-  //   ["gsm8k_pct", "GSM8K", "%"],
-  //   ["mmmu_pct",  "MMMU (val)", "%"],
-  // ],
+  // The eval set rendered in the benchmark card + "⚡ Reproduce" — the engine
+  // ships NO default; required whenever the benchmarks carry accuracy data
+  // (without it the accuracy rows silently don't render). [key, label, unit]
+  // tuples; keys must match benchmarks[].accuracy + defaultAccuracy +
+  // benchmarkCommands.accuracy. Delete only if there are no accuracy numbers.
+  accuracyLabels: [
+    ["gsm8k_pct", "GSM8K", "%"],
+  ],
 
   // OPTIONAL — `# ...` hint lines prepended to multi-node commands, ONLY for hw
   // whose fabric needs manual NIC env (e.g. gb200 NVL72/MNNVL). NOT every multi-N

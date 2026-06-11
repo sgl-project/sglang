@@ -20,9 +20,9 @@
 //   benchmarkCommands  optional — powers the "⚡ Reproduce" modal (speed +
 //                      per-eval accuracy templates)
 //   defaultAccuracy    optional — per-variant accuracy merged under cell.accuracy
-//   accuracyLabels     optional — [key, label, unit][] replacing the default
-//                      eval set (GPQA/AIME25/GSM8K) in the benchmark card and
-//                      the "⚡ Reproduce" modal
+//   accuracyLabels     [key, label, unit][] — the eval set shown in the
+//                      benchmark card + "⚡ Reproduce". NO engine default:
+//                      required whenever benchmarks carry accuracy data
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
 //   dockerImages       optional — per-hw image for `docker run` mode
 //   github             optional — "Submit verified cell" issue-template overrides
@@ -533,15 +533,12 @@ export const Deployment = ({ config, benchmarks }) => {
     return cmd;
   };
 
-  // Accuracy labels: [field-key, display-label, unit]. Keys must match the
-  // `accuracy` fields in the benchmarks file + `benchmarkCommands.accuracy`.
-  // A model whose evals don't fit these three can override the whole list via
-  // `config.accuracyLabels` (same tuple shape).
-  const ACCURACY_LABELS = config.accuracyLabels || [
-    ["gpqa_pct",   "GPQA Diamond", "%"],
-    ["aime25_pct", "AIME25",       "%"],
-    ["gsm8k_pct",  "GSM8K (1-shot)", "%"],
-  ];
+  // Accuracy labels: [field-key, display-label, unit]. Declared per model via
+  // `config.accuracyLabels` — the engine ships NO default eval set. A config
+  // without it renders no accuracy rows (and no Accuracy section in the
+  // "⚡ Reproduce" modal). Keys must match the `accuracy` fields in the
+  // benchmarks file + `benchmarkCommands.accuracy`.
+  const ACCURACY_LABELS = config.accuracyLabels || [];
 
   const renderBenchmarkCard = (entry) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
