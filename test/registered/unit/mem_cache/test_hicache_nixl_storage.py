@@ -773,5 +773,130 @@ class TestNixlDirectIO(CustomTestCase):
         self.assertFalse(hicache.file_manager.use_direct_io)
 
 
+class TestDocaMemosNixl(unittest.TestCase):
+    """DOCA_MEMOS key hashing, hugepage config, and backend gating."""
+
+    def test_format_key_doca_memos(self):
+        import hashlib
+        from unittest.mock import MagicMock
+
+        from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
+
+        k = "some/cache/key@suffix"
+        formatted = hashlib.sha256(k.encode("utf-8")).hexdigest()[:32]
+        dummy = HiCacheNixl.__new__(HiCacheNixl)
+        dummy.backend_selector = MagicMock()
+        dummy.backend_selector.backend_name = "DOCA_MEMOS"
+        dummy.backend_selector.mem_type = "OBJ"
+        self.assertEqual(dummy._format_key(k), formatted)
+
+    def test_doca_memos_backend_requires_hugepage_env(self):
+        from unittest.mock import MagicMock, patch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.mmap_allocator import HUGEPAGE_BYTES_2MB
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
+            NixlBackendConfig,
+            NixlBackendSelection,
+        )
+
+        agent = MagicMock()
+        agent.get_plugin_list.return_value = ["DOCA_MEMOS"]
+        agent.get_backend_params.return_value = {}
+        selector = NixlBackendSelection(
+            plugin="DOCA_MEMOS",
+            nixlconfig=NixlBackendConfig({}),
+        )
+        with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+            self.assertFalse(selector.create_backend(agent))
+        with envs.SGLANG_HUGEPAGE_SIZE.override("1GB"):
+            self.assertFalse(selector.create_backend(agent))
+        selector = NixlBackendSelection(
+            plugin="DOCA_MEMOS",
+            nixlconfig=NixlBackendConfig({}),
+        )
+        with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+            with patch(
+                "sglang.srt.mem_cache.mmap_allocator.hugepage_available_bytes",
+                return_value=HUGEPAGE_BYTES_2MB,
+            ):
+                self.assertTrue(selector.create_backend(agent))
+        selector = NixlBackendSelection(
+            plugin="DOCA_MEMOS",
+            nixlconfig=NixlBackendConfig({}),
+        )
+        with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+            with patch(
+                "sglang.srt.mem_cache.mmap_allocator.hugepage_available_bytes",
+                return_value=0,
+            ):
+                self.assertFalse(selector.create_backend(agent))
+
+    def test_memory_available_bytes_uses_max_of_ram_and_hugetlb(self):
+        from unittest.mock import MagicMock, patch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache import mmap_allocator
+        from sglang.srt.mem_cache.mmap_allocator import (
+            HUGEPAGE_BYTES_2MB,
+            memory_available_bytes,
+        )
+
+        normal_ram_bytes = 100 * 1024 * 1024
+        hugetlb_bytes = 100 * HUGEPAGE_BYTES_2MB
+        low_ram = MagicMock(available=normal_ram_bytes)
+        with patch.object(
+            mmap_allocator.psutil, "virtual_memory", return_value=low_ram
+        ):
+            with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+                self.assertEqual(memory_available_bytes(), normal_ram_bytes)
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(
+                    mmap_allocator,
+                    "hugepage_available_bytes",
+                    return_value=hugetlb_bytes,
+                ):
+                    self.assertEqual(memory_available_bytes(), hugetlb_bytes)
+
+    def test_hugepage_size_requested(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.mmap_allocator import (
+            HUGEPAGE_BYTES_1GB,
+            HUGEPAGE_BYTES_2MB,
+            hugepage_size_requested,
+        )
+
+        with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+            self.assertEqual(hugepage_size_requested(), 0)
+        with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+            self.assertEqual(hugepage_size_requested(), HUGEPAGE_BYTES_2MB)
+        with envs.SGLANG_HUGEPAGE_SIZE.override("1GB"):
+            self.assertEqual(hugepage_size_requested(), HUGEPAGE_BYTES_1GB)
+
+    def test_tensor_mem_backend_reflects_alloc(self):
+        import ctypes
+        from unittest.mock import patch
+
+        import torch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache import mmap_allocator
+        from sglang.srt.mem_cache.mmap_allocator import (
+            MEM_BACKEND_HUGEPAGE,
+            MEM_BACKEND_MMAP,
+            tensor_mem_backend,
+        )
+
+        with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+            buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+            self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_MMAP)
+
+        with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+            with patch.object(mmap_allocator, "_alloc_hugepage") as mock_hp:
+                mock_hp.return_value = (ctypes.c_uint8 * 16)()
+                buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+            self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_HUGEPAGE)
+
+
 if __name__ == "__main__":
     unittest.main()

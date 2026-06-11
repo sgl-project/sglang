@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import time
 import uuid
@@ -13,7 +14,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
-from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.mmap_allocator import (
+    MEM_BACKEND_HUGEPAGE,
+    alloc_mmap,
+    tensor_mem_backend,
+)
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
@@ -119,14 +124,19 @@ class HiCacheNixl(HiCacheStorage):
         self._bounce_get: Optional[torch.Tensor] = None
         self._bounce_page_bytes: Optional[int] = None
 
+    def _format_key(self, key: str) -> str:
+        if self.backend_selector.backend_name == "DOCA_MEMOS":
+            return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        if self.backend_selector.mem_type == "FILE":
+            return self.file_manager.get_file_path(key)
+        return key
+
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
     def _create_query_tuple(self, key: str) -> tuple:
         """Build the NIXL query_memory tuple for a single key."""
-        if self.backend_selector.mem_type == "FILE":
-            return (0, 0, 0, self.file_manager.get_file_path(key))
-        return (0, 0, 0, key)
+        return (0, 0, 0, self._format_key(key))
 
     def _xfer_and_wait(
         self,
@@ -233,6 +243,19 @@ class HiCacheNixl(HiCacheStorage):
             "page_first",
             "page_first_direct",
         ]
+
+        if self.backend_selector.backend_name == "DOCA_MEMOS":
+            if not self.is_zero_copy:
+                raise RuntimeError(
+                    "HiCache NIXL DOCA_MEMOS requires --hicache-mem-layout "
+                    "page_first or page_first_direct."
+                )
+            if tensor_mem_backend(mem_pool_host.kv_buffer) != MEM_BACKEND_HUGEPAGE:
+                raise RuntimeError(
+                    "HiCache NIXL DOCA_MEMOS requires hugetlb-backed host KV memory. "
+                    "Set SGLANG_HUGEPAGE_SIZE=2MB and reserve 2 MiB huge pages so "
+                    "alloc_mmap does not fall back to normal pages."
+                )
 
         if self.needs_page_alignment and self.is_zero_copy:
             # Check that the kv_buffer base AND per-page strides are multiples of
@@ -455,11 +478,8 @@ class HiCacheNixl(HiCacheStorage):
             logger.error("Mismatch between number of key_strs and host_buffers")
             return [False] * len(keys)
 
-        if self.backend_selector.mem_type == "FILE":
-            file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
-            success = self._xfer_pre_registered(host_buffers, file_paths, direction)
-        else:  # mem_type == "OBJ"
-            success = self._xfer_pre_registered(host_buffers, key_strs, direction)
+        storage_keys = [self._format_key(k) for k in key_strs]
+        success = self._xfer_pre_registered(host_buffers, storage_keys, direction)
 
         # READ results are consumed by _batch_get_postprocess, which pairs
         # entries 2*i / 2*i+1 for non-MLA zero-copy: it needs one bool per
