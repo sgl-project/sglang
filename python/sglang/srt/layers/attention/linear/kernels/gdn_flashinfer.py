@@ -14,6 +14,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -103,7 +104,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
 
         sm_major = torch.cuda.get_device_capability()[0]
-        self.use_state_pool = sm_major >= 10
+        self.use_state_pool = sm_major >= 9
         self.supports_target_verify = sm_major in (9, 10)
 
         if sm_major == 9 and self._prefill_fn is None:
@@ -111,8 +112,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if self._mtp_fn is None:
             raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
 
-        if self.use_state_pool and mtp_bf16_fn is not None:
-            # Adapt bf16 kernel to fp32 kernel interface so target_verify needs no branching.
+        # Select MTP kernel based on state dtype. The fp32 MTP kernel only
+        # accepts fp32 state, while the bf16 kernel only accepts bf16 state.
+        self._use_bf16_state = envs.SGLANG_MAMBA_SSM_DTYPE.get() == "bfloat16"
+        if self._use_bf16_state and mtp_bf16_fn is not None:
+
             def _mtp_bf16_adapted(
                 q,
                 k,
@@ -191,8 +195,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 initial_state_indices=cache_indices,
             )
         else:
-            # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
-            # will no longer be needed here.
             state_batch = ssm_states[cache_indices]
             output_fi, new_state = self._decode_fn(
                 q=query_fi,
@@ -259,7 +261,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 scale=None,
                 initial_state=initial_state_fi,
                 output_final_state=True,
-                cu_seqlens=query_start_loc,  # already int32
+                cu_seqlens=query_start_loc,
                 use_qk_l2norm_in_kernel=False,
                 output_state=output_state_fi,
             )
@@ -270,7 +272,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 cache_indices,
                 ssm_states.shape[0] - 1,
             ).to(torch.int64)
-            # State must be float32; kernel requires int64 cu_seqlens.
             initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
             output_fi, output_state_fi = self._prefill_fn(
                 q=q_fi,
@@ -281,7 +282,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 scale=None,
                 initial_state=initial_state_fi,
                 output_final_state=True,
-                cu_seqlens=query_start_loc.to(torch.int64),
+                cu_seqlens=query_start_loc,
                 use_qk_l2norm_in_kernel=False,
             )
 
@@ -349,8 +350,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
 
         intermediate_states_buffer_mtp = intermediate_states_buffer
-        if self.use_state_pool and intermediate_states_buffer is not None:
-            # The SM100 bf16 MTP kernel indexes this scratch buffer by the
+        if self._use_bf16_state and intermediate_states_buffer is not None:
+            # The bf16 MTP kernel indexes this scratch buffer by the
             # per-call batch id, while SGLang's speculative state cache is
             # pool-scoped and may include an extra dummy slot.
             intermediate_states_buffer_mtp = intermediate_states_buffer[:batch_size]

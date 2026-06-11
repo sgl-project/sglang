@@ -3385,20 +3385,6 @@ class ServerArgs:
                 "defaulting --linear-attn-decode-backend to flashinfer."
             )
 
-        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
-        decode = self.linear_attn_decode_backend or self.linear_attn_backend
-        if (
-            decode == "flashinfer"
-            and self.mamba_ssm_dtype != "bfloat16"
-            and torch.cuda.is_available()
-            and torch.cuda.get_device_capability()[0] >= 10
-        ):
-            raise ValueError(
-                "--linear-attn-decode-backend flashinfer on SM100+ requires "
-                "--mamba-ssm-dtype bfloat16, "
-                f"got {self.mamba_ssm_dtype!r}"
-            )
-
         # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
         # for correctness and best performance.
         prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
