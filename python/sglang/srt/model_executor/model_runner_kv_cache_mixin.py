@@ -217,7 +217,8 @@ class ModelRunnerKVCacheMixin:
         # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout (excluding TRTLLM and HIP+TileLang).
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
-        if kv_cache_dtype == torch.float8_e4m3fn:
+        # ROCm uses the e4m3fnuz fp8 variant, so match both fn and fnuz here.
+        if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             assert (
                 kv_lora_rank % quant_block_size == 0
             ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"

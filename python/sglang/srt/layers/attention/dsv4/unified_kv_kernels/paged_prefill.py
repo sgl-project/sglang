@@ -46,13 +46,16 @@ import torch
 import triton
 import triton.language as tl
 
-# OPUS gfx950 paged-prefill kernel is preferred when importable; otherwise fall
-# back to the Triton implementation below.
+# OPUS paged-prefill kernel is gfx950-only; prefer it when importable and running
+# on gfx950, otherwise fall back to the Triton implementation below.
 try:
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
 
-    _HAS_OPUS = True
-except ImportError:
+    _gfx = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    _HAS_OPUS = _gfx == "gfx950"
+    if not _HAS_OPUS:
+        pa_sparse_prefill_opus = None
+except Exception:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
 

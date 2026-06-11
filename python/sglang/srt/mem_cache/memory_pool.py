@@ -2003,9 +2003,10 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
+        # ROCm uses the e4m3fnuz fp8 variant, so match both fn and fnuz here.
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
-            and dtype == torch.float8_e4m3fn
+            and dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             and override_kv_cache_dim is not None
         )
         # When override_kv_cache_dim is provided with dsa model, we assume the
