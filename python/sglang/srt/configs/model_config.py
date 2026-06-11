@@ -251,7 +251,10 @@ class ModelConfig:
         self.is_fp4_experts: bool = False
         if is_deepseek_v4(self.hf_config):
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
-            if not envs.SGLANG_DSV4_FP4_EXPERTS.is_set() or envs.SGLANG_DSV4_FP4_DEQUANT.is_set():
+            if (
+                not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
+                or envs.SGLANG_DSV4_FP4_DEQUANT.is_set()
+            ):
                 from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
 
                 detected = try_detect_fp4_experts(self.model_path)

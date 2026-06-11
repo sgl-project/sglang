@@ -142,38 +142,31 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
 
-DSV4_DEQUANT_FP4_TABLE = torch.tensor([
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
-], dtype=torch.float32)
+DSV4_DEQUANT_FP4_TABLE = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
 
-DSV4_DEQUANT_MAPPING = {
-    "embed_tokens": ("embed", 0),
-    "input_layernorm": ("attn_norm", None),
-    "post_attention_layernorm": ("ffn_norm", None),
-    "q_proj": ("wq", 0),
-    "q_a_proj": ("wq_a", None),
-    "q_a_layernorm": ("q_norm", None),
-    "q_b_proj": ("wq_b", 0),
-    "kv_a_proj_with_mqa": ("wkv_a", None),
-    "kv_a_layernorm": ("kv_norm", None),
-    "kv_b_proj": ("wkv_b", 0),
-    "o_proj": ("wo", 1),
-    "gate_proj": ("w1", 0),
-    "down_proj": ("w2", 1),
-    "up_proj": ("w3", 0),
-    "lm_head": ("head", 0),
-
-    "embed": ("embed", 0),
-    "wq_b": ("wq_b", 0),
-    "wo_a": ("wo_a", 0),
-    "wo_b": ("wo_b", 1),
-    "head": ("head", 0),
-    "attn_sink": ("attn_sink", 0),
-    "weights_proj": ("weights_proj", 0),
-}
-
-def cast_e2m1fn_to_e4m3fn(x: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def cast_e2m1fn_to_e4m3fn(
+    x: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Casts a tensor from e2m1fn to e4m3fn losslessly.
     """
@@ -187,7 +180,7 @@ def cast_e2m1fn_to_e4m3fn(x: torch.Tensor, scale: torch.Tensor) -> tuple[torch.T
     assert scale.size(0) == out_dim and scale.size(1) == in_dim // fp4_block_size
 
     x = x.view(torch.uint8)
-    low  = x & 0x0F
+    low = x & 0x0F
     high = (x >> 4) & 0x0F
     table = DSV4_DEQUANT_FP4_TABLE.to(x.device)
     x = torch.stack([table[low.long()], table[high.long()]], dim=-1).flatten(2)
@@ -207,9 +200,14 @@ def cast_e2m1fn_to_e4m3fn(x: torch.Tensor, scale: torch.Tensor) -> tuple[torch.T
     # bOut, bIn, 128*4
     offset = scale / scale_max_offset_bits
     # bOut, bIn, 128, 128
-    offset = offset.unflatten(-1, (fp8_block_size, -1)).repeat_interleave(fp4_block_size, dim=-1)
+    offset = offset.unflatten(-1, (fp8_block_size, -1)).repeat_interleave(
+        fp4_block_size, dim=-1
+    )
     x = (x * offset).transpose(1, 2).reshape(out_dim, in_dim)
-    return x.to(torch.float8_e4m3fn), scale_max_offset_bits.squeeze(-1).to(torch.float8_e8m0fnu)
+    return x.to(torch.float8_e4m3fn), scale_max_offset_bits.squeeze(-1).to(
+        torch.float8_e8m0fnu
+    )
+
 
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
