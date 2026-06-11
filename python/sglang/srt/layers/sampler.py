@@ -88,10 +88,10 @@ class Sampler(nn.Module):
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
         # NaN logits (e.g. fp16 activation overflow) are undefined behavior in
-        # sampling kernels and can come back as out-of-vocab token ids, so
-        # detect (assert in CI, sync-free warning in prod), then sanitize.
-        # +-1e30 rather than dtype min/max: the latter overflows to +-Inf
-        # under the temperature division below.
+        # sampling kernels and can come back as out-of-vocab token ids; detect
+        # before sanitizing so the probes see the raw values. +-1e30 rather
+        # than dtype min/max: the latter overflows to +-Inf under the
+        # temperature division below.
         maybe_detect_nan(logits, "sampler: next_token_logits")
         maybe_warn_nan(logits, "sampler: next_token_logits")
         torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
