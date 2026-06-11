@@ -127,7 +127,6 @@ class GPTQMoEAscendKernel:
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
-        self.moe_runner_config: Optional["MoeRunnerConfig"] = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
