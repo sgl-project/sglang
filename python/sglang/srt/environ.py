@@ -672,6 +672,11 @@ class Envs:
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # Expand the verify tree mask to FULL (prefix + tree block) per request.
+    # Backends that derive TARGET_VERIFY semantics from seq_lens and never
+    # read spec_info.custom_mask (e.g. DeepSeek-V4 NSA) can turn this off to
+    # skip a per-step CPU mask build that grows with context length.
+    SGLANG_NGRAM_USE_FULL_MASK = EnvBool(True)
 
     # Warmup
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm

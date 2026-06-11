@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -27,9 +28,6 @@ from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 logger = logging.getLogger(__name__)
 
 
-USE_FULL_MASK = True
-
-
 class NGRAMWorker:
     def __init__(
         self,
@@ -45,6 +43,12 @@ class NGRAMWorker:
     ):
         self.server_args = server_args
         self.enable_overlap = not server_args.disable_overlap_schedule
+        # NOTE: QLEN_MASK is faster than FULL_MASK, but requires
+        # corresponding changes in flashinfer. Testing shows about 8%
+        # performance improvement (roughly proportional to batch size).
+        # Backends that never read spec_info.custom_mask (e.g. DeepSeek-V4
+        # NSA) can disable the FULL expansion outright.
+        self.use_full_mask = envs.SGLANG_NGRAM_USE_FULL_MASK.get()
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
@@ -67,17 +71,24 @@ class NGRAMWorker:
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
+        # Erase corpus match state as soon as a request leaves the decode
+        # batch. Draft sources that manage their own request lifecycle (e.g.
+        # SUFFIX's adapter, which uses a grace window so pipeline-parallel
+        # micro-batch rotation does not look like departure and trigger a
+        # full local-tree rebuild from the prompt every other step) set this
+        # False.
+        self.corpus_gc_on_departure = True
 
-        self.ngram_corpus = NgramCorpus(
-            min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
-            max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
-            match_type=server_args.speculative_ngram_match_type,
-            capacity=server_args.speculative_ngram_capacity,
-            max_trie_depth=server_args.speculative_ngram_max_trie_depth,
-            draft_token_num=server_args.speculative_num_draft_tokens,
-            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
-            external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
-        )
+        # Linear-chain draft sources (e.g. SUFFIX) accept a contiguous prefix
+        # of the canonical [seq_lens, seq_lens + K) verify slots, so accepted
+        # KV is already at its target location and the post-verify move is an
+        # identity — subclasses set this True to skip it. Skipping also
+        # enables KV pools that do not implement move_kv_cache (e.g.
+        # DeepSeek-V4's NSA paginated pool). BFS n-gram trees accept
+        # non-contiguous slots and must keep the move.
+        self.drafts_are_linear_chains = False
+
+        self.ngram_corpus = self._create_draft_source(server_args)
         if server_args.speculative_ngram_external_corpus_path is not None:
             from sglang.srt.speculative.cpp_ngram.external_corpus import (
                 iter_external_corpus_chunks,
@@ -98,6 +109,21 @@ class NGRAMWorker:
                 corpus_path,
                 loaded,
             )
+
+    def _create_draft_source(self, server_args: ServerArgs):
+        # Factory hook: subclasses with a different draft source (e.g. SUFFIX's
+        # arctic suffix tree) override this instead of paying NgramCorpus
+        # construction (capacity-sized C++ allocation) and then discarding it.
+        return NgramCorpus(
+            min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
+            max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
+            match_type=server_args.speculative_ngram_match_type,
+            capacity=server_args.speculative_ngram_capacity,
+            max_trie_depth=server_args.speculative_ngram_max_trie_depth,
+            draft_token_num=server_args.speculative_num_draft_tokens,
+            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
+            external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
+        )
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
@@ -280,9 +306,7 @@ class NGRAMWorker:
             self.draft_token_num,
         )
 
-        # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
-        # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK:
+        if self.use_full_mask:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
@@ -422,12 +446,16 @@ class NGRAMWorker:
             # The KV mover expects drafts-only counts. NGRAM's
             # accept_lens includes the bonus token, matching scheduler output.
             num_correct_drafts_per_req = accept_lens - 1
-            move_accept_tokens_to_target_kvcache(
-                batch,
-                accept_index,
-                num_correct_drafts_per_req,
-                self.token_to_kv_pool_allocator,
-            )
+            if not self.drafts_are_linear_chains:
+                # Linear-chain accepts already occupy the canonical target
+                # slots (see the flag in __init__) — the move would be an
+                # identity, and the KV pool may not support it at all.
+                move_accept_tokens_to_target_kvcache(
+                    batch,
+                    accept_index,
+                    num_correct_drafts_per_req,
+                    self.token_to_kv_pool_allocator,
+                )
             if batch.return_logprob:
                 # The last arg is the accept_index row width minus 1. NGRAM's
                 # accept_index is (bs, draft_token_num) -- the tree depth is not
@@ -448,11 +476,12 @@ class NGRAMWorker:
             # req.finished() is unusable here: under overlap it flips at result
             # processing, one iteration after the request left the batch.
             # The last batch's entries persist while idle (bounded, small).
-            cur_rids = {req.rid for req in batch.reqs}
-            departed_rids = self._prev_decode_rids - cur_rids
-            if departed_rids:
-                self.ngram_corpus.erase_match_state(list(departed_rids))
-            self._prev_decode_rids = cur_rids
+            if self.corpus_gc_on_departure:
+                cur_rids = {req.rid for req in batch.reqs}
+                departed_rids = self._prev_decode_rids - cur_rids
+                if departed_rids:
+                    self.ngram_corpus.erase_match_state(list(departed_rids))
+                self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
 
         else:
