@@ -6,7 +6,6 @@ sync point instead of as a silent NaN cascade or illegal-address crash.
 """
 
 import logging
-import time
 from typing import Optional
 
 import torch
@@ -17,38 +16,33 @@ logger = logging.getLogger(__name__)
 
 
 class _AsyncNanWarner:
-    """Non-fatal NaN monitor: device-side detection accumulates into a GPU
-    counter copied to pinned host memory without any stream sync; the host
-    reads the (slightly stale) value on a later call and warns, throttled."""
-
-    WARN_INTERVAL_S = 30.0
+    """One-shot NaN monitor: device-side detection lands in pinned host
+    memory without any stream sync; the host reads the (slightly stale) flag
+    on a later call, warns once, and stops detecting."""
 
     def __init__(self):
         self._dev = None
         self._host = None
-        self._reported = 0
-        self._last_warn_time = 0.0
+        self._warned = False
 
     def check(self, tensor: torch.Tensor, msg: str):
-        if not tensor.is_cuda:
+        if self._warned or not tensor.is_cuda:
             return
         if self._dev is None:
             self._dev = torch.zeros(1, dtype=torch.int32, device=tensor.device)
             self._host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
 
-        # Report hits enqueued on earlier steps (pinned-memory read, no sync).
-        seen = int(self._host[0])
-        now = time.monotonic()
-        if seen > self._reported and now - self._last_warn_time >= self.WARN_INTERVAL_S:
+        # Report a hit enqueued on an earlier step (pinned read, no sync).
+        if int(self._host[0]):
             logger.warning(
-                "NaN detected in %s (%d batches so far); values were sanitized "
-                "before sampling. This usually indicates numerical overflow "
-                "(e.g. fp16 activations) or an upstream bug producing NaN.",
+                "NaN detected in %s; values were sanitized before sampling. "
+                "This usually indicates numerical overflow (e.g. fp16 "
+                "activations) or an upstream bug producing NaN. "
+                "Logged once; further occurrences are silent.",
                 msg,
-                seen,
             )
-            self._reported = seen
-            self._last_warn_time = now
+            self._warned = True
+            return
 
         # Enqueue this step's detection (async, no sync).
         self._dev.add_(torch.isnan(tensor).any().to(torch.int32))
