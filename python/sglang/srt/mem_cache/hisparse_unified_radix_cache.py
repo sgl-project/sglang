@@ -65,6 +65,8 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         allocator = self.token_to_kv_pool_allocator
         kvcache = allocator.get_kvcache()
         compress_ratio = getattr(allocator, "compress_ratio", 1)
+        # TODO(hisparse): This unified radix/L3 storage path currently only
+        # supports DSA. DeepSeek V4 needs separate c4/indexer integration.
         can_load = compress_ratio == 1 and hasattr(
             host_pool, "load_to_device_per_layer"
         )
@@ -86,9 +88,12 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             return False
 
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-            build_anchor_sidecar_stack,
+            build_pool_entry,
         )
-        from sglang.srt.mem_cache.memory_pool_host import DSAIndexerPoolHost
+        from sglang.srt.mem_cache.memory_pool_host import (
+            DSAIndexerPoolHost,
+            HostPoolGroup,
+        )
 
         storage_backend = server_args.hicache_storage_backend
         storage_extra_config = None
@@ -110,42 +115,61 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         self.load_cache_event = threading.Event()
         self.sidecar_pool_specs.clear()
         self.extra_metric_labels = server_args.extra_metric_labels
-        indexer_layout = (
-            "page_first_direct"
-            if server_args.hicache_io_backend == "direct"
-            else "page_first"
+        # Keep the DSA indexer sidecar page-first even when the MLA host pool is
+        # layer-first. Indexer storage I/O is page-granular and its zero-copy
+        # metadata only supports page_first/page_first_direct layouts.
+        indexer_layout = "page_first"
+        layer_mapping = {i: i for i in range(kvcache.layer_num)}
+        indexer_host_pool = DSAIndexerPoolHost(
+            kvcache,
+            host_pool,
+            indexer_layout,
+            allocator_type=server_args.hicache_storage_backend,
         )
-        self.host_pool_group, self.cache_controller = build_anchor_sidecar_stack(
-            params=self._cache_init_params,
-            server_args=server_args,
-            kv_pool=kvcache,
-            sidecar_pool_name=PoolName.INDEXER,
-            full_layer_mapping={i: i for i in range(kvcache.layer_num)},
-            page_size=self.page_size,
-            tp_group=self.tp_group,
+        self.host_pool_group = HostPoolGroup(
+            [
+                build_pool_entry(
+                    name=PoolName.KV,
+                    host_pool=host_pool,
+                    device_pool=kvcache,
+                    layer_mapping=layer_mapping,
+                    transfer_layer_num=kvcache.layer_num,
+                    is_anchor=True,
+                ),
+                build_pool_entry(
+                    name=PoolName.INDEXER,
+                    host_pool=indexer_host_pool,
+                    device_pool=kvcache,
+                    layer_mapping=layer_mapping,
+                    transfer_layer_num=kvcache.layer_num,
+                ),
+            ]
+        )
+        self.cache_controller = HybridCacheController(
+            self.token_to_kv_pool_allocator,
+            self.host_pool_group,
+            self.page_size,
+            self.tp_group,
             load_cache_event=self.load_cache_event,
             attn_cp_group=self.attn_cp_group,
             attn_tp_group=self.attn_tp_group,
             pp_group=self.pp_group,
+            write_policy=server_args.hicache_write_policy,
+            io_backend=server_args.hicache_io_backend,
             storage_backend=storage_backend,
-            use_mla=True,
-            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
-                kvcache,
-                kv_host_pool,
-                indexer_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            ),
-            kv_host_pool=host_pool,
             prefetch_threshold=storage_prefetch_threshold,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=storage_extra_config,
+            transfer_layer_num=kvcache.layer_num,
             enable_storage_metrics=self._enable_metrics_flag,
         )
         self.full_kv_pool_host = host_pool
         self.register_sidecar_pool(
             SidecarPoolSpec(pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV)
         )
-        kvcache.register_layer_transfer_counter(self.cache_controller.layer_done_counter)
+        kvcache.register_layer_transfer_counter(
+            self.cache_controller.layer_done_counter
+        )
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
@@ -166,11 +190,7 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         empty = self._empty_match_result.device_indices
-        if (
-            self.cache_controller is None
-            or self.disable
-            or len(params.key) == 0
-        ):
+        if self.cache_controller is None or self.disable or len(params.key) == 0:
             return self._empty_match_result
 
         host_indices, node, raw_match_len = self.host_match_prefix(
@@ -240,7 +260,7 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             return empty, self.root_node, 0
 
         _, best_match_node, _, _ = self._match_prefix_helper(key)
-        host_indices = self._collect_host_indices(best_match_node)
+        host_indices = self._collect_full_host_prefix_indices(best_match_node)
         return host_indices, best_match_node, len(host_indices)
 
     def bind_hisparse_req_pools(self, req_to_host_pool, req_to_token) -> None:
@@ -351,9 +371,7 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             hash_node.key = key
             hash_value = compute_node_hash_values(hash_node, self.page_size)
 
-        insert_result = self._insert_helper_host(
-            self.root_node, key, value, hash_value
-        )
+        insert_result = self._insert_helper_host(self.root_node, key, value, hash_value)
         prefix_len = insert_result.prefix_len
         if (
             prefix_len < insert_result.total_len
@@ -369,9 +387,7 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             else empty
         )
         old_node = (
-            self._req_radix_node.get(req_idx)
-            if new_protected_len is not None
-            else None
+            self._req_radix_node.get(req_idx) if new_protected_len is not None else None
         )
         canonical_indices = None
         new_node = None
@@ -420,7 +436,7 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         ):
             return empty, best_match_node
 
-        host_indices = self._collect_host_indices(best_match_node)
+        host_indices = self._collect_full_host_prefix_indices(best_match_node)
         page_aligned_len = (host_hit_length // self.page_size) * self.page_size
         if page_aligned_len <= 0:
             return empty, best_match_node
@@ -473,7 +489,9 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         )
         return logical_indices, best_match_node
 
-    def _collect_host_indices(self, node: UnifiedTreeNode) -> torch.Tensor:
+    def _collect_full_host_prefix_indices(self, node: UnifiedTreeNode) -> torch.Tensor:
+        # Unified FullComponent only computes host hit length. HiSparse also
+        # needs the canonical host slots so the coordinator can bind/load them.
         chunks: list[torch.Tensor] = []
         cur = node
         while cur is not self.root_node:
