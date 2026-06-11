@@ -71,8 +71,11 @@ Apply [references/dimension-mapping.md](references/dimension-mapping.md). Key
 decision: a legacy toggle that **changes other parts of the command** (TP, mem)
 becomes a `strategies` entry (the Playground can't do coupled changes); a
 toggle that only adds/removes its own flags becomes a Playground axis with the
-flags baked into cells when the legacy default was ON. Degenerate single-entry
-`strategies` is legal.
+flags baked into cells when the legacy default was ON. The strategy set
+defaults to the full trio `low-latency` / `balanced` / `high-throughput`;
+**`low-latency` and `high-throughput` are mandatory on every page** — a
+single-strategy page is not acceptable; include `balanced` whenever the page
+has a third operating point (see dimension-mapping.md §4).
 
 ### 3. Generate the config (codegen, then audit)
 - For >~30 cells, port the legacy `generateCommand()` into a throwaway Node
@@ -106,8 +109,11 @@ prop entirely, but keep `benchmarkCommands` so ⚡Reproduce still guides users.
 From `page.mdx.tmpl`: keep the original `title` (nav identity), write a fresh
 SEO `description` (top-level — delete any legacy `metatags.description`), **no
 `tag: NEW`** (a migration is not a launch), **no `mode:`**. Install accordion
-carries the legacy install content + pinned images. Replace the template's
-three-strategy boilerplate with this model's actual strategy explanation.
+carries the legacy install content + pinned images. Keep the template's
+DSv4-style strategy bullets — serving semantics first (single-user chat /
+typical multi-user / batch throughput), trimmed to the strategies the page
+ships, plus at most a one-line note on what each strategy changes on this
+model; do NOT rewrite them as toggle-/migration-centric explanations.
 Legacy §5 benchmark prose is deleted (numbers → benchmark card, commands →
 ⚡Reproduce); legacy prose deploy commands are deleted (doc↔config parity —
 fold their unique flags into §2 tips). Invocation examples + real outputs carry

@@ -48,6 +48,8 @@ export const config = {
     { id: "fp8",  label: "FP8"  },
     { id: "fp4",  label: "FP4"  },
   ],
+  // 4th dim. Full trio by default; low-latency + high-throughput are MANDATORY
+  // on every page — drop balanced only if there's no third operating point.
   strategies: [
     { id: "low-latency",     label: "Low-Latency"     },
     { id: "balanced",        label: "Balanced"        },
