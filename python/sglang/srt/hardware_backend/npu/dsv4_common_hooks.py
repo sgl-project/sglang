@@ -290,12 +290,20 @@ def maybe_evict_dsv4_state(batch: "ScheduleBatch", req: "Req", pre_len: int) -> 
     c128_watermark = ((max(0, pre_len - (128 + 64))) // page_size) * page_size
 
     _free_state_range(
-        allocator.c4_state_attn_allocator, pool, "req_to_token_c4_state",
-        req, "c4_state_alloc_offset", c4_watermark,
+        allocator.c4_state_attn_allocator,
+        pool,
+        "req_to_token_c4_state",
+        req,
+        "c4_state_alloc_offset",
+        c4_watermark,
     )
     _free_state_range(
-        allocator.c128_state_attn_allocator, pool, "req_to_token_c128_state",
-        req, "c128_state_alloc_offset", c128_watermark,
+        allocator.c128_state_attn_allocator,
+        pool,
+        "req_to_token_c128_state",
+        req,
+        "c128_state_alloc_offset",
+        c128_watermark,
     )
 
 
@@ -316,18 +324,26 @@ def maybe_evict_dsv4_state_on_swa(
     fast enough, and the SWA-ride eviction is the primary reclaim mechanism.
     For typical large-window models (DS-V4 with window >> 192), the
     watermark eviction always runs first, making this path a no-op.
-  """
+    """
     allocator = batch.token_to_kv_pool_allocator
     pool = batch.req_to_token_pool
     if not hasattr(allocator, "c4_state_attn_allocator"):
         return
     _free_state_range(
-        allocator.c4_state_attn_allocator, pool, "req_to_token_c4_state",
-        req, "c4_state_alloc_offset", new_swa_evicted_seqlen,
+        allocator.c4_state_attn_allocator,
+        pool,
+        "req_to_token_c4_state",
+        req,
+        "c4_state_alloc_offset",
+        new_swa_evicted_seqlen,
     )
     _free_state_range(
-        allocator.c128_state_attn_allocator, pool, "req_to_token_c128_state",
-        req, "c128_state_alloc_offset", new_swa_evicted_seqlen,
+        allocator.c128_state_attn_allocator,
+        pool,
+        "req_to_token_c128_state",
+        req,
+        "c128_state_alloc_offset",
+        new_swa_evicted_seqlen,
     )
 
 
@@ -343,11 +359,7 @@ def _free_state_range(
     and advance its low-water mark. No-op when the allocator/table is absent or
     the watermark hasn't advanced past the current offset."""
     offset = getattr(req, offset_attr, 0)
-    if (
-        state_allocator is None
-        or not hasattr(pool, table_attr)
-        or watermark <= offset
-    ):
+    if state_allocator is None or not hasattr(pool, table_attr) or watermark <= offset:
         return
     free_slots = getattr(pool, table_attr)[req.req_pool_idx, offset:watermark]
     state_allocator.free(free_slots.to(torch.int64))

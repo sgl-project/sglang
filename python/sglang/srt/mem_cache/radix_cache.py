@@ -26,8 +26,8 @@ import heapq
 import logging
 import sys
 import time
+from array import array
 from collections import defaultdict
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -47,17 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
-from sglang.srt.mem_cache.evict_policy import (
-    EvictionStrategy,
-    FIFOStrategy,
-    FILOStrategy,
-    LFUStrategy,
-    LRUStrategy,
-    MRUStrategy,
-    PriorityStrategy,
-    SLRUStrategy,
-)
-from sglang.srt.mem_cache.utils import split_node_hash_value
+from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -70,7 +60,7 @@ class RadixKey:
 
     def __init__(
         self,
-        token_ids: List[int],
+        token_ids: array[int],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
     ):
@@ -87,6 +77,7 @@ class RadixKey:
             return n - 1 if n > 0 else 0
         return len(self.token_ids)
 
+    # TODO(Jialin): vectorize with numpy without PyLong boxing
     def __iter__(self) -> Iterator:
         if self.is_bigram:
             t = self.token_ids
@@ -110,7 +101,7 @@ class RadixKey:
         if self.is_bigram:
             # bigrams [start, stop) span raw tokens [start, stop + 1);
             # empty slice -> empty raw tokens (not a dangling boundary token).
-            raw = self.token_ids[start : stop + 1] if stop > start else []
+            raw = self.token_ids[start : stop + 1] if stop > start else array("q")
             return RadixKey(raw, self.extra_key, is_bigram=True)
         return RadixKey(self.token_ids[start:stop], self.extra_key)
 
@@ -148,32 +139,36 @@ class RadixKey:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
+        assert type(t0) is type(t1), (type(t0), type(t1))
+        n = min(len(t0), len(t1))
+
+        # Exponential search for the first diverging token: gallop in doubling
+        # windows (one C-level slice compare each), then binary-search the window
+        # holding the divergence -- no per-token Python loop on long shared prefixes.
+        matched_tokens = n
+        lo = 0
+        step = 1
+        while lo < n:
+            hi = lo + step if lo + step < n else n
+            if t0[lo:hi] != t1[lo:hi]:
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if t0[lo:mid] == t1[lo:mid]:
+                        lo = mid
+                    else:
+                        hi = mid
+                matched_tokens = lo
+                break
+            lo = hi
+            step *= 2
 
         if self.is_bigram:
-            # Walk raw tokens; L matching tokens imply L-1 matching bigrams.
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            matched = max(0, min(i - 1, len(self), len(other)))
+            matched = max(0, min(matched_tokens - 1, len(self), len(other)))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
         if page_size == 1:
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            return i
-
-        min_len = min(len(self), len(other))
-        i = 0
-        while i < min_len:
-            if t0[i : i + page_size] != t1[i : i + page_size]:
-                break
-            i += page_size
-        return i
+            return matched_tokens
+        return (matched_tokens // page_size) * page_size
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
@@ -222,6 +217,7 @@ class TreeNode:
         self.host_ref_counter = 0
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
+        self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
@@ -255,7 +251,6 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    @lru_cache(maxsize=1)
     def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
         if node is None or node.hash_value is None:
             return []
@@ -291,25 +286,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        if self.eviction_policy == "lru":
-            self.eviction_strategy: EvictionStrategy = LRUStrategy()
-        elif self.eviction_policy == "lfu":
-            self.eviction_strategy: EvictionStrategy = LFUStrategy()
-        elif self.eviction_policy == "fifo":
-            self.eviction_strategy: EvictionStrategy = FIFOStrategy()
-        elif self.eviction_policy == "mru":
-            self.eviction_strategy: EvictionStrategy = MRUStrategy()
-        elif self.eviction_policy == "filo":
-            self.eviction_strategy: EvictionStrategy = FILOStrategy()
-        elif self.eviction_policy == "priority":
-            self.eviction_strategy: EvictionStrategy = PriorityStrategy()
-        elif self.eviction_policy == "slru":
-            self.eviction_strategy: EvictionStrategy = SLRUStrategy()
-
-        else:
-            raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
-            )
+        self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
         self.evictable_leaves = set()
         self.reset()
@@ -337,7 +314,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def reset(self):
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
-        self.root_node.key = RadixKey(token_ids=[], extra_key=None)
+        self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
         self.root_node.value = []
         self.root_node.host_value = []
         self.root_node.lock_ref = 1
@@ -353,6 +330,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             ),
             last_device_node=self.root_node,
             last_host_node=self.root_node,
+            best_match_node=self.root_node,
         )
         self._record_all_cleared_event()
 
@@ -413,6 +391,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            best_match_node=last_node,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -487,7 +466,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -809,20 +788,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 if __name__ == "__main__":
     tree = RadixCache.create_simulated()
 
-    # Example token id sequences (as lists of ints)
-    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
-    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
-    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5], extra_key=None)))
-    tree.insert(
-        InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5, 6, 7], extra_key=None))
-    )
-    tree.insert(
-        InsertParams(key=RadixKey(token_ids=[8, 9, 10, 11, 12], extra_key=None))
-    )
+    tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [1, 2, 3]))))
+    tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [1, 2, 3]))))
+    tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [1, 2, 4, 5]))))
+    tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [1, 2, 4, 5, 6, 7]))))
+    tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [8, 9, 10, 11, 12]))))
     tree.pretty_print()
 
     print(
         tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids=[1, 2, 3, 13, 14], extra_key=None))
+            MatchPrefixParams(key=RadixKey(token_ids=array("q", [1, 2, 3, 13, 14])))
         )
     )

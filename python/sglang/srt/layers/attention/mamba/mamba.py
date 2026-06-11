@@ -26,6 +26,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
@@ -34,6 +35,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_npu,
+    is_xpu,
     set_weight_attrs,
 )
 
@@ -54,6 +56,22 @@ elif is_npu():
     )
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_update_npu as causal_conv1d_update,
+    )
+elif is_xpu():
+    # XPU has no native causal_conv1d kernel yet; use the portable Triton
+    # implementation for both the "native" and the "_triton" entry points so
+    # `causal_conv1d_fn` / `causal_conv1d_fn_triton` are always bound on XPU.
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn as causal_conv1d_fn,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn as causal_conv1d_fn_triton,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_update as causal_conv1d_update,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_update as causal_conv1d_update_triton,
     )
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
@@ -407,12 +425,17 @@ class MambaMixer2(torch.nn.Module):
         self,
         *,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
         layer_cache: MambaPool.State,
         metadata: Mamba2Metadata,
+        forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
     ):
+        # Returns the projected result. When `output` is given it is also
+        # written into that buffer (required by the cuda-graph split ops, which
+        # need a stable buffer); otherwise the caller uses the return value and
+        # avoids a copy.
         # metadata contains metadata necessary for the mamba2 triton
         # kernels to operate in continuous batching and in chunked prefill
         # modes; they are computed at top-level model forward since they
@@ -420,6 +443,7 @@ class MambaMixer2(torch.nn.Module):
         state_indices_tensor = metadata.mamba_cache_indices
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
+        intermediate_states = None
 
         query_start_loc = metadata.query_start_loc
 
@@ -517,6 +541,14 @@ class MambaMixer2(torch.nn.Module):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
+            if (
+                forward_batch.mamba_track_mask is not None
+                and forward_batch.mamba_track_mask.any()
+                and metadata.track_conv_indices is not None
+            ):
+                x_to_track = x[:, metadata.track_conv_indices].transpose(0, 1)
+                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+                conv_state[forward_batch.mamba_track_indices[mask_indices]] = x_to_track
             ccfn = (
                 causal_conv1d_fn
                 if not use_triton_causal_conv
@@ -546,7 +578,7 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             # NOTE: final output is an in-place update of out tensor
-            varlen_state = mamba_chunk_scan_combined(
+            intermediate_states, varlen_state = mamba_chunk_scan_combined(
                 hidden_states_p.view(
                     1, num_prefill_tokens, self.num_heads // self.tp_size, self.head_dim
                 ),
@@ -565,6 +597,7 @@ class MambaMixer2(torch.nn.Module):
                 initial_states=initial_states,
                 return_varlen_states=True,
                 return_final_states=False,
+                return_intermediate_states=True,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(
@@ -706,7 +739,11 @@ class MambaMixer2(torch.nn.Module):
         hidden_states = self.norm(preallocated_ssm_out, gate[:num_actual_tokens])
 
         # 5. Final linear projection
-        output[:num_actual_tokens], _ = self.out_proj(hidden_states)
+        mixer_out, _ = self.out_proj(hidden_states)
+        if output is not None:
+            output[:num_actual_tokens].copy_(mixer_out)
+
+        return mixer_out, intermediate_states
 
     @property
     def mamba_type(self) -> str:

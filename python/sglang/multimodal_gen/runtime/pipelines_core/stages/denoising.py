@@ -10,14 +10,13 @@ import math
 import os
 import time
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from typing import Any
 
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 
 from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
@@ -43,6 +42,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_group,
     get_world_group,
     get_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
     run_cfg_parallel,
@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
+    world_group_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
@@ -67,8 +68,10 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
 )
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -96,6 +99,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, dict_to_3d_list
@@ -172,6 +176,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         super().__init__()
         self.transformer = transformer
         self.transformer_2 = transformer_2
+        # cache-dit state (for delayed mounting and idempotent control)
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+        self._torch_compiled_module_ids: set[int] = set()
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -199,9 +207,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # misc
         self.profiler = None
-        # cache-dit state (for delayed mounting and idempotent control)
-        self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._is_warmed_up = False
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
@@ -218,12 +223,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if not backends:
             return None
         if len(backends) > 1:
+            sparse_backends = {backend for backend in backends if backend.is_sparse}
+            selected_backend = (
+                sorted(sparse_backends, key=lambda backend: backend.name)[0]
+                if sparse_backends
+                else sorted(backends, key=lambda backend: backend.name)[0]
+            )
             logger.warning(
                 "Multiple transformer attention backends detected: %s. "
-                "Using one backend for denoising metadata.",
+                "Using %s for denoising metadata.",
                 sorted(backend.name.lower() for backend in backends),
+                selected_backend.name.lower(),
             )
-        return sorted(backends, key=lambda backend: backend.name)[0]
+            return selected_backend
+        return next(iter(backends))
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -277,6 +290,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             module, nn.Module
         ):
             return
+        if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
+            logger.debug("Deferring torch.compile until cache-dit is enabled")
+            return
+        module_id = id(module)
+        if module_id in self._torch_compiled_module_ids:
+            return
+
         compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
 
         if current_platform.is_npu():
@@ -306,6 +326,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         module.compile(**compile_kwargs)
+        self._torch_compiled_module_ids.add(module_id)
+
+    def _maybe_enable_cache_dit_and_torch_compile(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> None:
+        """Apply request-dependent transformer acceleration in trace-safe order."""
+        self._maybe_enable_cache_dit(num_inference_steps, batch)
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            self._maybe_enable_torch_compile(transformer)
 
     @staticmethod
     def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
@@ -352,8 +381,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 )
             return
 
-        # check if cache-dit is enabled in config
-        if not envs.SGLANG_CACHE_DIT_ENABLED or batch.is_warmup:
+        # Keep cache-dit disabled for ordinary warmup, but allow torch.compile
+        # warmup to mount cache-dit before Dynamo traces the transformer.
+        if not envs.SGLANG_CACHE_DIT_ENABLED:
+            return
+        if batch.is_warmup and not self.server_args.enable_torch_compile:
             return
 
         world_size = get_world_size()
@@ -579,7 +611,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         scheduler = batch.scheduler
         assert scheduler is not None
 
-        boundary_timestep = self._handle_boundary_ratio(server_args, batch, scheduler)
+        boundary_timestep = (
+            self._handle_boundary_ratio(server_args, batch, scheduler)
+            if self.transformer_2 is not None
+            else None
+        )
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
         num_inference_steps = batch.num_inference_steps
@@ -593,20 +629,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         else:
             cache_dit_num_inference_steps = num_inference_steps
 
-        if not server_args.model_loaded["transformer"]:
+        transformer_was_loaded = server_args.model_loaded["transformer"]
+        if not transformer_was_loaded:
             # FIXME: reuse more code
             loader = TransformerLoader()
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args, "transformer"
             )
-            # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
-            self._maybe_enable_torch_compile(self.transformer)
+
+        self._maybe_enable_cache_dit_and_torch_compile(
+            cache_dit_num_inference_steps, batch
+        )
+
+        if not transformer_was_loaded:
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
-        else:
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
 
         if batch.rollout:
             self._maybe_prepare_rollout(batch)
@@ -618,7 +656,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         # Setup precision and autocast settings
-        target_dtype = torch.bfloat16
+        target_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         autocast_enabled = (
             target_dtype != torch.float32
         ) and not server_args.disable_autocast
@@ -772,6 +810,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """Prepare scheduler state before entering the shared denoising loop."""
         self._reset_scheduler_loop_state(ctx.scheduler)
         ctx.scheduler.set_begin_index(0)
+        self._init_cfg_gate_state(ctx, batch, server_args)
 
     def _reset_scheduler_loop_state(self, scheduler) -> None:
         if hasattr(scheduler, "_step_index"):
@@ -791,6 +830,60 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 scheduler.model_outputs = [None] * solver_order
             if hasattr(scheduler, "timestep_list"):
                 scheduler.timestep_list = [None] * solver_order
+
+    def _init_cfg_gate_state(
+        self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
+    ) -> None:
+        """Initialize optional CFG residual reuse for the current denoising loop."""
+        fraction = envs.SGLANG_DIFFUSION_CFG_GATE_STEP
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError(
+                "SGLANG_DIFFUSION_CFG_GATE_STEP must be between 0.0 and 1.0, "
+                f"got {fraction}."
+            )
+
+        num_steps = len(ctx.timesteps)
+        requested = fraction < 1.0 and batch.do_classifier_free_guidance
+        active = requested and not server_args.enable_cfg_parallel
+        gate_step = int(num_steps * fraction) if active else num_steps + 1
+        ctx.extra["cfg_gate_state"] = {
+            "fraction": fraction,
+            "requested": requested,
+            "active": active,
+            "gate_step": gate_step,
+            "delta": None,
+            "model_id": None,
+            "fresh_uncond": 0,
+            "reused": 0,
+            "invalidations": 0,
+        }
+
+        if not (active or requested):
+            return
+
+        if ctx.is_warmup or (
+            world_group_is_initialized() and get_world_group().local_rank != 0
+        ):
+            return
+
+        if active:
+            logger.info(
+                "CFG gating enabled: reuse unconditioned residual after step %d/%d "
+                "(fraction=%.3f).",
+                gate_step,
+                num_steps,
+                fraction,
+            )
+            if batch.guidance_rescale > 0:
+                logger.warning(
+                    "CFG gating is enabled with guidance_rescale=%s; benchmark image "
+                    "quality before using this setting in production.",
+                    batch.guidance_rescale,
+                )
+        elif requested:
+            logger.info(
+                "CFG gating requested but skipped because CFG parallel is enabled."
+            )
 
     def _get_transformer_attr(self, name: str) -> Any:
         seen: set[int] = set()
@@ -888,8 +981,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ) -> None:
         """Run one scheduler-backed denoising step in the shared base path.
 
-        Model-specific stages should override this instead of the whole loop whenever possible to achieve better performance
+        Model-specific stages should override this instead of the whole loop
+        whenever possible to achieve better performance. Overrides that bypass
+        ``_predict_noise_with_cfg`` / ``ctx.scheduler.step`` will lose the
+        inner ``predict_noise`` / ``scheduler_step`` NVTX markers emitted
+        below; mirror them in the override if those markers are needed.
         """
+        use_nvtx = self.current_use_nvtx
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
@@ -916,31 +1014,34 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         # 4. Run the model prediction path, including CFG when enabled.
-        noise_pred = self._predict_noise_with_cfg(
-            current_model=step.current_model,
-            latent_model_input=latent_model_input,
-            timestep=timestep,
-            batch=batch,
-            timestep_index=step.step_index,
-            attn_metadata=step.attn_metadata,
-            target_dtype=ctx.target_dtype,
-            current_guidance_scale=step.current_guidance_scale,
-            cfg_policy=ctx.cfg_policy,
-            server_args=server_args,
-            guidance=ctx.guidance,
-            latents=ctx.latents,
-        )
+        with maybe_nvtx_range("predict_noise", use_nvtx):
+            noise_pred = self._predict_noise_with_cfg(
+                current_model=step.current_model,
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                batch=batch,
+                timestep_index=step.step_index,
+                attn_metadata=step.attn_metadata,
+                target_dtype=ctx.target_dtype,
+                current_guidance_scale=step.current_guidance_scale,
+                cfg_policy=ctx.cfg_policy,
+                cfg_gate_state=ctx.extra.get("cfg_gate_state"),
+                server_args=server_args,
+                guidance=ctx.guidance,
+                latents=ctx.latents,
+            )
         if server_args.comfyui_mode:
             batch.noise_pred = noise_pred
 
         # 5. Advance the scheduler state with the predicted noise.
-        ctx.latents = ctx.scheduler.step(
-            model_output=noise_pred,
-            timestep=step.t_device,
-            sample=ctx.latents,
-            **ctx.extra_step_kwargs,
-            return_dict=False,
-        )[0]
+        with maybe_nvtx_range("scheduler_step", use_nvtx):
+            ctx.latents = ctx.scheduler.step(
+                model_output=noise_pred,
+                timestep=step.t_device,
+                sample=ctx.latents,
+                **ctx.extra_step_kwargs,
+                return_dict=False,
+            )[0]
 
         # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
@@ -968,6 +1069,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Finalize the shared loop by handing state to post-denoising processing."""
+        self._log_cfg_gate_summary(ctx, batch)
         self._post_denoising_loop(
             batch=batch,
             latents=ctx.latents,
@@ -975,6 +1077,28 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             trajectory_timesteps=ctx.trajectory_timesteps,
             server_args=server_args,
             is_warmup=ctx.is_warmup,
+        )
+
+    def _log_cfg_gate_summary(self, ctx: DenoisingContext, batch: Req) -> None:
+        state = ctx.extra.get("cfg_gate_state")
+        if (
+            not state
+            or not state["requested"]
+            or ctx.is_warmup
+            or (world_group_is_initialized() and get_world_group().local_rank != 0)
+        ):
+            return
+
+        logger.info(
+            "CFG gating summary: fraction=%.3f, gate_step=%d/%d, "
+            "fresh_uncond=%d, reused=%d, invalidations=%d, guidance_rescale=%s.",
+            state["fraction"],
+            state["gate_step"],
+            len(ctx.timesteps),
+            state["fresh_uncond"],
+            state["reused"],
+            state["invalidations"],
+            batch.guidance_rescale,
         )
 
     def _post_denoising_loop(
@@ -1004,7 +1128,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # Gather noise_pred if using sequence parallelism
         # noise_pred has the same shape as latents (sharded along sequence dimension)
         if (
-            get_sp_world_size() > 1
+            self._sp_world_size() > 1
             and getattr(batch, "did_sp_shard_latents", False)
             and server_args.comfyui_mode
             and hasattr(batch, "noise_pred")
@@ -1038,6 +1162,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
+            if self._component_residency_manager is not None:
+                self._component_residency_manager.remove_nvtx_hooks_for_module(
+                    self.transformer
+                )
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
@@ -1049,7 +1177,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
-        if get_sp_world_size() <= 1:
+        if self._sp_world_size() <= 1:
             return
 
         if batch.latents is not None:
@@ -1087,7 +1215,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         trajectory_tensor: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather latents after Sequence Parallelism if they were sharded."""
-        if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
+        if self._sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
             latents = self.server_args.pipeline_config.gather_latents_for_sp(
                 latents, batch=batch
             )
@@ -1112,6 +1240,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         if trajectory_tensor.shape[2] > orig_s:
                             trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
         return latents, trajectory_tensor
+
+    def _sp_world_size(self) -> int:
+        if not model_parallel_is_initialized():
+            return 1
+        return get_sp_world_size()
 
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()
@@ -1143,7 +1276,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             preferred_ready_after_request=component_name == "transformer",
             memory_intensive=True,
         )
-        manager.begin_use(use)
+        manager.begin_use(use, module=current_model)
 
     def _select_and_manage_model(
         self,
@@ -1228,19 +1361,33 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=ctx.target_dtype,
-            enabled=ctx.autocast_enabled,
+        # Re-resolve the explicit-range gate so the per-step markers
+        # below honor this request's is_warmup state. Layer hooks are
+        # registered by the residency manager at the use-site.
+        use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
+
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=ctx.target_dtype,
+                enabled=ctx.autocast_enabled,
+            ),
+            maybe_nvtx_range("denoising_loop", use_nvtx),
         ):
             with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
                 for step_index, t_host in enumerate(timesteps_cpu):
-                    with StageProfiler(
-                        f"denoising_step_{step_index}",
-                        logger=logger,
-                        metrics=batch.metrics,
-                        perf_dump_path_provided=batch.perf_dump_path is not None,
-                        record_as_step=True,
+                    # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
+                    # use non-integer timesteps keep their precision in markers.
+                    step_marker = f"denoising_step_{step_index}_t{t_host.item():.4g}"
+                    with (
+                        maybe_nvtx_range(step_marker, use_nvtx),
+                        StageProfiler(
+                            f"denoising_step_{step_index}",
+                            logger=logger,
+                            metrics=batch.metrics,
+                            perf_dump_path_provided=batch.perf_dump_path is not None,
+                            record_as_step=True,
+                        ),
                     ):
                         step = self._prepare_step_state(
                             ctx,
@@ -1345,16 +1492,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return kwargs
         return {k: v for k, v in kwargs.items() if k in param_names}
 
-    def progress_bar(
-        self, iterable: Iterable | None = None, total: int | None = None
-    ) -> tqdm:
-        """
-        Create a progress bar for the denoising process.
-        """
-        local_rank = get_world_group().local_rank
-        disable = local_rank != 0
-        return tqdm(iterable=iterable, total=total, disable=disable)
-
     def _predict_noise_with_cfg(
         self,
         current_model: nn.Module,
@@ -1366,6 +1503,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         target_dtype,
         current_guidance_scale,
         cfg_policy: CFGPolicy,
+        cfg_gate_state: dict[str, Any] | None,
         server_args: ServerArgs,
         guidance: torch.Tensor,
         latents: torch.Tensor,
@@ -1396,6 +1534,48 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),
                 )
             return _unwrap(pred_t)
+
+        if (
+            cfg_gate_state
+            and cfg_gate_state["active"]
+            and not server_args.enable_cfg_parallel
+            and type(cfg_policy) is CFGPolicy
+            and len(cfg_policy.branches) == 2
+            and cfg_policy.branches[0].is_conditional
+            and not cfg_policy.branches[1].is_conditional
+        ):
+            model_id = id(current_model)
+            if cfg_gate_state["model_id"] not in (None, model_id):
+                cfg_gate_state["delta"] = None
+                cfg_gate_state["invalidations"] += 1
+
+            pos_pred = predict_fn(cfg_policy.branches[0])
+            pos_t = _wrap(pos_pred)
+            delta_t = cfg_gate_state["delta"]
+            can_reuse = (
+                timestep_index >= cfg_gate_state["gate_step"]
+                and delta_t is not None
+                and len(pos_t) == len(delta_t)
+            )
+
+            if can_reuse:
+                neg_pred = _unwrap(tuple(p - d for p, d in zip(pos_t, delta_t)))
+                cfg_gate_state["reused"] += 1
+            else:
+                neg_pred = predict_fn(cfg_policy.branches[1])
+                neg_t = _wrap(neg_pred)
+                cfg_gate_state["delta"] = tuple(
+                    p.detach() - n.detach() for p, n in zip(pos_t, neg_t)
+                )
+                cfg_gate_state["model_id"] = model_id
+                cfg_gate_state["fresh_uncond"] += 1
+
+            return cfg_policy.combine(
+                [pos_pred, neg_pred],
+                batch,
+                cfg_scale,
+                server_args.pipeline_config,
+            )
 
         if server_args.enable_cfg_parallel:
             if (
@@ -1450,12 +1630,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
             or self.attn_backend.get_enum() == AttentionBackendEnum.VIDEO_SPARSE_ATTN
         ):
+            attention_backend_config = server_args.attention_backend_config or {}
+            vsa_sparsity = attention_backend_config.get(
+                "VSA_sparsity", attention_backend_config.get("sparsity", 0.0)
+            )
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=i,
                 raw_latent_shape=batch.raw_latent_shape[2:5],
                 patch_size=server_args.pipeline_config.dit_config.patch_size,
                 STA_param=batch.STA_param,
-                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+                VSA_sparsity=vsa_sparsity,
                 device=get_local_torch_device(),
             )
         elif (
@@ -1557,6 +1741,35 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
+            )
+        elif self.attn_backend.get_enum() in [
+            AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.RAIN_FUSION_ATTN,
+        ]:
+            sparse_config = server_args.attention_backend_config
+
+            current_timestep = i
+            skip_first_steps = sparse_config.get("skip_first_steps", 10)
+            sparsity = sparse_config.get("sparsity", 0.2)
+
+            raw_latent_shape = batch.raw_latent_shape
+            patch_size = server_args.pipeline_config.dit_config.patch_size
+
+            if isinstance(patch_size, int):
+                patch_size_t = getattr(
+                    server_args.pipeline_config.dit_config, "patch_size_t", None
+                )
+                if patch_size_t is not None:
+                    patch_size = (patch_size_t, patch_size, patch_size)
+                else:
+                    patch_size = (patch_size, patch_size, patch_size)
+
+            attn_metadata = self.attn_metadata_builder.build(
+                current_timestep=current_timestep,
+                skip_first_steps=skip_first_steps,
+                sparsity=sparsity,
+                raw_latent_shape=raw_latent_shape,
+                patch_size=patch_size,
             )
         else:
             # attn_metadata can be None for SDPA attention backend

@@ -34,7 +34,8 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {server_args.page_size}."
     )
     assert server_args.kv_cache_dtype in [
-        "fp8_e4m3", "bfloat16"
+        "fp8_e4m3",
+        "bfloat16",
     ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.max_running_requests is None:
@@ -61,25 +62,20 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
-    if server_args.disaggregation_mode != "null" and server_args.pp_size > 1:
-        # get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized
-        # flat KV ptrs by PP layer range.
-        raise ValueError(
-            f"V4 PD disaggregation requires pp_size=1, got pp_size={server_args.pp_size}."
-        )
-
 
 def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
-    if not server_args.enable_nsa_prefill_context_parallel:
+    if not server_args.enable_prefill_cp:
         return
 
-    if server_args.nsa_prefill_cp_mode != "round-robin-split":
+    if server_args.cp_strategy != "interleave":
         raise ValueError(
-            f"DeepSeekV4 only supports round-robin-split CP mode, "
-            f"got {server_args.nsa_prefill_cp_mode}"
+            "DeepSeekV4 only supports interleave CP strategy, "
+            f"got {server_args.cp_strategy}"
         )
 
+    server_args.enable_dsa_prefill_context_parallel = True
+    server_args.dsa_prefill_cp_mode = "round-robin-split"
     server_args.enable_dp_attention = True
     server_args.moe_dense_tp_size = 1
     server_args.attn_cp_size = server_args.tp_size // server_args.dp_size

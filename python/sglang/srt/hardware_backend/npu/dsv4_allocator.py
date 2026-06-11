@@ -252,7 +252,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         c_prefix = (prefix_lens // ratio).to(prefix_lens.dtype)
         c_seq = (seq_lens // ratio).to(seq_lens.dtype)
-        c_last_loc = get_last_loc(c_table, req_pool_indices, c_prefix).to(last_loc_dtype)
+        c_last_loc = get_last_loc(c_table, req_pool_indices, c_prefix).to(
+            last_loc_dtype
+        )
 
         result = allocator.alloc_extend(
             c_prefix,
@@ -263,7 +265,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             c_extend,
         )
         if result is None:
-            raise self._pool_exhausted(ratio, "KV", c_extend, allocator.available_size())
+            raise self._pool_exhausted(
+                ratio, "KV", c_extend, allocator.available_size()
+            )
         return result
 
     def _alloc_c_and_state(
@@ -295,29 +299,47 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         out_c4_loc = self._alloc_c_extend(
             self.c4_attn_allocator,
-            prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu,
-            req_pool_indices, last_loc_dtype, ratio=4,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            req_pool_indices,
+            last_loc_dtype,
+            ratio=4,
         )
         out_c128_loc = self._alloc_c_extend(
             self.c128_attn_allocator,
-            prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu,
-            req_pool_indices, last_loc_dtype, ratio=128,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            req_pool_indices,
+            last_loc_dtype,
+            ratio=128,
         )
         out_c4_state_loc = self._alloc_state_extend(
             self.c4_state_attn_allocator,
             prefix_lens,
-            dsv4_state_lens.c4_prefix_lens, dsv4_state_lens.c4_prefix_lens_cpu,
-            dsv4_state_lens.c4_seq_lens, dsv4_state_lens.c4_seq_lens_cpu,
-            req_pool_indices, last_loc_dtype,
-            dsv4_state_lens.c4_extend_num_tokens, ratio=4,
+            dsv4_state_lens.c4_prefix_lens,
+            dsv4_state_lens.c4_prefix_lens_cpu,
+            dsv4_state_lens.c4_seq_lens,
+            dsv4_state_lens.c4_seq_lens_cpu,
+            req_pool_indices,
+            last_loc_dtype,
+            dsv4_state_lens.c4_extend_num_tokens,
+            ratio=4,
         )
         out_c128_state_loc = self._alloc_state_extend(
             self.c128_state_attn_allocator,
             prefix_lens,
-            dsv4_state_lens.c128_prefix_lens, dsv4_state_lens.c128_prefix_lens_cpu,
-            dsv4_state_lens.c128_seq_lens, dsv4_state_lens.c128_seq_lens_cpu,
-            req_pool_indices, last_loc_dtype,
-            dsv4_state_lens.c128_extend_num_tokens, ratio=128,
+            dsv4_state_lens.c128_prefix_lens,
+            dsv4_state_lens.c128_prefix_lens_cpu,
+            dsv4_state_lens.c128_seq_lens,
+            dsv4_state_lens.c128_seq_lens_cpu,
+            req_pool_indices,
+            last_loc_dtype,
+            dsv4_state_lens.c128_extend_num_tokens,
+            ratio=128,
         )
         return DSV4OutCacheLoc(
             out_full_loc=out_full_loc,
@@ -382,7 +404,10 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             req.c128_state_alloc_offset = seq_len - c128_alloc_len
 
         return self._pack_state_lens(
-            c4_prefix, c4_seq, c128_prefix, c128_seq,
+            c4_prefix,
+            c4_seq,
+            c128_prefix,
+            c128_seq,
             c4_extend_num_tokens=int(sum(s - p for s, p in zip(c4_seq, c4_prefix))),
             c128_extend_num_tokens=int(
                 sum(s - p for s, p in zip(c128_seq, c128_prefix))
@@ -414,7 +439,10 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         bs = len(reqs)
         return self._pack_state_lens(
-            c4_prefix, c4_seq, c128_prefix, c128_seq,
+            c4_prefix,
+            c4_seq,
+            c128_prefix,
+            c128_seq,
             c4_extend_num_tokens=bs,
             c128_extend_num_tokens=bs,
         )
@@ -463,8 +491,12 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # _alloc_c_extend / _alloc_state_extend); no permanent allocator->pool ref.
         self._cur_req_to_token_pool = req_to_token_pool
         out_full_loc = super().alloc_extend(
-            prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu,
-            last_loc, extend_num_tokens,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
         )
         if out_full_loc is None:
             return None
@@ -475,9 +507,15 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             "full_to_swa_index_mapping not initialized?"
         )
         return self._alloc_c_and_state(
-            out_full_loc, out_swa_loc,
-            prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu,
-            last_loc.dtype, req_pool_indices, dsv4_state_lens,
+            out_full_loc,
+            out_swa_loc,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc.dtype,
+            req_pool_indices,
+            dsv4_state_lens,
         )
 
     def alloc_decode(
@@ -502,9 +540,15 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         prefix_lens = (seq_lens - 1).clamp(min=0)
         prefix_lens_cpu = (seq_lens_cpu - 1).clamp(min=0)
         return self._alloc_c_and_state(
-            out_full_loc, out_swa_loc,
-            prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu,
-            last_loc.dtype, req_pool_indices, dsv4_state_lens,
+            out_full_loc,
+            out_swa_loc,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc.dtype,
+            req_pool_indices,
+            dsv4_state_lens,
         )
 
     def free(
@@ -552,10 +596,18 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         # State pools: free only the tail [c{N}_state_alloc_offset, kv_len).
         for ratio, allocator, table_attr, off_attr in (
-            (4, self.c4_state_attn_allocator, "req_to_token_c4_state",
-             "c4_state_alloc_offset"),
-            (128, self.c128_state_attn_allocator, "req_to_token_c128_state",
-             "c128_state_alloc_offset"),
+            (
+                4,
+                self.c4_state_attn_allocator,
+                "req_to_token_c4_state",
+                "c4_state_alloc_offset",
+            ),
+            (
+                128,
+                self.c128_state_attn_allocator,
+                "req_to_token_c128_state",
+                "c128_state_alloc_offset",
+            ),
         ):
             if allocator is None or not hasattr(req_to_token_pool, table_attr):
                 continue

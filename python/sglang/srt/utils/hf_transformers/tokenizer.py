@@ -105,7 +105,7 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     if tok_cls is None:
         return None
 
-    logger.info(
+    logger.debug(
         "Loading tokenizer for %s directly as %s (bypassing AutoTokenizer)",
         tokenizer_name,
         tok_class_name,
@@ -208,7 +208,7 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
     ``tokenizer_config.json``.  May still return a ``TokenizersBackend``
     if all retries fail (with a warning).
     """
-    logger.warning(
+    logger.debug(
         "Tokenizer loaded as generic TokenizersBackend for %s, "
         "retrying with use_fast=False",
         tokenizer_name,
@@ -239,7 +239,7 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
                 tokenizer_name,
             )
         else:
-            logger.warning(
+            logger.debug(
                 "Tokenizer for %s loaded as generic TokenizersBackend. "
                 "Set --trust-remote-code to load the model-specific tokenizer.",
                 tokenizer_name,

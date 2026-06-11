@@ -7,6 +7,9 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -14,6 +17,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _mask_topk_ids_padded_region,
+    _zero_topk_weights_padded_region,
 )
 from sglang.srt.utils import is_hip, is_npu
 
@@ -34,6 +38,20 @@ class HashTopK(nn.Module):
         apply_routed_scaling_factor_on_output=False,
     ):
         super().__init__()
+        self.layer_id = None
+        from sglang.srt.server_args import get_global_server_args
+
+        self.enable_deepep_waterfill = (
+            num_fused_shared_experts > 0
+            and get_global_server_args().enable_deepep_waterfill
+        )
+        self.deepep_waterfill_balancer = None
+
+        if self.enable_deepep_waterfill:
+            # Waterfill appends the shared expert after EPLB maps routed IDs.
+            topk -= num_fused_shared_experts
+            num_fused_shared_experts = 0
+
         self.num_experts = num_experts
         self.topk = topk
         self.routed_scaling_factor = routed_scaling_factor
@@ -43,15 +61,47 @@ class HashTopK(nn.Module):
             torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
             requires_grad=False,
         )
+        self._init_default_tid2eid()
 
         assert not apply_routed_scaling_factor_on_output, "not implemented"
+
+    def _init_default_tid2eid(self) -> None:
+        topk = self.tid2eid.shape[1]
+        if topk == 0:
+            return
+
+        # DummyModelLoader only initializes floating tensors, so keep this int
+        # lookup table valid until real checkpoints overwrite it.
+        token_ids = torch.arange(
+            self.tid2eid.shape[0], dtype=self.tid2eid.dtype, device=self.tid2eid.device
+        ).unsqueeze(1)
+        expert_offsets = torch.arange(
+            topk, dtype=self.tid2eid.dtype, device=self.tid2eid.device
+        ).unsqueeze(0)
+        tid2eid = (token_ids + expert_offsets) % self.num_experts
+        with torch.no_grad():
+            self.tid2eid.copy_(tid2eid.to(self.tid2eid.dtype))
 
     def empty_topk_output(self, device: torch.device):
         topk = self.topk - self.num_fused_shared_experts
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
-        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+        return self._apply_deepep_waterfill(
+            StandardTopKOutput(topk_weights, topk_ids, router_logits),
+            num_tokens=0,
+        )
+
+    def _apply_deepep_waterfill(
+        self, topk_output: StandardTopKOutput, num_tokens: int
+    ) -> StandardTopKOutput:
+        if self.enable_deepep_waterfill and self.deepep_waterfill_balancer is None:
+            raise RuntimeError(
+                "DeepEP waterfill HashTopK must be prepared by ModelRunner before forward."
+            )
+        if self.deepep_waterfill_balancer is None:
+            return topk_output
+        return self.deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
 
     def _forward_torch(
         self, router_logits: torch.Tensor, input_ids: torch.Tensor
@@ -111,7 +161,7 @@ class HashTopK(nn.Module):
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.jit_kernel.deepseek_v4 import hash_topk
+            from sglang.jit_kernel.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
@@ -124,13 +174,22 @@ class HashTopK(nn.Module):
         elif _is_npu:
             # fused_shared_experts == 1 is not supported
             from sglang.srt.hardware_backend.npu.moe.topk import fused_hash_topk_npu
-            return fused_hash_topk_npu(
+
+            # fused_hash_topk_npu already does topk_ids_logical_to_physical.
+            topk_output = fused_hash_topk_npu(
                 router_logits=router_logits,
                 input_ids=input_ids,
                 tid2eid=self.tid2eid,
                 routed_scaling_factor=self.routed_scaling_factor,
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
+            # Record expert distribution (EPLB) and apply deepep-waterfill so the
+            # NPU path matches the CUDA tail below; only logical->physical (done
+            # in the kernel) and the HIP-only padding masking are skipped.
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=topk_output.topk_ids
+            )
+            return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
 
@@ -138,8 +197,17 @@ class HashTopK(nn.Module):
             topk_weights = topk_weights.to(torch.float32)
 
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        if is_hip():
+            _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        else:
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
+        topk_output = self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        if is_hip():
+            _zero_topk_weights_padded_region(
+                topk_output.topk_weights, num_token_non_padded
+            )
         return topk_output
