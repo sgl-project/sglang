@@ -384,7 +384,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.image_data for row in rows))
 
-    def test_image_sampler_with_share_gpt_dataset(self):
+    def test_image_sampler_with_sharegpt_dataset(self):
         dataset_path = self._write_sharegpt_json()
         rows = sample_image_requests(
             num_requests=2,
