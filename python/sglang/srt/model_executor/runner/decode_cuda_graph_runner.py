@@ -115,11 +115,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-# Graph keys are constructed inline via ShapeKey(...) at each runner;
-# the legacy `_make_graph_key(bs, stream_idx, variant_label)` helper that
-# concatenated stringly-typed forms ("lora_0_8") is gone.
-
-
 def build_replay_fb_view(
     forward_batch: ForwardBatch,
     buffers: DecodeInputBuffers,

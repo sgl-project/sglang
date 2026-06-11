@@ -55,9 +55,6 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
-        # PR #27659: persistent output storage shared across capture sizes.
-        # Allocated lazily inside the first capture_one of a session, reset
-        # at capture_session entry.
         self._shared_output_buffer: Optional[Any] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -109,11 +106,6 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             stream=self._capture_stream,
         ):
             out = captured_fn()
-            # PR #27659: share a single persistent output buffer across capture
-            # sizes. The runner iterates capture sizes largest-first, so the
-            # first capture allocates the full-size buffer; subsequent captures
-            # copy their replay output into it (recorded inside the captured
-            # graph).
             if self._shared_output_buffer is not None:
                 self._copy_output_to_buffer(out, self._shared_output_buffer, size)
 

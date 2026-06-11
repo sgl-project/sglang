@@ -1,13 +1,4 @@
-"""ShapeKey — typed identifier for one captured CUDA-graph shape.
-
-Replaces the previous `int | str` keys produced by the legacy
-`_make_graph_key(bs, stream_idx, variant_label)` (which f-string'd
-into stringly-typed forms like `"lora_0_8"`). The `size` field
-preserves the original per-phase shape semantics (prefill →
-num_tokens, decode → bs) and doubles as the leading-dim BCG slices
-to in prefill (where size == num_tokens == leading dim of the
-captured output).
-"""
+"""ShapeKey — typed identifier for one captured CUDA-graph shape."""
 
 from __future__ import annotations
 
