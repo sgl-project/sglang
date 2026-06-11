@@ -122,7 +122,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --nnodes 1 \
     --node-rank 0 \
@@ -134,7 +134,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --chunked-prefill-size -1 \
     --max-prefill-tokens 65536 \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path QWEN3_32B_EAGLE_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 5 \
@@ -199,7 +199,7 @@ export SGLANG_NPU_USE_DEEPGEMM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --nnodes 1 \
     --node-rank 0 \
@@ -212,7 +212,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --chunked-prefill-size -1 \
     --max-prefill-tokens 35000 \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path QWEN3_32B_EAGLE_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \

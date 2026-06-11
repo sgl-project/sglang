@@ -226,13 +226,12 @@ do
         export ZBAL_HCCL_OP=send,recv
         export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode prefill \
         --disaggregation-transfer-backend ascend \
         --nnodes 1 \
-        --node-rank 0 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu \
@@ -248,7 +247,8 @@ do
         --max-prefill-tokens 131072 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend
+        --sampling-backend ascend \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -270,10 +270,10 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode decode \
         --disaggregation-transfer-backend ascend \
         --nnodes 1 \
         --trust-remote-code \
@@ -291,7 +291,8 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 1 2 4 6 8 12 16
+        --cuda-graph-bs 1 2 4 6 8 12 16 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -325,7 +326,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 1 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```
 
 ### kimi k2 6 w4a8 1p1d 16p in128k out1k prefix90 100ms
@@ -389,13 +390,12 @@ do
         export ZBAL_HCCL_OP=send,recv
         export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode prefill \
         --disaggregation-transfer-backend ascend \
         --nnodes 1 \
-        --node-rank 0 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu \
@@ -409,7 +409,8 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend
+        --sampling-backend ascend \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -431,10 +432,10 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode decode \
         --disaggregation-transfer-backend ascend \
         --nnodes 1 \
         --trust-remote-code \
@@ -452,7 +453,8 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 1 2 4 6 8 12
+        --cuda-graph-bs 1 2 4 6 8 12 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -486,7 +488,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 8 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```
 
 ### kimi k2 6 w4a8 1p1d 16p in64k out1k5 100ms
@@ -550,13 +552,12 @@ do
         export ZBAL_HCCL_OP=send,recv
         export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode prefill \
         --disaggregation-transfer-backend ascend \
         --nnodes 1 \
-        --node-rank 0 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu \
@@ -572,7 +573,8 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend
+        --sampling-backend ascend \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -594,10 +596,10 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode decode \
         --disaggregation-transfer-backend ascend \
         --nnodes 1 \
         --trust-remote-code \
@@ -615,7 +617,8 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 16
+        --cuda-graph-bs 16 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -649,7 +652,7 @@ python -m sglang.bench_serving \
     --random-output-len 1536 \
     --num-prompts 1 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```
 
 ### kimi k2 6 w4a8 1p1d 16p in64k out1k5 prefix90 100ms
@@ -713,13 +716,12 @@ do
         export ZBAL_HCCL_OP=send,recv
         export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode prefill \
         --disaggregation-transfer-backend ascend \
         --nnodes 1 \
-        --node-rank 0 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu \
@@ -733,7 +735,8 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend
+        --sampling-backend ascend \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -755,10 +758,10 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode decode \
         --disaggregation-transfer-backend ascend \
         --nnodes 1 \
         --trust-remote-code \
@@ -776,7 +779,8 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 1 2 4 6 8 12
+        --cuda-graph-bs 1 2 4 6 8 12 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -810,7 +814,7 @@ python -m sglang.bench_serving \
     --random-output-len 1536 \
     --num-prompts 16 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```
 
 ### kimi k2 6 w4a8 1p1d 24p in128k out1k prefix90 100ms
@@ -868,12 +872,11 @@ do
         export HCCL_BUFFSIZE=1800
         export HCCL_SOCKET_IFNAME=lo
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode prefill \
         --nnodes 1 \
-        --node-rank 0 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu \
@@ -885,7 +888,8 @@ do
         --mm-attention-backend ascend_attn \
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
-        --deepep-mode auto
+        --deepep-mode auto \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -907,10 +911,10 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode decode \
         --nnodes 2 \
         --trust-remote-code \
         --attention-backend ascend \
@@ -928,11 +932,12 @@ do
         --deepep-mode auto \
         --cuda-graph-bs 8 \
         --speculative-algorithm EAGLE3 \
-        --speculative-draft-model-path KIMI_K2_6_EAGLE3_MODEL_PATH \
+        --speculative-draft-model-path xxx \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --speculative-draft-model-quantization unquant
+        --speculative-draft-model-quantization unquant \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -966,7 +971,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 8 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```
 
 ### kimi k2 6 w4a8 1p1d 24p in64k out1k5 prefix90 100ms
@@ -1024,12 +1029,11 @@ do
         export HCCL_BUFFSIZE=1800
         export HCCL_SOCKET_IFNAME=lo
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode prefill \
         --nnodes 1 \
-        --node-rank 0 \
         --trust-remote-code \
         --attention-backend ascend \
         --device npu \
@@ -1041,7 +1045,8 @@ do
         --mm-attention-backend ascend_attn \
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
-        --deepep-mode auto
+        --deepep-mode auto \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -1063,10 +1068,10 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --quantization modelslim \
         --dtype bfloat16 \
-        --disaggregation-mode decode \
         --nnodes 2 \
         --trust-remote-code \
         --attention-backend ascend \
@@ -1084,11 +1089,12 @@ do
         --deepep-mode auto \
         --cuda-graph-bs 8 \
         --speculative-algorithm EAGLE3 \
-        --speculative-draft-model-path KIMI_K2_6_EAGLE3_MODEL_PATH \
+        --speculative-draft-model-path xxx \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --speculative-draft-model-quantization unquant
+        --speculative-draft-model-quantization unquant \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -1122,7 +1128,7 @@ python -m sglang.bench_serving \
     --random-output-len 1536 \
     --num-prompts 16 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```
 
 ### kimi k2 6 w4a8 8p in1024x1024 30 out1024 50ms
@@ -1163,7 +1169,7 @@ export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --quantization modelslim \
     --dtype bfloat16 \
     --model-loader-extra-config {"enable_multithread_load": true} \
@@ -1186,7 +1192,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --cuda-graph-bs 1 2 4 8 9 10 11 \
     --disable-radix-cache \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path KIMI_K2_6_EAGLE3_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 2 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 3 \
@@ -1210,7 +1216,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 640 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 16
 ```
 
@@ -1250,7 +1256,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --quantization modelslim \
     --dtype bfloat16 \
     --model-loader-extra-config {"enable_multithread_load": true} \
@@ -1273,7 +1279,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --cuda-graph-bs 1 2 4 6 8 10 \
     --disable-radix-cache \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path KIMI_K2_6_EAGLE3_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 5 \
@@ -1295,7 +1301,7 @@ python -m sglang.bench_serving \
     --random-output-len 256 \
     --num-prompts 20 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```
 
 ### kimi k2 6 w4a8 8p in3k5 out1k5 20ms
@@ -1340,7 +1346,7 @@ export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
@@ -1363,7 +1369,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --disable-radix-cache \
     --model-loader-extra-config {"enable_multithread_load": true} \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path KIMI_K2_6_EAGLE3_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 5 \
@@ -1430,7 +1436,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
@@ -1453,7 +1459,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --disable-radix-cache \
     --model-loader-extra-config {"enable_multithread_load": true} \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path KIMI_K2_6_EAGLE3_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 5 \

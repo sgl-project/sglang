@@ -149,7 +149,7 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -232,7 +232,7 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -311,7 +311,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -350,7 +350,7 @@ python -m sglang.bench_serving \
     --random-output-len 1000 \
     --num-prompts 80 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```
 
 ### qwen3 6 27b w8a8 1p in3k5 out1k5 50ms gpqa
@@ -392,7 +392,7 @@ export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -404,7 +404,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 64 \
     --max-mamba-cache-size 74 \
     --mem-fraction-static 0.7 \
-    --cuda-graph-bs 2 8 16 32 48 64 \
+    --cuda-graph-bs 2 8 16 32 40 45 50 54 \
     --enable-multimodal \
     --quantization modelslim \
     --mm-attention-backend ascend_attn \
@@ -472,7 +472,7 @@ export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --tp-size 4 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -543,12 +543,12 @@ export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=130
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --tp-size 4 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -560,7 +560,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 28 \
     --max-mamba-cache-size 50 \
     --mem-fraction-static 0.7 \
-    --cuda-graph-bs 2 8 12 16 20 24 28 \
+    --cuda-graph-bs 2 8 12 16 20 24 26 28 \
     --enable-multimodal \
     --quantization modelslim \
     --mm-attention-backend ascend_attn \
@@ -628,7 +628,7 @@ export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --tp-size 4 \
     --nnodes 1 \
     --attention-backend ascend \

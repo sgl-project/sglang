@@ -145,7 +145,7 @@ export ZBCCL_ENABLE_GRAPH=1
 export ZBCCL_LOCAL_MEM_SIZE=60416
 export ZBCCL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
@@ -167,7 +167,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 2 \
     --cuda-graph-bs 2 \
     --mamba-ssm-dtype bfloat16 \
-    --speculative-draft-model-path QWEN3_NEXT_80B_A3B_MODEL_PATH
+    --speculative-draft-model-path xxx
 ```
 
 #### Benchmark
@@ -236,7 +236,7 @@ export ZBAL_ENABLE_GRAPH=1
 export ZBAL_HCCL_OP=allreduce,_allgather_base,allgather,broadcast,scatter,reduce_scatter,_reduce_scatter_base,alltoall_base
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
@@ -256,7 +256,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
-    --speculative-draft-model-path QWEN3_NEXT_80B_A3B_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --dp-size 2 \
     --enable-dp-attention \
     --enable-dp-lm-head \
@@ -332,7 +332,7 @@ export ZBCCL_ENABLE_GRAPH=1
 export ZBCCL_LOCAL_MEM_SIZE=60416
 export ZBCCL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
@@ -357,7 +357,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --cuda-graph-bs 2 4 8 \
     --mamba-ssm-dtype bfloat16 \
-    --speculative-draft-model-path QWEN3_NEXT_80B_A3B_MODEL_PATH
+    --speculative-draft-model-path xxx
 ```
 
 #### Benchmark

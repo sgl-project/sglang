@@ -121,7 +121,7 @@ export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --nnodes 1 \
     --node-rank 0 \
@@ -133,7 +133,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-prefill-tokens 16384 \
     --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path QWEN3_235B_A22B_EAGLE_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 5 \
@@ -203,7 +203,7 @@ export SGLANG_NPU_PROFILING_BS=27
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --nnodes 1 \
     --node-rank 0 \
@@ -221,7 +221,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --disable-radix-cache \
     --moe-a2a-backend ascend_fuseep \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path QWEN3_235B_A22B_EAGLE_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
@@ -247,6 +247,6 @@ python -m sglang.bench_serving \
     --max-concurrency 432 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts int(max_concurrency) * 4 \
+    --num-prompts 1728 \
     --random-range-ratio 1
 ```

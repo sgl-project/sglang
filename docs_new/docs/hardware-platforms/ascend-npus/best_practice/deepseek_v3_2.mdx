@@ -128,7 +128,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
+P_IP=('your prefill ip1')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -150,7 +150,8 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -163,7 +164,6 @@ do
         --deepep-mode normal \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
-        --disaggregation-mode prefill \
         --disable-cuda-graph \
         --moe-dense-tp-size 1 \
         --enable-nsa-prefill-context-parallel \
@@ -172,7 +172,8 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -194,7 +195,8 @@ do
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --nnodes 2 \
         --tp 32 \
         --dp 8 \
@@ -217,7 +219,7 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --disaggregation-transfer-backend ascend \
-        --disaggregation-mode decode
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -286,7 +288,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
+P_IP=('your prefill ip1')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -308,7 +310,8 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -321,7 +324,6 @@ do
         --deepep-mode normal \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
-        --disaggregation-mode prefill \
         --disable-cuda-graph \
         --moe-dense-tp-size 1 \
         --enable-nsa-prefill-context-parallel \
@@ -330,7 +332,8 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -352,7 +355,8 @@ do
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --nnodes 2 \
         --tp 32 \
         --dp 8 \
@@ -375,7 +379,7 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --disaggregation-transfer-backend ascend \
-        --disaggregation-mode decode
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -444,7 +448,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
+P_IP=('your prefill ip1')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -466,7 +470,8 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -479,7 +484,6 @@ do
         --deepep-mode normal \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
-        --disaggregation-mode prefill \
         --disable-cuda-graph \
         --moe-dense-tp-size 1 \
         --enable-nsa-prefill-context-parallel \
@@ -488,7 +492,8 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --speculative-num-draft-tokens 2 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -510,7 +515,8 @@ do
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --nnodes 2 \
         --tp 32 \
         --dp 8 \
@@ -533,7 +539,7 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --disaggregation-transfer-backend ascend \
-        --disaggregation-mode decode
+        --node-rank $i
         NODE_RANK=$i
         break
     fi

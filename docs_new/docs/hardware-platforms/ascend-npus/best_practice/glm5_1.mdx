@@ -172,16 +172,18 @@ unset ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_BUFFSIZE=2500
 export HCCL_SOCKET_IFNAME=lo
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 32 \
@@ -258,7 +260,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
+P_IP=('your prefill ip1')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -284,9 +286,9 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode prefill \
-        --tp-size 32 \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --tp-size 4 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
         --attention-backend ascend \
@@ -308,7 +310,8 @@ do
         --attn-cp-size 4 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --pp-size 8
+        --pp-size 8 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -330,8 +333,8 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode decode \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -354,7 +357,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --speculative-draft-model-quantization unquant
+        --speculative-draft-model-quantization unquant \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -424,7 +428,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
+P_IP=('your prefill ip1')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -441,8 +445,6 @@ do
         echo "${P_IP[$i]}"
 
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
-        export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export ENABLE_PROFILING=0
         export GLOO_SOCKET_IFNAME=lo
@@ -450,8 +452,8 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode prefill \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.75 \
@@ -476,11 +478,7 @@ do
         --attn-cp-size 8 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --speculative-draft-model-quantization unquant \
-        --speculative-algorithm NEXTN \
-        --speculative-num-steps 1 \
-        --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -502,8 +500,8 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode decode \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -530,7 +528,8 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4
+        --speculative-num-draft-tokens 4 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -601,7 +600,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
+P_IP=('your prefill ip1')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -627,9 +626,9 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode prefill \
-        --tp-size 32 \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --tp-size 4 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
         --attention-backend ascend \
@@ -651,7 +650,8 @@ do
         --attn-cp-size 4 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --pp-size 8
+        --pp-size 8 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -673,8 +673,8 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode decode \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -697,7 +697,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --speculative-draft-model-quantization unquant
+        --speculative-draft-model-quantization unquant \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -767,7 +768,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
+P_IP=('your prefill ip1')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -784,8 +785,6 @@ do
         echo "${P_IP[$i]}"
 
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
-        export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export ENABLE_PROFILING=0
         export GLOO_SOCKET_IFNAME=lo
@@ -793,8 +792,8 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode prefill \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.75 \
@@ -819,11 +818,7 @@ do
         --attn-cp-size 8 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --speculative-draft-model-quantization unquant \
-        --speculative-algorithm NEXTN \
-        --speculative-num-steps 1 \
-        --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -845,8 +840,8 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode decode \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -873,7 +868,8 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4
+        --speculative-num-draft-tokens 4 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -907,7 +903,7 @@ python -m sglang.bench_serving \
     --random-output-len 1536 \
     --num-prompts 480 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```
 
 ### glm5 1 w4a8 1p1d 48p in65k out1k5 prefix100 33ms
@@ -944,7 +940,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
+P_IP=('your prefill ip1')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -961,16 +957,14 @@ do
         echo "${P_IP[$i]}"
 
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
-        export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=lo
         export HCCL_BUFFSIZE=1200
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode prefill \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -983,14 +977,10 @@ do
         --chunked-prefill-size 16384 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
-        --speculative-algorithm NEXTN \
-        --speculative-num-steps 1 \
-        --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2 \
-        --speculative-draft-model-quantization unquant \
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
-        --dtype bfloat16
+        --dtype bfloat16 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -1013,8 +1003,8 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode decode \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --tp-size 64 \
         --nnodes 4 \
         --dp-size 64 \
@@ -1044,7 +1034,8 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method round_robin
+        --load-balance-method round_robin \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -1141,8 +1132,8 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode prefill \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --tp-size 4 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -1165,7 +1156,8 @@ do
         --attn-cp-size 4 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --pp-size 8
+        --pp-size 8 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -1187,8 +1179,8 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode decode \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -1215,7 +1207,8 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4
+        --speculative-num-draft-tokens 4 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -1249,7 +1242,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 576 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```
 
 ### glm5 1 w4a8 4p1d 48p in64k out1k prefix90 50ms
@@ -1287,7 +1280,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1')
+P_IP=('your prefill ip1' 'your prefill ip2')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -1313,8 +1306,8 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode prefill \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --tp-size 4 \
         --nnodes 1 \
         --mem-fraction-static 0.72 \
@@ -1337,7 +1330,8 @@ do
         --attn-cp-size 4 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --pp-size 4
+        --pp-size 4 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -1359,8 +1353,8 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
-        --disaggregation-mode decode \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -1387,7 +1381,8 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4
+        --speculative-num-draft-tokens 4 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -1421,5 +1416,5 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 1280 \
     --random-range-ratio 1 \
-    --request-rate float("inf")
+    --request-rate inf
 ```

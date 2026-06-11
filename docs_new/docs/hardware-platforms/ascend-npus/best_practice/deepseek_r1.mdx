@@ -193,10 +193,9 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
-        --node-rank 0 \
-        --disaggregation-mode prefill \
         --tp-size 16 \
         --mem-fraction-static 0.62 \
         --quantization modelslim \
@@ -214,7 +213,8 @@ do
         --dp-size 8 \
         --enable-dp-attention \
         --disable-shared-experts-fusion \
-        --dtype bfloat16
+        --dtype bfloat16 \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -235,9 +235,9 @@ do
         export SGLANG_ENABLE_SPEC_V2=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --nnodes 1 \
-        --disaggregation-mode decode \
         --tp-size 16 \
         --dp-size 16 \
         --mem-fraction-static 0.805 \
@@ -258,7 +258,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --tokenizer-worker-num 4 \
-        --load-balance-method ROUND_ROBIN
+        --load-balance-method round_robin \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -289,7 +290,7 @@ python -m sglang.bench_serving \
     --max-concurrency 416 \
     --random-input-len 3584 \
     --random-output-len 1536 \
-    --num-prompts int(max_concurrency) * 4 \
+    --num-prompts 1664 \
     --random-range-ratio 1 \
     --request-rate 24
 ```
@@ -337,7 +338,7 @@ export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
     --trust-remote-code \
     --attention-backend ascend \
@@ -415,7 +416,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1')
+P_IP=('your prefill ip1' 'your prefill ip2')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -437,10 +438,9 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
-        --node-rank 0 \
-        --disaggregation-mode prefill \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
         --quantization modelslim \
@@ -459,7 +459,8 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --enable-attn-tp-input-scattered
+        --enable-attn-tp-input-scattered \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -481,9 +482,9 @@ do
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --nnodes 2 \
-        --disaggregation-mode decode \
         --tp-size 32 \
         --dp-size 16 \
         --mem-fraction-static 0.75 \
@@ -505,7 +506,8 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method ROUND_ROBIN
+        --load-balance-method round_robin \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -580,7 +582,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1')
+P_IP=('your prefill ip1' 'your prefill ip2')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -605,10 +607,9 @@ do
         export SGLANG_USE_AG_AFTER_QLORA=1
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
-        --node-rank 0 \
-        --disaggregation-mode prefill \
         --tp-size 16 \
         --mem-fraction-static 0.778 \
         --quantization modelslim \
@@ -626,7 +627,8 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --enable-attn-tp-input-scattered
+        --enable-attn-tp-input-scattered \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -649,9 +651,9 @@ do
         export SGLANG_NPU_FUSED_MOE_MODE=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --nnodes 2 \
-        --disaggregation-mode decode \
         --tp-size 32 \
         --dp-size 32 \
         --mem-fraction-static 0.82 \
@@ -672,7 +674,8 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method ROUND_ROBIN
+        --load-balance-method round_robin \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -745,7 +748,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1')
+P_IP=('your prefill ip1' 'your prefill ip2')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -767,10 +770,9 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
-        --node-rank 0 \
-        --disaggregation-mode prefill \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
         --quantization modelslim \
@@ -789,7 +791,8 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --enable-attn-tp-input-scattered
+        --enable-attn-tp-input-scattered \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -811,9 +814,9 @@ do
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --nnodes 2 \
-        --disaggregation-mode decode \
         --tp-size 32 \
         --dp-size 16 \
         --mem-fraction-static 0.75 \
@@ -835,7 +838,8 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method ROUND_ROBIN
+        --load-balance-method round_robin \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -908,7 +912,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1')
+P_IP=('your prefill ip1' 'your prefill ip2')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -930,10 +934,9 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
-        --node-rank 0 \
-        --disaggregation-mode prefill \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
         --quantization modelslim \
@@ -952,7 +955,8 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --enable-attn-tp-input-scattered
+        --enable-attn-tp-input-scattered \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -974,9 +978,9 @@ do
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --nnodes 2 \
-        --disaggregation-mode decode \
         --tp-size 32 \
         --dp-size 16 \
         --mem-fraction-static 0.75 \
@@ -998,7 +1002,8 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method ROUND_ROBIN
+        --load-balance-method round_robin \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -1071,7 +1076,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1')
+P_IP=('your prefill ip1' 'your prefill ip2')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -1093,10 +1098,9 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
-        --node-rank 0 \
-        --disaggregation-mode prefill \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
         --quantization modelslim \
@@ -1114,7 +1118,8 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --enable-attn-tp-input-scattered
+        --enable-attn-tp-input-scattered \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi
@@ -1136,9 +1141,9 @@ do
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
         --nnodes 2 \
-        --disaggregation-mode decode \
         --tp-size 32 \
         --dp-size 8 \
         --mem-fraction-static 0.75 \
@@ -1159,7 +1164,8 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method ROUND_ROBIN
+        --load-balance-method round_robin \
+        --node-rank $i
         NODE_RANK=$i
         break
     fi

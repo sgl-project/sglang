@@ -132,7 +132,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=50
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --nnodes 1 \
     --node-rank 0 \
@@ -149,7 +149,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --dtype bfloat16 \
     --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path QWEN3_8B_EAGLE_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4
@@ -207,7 +207,7 @@ export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --nnodes 1 \
     --node-rank 0 \
@@ -224,7 +224,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --dtype bfloat16 \
     --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path QWEN3_8B_EAGLE_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 5
@@ -282,7 +282,7 @@ export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --nnodes 1 \
     --node-rank 0 \
@@ -299,7 +299,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --dtype bfloat16 \
     --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path QWEN3_8B_EAGLE_MODEL_PATH \
+    --speculative-draft-model-path xxx \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 5

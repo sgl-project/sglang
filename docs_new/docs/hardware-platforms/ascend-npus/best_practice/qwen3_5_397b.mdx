@@ -213,7 +213,7 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 16 \
@@ -254,7 +254,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 3 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 2
 ```
 
@@ -306,7 +306,7 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 16 \
@@ -347,7 +347,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 10 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 8
 ```
 
@@ -399,7 +399,7 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 16 \
@@ -441,7 +441,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 40 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 0
 ```
 
@@ -493,7 +493,7 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 16 \
@@ -538,7 +538,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 40 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 32
 ```
 
@@ -590,7 +590,7 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 16 \
@@ -635,7 +635,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 144 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 8
 ```
 
@@ -687,7 +687,7 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 16 \
@@ -731,7 +731,7 @@ python -m sglang.bench_serving \
     --random-output-len 1500 \
     --num-prompts 160 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 64
 ```
 
@@ -783,7 +783,7 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 16 \
@@ -827,7 +827,7 @@ python -m sglang.bench_serving \
     --random-output-len 1500 \
     --num-prompts 432 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 16
 ```
 
@@ -879,7 +879,7 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 16 \
@@ -924,7 +924,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 8 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 8
 ```
 
@@ -976,7 +976,7 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 16 \
@@ -1021,7 +1021,7 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 28 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 8
 ```
 
@@ -1073,7 +1073,7 @@ export STREAMS_PER_DEVICE=32
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python -m sglang.launch_server --model-path $MODEL_PATH \
+python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 16 \
@@ -1118,6 +1118,6 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 128 \
     --random-range-ratio 1 \
-    --request-rate float("inf") \
+    --request-rate inf \
     --warmup-requests 0
 ```
