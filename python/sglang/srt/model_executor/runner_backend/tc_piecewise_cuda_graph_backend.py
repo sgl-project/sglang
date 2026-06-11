@@ -185,6 +185,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
+        num_tokens: Optional[int] = None,
     ) -> None:
         # Call 1 warms FX state; call 2 captures the cuda graph inside capture_session.
         # See cuda_piecewise_backend.py for the FX backend that drives the capture.

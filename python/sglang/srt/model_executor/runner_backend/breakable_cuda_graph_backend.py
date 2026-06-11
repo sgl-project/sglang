@@ -13,6 +13,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -53,6 +54,10 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
+        # PR #27659: persistent output storage shared across capture sizes when
+        # the caller passes num_tokens. Allocated lazily inside the
+        # first capture_one of a session, reset at capture_session entry.
+        self._shared_output_buffer: Optional[Any] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -71,6 +76,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             self._pool = self._device_module.graph_pool_handle()
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
+        self._shared_output_buffer = None
         try:
             with self.replay_session():
                 yield
@@ -83,6 +89,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
+        num_tokens: Optional[int] = None,
     ) -> None:
         for _ in range(2):
             self._device_module.synchronize()
@@ -101,8 +108,80 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             stream=self._capture_stream,
         ):
             out = captured_fn()
+            # PR #27659: when num_tokens is provided, share a single
+            # persistent output buffer across capture sizes. The runner iterates
+            # capture sizes largest-first, so the first capture allocates the
+            # full-size buffer; subsequent captures copy their replay output
+            # into it (recorded inside the captured graph).
+            if num_tokens is not None and self._shared_output_buffer is not None:
+                self._copy_output_to_buffer(out, self._shared_output_buffer, num_tokens)
+
+        if num_tokens is None:
+            stored = out
+        else:
+            if self._shared_output_buffer is None:
+                self._shared_output_buffer = out
+                stored = self._slice_output(out, num_tokens)
+            else:
+                stored = self._slice_output(self._shared_output_buffer, num_tokens)
+
         self._graphs[shape_key] = graph
-        self._outputs[shape_key] = out
+        self._outputs[shape_key] = stored
+
+    def _slice_output(self, output: Any, num_tokens: int) -> Any:
+        if output is None:
+            return None
+        if torch.is_tensor(output):
+            return output[:num_tokens]
+        if isinstance(output, PPProxyTensors):
+            return output[:num_tokens]
+        if isinstance(output, tuple):
+            return tuple(self._slice_output(item, num_tokens) for item in output)
+        if isinstance(output, list):
+            return [self._slice_output(item, num_tokens) for item in output]
+        raise TypeError(f"Unsupported BCG output type: {type(output)}")
+
+    def _copy_output_to_buffer(
+        self, output: Any, output_buffer: Any, num_tokens: int
+    ) -> None:
+        if output is None or output_buffer is None:
+            if output is None and output_buffer is None:
+                return
+            raise ValueError(
+                "BCG output structure changed between capture sizes: "
+                f"{type(output)} vs {type(output_buffer)}"
+            )
+        if torch.is_tensor(output) and torch.is_tensor(output_buffer):
+            output_buffer[:num_tokens].copy_(output[:num_tokens])
+            return
+        if isinstance(output, PPProxyTensors) and isinstance(
+            output_buffer, PPProxyTensors
+        ):
+            if output.tensors.keys() != output_buffer.tensors.keys():
+                raise ValueError(
+                    "BCG output proxy structure changed between capture sizes: "
+                    f"{output.tensors.keys()} != {output_buffer.tensors.keys()}"
+                )
+            for key, tensor in output.tensors.items():
+                self._copy_output_to_buffer(
+                    tensor, output_buffer.tensors[key], num_tokens
+                )
+            return
+        if isinstance(output, (list, tuple)) and isinstance(
+            output_buffer, type(output)
+        ):
+            if len(output) != len(output_buffer):
+                raise ValueError(
+                    "BCG output sequence structure changed between capture sizes: "
+                    f"{len(output)} != {len(output_buffer)}"
+                )
+            for item, buffer in zip(output, output_buffer):
+                self._copy_output_to_buffer(item, buffer, num_tokens)
+            return
+        raise TypeError(
+            "Unsupported BCG output buffer pair: "
+            f"{type(output)} vs {type(output_buffer)}"
+        )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
         return shape_key in self._graphs
@@ -125,3 +204,4 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None
+        self._shared_output_buffer = None

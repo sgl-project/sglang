@@ -613,11 +613,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook = None
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
+        # PR #27659: num_tokens lets BCG share one output buffer across capture
+        # sizes; other backends accept it as a no-op.
         self.backend.capture_one(
             num_tokens,
             run_once,
             dummies=None,
             post_warmup_hook=post_warmup_hook,
+            num_tokens=num_tokens,
         )
 
     # -----------------------------------------------------------------

@@ -66,6 +66,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
+        num_tokens: Optional[int] = None,
     ) -> None:
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.

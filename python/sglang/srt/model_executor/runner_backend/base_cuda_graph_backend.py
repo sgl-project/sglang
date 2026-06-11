@@ -47,6 +47,7 @@ class BaseCudaGraphBackend(ABC):
         forward_fn,
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
+        num_tokens: Optional[int] = None,
     ) -> None: ...
 
     @abstractmethod

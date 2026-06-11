@@ -79,6 +79,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
+        num_tokens: Optional[int] = None,
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
 
