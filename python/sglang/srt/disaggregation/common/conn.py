@@ -710,6 +710,15 @@ class CommonKVManager(BaseKVManager):
             keys_to_remove = [
                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
             ]
+            # Collect TCP endpoints from cached bootstrap_infos before deletion
+            stale_endpoints = set()
+            for k in keys_to_remove:
+                for info in self.connection_pool[k]:
+                    ip = info.get("rank_ip")
+                    port = info.get("rank_port")
+                    if ip and port:
+                        na = NetworkAddress(ip, int(port))
+                        stale_endpoints.add(na.to_tcp())
             for k in keys_to_remove:
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
@@ -718,6 +727,9 @@ class CommonKVManager(BaseKVManager):
                 failed_bootstrap_addr, []
             )
             self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
+
+        for endpoint in stale_endpoints:
+            CommonKVReceiver.disconnect_endpoint(endpoint)
 
         affected_rooms = []
         for room in possible_affected_rooms:
@@ -1081,6 +1093,19 @@ class CommonKVReceiver(BaseKVReceiver):
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+
+    @classmethod
+    def disconnect_endpoint(cls, endpoint: str):
+        with cls._global_lock:
+            sock = cls._socket_cache.pop(endpoint, None)
+            lock = cls._socket_locks.pop(endpoint, None)
+        if sock:
+            if lock:
+                with lock:
+                    sock.close()
+            else:
+                sock.close()
+            logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
