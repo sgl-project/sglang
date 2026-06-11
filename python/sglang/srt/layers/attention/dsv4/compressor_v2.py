@@ -519,9 +519,6 @@ class CompressorBackendMixin:
                 kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
                 if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
-                    # The v2 compressor writes directly into the raw C4 KV tensor,
-                    # so HiSparse C4 needs the physical C4 location here. Use the
-                    # int64 (no-narrowing) translation; the store kernel takes int64.
                     out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
                         out_loc
                     )
