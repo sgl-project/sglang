@@ -2085,4 +2085,3 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
-
