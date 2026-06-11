@@ -6,9 +6,12 @@ with_attention fills them).
 """
 
 import unittest
+from unittest import mock
 
 from sglang.srt.model_executor.runtime_context import (
     ConfigSection,
+    FlagsConfig,
+    MoeFlags,
     ParallelConfig,
     RuntimeContext,
     get_attn_cp_rank,
@@ -273,6 +276,77 @@ class TestOverrideFreeze(unittest.TestCase):
         self.assertIsNot(c2, c1)
         c2.config.set("use_mla_backend", False)  # must NOT raise
         self.assertFalse(get_use_mla_backend())
+
+
+class TestFlagsMaterialize(unittest.TestCase):
+    """M0.2: ``.flags.moe.use_cutlass_fp4_allgather`` is materialized at
+    ``freeze()`` from the existing predicate (single source of truth — the 6
+    clauses are not reimplemented, so the cached flag cannot drift from the
+    not-yet-flipped call-sites)."""
+
+    _PREDICATE = (
+        "sglang.srt.layers.moe.utils.should_use_flashinfer_cutlass_moe_fp4_allgather"
+    )
+
+    def setUp(self):
+        reset_runtime_context()
+
+    def tearDown(self):
+        reset_runtime_context()
+
+    def test_default_false_before_freeze(self):
+        _publish(_engine_parallel())
+        # not yet materialized → default snapshot
+        self.assertFalse(
+            get_runtime_context().flags.moe.use_cutlass_fp4_allgather
+        )
+
+    def test_freeze_materializes_predicate_true(self):
+        _publish(_engine_parallel())
+        ctx = get_runtime_context()
+        with mock.patch(self._PREDICATE, return_value=True):
+            ctx.freeze()
+        self.assertTrue(ctx.flags.moe.use_cutlass_fp4_allgather)
+
+    def test_freeze_materializes_predicate_false(self):
+        _publish(_engine_parallel())
+        ctx = get_runtime_context()
+        with mock.patch(self._PREDICATE, return_value=False):
+            ctx.freeze()
+        self.assertFalse(ctx.flags.moe.use_cutlass_fp4_allgather)
+
+    def test_materialize_calls_predicate_once(self):
+        # single source of truth: freeze snapshots the predicate result; it does
+        # not reimplement the clauses.
+        _publish(_engine_parallel())
+        ctx = get_runtime_context()
+        with mock.patch(self._PREDICATE, return_value=True) as m:
+            ctx.freeze()
+        m.assert_called_once_with()
+
+    def test_flag_structs_are_frozen(self):
+        flags = FlagsConfig(moe=MoeFlags(use_cutlass_fp4_allgather=True))
+        with self.assertRaises(Exception):  # FrozenInstanceError
+            flags.moe.use_cutlass_fp4_allgather = False
+        with self.assertRaises(Exception):
+            flags.moe = MoeFlags()
+
+    def test_republish_resets_flags_until_refrozen(self):
+        # m0.2 R4 / m0.5 R2: a second ModelRunner publishes a fresh context; its
+        # flags start at default until its own freeze re-materializes them (so a
+        # stale True from runner #1 does not leak into runner #2).
+        _publish(_engine_parallel())
+        c1 = get_runtime_context()
+        with mock.patch(self._PREDICATE, return_value=True):
+            c1.freeze()
+        self.assertTrue(c1.flags.moe.use_cutlass_fp4_allgather)
+        _publish(_engine_parallel())  # fresh runner
+        c2 = get_runtime_context()
+        self.assertIsNot(c2, c1)
+        self.assertFalse(c2.flags.moe.use_cutlass_fp4_allgather)  # default again
+        with mock.patch(self._PREDICATE, return_value=False):
+            c2.freeze()
+        self.assertFalse(c2.flags.moe.use_cutlass_fp4_allgather)
 
 
 if __name__ == "__main__":

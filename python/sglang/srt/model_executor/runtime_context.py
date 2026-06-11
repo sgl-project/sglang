@@ -8,12 +8,13 @@ resolve into this *process-static* ``RuntimeContext`` (eventually frozen after
 resolve); ``forward_batch`` drives a separate per-forward ``ForwardContext``.
 
 ``RuntimeContext`` has four sub-structs ``.config`` / ``.flags`` / ``.resources``
-/ ``.buffers``, each a per-subsystem namespace. **This step (M0.1) only fills
-``.config.parallel``** — the whole parallelism subsystem (tp/pp/dp/moe_ep/moe_dp
-+ attention attn_tp/attn_dp/local_attn_dp/attn_cp, each size + rank) — as the
-single source of truth, read via named accessors (``get_tp_size`` … ). The other
-sub-structs and the ``freeze`` / ``apply_model_overrides`` / ``override``
-discipline are placeholders filled by later PoC steps (M0.2–M0.6).
+/ ``.buffers``, each a per-subsystem namespace. **M0.1 fills ``.config.parallel``**
+— the whole parallelism subsystem (tp/pp/dp/moe_ep/moe_dp + attention
+attn_tp/attn_dp/local_attn_dp/attn_cp, each size + rank) — as the single source
+of truth, read via named accessors (``get_tp_size`` … ). **M0.2 fills
+``.flags.moe``** — one G4 static-side derived flag materialized at ``freeze()``.
+``.resources`` / ``.buffers`` and the ``apply_model_overrides`` discipline are
+placeholders filled by later PoC steps (M0.3–M0.6).
 
 Two-stage fill: the **engine** dims are known at ``ModelRunner.__init__``; the
 **attention** dims are only resolved by ``initialize_dp_attention`` (inside
@@ -140,12 +141,37 @@ class ConfigSection:
                     self._overrides[name] = old
 
 
+@dataclass(frozen=True, slots=True)
+class MoeFlags:
+    """``.flags.moe`` — MoE-subsystem derived flags (G4 static side).
+
+    ``use_cutlass_fp4_allgather`` is materialized once at ``RuntimeContext.freeze()``
+    by calling the existing ``should_use_flashinfer_cutlass_moe_fp4_allgather()``
+    predicate (``layers/moe/utils.py``). The predicate stays the single source of
+    truth; this is only a result snapshot, so it cannot drift from the (not-yet-
+    flipped) call-sites. Name drops the ``should_use_`` prefix to signal it is the
+    already-derived result, not the decision function (m0.2)."""
+
+    use_cutlass_fp4_allgather: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FlagsConfig:
+    """The ``.flags`` sub-struct: per-subsystem derived flags, nested (G1 — not a
+    flat bag). M0.2 fills only ``.moe``; ``.attn`` / ``.comm`` / ``.quant`` land in
+    Stage-B P3."""
+
+    moe: MoeFlags = field(default_factory=MoeFlags)
+
+
 @dataclass(slots=True)
 class RuntimeContext:
-    """Process-static container skeleton (G1). M0.1 fills only ``.config.parallel``;
-    ``.flags`` / ``.resources`` / ``.buffers`` are reserved for M0.2–M0.4."""
+    """Process-static container skeleton (G1). M0.1 fills ``.config.parallel``;
+    M0.2 fills ``.flags.moe`` (materialized at ``freeze()``). ``.resources`` /
+    ``.buffers`` are reserved for M0.3–M0.4."""
 
     config: ConfigSection
+    flags: FlagsConfig = field(default_factory=FlagsConfig)
     _frozen: bool = False
 
     def apply_model_overrides(self, model) -> None:
@@ -156,12 +182,33 @@ class RuntimeContext:
         ...
 
     def freeze(self) -> None:
-        """G1/G3 freeze — M0.5 fills it: close the ``.config`` write surface
-        (subsequent ``config.set`` raises; ``override`` still bypasses). Lands
+        """G1/G3 freeze — M0.5: close the ``.config`` write surface (subsequent
+        ``config.set`` raises; ``override`` still bypasses). M0.2: materialize the
+        G4 static-side ``.flags`` here, after ``.config`` is fully resolved. Lands
         after ``init_memory_pool`` per resolution cycle; a second ModelRunner
-        re-publishes a fresh (unfrozen) context, so multi-runner is safe (m0.5 R2)."""
+        re-publishes a fresh (unfrozen) context, so multi-runner is safe (m0.5 R2).
+
+        Ordering precondition (m0.2 R1/R3): freeze() must run *after* both
+        ``initialize_dp_attention`` (model_runner.py — sets the dp-attn globals
+        the predicate's clause 4/6 read) and ``initialize_moe_config`` (sets the
+        MoE globals clause 1/2/3/5 read). Otherwise the cached flag locks in a
+        lazy-default / asserts on the unset ``_ATTN_DP_SIZE``. The current
+        ``init_memory_pool`` landing site satisfies both."""
         self._frozen = True
         self.config.freeze()
+        # M0.2: G4 static-side materialize. The predicate is the single source of
+        # truth (clause bodies are NOT reimplemented here); we cache the result so
+        # forward-path readers do one named-flag read. Lazy import to avoid a
+        # module-load cycle (moe/utils pulls in heavy layer deps).
+        from sglang.srt.layers.moe.utils import (
+            should_use_flashinfer_cutlass_moe_fp4_allgather,
+        )
+
+        self.flags = FlagsConfig(
+            moe=MoeFlags(
+                use_cutlass_fp4_allgather=should_use_flashinfer_cutlass_moe_fp4_allgather(),
+            )
+        )
 
     def override(self, **kwargs):
         """G3(b) scoped test/debug override over ``.config`` — set-with-restore,
