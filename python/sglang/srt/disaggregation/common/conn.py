@@ -917,7 +917,6 @@ class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
     _socket_cache = {}
     _socket_locks = {}
-    _monitor_cache = {}
     _global_lock = threading.Lock()
 
     def __init__(
@@ -1074,42 +1073,13 @@ class CommonKVReceiver(BaseKVReceiver):
     @classmethod
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
         with cls._global_lock:
-            if endpoint in cls._socket_cache:
-                monitor = cls._monitor_cache.get(endpoint)
-                disconnected = False
-                if monitor is not None:
-                    try:
-                        monitor.recv_multipart(zmq.NOBLOCK)
-                        disconnected = True
-                    except zmq.Again:
-                        pass
-                    except zmq.ZMQError:
-                        disconnected = True
-                if not disconnected:
-                    return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
-                cls._socket_cache[endpoint].close(linger=0)
-                if monitor is not None:
-                    monitor.close()
-                del cls._socket_cache[endpoint]
-                del cls._socket_locks[endpoint]
-                cls._monitor_cache.pop(endpoint, None)
-
-            sock = cls._ctx.socket(zmq.PUSH)
-            if is_ipv6:
-                sock.setsockopt(zmq.IPV6, 1)
-            sock.setsockopt(zmq.RECONNECT_IVL, -1)
-            sock.setsockopt(zmq.SNDTIMEO, 30000)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
-            sock.connect(endpoint)
-            cls._socket_cache[endpoint] = sock
-            cls._socket_locks[endpoint] = threading.Lock()
-            cls._monitor_cache[endpoint] = sock.get_monitor_socket(
-                zmq.EVENT_DISCONNECTED
-            )
+            if endpoint not in cls._socket_cache:
+                sock = cls._ctx.socket(zmq.PUSH)
+                if is_ipv6:
+                    sock.setsockopt(zmq.IPV6, 1)
+                sock.connect(endpoint)
+                cls._socket_cache[endpoint] = sock
+                cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     @classmethod
