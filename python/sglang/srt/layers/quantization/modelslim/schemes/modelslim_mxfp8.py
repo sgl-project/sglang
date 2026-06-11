@@ -7,14 +7,21 @@ uint8 scales) and runs MXFP8 matmul at inference.
 from typing import Dict, List, Optional
 
 import torch
-import torch_npu
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
+from sglang.srt.platforms import current_platform
+
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    import torch_npu
 
 MXFP8_BLOCK_SIZE = 32
-_FLOAT8_E8M0FNU_DTYPE = getattr(
-    torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)
+_FLOAT8_E8M0FNU_DTYPE = (
+    getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None))
+    if _is_npu
+    else getattr(torch, "float8_e8m0fnu", None)
 )
 
 
