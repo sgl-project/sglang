@@ -183,45 +183,18 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
 
-        self.host_radix_cache = None
+        self.radix_cache = None
         self._req_host_written_len: dict[int, int] = {}
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
-    def set_host_radix_cache(self, cache) -> None:
-        self.host_radix_cache = cache
+    def set_radix_cache(self, cache) -> None:
+        self.radix_cache = cache
         cache.bind_hisparse_req_pools(
             self.req_to_host_pool,
             self.req_to_token_pool.req_to_token,
         )
-
-    def _backup_from_device_all_layer(
-        self,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
-        **kwargs,
-    ) -> None:
-        if self.host_radix_cache is not None:
-            self.host_radix_cache.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                **kwargs,
-            )
-        else:
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                io_backend="kernel",
-            )
-
-    def _free_req_host_range(self, req_idx: int, start: int, end: int) -> None:
-        host_indices = self.req_to_host_pool[req_idx, start:end]
-        host_indices = host_indices[host_indices >= 0]
-        if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -255,27 +228,21 @@ class HiSparseCoordinator:
         prefill_len = len(device_indices)
         token_ids = list(req.fill_ids[:prefill_len])
 
-        radix_prefix_len = 0
-        if self.host_radix_cache is not None:
-            host_prefix, radix_prefix_len = (
-                self.host_radix_cache.match_and_lock_req_prefix(
-                    req.req_pool_idx,
-                    token_ids,
-                    req.extra_key,
-                    prefill_len,
-                )
+        host_prefix, radix_prefix_len = self.radix_cache.match_and_lock_req_prefix(
+            req.req_pool_idx,
+            token_ids,
+            req.extra_key,
+            prefill_len,
+        )
+        if radix_prefix_len > 0:
+            self.req_to_host_pool[req.req_pool_idx, :radix_prefix_len] = (
+                host_prefix[:radix_prefix_len].to(device=self.device, non_blocking=True)
             )
-            if radix_prefix_len > 0:
-                self.req_to_host_pool[req.req_pool_idx, :radix_prefix_len] = (
-                    host_prefix[:radix_prefix_len].to(
-                        device=self.device, non_blocking=True
-                    )
-                )
-                self.req_to_host_pool_allocated_len[req.req_pool_idx] = (
-                    (radix_prefix_len + self.page_size - 1)
-                    // self.page_size
-                    * self.page_size
-                )
+            self.req_to_host_pool_allocated_len[req.req_pool_idx] = (
+                (radix_prefix_len + self.page_size - 1)
+                // self.page_size
+                * self.page_size
+            )
 
         self._req_host_written_len[req.req_pool_idx] = prefill_len
 
@@ -295,7 +262,8 @@ class HiSparseCoordinator:
 
             with device_module.stream(self.write_staging_stream):
                 start_event.wait(self.write_staging_stream)
-                self._backup_from_device_all_layer(
+                self.radix_cache.backup_from_device_all_layer(
+                    self.mem_pool_device,
                     suffix_host_indices,
                     suffix_device_indices,
                     indexer_ranges=[(req.req_pool_idx, radix_prefix_len, prefill_len)],
@@ -484,16 +452,13 @@ class HiSparseCoordinator:
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
     def _insert_prefill_into_radix_cache(self, req: Req) -> None:
-        if self.host_radix_cache is None:
-            return
-
         prefill_len = len(req.fill_ids)
         token_ids = list(req.fill_ids[:prefill_len])
         host_indices = self.req_to_host_pool[req.req_pool_idx, :prefill_len].cpu()
-        old_prefix_len = self.host_radix_cache.req_prefix_len(req.req_pool_idx)
+        old_prefix_len = self.radix_cache.req_prefix_len(req.req_pool_idx)
 
         insert_prefix_len, duplicate_indices, canonical_indices = (
-            self.host_radix_cache.insert_req_host_indices(
+            self.radix_cache.insert_req_host_indices(
                 req.req_pool_idx,
                 token_ids,
                 host_indices,
@@ -681,7 +646,8 @@ class HiSparseCoordinator:
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
-            self._backup_from_device_all_layer(
+            self.radix_cache.backup_from_device_all_layer(
+                self.mem_pool_device,
                 host_locs,
                 device_locs,
                 completed_indexer_pages=completed_indexer_pages,
@@ -815,17 +781,17 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
         # Free only request-owned suffix slots. Prefix slots can be canonical
-        # host-radix entries owned by the unified tree.
-        radix_prefix_len = (
-            self.host_radix_cache.req_prefix_len(req.req_pool_idx)
-            if self.host_radix_cache is not None
-            else 0
-        )
+        # radix-cache entries owned by the unified tree.
+        radix_prefix_len = self.radix_cache.req_prefix_len(req.req_pool_idx)
         allocated_len = int(self.req_to_host_pool_allocated_len[req.req_pool_idx])
-        self._free_req_host_range(req.req_pool_idx, radix_prefix_len, allocated_len)
+        host_indices = self.req_to_host_pool[
+            req.req_pool_idx, radix_prefix_len:allocated_len
+        ]
+        host_indices = host_indices[host_indices >= 0]
+        if host_indices.numel() > 0:
+            self.mem_pool_host.free(host_indices)
 
-        if self.host_radix_cache is not None:
-            self.host_radix_cache.release_req_node(req.req_pool_idx)
+        self.radix_cache.release_req_node(req.req_pool_idx)
 
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
@@ -870,39 +836,31 @@ class HiSparseCoordinator:
         )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
 
-        if self.host_radix_cache is not None:
-            total_len = radix_cache_len
-            host_indices = self.req_to_host_pool[req.req_pool_idx, :total_len]
-            token_ids = list((req.origin_input_ids + req.output_ids)[:total_len])
-            host_indices_cpu = host_indices.cpu()
-            old_protected = self.host_radix_cache.req_prefix_len(req.req_pool_idx)
-            cache_key_len = (len(token_ids) // self.page_size) * self.page_size
-            if total_len > 0:
-                _, duplicate_indices, _ = self.host_radix_cache.insert_req_host_indices(
-                    req.req_pool_idx,
-                    token_ids,
-                    host_indices_cpu,
-                    req.extra_key,
-                )
-                if duplicate_indices.numel() > 0:
-                    self.mem_pool_host.free(duplicate_indices)
-
-            allocated_host_len = int(
-                self.req_to_host_pool_allocated_len[req.req_pool_idx]
-            )
-            free_tail_start = max(cache_key_len, old_protected)
-            self._free_req_host_range(
-                req.req_pool_idx, free_tail_start, allocated_host_len
-            )
-        else:
-            self._free_req_host_range(
+        total_len = radix_cache_len
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :total_len]
+        token_ids = list((req.origin_input_ids + req.output_ids)[:total_len])
+        old_protected = self.radix_cache.req_prefix_len(req.req_pool_idx)
+        cache_key_len = (len(token_ids) // self.page_size) * self.page_size
+        if total_len > 0:
+            _, duplicate_indices, _ = self.radix_cache.insert_req_host_indices(
                 req.req_pool_idx,
-                0,
-                int(self.req_to_host_pool_allocated_len[req.req_pool_idx]),
+                token_ids,
+                host_indices.cpu(),
+                req.extra_key,
             )
+            if duplicate_indices.numel() > 0:
+                self.mem_pool_host.free(duplicate_indices)
 
-        if self.host_radix_cache is not None:
-            self.host_radix_cache.release_req_node(req.req_pool_idx)
+        allocated_host_len = int(self.req_to_host_pool_allocated_len[req.req_pool_idx])
+        free_tail_start = max(cache_key_len, old_protected)
+        host_indices = self.req_to_host_pool[
+            req.req_pool_idx, free_tail_start:allocated_host_len
+        ]
+        host_indices = host_indices[host_indices >= 0]
+        if host_indices.numel() > 0:
+            self.mem_pool_host.free(host_indices)
+
+        self.radix_cache.release_req_node(req.req_pool_idx)
 
         # clear req info
         self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
@@ -917,9 +875,6 @@ class HiSparseCoordinator:
 
     def _prepare_radix_cache_len(self, req: Req, total_len: int) -> int:
         """Return the contiguous host-written length safe to insert in radix."""
-        if self.host_radix_cache is None:
-            return 0
-
         req_idx = req.req_pool_idx
         written_len = min(self._req_host_written_len.get(req_idx, 0), total_len)
         if written_len >= total_len:
@@ -944,7 +899,8 @@ class HiSparseCoordinator:
         )
         device_slot = min(written_len, self.device_buffer_size)
         device_locs = self.req_to_device_buffer[req_idx, device_slot : device_slot + 1]
-        self._backup_from_device_all_layer(
+        self.radix_cache.backup_from_device_all_layer(
+            self.mem_pool_device,
             host_locs,
             device_locs,
             completed_indexer_pages=[(req_idx, written_len + 1)],

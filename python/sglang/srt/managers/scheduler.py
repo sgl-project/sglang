@@ -480,7 +480,7 @@ class Scheduler(
                     )
                 )
                 if self.enable_hisparse_radix_cache:
-                    self.hisparse_coordinator.set_host_radix_cache(self.tree_cache)
+                    self.hisparse_coordinator.set_radix_cache(self.tree_cache)
                     self.tp_worker.register_hicache_layer_transfer_counter(
                         self.tree_cache.cache_controller.layer_done_counter
                     )
