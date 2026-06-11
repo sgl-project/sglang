@@ -161,12 +161,12 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
     ) -> "CombineInput":
         backend = self.runner.runner_backend
         quant_info = TorchNpuQuantInfo(
-            w13_weight=layer.w13_qweight,
-            w2_weight=layer.w2_qweight,
-            w13_scale=layer.w13_scales,
-            w2_scale=layer.w2_scales,
-            w13_offset=layer.w13_qzeros,
-            w2_offset=layer.w2_qzeros,
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_offset=layer.w13_weight_offset,
+            w2_offset=layer.w2_weight_offset,
         )
         return self.runner.run(dispatch_output, quant_info)
 
