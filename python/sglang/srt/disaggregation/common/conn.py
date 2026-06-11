@@ -430,7 +430,10 @@ class CommonKVManager(BaseKVManager):
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         with self._push_socket_lock:
             if endpoint in self._push_socket_cache:
-                return self._push_socket_cache[endpoint]
+                return (
+                    self._push_socket_cache[endpoint],
+                    self._push_endpoint_locks[endpoint],
+                )
             sock = self._zmq_ctx.socket(zmq.PUSH)
             sock.setsockopt(zmq.LINGER, 0)
             sock.setsockopt(zmq.RECONNECT_IVL, -1)
@@ -445,7 +448,10 @@ class CommonKVManager(BaseKVManager):
             lock = threading.Lock()
             self._push_endpoint_locks[endpoint] = lock
             self._push_socket_cache[endpoint] = sock
-            return sock, lock
+            return (
+                self._push_socket_cache[endpoint],
+                self._push_endpoint_locks[endpoint],
+            )
 
     def disconnect_endpoint(self, endpoint: str):
         with self._push_socket_lock:
