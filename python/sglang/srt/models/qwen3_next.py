@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -65,6 +66,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
@@ -824,8 +826,15 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if _is_hip:
+                from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                    sigmoid_gate_mul,
+                )
+
+                attn_output = sigmoid_gate_mul(attn_output, gate)
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output
