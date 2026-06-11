@@ -250,7 +250,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         # EAGLE doesn't use stream_idx / lora variants.
-        return ShapeKey(size=bs * self.num_tokens_per_bs)
+        return ShapeKey(size=bs)
 
     # -----------------------------------------------------------------
     # can_run

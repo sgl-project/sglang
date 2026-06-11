@@ -287,7 +287,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        return ShapeKey(size=bs * self.num_tokens_per_bs)
+        return ShapeKey(size=bs)
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:

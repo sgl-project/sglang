@@ -494,7 +494,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(
-            size=bs * self.num_tokens_per_bs,
+            size=bs,
             stream_idx=stream_idx,
             variant_label=variant_label,
         )

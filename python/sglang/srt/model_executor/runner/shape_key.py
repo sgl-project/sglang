@@ -2,10 +2,11 @@
 
 Replaces the previous `int | str` keys produced by the legacy
 `_make_graph_key(bs, stream_idx, variant_label)` (which f-string'd
-into stringly-typed forms like `"lora_0_8"`). Carries the size of
-the captured input/output (bs and token count are fused — see
-DecodeCudaGraphRunner) so backends that share output buffers across
-capture sizes (BCG) don't need a side-channel.
+into stringly-typed forms like `"lora_0_8"`). The `size` field
+preserves the original per-phase shape semantics (prefill →
+num_tokens, decode → bs) and doubles as the leading-dim BCG slices
+to in prefill (where size == num_tokens == leading dim of the
+captured output).
 """
 
 from __future__ import annotations
@@ -18,9 +19,9 @@ from typing import Optional
 class ShapeKey:
     """Identifies one captured CUDA-graph shape across all runners.
 
-    size: number of rows in the captured input/output tensor.
+    size: the per-phase capture size — what the runner iterates over.
         - prefill: num_tokens
-        - decode:  bs * num_tokens_per_bs (bs and token count are fused)
+        - decode:  bs
     stream_idx:   pdmux stream index, or None for single-stream runners.
     variant_label: LoRA-variant label ("lora" / "nolora"), or None
         for runners that don't record per-variant graphs.
