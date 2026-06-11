@@ -3661,22 +3661,6 @@ class ServerArgs:
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
-        # TODO(yuwei): Fix piecewise cuda graph support for bypassed topk MoE backends.
-        # Exception: GptOssForCausalLM wraps the entire MoE block in its own
-        # custom op (moe_impl), so bypassed topk is handled inside the op body.
-        if (
-            (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked
-            and self.moe_runner_backend in ("flashinfer_trtllm", "flashinfer_mxfp4")
-            and self.get_model_config().hf_config.architectures[0]
-            != "GptOssForCausalLM"
-        ):
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            logger.info(
-                f"Piecewise cuda graph is disabled for MoE runner backend "
-                f"'{self.moe_runner_backend}' (bypassed topk is incompatible "
-                f"with torch.compile)."
-            )
-
     def cutedsl_moe_max_num_tokens(self) -> int:
         """Largest number of tokens a single forward routes through a CuteDSL
         MoE layer on one (DP) rank. Single source of truth for both the
