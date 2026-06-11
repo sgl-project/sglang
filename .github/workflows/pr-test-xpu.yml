@@ -119,10 +119,24 @@ jobs:
       - name: Cleanup container
         if: always()
         run: |
+          # pip install ran as root inside the container against the
+          # bind-mounted workspace, so build artifacts are root-owned on
+          # the host. Chown them back before rm to avoid Permission denied.
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          # Wipe everything the run wrote into the workspace so the next
+          # job starts from a clean tree.
           rm -rf \
             python/build \
+            python/dist \
             python/sglang.egg-info \
-            test/result.jsonl || true
+            python/sglang/*.egg-info \
+            test/result.jsonl \
+            test/results \
+            test/.pytest_cache \
+            .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
           docker rm -f ci_sglang_xpu || true
           if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
@@ -177,15 +191,31 @@ jobs:
       - name: Run stage-b tests
         timeout-minutes: 60
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu"
+          # --continue-on-error: run every file even if an earlier one fails,
+          # so a single regression doesn't hide the status of the rest.
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu --continue-on-error"
 
       - name: Cleanup container
         if: always()
         run: |
+          # pip install ran as root inside the container against the
+          # bind-mounted workspace, so build artifacts are root-owned on
+          # the host. Chown them back before rm to avoid Permission denied.
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          # Wipe everything the run wrote into the workspace so the next
+          # job starts from a clean tree.
           rm -rf \
             python/build \
+            python/dist \
             python/sglang.egg-info \
-            test/result.jsonl || true
+            python/sglang/*.egg-info \
+            test/result.jsonl \
+            test/results \
+            test/.pytest_cache \
+            .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
           docker rm -f ci_sglang_xpu || true
           if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
