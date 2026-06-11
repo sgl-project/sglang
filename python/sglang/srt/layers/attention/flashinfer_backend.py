@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.server_args import MIS_MAX_ITEM_LEN
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -105,6 +106,18 @@ if is_flashinfer_available():
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
+
+
+def _mis_max_item_position(delimiter_indices_cpu: torch.Tensor, seq_len: int) -> int:
+    """Return the largest pos_within_item for any single scored item."""
+    if delimiter_indices_cpu.numel() == 0:
+        return 0
+    max_pos = 0
+    for j in range(delimiter_indices_cpu.numel() - 1):
+        gap = delimiter_indices_cpu[j + 1].item() - delimiter_indices_cpu[j].item()
+        max_pos = max(max_pos, gap - 1)
+    tail = seq_len - delimiter_indices_cpu[-1].item() - 1
+    return max(max_pos, tail)
 
 
 @dataclass
@@ -419,6 +432,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_start = seq_end
                 continue
 
+            # Backstop for requests that bypass TokenizerManager validation:
+            # FlashInfer MIS metadata is uint16, so longer items would wrap.
+            max_item_pos = _mis_max_item_position(delimiter_indices_cpu, seq_len)
+            if max_item_pos > MIS_MAX_ITEM_LEN:
+                raise ValueError(
+                    f"Multi-item scoring item length {max_item_pos} exceeds "
+                    f"FlashInfer uint16 metadata limit ({MIS_MAX_ITEM_LEN}). "
+                    f"Shorten the scored item or disable --enable-mis."
+                )
+
             first_delim = delimiter_indices_cpu[0].item()  # CPU .item(), no GPU sync
             delimiter_indices = delimiter_indices_cpu.to(device, non_blocking=True)
             prefix_len = first_delim + (
@@ -441,6 +464,7 @@ class FlashInferAttnBackend(AttentionBackend):
             last_delim = relative_positions[torch.clamp(bucket_idx - 1, min=0)]
             pos_within_item = suffix_range - last_delim
 
+            # Safe: per-item length validated against MIS_MAX_ITEM_LEN above.
             token_pos_in_items_ptr.append(pos_within_item.to(torch.uint16))
 
             forward_batch.positions[seq_start + first_delim : seq_end] = (

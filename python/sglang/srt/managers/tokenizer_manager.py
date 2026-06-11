@@ -101,6 +101,7 @@ from sglang.srt.observability.request_metrics_exporter import (
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
+    MIS_MAX_ITEM_LEN,
     PortArgs,
     ServerArgs,
     set_global_server_args_for_tokenizer,
@@ -232,6 +233,20 @@ class InputFormat(Enum):
     SINGLE_STRING = 1  # Regular single text like "Hello world"
     BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
+
+
+def _validate_mis_item_lengths(delimiter_indices: List[int], num_tokens: int) -> None:
+    """Reject MIS requests whose longest item would overflow uint16 metadata."""
+    boundaries = [*delimiter_indices, num_tokens]
+    max_item_len = max(
+        (b - a - 1 for a, b in zip(boundaries, boundaries[1:])), default=0
+    )
+    if max_item_len > MIS_MAX_ITEM_LEN:
+        raise ValueError(
+            f"Multi-item scoring item length {max_item_len} exceeds FlashInfer "
+            f"uint16 metadata limit ({MIS_MAX_ITEM_LEN} tokens). Use shorter "
+            f"items or disable multi-item scoring (--enable-mis)."
+        )
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -1003,6 +1018,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+
+        # FlashInfer MIS metadata is uint16. Reject over-limit items here so
+        # the request fails cleanly before entering the scheduler forward path.
+        if obj.multi_item_delimiter_indices and input_ids:
+            _validate_mis_item_lengths(obj.multi_item_delimiter_indices, len(input_ids))
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

@@ -228,6 +228,12 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 # attention backend supports position-only MIS.
 MIS_DELIMITER_TOKEN_ID = 9999
 
+# FlashInfer MIS kernels read item-position metadata (token_pos_in_items_ptr /
+# max_item_len_ptr) as uint16: the delimiter occupies position 0 and item
+# tokens occupy positions 1..len, so no single scored item may exceed this
+# many tokens. Longer items would silently wrap modulo 2^16 (issue #26629).
+MIS_MAX_ITEM_LEN = (1 << 16) - 1
+
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
