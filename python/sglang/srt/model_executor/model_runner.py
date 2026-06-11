@@ -807,6 +807,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
+        # Snapshot free memory at the end of the weight-load phase. KV-pool
+        # profiling uses this instead of measuring at alloc_memory_pool()
+        # time: draft-model weights load between the two phases and must stay
+        # outside the --mem-fraction-static budget (deployments tune the
+        # fraction assuming draft weights live in the non-static slack).
+        self.post_model_load_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
+
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
