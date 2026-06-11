@@ -655,6 +655,8 @@ class Envs:
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING = EnvBool(False)
+    SGLANG_MAMBA_SSM_PHILOX_ROUNDS = EnvInt(10)
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)

@@ -688,6 +688,8 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
+    mamba_ssm_enable_stochastic_rounding: bool = False
+    mamba_ssm_philox_rounds: int = 10
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
@@ -3385,6 +3387,8 @@ class ServerArgs:
             self.linear_attn_decode_backend is None
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
+            and self.speculative_algorithm is None
+            and not self.mamba_ssm_enable_stochastic_rounding
         ):
             self.linear_attn_decode_backend = "flashinfer"
             logger.info(
@@ -3404,6 +3408,56 @@ class ServerArgs:
                 "--linear-attn-decode-backend flashinfer on SM100+ requires "
                 "--mamba-ssm-dtype bfloat16, "
                 f"got {self.mamba_ssm_dtype!r}"
+            )
+
+        # --mamba-ssm-enable-stochastic-rounding: SR of the fp32 recurrent state
+        # into the narrow cache dtype, done in the Triton kernels via hardware
+        # cvt.rs (GDN decode/prefill, Mamba1/2 decode). No software fallback.
+        if self.mamba_ssm_enable_stochastic_rounding:
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--mamba-ssm-enable-stochastic-rounding is not supported with "
+                    "speculative decoding: under MTP the recurrent state is advanced "
+                    "via the target-verify path + state scatter, neither SR-wired, so "
+                    "SR would be silently skipped on decode. Disable speculative "
+                    "decoding to use SR. Got --speculative-algorithm="
+                    f"{self.speculative_algorithm!r}."
+                )
+            if self.mamba_ssm_dtype not in ("float16", "bfloat16"):
+                raise ValueError(
+                    "--mamba-ssm-enable-stochastic-rounding requires --mamba-ssm-dtype "
+                    "float16 or bfloat16 (nothing to round at float32); got "
+                    f"{self.mamba_ssm_dtype!r}."
+                )
+            if self.mamba_ssm_philox_rounds < 1:
+                raise ValueError(
+                    "--mamba-ssm-philox-rounds must be >= 1, got "
+                    f"{self.mamba_ssm_philox_rounds}."
+                )
+            for _bk in (
+                self.linear_attn_decode_backend,
+                self.linear_attn_prefill_backend,
+            ):
+                if _bk is not None and _bk != "triton":
+                    raise ValueError(
+                        "--mamba-ssm-enable-stochastic-rounding requires the Triton "
+                        f"backend for GDN linear attention; got {_bk!r}. Use the Triton "
+                        "backend (omit --linear-attn-*-backend or set 'triton')."
+                    )
+            if (
+                not torch.cuda.is_available()
+                or torch.cuda.get_device_capability()[0] < 10
+            ):
+                raise ValueError(
+                    "--mamba-ssm-enable-stochastic-rounding requires an SM100+ GPU "
+                    "(hardware cvt.rs stochastic-rounding convert); this GPU does not "
+                    "support it and there is no software fallback."
+                )
+            logger.info(
+                "SSM stochastic rounding ENABLED: dtype=%s, philox_rounds=%d "
+                "(hardware cvt.rs, Triton kernels)",
+                self.mamba_ssm_dtype,
+                self.mamba_ssm_philox_rounds,
             )
 
         # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
@@ -4357,6 +4411,9 @@ class ServerArgs:
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
         if self.mamba_ssm_dtype is not None:
             envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
+        if self.mamba_ssm_enable_stochastic_rounding:
+            envs.SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING.set(True)
+            envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.set(self.mamba_ssm_philox_rounds)
         envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
             "1" if self.disable_outlines_disk_cache else "0"
         )
@@ -6445,6 +6502,21 @@ class ServerArgs:
             choices=["float32", "bfloat16", "float16"],
             help="The data type of the SSM states in mamba cache. "
             "If not set, will be read from model config (mamba_ssm_dtype).",
+        )
+        parser.add_argument(
+            "--mamba-ssm-enable-stochastic-rounding",
+            action="store_true",
+            help="Stochastically round the fp32 recurrent state to the narrow "
+            "--mamba-ssm-dtype (fp16/bf16) at the kernel store, instead of "
+            "round-to-nearest. Supports GDN and Mamba1/Mamba2 decode kernels "
+            "(Triton backend). Requires an SM100+ GPU (hardware cvt.rs).",
+        )
+        parser.add_argument(
+            "--mamba-ssm-philox-rounds",
+            type=int,
+            default=ServerArgs.mamba_ssm_philox_rounds,
+            help="Philox round count for the SSM stochastic-rounding RNG "
+            "(default 10; only used with --mamba-ssm-enable-stochastic-rounding).",
         )
         parser.add_argument(
             "--mamba-full-memory-ratio",

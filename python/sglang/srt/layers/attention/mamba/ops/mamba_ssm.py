@@ -12,6 +12,7 @@ import triton.language as tl
 from packaging import version
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.layers.attention.fla.stochastic_round import rs_round_state
 
 PAD_SLOT_ID = -1
 
@@ -144,6 +145,9 @@ def _selective_scan_update_kernel(
     HAS_INTERMEDIATE_STATE_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    rand_seed=None,
+    USE_RS_ROUNDING: tl.constexpr = False,
+    PHILOX_ROUNDS: tl.constexpr = 10,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -300,7 +304,20 @@ def _selective_scan_update_kernel(
             z_ptr += stride_z_T
 
     if not DISABLE_STATE_UPDATE:
-        tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
+        if USE_RS_ROUNDING:
+            rs_offs = (
+                pid_b * nheads * dim * dstate
+                + pid_h * dim * dstate
+                + offs_m[:, None] * dstate
+                + offs_n[None, :]
+            )
+            state_q = rs_round_state(
+                state, tl.load(rand_seed), rs_offs,
+                state_ptrs.dtype.element_ty, PHILOX_ROUNDS,
+            )
+        else:
+            state_q = state.to(state_ptrs.dtype.element_ty)
+        tl.store(state_ptrs, state_q, mask=mask)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -325,6 +342,9 @@ def selective_state_update(
     cache_steps=None,
     retrieve_parent_token=None,
     intermediate_state_indices=None,
+    rand_seed=None,
+    use_rs_rounding=False,
+    philox_rounds=10,
 ):
     """
     Argument:
@@ -502,5 +522,8 @@ def selective_state_update(
             BLOCK_SIZE_M,
             DISABLE_STATE_UPDATE=disable_state_update,
             num_warps=num_warps,
+            rand_seed=rand_seed,
+            USE_RS_ROUNDING=use_rs_rounding,
+            PHILOX_ROUNDS=philox_rounds,
             **pdl_kwargs,
         )

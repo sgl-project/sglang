@@ -13,7 +13,9 @@ from sglang.srt.layers.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
+from sglang.srt.layers.attention.fla.stochastic_round import rs_round_state
 from sglang.srt.layers.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
@@ -76,6 +78,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
+    rand_seed=None,
+    USE_RS_ROUNDING: tl.constexpr = False,
+    PHILOX_ROUNDS: tl.constexpr = 10,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -271,25 +276,72 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h4 += tl.trans(tl.dot(b_k, b_v))
 
-    # epilogue
+    # epilogue: write the final recurrent state back to the in-place cache. With
+    # USE_RS_ROUNDING, stochastically round the fp32 state into the narrow cache
+    # dtype (per-element Philox counters decorrelate lanes; per-call seed loaded
+    # from device memory).
     if INPLACE_UPDATE:
+        if USE_RS_ROUNDING:
+            rs_seed = tl.load(rand_seed)
+            rs_o_v = i_v * BV + tl.arange(0, BV)
+            rs_base = (i_n * H + i_h) * V * K + rs_o_v[:, None] * K
         p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-        tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+        if USE_RS_ROUNDING:
+            b_o = rs_round_state(
+                b_h1,
+                rs_seed,
+                rs_base + tl.arange(0, 64)[None, :],
+                ht.dtype.element_ty,
+                PHILOX_ROUNDS,
+            )
+        else:
+            b_o = b_h1.to(p_ht.dtype.element_ty)
+        tl.store(p_ht, b_o, boundary_check=(0, 1))
         if K > 64:
             p_ht = tl.make_block_ptr(
                 ht, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
             )
-            tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if USE_RS_ROUNDING:
+                b_o = rs_round_state(
+                    b_h2,
+                    rs_seed,
+                    rs_base + (64 + tl.arange(0, 64))[None, :],
+                    ht.dtype.element_ty,
+                    PHILOX_ROUNDS,
+                )
+            else:
+                b_o = b_h2.to(p_ht.dtype.element_ty)
+            tl.store(p_ht, b_o, boundary_check=(0, 1))
         if K > 128:
             p_ht = tl.make_block_ptr(
                 ht, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
             )
-            tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if USE_RS_ROUNDING:
+                b_o = rs_round_state(
+                    b_h3,
+                    rs_seed,
+                    rs_base + (128 + tl.arange(0, 64))[None, :],
+                    ht.dtype.element_ty,
+                    PHILOX_ROUNDS,
+                )
+            else:
+                b_o = b_h3.to(p_ht.dtype.element_ty)
+            tl.store(p_ht, b_o, boundary_check=(0, 1))
         if K > 192:
             p_ht = tl.make_block_ptr(
                 ht, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
             )
-            tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if USE_RS_ROUNDING:
+                b_o = rs_round_state(
+                    b_h4,
+                    rs_seed,
+                    rs_base + (192 + tl.arange(0, 64))[None, :],
+                    ht.dtype.element_ty,
+                    PHILOX_ROUNDS,
+                )
+            else:
+                b_o = b_h4.to(p_ht.dtype.element_ty)
+            tl.store(p_ht, b_o, boundary_check=(0, 1))
 
 
 def chunk_gated_delta_rule_fwd_h(
@@ -325,6 +377,15 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
+    # GDN cache stochastic rounding (--mamba-ssm-enable-stochastic-rounding):
+    # the kernel rounds the fp32 final state into the narrow ssm_dtype cache.
+    use_rs = envs.SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING.get()
+    rand_seed = (
+        torch.randint(0, 2**31 - 1, (1,), device=k.device, dtype=torch.int64)
+        if use_rs
+        else None
+    )
+
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
@@ -353,5 +414,8 @@ def chunk_gated_delta_rule_fwd_h(
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
+        rand_seed=rand_seed,
+        USE_RS_ROUNDING=use_rs,
+        PHILOX_ROUNDS=envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.get(),
     )
     return h, v_new

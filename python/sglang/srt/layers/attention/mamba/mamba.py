@@ -4,6 +4,7 @@ from typing import Callable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.srt.environ import envs
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     extra_groups_for_head_shards,
@@ -717,6 +718,12 @@ class MambaMixer2(torch.nn.Module):
                     intermediate_state_indices=self.intermediate_state_indices,
                 )
             else:
+                use_rs = envs.SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING.get()
+                rand_seed = (
+                    torch.randint(0, 2**31 - 1, (1,), device=ssm_state.device, dtype=torch.int64)
+                    if use_rs
+                    else None
+                )
                 selective_state_update(
                     ssm_state,
                     hidden_states_d,
@@ -730,6 +737,9 @@ class MambaMixer2(torch.nn.Module):
                     dt_softplus=True,
                     state_batch_indices=state_indices_tensor_d,
                     out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                    rand_seed=rand_seed,
+                    use_rs_rounding=use_rs,
+                    philox_rounds=envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.get(),
                 )
 
         # 4. gated MLP

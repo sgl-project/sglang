@@ -1,5 +1,6 @@
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -78,6 +79,17 @@ class TritonGDNKernel(LinearAttnKernelBase):
         # Packed kernel expects output shape [B, 1, HV, V]
         out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
 
+        # GDN cache stochastic rounding (--mamba-ssm-enable-stochastic-rounding):
+        # round the fp32 state into the narrow ssm_dtype cache stochastically. The
+        # per-call seed is drawn from the default CUDA RNG (capturable; advances on
+        # each CUDA-graph replay so every decode step gets fresh rounding noise).
+        use_rs = envs.SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING.get()
+        rand_seed = (
+            torch.randint(0, 2**31 - 1, (1,), device=mixed_qkv.device, dtype=torch.int64)
+            if use_rs
+            else None
+        )
+
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv,
             a=a,
@@ -89,6 +101,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
+            rand_seed=rand_seed,
+            use_rs_rounding=use_rs,
+            philox_rounds=envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.get(),
         )
 
         # Convert [B, 1, HV, V] → [1, B, HV, V] to match existing output

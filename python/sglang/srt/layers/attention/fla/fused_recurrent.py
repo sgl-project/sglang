@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.fla.op import exp
+from sglang.srt.layers.attention.fla.stochastic_round import rs_round_state
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
@@ -193,6 +194,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     h0,
     ht,
     ssm_state_indices,
+    rand_seed,
     scale,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
@@ -208,6 +210,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    USE_RS_ROUNDING: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -262,7 +266,17 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
 
     p_ht = ht + state_idx * stride_final_state_token
     p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+    if USE_RS_ROUNDING:
+        # Stochastic rounding of the fp32 state into the narrow cache dtype.
+        # Per-element Philox counters (unique per request/head/v/k) decorrelate
+        # lanes; the per-call seed (device tensor) advances each step/replay.
+        rs_offs = (i_n * HV + i_hv) * V * K + o_v[:, None] * K + o_k[None, :]
+        b_ht = rs_round_state(
+            b_h, tl.load(rand_seed), rs_offs, p_ht.dtype.element_ty, PHILOX_ROUNDS
+        )
+    else:
+        b_ht = b_h.to(p_ht.dtype.element_ty)
+    tl.store(p_ht, b_ht, mask=mask_h)
 
 
 def fused_recurrent_gated_delta_rule_packed_decode(
@@ -276,6 +290,9 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    rand_seed: Optional[torch.Tensor] = None,
+    use_rs_rounding: bool = False,
+    philox_rounds: int = 10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if mixed_qkv.ndim != 2:
         raise ValueError(
@@ -381,6 +398,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         h0=initial_state,
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
+        rand_seed=rand_seed,
         scale=scale,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
@@ -396,6 +414,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        USE_RS_ROUNDING=use_rs_rounding,
+        PHILOX_ROUNDS=philox_rounds,
         num_warps=num_warps,
         num_stages=num_stages,
     )
