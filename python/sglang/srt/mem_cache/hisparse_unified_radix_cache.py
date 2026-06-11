@@ -243,19 +243,6 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         host_indices = self._collect_host_indices(best_match_node)
         return host_indices, best_match_node, len(host_indices)
 
-    def evict_host_if_needed(self, host_pool, need: int) -> None:
-        if need <= 0 or host_pool.available_size() >= need:
-            return
-
-        deficit = need - host_pool.available_size()
-        evictable = sum(
-            len(node.component_data[BASE_COMPONENT_TYPE].host_value)
-            for node in self.evictable_host_leaves
-            if node.component_data[BASE_COMPONENT_TYPE].host_value is not None
-        )
-        if evictable >= deficit:
-            self.evict_host(deficit)
-
     def bind_hisparse_req_pools(self, req_to_host_pool, req_to_token) -> None:
         self._hisparse_req_to_host_pool = req_to_host_pool
         self._hisparse_req_to_token = req_to_token

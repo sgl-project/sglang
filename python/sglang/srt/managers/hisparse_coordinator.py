@@ -196,36 +196,6 @@ class HiSparseCoordinator:
             self.req_to_token_pool.req_to_token,
         )
 
-    def _alloc_paged_host_slots(
-        self,
-        req_pool_idx: int,
-        start_pos: int,
-        num_tokens: int,
-    ) -> torch.Tensor:
-        if num_tokens <= 0:
-            return torch.empty((0,), dtype=torch.int64, device=self.device)
-
-        allocated_len = int(self.req_to_host_pool_allocated_len[req_pool_idx])
-        page_end = (
-            (start_pos + num_tokens + self.page_size - 1)
-            // self.page_size
-            * self.page_size
-        )
-        need = max(0, page_end - allocated_len)
-        if (
-            need > 0
-            and self.mem_pool_host.available_size() < need
-            and self.host_radix_cache is not None
-        ):
-            self.host_radix_cache.evict_host_if_needed(self.mem_pool_host, need)
-        return self.mem_pool_host.alloc_paged_token_slots(
-            self.req_to_host_pool,
-            self.req_to_host_pool_allocated_len,
-            req_pool_idx,
-            start_pos,
-            num_tokens,
-        )
-
     def _backup_from_device_all_layer(
         self,
         host_indices: torch.Tensor,
@@ -314,7 +284,9 @@ class HiSparseCoordinator:
         start_event.record()
         suffix_len = prefill_len - radix_prefix_len
         if suffix_len > 0:
-            suffix_host_indices = self._alloc_paged_host_slots(
+            suffix_host_indices = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 radix_prefix_len,
                 suffix_len,
@@ -688,7 +660,9 @@ class HiSparseCoordinator:
         for i in backup_indices:
             req_idx = int(req_pool_indices_cpu[i])
             start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
-            host_locs = self._alloc_paged_host_slots(
+            host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
                 req_idx,
                 start_pos,
                 1,
@@ -961,7 +935,13 @@ class HiSparseCoordinator:
             )
             return written_len
 
-        host_locs = self._alloc_paged_host_slots(req_idx, written_len, 1)
+        host_locs = self.mem_pool_host.alloc_paged_token_slots(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            req_idx,
+            written_len,
+            1,
+        )
         device_slot = min(written_len, self.device_buffer_size)
         device_locs = self.req_to_device_buffer[req_idx, device_slot : device_slot + 1]
         self._backup_from_device_all_layer(
