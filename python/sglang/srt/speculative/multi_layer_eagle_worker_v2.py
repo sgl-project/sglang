@@ -54,6 +54,7 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_prepare_for_verify,
     eagle_sample,
     get_draft_recurrent_hidden_state_spec,
+    resolve_tree_mask_mode,
 )
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -195,6 +196,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             speculative_moe_backend_context(),
         ):
             super().init_attention_backends()
+
+        self.tree_mask_mode = resolve_tree_mask_mode(
+            self.target_worker.model_runner.attn_backend
+        )
 
     def init_cuda_graphs(self):
         with (

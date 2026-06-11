@@ -7,6 +7,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
+from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPVerifyInput
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
@@ -228,6 +229,16 @@ def _draft_tree_mask(
     return mask
 
 
+def _verify_tree_mask_mode(case, topk: int) -> TreeMaskMode:
+    """Mirror the production workers: the verify mask layout is a property of
+    the target attention backend (see `tree_mask_mode` resolution in
+    eagle_worker_v2). trtllm_mha consumes the draft-only QLEN_ONLY layout for
+    tree verify; everything else takes the dense FULL_MASK layout."""
+    if topk > 1 and case.backend == "trtllm_mha":
+        return TreeMaskMode.QLEN_ONLY
+    return TreeMaskMode.FULL_MASK
+
+
 def _make_custom_masks(
     case,
     *,
@@ -240,6 +251,7 @@ def _make_custom_masks(
         topk=topk,
         device=device,
     )
+    tree_mask_mode = _verify_tree_mask_mode(case, topk)
     masks_by_req = []
     flattened_masks = []
     for prefix_len in case.prefix_lens:
@@ -253,9 +265,13 @@ def _make_custom_masks(
         reference_mask[:, prefix_len:] = draft_mask
         masks_by_req.append(reference_mask)
 
-        backend_mask = torch.zeros_like(reference_mask)
-        backend_mask[:, :seq_len] = reference_mask
-        flattened_masks.append(backend_mask.reshape(-1))
+        if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
+            # Draft-only mask, flat (bs, draft_token_num, draft_token_num).
+            flattened_masks.append(draft_mask.reshape(-1))
+        else:
+            backend_mask = torch.zeros_like(reference_mask)
+            backend_mask[:, :seq_len] = reference_mask
+            flattened_masks.append(backend_mask.reshape(-1))
 
     return masks_by_req, torch.cat(flattened_masks, dim=0)
 
