@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
@@ -292,9 +294,15 @@ def get_quant_config(
     possible_config_filenames = quant_cls.get_config_filenames()
 
     # If the quantization config is not found, use the default config.
+    # TODO: standardize the handling of online quantization with custom handlenames (mxfp8, quark_mxfp4, etc.)
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+        if model_config.quantization == "quark_mxfp4":
+            return quant_cls(
+                online_scheme=model_config.quantization,
+                hf_config=model_config.hf_config,
+            )
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
@@ -683,7 +691,13 @@ def maybe_add_mtp_safetensors(
         getattr(hf_config, "num_nextn_predict_layers", 0),
     )
     if not (
-        arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]
+        arch
+        in [
+            "Glm4MoeForCausalLM",
+            "Glm4MoeForCausalLMNextN",
+            "Glm4MoeLiteForCausalLM",
+            "Glm4MoeLiteForCausalLMNextN",
+        ]
         and num_nextn_layers > 0
     ):
         return hf_weights_files
@@ -875,24 +889,43 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def _drop_file_cache_after_load(path: str) -> None:
+    """Release of checkpoint pages after weights have been copied out. Used to avoid CPU OOM in RL."""
+    posix_fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if posix_fadvise is None or dontneed is None:
+        return
+
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        posix_fadvise(fd, 0, 0, dontneed)
+    except OSError as e:
+        logger.debug("Failed to drop file cache for %s: %s", path, e)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
-    sorted_files = sorted(hf_weights_files)
-
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
 
     for st_file in tqdm(
-        sorted_files,
+        hf_weights_files,
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
         bar_format=BAR_FORMAT,
@@ -907,6 +940,8 @@ def safetensors_weights_iterator(
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
                     yield name, f.get_tensor(name)
+        if drop_cache_after_load:
+            _drop_file_cache_after_load(st_file)
 
 
 def fastsafetensors_weights_iterator(
@@ -968,6 +1003,7 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
     disable_mmap: bool = False,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -977,8 +1013,12 @@ def multi_thread_safetensors_weights_iterator(
     def _load_file(st_file: str):
         if disable_mmap:
             with open(st_file, "rb") as f:
-                return safetensors.torch.load(f.read())
-        return safetensors.torch.load_file(st_file, device="cpu")
+                result = safetensors.torch.load(f.read())
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
+
+        return st_file, result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
@@ -995,9 +1035,12 @@ def multi_thread_safetensors_weights_iterator(
             futures_iter = concurrent.futures.as_completed(futures)
 
         for future in futures_iter:
-            state_dict = future.result()
+            st_file, state_dict = future.result()
             for name, param in state_dict.items():
                 yield name, param
+            del state_dict
+            if drop_cache_after_load:
+                _drop_file_cache_after_load(st_file)
 
 
 def buffered_multi_thread_safetensors_weights_iterator(
@@ -1006,6 +1049,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1013,9 +1057,10 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
-    sorted_files = sorted(hf_weights_files)
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -1033,7 +1078,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     buffer_size = max_workers + 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        file_iter = iter(sorted_files)
+        file_iter = iter(hf_weights_files)
         pending: collections.deque = collections.deque()
 
         # Seed the buffer.

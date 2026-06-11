@@ -1,27 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.speculative.dflash_utils import (
-    compute_dflash_accept_len_and_bonus,
-    compute_dflash_sampling_accept_len_and_bonus,
+    apply_dflash_verify_logits_adjustments,
+    compute_dflash_correct_drafts_and_bonus,
+    compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.tp_worker import TpModelWorker
 
 
 def _compute_paged_keep_slots(
@@ -67,7 +74,7 @@ class DFlashDraftInput(SpecInput):
     """
 
     # Current token to start the next DFlash block (one per request).
-    verified_id: torch.Tensor
+    bonus_tokens: torch.Tensor
 
     # Flattened context features for tokens that need to be appended into the draft cache.
     # Shape: [sum(ctx_lens), K * hidden_size], where K is the number of target-layer
@@ -92,7 +99,7 @@ class DFlashDraftInput(SpecInput):
         old_ctx_lens = self.ctx_lens
         old_target_hidden = self.target_hidden
 
-        self.verified_id = self.verified_id[new_indices]
+        self.bonus_tokens = self.bonus_tokens[new_indices]
         self.ctx_lens = old_ctx_lens[new_indices]
         self.draft_seq_lens = self.draft_seq_lens[new_indices]
 
@@ -129,7 +136,9 @@ class DFlashDraftInput(SpecInput):
         )
 
     def merge_batch(self, spec_info: "DFlashDraftInput"):
-        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
+        self.bonus_tokens = torch.cat(
+            [self.bonus_tokens, spec_info.bonus_tokens], dim=0
+        )
         self.ctx_lens = torch.cat([self.ctx_lens, spec_info.ctx_lens], dim=0)
         self.draft_seq_lens = torch.cat(
             [self.draft_seq_lens, spec_info.draft_seq_lens], dim=0
@@ -159,7 +168,7 @@ class DFlashVerifyInput(SpecInput):
     # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
     # DFLASH verify is linear (non-tree), so this is always 1.
     topk: int = 1
-    # Custom attention "allow mask" for TARGET_VERIFY in backends that require it (e.g. triton).
+    # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
@@ -211,7 +220,6 @@ class DFlashVerifyInput(SpecInput):
                 last_loc,
                 len(batch.input_ids),
             )
-            self.last_loc = last_loc
 
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
@@ -250,12 +258,53 @@ class DFlashVerifyInput(SpecInput):
             else torch.empty((0,), dtype=torch.bool, device=batch.device)
         )
 
+    def prepare_for_v2_verify(
+        self,
+        batch: ScheduleBatch,
+        target_worker: "TpModelWorker",
+    ) -> tuple[ForwardBatch, bool]:
+        """Prepare a DFLASH verify forward batch for overlap scheduling.
+
+        Unlike spec-v1, the overlap path already computes and stores
+        `batch.out_cache_loc` before this method is called. This helper only
+        packages the verify forward and pre-initializes either CUDA-graph replay
+        metadata or eager attention metadata so the actual forward can run with
+        `skip_attn_backend_init=True`.
+        """
+        batch.input_ids = self.draft_token
+        batch.spec_info = self
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        batch.capture_hidden_mode = self.capture_hidden_mode
+        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+
+        can_run_cuda_graph = bool(
+            target_worker.model_runner.decode_cuda_graph_runner
+            and target_worker.model_runner.decode_cuda_graph_runner.can_run(
+                verify_forward_batch
+            )
+        )
+        if can_run_cuda_graph:
+            target_worker.model_runner.decode_cuda_graph_runner.replay_prepare(
+                verify_forward_batch
+            )
+        elif not batch.forward_mode.is_idle():
+            target_worker.model_runner.attn_backend.init_forward_metadata(
+                verify_forward_batch
+            )
+
+        return verify_forward_batch, can_run_cuda_graph
+
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        kv_start_idx: Optional[torch.Tensor] = None,
     ):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
@@ -282,7 +331,7 @@ class DFlashVerifyInput(SpecInput):
             req_pool_indices,
             paged_kernel_lens,
             cum_kv_seq_len,
-            None,
+            kv_start_idx,
             kv_indices,
             req_to_token.size(1),
         )
@@ -319,10 +368,10 @@ class DFlashVerifyInput(SpecInput):
         """DFlash verification for greedy and non-greedy sampling.
 
         Returns:
-            new_verified_id: int64 tensor [bs] (the new current token per request)
+            new_bonus_tokens: int64 tensor [bs] (the new current token per request)
             commit_lens: int32 tensor [bs] (how many verify-input tokens are committed)
             next_target_hidden: tensor [sum(commit_lens), feature_dim]
-            num_accepted_drafts_per_req_cpu: list[int] (accepted draft tokens per request)
+            num_correct_drafts_per_req_cpu: list[int] (accepted draft tokens per request)
         """
         if batch.forward_mode.is_idle():
             empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
@@ -338,28 +387,11 @@ class DFlashVerifyInput(SpecInput):
                     "DFLASH verify sampling_info size mismatch: "
                     f"len(sampling_info)={len(sampling_info)}, bs={bs}."
                 )
-
-            # Keep speculative verify semantics consistent with normal sampling path.
-            if sampling_info.has_custom_logit_processor:
-                apply_custom_logit_processor(
-                    logits_output.next_token_logits,
-                    sampling_info,
-                    num_tokens_in_batch=self.draft_token_num,
-                )
-
-            if (
-                sampling_info.penalizer_orchestrator.is_required
-                or sampling_info.logit_bias is not None
-            ):
-                linear_penalty = torch.zeros(
-                    (bs, logits_output.next_token_logits.shape[1]),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                sampling_info.apply_logits_bias(linear_penalty)
-                logits_output.next_token_logits.add_(
-                    torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
-                )
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=self.draft_token_num,
+            )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
         if (
@@ -367,29 +399,36 @@ class DFlashVerifyInput(SpecInput):
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
+            top_ks = [int(req.sampling_params.top_k) for req in batch.reqs]
+            correct_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
+                max_top_k=max(max(top_ks), 1) if top_ks else 1,
+                uniform_top_k_value=(
+                    top_ks[0]
+                    if top_ks and all(top_k == top_ks[0] for top_k in top_ks)
+                    else None
+                ),
             )
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, self.draft_token_num
             )
-            accept_len, bonus = compute_dflash_accept_len_and_bonus(
+            correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
                 candidates=candidates,
                 target_predict=target_predict,
             )
 
-        # Single D2H transfer: candidates[1:] + accept_len + bonus
+        # Single D2H transfer: candidates[1:] + correct_len + bonus
         packed = torch.cat(
-            [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
+            [candidates[:, 1:], correct_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
         ).cpu()
 
         max_acc = self.draft_token_num - 1
-        num_accepted_drafts_per_req_cpu: List[int] = []
+        num_correct_drafts_per_req_cpu: List[int] = []
         commit_lens_cpu: List[int] = []
-        new_verified_list: List[int] = []
+        new_bonus_tokens_list: List[int] = []
 
         for i, req in enumerate(batch.reqs):
             acc_len = int(packed[i, max_acc].item())
@@ -402,31 +441,31 @@ class DFlashVerifyInput(SpecInput):
                 token_id = int(token_id)
                 req.output_ids.append(token_id)
                 appended += 1
-                req.check_finished()
+                req.update_finish_state()
                 if req.finished():
                     break
                 if req.grammar is not None:
                     req.grammar.accept_token(token_id)
 
             if req.output_ids:
-                new_verified_token = int(req.output_ids[-1])
+                new_bonus_token = int(req.output_ids[-1])
             elif req.origin_input_ids:
                 # If no token was appended in this verify step, keep the current token unchanged.
-                new_verified_token = int(req.origin_input_ids[-1])
+                new_bonus_token = int(req.origin_input_ids[-1])
             else:
                 raise RuntimeError(
                     "DFLASH verify cannot determine current token: both output_ids and origin_input_ids are empty."
                 )
 
             commit_lens_cpu.append(appended)
-            new_verified_list.append(new_verified_token)
-            num_accepted_drafts_per_req_cpu.append(max(0, appended - 1))
+            new_bonus_tokens_list.append(new_bonus_token)
+            num_correct_drafts_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
-            req.spec_accepted_drafts += num_accepted_drafts_per_req_cpu[-1]
+            req.spec_num_correct_drafts += num_correct_drafts_per_req_cpu[-1]
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
-        new_verified_id = torch.tensor(
-            new_verified_list, dtype=torch.int64, device=device
+        new_bonus_tokens = torch.tensor(
+            new_bonus_tokens_list, dtype=torch.int64, device=device
         )
 
         # Free uncommitted KV cache slots and compact out_cache_loc.
@@ -494,8 +533,8 @@ class DFlashVerifyInput(SpecInput):
         logits_output.hidden_states = None
 
         return (
-            new_verified_id,
+            new_bonus_tokens,
             commit_lens,
             next_target_hidden,
-            num_accepted_drafts_per_req_cpu,
+            num_correct_drafts_per_req_cpu,
         )

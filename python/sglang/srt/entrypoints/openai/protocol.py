@@ -13,6 +13,8 @@
 # ==============================================================================
 """Pydantic models for OpenAI API protocol"""
 
+from __future__ import annotations
+
 import logging
 import time
 import uuid
@@ -23,10 +25,12 @@ from typing import (
     List,
     NamedTuple,
     Optional,
+    Protocol,
     Tuple,
     TypeAlias,
     Union,
     get_args,
+    runtime_checkable,
 )
 
 from openai.types.responses import (
@@ -86,6 +90,42 @@ class ErrorResponse(BaseModel):
     type: str
     param: Optional[str] = None
     code: int
+
+
+@runtime_checkable
+class ParsedResponseFields(Protocol):
+    """Protocol for parsed response fields from custom renderers."""
+
+    content: Optional[str]
+    tool_calls: Optional[List[Dict]]
+    reasoning_content: Optional[str]
+
+
+class ResponseParserProtocol(Protocol):
+    """Protocol for custom response parsers.
+
+    Implementations parse model output tokens into structured OpenAI response fields.
+    """
+
+    def parse_response(
+        self, output_ids: List[int]
+    ) -> Union[ParsedResponseFields, ErrorResponse]:
+        """Parse complete response from output token IDs."""
+        ...
+
+    def build_streaming_sse_chunks(
+        self,
+        output_ids: List[int],
+        index: int,
+        chunk_id: str,
+        model: str,
+        usage: Optional[Dict],
+    ) -> Tuple[List[str], bool, Optional[str]]:
+        """Parse streaming tokens and build SSE chunks.
+
+        Returns: (sse_chunks, has_tool_calls, error_message)
+        """
+        ...
 
 
 class LogProbs(BaseModel):
@@ -285,6 +325,7 @@ class CompletionRequest(BaseModel):
     user: Optional[str] = None
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -632,14 +673,20 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
+    return_prompt_token_ids: bool = False
+    return_meta_info: bool = False
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
         "in a response. 'none' defaults thinking and enable_thinking to false in "
-        "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path.",
+        "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path."
+        "'max' is an sglang extension to the OpenAI schema for "
+        "models that expose a maximum-effort tier above 'high'; models that don't "
+        "support it treat it the same as 'high'.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -678,6 +725,11 @@ class ChatCompletionRequest(BaseModel):
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+
+    # Pre-computed prompt token IDs: when provided, bypasses chat template
+    # tokenization entirely.  Messages are still used to derive stop tokens
+    # and tool_call_constraint.
+    input_ids: Optional[List[int]] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -903,12 +955,18 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    prompt_token_ids: Optional[List[int]] = None
+    meta_info: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
+        if self.meta_info is None:
+            data.pop("meta_info", None)
         return data
 
 

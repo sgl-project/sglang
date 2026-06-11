@@ -1,16 +1,31 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Sequence, Union
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Optional,
+    Sequence,
+    Union,
+)
 
 import torch
 
 from sglang.srt.layers.dp_attention import set_dp_buffer_len
+from sglang.srt.model_executor.forward_context import (
+    forward_context,
+    get_forward_context,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_context import ForwardContext
 
 _ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_OPERATIONS_ENABLE_PROFILE", "0")))
 
@@ -39,10 +54,15 @@ def execute_overlapped_operations(
     assert delta_stage_a == 0
     delta_stage = delta_stage_b
 
+    # Each TBO child sub-batch dispatches against its own per-child backend
+    # (children[i] has metadata init'd for sub-batch i; the parent's primary
+    # has metadata for the full pre-split batch).
+    child_ctx_a, child_ctx_b = _resolve_tbo_child_contexts()
+
     stages_a = _convert_operations_to_stages(operations_a)
     stages_b = _convert_operations_to_stages(operations_b)
-    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a)
-    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b)
+    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a)
+    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b)
 
     for _ in range(delta_stage):
         executor_a.next()
@@ -56,6 +76,25 @@ def execute_overlapped_operations(
 
     assert executor_a.done and executor_b.done
     return [executor_a.output, executor_b.output]
+
+
+def _resolve_tbo_child_contexts():
+    """Return (child_ctx_a, child_ctx_b) derived from the active TboAttnBackend,
+    or (None, None) if the active backend is not a TBO dispatcher (e.g. a
+    backend that handles TBO splitting internally like DeepSeek MHA's
+    _resolve_attn_backend path)."""
+    # Lazy import to avoid circular dependency at module load time.
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+    ctx = get_forward_context()
+    backend = ctx.attn_backend
+    if not isinstance(backend, TboAttnBackend):
+        return None, None
+    child_a, child_b = backend.children
+    return (
+        replace(ctx, attn_backend=child_a),
+        replace(ctx, attn_backend=child_b),
+    )
 
 
 class YieldOperation:
@@ -73,12 +112,23 @@ Stage = List[ExecutionOperation]
 
 
 class _StageExecutor:
-    def __init__(self, debug_name: str, stages: List[Stage], inputs: dict):
+    def __init__(
+        self,
+        debug_name: str,
+        stages: List[Stage],
+        inputs: dict,
+        child_ctx: Optional["ForwardContext"] = None,
+    ):
         self._debug_name = debug_name
         self._stages = stages
         self._index = 0
         self._stage_state = _StateDict()
         self._stage_output = inputs
+        # When set, every next() runs inside this ForwardContext so that
+        # get_attn_backend() inside RadixAttention.forward resolves to the
+        # per-child backend (with sub-batch metadata) instead of the TBO
+        # parent's primary.
+        self._child_ctx = child_ctx
 
         # handling DP attention
         forward_batch: ForwardBatch = inputs["forward_batch"]
@@ -102,7 +152,12 @@ class _StageExecutor:
             self._global_num_tokens,
         )
 
-        with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
+        ctx_mgr = (
+            forward_context(self._child_ctx)
+            if self._child_ctx is not None
+            else nullcontext()
+        )
+        with ctx_mgr, _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
             for op in stage:
                 with _annotate_region(debug_name=op.debug_name):
                     self._stage_output = op.fn(

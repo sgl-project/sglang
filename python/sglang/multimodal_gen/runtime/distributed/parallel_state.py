@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Adapted from
@@ -119,6 +120,10 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
 def get_world_group() -> GroupCoordinator:
     assert _WORLD is not None, "world group is not initialized"
     return _WORLD
+
+
+def world_group_is_initialized() -> bool:
+    return _WORLD is not None
 
 
 def init_world_group(
