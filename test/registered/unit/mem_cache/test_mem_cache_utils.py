@@ -235,7 +235,7 @@ class TestComputeNodeHashValues(CustomTestCase):
     def test_key_shorter_than_page_size(self):
         node = self._make_node(key_len=5)
         result = compute_node_hash_values(node, page_size=16)
-        self.assertEqual(len(result), 1)
+        self.assertEqual(result, ["p0-5"])
 
     def test_chained_parent_hash(self):
         parent = MagicMock()
@@ -247,8 +247,7 @@ class TestComputeNodeHashValues(CustomTestCase):
             key_len=16, parent=parent, parent_hash_values=parent.hash_value
         )
         result = compute_node_hash_values(child, page_size=8)
-        self.assertEqual(len(result), 2)
-        self.assertIn("parent_hash_1", result[0])
+        self.assertEqual(result, ["p0-8-parent_hash_1", "p8-16-p0-8-parent_hash_1"])
 
     def test_parent_with_empty_key(self):
         parent = MagicMock()
