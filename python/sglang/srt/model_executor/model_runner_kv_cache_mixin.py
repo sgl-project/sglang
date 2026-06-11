@@ -17,14 +17,14 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.hisparse_memory_pool import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseDSATokenToKVPool,
-    HiSparseTokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -408,6 +408,7 @@ class ModelRunnerKVCacheMixin:
                 c128_state_pool_size=self.c128_state_pool_size,
                 page_size=self.page_size,
                 swa_page_size=swa_page_size,
+                sliding_window=self.model_config.window_size,
                 dtype=self.kv_cache_dtype,
                 state_dtype=self.state_dtype,
                 qk_nope_head_dim=self.model_config.qk_nope_head_dim,
@@ -505,9 +506,6 @@ class ModelRunnerKVCacheMixin:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     token_to_kv_pool_class=NPUMHATokenToKVPool,
-                    enable_kv_cache_copy=(
-                        self.server_args.speculative_algorithm is not None
-                    ),
                     **kwargs,
                 )
             elif self.use_mla_backend:
