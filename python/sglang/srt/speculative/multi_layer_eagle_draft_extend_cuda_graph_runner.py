@@ -56,7 +56,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.speculative.multi_layer_eagle_utils import assign_new_state
+from sglang.srt.speculative.multi_layer_eagle_utils import assign_new_state_triton
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -466,7 +466,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 padding_lens = (
                     self.speculative_num_draft_tokens - 1
                 ) - buffers.num_correct_drafts[:bs]
-                assign_new_state(
+                assign_new_state_triton(
                     ret.topk_index,
                     buffers.input_ids,
                     buffers.positions,

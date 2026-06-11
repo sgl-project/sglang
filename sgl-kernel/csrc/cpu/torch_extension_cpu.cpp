@@ -127,28 +127,6 @@ void rotate_input_ids_cpu(
     const at::Tensor& topk_index,
     const c10::optional<at::Tensor>& select_index_opt);
 
-void assign_new_state_cpu(
-    const at::Tensor& next_token_ids,
-    const at::Tensor& old_input_ids,
-    const at::Tensor& old_positions,
-    const at::Tensor& old_out_cache_loc,
-    const at::Tensor& old_extend_seq_lens,
-    const at::Tensor& old_extend_start_loc,
-    at::Tensor input_ids,
-    at::Tensor positions,
-    at::Tensor out_cache_loc,
-    at::Tensor extend_seq_lens,
-    at::Tensor extend_start_loc,
-    const at::Tensor& seq_lens,
-    const at::Tensor& padding_lens,
-    const at::Tensor& req_pool_indices,
-    const at::Tensor& req_to_token,
-    int64_t num_seqs,
-    int64_t step,
-    at::Tensor hidden_states,
-    const at::Tensor& old_hidden_states,
-    const at::Tensor& req_to_hidden_states_pool);
-
 // topk
 std::tuple<at::Tensor, at::Tensor>
 topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
@@ -633,19 +611,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotate_input_ids_cpu(Tensor(a!) input_ids, Tensor extend_start_loc, "
       "Tensor extend_seq_lens, Tensor topk_index, Tensor? select_index) -> ()");
   m.impl("rotate_input_ids_cpu", torch::kCPU, &rotate_input_ids_cpu);
-
-  m.def(
-      "assign_new_state_cpu(Tensor next_token_ids, Tensor old_input_ids, "
-      "Tensor old_positions, Tensor old_out_cache_loc, "
-      "Tensor old_extend_seq_lens, Tensor old_extend_start_loc, "
-      "Tensor(a!) input_ids, Tensor(a!) positions, Tensor(a!) out_cache_loc, "
-      "Tensor(a!) extend_seq_lens, Tensor(a!) extend_start_loc, "
-      "Tensor seq_lens, Tensor padding_lens, "
-      "Tensor req_pool_indices, Tensor req_to_token, "
-      "int num_seqs, int step, "
-      "Tensor(a!) hidden_states, Tensor old_hidden_states, "
-      "Tensor req_to_hidden_states_pool) -> ()");
-  m.impl("assign_new_state_cpu", torch::kCPU, &assign_new_state_cpu);
 
   // topk
   m.def("topk_sigmoid_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");
