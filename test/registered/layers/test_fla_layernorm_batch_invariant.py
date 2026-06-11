@@ -14,6 +14,9 @@ from sglang.srt.layers.attention.fla.layernorm_gated import (
 from sglang.srt.layers.attention.fla.layernorm_gated import (
     calc_rows_per_block,
 )
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    _use_moe_sum_reduce_torch_compile,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
@@ -86,3 +89,20 @@ def test_layernorm_gated_row_output_is_batch_invariant(
             atol=0,
             rtol=0,
         )
+
+
+def test_moe_sum_reduce_impl_does_not_change_for_small_batches_in_batch_invariant_mode(
+    cuda_device, batch_invariant_mode
+):
+    for num_tokens in [1, 16, 32, 33]:
+        assert not _use_moe_sum_reduce_torch_compile(num_tokens)
+
+
+def test_moe_sum_reduce_keeps_small_batch_fast_path_outside_batch_invariant_mode(
+    cuda_device,
+):
+    disable_batch_invariant_mode()
+
+    assert _use_moe_sum_reduce_torch_compile(1)
+    assert _use_moe_sum_reduce_torch_compile(32)
+    assert not _use_moe_sum_reduce_torch_compile(33)
