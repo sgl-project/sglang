@@ -100,6 +100,14 @@ class SchedulerWeightUpdaterManager:
                     time.perf_counter() - t0, source
                 )
 
+    def after_weights_updated(self, recv_req) -> None:
+        """Bookkeeping shared by every successful update_weights_from_* call."""
+        # Content-hash keyed, so entries would alias across weight versions.
+        from sglang.srt.managers import mm_utils
+
+        if mm_utils.embedding_cache is not None:
+            mm_utils.embedding_cache.clear()
+
     def flush_cache_after_weight_update(self, recv_req) -> None:
         if recv_req.flush_cache:
             flush_cache_success = self.flush_cache(
@@ -115,6 +123,8 @@ class SchedulerWeightUpdaterManager:
             tp_success = success
             if success and self.draft_worker is not None:
                 success, message = self.draft_worker.update_weights_from_disk(recv_req)
+            if success:
+                self.after_weights_updated(recv_req)
             if tp_success:
                 self.flush_cache_after_weight_update(recv_req)
             if not success:
@@ -143,6 +153,7 @@ class SchedulerWeightUpdaterManager:
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
+                self.after_weights_updated(recv_req)
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
@@ -158,6 +169,7 @@ class SchedulerWeightUpdaterManager:
                 worker = self.draft_worker or self.tp_worker
             success, message = worker.update_weights_from_tensor(recv_req)
             if success:
+                self.after_weights_updated(recv_req)
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
@@ -172,6 +184,8 @@ class SchedulerWeightUpdaterManager:
             tp_success = success
             if success and self.draft_worker is not None:
                 success, message = self.draft_worker.update_weights_from_ipc(recv_req)
+            if success:
+                self.after_weights_updated(recv_req)
             if tp_success:
                 self.flush_cache_after_weight_update(recv_req)
             if not success:
