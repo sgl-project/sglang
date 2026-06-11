@@ -3,6 +3,7 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.minimax_sparse_ops.decode.flash_with_topk_idx import (
     flash_decode_with_topk_idx,
 )
@@ -221,7 +222,7 @@ def test_flash_decode_with_topk_idx(
         with_sink=with_sink,
     )
 
-    o_new, topk_new = flash_decode_with_topk_idx(
+    o_new, topk_new, _ = flash_decode_with_topk_idx(
         q,
         sink,
         k_cache,
@@ -302,7 +303,7 @@ def test_flash_decode_score_only(
         with_sink=with_sink,
     )
 
-    o_new, topk_new = flash_decode_with_topk_idx(
+    o_new, topk_new, _ = flash_decode_with_topk_idx(
         q,
         sink,
         k_cache,
@@ -355,6 +356,124 @@ def test_flash_decode_score_only(
             assert (
                 invalid == -1
             ).all(), f"sentinel fail at b={b}: expected -1, got {invalid[invalid != -1].tolist()}"
+
+
+def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():
+    torch.manual_seed(123)
+    bs, nqh, nkh, hd, blk, tk = 4, 8, 1, 128, 64, 32
+    seq_lens, mkl = make_seq_lens("few_blocks", bs, blk)
+
+    q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, slot_ids = build_inputs(
+        bs,
+        nqh,
+        nkh,
+        hd,
+        seq_lens,
+        max_kv_len=mkl,
+    )
+
+    with envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.override(True):
+        o_new, topk_new, real_seq_lens = flash_decode_with_topk_idx(
+            q,
+            sink,
+            k_cache,
+            v_cache,
+            req_to_token,
+            seq_lens_t,
+            mkl,
+            slot_ids,
+            blk,
+            tk,
+            0,
+            0,
+        )
+    o_ref, topk_ref = pytorch_reference(
+        q,
+        sink,
+        k_cache,
+        v_cache,
+        req_to_token,
+        seq_lens_t,
+        slot_ids,
+        blk,
+        tk,
+        0,
+        0,
+    )
+
+    assert real_seq_lens is None
+    assert torch.allclose(
+        o_new.float(), o_ref.float(), rtol=RTOL_VS_REF, atol=ATOL_VS_REF
+    )
+    for h in range(nqh):
+        for b in range(bs):
+            sl = seq_lens[b]
+            num_blocks = (sl + blk - 1) // blk
+            actual_k = min(tk, num_blocks)
+            assert set(topk_new[h, b, :actual_k].tolist()) == set(
+                topk_ref[h, b, :actual_k].tolist()
+            )
+            assert (topk_new[h, b, actual_k:] == -1).all()
+
+
+def test_flash_decode_dense_page_table_trivial_rows_skip_score_writes():
+    torch.manual_seed(321)
+    bs, nqh, nkh, hd, blk, tk, page_size = 3, 4, 1, 128, 64, 32, 1
+    seq_lens, mkl = make_seq_lens("few_blocks", bs, blk)
+
+    q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, slot_ids = build_inputs(
+        bs,
+        nqh,
+        nkh,
+        hd,
+        seq_lens,
+        max_kv_len=mkl,
+    )
+
+    o_new, page_table, real_seq_lens = flash_decode_with_topk_idx(
+        q,
+        sink,
+        k_cache,
+        v_cache,
+        req_to_token,
+        seq_lens_t,
+        mkl,
+        slot_ids,
+        blk,
+        tk,
+        0,
+        0,
+        use_dense_main_attn=True,
+        page_size=page_size,
+    )
+    o_ref, _ = pytorch_reference(
+        q,
+        sink,
+        k_cache,
+        v_cache,
+        req_to_token,
+        seq_lens_t,
+        slot_ids,
+        blk,
+        tk,
+        0,
+        0,
+    )
+
+    assert torch.allclose(
+        o_new.float(), o_ref.float(), rtol=RTOL_VS_REF, atol=ATOL_VS_REF
+    )
+    assert page_table.shape == (bs * nqh, tk * blk // page_size)
+    assert torch.equal(real_seq_lens.cpu(), seq_lens_t.repeat_interleave(nqh).cpu())
+
+    page_table_cpu = page_table.cpu()
+    req_to_token_cpu = req_to_token.cpu()
+    for b, seq_len in enumerate(seq_lens):
+        valid_pages = seq_len // page_size
+        for h in range(nqh):
+            row = b * nqh + h
+            expected = req_to_token_cpu[b, :seq_len:page_size] // page_size * nqh + h
+            assert torch.equal(page_table_cpu[row, :valid_pages], expected)
 
 
 if __name__ == "__main__":

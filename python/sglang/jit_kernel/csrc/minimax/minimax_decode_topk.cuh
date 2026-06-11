@@ -9,7 +9,12 @@
 
 #include <cfloat>
 #include <cstdint>
-#include <math_constants.h>  // For CUDART_INF_F
+#if defined(__HIP_PLATFORM_AMD__)
+static constexpr unsigned long long kWarpSyncMask = 0xFFFFFFFFFFFFFFFFull;
+#else
+#include <math_constants.h>
+static constexpr unsigned int kWarpSyncMask = 0xFFFFFFFFu;
+#endif
 
 namespace {
 
@@ -63,7 +68,7 @@ struct TopKTrait {
     constexpr auto warp_inclusive_sum = [](uint32_t lane_id, uint32_t val) {
 #pragma unroll
       for (uint32_t offset = 1; offset < 32; offset *= 2) {
-        uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+        uint32_t n = __shfl_up_sync(kWarpSyncMask, val, offset, 32);
         if (lane_id >= offset) val += n;
       }
       return val;

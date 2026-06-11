@@ -50,6 +50,7 @@ def _decode_score_kernel(
     head_dim,
     # block size
     block_size: tl.constexpr,
+    topk: tl.constexpr,
     # sm_scale
     sm_scale,
     # init and local blocks
@@ -73,6 +74,7 @@ def _decode_score_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     NUM_KV_CHUNKS: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
+    SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -86,6 +88,9 @@ def _decode_score_kernel(
     # block-aligned fixed-count chunked decode (grid independent of seq_len for cuda graph)
     seq_len = tl.load(seq_lens + pid_b).to(tl.int32)
     num_blocks = (seq_len + block_size - 1) // block_size
+    if SKIP_TRIVIAL_TOPK_SCORE:
+        if num_blocks <= topk:
+            return
     chunk_size_blocks = tl.cdiv(num_blocks, NUM_KV_CHUNKS)
     chunk_start_block = pid_c * chunk_size_blocks
     chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
@@ -229,6 +234,7 @@ def _decode_score_attn_kernel(
     head_dim,
     # block size
     block_size: tl.constexpr,
+    topk: tl.constexpr,
     # sm_scale
     sm_scale,
     # init and local blocks
@@ -264,6 +270,7 @@ def _decode_score_attn_kernel(
     NUM_KV_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
+    SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -403,7 +410,13 @@ def _decode_score_attn_kernel(
         score = tl.where(
             is_local[None, :], 1e29, tl.where(is_init[None, :], 1e30, score)
         )
-        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
+        if SKIP_TRIVIAL_TOPK_SCORE:
+            if num_blocks > topk:
+                tl.store(
+                    s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1)
+                )
+        else:
+            tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
         # max-of-max == max(qk), avoids re-scanning qk
         m_ij = tl.maximum(m_i, tl.max(sub_max, axis=1))
         p = tl.exp2(qk - m_ij[:, None])
@@ -861,12 +874,28 @@ def flash_decode_with_topk_idx(
     )
     NUM_KV_CHUNKS = 1 << (target.bit_length() - 1)
     score_kv_len = min(max_seqlen, max_kv_len)
-    score = torch.full(
+    # The score producers below write every valid block column
+    # [0, ceil(seq_len / block_size)) for each (head, batch) row. All consumers
+    # clamp their scan to the same per-row valid block count, so columns beyond
+    # seq_len are never read. Avoid a full-tensor -inf memset here; on CUDA graph
+    # capture the static score shape can be much larger than the live context.
+    score = torch.empty(
         (num_q_heads, batch_size, triton.cdiv(score_kv_len, block_size)),
-        fill_value=-float("inf"),
         dtype=torch.float32,
         device=q.device,
     )
+    use_jit_topk = (
+        envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
+        and score.shape[2] <= 4096
+        and topk <= 32
+    )
+    # If the live context has <= topk sparse blocks, the downstream dense
+    # page-table/JIT top-k kernels select every block from seq_lens directly
+    # without reading score. Keep this gate in sync with the consumers below:
+    # _skip_block_topk/use_dense_main_attn and use_jit_topk special-case
+    # num_blocks <= topk, while the Triton fallback reads score and must not
+    # skip these writes.
+    skip_trivial_topk_score = use_dense_main_attn or use_jit_topk
 
     grid = (batch_size * NUM_KV_CHUNKS, num_kv_heads)
     if disable_index_value:
@@ -882,6 +911,7 @@ def flash_decode_with_topk_idx(
             gqa_group_size,
             head_dim,
             block_size,
+            topk,
             sm_scale,
             init_blocks,
             local_blocks,
@@ -897,6 +927,7 @@ def flash_decode_with_topk_idx(
             score.stride(2),
             NUM_KV_CHUNKS=NUM_KV_CHUNKS,
             SCORE_TYPE=score_type,
+            SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
         )
     else:
         assert v_cache is not None
@@ -927,6 +958,7 @@ def flash_decode_with_topk_idx(
             gqa_group_size,
             head_dim,
             block_size,
+            topk,
             sm_scale,
             init_blocks,
             local_blocks,
@@ -954,6 +986,7 @@ def flash_decode_with_topk_idx(
             score.stride(2),
             NUM_KV_CHUNKS=NUM_KV_CHUNKS,
             SCORE_TYPE=score_type,
+            SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
         )
     # Fused top-k + page-table transform: emit the dense backend's page table
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
@@ -987,7 +1020,7 @@ def flash_decode_with_topk_idx(
 
     if _skip_block_topk:
         pass
-    elif envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get():
+    elif use_jit_topk:
         # Single-stage JIT radix-select: one kernel, no intermediate buffers.
         # Equivalent output to the 2-stage path (set of block ids, front-packed,
         # -1 padded); ~2-16x faster for long context. See
