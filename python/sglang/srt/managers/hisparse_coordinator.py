@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import Dict, List, NamedTuple, Union
+from typing import List, NamedTuple, Union
 
 import torch
 
@@ -183,9 +183,8 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
 
-        # The scheduler attaches this after the coordinator owns the host pool.
         self.host_radix_cache = None
-        self._req_host_written_len: Dict[int, int] = {}
+        self._req_host_written_len: dict[int, int] = {}
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -196,14 +195,6 @@ class HiSparseCoordinator:
             self.req_to_host_pool,
             self.req_to_token_pool.req_to_token,
         )
-
-    def _ensure_host_capacity(self, need: int) -> None:
-        if need <= 0 or self.mem_pool_host.available_size() >= need:
-            return
-        if self.host_radix_cache is None:
-            return
-
-        self.host_radix_cache.evict_host_if_needed(self.mem_pool_host, need)
 
     def _alloc_paged_host_slots(
         self,
@@ -220,7 +211,13 @@ class HiSparseCoordinator:
             // self.page_size
             * self.page_size
         )
-        self._ensure_host_capacity(max(0, page_end - allocated_len))
+        need = max(0, page_end - allocated_len)
+        if (
+            need > 0
+            and self.mem_pool_host.available_size() < need
+            and self.host_radix_cache is not None
+        ):
+            self.host_radix_cache.evict_host_if_needed(self.mem_pool_host, need)
         return self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
@@ -228,6 +225,33 @@ class HiSparseCoordinator:
             start_pos,
             num_tokens,
         )
+
+    def _backup_from_device_all_layer(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        **kwargs,
+    ) -> None:
+        if self.host_radix_cache is not None:
+            self.host_radix_cache.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                **kwargs,
+            )
+        else:
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                io_backend="kernel",
+            )
+
+    def _free_req_host_range(self, req_idx: int, start: int, end: int) -> None:
+        host_indices = self.req_to_host_pool[req_idx, start:end]
+        host_indices = host_indices[host_indices >= 0]
+        if host_indices.numel() > 0:
+            self.mem_pool_host.free(host_indices)
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -285,6 +309,9 @@ class HiSparseCoordinator:
 
         self._req_host_written_len[req.req_pool_idx] = prefill_len
 
+        start_event = device_module.Event()
+        finish_event = device_module.Event()
+        start_event.record()
         suffix_len = prefill_len - radix_prefix_len
         if suffix_len > 0:
             suffix_host_indices = self._alloc_paged_host_slots(
@@ -294,36 +321,19 @@ class HiSparseCoordinator:
             )
             suffix_device_indices = device_indices[radix_prefix_len:]
 
-            start_event = device_module.Event()
-            finish_event = device_module.Event()
-            start_event.record()
             with device_module.stream(self.write_staging_stream):
                 start_event.wait(self.write_staging_stream)
-                if self.host_radix_cache is not None:
-                    self.host_radix_cache.backup_from_device_all_layer(
-                        self.mem_pool_device,
-                        suffix_host_indices,
-                        suffix_device_indices,
-                        indexer_ranges=[
-                            (req.req_pool_idx, radix_prefix_len, prefill_len)
-                        ],
-                    )
-                else:
-                    self.mem_pool_host.backup_from_device_all_layer(
-                        self.mem_pool_device,
-                        suffix_host_indices,
-                        suffix_device_indices,
-                        io_backend="kernel",
-                    )
+                self._backup_from_device_all_layer(
+                    suffix_host_indices,
+                    suffix_device_indices,
+                    indexer_ranges=[(req.req_pool_idx, radix_prefix_len, prefill_len)],
+                )
                 finish_event.record()
                 if suffix_host_indices.is_cuda:
                     suffix_host_indices.record_stream(self.write_staging_stream)
                 if suffix_device_indices.is_cuda:
                     suffix_device_indices.record_stream(self.write_staging_stream)
         else:
-            start_event = device_module.Event()
-            finish_event = device_module.Event()
-            start_event.record()
             finish_event.record()
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
@@ -697,20 +707,11 @@ class HiSparseCoordinator:
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
-            if self.host_radix_cache is not None:
-                self.host_radix_cache.backup_from_device_all_layer(
-                    self.mem_pool_device,
-                    host_locs,
-                    device_locs,
-                    completed_indexer_pages=completed_indexer_pages,
-                )
-            else:
-                self.mem_pool_host.backup_from_device_all_layer(
-                    self.mem_pool_device,
-                    host_locs,
-                    device_locs,
-                    io_backend="kernel",
-                )
+            self._backup_from_device_all_layer(
+                host_locs,
+                device_locs,
+                completed_indexer_pages=completed_indexer_pages,
+            )
             self._backup_done_event.record()
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
@@ -847,12 +848,7 @@ class HiSparseCoordinator:
             else 0
         )
         allocated_len = int(self.req_to_host_pool_allocated_len[req.req_pool_idx])
-        host_indices = self.req_to_host_pool[
-            req.req_pool_idx, radix_prefix_len:allocated_len
-        ]
-        host_indices = host_indices[host_indices >= 0]
-        if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
+        self._free_req_host_range(req.req_pool_idx, radix_prefix_len, allocated_len)
 
         if self.host_radix_cache is not None:
             self.host_radix_cache.release_req_node(req.req_pool_idx)
@@ -921,20 +917,15 @@ class HiSparseCoordinator:
                 self.req_to_host_pool_allocated_len[req.req_pool_idx]
             )
             free_tail_start = max(cache_key_len, old_protected)
-            tail_indices = self.req_to_host_pool[
-                req.req_pool_idx, free_tail_start:allocated_host_len
-            ]
-            tail_indices = tail_indices[tail_indices >= 0]
-            if tail_indices.numel() > 0:
-                self.mem_pool_host.free(tail_indices)
-        else:
-            host_indices = self.mem_pool_host.allocated_host_indices(
-                self.req_to_host_pool,
-                req.req_pool_idx,
-                self.req_to_host_pool_allocated_len[req.req_pool_idx],
+            self._free_req_host_range(
+                req.req_pool_idx, free_tail_start, allocated_host_len
             )
-            if host_indices.numel() > 0:
-                self.mem_pool_host.free(host_indices)
+        else:
+            self._free_req_host_range(
+                req.req_pool_idx,
+                0,
+                int(self.req_to_host_pool_allocated_len[req.req_pool_idx]),
+            )
 
         if self.host_radix_cache is not None:
             self.host_radix_cache.release_req_node(req.req_pool_idx)
@@ -951,13 +942,7 @@ class HiSparseCoordinator:
         self._req_host_written_len.pop(req.req_pool_idx, None)
 
     def _prepare_radix_cache_len(self, req: Req, total_len: int) -> int:
-        """Return the contiguous host-written length safe to insert in radix.
-
-        Current HiSparse host slots are page-allocated, so req_to_host_pool can
-        contain allocated indices for future positions whose KV has not been
-        copied yet. Before the final radix insert, synchronously back up the
-        latest generated token when it is the only missing contiguous token.
-        """
+        """Return the contiguous host-written length safe to insert in radix."""
         if self.host_radix_cache is None:
             return 0
 
@@ -979,8 +964,7 @@ class HiSparseCoordinator:
         host_locs = self._alloc_paged_host_slots(req_idx, written_len, 1)
         device_slot = min(written_len, self.device_buffer_size)
         device_locs = self.req_to_device_buffer[req_idx, device_slot : device_slot + 1]
-        self.host_radix_cache.backup_from_device_all_layer(
-            self.mem_pool_device,
+        self._backup_from_device_all_layer(
             host_locs,
             device_locs,
             completed_indexer_pages=[(req_idx, written_len + 1)],

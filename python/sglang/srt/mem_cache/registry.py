@@ -35,7 +35,6 @@ class TreeCacheBuildContext:
     is_hybrid_swa: bool
     is_hybrid_ssm: bool
     enable_hierarchical_cache: bool
-    enable_hisparse: bool
     disable_radix_cache: bool
     effective_chunked_prefill_size: Optional[int]
     tp_worker: Any
@@ -89,7 +88,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return SWAChunkCache(params)
 
-    if ctx.enable_hisparse and not ctx.disable_radix_cache:
+    if server_args.enable_hisparse and not ctx.disable_radix_cache:
         from sglang.srt.mem_cache.hisparse_unified_radix_cache import (
             HiSparseUnifiedRadixCache,
         )

@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    CacheOperation,
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -43,9 +44,7 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
     """Unified radix variant that indexes HiSparse host KV entries."""
 
     def __init__(self, params: CacheInitParams):
-        self.hisparse_host_pool = None
-        self._hisparse_load_back_supported = False
-        self._last_match_host_indices: dict[int, torch.Tensor] = {}
+        self._cache_init_params = params
         self._hisparse_req_to_host_pool = None
         self._hisparse_req_to_token = None
         self._req_radix_node: dict[int, Optional[UnifiedTreeNode]] = {}
@@ -54,7 +53,6 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
 
     def _reset_full(self) -> None:
         super()._reset_full()
-        self._last_match_host_indices.clear()
         self._req_radix_node.clear()
         self._req_radix_prefix_len.clear()
 
@@ -62,7 +60,6 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         self, host_pool, server_args: Optional[ServerArgs] = None
     ) -> bool:
         """Attach the HiSparse coordinator host pool to the unified tree."""
-        self.hisparse_host_pool = host_pool
         self.components[BASE_COMPONENT_TYPE]._full_kv_pool_host = host_pool
 
         allocator = self.token_to_kv_pool_allocator
@@ -71,7 +68,6 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         can_load = compress_ratio == 1 and hasattr(
             host_pool, "load_to_device_per_layer"
         )
-        self._hisparse_load_back_supported = can_load
         if not can_load:
             logger.warning(
                 "HiSparse unified radix cache is disabled for this pool "
@@ -82,128 +78,96 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             return False
 
         if (
-            server_args is not None
-            and server_args.enable_hierarchical_cache
-            and hasattr(kvcache, "index_k_with_scale_buffer")
+            server_args is None
+            or not server_args.enable_hierarchical_cache
+            or not hasattr(kvcache, "index_k_with_scale_buffer")
         ):
-            from sglang.srt.mem_cache.memory_pool_host import (
-                DSAIndexerPoolHost,
-                HostPoolGroup,
-                PoolEntry,
+            logger.warning("HiSparse unified radix cache requires DSA HiCache sidecar.")
+            return False
+
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_anchor_sidecar_stack,
+        )
+        from sglang.srt.mem_cache.memory_pool_host import DSAIndexerPoolHost
+
+        storage_backend = server_args.hicache_storage_backend
+        storage_extra_config = None
+        storage_prefetch_threshold = 256
+        prefetch_timeout_base = 1.0
+        prefetch_timeout_per_ki_token = 0.25
+        hicache_storage_pass_prefix_keys = False
+        if storage_backend is not None:
+            (
+                storage_extra_config,
+                storage_prefetch_threshold,
+                prefetch_timeout_base,
+                prefetch_timeout_per_ki_token,
+                hicache_storage_pass_prefix_keys,
+            ) = HybridCacheController.parse_storage_backend_extra_config(
+                server_args.hicache_storage_backend_extra_config
             )
 
-            storage_backend = server_args.hicache_storage_backend
-            storage_extra_config = None
-            storage_prefetch_threshold = 256
-            prefetch_timeout_base = 1.0
-            prefetch_timeout_per_ki_token = 0.25
-            hicache_storage_pass_prefix_keys = False
-            if storage_backend is not None:
-                (
-                    storage_extra_config,
-                    storage_prefetch_threshold,
-                    prefetch_timeout_base,
-                    prefetch_timeout_per_ki_token,
-                    hicache_storage_pass_prefix_keys,
-                ) = HybridCacheController.parse_storage_backend_extra_config(
-                    server_args.hicache_storage_backend_extra_config
-                )
-
-            self.load_cache_event = threading.Event()
-            self.sidecar_pool_specs.clear()
-            self.extra_metric_labels = server_args.extra_metric_labels
-            layer_num = kvcache.layer_num
-
-            def layer_mapper(layer_id):
-                return layer_id
-
-            indexer_layout = (
-                "page_first_direct"
-                if server_args.hicache_io_backend == "direct"
-                else "page_first"
-            )
-            indexer_host_pool = DSAIndexerPoolHost(
+        self.load_cache_event = threading.Event()
+        self.sidecar_pool_specs.clear()
+        self.extra_metric_labels = server_args.extra_metric_labels
+        indexer_layout = (
+            "page_first_direct"
+            if server_args.hicache_io_backend == "direct"
+            else "page_first"
+        )
+        self.host_pool_group, self.cache_controller = build_anchor_sidecar_stack(
+            params=self._cache_init_params,
+            server_args=server_args,
+            kv_pool=kvcache,
+            sidecar_pool_name=PoolName.INDEXER,
+            full_layer_mapping={i: i for i in range(kvcache.layer_num)},
+            page_size=self.page_size,
+            tp_group=self.tp_group,
+            load_cache_event=self.load_cache_event,
+            attn_cp_group=self.attn_cp_group,
+            attn_tp_group=self.attn_tp_group,
+            pp_group=self.pp_group,
+            storage_backend=storage_backend,
+            use_mla=True,
+            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
                 kvcache,
-                host_pool,
+                kv_host_pool,
                 indexer_layout,
                 allocator_type=server_args.hicache_storage_backend,
-            )
-            host_pool_group = HostPoolGroup(
-                [
-                    PoolEntry(
-                        name=PoolName.KV,
-                        host_pool=host_pool,
-                        device_pool=kvcache,
-                        layer_mapper=layer_mapper,
-                        is_primary_index_anchor=True,
-                    ),
-                    PoolEntry(
-                        name=PoolName.INDEXER,
-                        host_pool=indexer_host_pool,
-                        device_pool=kvcache,
-                        layer_mapper=layer_mapper,
-                    ),
-                ]
-            )
-            self.host_pool_group = host_pool_group
-            self.cache_controller = HybridCacheController(
-                self.token_to_kv_pool_allocator,
-                host_pool_group,
-                self.page_size,
-                self.tp_group,
-                load_cache_event=self.load_cache_event,
-                attn_cp_group=self.attn_cp_group,
-                attn_tp_group=self.attn_tp_group,
-                pp_group=self.pp_group,
-                write_policy=server_args.hicache_write_policy,
-                io_backend=server_args.hicache_io_backend,
+            ),
+            kv_host_pool=host_pool,
+            prefetch_threshold=storage_prefetch_threshold,
+            model_name=server_args.served_model_name,
+            storage_backend_extra_config=storage_extra_config,
+            enable_storage_metrics=self._enable_metrics_flag,
+        )
+        self.full_kv_pool_host = host_pool
+        self.register_sidecar_pool(
+            SidecarPoolSpec(pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV)
+        )
+        kvcache.register_layer_transfer_counter(self.cache_controller.layer_done_counter)
+        self.write_through_threshold = (
+            1 if server_args.hicache_write_policy == "write_through" else 2
+        )
+        self.load_back_threshold = 0
+        self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+        if storage_backend is not None:
+            self._apply_storage_runtime_config(
                 storage_backend=storage_backend,
                 prefetch_threshold=storage_prefetch_threshold,
-                model_name=server_args.served_model_name,
-                storage_backend_extra_config=storage_extra_config,
-                transfer_layer_num=layer_num,
+                prefetch_timeout_base=prefetch_timeout_base,
+                prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+                hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+                enable_storage=self.cache_controller.enable_storage,
                 enable_storage_metrics=self._enable_metrics_flag,
+                extra_metric_labels=self.extra_metric_labels,
             )
-            self.full_kv_pool_host = host_pool
-            self.register_sidecar_pool(
-                SidecarPoolSpec(
-                    pool_name=PoolName.INDEXER,
-                    indices_from_pool=PoolName.KV,
-                )
-            )
-            kvcache.register_layer_transfer_counter(
-                self.cache_controller.layer_done_counter
-            )
-            self.write_through_threshold = (
-                1 if server_args.hicache_write_policy == "write_through" else 2
-            )
-            self.load_back_threshold = 0
-            self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
-            if storage_backend is not None:
-                self._apply_storage_runtime_config(
-                    storage_backend=storage_backend,
-                    prefetch_threshold=storage_prefetch_threshold,
-                    prefetch_timeout_base=prefetch_timeout_base,
-                    prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
-                    hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
-                    enable_storage=self.cache_controller.enable_storage,
-                    enable_storage_metrics=self._enable_metrics_flag,
-                    extra_metric_labels=self.extra_metric_labels,
-                )
-            logger.info(
-                "HiSparse unified radix cache enabled with DSA HiCache sidecar "
-                "(host_pool=%s).",
-                type(host_pool).__name__,
-            )
-            return True
-
-        logger.warning("HiSparse unified radix cache requires DSA HiCache sidecar.")
-        return False
+        return True
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         empty = self._empty_match_result.device_indices
         if (
-            not self._hisparse_load_back_supported
+            self.cache_controller is None
             or self.disable
             or len(params.key) == 0
         ):
@@ -216,14 +180,6 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         if host_hit_len <= 0 or node is None:
             return self._empty_match_result
 
-        self._last_match_host_indices[node.id] = host_indices[:host_hit_len]
-        logger.debug(
-            "HiSparse unified radix host prefix match: node=%d raw=%d aligned=%d host_indices=%d",
-            node.id,
-            raw_match_len,
-            host_hit_len,
-            host_indices.numel(),
-        )
         return MatchResult(
             device_indices=empty,
             last_device_node=node,
@@ -274,42 +230,18 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
     def host_match_prefix(
         self, token_ids: list[int], extra_key: Optional[str] = None
     ) -> tuple[torch.Tensor, UnifiedTreeNode, int]:
+        empty = torch.empty((0,), dtype=torch.int64, device="cpu")
         if len(token_ids) == 0:
-            return (
-                torch.empty((0,), dtype=torch.int64, device="cpu"),
-                self.root_node,
-                0,
-            )
-
+            return empty, self.root_node, 0
         key = RadixKey(token_ids=token_ids, extra_key=extra_key).page_aligned(
             self.page_size
         )
         if len(key) == 0:
-            return (
-                torch.empty((0,), dtype=torch.int64, device="cpu"),
-                self.root_node,
-                0,
-            )
+            return empty, self.root_node, 0
 
         _, best_match_node, _, _ = self._match_prefix_helper(key)
         host_indices = self._collect_host_indices(best_match_node)
         return host_indices, best_match_node, len(host_indices)
-
-    def host_insert(
-        self,
-        token_ids: list[int],
-        host_indices: torch.Tensor,
-        extra_key: Optional[str] = None,
-    ) -> int:
-        if len(token_ids) == 0:
-            return 0
-        key = RadixKey(token_ids=token_ids, extra_key=extra_key).page_aligned(
-            self.page_size
-        )
-        if len(key) == 0:
-            return 0
-        value = host_indices[: len(key)].to(dtype=torch.int64, device="cpu")
-        return self._host_insert_helper(self.root_node, key, value)
 
     def evict_host_if_needed(self, host_pool, need: int) -> None:
         if need <= 0 or host_pool.available_size() >= need:
@@ -346,15 +278,14 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
     def req_prefix_len(self, req_idx: int) -> int:
         return self._req_radix_prefix_len.get(req_idx, 0)
 
-    def indexer_pool_transfer(
+    def _indexer_pool_transfer(
         self,
         req_idx: int,
         start_pos: int,
         end_pos: int,
     ) -> Optional[PoolTransfer]:
         if (
-            self._hisparse_host_pool_group() is None
-            or self._hisparse_req_to_host_pool is None
+            self._hisparse_req_to_host_pool is None
             or self._hisparse_req_to_token is None
         ):
             return None
@@ -379,17 +310,6 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             ].to(dtype=torch.int64),
         )
 
-    def indexer_pool_transfer_for_completed_page(
-        self,
-        req_idx: int,
-        written_end: int,
-    ) -> Optional[PoolTransfer]:
-        if written_end <= 0 or written_end % self.page_size != 0:
-            return None
-        return self.indexer_pool_transfer(
-            req_idx, written_end - self.page_size, written_end
-        )
-
     def backup_from_device_all_layer(
         self,
         mem_pool_device,
@@ -401,74 +321,26 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
     ) -> None:
         if indexer_ranges or completed_indexer_pages:
             pool_transfers = list(pool_transfers or [])
-            for req_idx, start_pos, end_pos in indexer_ranges or []:
-                transfer = self.indexer_pool_transfer(req_idx, start_pos, end_pos)
-                if transfer is not None:
-                    pool_transfers.append(transfer)
-            for req_idx, written_end in completed_indexer_pages or []:
-                transfer = self.indexer_pool_transfer_for_completed_page(
-                    req_idx, written_end
-                )
+            ranges = list(indexer_ranges or [])
+            ranges.extend(
+                (req_idx, written_end - self.page_size, written_end)
+                for req_idx, written_end in completed_indexer_pages or []
+                if written_end > 0 and written_end % self.page_size == 0
+            )
+            for req_idx, start_pos, end_pos in ranges:
+                transfer = self._indexer_pool_transfer(req_idx, start_pos, end_pos)
                 if transfer is not None:
                     pool_transfers.append(transfer)
             if len(pool_transfers) == 0:
                 pool_transfers = None
 
-        host_pool_group = self._hisparse_host_pool_group()
-        if host_pool_group is None:
-            self.hisparse_host_pool.backup_from_device_all_layer(
-                mem_pool_device,
-                host_indices,
-                device_indices,
-                io_backend="kernel",
-            )
-            return
-
-        host_pool_group.backup_from_device_all_layer(
+        self.host_pool_group.backup_from_device_all_layer(
             mem_pool_device,
             host_indices,
             device_indices,
             io_backend=getattr(self.cache_controller, "io_backend", "kernel"),
             pool_transfers=pool_transfers,
         )
-
-    def insert_host_indices(
-        self,
-        token_ids: list[int],
-        host_indices: torch.Tensor,
-        extra_key: Optional[str],
-        protected_len: int,
-        old_node: Optional[UnifiedTreeNode] = None,
-        lock_new_node: bool = False,
-        return_canonical_indices: bool = False,
-    ) -> tuple[int, Optional[UnifiedTreeNode], torch.Tensor, Optional[torch.Tensor]]:
-        prefix_len = self.host_insert(token_ids, host_indices, extra_key)
-        duplicate_host_indices = (
-            host_indices[protected_len:prefix_len]
-            if prefix_len > protected_len
-            else host_indices[:0]
-        )
-        canonical_host_indices = None
-        new_node = None
-        if (
-            old_node is not None
-            or lock_new_node
-            or (return_canonical_indices and duplicate_host_indices.numel() > 0)
-        ):
-            canonical_host_indices_all, new_node, _ = self.host_match_prefix(
-                token_ids, extra_key
-            )
-            if return_canonical_indices and duplicate_host_indices.numel() > 0:
-                canonical_host_indices = canonical_host_indices_all[
-                    protected_len:prefix_len
-                ]
-
-        if old_node is not None and old_node is not self.root_node:
-            self.dec_lock_ref(old_node)
-        if lock_new_node and new_node is not None and new_node is not self.root_node:
-            self.inc_lock_ref(new_node)
-
-        return prefix_len, new_node, duplicate_host_indices, canonical_host_indices
 
     def insert_req_host_indices(
         self,
@@ -480,22 +352,64 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         lock_new_node: bool = False,
         return_canonical_indices: bool = False,
     ) -> tuple[int, torch.Tensor, Optional[torch.Tensor]]:
+        empty = host_indices[:0]
+        if len(token_ids) == 0:
+            return 0, empty, None
+
+        key = RadixKey(token_ids=token_ids, extra_key=extra_key).page_aligned(
+            self.page_size
+        )
+        if len(key) == 0:
+            return 0, empty, None
+
+        value = host_indices[: len(key)].to(dtype=torch.int64, device="cpu")
+        hash_value = []
+        if self.enable_storage:
+            hash_node = UnifiedTreeNode(self.tree_components)
+            hash_node.parent = self.root_node
+            hash_node.key = key
+            hash_value = compute_node_hash_values(hash_node, self.page_size)
+
+        insert_result = self._insert_helper_host(
+            self.root_node, key, value, hash_value
+        )
+        prefix_len = insert_result.prefix_len
+        if (
+            prefix_len < insert_result.total_len
+            and insert_result.inserted_host_node is not None
+        ):
+            self._inc_hit_count(insert_result.inserted_host_node)
+            self.write_backup_storage(insert_result.inserted_host_node)
+
+        protected_len = self.req_prefix_len(req_idx)
+        duplicate_indices = (
+            host_indices[protected_len:prefix_len]
+            if prefix_len > protected_len
+            else empty
+        )
         old_node = (
             self._req_radix_node.get(req_idx)
             if new_protected_len is not None
             else None
         )
-        prefix_len, new_node, duplicate_indices, canonical_indices = (
-            self.insert_host_indices(
-                token_ids,
-                host_indices,
-                extra_key,
-                protected_len=self.req_prefix_len(req_idx),
-                old_node=old_node,
-                lock_new_node=lock_new_node,
-                return_canonical_indices=return_canonical_indices,
+        canonical_indices = None
+        new_node = None
+        if (
+            old_node is not None
+            or lock_new_node
+            or (return_canonical_indices and duplicate_indices.numel() > 0)
+        ):
+            canonical_indices_all, new_node, _ = self.host_match_prefix(
+                token_ids, extra_key
             )
-        )
+            if return_canonical_indices and duplicate_indices.numel() > 0:
+                canonical_indices = canonical_indices_all[protected_len:prefix_len]
+
+        if old_node is not None and old_node is not self.root_node:
+            self.dec_lock_ref(old_node)
+        if lock_new_node and new_node is not None and new_node is not self.root_node:
+            self.inc_lock_ref(new_node)
+
         if new_protected_len is not None:
             if new_node is None:
                 self._req_radix_node.pop(req_idx, None)
@@ -519,17 +433,13 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         empty = self._empty_match_result.device_indices
 
         if (
-            not self._hisparse_load_back_supported
-            or self.cache_controller is None
+            self.cache_controller is None
             or best_match_node is None
             or host_hit_length <= 0
         ):
             return empty, best_match_node
 
-        host_indices = self._last_match_host_indices.pop(best_match_node.id, None)
-        if host_indices is None or host_indices.numel() == 0:
-            host_indices = self._collect_host_indices(best_match_node)
-
+        host_indices = self._collect_host_indices(best_match_node)
         page_aligned_len = (host_hit_length // self.page_size) * self.page_size
         if page_aligned_len <= 0:
             return empty, best_match_node
@@ -562,54 +472,25 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
 
         mapping[logical_indices] = hisparse_indices
 
-        pool_transfers = None
-        if self._hisparse_host_pool_group() is not None:
-            from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-                CacheOperation,
-            )
-
-            pool_transfers = [
-                PoolTransfer(
-                    name=PoolName.INDEXER,
-                    host_indices=host_indices,
-                    device_indices=logical_indices,
-                )
-            ]
-        else:
-            from sglang.srt.managers.cache_controller import CacheOperation
-
-        kwargs = {"pool_transfers": pool_transfers} if pool_transfers else {}
         self.cache_controller.load_queue.append(
             CacheOperation(
                 host_indices=host_indices,
                 device_indices=hisparse_indices,
                 node_id=best_match_node.id,
-                **kwargs,
+                pool_transfers=[
+                    PoolTransfer(
+                        name=PoolName.INDEXER,
+                        host_indices=host_indices,
+                        device_indices=logical_indices,
+                    )
+                ],
             )
         )
         self.ongoing_load_back[best_match_node.id] = (
             best_match_node,
             self.inc_lock_ref(best_match_node).to_dec_params(),
         )
-        logger.debug(
-            "HiSparse unified radix load-back queued: node=%d tokens=%d host_indices=%d",
-            best_match_node.id,
-            page_aligned_len,
-            host_indices.numel(),
-        )
         return logical_indices, best_match_node
-
-    def _hisparse_host_pool_group(self):
-        cache_controller = getattr(self, "cache_controller", None)
-        host_pool_group = getattr(cache_controller, "mem_pool_host", None)
-        entry_map = getattr(host_pool_group, "entry_map", {})
-        anchor_entry = getattr(host_pool_group, "anchor_entry", None)
-        if (
-            PoolName.INDEXER in entry_map
-            and getattr(anchor_entry, "host_pool", None) is self.hisparse_host_pool
-        ):
-            return host_pool_group
-        return None
 
     def _collect_host_indices(self, node: UnifiedTreeNode) -> torch.Tensor:
         chunks: list[torch.Tensor] = []
@@ -624,58 +505,3 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             return torch.empty((0,), dtype=torch.int64, device="cpu")
         chunks.reverse()
         return torch.cat(chunks)
-
-    def _add_new_host_node(
-        self,
-        parent: UnifiedTreeNode,
-        key: RadixKey,
-        host_value: torch.Tensor,
-    ) -> UnifiedTreeNode:
-        new_node = UnifiedTreeNode(self.tree_components)
-        new_node.parent = parent
-        new_node.key = key
-        new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
-        if self.enable_storage:
-            new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
-        parent.children[key.child_key(self.page_size)] = new_node
-        self._update_evictable_leaf_sets(new_node)
-        self._update_evictable_leaf_sets(parent)
-        return new_node
-
-    def _host_insert_helper(
-        self,
-        node: UnifiedTreeNode,
-        key: RadixKey,
-        host_value: torch.Tensor,
-    ) -> int:
-        self._touch_node(node)
-        if len(key) == 0:
-            return 0
-
-        child_key = key.child_key(self.page_size)
-        total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children:
-            node = node.children[child_key]
-            self._touch_node(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
-            if prefix_len < len(node.key):
-                node = self._split_node(node.key, node, prefix_len)
-
-            if node.component_data[BASE_COMPONENT_TYPE].host_value is None:
-                raise RuntimeError(
-                    "HiSparse unified radix cache found a matching node without "
-                    f"host KV indices (node_id={node.id})."
-                )
-
-            self._inc_hit_count(node)
-            total_prefix_length += prefix_len
-            key = key[prefix_len:]
-            host_value = host_value[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
-
-        if len(key):
-            new_node = self._add_new_host_node(node, key, host_value)
-            self._inc_hit_count(new_node)
-            self.write_backup_storage(new_node)
-        return total_prefix_length

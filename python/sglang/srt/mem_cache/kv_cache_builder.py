@@ -234,7 +234,6 @@ def build_kv_cache(
             is_hybrid_swa=is_hybrid_swa,
             is_hybrid_ssm=is_hybrid_ssm,
             enable_hierarchical_cache=enable_hierarchical_cache,
-            enable_hisparse=server_args.enable_hisparse,
             disable_radix_cache=disable_radix_cache,
             effective_chunked_prefill_size=effective_chunked_prefill_size,
             tp_worker=tp_worker,
