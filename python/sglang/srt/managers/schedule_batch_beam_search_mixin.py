@@ -33,9 +33,10 @@ if TYPE_CHECKING:
 class BeamSearchAdmissionError(RuntimeError):
     """Req-to-token pool can't fit the beam branches a decode tick is allocating.
 
-    Carries structured context so the scheduler can skip the tick instead of
-    crashing with a generic OOM. Should be unreachable given the admission gate
-    in ``Scheduler.get_num_allocatable_reqs``.
+    Fail-fast assertion: unreachable when ``Scheduler.get_num_allocatable_reqs``
+    admits correctly (and oversized beam_width is rejected up front), so if it
+    fires it signals an admission-accounting bug and crashes with structured
+    context rather than being silently caught.
     """
 
     def __init__(self, *, failing_reqs, total_slots, available):

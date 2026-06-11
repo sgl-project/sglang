@@ -162,9 +162,6 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.managers.schedule_batch_beam_search_mixin import (
-    BeamSearchAdmissionError,
-)
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
@@ -1982,6 +1979,22 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # Reject a beam request that can never be scheduled: a beam req owns
+            # beam_width + 1 req-to-token slots once decoding, so if that exceeds
+            # the whole pool it would never fit even on an idle server and would
+            # otherwise block the waiting queue forever. Fail fast with BAD_REQUEST.
+            if is_beam_search and req.beam_width + 1 > self.req_to_token_pool.size:
+                error_msg = (
+                    f"Invalid request: beam_width (n={req.beam_width}) needs "
+                    f"{req.beam_width + 1} req-to-token slots but the pool holds only "
+                    f"{self.req_to_token_pool.size}. Reduce n or raise "
+                    f"--max-running-requests."
+                )
+                logger.error(error_msg)
+                prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                self.output_streamer.stream_output([req], req.return_logprob)
+                return
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (
@@ -2533,25 +2546,8 @@ class Scheduler(
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
             ):
-                try:
-                    self.running_batch = self.update_running_batch(self.running_batch)
-                    ret = (
-                        self.running_batch
-                        if not self.running_batch.is_empty()
-                        else None
-                    )
-                except BeamSearchAdmissionError as e:
-                    # Pool can't fit this tick's beam branches (should be
-                    # unreachable given get_num_allocatable_reqs). Skip the tick
-                    # and retry next loop instead of crashing.
-                    logger.warning(
-                        "Skipping beam search decode tick: needs %d slots, %d free "
-                        "(#reqs=%d).",
-                        e.total_slots,
-                        e.available,
-                        len(e.failing_reqs),
-                    )
-                    ret = None
+                self.running_batch = self.update_running_batch(self.running_batch)
+                ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
 
