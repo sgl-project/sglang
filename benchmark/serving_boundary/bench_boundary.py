@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+
 # ---------------------------------------------------------------------------
 # Workload presets: name -> list of bench_serving CLI flags for `num_prompts`.
 # The three length-controlled shapes use the `random` dataset; repeated_prefix
@@ -54,11 +55,16 @@ import numpy as np
 # ---------------------------------------------------------------------------
 def _random_workload(input_len, output_len, num_prompts, range_ratio):
     return [
-        "--dataset-name", "random",
-        "--random-input-len", str(input_len),
-        "--random-output-len", str(output_len),
-        "--random-range-ratio", str(range_ratio),
-        "--num-prompts", str(num_prompts),
+        "--dataset-name",
+        "random",
+        "--random-input-len",
+        str(input_len),
+        "--random-output-len",
+        str(output_len),
+        "--random-range-ratio",
+        str(range_ratio),
+        "--num-prompts",
+        str(num_prompts),
     ]
 
 
@@ -68,13 +74,20 @@ def _repeated_prefix_workload(num_prompts, range_ratio):
     num_groups = max(1, min(8, num_prompts))
     prompts_per_group = max(1, num_prompts // num_groups)
     return [
-        "--dataset-name", "generated-shared-prefix",
-        "--gsp-num-groups", str(num_groups),
-        "--gsp-prompts-per-group", str(prompts_per_group),
-        "--gsp-system-prompt-len", "1920",
-        "--gsp-question-len", "128",
-        "--gsp-output-len", "128",
-        "--gsp-range-ratio", str(range_ratio),
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-num-groups",
+        str(num_groups),
+        "--gsp-prompts-per-group",
+        str(prompts_per_group),
+        "--gsp-system-prompt-len",
+        "1920",
+        "--gsp-question-len",
+        "128",
+        "--gsp-output-len",
+        "128",
+        "--gsp-range-ratio",
+        str(range_ratio),
     ]
 
 
@@ -90,17 +103,28 @@ def _agentic_session_workload(args, n):
     # --extra-bench-args (later duplicate flags win).
     sessions = args.agentic_sessions if args.agentic_sessions > 0 else max(2 * n, 8)
     return [
-        "--dataset-name", "generated-shared-prefix",
-        "--gsp-num-groups", str(sessions),
-        "--gsp-prompts-per-group", "1",
-        "--gsp-num-turns", str(args.agentic_turns),
-        "--gsp-system-prompt-len", "3072",
-        "--gsp-question-len", "512",
-        "--gsp-output-len", "256",
-        "--gsp-range-ratio", str(args.random_range_ratio if args.random_range_ratio > 0 else 1.0),
-        "--gsp-turn-gap-short-s", str(args.agentic_gap_short_s),
-        "--gsp-turn-gap-long-s", str(args.agentic_gap_long_s),
-        "--gsp-turn-gap-long-prob", str(args.agentic_gap_long_prob),
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-num-groups",
+        str(sessions),
+        "--gsp-prompts-per-group",
+        "1",
+        "--gsp-num-turns",
+        str(args.agentic_turns),
+        "--gsp-system-prompt-len",
+        "3072",
+        "--gsp-question-len",
+        "512",
+        "--gsp-output-len",
+        "256",
+        "--gsp-range-ratio",
+        str(args.random_range_ratio if args.random_range_ratio > 0 else 1.0),
+        "--gsp-turn-gap-short-s",
+        str(args.agentic_gap_short_s),
+        "--gsp-turn-gap-long-s",
+        str(args.agentic_gap_long_s),
+        "--gsp-turn-gap-long-prob",
+        str(args.agentic_gap_long_prob),
     ]
 
 
@@ -263,24 +287,31 @@ def aggregate(cells):
 # Running cells.
 # ---------------------------------------------------------------------------
 def build_cmd(args, base_url, phase, workload, n, rep, raw_path):
-    tag = TAG_SEP.join(
-        [args.server_config_label, phase, workload, f"N{n}", f"r{rep}"]
-    )
+    tag = TAG_SEP.join([args.server_config_label, phase, workload, f"N{n}", f"r{rep}"])
     if phase == "scaling":
         request_rate = "inf"
     else:  # ttft: paced; default rate = concurrency unless overridden
         request_rate = str(args.ttft_request_rate if args.ttft_request_rate > 0 else n)
 
     cmd = [
-        sys.executable, "-m", "sglang.bench_serving",
-        "--backend", workload_backend(workload),
-        "--base-url", base_url,
-        "--max-concurrency", str(n),
-        "--request-rate", request_rate,
+        sys.executable,
+        "-m",
+        "sglang.bench_serving",
+        "--backend",
+        workload_backend(workload),
+        "--base-url",
+        base_url,
+        "--max-concurrency",
+        str(n),
+        "--request-rate",
+        request_rate,
         "--output-details",
-        "--output-file", raw_path,
-        "--tag", tag,
-        "--seed", str(args.seed + rep),
+        "--output-file",
+        raw_path,
+        "--tag",
+        tag,
+        "--seed",
+        str(args.seed + rep),
         "--disable-tqdm",
     ]
     if args.model:
@@ -294,30 +325,128 @@ def build_cmd(args, base_url, phase, workload, n, rep, raw_path):
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", type=str, default=None, help="Model path/id (defaults to whatever the server is serving).")
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model path/id (defaults to whatever the server is serving).",
+    )
     p.add_argument("--host", type=str, default="127.0.0.1", help="Server host.")
     p.add_argument("--port", type=int, default=30000, help="Server port.")
-    p.add_argument("--base-url", type=str, default=None, help="Full server base URL; overrides --host/--port.")
-    p.add_argument("--workloads", type=str, default=",".join(ALL_WORKLOADS), help="Comma-separated workloads.")
-    p.add_argument("--phases", type=str, default=",".join(ALL_PHASES), help="Comma-separated phases (scaling,ttft).")
-    p.add_argument("--concurrency", type=str, default="1,2,4,8,16,32", help="Comma-separated concurrency ladder. Include 1 for the p95-multiplier baseline.")
-    p.add_argument("--reps", type=int, default=3, help="Repetitions per cell (aggregated as the mean).")
-    p.add_argument("--num-prompts", type=int, default=200, help="Requests issued per cell.")
-    p.add_argument("--random-range-ratio", type=float, default=0.0, help="Length jitter for random/gsp datasets (0 = fixed lengths).")
-    p.add_argument("--ttft-request-rate", type=float, default=0.0, help="Paced arrival rate (req/s) for the ttft phase; 0 = use concurrency N.")
-    p.add_argument("--flush-cache", action="store_true", default=True, help="Flush the server cache before each cell (default on).")
-    p.add_argument("--no-flush-cache", dest="flush_cache", action="store_false", help="Do not flush between cells.")
-    p.add_argument("--agentic-sessions", type=int, default=0, help="agentic_session: number of concurrent agent sessions per cell; 0 = auto (2x concurrency, min 8).")
-    p.add_argument("--agentic-turns", type=int, default=6, help="agentic_session: turns played per session.")
-    p.add_argument("--agentic-gap-short-s", type=float, default=0.5, help="agentic_session: pause before a turn for a fast tool call (seconds).")
-    p.add_argument("--agentic-gap-long-s", type=float, default=15.0, help="agentic_session: pause before a turn for a slow external tool call (seconds).")
-    p.add_argument("--agentic-gap-long-prob", type=float, default=0.15, help="agentic_session: probability a turn's pause is the long gap.")
-    p.add_argument("--server-config-label", type=str, default="default", help="Label for the server config (e.g. radix_on/radix_off); embedded in results so multiple configs can share one --output-dir.")
-    p.add_argument("--output-dir", type=str, default="./boundary_results", help="Directory for raw + summary outputs.")
-    p.add_argument("--seed", type=int, default=42, help="Base RNG seed (offset by rep index).")
-    p.add_argument("--extra-bench-args", type=str, default=None, help="Extra args appended verbatim to every sglang.bench_serving call.")
-    p.add_argument("--dry-run", action="store_true", help="Print the planned commands and exit.")
+    p.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="Full server base URL; overrides --host/--port.",
+    )
+    p.add_argument(
+        "--workloads",
+        type=str,
+        default=",".join(ALL_WORKLOADS),
+        help="Comma-separated workloads.",
+    )
+    p.add_argument(
+        "--phases",
+        type=str,
+        default=",".join(ALL_PHASES),
+        help="Comma-separated phases (scaling,ttft).",
+    )
+    p.add_argument(
+        "--concurrency",
+        type=str,
+        default="1,2,4,8,16,32",
+        help="Comma-separated concurrency ladder. Include 1 for the p95-multiplier baseline.",
+    )
+    p.add_argument(
+        "--reps",
+        type=int,
+        default=3,
+        help="Repetitions per cell (aggregated as the mean).",
+    )
+    p.add_argument(
+        "--num-prompts", type=int, default=200, help="Requests issued per cell."
+    )
+    p.add_argument(
+        "--random-range-ratio",
+        type=float,
+        default=0.0,
+        help="Length jitter for random/gsp datasets (0 = fixed lengths).",
+    )
+    p.add_argument(
+        "--ttft-request-rate",
+        type=float,
+        default=0.0,
+        help="Paced arrival rate (req/s) for the ttft phase; 0 = use concurrency N.",
+    )
+    p.add_argument(
+        "--flush-cache",
+        action="store_true",
+        default=True,
+        help="Flush the server cache before each cell (default on).",
+    )
+    p.add_argument(
+        "--no-flush-cache",
+        dest="flush_cache",
+        action="store_false",
+        help="Do not flush between cells.",
+    )
+    p.add_argument(
+        "--agentic-sessions",
+        type=int,
+        default=0,
+        help="agentic_session: number of concurrent agent sessions per cell; 0 = auto (2x concurrency, min 8).",
+    )
+    p.add_argument(
+        "--agentic-turns",
+        type=int,
+        default=6,
+        help="agentic_session: turns played per session.",
+    )
+    p.add_argument(
+        "--agentic-gap-short-s",
+        type=float,
+        default=0.5,
+        help="agentic_session: pause before a turn for a fast tool call (seconds).",
+    )
+    p.add_argument(
+        "--agentic-gap-long-s",
+        type=float,
+        default=15.0,
+        help="agentic_session: pause before a turn for a slow external tool call (seconds).",
+    )
+    p.add_argument(
+        "--agentic-gap-long-prob",
+        type=float,
+        default=0.15,
+        help="agentic_session: probability a turn's pause is the long gap.",
+    )
+    p.add_argument(
+        "--server-config-label",
+        type=str,
+        default="default",
+        help="Label for the server config (e.g. radix_on/radix_off); embedded in results so multiple configs can share one --output-dir.",
+    )
+    p.add_argument(
+        "--output-dir",
+        type=str,
+        default="./boundary_results",
+        help="Directory for raw + summary outputs.",
+    )
+    p.add_argument(
+        "--seed", type=int, default=42, help="Base RNG seed (offset by rep index)."
+    )
+    p.add_argument(
+        "--extra-bench-args",
+        type=str,
+        default=None,
+        help="Extra args appended verbatim to every sglang.bench_serving call.",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="Print the planned commands and exit."
+    )
     args = p.parse_args()
 
     workloads = [w.strip() for w in args.workloads.split(",") if w.strip()]
@@ -343,8 +472,10 @@ def main():
         for n in concurrency
         for rep in range(args.reps)
     ]
-    print(f"Planned cells: {len(plan)}  "
-          f"(phases={phases} workloads={workloads} N={concurrency} reps={args.reps})")
+    print(
+        f"Planned cells: {len(plan)}  "
+        f"(phases={phases} workloads={workloads} N={concurrency} reps={args.reps})"
+    )
     print(f"Server: {base_url}   config-label: {args.server_config_label}\n")
 
     for i, (ph, w, n, rep) in enumerate(plan, 1):
@@ -382,8 +513,12 @@ def report(args, raw_path):
         return
 
     aggs = aggregate(cells)
-    cells_path = os.path.join(args.output_dir, f"boundary_cells_{args.server_config_label}.jsonl")
-    summary_path = os.path.join(args.output_dir, f"boundary_summary_{args.server_config_label}.jsonl")
+    cells_path = os.path.join(
+        args.output_dir, f"boundary_cells_{args.server_config_label}.jsonl"
+    )
+    summary_path = os.path.join(
+        args.output_dir, f"boundary_summary_{args.server_config_label}.jsonl"
+    )
     with open(cells_path, "w") as f:
         for c in cells:
             f.write(json.dumps(c.__dict__) + "\n")
@@ -404,7 +539,9 @@ def report(args, raw_path):
     print("-" * len(header))
     for key in sorted(aggs, key=lambda k: (k[1], k[2], k[3])):
         a = aggs[key]
-        mult = "" if np.isnan(a.p95_wall_mult_vs_n1) else f"{a.p95_wall_mult_vs_n1:.2f}x"
+        mult = (
+            "" if np.isnan(a.p95_wall_mult_vs_n1) else f"{a.p95_wall_mult_vs_n1:.2f}x"
+        )
         print(
             f"{a.phase:8} {a.workload:16} {a.n:>4} "
             f"{a.decode_tps:>11.1f} {a.p50_wall_ms:>9.1f} {a.p95_wall_ms:>9.1f} {mult:>7} "

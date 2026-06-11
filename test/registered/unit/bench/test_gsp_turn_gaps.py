@@ -119,9 +119,7 @@ class TestTurnGapSampling(CustomTestCase):
         with_gaps = _sample(
             turn_gap_short_s=0.5, turn_gap_long_s=15.0, turn_gap_long_prob=0.5
         )
-        self.assertEqual(
-            [r.prompt for r in without], [r.prompt for r in with_gaps]
-        )
+        self.assertEqual([r.prompt for r in without], [r.prompt for r in with_gaps])
 
     def test_single_turn_never_gets_gaps(self):
         rows = _sample(
@@ -139,9 +137,7 @@ class TestTurnGapSampling(CustomTestCase):
 class TestTurnGapValidation(CustomTestCase):
     def test_negative_gap_rejected(self):
         with self.assertRaises(ValueError):
-            GeneratedSharedPrefixDataset.from_args(
-                _gap_args(gsp_turn_gap_short_s=-1.0)
-            )
+            GeneratedSharedPrefixDataset.from_args(_gap_args(gsp_turn_gap_short_s=-1.0))
         with self.assertRaises(ValueError):
             GeneratedSharedPrefixDataset.from_args(_gap_args(gsp_turn_gap_long_s=-1.0))
 
