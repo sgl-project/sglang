@@ -35,8 +35,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -58,8 +59,14 @@ logger = logging.getLogger(__name__)
 
 from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_cat
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
@@ -196,7 +203,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                     else {}
                 ),
             )
-            if not get_global_server_args().disable_piecewise_cuda_graph
+            if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             else FusedRMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
@@ -372,7 +379,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         if (
             _is_cpu
             or _is_npu
-            or not get_global_server_args().disable_piecewise_cuda_graph
+            or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
         ):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
@@ -819,8 +826,15 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if _is_hip:
+                from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                    sigmoid_gate_mul,
+                )
+
+                attn_output = sigmoid_gate_mul(attn_output, gate)
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output
