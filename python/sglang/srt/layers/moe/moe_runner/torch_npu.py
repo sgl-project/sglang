@@ -124,7 +124,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
 
         # --- w13 (gate & up) projection ---
         hidden_states = self.config.layer.w13_kernel.apply(
-            self.config.layer,
+            quant_info,
             x,
             expert_tokens,
             pertoken_scale=runner_input.hidden_states_scale,
@@ -148,7 +148,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
 
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
-            self.config.layer,
+            quant_info,
             hidden_states,
             expert_tokens,
             pertoken_scale=pertoken_scale,
