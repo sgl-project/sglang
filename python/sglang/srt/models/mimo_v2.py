@@ -269,8 +269,9 @@ class MiMoV2MoE(nn.Module):
             # the host-side TopK (e.g. flashinfer_trtllm) route inside the
             # kernel using this type; without it the kernel falls back to
             # softmax-style routing and selects the wrong experts.
-            routing_method_type=getattr(
-                config, "routing_method_type", RoutingMethodType.DeepSeekV3
+            routing_method_type=(
+                getattr(config, "routing_method_type", None)
+                or RoutingMethodType.DeepSeekV3
             ),
             prefix=add_prefix("experts", prefix),
         )
