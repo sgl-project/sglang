@@ -309,6 +309,10 @@ class Envs:
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
+    # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
+    # already enabled regardless of this flag (see start_event_loop).
+    SGLANG_ENABLE_WAR_BARRIER = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
