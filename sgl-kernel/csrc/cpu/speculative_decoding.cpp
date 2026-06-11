@@ -278,10 +278,10 @@ void fill_bonus_tokens_cpu(
 }
 
 void fill_accept_out_cache_loc_cpu(
-    const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accepted_out_cache_loc, int64_t size) {
+    const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accept_out_cache_loc, int64_t size) {
   auto* ai_ptr = accept_index.data_ptr<int32_t>();
   auto* ocl_ptr = out_cache_loc.data_ptr<int64_t>();
-  auto* out_ptr = accepted_out_cache_loc.data_ptr<int64_t>();
+  auto* out_ptr = accept_out_cache_loc.data_ptr<int64_t>();
 
   int64_t dst = 0;
   for (int64_t i = 0; i < size; ++i) {

@@ -233,13 +233,13 @@ def fill_bonus_tokens_cpu(
 def fill_accept_out_cache_loc_cpu(
     accept_index: torch.Tensor,
     out_cache_loc: torch.Tensor,
-    accepted_out_cache_loc: torch.Tensor,
+    accept_out_cache_loc: torch.Tensor,
     size: int,
 ) -> None:
     torch.ops.sgl_kernel.fill_accept_out_cache_loc_cpu(
         accept_index,
         out_cache_loc,
-        accepted_out_cache_loc,
+        accept_out_cache_loc,
         size,
     )
 

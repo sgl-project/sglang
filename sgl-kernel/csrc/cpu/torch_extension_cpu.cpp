@@ -101,7 +101,7 @@ void fill_bonus_tokens_cpu(
     const at::Tensor& accept_tokens, const at::Tensor& accept_lens, at::Tensor bonus_tokens, int64_t accept_stride);
 
 void fill_accept_out_cache_loc_cpu(
-    const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accepted_out_cache_loc, int64_t size);
+    const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accept_out_cache_loc, int64_t size);
 
 void assign_draft_cache_locs_contiguous_cpu(
     const at::Tensor& req_pool_indices,
@@ -594,7 +594,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "fill_accept_out_cache_loc_cpu(Tensor accept_index, Tensor out_cache_loc, "
-      "Tensor(a!) accepted_out_cache_loc, int size) -> ()");
+      "Tensor(a!) accept_out_cache_loc, int size) -> ()");
   m.impl("fill_accept_out_cache_loc_cpu", torch::kCPU, &fill_accept_out_cache_loc_cpu);
 
   m.def(
