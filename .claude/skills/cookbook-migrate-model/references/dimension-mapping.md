@@ -91,6 +91,19 @@ always from the DeepSeek-V4 vocabulary, never model-specific ids like
 - **3 operating points** → the **full trio** (the ideal — e.g. GPU-budget
   tiers 2/4/8).
 
+The tiers apply **per (hw × variant × quant) combination**, not just per page:
+a combination with fewer operating points than the page parks its cells in
+the semantically honest tier. A single recipe with a clear slant goes to that
+tier (DSv4's RTX PRO 6000 → `low-latency`: workstation card, low-batch Marlin
+recipe); a general-purpose recipe with no latency/throughput slant goes to
+`balanced` (Qwen3.5's Xeon → `balanced`). Never park a no-slant recipe under
+`low-latency`/`high-throughput` just because the page's toggle mapping lands
+there — that reads as a semantic lie ("CPU = high-throughput?"). The page's
+`strategies` list is the union of tiers actually used (a mixed
+[low-latency, balanced, high-throughput] page where GPUs use the two ends and
+CPU uses the middle is fine); the engine greys unused chips per selection and
+auto-snaps, no extra config needed.
+
 Deviations (e.g. how to name pure GPU-budget tiers) need maintainer sign-off.
 The MDX strategy bullets describe serving semantics in the DSv4 style
 (single-user chat / typical multi-user / batch jobs), with at most a one-line
@@ -107,7 +120,7 @@ model-specific note — never toggle-/migration-centric explanations.
 | Qwen3.6, Qwen3-Next, Qwen3-Coder-Next | `low-latency` (MTP on, the legacy speculative toggle) / `high-throughput` (MTP off) | same pattern as the Qwen3.5 pilot |
 | Kimi-Linear, MiniMax-M2, Qwen3, Qwen3-Coder | single `balanced` — one recipe, no performance toggle (rule above: 1 operating point → `balanced`) | renders as one chip |
 | MiniMax-M2.5, M2.7 | `low-latency`(2) / `balanced`(4) / `high-throughput`(8=tp8+ep8) — confirm naming, tiers are GPU budgets | Xeon (M2.7) cells under one tier only |
-| Qwen3.5 (DONE — pilot) | `low-latency` (MTP on) / `high-throughput` (MTP off) | see §5 |
+| Qwen3.5 (DONE — pilot) | `low-latency` (MTP on) / `high-throughput` (MTP off); Xeon's single no-slant recipe → `balanced` (the page ships the full trio) | see §5 |
 
 Qwen3 variant fan-out: variants = deployable checkpoints size-ordered
 (`235b-instruct`, `235b-thinking`, `235b`, `30b-*`, `32b`, …); do NOT abuse
@@ -121,8 +134,12 @@ Decisions log, in the order they came up:
 1. **Strategy split over Playground toggle** because MTP couples with TP on
    three H100 combos (35B/27B BF16: tp2↔tp1+mem0.88; 122B FP8: tp4↔tp2).
    Canonical naming: `low-latency` = MTP on (legacy default), `high-throughput`
-   = MTP off. Result: 186 cells = 87 low-latency + 99 high-throughput (Xeon has
-   no low-latency cells — the legacy widget hid the MTP toggle there).
+   = MTP off. Xeon has a single operating point (the legacy widget hid the MTP
+   toggle there) and its recipe has no latency/throughput slant → its 12 cells
+   park under `balanced` (per-combination placement; parking them under
+   high-throughput as a toggle-mapping side effect read as a semantic lie).
+   Result: 186 cells = 87 low-latency + 87 high-throughput + 12 balanced; the
+   page ships the full trio and the engine greys unused chips per selection.
 2. **Verified cell follows the measurement**: H200/397B/BF16/low-latency =
    `SGLANG_USE_CUDA_IPC_TRANSPORT=1` env + `--speculative-algorithm NEXTN`
    (normalized spelling) + measured flag set **minus the parser flags** (the

@@ -49,11 +49,15 @@ than restating.
 - `placeholders` declares every `{{KEY}}` used in `curl` or any cell.
 - `modelNames` covers every cell (by `hw|variant|quant` triple or `variant|quant` pair).
 - `strategies` count matches the page's operating points — 1 recipe → a single `balanced`;
-  2 → `low-latency` + `high-throughput`; 3 → the full trio. Flag model-specific ids (e.g.
-  `mtp`) and naming mismatches (a two-strategy page must be low-latency/high-throughput,
-  not balanced+something; a one-strategy page must be `balanced`). The MDX strategy bullets
-  describe serving semantics in the DSv4 style (single-user chat / typical multi-user /
-  batch jobs), not internal toggles.
+  2 → `low-latency` + `high-throughput`; 3 → the full trio. Tiers apply per
+  (hw × variant × quant) combination: a single-recipe combination must park under its
+  semantically honest tier (clear slant → that tier, e.g. a workstation card under
+  `low-latency`; no slant → `balanced`, e.g. a CPU platform) — **flag a no-slant recipe
+  parked under low-latency/high-throughput as a toggle-mapping side effect**. Mixed unions
+  like [low-latency, balanced, high-throughput] with per-selection greying are fine. Also
+  flag model-specific ids (e.g. `mtp`). The MDX strategy bullets describe serving semantics
+  in the DSv4 style (single-user chat / typical multi-user / batch jobs), not internal
+  toggles.
 - `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback).
 - `multiNodeHints` present ONLY for hw whose fabric needs manual NIC env (e.g. `gb200`
   NVL72) — NOT every `multi-N` hw (standard-IB DeepEP / Marlin multi-node don't need it).

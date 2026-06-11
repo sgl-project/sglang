@@ -50,7 +50,10 @@ export const config = {
   ],
   // 4th dim. The count follows the model's operating points: 1 recipe → a
   // single "balanced"; 2 → low-latency + high-throughput; 3 → the full trio
-  // (the ideal). Never invent a recipe just to fill chips.
+  // (the ideal). Per-combination: a single-recipe combination (e.g. a CPU
+  // platform) parks under its semantically honest tier — no slant → balanced;
+  // the page's list is the union and the engine greys unused chips. Never
+  // invent a recipe just to fill chips.
   strategies: [
     { id: "low-latency",     label: "Low-Latency"     },
     { id: "balanced",        label: "Balanced"        },
