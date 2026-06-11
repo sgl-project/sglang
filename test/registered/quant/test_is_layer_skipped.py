@@ -47,6 +47,17 @@ class TestIsLayerSkipped(CustomTestCase):
         )
         self.assertTrue(is_layer_skipped("model.layers.0.mlp.gate", ignored, {}))
 
+    def test_trailing_dot_prefix_matches_child_modules(self):
+        # Mixed-precision checkpoints may use a trailing-dot layer prefix to keep
+        # every module under the layer in higher precision.
+        ignored = ["model.layers.34."]
+        self.assertTrue(
+            is_layer_skipped("model.layers.34.mlp.experts.0.down_proj", ignored, {})
+        )
+        self.assertFalse(
+            is_layer_skipped("model.layers.340.mlp.experts.0.down_proj", ignored, {})
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

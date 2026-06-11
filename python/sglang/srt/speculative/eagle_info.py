@@ -1,5 +1,5 @@
+import copy
 import logging
-from copy import copy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -44,6 +44,7 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -56,11 +57,11 @@ logger = logging.getLogger(__name__)
 
 
 def _draft_runner_of(worker):
-    """Draft model_runner accessor that handles v1 / v2 worker naming.
+    """Draft model_runner accessor across worker shapes.
 
-    v1 (`EAGLEWorker` and subclasses) exposes the draft model_runner as
-    `model_runner` (the worker itself runs the draft model);
-    v2 (`EagleDraftWorker` and subclasses) exposes it as `draft_runner`.
+    v2 draft workers (`EagleDraftWorker` and subclasses) expose the draft
+    model_runner as `draft_runner`; fall back to `model_runner` for workers
+    that run the draft model directly.
     """
     return (
         worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
@@ -116,7 +117,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             spec_steps=spec_steps,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=0,
-            seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
@@ -125,6 +126,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             return
 
         batch.input_ids = self.draft_token
+        maybe_detect_oob(
+            batch.input_ids,
+            0,
+            batch.model_config.vocab_size,
+            "eagle prepare_for_verify input_ids",
+        )
 
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
@@ -349,18 +356,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
             )  # (bs * draft_token_num, vocab_size)
+            maybe_detect_nan(target_probs, "verify: target_probs after softmax")
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
+            maybe_detect_nan(target_probs, "verify: target_probs after top_k_renorm")
             if sampling_info.need_top_p_sampling:
                 target_probs = top_p_renorm_prob(
                     target_probs,
                     torch.repeat_interleave(
                         sampling_info.top_ps, self.draft_token_num, dim=0
                     ),
+                )
+                maybe_detect_nan(
+                    target_probs, "verify: target_probs after top_p_renorm"
                 )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
@@ -417,6 +429,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
+
+        # accept_index values index batch.out_cache_loc (size = bs * draft_token_num);
+        # -1 is the reject sentinel.
+        maybe_detect_oob(
+            accept_index,
+            -1,
+            bs * self.draft_token_num,
+            "eagle verify accept_index post-sampling",
+        )
+        maybe_detect_oob(
+            num_correct_drafts,
+            0,
+            self.draft_token_num + 1,
+            "eagle verify num_correct_drafts post-sampling",
+        )
 
         unfinished_index = []
         unfinished_accept_index = []
@@ -475,6 +502,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
         accept_tokens = predict[accept_index]
+        maybe_detect_oob(
+            accept_tokens,
+            0,
+            batch.model_config.vocab_size,
+            "eagle verify accept_tokens",
+        )
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
         num_correct_drafts_cpu = num_correct_drafts.cpu()
@@ -902,8 +935,8 @@ class EagleDraftExtendInput(SpecInput):
             num_accept_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             num_accept_tokens_cpu=[],
             input_ids=torch.empty((0,), device=device, dtype=torch.long),
-            seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
-            seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
+            seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
             req_pool_indices=torch.empty((0,), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
         )

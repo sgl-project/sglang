@@ -14,6 +14,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
@@ -39,6 +40,7 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    can_run_breakable_cuda_graph: bool
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -57,6 +59,7 @@ class MLPSyncBatchInfo:
                 int(self.is_extend_in_batch),
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
+                int(self.can_run_breakable_cuda_graph),
             ],
             device=device,
             dtype=dtype,
@@ -71,6 +74,7 @@ class MLPSyncBatchInfo:
                 0,  # is_extend_in_batch
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
+                0,  # can_run_breakable_cuda_graph
             ],
             device=device,
             dtype=dtype,
@@ -79,7 +83,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
+            (self.dp_size, self.tp_size * self.cp_size, 7),
             dtype=torch.int64,
             device=device,
         )
@@ -95,7 +99,7 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -106,6 +110,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
+        self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -132,6 +137,7 @@ def _update_gather_batch(
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
+    batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_breakable_cuda_graph
 
 
 def prepare_mlp_sync_batch_raw(
@@ -178,6 +184,11 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    can_run_breakable_cuda_graph = (
+        local_batch is not None
+        and local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        and not disable_cuda_graph
+    )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
@@ -206,6 +217,7 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        can_run_breakable_cuda_graph=can_run_breakable_cuda_graph,
     )
 
     if not skip_all_gather:
@@ -217,14 +229,22 @@ def prepare_mlp_sync_batch_raw(
             )
         )
 
-    need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
+    # Decide whether to emit idle batch
+    if skip_all_gather:
+        # Skip idle batch when attn-dp=1
+        need_idle_batch = dp_size > 1
+    else:
+        need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
+
+    batch_to_gather = local_batch
     if need_idle_batch:
-        batch_to_gather = local_batch
         if local_batch is None:
             batch_to_gather = local_batch = get_idle_batch()
         elif local_batch.forward_mode.is_prebuilt():
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
+
+    if batch_to_gather is not None:
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
@@ -257,7 +277,7 @@ class SchedulerDPAttnAdapter:
             attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
-            disable_cuda_graph=self.server_args.disable_cuda_graph,
+            disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,

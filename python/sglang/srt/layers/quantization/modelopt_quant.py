@@ -48,6 +48,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    apply_fp4_marlin_linear,
+    prepare_moe_nvfp4_layer_for_marlin,
+    prepare_nvfp4_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -59,9 +64,11 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
+    get_device_capability,
     is_cuda,
     is_sm120_supported,
     next_power_of_2,
+    round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -280,6 +287,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
+        self.use_per_token_activation = False
 
     def _get_quant_method(
         self,
@@ -970,6 +978,43 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
             layer.fc1_input_dequant = Parameter(input_scale, requires_grad=False)
 
+            # flashinfer_cutlass kernel requires intermediate_size to be a
+            # multiple of 16.  Pad weight tensors with zeros after loading.
+            # For gated activations (swiglu), w13 is [Up, Gate] concatenated
+            # along dim 1 — we must split, pad each half separately, and
+            # re-concat so the kernel's half-split stays aligned.
+            num_shards = 2 if layer.moe_runner_config.is_gated else 1
+            isp = layer.w13_weight.shape[1] // num_shards
+            if isp % 16 != 0:
+                pad_amount = round_up(isp, 16) - isp
+                w13_data = layer.w13_weight.data
+                if num_shards == 2:
+                    up_weight = w13_data[:, :isp, :]
+                    gate_weight = w13_data[:, isp:, :]
+                    layer.w13_weight = Parameter(
+                        torch.cat(
+                            [
+                                torch.nn.functional.pad(
+                                    up_weight, (0, 0, 0, pad_amount)
+                                ),
+                                torch.nn.functional.pad(
+                                    gate_weight, (0, 0, 0, pad_amount)
+                                ),
+                            ],
+                            dim=1,
+                        ),
+                        requires_grad=False,
+                    )
+                else:
+                    layer.w13_weight = Parameter(
+                        torch.nn.functional.pad(w13_data, (0, 0, 0, pad_amount)),
+                        requires_grad=False,
+                    )
+                layer.w2_weight = Parameter(
+                    torch.nn.functional.pad(layer.w2_weight.data, (0, pad_amount)),
+                    requires_grad=False,
+                )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -1101,6 +1146,12 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 activation_type=activation,
             )[0]
 
+            if (
+                not layer.should_fuse_routed_scaling_factor_in_topk
+                and self.moe_runner_config.routed_scaling_factor is not None
+            ):
+                output.mul_(self.moe_runner_config.routed_scaling_factor)
+
             return StandardCombineInput(hidden_states=output)
 
         quant_info = TritonMoeQuantInfo(
@@ -1127,6 +1178,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         group_size: int = None,
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        use_per_token_activation: Optional[bool] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -1136,6 +1188,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "format is experimental and subject to change."
             )
         self.group_size = group_size
+        self.use_per_token_activation = (
+            use_per_token_activation
+            or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+        )
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -1152,7 +1208,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100
+        return 80
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:
@@ -1329,6 +1385,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.params_dtype = params_dtype
+        layer.quant_config = self.quant_config
         if input_size_per_partition % 16 != 0:
             raise ValueError(
                 "Unsupported model when in features size is not multiple of 16"
@@ -1395,6 +1453,23 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
+
+        if get_fp4_gemm_runner_backend().is_marlin():
+            if self.quant_config.group_size != 16:
+                raise ValueError(
+                    f"NVFP4 Marlin requires group_size=16, got {self.quant_config.group_size}."
+                )
+            copy_or_rebind_param(layer, "input_global_scale", input_scale_2)
+            copy_or_rebind_param(layer, "weight_global_scale", weight_scale_2)
+            prepare_nvfp4_layer_for_marlin(layer)
+            layer.weights_padding_cols = 0
+            return
+
+        if not is_blackwell_supported():
+            raise ValueError(
+                "ModelOpt NVFP4 native dense GEMM backends require SM100+. "
+                "Use --fp4-gemm-backend marlin on SM80-SM90."
+            )
 
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
@@ -1465,6 +1540,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         K_padded = round_up_to_multiple(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
+
+        # Snapshot the raw (pre-swizzle) scale BEFORE alias_or_bind_derived_param
+        # overwrites layer.weight_scale.data in-place via .copy_() on the broadcast
+        # path. Without this, the swiglu side-channel below would read the swizzled
+        # bytes when it later re-reads layer.weight_scale.
+        raw_scale_snapshot = (
+            (scales.squeeze(0) if scale_ndim == 2 else scales).detach().clone()
+        )
+
         batches, rows, cols = padded_scales.shape
         assert rows % 128 == 0
         assert cols % 4 == 0
@@ -1480,22 +1564,84 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer, "weight_scale", "weight_scale_interleaved", padded_scales
         )
 
+        if getattr(layer, "_interleave_for_swiglu_fusion", False):
+            from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+                interleave_linear_and_gate,
+                swizzle_blockscale_2d,
+            )
+
+            w = layer.weight.data
+            assert weights_padding_cols == 0, (
+                "_interleave_for_swiglu_fusion does not support K-padded weights; "
+                f"got weights_padding_cols={weights_padding_cols}."
+            )
+            assert raw_scale_snapshot.shape[0] == w.shape[0], (
+                "_interleave_for_swiglu_fusion requires no N-padding; "
+                f"raw_scale rows={raw_scale_snapshot.shape[0]} vs weight rows={w.shape[0]}."
+            )
+            assert w.shape[0] % 128 == 0, (
+                "_interleave_for_swiglu_fusion requires N % 128 == 0 (group_size=64 "
+                f"with gate+up halves); got N={w.shape[0]}."
+            )
+
+            gate_w, up_w = w.chunk(2, dim=0)
+            w_swiglu = interleave_linear_and_gate(
+                torch.cat((up_w, gate_w), dim=0), group_size=64, dim=0
+            )
+
+            gate_s, up_s = raw_scale_snapshot.chunk(2, dim=0)
+            w_scale_swiglu = swizzle_blockscale_2d(
+                interleave_linear_and_gate(
+                    torch.cat((up_s, gate_s), dim=0), group_size=64, dim=0
+                )
+            )
+
+            layer.weight_swiglu_interleaved = w_swiglu
+            layer.weight_scale_swiglu_interleaved = w_scale_swiglu
+
+            # Keep the Parameter objects alive so weight reload can refill
+            # them and re-run this hook; free their storage in the meantime.
+            layer.weight.data = torch.empty(
+                0, dtype=layer.weight.dtype, device=layer.weight.device
+            )
+            layer.weight_scale_interleaved.data = torch.empty(
+                0,
+                dtype=layer.weight_scale_interleaved.dtype,
+                device=layer.weight_scale_interleaved.device,
+            )
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        output_dtype = x.dtype
-        x_m, _ = x.shape
+        if get_fp4_gemm_runner_backend().is_marlin():
+            return apply_fp4_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                weight_global_scale=layer.weight_global_scale,
+                workspace=layer.workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
 
-        # Get original output size (before padding) and padded weight size
+        # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
+        # tuple from unrelated code can't silently bypass quantization.
+        if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(x, tuple):
+            x_fp4, x_scale_interleaved = x
+            x_m = x_fp4.shape[0]
+            output_dtype = layer.params_dtype
+        else:
+            x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
+            x_m, _ = x.shape
+            output_dtype = x.dtype
+
         output_size = layer.output_size_per_partition
         w_n, _ = layer.weight.shape
         output_shape = [x_m, output_size]
-
-        # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight.dtype == torch.uint8
@@ -1542,11 +1688,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        if not is_blackwell_supported():
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto() and is_cuda():
+            capability = get_device_capability()
+            use_marlin_fallback = (8, 0) <= capability < (10, 0)
+        else:
+            use_marlin_fallback = moe_runner_backend.is_marlin()
+        if not is_blackwell_supported() and not use_marlin_fallback:
             raise ValueError(
                 "Current platform does not support NVFP4"
-                " quantization. Please use Blackwell and"
-                " above."
+                " quantization with the selected MoE backend. Please use "
+                "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
         self.enable_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
@@ -1600,11 +1752,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not self.quant_config.is_checkpoint_nvfp4_serialized:
+        is_nvfp4_online = getattr(self.quant_config, "is_nvfp4_online", False)
+        if not self.quant_config.is_checkpoint_nvfp4_serialized and not is_nvfp4_online:
             raise ValueError(
                 "NVFP4 quantization was selected, "
                 " dynamic quantization is not supported."
             )
+        # `nvfp4_online` is not a serialized checkpoint format, but after the
+        # online loader converts each expert it uses the same packed NVFP4
+        # weights, block scales, and per-tensor scales as serialized ModelOpt
+        # NVFP4 checkpoints. Reuse this layout and swap only the weight loader.
+        if is_nvfp4_online:
+            if not self.enable_flashinfer_trtllm_moe:
+                raise ValueError(
+                    "--quantization nvfp4_online supports only "
+                    "--moe-runner-backend flashinfer_trtllm or "
+                    "flashinfer_trtllm_routed."
+                )
 
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
@@ -1614,6 +1778,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
         weight_loader = extra_weight_attrs.get("weight_loader")
+        if is_nvfp4_online:
+            weight_loader = self.get_online_weight_loader(layer, weight_loader)
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
@@ -1659,10 +1825,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        # Only use `swizzle_blockscale` for shapes, not for real content
-        layer.w13_blockscale_swizzled = Parameter(
-            swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
-        )
+        # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
+        # during process_weights_after_loading, so skip the expensive
+        # swizzle+allocate here to avoid GPU memory fragmentation
+        if self.enable_flashinfer_trtllm_moe:
+            layer.w13_blockscale_swizzled = None
+        else:
+            layer.w13_blockscale_swizzled = Parameter(
+                swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
+            )
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
@@ -1677,9 +1848,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        layer.w2_blockscale_swizzled = Parameter(
-            swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
-        )
+        if self.enable_flashinfer_trtllm_moe:
+            layer.w2_blockscale_swizzled = None
+        else:
+            layer.w2_blockscale_swizzled = Parameter(
+                swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
+            )
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
@@ -1703,6 +1877,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
+
+        if is_nvfp4_online and self.quant_config.is_checkpoint_fp8_serialized:
+            # FP8 checkpoints usually store expert scales as weight_scale_inv.
+            # Online NVFP4 consumes them in the loader and writes the generated
+            # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.
+            w13_source_weight_scale_inv = PerTensorScaleParameter(
+                data=torch.empty(0, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter(
+                "w13_weight_scale_inv", w13_source_weight_scale_inv
+            )
+            w2_source_weight_scale_inv = PerTensorScaleParameter(
+                data=torch.empty(0, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("w2_weight_scale_inv", w2_source_weight_scale_inv)
 
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
@@ -1747,6 +1938,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
 
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
+        if moe_runner_backend.is_marlin():
+            copy_or_rebind_param(
+                layer,
+                "w13_weight_scale_2",
+                w13_weight_scale_2.contiguous(),
+            )
+            prepare_moe_nvfp4_layer_for_marlin(layer)
+            return
+
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
@@ -1779,10 +1982,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        if (
-            self.enable_flashinfer_trtllm_moe
-            and envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
-        ):
+        if self.quant_config.use_per_token_activation:
+            # FlashInfer computes activation scales dynamically per token, so
+            # the static checkpoint activation scale is intentionally neutral.
             w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
             w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
 
@@ -2018,9 +2220,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
-            # TRTLLM is currently the most performant and tested FP4 MoE
-            # backend, so use it as the default.
-            moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+                moe_runner_backend = MoeRunnerBackend.MARLIN
+            else:
+                # TRTLLM is currently the most performant and tested FP4 MoE
+                # backend, so use it as the default.
+                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+
+        self._moe_runner_backend = moe_runner_backend
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
@@ -2040,11 +2247,41 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # tuple). Defer per-attribute access to the branches that actually
         # consume them.
         activation = self.moe_runner_config.activation
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
 
         assert (
             activation in _SUPPORTED_ACT_STRS
         ), f"{activation=} not in supported {_SUPPORTED_ACT_STRS}"
         moe_runner_config = self.moe_runner_config
+
+        if moe_runner_backend.is_marlin():
+            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+            expert_map = None
+            global_num_experts = -1
+            if hasattr(layer, "dispatcher") and hasattr(
+                layer.dispatcher, "local_expert_mapping"
+            ):
+                expert_map = layer.dispatcher.local_expert_mapping
+                if expert_map is not None:
+                    global_num_experts = self.moe_runner_config.num_experts
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=4,
+                w13_global_scale=layer.w13_weight_scale_2,
+                w2_global_scale=layer.w2_weight_scale_2,
+                expert_map=expert_map,
+                global_num_experts=global_num_experts,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         # FlashInfer TRTLLM FP4 path
         if self.enable_flashinfer_trtllm_moe and hasattr(layer, "g1_scale_c"):
@@ -2072,6 +2309,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 local_num_experts=layer.num_local_experts,
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
+                use_per_token_activation=self.quant_config.use_per_token_activation,
             )
 
             return self.runner.run(dispatch_output, quant_info)
@@ -2103,7 +2341,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # v2 standard path (a2a=none/flashinfer): uses CuteDslMoEWrapper
             # with [Up, Gate] interleaved weights and MMA blockscales.
-            ensure_cutedsl_wrapper(layer, dispatch_output.hidden_states.shape[0])
+            ensure_cutedsl_wrapper(layer)
             w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
             quant_info = CuteDslFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight,
