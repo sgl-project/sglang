@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -165,6 +166,12 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
     # Layout-robustness. See dense/test_triton.py for the rationale.
     # Reuse the case generator's first two cases to avoid duplicating
     # all the Mamba2-specific config fields.
+    @unittest.skipIf(
+        is_hip(),
+        "interleaved_pages layout drives the causal_conv1d_fn path in "
+        "mamba/mamba.py, which is a CUDA-only conditional import "
+        "(NameError on ROCm). The other Mamba2 cases pass on AMD.",
+    )
     def test_layout_robustness_cases(self):
         cases = [
             self.CASES[0],  # extend exact-page (zero-prefix, multi-token)
