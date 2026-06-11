@@ -24,17 +24,17 @@ class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
         self,
         quant_config: Optional["QuantizationConfig"] = None,
     ):
-        # super().__init__(quant_config)
+        super().__init__()
         self.quant_config = quant_config
 
-    def _set_dispatcher_output_dtype(self, quant_info: TorchNpuQuantInfo, dtype) -> None:
+    @staticmethod
+    def _set_dispatcher_output_dtype(layer: torch.nn.Module, dtype) -> None:
         """Set dispatcher output dtype if the layer has a dispatcher."""
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
 
-    def _validate_weight_prefix(
-        self, quant_info: TorchNpuQuantInfo, weight_prefix: str
-    ) -> None:
+    @staticmethod
+    def _validate_weight_prefix(layer: torch.nn.Module, weight_prefix: str) -> None:
         """Ensure the required attributes exist on the layer for the given prefix."""
         required = [f"{weight_prefix}_weight"]
         for attr in required:
@@ -59,7 +59,7 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
         )
 
     def process_weights_after_loading(
-        self, layer: torch.nn.Module,, weight_prefix: str
+        self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
         self._validate_weight_prefix(layer, weight_prefix)
 
@@ -68,7 +68,6 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
         scale_np = scale.data.cpu().contiguous().numpy()
         scale_np.dtype = np.uint32
         scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
-        # squeeze(-1) already yields contiguous tensor; no extra .contiguous() needed
         processed_scale = torch.nn.Parameter(
             scale_uint64_tensor.squeeze(-1), requires_grad=False
         )
@@ -93,7 +92,7 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
         weight.data = self._pack_to_int32(weight.data)
 
         # Set DeepEP dispatcher output dtype
-        if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
+        if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
 
     def _pack_int4(self, weight) -> torch.Tensor:
@@ -139,7 +138,7 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
         return packed_weight_tensor
 
     def _pack_to_int32(self, weight: torch.Tensor):
-        # pack 4 int8(int4*2) to int32, because in pytorch, we need to use int32 to represent int4
+        # pack 4 int8(int4*2) to int32
         return weight.contiguous().view(torch.int32)
 
     def apply(
@@ -152,7 +151,7 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
-        scale = getattr(quant_info, f"{weight_prefix}_weigh_scale", None)
+        scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
                 hidden_states
@@ -184,7 +183,7 @@ class NPUW8A8Int8MoEMethod(_NPUFusedMoEMethodBase):
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
 
     def process_weights_after_loading(
-        self, layer: torch.nn.Module,, weight_prefix: str
+        self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
         self._validate_weight_prefix(layer, weight_prefix)
 
@@ -215,7 +214,7 @@ class NPUW8A8Int8MoEMethod(_NPUFusedMoEMethodBase):
         )
 
         # Set dispatcher output dtype
-        if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
+        if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "int8")
 
     def apply(
@@ -228,7 +227,7 @@ class NPUW8A8Int8MoEMethod(_NPUFusedMoEMethodBase):
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
-        scale = getattr(quant_info, f"{weight_prefix}_weigh_scale", None)
+        scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
                 hidden_states
@@ -321,7 +320,7 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
         )
 
         # Set dispatcher output dtype
-        if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
+        if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "int8")
 
     def _process_scale(
@@ -375,7 +374,7 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
-        scale = getattr(quant_info, f"{weight_prefix}_weigh_scale", None)
+        scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
                 hidden_states
@@ -384,10 +383,13 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
             "scale": [scale],
             "per_token_scale": [pertoken_scale],
         }
-        if bias is None and self.activation_use_clip:
+
+        bias = None
+        if self.activation_use_clip:
             bias = getattr(quant_info, f"{weight_prefix}_scale_bias", None)
         if bias is not None:
             scale_args["bias"] = [bias]
+
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -443,7 +445,7 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
         )
 
         # Set dispatcher output dtype
-        if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
+        if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
 
     def _pack_to_int32(self, weight: torch.Tensor) -> torch.Tensor:
@@ -477,8 +479,6 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
         """
         Unpacks a tensor of packed int32 weights into individual int8s,
         maintaining the original bit range.
-
-        Returns int8 tensor.
         """
         if value.dtype is not torch.int32:
             raise ValueError(
@@ -527,8 +527,8 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
-        scale = getattr(quant_info, f"{weight_prefix}_weigh_scale", None)
-        offset = getattr(quant_info, f"{weight_prefix}_weigh_offset", None)
+        scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+        offset = getattr(quant_info, f"{weight_prefix}_weight_offset", None)
         scale_args: Dict[str, Any] = {
             "antiquant_scale": [scale],
             "antiquant_offset": [offset] if offset is not None else [],
@@ -567,7 +567,7 @@ class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
             torch.nn.Parameter(weight, requires_grad=False),
         )
 
-        if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
+        if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
 
     def apply(
