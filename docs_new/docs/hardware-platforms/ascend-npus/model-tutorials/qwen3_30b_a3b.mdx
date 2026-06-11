@@ -28,7 +28,7 @@ v0.5.10 or a later version.
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 35000`                                        |
 | NPU Graph                     | `--cuda-graph-bs-decode 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162`                    |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
-| Overlap Schedule              | `SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                |
+| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | Disable Radix Cache           | `--disable-radix-cache`                                                                       |
 
 For feature compatibility and conflict information between features,
@@ -236,9 +236,9 @@ on the Best Practice page.
 
 | Scenario                      | Deployment mode | Total NPUs | Weight version |
 |-------------------------------|-----------------|------------|----------------|
-| Low latency (6K+1.5K)         | PD mixed        | 1 (A3)     | W8A8 INT8      |
-| Low latency (1K+0.3K)         | PD mixed        | 1 (A3)     | W8A8 INT8      |
-| High throughput (3.5K+1.5K)   | PD mixed        | 1 (A3)     | W8A8 INT8      |
+| Low latency (6K+1.5K)         | PD mixed        | 1 (A3)     | W8A8      |
+| Low latency (1K+0.3K)         | PD mixed        | 1 (A3)     | W8A8      |
+| High throughput (3.5K+1.5K)   | PD mixed        | 1 (A3)     | W8A8      |
 
 `Total NPUs` indicates the total number of NPUs used across all nodes.
 
