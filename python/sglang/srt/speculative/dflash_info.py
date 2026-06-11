@@ -1,27 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_verify_logits_adjustments,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.tp_worker import TpModelWorker
 
 
 def _compute_paged_keep_slots(
@@ -161,7 +168,7 @@ class DFlashVerifyInput(SpecInput):
     # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
     # DFLASH verify is linear (non-tree), so this is always 1.
     topk: int = 1
-    # Custom attention "allow mask" for TARGET_VERIFY in backends that require it (e.g. triton).
+    # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
@@ -251,12 +258,53 @@ class DFlashVerifyInput(SpecInput):
             else torch.empty((0,), dtype=torch.bool, device=batch.device)
         )
 
+    def prepare_for_v2_verify(
+        self,
+        batch: ScheduleBatch,
+        target_worker: "TpModelWorker",
+    ) -> tuple[ForwardBatch, bool]:
+        """Prepare a DFLASH verify forward batch for overlap scheduling.
+
+        Unlike spec-v1, the overlap path already computes and stores
+        `batch.out_cache_loc` before this method is called. This helper only
+        packages the verify forward and pre-initializes either CUDA-graph replay
+        metadata or eager attention metadata so the actual forward can run with
+        `skip_attn_backend_init=True`.
+        """
+        batch.input_ids = self.draft_token
+        batch.spec_info = self
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        batch.capture_hidden_mode = self.capture_hidden_mode
+        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+
+        can_run_cuda_graph = bool(
+            target_worker.model_runner.decode_cuda_graph_runner
+            and target_worker.model_runner.decode_cuda_graph_runner.can_run(
+                verify_forward_batch
+            )
+        )
+        if can_run_cuda_graph:
+            target_worker.model_runner.decode_cuda_graph_runner.replay_prepare(
+                verify_forward_batch
+            )
+        elif not batch.forward_mode.is_idle():
+            target_worker.model_runner.attn_backend.init_forward_metadata(
+                verify_forward_batch
+            )
+
+        return verify_forward_batch, can_run_cuda_graph
+
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        kv_start_idx: Optional[torch.Tensor] = None,
     ):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
@@ -283,7 +331,7 @@ class DFlashVerifyInput(SpecInput):
             req_pool_indices,
             paged_kernel_lens,
             cum_kv_seq_len,
-            None,
+            kv_start_idx,
             kv_indices,
             req_to_token.size(1),
         )
@@ -339,28 +387,11 @@ class DFlashVerifyInput(SpecInput):
                     "DFLASH verify sampling_info size mismatch: "
                     f"len(sampling_info)={len(sampling_info)}, bs={bs}."
                 )
-
-            # Keep speculative verify semantics consistent with normal sampling path.
-            if sampling_info.has_custom_logit_processor:
-                apply_custom_logit_processor(
-                    logits_output.next_token_logits,
-                    sampling_info,
-                    num_tokens_in_batch=self.draft_token_num,
-                )
-
-            if (
-                sampling_info.penalizer_orchestrator.is_required
-                or sampling_info.logit_bias is not None
-            ):
-                linear_penalty = torch.zeros(
-                    (bs, logits_output.next_token_logits.shape[1]),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                sampling_info.apply_logits_bias(linear_penalty)
-                logits_output.next_token_logits.add_(
-                    torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
-                )
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=self.draft_token_num,
+            )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
         if (
@@ -368,10 +399,17 @@ class DFlashVerifyInput(SpecInput):
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
+            top_ks = [int(req.sampling_params.top_k) for req in batch.reqs]
             correct_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
+                max_top_k=max(max(top_ks), 1) if top_ks else 1,
+                uniform_top_k_value=(
+                    top_ks[0]
+                    if top_ks and all(top_k == top_ks[0] for top_k in top_ks)
+                    else None
+                ),
             )
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(

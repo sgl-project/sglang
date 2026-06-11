@@ -140,19 +140,29 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     def replay_with_input_update(
         self,
         shape_key: Any,
-        seq_lens: list,
-        attr_name: str,
-        attr_type: Any,
+        seq_lens: Any,
+        attr_name: str = None,
+        attr_type: Any = None,
+        cpu_update_input: list = None,
     ) -> Any:
         """Rebind seq_lens on the recorded NPU graph in a background
-        thread, then replay. Used when the model is not deepseek-nsa."""
-        if isinstance(attr_type, torch.Tensor):
-            seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+        thread, then replay. Used when the model is not deepseek-nsa.
+
+        Two calling conventions:
+        1. (legacy) seq_lens + attr_name + attr_type:
+           Constructs cpu_update_input=[{attr_name: seq_lens}] internally.
+        2. cpu_update_input: A list of {attr_name: seq_lens} dicts,
+           one per speculative step.  Used by EAGLE draft runners.
+        """
+        if cpu_update_input is None:
+            if isinstance(attr_type, torch.Tensor):
+                seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+            cpu_update_input = [{attr_name: seq_lens}]
 
         graph = self._graphs[shape_key]
 
         def _update():
-            graph.update(cpu_update_input=[{attr_name: seq_lens}])
+            graph.update(cpu_update_input=cpu_update_input)
 
         thread = threading.Thread(target=_update)
         thread.start()

@@ -472,7 +472,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         """
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
-            kv_len_arr_cpu = seq_lens_cpu[:bs]
+            kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32)
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
             )
