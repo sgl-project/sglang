@@ -24,6 +24,11 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
 )
 
+# Distilled 3-step stage-2 sigma schedule. Single source of truth shared by
+# LTX2TwoStagePipeline and the SANA-WM refiner stages (matches NVlabs
+# `inference_sana_wm.py` / the LTX-2 distilled refiner).
+STAGE_2_DISTILLED_SIGMA_VALUES: tuple[float, ...] = (0.909375, 0.725, 0.421875, 0.0)
+
 
 def pack_text_embeds(
     text_hidden_states: torch.Tensor,
@@ -179,8 +184,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
     # Audio VAE configuration
     vae_config: LTXVideoVAEConfig = field(default_factory=LTXVideoVAEConfig)
+    vae_precision: str = "bf16"
     audio_vae_config: LTXAudioVAEConfig = field(default_factory=LTXAudioVAEConfig)
-    audio_vae_precision: str = "fp32"
+    audio_vae_precision: str = "bf16"
 
     @property
     def vae_scale_factor(self):

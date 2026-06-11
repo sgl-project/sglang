@@ -21,7 +21,7 @@ from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,7 @@ class _StubPlatform(SRTPlatform):
     def get_mla_kv_pool_cls(self):
         return object
 
-    def get_nsa_kv_pool_cls(self):
+    def get_dsa_kv_pool_cls(self):
         return object
 
     def get_paged_allocator_cls(self):

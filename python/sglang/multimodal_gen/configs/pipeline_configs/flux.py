@@ -48,6 +48,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
     dit_config: DiTConfig = field(default_factory=FluxConfig)
     # VAE
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
+    vae_precision: str = "bf16"
 
     enable_autocast: bool = False
 
@@ -797,3 +798,28 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
             return_tensors=return_tensors,
             **tok_kwargs,
         )
+
+
+@dataclass
+class Flux2KleinBasePipelineConfig(Flux2KleinPipelineConfig):
+    # Undistilled Klein base model, with guidance embeddings
+    should_use_guidance: bool = True
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            0,
+            negative=True,
+            expected_batch_size=batch.negative_prompt_embeds[0].shape[0],
+        )
+        return {
+            "freqs_cis": self.get_freqs_cis(
+                batch.negative_prompt_embeds[0],
+                batch.width,
+                batch.height,
+                device,
+                rotary_emb,
+                batch,
+                txt_seq_lens,
+            )
+        }

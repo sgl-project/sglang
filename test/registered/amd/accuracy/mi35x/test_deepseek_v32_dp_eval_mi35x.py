@@ -6,12 +6,6 @@ completion benchmark on MI35x.
 Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-dp suite
 """
 
-import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from types import SimpleNamespace
 
@@ -60,9 +54,9 @@ class TestDeepseekV32DP(CustomTestCase):
             "--enable-dp-attention",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
-            "--nsa-prefill-backend",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
         ]
         cls.process = popen_launch_server(
