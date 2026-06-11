@@ -79,6 +79,7 @@ ENV ROCM_HOME=$VIRTUAL_ENV/lib/python3.12/site-packages/_rocm_sdk_devel
 ENV CPATH=$ROCM_HOME/include
 ENV LIBRARY_PATH=$ROCM_HOME/lib
 ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
+ENV ROCM_PATH=$ROCM_HOME
 
 # Install PyTorch ROCm wheels
 RUN python3 -m pip install --no-cache-dir numpy \
@@ -87,6 +88,11 @@ RUN python3 -m pip install --no-cache-dir numpy \
          "torch==${TORCH_VERSION}" \
          "torchvision==${TORCHVISION_VERSION}" \
          "torchaudio==${TORCHAUDIO_VERSION}"
+
+# Workaround: ROCm SDK hsakmtTargets.cmake contains hardcoded /usr/lib64/libc.so from
+# the upstream build system, but Ubuntu uses /lib/x86_64-linux-gnu/. Create symlink to
+# avoid "ninja: error: /usr/lib64/libc.so missing and no known rule to make it"
+RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
 
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
@@ -243,6 +249,13 @@ RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which
 # The ROCm 7.2 base image (rocm/pytorch) does not pre-install this package.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
+      *rocm7_14*) \
+        # Should install it properly, however it seems there are race
+        # conditions between torch and amdsmi module initialization code.
+        # keep the following section commented before it is fixed.
+        # cd $ROCM_HOME/share/amd_smi \
+        # && python3 -m pip install --no-cache-dir . \
+        ;; \
       *rocm720*) \
         echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
         cd /opt/rocm/share/amd_smi \
@@ -589,10 +602,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     sed -i "/find_package(hsa-runtime64 REQUIRED)/i find_package(NUMA REQUIRED)" src/application/CMakeLists.txt; \
     \
     export ROCM_PATH=${ROCM_HOME}; \
-    # Workaround: ROCm SDK hsakmtTargets.cmake contains hardcoded /usr/lib64/libc.so from
-    # the upstream build system, but Ubuntu uses /lib/x86_64-linux-gnu/. Create symlink to
-    # avoid "ninja: error: /usr/lib64/libc.so missing and no known rule to make it"
-    mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so.6 /usr/lib64/libc.so; \
     # Build with proper CMAKE_PREFIX_PATH to find NUMA and other ROCm SDK dependencies
     PATH=${ROCM_HOME}/bin:$PATH \
     CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/rocm_sysdeps/lib/cmake:${ROCM_HOME}/lib/cmake:${ROCM_HOME} \
