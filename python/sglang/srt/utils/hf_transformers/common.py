@@ -172,6 +172,12 @@ def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
     local_path = Path(model_name_or_path) / filename
     if local_path.is_file():
         return str(local_path)
+    # A local model dir without the file: hf_hub_download would reject the
+    # path as a repo id (HFValidationError, a ValueError) before checking the
+    # cache. Raise the FileNotFoundError callers already handle for cache
+    # misses (LocalEntryNotFoundError is a FileNotFoundError subclass).
+    if os.path.isdir(model_name_or_path):
+        raise FileNotFoundError(str(local_path))
     from huggingface_hub import hf_hub_download
 
     return hf_hub_download(

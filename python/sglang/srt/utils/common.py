@@ -2761,6 +2761,11 @@ def has_hf_quant_config(model_path: str) -> bool:
     if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
         return True
 
+    # A local model dir without the file: don't pass the path to hub APIs,
+    # validate_repo_id rejects filesystem paths with HFValidationError.
+    if os.path.exists(model_path):
+        return False
+
     from huggingface_hub import try_to_load_from_cache
 
     # Check if the model_path is a HuggingFace model ID and exists locally
