@@ -184,7 +184,6 @@ class HiSparseCoordinator:
         self._skip_first_backup = [False] * max_num_req_slots
 
         self.radix_cache = None
-        self._req_host_written_len: dict[int, int] = {}
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -243,8 +242,6 @@ class HiSparseCoordinator:
                 // self.page_size
                 * self.page_size
             )
-
-        self._req_host_written_len[req.req_pool_idx] = prefill_len
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -633,10 +630,6 @@ class HiSparseCoordinator:
                 1,
             )
             host_locs_list.append(host_locs)
-            self._req_host_written_len[req_idx] = max(
-                self._req_host_written_len.get(req_idx, 0),
-                start_pos + 1,
-            )
             completed_indexer_pages.append((req_idx, start_pos + 1))
         host_locs = torch.cat(host_locs_list)
 
@@ -797,7 +790,6 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self._skip_first_backup[req.req_pool_idx] = False
-        self._req_host_written_len.pop(req.req_pool_idx, None)
         req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
@@ -819,7 +811,34 @@ class HiSparseCoordinator:
         # subsequent release_kv_cache -> allocator.free -> free_hisparse path
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv_allocated_len
-        radix_cache_len = self._prepare_radix_cache_len(req, allocated_len)
+
+        all_token_ids = req.origin_input_ids + req.output_ids
+        cache_len = min(req.kv_committed_len, len(all_token_ids))
+        cache_key_len = (cache_len // self.page_size) * self.page_size
+        old_protected = self.radix_cache.req_prefix_len(req.req_pool_idx)
+        if (
+            len(req.output_ids) > 0
+            and cache_key_len > old_protected
+            and cache_key_len == cache_len
+        ):
+            last_pos = cache_len - 1
+            host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                req.req_pool_idx,
+                last_pos,
+                1,
+            )
+            device_slot = min(last_pos, self.device_buffer_size)
+            device_locs = self.req_to_device_buffer[
+                req.req_pool_idx, device_slot : device_slot + 1
+            ]
+            self.radix_cache.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                completed_indexer_pages=[(req.req_pool_idx, cache_len)],
+            )
 
         # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
@@ -837,12 +856,9 @@ class HiSparseCoordinator:
         )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
 
-        total_len = radix_cache_len
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :total_len]
-        token_ids = list((req.origin_input_ids + req.output_ids)[:total_len])
-        old_protected = self.radix_cache.req_prefix_len(req.req_pool_idx)
-        cache_key_len = (len(token_ids) // self.page_size) * self.page_size
-        if total_len > 0:
+        if cache_key_len > old_protected:
+            token_ids = all_token_ids[:cache_key_len]
+            host_indices = self.req_to_host_pool[req.req_pool_idx, :cache_key_len]
             _, duplicate_indices, _ = self.radix_cache.insert_req_host_indices(
                 req.req_pool_idx,
                 token_ids,
@@ -873,43 +889,6 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
-        self._req_host_written_len.pop(req.req_pool_idx, None)
-
-    def _prepare_radix_cache_len(self, req: Req, total_len: int) -> int:
-        """Return the contiguous host-written length safe to insert in radix."""
-        req_idx = req.req_pool_idx
-        written_len = min(self._req_host_written_len.get(req_idx, 0), total_len)
-        if written_len >= total_len:
-            return written_len
-
-        if self.is_dsv4_hisparse or total_len - written_len != 1:
-            logger.warning(
-                "HiSparse radix cache inserts only %d/%d host-written tokens "
-                "for req %s.",
-                written_len,
-                total_len,
-                req.rid,
-            )
-            return written_len
-
-        host_locs = self.mem_pool_host.alloc_paged_token_slots(
-            self.req_to_host_pool,
-            self.req_to_host_pool_allocated_len,
-            req_idx,
-            written_len,
-            1,
-        )
-        device_slot = min(written_len, self.device_buffer_size)
-        device_locs = self.req_to_device_buffer[req_idx, device_slot : device_slot + 1]
-        self.radix_cache.backup_from_device_all_layer(
-            self.mem_pool_device,
-            host_locs,
-            device_locs,
-            completed_indexer_pages=[(req_idx, written_len + 1)],
-        )
-        written_len += 1
-        self._req_host_written_len[req_idx] = written_len
-        return written_len
 
     def swap_in_selected_pages(
         self,
