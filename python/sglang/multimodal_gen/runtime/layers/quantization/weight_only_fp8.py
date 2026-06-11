@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,8 +13,13 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 FP8_WEIGHT_DTYPE = torch.float8_e4m3fn
+W8A8_FP8_GEMM_ENV = "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
+
+logger = logging.getLogger(__name__)
+_w8a8_fp8_gemm_warning_logged = False
 
 
 def _can_apply_fused_w8a8_fp8_linear(
@@ -75,7 +82,7 @@ def _apply_weight_only_fp8_linear(
         try:
             # The fused kernel uses W8A8 compute; fallback keeps BF16/FP16
             # activations after dequantizing the FP8 weights.
-            return _apply_srt_w8a8_fp8_linear(
+            output = _apply_srt_w8a8_fp8_linear(
                 input=x,
                 weight=weight.t(),
                 weight_scale=weight_scale,
@@ -83,6 +90,8 @@ def _apply_weight_only_fp8_linear(
                 bias=bias,
                 cutlass_fp8_supported=_is_cutlass_fp8_supported(),
             )
+            _log_w8a8_fp8_gemm_warning_once()
+            return output
         except (ImportError, NotImplementedError):
             pass
 
@@ -99,13 +108,13 @@ class WeightOnlyFP8Linear(nn.Module):
         out_features: int,
         bias: bool = True,
         compute_dtype: torch.dtype | None = None,
-        enable_fused_w8a8: bool = True,
+        enable_fused_w8a8: bool | None = None,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.compute_dtype = compute_dtype
-        self.enable_fused_w8a8 = enable_fused_w8a8
+        self.enable_fused_w8a8 = _resolve_enable_fused_w8a8(enable_fused_w8a8)
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, dtype=FP8_WEIGHT_DTYPE),
             requires_grad=False,
@@ -148,14 +157,14 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
         compute_dtype: torch.dtype | None = None,
         gather_output: bool = True,
         tp_group=None,
-        enable_fused_w8a8: bool = True,
+        enable_fused_w8a8: bool | None = None,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.compute_dtype = compute_dtype
         self.gather_output = gather_output
-        self.enable_fused_w8a8 = enable_fused_w8a8
+        self.enable_fused_w8a8 = _resolve_enable_fused_w8a8(enable_fused_w8a8)
         self.tp_group = tp_group or get_tp_group()
         self.tp_size = get_group_size(self.tp_group)
         self.tp_rank = get_group_rank(self.tp_group)
@@ -234,6 +243,25 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
                 output_parallel, tp_group=self.tp_group
             )
         return output_parallel
+
+
+def _resolve_enable_fused_w8a8(value: bool | None) -> bool:
+    if value is not None:
+        return value
+    return get_bool_env_var(W8A8_FP8_GEMM_ENV)
+
+
+def _log_w8a8_fp8_gemm_warning_once() -> None:
+    global _w8a8_fp8_gemm_warning_logged
+    if _w8a8_fp8_gemm_warning_logged:
+        return
+    logger.warning(
+        "%s=1 enables W8A8 FP8 GEMM for weight-only FP8 linears; activations "
+        "are dynamically quantized to FP8 and outputs may differ from the "
+        "official weight-only FP8 path.",
+        W8A8_FP8_GEMM_ENV,
+    )
+    _w8a8_fp8_gemm_warning_logged = True
 
 
 def swap_linears_to_weight_only_fp8(module: nn.Module) -> None:
