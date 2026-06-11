@@ -2252,13 +2252,13 @@ class DeepseekSparseAttnBackend(
         """
         Decide all attention prefill dispatch strategies for this batch.
         """
-        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-            is_in_tc_piecewise_cuda_graph,
+        from sglang.srt.compilation.piecewise_context_manager import (
+            is_in_piecewise_cuda_graph,
         )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         # Decide MHA vs MLA
-        if is_in_tc_piecewise_cuda_graph():
+        if is_in_piecewise_cuda_graph():
             # Can't branch on seq_lens_cpu in PCG, force mha off to guarantee correctness.
             self.use_mha = False
         elif (

@@ -18,7 +18,6 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
 )
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -35,7 +34,6 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
-from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 
 
 @dataclass
@@ -62,8 +60,6 @@ class FlashAttentionMetadata:
     page_table: torch.Tensor = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
-    # full->SWA translated out_cache_loc (SWA KV-store write target)
-    swa_out_cache_loc: torch.Tensor = None
     # Precomputed FA3 scheduler metadata (avoids per-layer prepare_varlen_num_blocks)
     scheduler_metadata: torch.Tensor = None
 
@@ -216,7 +212,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.num_splits = (
             1
             if model_runner.server_args.enable_deterministic_inference
-            or (self.fa_impl_ver == 4 and not cuda_graph_fully_disabled())
+            or (
+                self.fa_impl_ver == 4
+                and not model_runner.server_args.disable_cuda_graph
+            )
             else 0
         )
 
@@ -701,12 +700,6 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table
                 ).to(torch.int32)
             )
-            if forward_batch.out_cache_loc is not None:
-                metadata.swa_out_cache_loc = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
-                )
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
@@ -807,25 +800,11 @@ class FlashAttentionBackend(AttentionBackend):
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
                     cp_allgather_and_save_kv_cache(
-                        forward_batch,
-                        layer,
-                        k,
-                        v,
-                        self.attn_cp_size,
-                        swa_loc=(
-                            self.forward_metadata.swa_out_cache_loc
-                            if self.use_sliding_window_kv_pool
-                            else None
-                        ),
+                        forward_batch, layer, k, v, self.attn_cp_size
                     )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
         # Use precomputed metadata across all layers
@@ -1267,12 +1246,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
                     self.token_to_kv_pool.set_mla_kv_buffer(
@@ -1616,13 +1590,6 @@ class FlashAttentionBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # SWA write-target buffer; metadata binds a [:num_tokens] view,
-            # refilled from the live out_cache_loc before each replay.
-            self.swa_out_cache_loc_buf = torch.zeros(
-                max_num_tokens,
-                dtype=torch.int64,
-                device=self.device,
-            )
 
         # This is used by draft decode's first half of metadata when topk > 1
         if self.topk > 1:
@@ -1884,9 +1851,6 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.swa_page_table = self.decode_cuda_graph_metadata[
                             "swa_page_table"
                         ][:bs, :]
-                        metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[
-                            :num_tokens
-                        ]
                     self.decode_cuda_graph_metadata[bs] = metadata
                 else:
                     # Draft Decode topk>1: two metadata objects
@@ -1943,7 +1907,6 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_page_table = self.decode_cuda_graph_metadata[
                         "swa_page_table"
                     ][:bs, :]
-                    metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
                 self.decode_cuda_graph_metadata[bs] = metadata
 
         elif forward_mode.is_target_verify():
@@ -1963,7 +1926,6 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_page_table = self.target_verify_metadata[
                         "swa_page_table"
                     ][:bs, :]
-                    metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
                 self.target_verify_metadata[bs] = metadata
             else:
                 # Target Verify topk>1: two (or three with SWA) metadata objects
@@ -1999,10 +1961,6 @@ class FlashAttentionBackend(AttentionBackend):
 
                 self.target_verify_metadata_topk_normal[bs] = metadata
                 self.target_verify_metadata_topk_expand[bs] = metadata_expand
-                # topk>1 target-verify early-returns before _apply; bind the
-                # view here (buffer refilled at replay).
-                if self.use_sliding_window_kv_pool:
-                    metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
 
                 if self.has_swa:
                     metadata_swa = FlashAttentionMetadata()
@@ -2039,7 +1997,6 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.swa_page_table = self.draft_extend_metadata["swa_page_table"][
                     :bs, :
                 ]
-                metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
             self.draft_extend_metadata[bs] = metadata
 
         if encoder_lens is not None:
@@ -2071,7 +2028,7 @@ class FlashAttentionBackend(AttentionBackend):
         """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`. This helper
-        formerly lived as the legacy init_forward_metadata_replay_cuda_graph;
+        formerly lived as the legacy ``init_forward_metadata_replay_cuda_graph``;
         the capture path used to wrap it. Both legacy method overrides
         are gone.
         """
@@ -2081,15 +2038,6 @@ class FlashAttentionBackend(AttentionBackend):
         device = seq_lens.device
         metadata = None
         metadata_expand = None
-
-        # Refill the SWA write-target buffer (bound as a metadata view in
-        # _bind_metadata_buffers) from the live out_cache_loc before replay.
-        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
-            n = out_cache_loc.shape[0]
-            self.swa_out_cache_loc_buf[n:].zero_()
-            self.swa_out_cache_loc_buf[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
-            )
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:

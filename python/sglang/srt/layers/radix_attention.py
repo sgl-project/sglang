@@ -22,14 +22,14 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-)
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -124,16 +124,13 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        if (
-            forward_batch.forward_mode.is_extend()
-            and get_tc_piecewise_forward_context() is not None
-        ):
+        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:
                 output = torch.empty_like(q)
             if is_in_breakable_cuda_graph():
-                breakable_unified_attention_with_output(
+                bcg_unified_attention_with_output(
                     q, k, v, output, save_kv_cache, self.layer_id, **kwargs
                 )
             else:
@@ -173,7 +170,7 @@ def unified_attention_with_output(
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    context = get_tc_piecewise_forward_context()
+    context = get_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
@@ -253,6 +250,4 @@ def unified_attention_with_output(
     return
 
 
-breakable_unified_attention_with_output = eager_on_graph(True)(
-    unified_attention_with_output
-)
+bcg_unified_attention_with_output = eager_on_graph(True)(unified_attention_with_output)

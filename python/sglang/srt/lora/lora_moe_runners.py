@@ -29,7 +29,7 @@ from typing import Callable
 
 import torch
 
-from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
 
 _is_cuda = is_cuda()

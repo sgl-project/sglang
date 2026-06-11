@@ -25,10 +25,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_stage import (
     SanaWMRealtimeStage,
 )
-from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
-from sglang.multimodal_gen.runtime.realtime.states import (
-    get_realtime_causal_dit_state,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
+    SanaWMStreamCacheState,
 )
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 MC = 8
@@ -162,7 +162,7 @@ def test_latent_prep_plan_and_noise_discipline(_global_args):
     inputs.latent_t = 5  # fixed horizon: segments [0, 3, 5] for nfpb=2
     inputs.num_frame_per_block = 2
     inputs.sink_size = 1
-    cache = get_realtime_causal_dit_state(session)
+    cache = session.get_or_create_state(SanaWMStreamCacheState)
 
     # Tick 0: front-loaded chunk 0 (cond + remainder) + full-horizon buffer.
     batch = stage.forward(_batch(session, 0, fl), _server_args())
@@ -202,7 +202,7 @@ def test_latent_prep_open_ended_uniform_chunk0(_global_args):
     inputs.latent_t = None  # open-ended
     inputs.num_frame_per_block = 3
     inputs.sink_size = 1
-    get_realtime_causal_dit_state(session)
+    session.get_or_create_state(SanaWMStreamCacheState)
 
     batch = stage.forward(_batch(session, 0, fl), _server_args())
     noise = session.get_or_create_state(SanaWMNoiseState)

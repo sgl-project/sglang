@@ -3,16 +3,16 @@ from typing import Any, Callable
 
 import torch
 
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+from sglang.srt.compilation.piecewise_context_manager import (
+    enable_piecewise_cuda_graph,
+)
+from sglang.srt.compilation.piecewise_context_manager import (
+    set_forward_context as piecewise_forward_context,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
     enable_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
-    enable_tc_piecewise_cuda_graph as enable_piecewise_cuda_graph,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
-    set_tc_piecewise_forward_context as piecewise_forward_context,
-)
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 
 from ..attention_methods.dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
 from ..attention_methods.dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE

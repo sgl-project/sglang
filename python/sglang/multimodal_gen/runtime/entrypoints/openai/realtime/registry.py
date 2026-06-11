@@ -5,20 +5,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
-    BaseRealtimeModelAdapter,
+    RealtimeModelAdapter,
 )
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-_REALTIME_ADAPTER_REGISTRY: dict[type, type[BaseRealtimeModelAdapter]] = {}
+_REALTIME_ADAPTER_REGISTRY: dict[type, type[RealtimeModelAdapter]] = {}
 _BUILTIN_ADAPTERS_REGISTERED = False
 
 
 def register_realtime_model_adapter(
     pipeline_config_cls: type,
-    adapter_cls: type[BaseRealtimeModelAdapter],
+    adapter_cls: type[RealtimeModelAdapter],
 ) -> None:
     _REALTIME_ADAPTER_REGISTRY[pipeline_config_cls] = adapter_cls
 
@@ -54,7 +54,7 @@ def _register_builtin_realtime_model_adapters() -> None:
 
 def get_realtime_model_adapter(
     server_args: ServerArgs,
-) -> BaseRealtimeModelAdapter:
+) -> RealtimeModelAdapter:
     _register_builtin_realtime_model_adapters()
 
     pipeline_config = server_args.pipeline_config

@@ -8,14 +8,13 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.cuda_graph_runner import set_global_graph_memory_pool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
-from sglang.srt.model_executor.runner import set_global_graph_memory_pool
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -297,12 +296,7 @@ def _configure_runner_for_eagle_draft(
     server_args = runner.server_args
     updates = {
         "attention_backend": case.backend,
-        "cuda_graph_config": CudaGraphConfig(
-            decode=PhaseConfig(
-                bs=[settings.capture_batch_size],
-                max_bs=settings.capture_batch_size,
-            ),
-        ),
+        "cuda_graph_bs": [settings.capture_batch_size],
         "debug_cuda_graph": False,
         "decode_attention_backend": case.backend,
         "disable_cuda_graph_padding": False,
@@ -430,19 +424,19 @@ def _capture_eagle_draft_graph_runner(
 ) -> EAGLEDraftCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.graph_capture",
+            "sglang.srt.model_executor.cuda_graph_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
+            "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
         patch(
-            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
+            "sglang.srt.model_executor.cuda_graph_runner.get_attention_cp_size",
             lambda: 1,
         ),
     ):
@@ -459,15 +453,19 @@ def _capture_frozen_kv_mtp_graph_runner(
 ) -> FrozenKVMTPCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner.graph_capture",
+            "sglang.srt.model_executor.cuda_graph_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
+            "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
+            lambda *args, **kwargs: 0.0,
+        ),
+        patch(
+            "sglang.srt.model_executor.cuda_graph_runner.get_attention_cp_size",
             lambda: 1,
         ),
     ):

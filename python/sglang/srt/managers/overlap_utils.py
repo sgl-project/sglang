@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Sequence, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.srt.utils import is_cuda, is_hip, is_npu
@@ -31,11 +30,7 @@ def decide_needs_cpu_seq_lens(
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
-    cuda_graph_config = server_args.cuda_graph_config
-    if (
-        cuda_graph_config is not None
-        and cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE
-    ):
+    if not server_args.disable_piecewise_cuda_graph:
         # FIXME: support PCG without seq lens cpu value
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
@@ -171,9 +166,6 @@ class FutureMap:
             )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
-        if self.spec_algo.is_ngram():
-            # FIXME: remove once precomputed draft is supported.
-            return
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
@@ -259,9 +251,6 @@ class FutureMap:
         future_indices: torch.Tensor,
         payload: Union[torch.Tensor, EagleDraftInput],
     ) -> None:
-        if self.spec_algo.is_ngram():
-            # FIXME: remove once precomputed draft is supported.
-            return
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.

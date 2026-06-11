@@ -4,14 +4,13 @@ export const KimiK25Deployment = () => {
   // GPU requirements:
   //   H200: tp=8
   //   B300: tp=8
-  //   GB300: tp=4
   //   MI300X: tp=4 (64 heads / 4 = 16 heads per GPU, AITER MLA requires heads_per_gpu % 16 == 0)
   //   MI325X: tp=4 (same constraint as MI300X)
   //   MI350X: tp=4 (same constraint as MI300X)
   //   MI355X: tp=4 (same constraint as MI300X)
   //
-  // NVFP4 quantization is only supported on NVIDIA Blackwell (B300/GB300).
-  // Speculative decoding is only supported on H200, B300, and GB300.
+  // NVFP4 quantization is only supported on NVIDIA Blackwell (B300).
+  // Speculative decoding is only supported on H200 and B300.
   const options = {
     hardware: {
       name: 'hardware',
@@ -19,7 +18,6 @@ export const KimiK25Deployment = () => {
       items: [
         { id: 'h200',   label: 'H200',   default: true  },
         { id: 'b300',   label: 'B300',   default: false },
-        { id: 'gb300',  label: 'GB300',  default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi350x', label: 'MI350X', default: false },
@@ -31,10 +29,10 @@ export const KimiK25Deployment = () => {
       title: 'Quantization',
       getDynamicItems: (values) => {
         const hw = values.hardware;
-        const isBlackwell = hw === 'b300' || hw === 'gb300';
+        const isB300 = hw === 'b300';
         return [
           { id: 'int4',  label: 'INT4',  subtitle: 'initial model',   default: true },
-          { id: 'nvfp4', label: 'NVFP4', subtitle: 'Blackwell only',  default: false, disabled: !isBlackwell, disabledReason: 'NVFP4 only on B300/GB300' }
+          { id: 'nvfp4', label: 'NVFP4', subtitle: 'Blackwell only',  default: false, disabled: !isB300, disabledReason: 'NVFP4 only on B300' }
         ];
       }
     },
@@ -65,7 +63,7 @@ export const KimiK25Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding',
-      condition: (values) => values.hardware === 'h200' || values.hardware === 'b300' || values.hardware === 'gb300',
+      condition: (values) => values.hardware === 'h200' || values.hardware === 'b300',
       items: [
         { id: 'disabled', label: 'Disabled', default: true  },
         { id: 'enabled',  label: 'Enabled',  default: false }
@@ -76,7 +74,6 @@ export const KimiK25Deployment = () => {
   const modelConfigs = {
     h200:   { tp: 8 },
     b300:   { tp: 8 },
-    gb300:  { tp: 4 },
     mi300x: { tp: 4 },
     mi325x: { tp: 4 },
     mi350x: { tp: 4 },
@@ -115,7 +112,7 @@ export const KimiK25Deployment = () => {
     return () => observer.disconnect();
   }, []);
 
-  // When hardware changes, re-resolve quantization defaults (NVFP4 only on B300/GB300).
+  // When hardware changes, re-resolve quantization defaults (NVFP4 only on B300).
   useEffect(() => {
     setValues(prev => {
       const next = { ...prev };
@@ -141,14 +138,14 @@ export const KimiK25Deployment = () => {
     const { hardware, quantization, speculative } = values;
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi350x' || hardware === 'mi355x';
 
-    // NVFP4 is only supported on NVIDIA Blackwell (B300/GB300)
-    if (quantization === 'nvfp4' && hardware !== 'b300' && hardware !== 'gb300') {
-      return '# NVFP4 quantization is only supported on NVIDIA Blackwell GPUs (B300/GB300)';
+    // NVFP4 is only supported on NVIDIA Blackwell (B300)
+    if (quantization === 'nvfp4' && hardware !== 'b300') {
+      return '# NVFP4 quantization is only supported on NVIDIA Blackwell GPUs (B300)';
     }
 
-    // Speculative decoding only supported on H200, B300, and GB300
-    if (speculative === 'enabled' && hardware !== 'h200' && hardware !== 'b300' && hardware !== 'gb300') {
-      return '# Speculative Decoding for Kimi-K2.5 is only supported on H200, B300, and GB300';
+    // Speculative decoding only supported on H200 and B300
+    if (speculative === 'enabled' && hardware !== 'h200' && hardware !== 'b300') {
+      return '# Speculative Decoding for Kimi-K2.5 is only supported on H200 and B300';
     }
 
     // Model path depends on quantization
@@ -166,8 +163,13 @@ export const KimiK25Deployment = () => {
       cmd += 'SGLANG_USE_AITER=1 SGLANG_ROCM_FUSED_DECODE_MLA=0 ';
     }
 
+    // Speculative decoding env var
+    if (speculative === 'enabled') {
+      cmd += 'SGLANG_ENABLE_SPEC_V2=1 ';
+    }
+
     // If we added any env vars above, break to a new line for readability
-    if (isAMD) {
+    if (isAMD || speculative === 'enabled') {
       cmd += '\\\n';
     }
 
@@ -196,8 +198,8 @@ export const KimiK25Deployment = () => {
       cmd += ' \\\n  --speculative-algorithm EAGLE3 \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla';
     }
 
-    // Blackwell (B300/GB300): tokenspeed MLA attention backend
-    if (hardware === 'b300' || hardware === 'gb300') {
+    // Blackwell (B300): tokenspeed MLA attention backend
+    if (hardware === 'b300') {
       cmd += ' \\\n  --attention-backend tokenspeed_mla';
     }
 

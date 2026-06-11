@@ -37,7 +37,7 @@ import { KimiK25Deployment } from '/src/snippets/autoregressive/kimi-k25-deploym
 
 ### 3.2 Configuration Tips
 
-- **Memory**: Requires GPUs with >=140GB each. Supported platforms: H200 (8x, TP=8), B300 (8x, TP=8), GB300 (4x, TP=4), MI300X/MI325X (4x, TP=4), MI350X/MI355X (4x, TP=4). Use `--context-length 128000` to conserve memory.
+- **Memory**: Requires GPUs with >=140GB each. Supported platforms: H200 (8x, TP=8), B300 (8x, TP=8), MI300X/MI325X (4x, TP=4), MI350X/MI355X (4x, TP=4). Use `--context-length 128000` to conserve memory.
 - **AMD GPU TP Constraint**: On AMD GPUs, TP must be &lt;= 4 (not 8). Kimi-K2.5 has 64 attention heads; the AITER MLA kernel requires `heads_per_gpu % 16 == 0`. With TP=4, each GPU gets 16 heads (valid). With TP=8, each GPU gets 8 heads (invalid).
 - **AMD Docker Image**: Use `lmsysorg/sglang:v0.5.9-rocm700-mi35x` for MI350X/MI355X and `lmsysorg/sglang:v0.5.9-rocm700-mi30x` for MI300X/MI325X. The ROCm 7.2 images (`rocm720`) have an AITER compatibility issue.
 - **DP Attention**: Enable with `--dp <N> --enable-dp-attention` for production throughput. A common choice is to set `--dp` equal to `--tp`, but this is not required.
@@ -440,10 +440,10 @@ Let me search for this product and similar items:
 
 **Nvidia**
 
-Deploy Kimi-K2.5 with the following command (H200/B300, all features enabled):
+Deploy Kimi-K2.5 with the following command (H200/B200, all features enabled):
 
 ```shell Command
-sglang serve \
+SGLANG_ENABLE_SPEC_V2=1 sglang serve \
   --model-path moonshotai/Kimi-K2.5 \
   --tp 8 \
   --reasoning-parser kimi_k2 \
@@ -452,16 +452,16 @@ sglang serve \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
-  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla \
+  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3 \
   --trust-remote-code \
   --host 0.0.0.0 \
   --port 30000
 ```
 
-Deploy Kimi-K2.5-NVFP4 with the following command (B300, all features enabled):
+Deploy Kimi-K2.5-NVFP4 with the following command (B200, all features enabled):
 
 ```shell Command
-sglang serve \
+SGLANG_ENABLE_SPEC_V2=1 sglang serve \
   --model-path nvidia/Kimi-K2.5-NVFP4 \
   --tp 8 \
   --reasoning-parser kimi_k2 \
@@ -471,13 +471,11 @@ sglang serve \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
-  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla \
+  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3 \
   --trust-remote-code \
   --host 0.0.0.0 \
   --port 30000
 ```
-
-For GB300, use `--tp 4`.
 
 ## 5. Benchmark
 
@@ -1031,7 +1029,7 @@ Max ITL (ms):                            7778.47
 - **Model Deployment:**
 
 ```bash Command
-sglang serve \
+SGLANG_ENABLE_SPEC_V2=1 sglang serve \
   --model-path moonshotai/Kimi-K2.5 \
   --tp 8 \
   --reasoning-parser kimi_k2 \
@@ -1040,7 +1038,7 @@ sglang serve \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
-  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla \
+  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3 \
   --trust-remote-code \
   --host 0.0.0.0 \
   --port 30000

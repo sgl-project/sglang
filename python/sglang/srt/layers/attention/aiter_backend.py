@@ -69,7 +69,6 @@ from sglang.srt.layers.attention.utils import (
     pad_sequence_with_mask,
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
@@ -118,8 +117,6 @@ class ForwardMetadata:
     max_extend_len: Optional[int] = None
     fp8_prefill_kv_indices: Optional[torch.Tensor] = None
     swa_page_table: Optional[torch.Tensor] = None
-    # full->SWA translated out_cache_loc (SWA KV-store write target)
-    swa_out_cache_loc: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
@@ -868,20 +865,6 @@ class AiterAttnBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
         )
 
-        # Refill the SWA write-target buffer from the live out_cache_loc and
-        # bind it onto the metadata before replay (_apply rebuilds it each call).
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            n = forward_batch.out_cache_loc.shape[0]
-            self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
-            )
-            self.forward_metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
-                :n
-            ]
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
 
@@ -902,11 +885,6 @@ class AiterAttnBackend(AttentionBackend):
 
         num_kv_splits = None
         swa_page_table = None
-        swa_out_cache_loc = None
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
-            )
         max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -1027,7 +1005,6 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 run_graph=False,
                 swa_page_table=swa_page_table,
-                swa_out_cache_loc=swa_out_cache_loc,
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -1300,7 +1277,6 @@ class AiterAttnBackend(AttentionBackend):
                         max_kv_len,
                         max_extend_len=max_q_len,
                         swa_page_table=swa_page_table,
-                        swa_out_cache_loc=swa_out_cache_loc,
                     )
                 else:
                     qo_indptr = torch.arange(
@@ -1449,7 +1425,6 @@ class AiterAttnBackend(AttentionBackend):
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
                     swa_page_table=swa_page_table,
-                    swa_out_cache_loc=swa_out_cache_loc,
                 )
 
     def init_cuda_graph_state(
@@ -1562,13 +1537,6 @@ class AiterAttnBackend(AttentionBackend):
             self.cuda_graph_swa_page_table = torch.zeros(
                 (max_bs, max_num_blocks_per_seq),
                 dtype=torch.int32,
-                device=self.device,
-            )
-            # SWA write-target buffer; refilled and bound onto forward_metadata
-            # in init_forward_metadata_out_graph before each replay.
-            self.cuda_graph_swa_out_cache_loc = torch.zeros(
-                (max_num_tokens,),
-                dtype=torch.int64,
                 device=self.device,
             )
 
@@ -2053,12 +2021,7 @@ class AiterAttnBackend(AttentionBackend):
                 # set_kv_buffer which dispatches to the SHUFFLE 5D writer.
                 if self.kv_cache_is_vectorized_5d:
                     self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                        k,
-                        v,
-                        k_descale,
-                        v_descale,
+                        layer, cache_loc, k, v, k_descale, v_descale
                     )
                 # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
                 # both unified attention and sliding window kv pool are active.
@@ -2097,12 +2060,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                        k,
-                        v,
-                        k_descale,
-                        v_descale,
+                        layer, cache_loc, k, v, k_descale, v_descale
                     )
 
         if self.use_mla:
@@ -2530,15 +2488,7 @@ class AiterAttnBackend(AttentionBackend):
             # SHUFFLE 5D pool path — see forward_extend for rationale.
             if self.kv_cache_is_vectorized_5d:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
-                    ),
-                    k,
-                    v,
-                    k_descale,
-                    v_descale,
+                    layer, forward_batch.out_cache_loc, k, v, k_descale, v_descale
                 )
             # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
             # both unified attention and sliding window kv pool are active.
@@ -2583,13 +2533,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
-                    ),
-                    k,
-                    v,
+                    layer, forward_batch.out_cache_loc, k, v
                 )
 
         if self.use_mla:

@@ -325,7 +325,7 @@ def _run_server_and_generate(
         "--mem-fraction-static",
         "0.5",
         "--disable-cuda-graph",
-        "--cuda-graph-backend-prefill=disabled",
+        "--disable-piecewise-cuda-graph",
         "--disable-radix-cache",
     ]
     if extra_server_args:

@@ -11,7 +11,7 @@ import msgspec.msgpack
 from fastapi import WebSocket
 from PIL import Image
 
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timer import (
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timing import (
     RealtimeStageTimer,
 )
 from sglang.multimodal_gen.runtime.utils.realtime_video import (

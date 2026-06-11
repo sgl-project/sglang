@@ -34,7 +34,6 @@ from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
-    DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
@@ -49,14 +48,6 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.model_executor.cuda_graph_config import (
-    ALLOWED_BACKENDS_PER_PHASE,
-    Backend,
-    CudaGraphConfig,
-    Phase,
-    default_cuda_graph_config,
-    parse_cuda_graph_config_arg,
-)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
@@ -152,7 +143,6 @@ QUANTIZATION_CHOICES = [
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
-    "nvfp4_online",
     "modelopt_mixed",
     "petit_nvfp4",
     "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
@@ -742,39 +732,14 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    cuda_graph_max_bs: Optional[int] = None
+    cuda_graph_bs: Optional[List[int]] = None
+    disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
-
-    # Accepts dict (CLI JSON / SDK) at construction time; normalized to
-    # CudaGraphConfig by _parse_cuda_graph_config.
-    cuda_graph_config: Optional[CudaGraphConfig] = None
-
-    # Per-phase convenience CLI inputs that fold into cuda_graph_config.
-    cuda_graph_backend_decode: Optional[
-        Literal["full", "breakable", "tc_piecewise", "disabled"]
-    ] = None
-    cuda_graph_backend_prefill: Optional[
-        Literal["breakable", "tc_piecewise", "disabled"]
-    ] = None
-    cuda_graph_max_bs_decode: Optional[int] = None
-    cuda_graph_max_bs_prefill: Optional[int] = None
-    cuda_graph_bs_decode: Optional[List[int]] = None
-    cuda_graph_bs_prefill: Optional[List[int]] = None
-    cuda_graph_tc_compiler: Optional[Literal["eager", "inductor"]] = None
-
-    # Legacy CLI inputs that fold into cuda_graph_config (with a CLI
-    # deprecation warning). Internal-only after parsing.
-    disable_cuda_graph: bool = False
-    disable_prefill_cuda_graph: bool = False
-    disable_decode_cuda_graph: bool = False
-    prefill_cuda_graph_backend: Optional[
-        Literal["breakable", "tc_piecewise", "disabled"]
-    ] = None
-    decode_cuda_graph_backend: Optional[
-        Literal["full", "breakable", "tc_piecewise", "disabled"]
-    ] = None
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -797,8 +762,13 @@ class ServerArgs:
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
+    disable_piecewise_cuda_graph: bool = False
+    enforce_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
+    piecewise_cuda_graph_max_tokens: Optional[int] = None
+    piecewise_cuda_graph_tokens: Optional[List[int]] = None
+    piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
@@ -971,8 +941,6 @@ class ServerArgs:
         # Set missing default values.
         self._handle_missing_default_values()
 
-        self._handle_cuda_graph_config()
-
         # Handle device-specific backends.
         self._handle_hpu_backends()
         self._handle_cpu_backends()
@@ -982,6 +950,9 @@ class ServerArgs:
 
         # Allow OOT platform plugins to apply server args defaults.
         current_platform.apply_server_args_defaults(self)
+
+        # Handle piecewise CUDA graph.
+        self._handle_piecewise_cuda_graph()
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
@@ -1266,11 +1237,11 @@ class ServerArgs:
 
     def _handle_modelscope_paths(self):
         """Resolve model / tokenizer / speculative-draft paths from the local
-        ModelScope cache when possible, falling back to snapshot_download
+        ModelScope cache when possible, falling back to ``snapshot_download``
         for any path that is not already present on disk.
 
-        Note: speculative_token_map is intentionally NOT handled here
-        because its value uses repo_id/filename semantics rather than a
+        Note: ``speculative_token_map`` is intentionally NOT handled here
+        because its value uses ``repo_id/filename`` semantics rather than a
         plain repo ID.  That resolution lives in
         :func:`sglang.srt.speculative.spec_utils.load_token_map`.
         """
@@ -1347,13 +1318,12 @@ class ServerArgs:
 
             set_default_server_args(self)
 
-            current = self.cuda_graph_config.prefill.tc_compiler
-            if current is not None and current != "eager":
+            if self.piecewise_cuda_graph_compiler != "eager":
                 logger.warning(
                     "At this moment Ascend platform only support prefill graph compilation with "
-                    "cuda_graph_config[prefill].tc_compiler='eager'."
+                    "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
                 )
-                self.cuda_graph_config.prefill.tc_compiler = "eager"
+                self.piecewise_cuda_graph_compiler = "eager"
 
     def _handle_mps_backends(self):
         if self.device == "mps":
@@ -1362,191 +1332,83 @@ class ServerArgs:
 
     def _handle_xpu_backends(self):
         if self.device == "xpu":
-            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+            if not self.disable_piecewise_cuda_graph:
                 logger.warning(
-                    "XPU platform does not support piecewise CUDA graph, "
-                    "disabling prefill cuda graph."
+                    "XPU platform does not support piecewise CUDA graph, ignoring --disable-piecewise-cuda-graph"
+                    " flag and disabling piecewise CUDA graph."
                 )
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self.disable_piecewise_cuda_graph = True
 
-    # ------------------------------------------------------------------
-    # CUDA graph configuration resolution
-    # ------------------------------------------------------------------
-    # TODO: add unit tests in test/srt/test_server_args.py covering the
-    # precedence cascade + auto-disable matrix (follow-up PR).
-    def _handle_cuda_graph_config(self):
-        self._parse_cuda_graph_config()
-        self._apply_cuda_graph_compatibility()
-        self._validate_cuda_graph_config()
-
-    def _parse_cuda_graph_config(self):
-        """Resolve cuda_graph_config from explicit JSON, per-phase
-        convenience flags, legacy global flags, and defaults.
-        Precedence (highest first): explicit JSON > convenience > legacy > defaults.
-        Also populates self._cuda_graph_config_locked — the set of
-        (phase, key) tuples that came from non-default sources; the
-        auto-disable cascade respects this lock (the old
-        --enforce-piecewise-cuda-graph semantics generalized).
-        """
-        raw_input = self.cuda_graph_config
-        if isinstance(raw_input, CudaGraphConfig):
-            explicit_input = raw_input.to_dict()
-        else:
-            explicit_input = raw_input or {}
-        config = default_cuda_graph_config()
-        locked: set = set()
-
-        def _set(phase: str, key: str, value: Any) -> None:
-            setattr(getattr(config, phase), key, value)
-            locked.add((phase, key))
-
-        # ---- Legacy global flags (lowest precedence above defaults) ----
-        if self.disable_cuda_graph:
-            _set(Phase.DECODE, "backend", Backend.DISABLED)
-            _set(Phase.PREFILL, "backend", Backend.DISABLED)
-
-        # ---- Legacy convenience flags ----
-        if self.disable_prefill_cuda_graph:
-            _set(Phase.PREFILL, "backend", Backend.DISABLED)
-        if self.disable_decode_cuda_graph:
-            _set(Phase.DECODE, "backend", Backend.DISABLED)
-        if self.prefill_cuda_graph_backend is not None:
-            _set(Phase.PREFILL, "backend", self.prefill_cuda_graph_backend)
-        if self.decode_cuda_graph_backend is not None:
-            _set(Phase.DECODE, "backend", self.decode_cuda_graph_backend)
-
-        # ---- Per-phase convenience flags ----
-        if self.cuda_graph_backend_decode is not None:
-            _set(Phase.DECODE, "backend", self.cuda_graph_backend_decode)
-        if self.cuda_graph_backend_prefill is not None:
-            _set(Phase.PREFILL, "backend", self.cuda_graph_backend_prefill)
-        if self.cuda_graph_max_bs_decode is not None:
-            _set(Phase.DECODE, "max_bs", self.cuda_graph_max_bs_decode)
-        if self.cuda_graph_max_bs_prefill is not None:
-            _set(Phase.PREFILL, "max_bs", self.cuda_graph_max_bs_prefill)
-        if self.cuda_graph_bs_decode is not None:
-            _set(Phase.DECODE, "bs", self.cuda_graph_bs_decode)
-        if self.cuda_graph_bs_prefill is not None:
-            _set(Phase.PREFILL, "bs", self.cuda_graph_bs_prefill)
-        if self.cuda_graph_tc_compiler is not None:
-            # Written to both phases so the value is in place when TC_PIECEWISE
-            # decode is implemented; today decode ignores it.
-            _set(Phase.DECODE, "tc_compiler", self.cuda_graph_tc_compiler)
-            _set(Phase.PREFILL, "tc_compiler", self.cuda_graph_tc_compiler)
-
-        # ---- Explicit JSON config (highest precedence) ----
-        for phase, phase_config in explicit_input.items():
-            if not isinstance(phase_config, dict):
-                continue
-            for key, value in phase_config.items():
-                _set(phase, key, value)
-
-        self.cuda_graph_config = config
-        self._cuda_graph_config_locked = locked
-
-    def _apply_cuda_graph_compatibility(self):
-        """Auto-disable prefill cuda graph for incompatible configs.
-        Rules are split per backend — TcPiecewise and Breakable have
-        different constraints. Skipped when the user explicitly set the
-        prefill backend (this folds in the old
-        --enforce-piecewise-cuda-graph contract).
-        """
-        if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
+    def _handle_piecewise_cuda_graph(self):
+        # Skip auto-disable when enforce flag is set (for testing)
+        if self.enforce_piecewise_cuda_graph:
+            self.disable_piecewise_cuda_graph = False
             return
-        if self.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
-            self._disable_tc_piecewise_cudagraph_if_incompatible()
-        elif self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
-            self._disable_breakable_cudagraph_if_incompatible()
 
-    def _disable_tc_piecewise_cudagraph_if_incompatible(self):
-        """TcPiecewise (torch.compile + piecewise) is incompatible with
-        these configurations. Most are torch.compile / dynamo limitations.
-        """
-
-        rules = [
-            (
-                "model-arch blacklist",
-                lambda: self.get_model_config().is_piecewise_cuda_graph_disabled_model,
-            ),
-            ("DP attention", lambda: self.enable_dp_attention),
-            ("full torch.compile mode", lambda: self.enable_torch_compile),
-            ("pipeline parallelism (pp_size > 1)", lambda: self.pp_size > 1),
-            (
-                "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
-                lambda: is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu(),
-            ),
-            (
-                "OOT platform without piecewise support",
-                lambda: current_platform.is_out_of_tree()
-                and not current_platform.support_piecewise_cuda_graph(),
-            ),
-            ("MoE A2A backend", lambda: self.moe_a2a_backend != "none"),
-            ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
-            ("multimodal model", lambda: self.get_model_config().is_multimodal),
-            (
-                "GGUF quantization",
-                lambda: self.load_format == "gguf"
-                or self.quantization == "gguf"
-                or check_gguf_file(self.model_path),
-            ),
-            ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
-            (
-                "CPU offload / hierarchical cache",
-                lambda: self.cpu_offload_gb > 0 or self.enable_hierarchical_cache,
-            ),
-            (
-                "deterministic inference",
-                lambda: self.enable_deterministic_inference,
-            ),
-            ("PD disaggregation", lambda: self.disaggregation_mode != "null"),
-            ("symmetric memory", lambda: self.enable_symm_mem),
-            (
-                "expert distribution recorder",
-                lambda: self.enable_eplb
-                or self.expert_distribution_recorder_mode is not None,
-            ),
-            ("context parallel (attn_cp_size > 1)", lambda: self.attn_cp_size > 1),
-            ("CUDA graph debug mode", lambda: self.debug_cuda_graph),
-            (
-                "DSA prefill context parallelism",
-                lambda: self.enable_dsa_prefill_context_parallel,
-            ),
-        ]
-        for _name, predicate in rules:
-            if predicate():
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
-
-    def _disable_breakable_cudagraph_if_incompatible(self):
-        """Breakable (segmented capture, no torch.compile). Breakable enforces HIP
-        / memory-saver rejection in its own __init__; config-time
-        rules can be added here as they're discovered.
-        """
-        rules = [
-            # MLA prefill takes a different attn-forward path under BCG (no
-            # tc_piecewise gate), causing q.view shape mismatches. Disable
-            # until the MLA prefill path is BCG-aware.
-            ("MLA attention", lambda: self.use_mla_backend()),
-        ]
-        for name, predicate in rules:
-            if predicate():
-                logger.warning(
-                    "Breakable CUDA graph is incompatible with %s; "
-                    "disabling prefill CUDA graph.",
-                    name,
-                )
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
-                return
-
-    def _validate_cuda_graph_config(self):
-        if self.cuda_graph_config is None:
-            return
-        for phase in Phase.ALL:
-            backend = getattr(self.cuda_graph_config, phase).backend
-            if backend not in ALLOWED_BACKENDS_PER_PHASE[phase]:
-                raise ValueError(
-                    f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
-                    f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
-                )
+        # Disable piecewise cuda graph with following conditions:
+        # 1. Disable Model Arch
+        if self.get_model_config().is_piecewise_cuda_graph_disabled_model:
+            self.disable_piecewise_cuda_graph = True
+        # 2. DP attention
+        if self.enable_dp_attention:
+            self.disable_piecewise_cuda_graph = True
+        # 3. Torch compile
+        if self.enable_torch_compile:
+            self.disable_piecewise_cuda_graph = True
+        # 4. Pipeline parallelism
+        if self.pp_size > 1:
+            self.disable_piecewise_cuda_graph = True
+        # 5. Non-CUDA hardware (AMD, NPU, CPU, MPS, XPU, etc.)
+        if is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu():
+            self.disable_piecewise_cuda_graph = True
+        # 5b. OOT platforms that don't support piecewise cuda graph
+        if current_platform.is_out_of_tree():
+            if not current_platform.support_piecewise_cuda_graph():
+                self.disable_piecewise_cuda_graph = True
+        # 6. MoE A2A backend
+        if self.moe_a2a_backend != "none":
+            self.disable_piecewise_cuda_graph = True
+        # 7. LoRA
+        if self.lora_paths or self.enable_lora:
+            self.disable_piecewise_cuda_graph = True
+        # 8. Multimodal / VLM models
+        if self.get_model_config().is_multimodal:
+            self.disable_piecewise_cuda_graph = True
+        # 9. GGUF quantized models (custom dequant ops unsupported by torch.compile)
+        if (
+            self.load_format == "gguf"
+            or self.quantization == "gguf"
+            or check_gguf_file(self.model_path)
+        ):
+            self.disable_piecewise_cuda_graph = True
+        # 10. DLLM (diffusion LLM) models (context manager in forward breaks dynamo)
+        if self.dllm_algorithm is not None:
+            self.disable_piecewise_cuda_graph = True
+        # 11. CPU offload (breaks dynamo)
+        if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
+            self.disable_piecewise_cuda_graph = True
+        # 12. Deterministic inference
+        if self.enable_deterministic_inference:
+            self.disable_piecewise_cuda_graph = True
+        # 13. PD disaggregation
+        if self.disaggregation_mode != "null":
+            self.disable_piecewise_cuda_graph = True
+        # 14. Symmetric memory (torch.cuda.use_mem_pool is untraceable by dynamo)
+        if self.enable_symm_mem:
+            self.disable_piecewise_cuda_graph = True
+        # 15. Expert distribution recorder
+        if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
+            self.disable_piecewise_cuda_graph = True
+        # 16. Context parallel
+        if self.attn_cp_size > 1:
+            self.disable_piecewise_cuda_graph = True
+        # 18. CUDA Graph debug mode
+        if self.debug_cuda_graph:
+            self.disable_piecewise_cuda_graph = True
+        # 19. DSA prefill context parallelism (attn_cp_size is set later in
+        # _handle_model_specific_adjustments, so check the flag directly here)
+        if self.enable_dsa_prefill_context_parallel:
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_multi_item_scoring(self):
         """Setup and validate multi-item scoring constraints.
@@ -1559,10 +1421,10 @@ class ServerArgs:
         if not self.enable_mis:
             return
 
-        if self.cuda_graph_config.decode.backend != Backend.DISABLED:
+        if not self.disable_cuda_graph:
             logger.warning("CUDA graph is disabled because --enable-mis is set.")
-        self.cuda_graph_config.decode.backend = Backend.DISABLED
-        self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self.disable_cuda_graph = True
+        self.disable_piecewise_cuda_graph = True
 
         if not self.disable_radix_cache:
             logger.warning("Radix cache is disabled because --enable-mis is set.")
@@ -1582,13 +1444,13 @@ class ServerArgs:
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
         Configure GPU memory-dependent settings including
-        chunked_prefill_size, cuda_graph_config[decode].max_bs, and mem_fraction_static.
+        chunked_prefill_size, cuda_graph_max_bs, and mem_fraction_static.
 
         Here are our heuristics:
-        - Set chunked_prefill_size and cuda_graph_config[decode].max_bs based on the GPU memory capacity.
+        - Set chunked_prefill_size and cuda_graph_max_bs based on the GPU memory capacity.
           This is because GPUs with more memory are generally more powerful, we need to use a larger
-          chunked_prefill_size and a larger decode max_bs to fully utilize the GPU.
-        - Then set mem_fraction_static based on chunked_prefill_size and decode max_bs.
+          chunked_prefill_size and a larger cuda_graph_max_bs to fully utilize the GPU.
+        - Then set mem_fraction_static based on chunked_prefill_size and cuda_graph_max_bs.
 
           GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
 
@@ -1597,140 +1459,134 @@ class ServerArgs:
 
           In order to compute mem_fraction_static, we need to estimate the size of activations and cuda graph buffers.
           The activation memory is proportional to the chunked_prefill_size.
-          The cuda graph memory is proportional to the decode max_bs.
-          We use reserved_mem = chunked_prefill_size * 1.5 + max_bs * 2 to estimate the size of activations and cuda graph buffers in GB,
+          The cuda graph memory is proportional to the cuda_graph_max_bs.
+          We use reserved_mem = chunked_prefill_size * 1.5 + cuda_graph_max_bs * 2 to estimate the size of activations and cuda graph buffers in GB.
           and set mem_fraction_static = (GPU memory capacity - reserved_mem) / GPU memory capacity.
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
-        decode_cuda_graph_config = self.cuda_graph_config.decode
-        prefill_cuda_graph_config = self.cuda_graph_config.prefill
-
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
                 # T4, 4080
-                # (chunked_prefill_size 2k, max_bs 8)
+                # (chunked_prefill_size 2k, cuda_graph_max_bs 8)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 2048
-                if decode_cuda_graph_config.max_bs is None:
-                    decode_cuda_graph_config.max_bs = 8
+                if self.cuda_graph_max_bs is None:
+                    self.cuda_graph_max_bs = 8
             elif gpu_mem < 35 * 1024:
                 # A10, 4090, 5090
-                # (chunked_prefill_size 2k, max_bs 24 if tp < 4 else 80)
+                # (chunked_prefill_size 2k, cuda_graph_max_bs 24 if tp < 4 else 80)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 2048
-                if decode_cuda_graph_config.max_bs is None:
+                if self.cuda_graph_max_bs is None:
+                    # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM < 35GB, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance.
+                    # However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs
+                    # from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
                     if self.tp_size < 4:
-                        decode_cuda_graph_config.max_bs = 24
+                        self.cuda_graph_max_bs = 24
                     else:
-                        decode_cuda_graph_config.max_bs = 80
+                        self.cuda_graph_max_bs = 80
             elif gpu_mem < 60 * 1024:
                 # A100 (40GB), L40,
-                # (chunked_prefill_size 4k, max_bs 32 if tp < 4 else 160)
+                # (chunked_prefill_size 4k, cuda_graph_max_bs 32 if tp < 4 else 160)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 4096
-                if decode_cuda_graph_config.max_bs is None:
+                if self.cuda_graph_max_bs is None:
                     if self.tp_size < 4:
-                        decode_cuda_graph_config.max_bs = 32
+                        self.cuda_graph_max_bs = 32
                     else:
-                        decode_cuda_graph_config.max_bs = 160
+                        self.cuda_graph_max_bs = 160
             elif gpu_mem < 90 * 1024:
                 # H100, A100
-                # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
+                # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 8192
-                if decode_cuda_graph_config.max_bs is None:
+                if self.cuda_graph_max_bs is None:
                     if self.tp_size < 4:
-                        decode_cuda_graph_config.max_bs = 256
+                        self.cuda_graph_max_bs = 256
                     else:
-                        decode_cuda_graph_config.max_bs = 512
+                        self.cuda_graph_max_bs = 512
             elif gpu_mem < 160 * 1024:
                 # H20, H200
-                # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
+                # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 8192
-                if decode_cuda_graph_config.max_bs is None:
+                if self.cuda_graph_max_bs is None:
                     if self.tp_size < 4:
-                        decode_cuda_graph_config.max_bs = 256
+                        self.cuda_graph_max_bs = 256
                     else:
-                        decode_cuda_graph_config.max_bs = 512
+                        self.cuda_graph_max_bs = 512
             else:
                 # B200, MI300
-                # (chunked_prefill_size 16k, max_bs 512)
+                # (chunked_prefill_size 16k, cuda_graph_max_bs 512)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 16384
-                if decode_cuda_graph_config.max_bs is None:
-                    decode_cuda_graph_config.max_bs = 512
+                if self.cuda_graph_max_bs is None:
+                    self.cuda_graph_max_bs = 512
         else:
             # Fallback defaults when gpu_mem is None
             if self.chunked_prefill_size is None:
                 self.chunked_prefill_size = 4096
-            if decode_cuda_graph_config.max_bs is None:
-                decode_cuda_graph_config.max_bs = 160
+            if self.cuda_graph_max_bs is None:
+                self.cuda_graph_max_bs = 160
 
         # Set cuda graph batch sizes
         if self.device != "cpu":
-            if decode_cuda_graph_config.bs is None:
-                decode_cuda_graph_config.bs = (
-                    self._generate_decode_cuda_graph_batch_sizes(
-                        decode_cuda_graph_config.max_bs
-                    )
-                )
+            if self.cuda_graph_bs is None:
+                self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
             else:
-                decode_cuda_graph_config.max_bs = max(decode_cuda_graph_config.bs)
+                self.cuda_graph_max_bs = max(self.cuda_graph_bs)
         else:
-            # Reuse decode_cuda_graph_config.bs for cpu graph and use torch_compile_max_bs for cpu graph batch size limit,
+            # Reuse cuda_graph_bs for cpu graph and use torch_compile_max_bs for cpu graph batch size limit,
             # as cpu graph is based on torch.compile
-            if decode_cuda_graph_config.bs is not None:
-                self.torch_compile_max_bs = max(decode_cuda_graph_config.bs)
+            if self.cuda_graph_bs is not None:
+                self.torch_compile_max_bs = max(self.cuda_graph_bs)
             else:
-                # If decode_cuda_graph_config.bs is not set, we will preferentially use torch_compile_max_bs
-                # to generate decode_cuda_graph_config.bs
+                # If cuda_graph_bs is not set, we will preferentially use torch_compile_max_bs
+                # to generate cuda_graph_bs
                 self.torch_compile_max_bs = (
-                    self.torch_compile_max_bs or decode_cuda_graph_config.max_bs
+                    self.torch_compile_max_bs or self.cuda_graph_max_bs
                 )
-                decode_cuda_graph_config.bs = self._generate_cpu_graph_batch_sizes()
+                self.cuda_graph_bs = self._generate_cpu_graph_batch_sizes()
 
             assert (
                 self.torch_compile_max_bs > 0
-            ), "cuda_graph_config[decode].bs should contain positive batch sizes"
-            decode_cuda_graph_config.max_bs = self.torch_compile_max_bs
+            ), "cuda_graph_bs should contain positive batch sizes"
+            self.cuda_graph_max_bs = self.torch_compile_max_bs
 
-        if prefill_cuda_graph_config.max_bs is None:
-            # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
+        if self.piecewise_cuda_graph_max_tokens is None:
+            # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
             # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
-            # To avoid the performance regression, we set max_bs to 2048 by default.
+            # To avoid the performance regression, we set the max tokens to 2048 by default.
             if not self.use_mla_backend():
-                prefill_cuda_graph_config.max_bs = self.chunked_prefill_size
+                self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
             else:
-                prefill_cuda_graph_config.max_bs = 2048
+                self.piecewise_cuda_graph_max_tokens = 2048
 
-            # If max_total_tokens is set, cap prefill max_bs to not exceed max_total_tokens.
+            # If max_total_tokens is set, cap pcg tokens to not exceed max_total_tokens
             if self.max_total_tokens is not None:
-                prefill_cuda_graph_config.max_bs = min(
-                    prefill_cuda_graph_config.max_bs, self.max_total_tokens
+                self.piecewise_cuda_graph_max_tokens = min(
+                    self.piecewise_cuda_graph_max_tokens, self.max_total_tokens
                 )
 
-            # For Llama2 series models, max_bs is limited to 4096.
+            # For Llama2 series models, the max tokens is limited to 4096
             # TODO(yuwei): remove this after the issue is fixed
             if "llama-2" in self.model_path.lower():
-                prefill_cuda_graph_config.max_bs = min(
-                    prefill_cuda_graph_config.max_bs, 4096
+                self.piecewise_cuda_graph_max_tokens = min(
+                    self.piecewise_cuda_graph_max_tokens, 4096
                 )
 
-        # Clamp to context_length if explicitly set — prevents prefill CG
-        # warmup from compiling graphs with more tokens than the model
-        # buffers can hold, which causes illegal memory access (#21112).
+        # Clamp to context_length if explicitly set — prevents PCG warmup
+        # from compiling graphs with more tokens than the model buffers
+        # can hold, which causes illegal memory access (#21112)
         if self.context_length is not None:
-            prefill_cuda_graph_config.max_bs = min(
-                prefill_cuda_graph_config.max_bs, self.context_length
+            self.piecewise_cuda_graph_max_tokens = min(
+                self.piecewise_cuda_graph_max_tokens, self.context_length
             )
 
-        if prefill_cuda_graph_config.bs is None:
-            prefill_cuda_graph_config.bs = (
-                self._generate_prefill_cuda_graph_batch_sizes(
-                    prefill_cuda_graph_config.max_bs
-                )
+        if self.piecewise_cuda_graph_tokens is None:
+            self.piecewise_cuda_graph_tokens = (
+                self._generate_piecewise_cuda_graph_tokens()
             )
 
         if self.mem_fraction_static is None:
@@ -1742,25 +1598,25 @@ class ServerArgs:
             else:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
             # For cuda graphs
-            reserved_mem += decode_cuda_graph_config.max_bs * 2
+            reserved_mem += self.cuda_graph_max_bs * 2
             # Some adjustments for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
             if self.enable_dp_attention:
                 # DP attention needs more padding for some operations
-                reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 3
+                reserved_mem += self.cuda_graph_max_bs * self.dp_size * 3
 
                 # DP attention uses much more memory for large cuda graph max bs,
                 # likely due to some inefficiencies in torch allocator or our implementation.
                 # So we need to reserve more memory.
-                if decode_cuda_graph_config.max_bs > 300:
-                    reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 1.5
+                if self.cuda_graph_max_bs > 300:
+                    reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
             # For piecewise cuda graphs
-            if prefill_cuda_graph_config.backend != Backend.DISABLED:
+            if not self.disable_piecewise_cuda_graph:
                 if not self.use_mla_backend():
                     # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
-                    reserved_mem += len(prefill_cuda_graph_config.bs) * 8
+                    reserved_mem += len(self.piecewise_cuda_graph_tokens) * 8
                 else:
                     # For MLA backend the memory overhead is much higher than expected with fa3
                     reserved_mem += 1.5 * 1024
@@ -1796,21 +1652,21 @@ class ServerArgs:
                 "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
             )
 
-    def _generate_decode_cuda_graph_batch_sizes(self, max_bs: int):
+    def _generate_cuda_graph_batch_sizes(self):
         """
-        Generate the list of batch sizes for CUDA graph capture based on max_bs.
+        Generate the list of batch sizes for CUDA graph capture based on cuda_graph_max_bs.
         This integrates the logic from cuda_graph_runner.py.
         """
         # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
         if self.disable_cuda_graph_padding:
-            capture_bs = list(range(1, max_bs + 1))
+            capture_bs = list(range(1, self.cuda_graph_max_bs + 1))
         elif self.speculative_algorithm is None:
             # Normal case:
             capture_bs = (
                 [1, 2, 4, 8, 12]
                 + list(range(16, 257, 8))
                 + list(range(272, 512, 16))
-                + list(range(512, max_bs + 1, 32))
+                + list(range(512, self.cuda_graph_max_bs + 1, 32))
             )
         else:
             # Spec decoding case: less padding for smaller batch sizes
@@ -1819,13 +1675,13 @@ class ServerArgs:
                 + list(range(10, 33, 2))
                 + list(range(40, 65, 4))
                 + list(range(72, 257, 8))
-                + list(range(272, max_bs + 1, 16))
+                + list(range(272, self.cuda_graph_max_bs + 1, 16))
             )
 
-        capture_bs = [bs for bs in capture_bs if bs <= max_bs]
+        capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
-        if max_bs not in capture_bs:
-            capture_bs.append(max_bs)
+        if self.cuda_graph_max_bs not in capture_bs:
+            capture_bs.append(self.cuda_graph_max_bs)
 
         return capture_bs
 
@@ -1849,11 +1705,10 @@ class ServerArgs:
 
         return capture_bs
 
-    def _generate_prefill_cuda_graph_batch_sizes(self, max_bs: int):
+    def _generate_piecewise_cuda_graph_tokens(self):
         """
-        Generate the list of batch sizes for prefill CUDA graph capture
-        based on max_bs. For tc_piecewise prefill, bs carries the
-        captured token count (one shape knob per phase).
+        Generate the list of batch sizes for piecewise CUDA graph capture
+        based on piecewise_cuda_graph_max_tokens.
         """
         capture_sizes = (
             list(range(4, 33, 4))
@@ -1861,10 +1716,12 @@ class ServerArgs:
             + list(range(288, 513, 32))
             + list(range(576, 1024 + 1, 64))
             + list(range(1280, 4096 + 1, 256))
-            + list(range(4608, max_bs + 1, 512))
+            + list(range(4608, self.piecewise_cuda_graph_max_tokens + 1, 512))
         )
 
-        capture_sizes = [s for s in capture_sizes if s <= max_bs]
+        capture_sizes = [
+            s for s in capture_sizes if s <= self.piecewise_cuda_graph_max_tokens
+        ]
 
         return capture_sizes
 
@@ -2048,7 +1905,7 @@ class ServerArgs:
                         # DSACPLayerCommunicator does not all-reduce attention-TP
                         # partial o_proj outputs before replicated dense FFNs.
                         self.attn_cp_size = self.tp_size // self.dp_size
-                        self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                        self.disable_piecewise_cuda_graph = True
                         logger.warning(
                             f"Enable DSA Context Parallel opt, "
                             f"Setting dp_size == {self.dp_size} and "
@@ -2057,7 +1914,7 @@ class ServerArgs:
                             f"tp_size == {self.tp_size}, "
                             f"kv_cache_dtype == {self.kv_cache_dtype}, "
                             f"moe_a2a_backend {self.moe_a2a_backend}, "
-                            f"cuda_graph_config[prefill].backend=disabled"
+                            f"disable_piecewise_cuda_graph=True"
                         )
                     else:
                         # Pure TP and partial DP Attention mode is active for DSA, logging a warning
@@ -2099,8 +1956,8 @@ class ServerArgs:
                     ), "CP is only supported for prefill when PD disaggregation, please remove --enable-dsa-prefill-context-parallel."
 
             else:
-                # DeepSeek V3/R1/V3.1
-                if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                # DeepSeek V3/R1/V3.1 and Kimi K2.5
+                if not self.disable_piecewise_cuda_graph:
                     logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
                 if is_sm100_supported():
@@ -2133,7 +1990,7 @@ class ServerArgs:
                     # DSACPLayerCommunicator does not all-reduce attention-TP
                     # partial o_proj outputs before replicated dense FFNs.
                     self.attn_cp_size = self.tp_size // self.dp_size
-                    self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                    self.disable_piecewise_cuda_graph = True
                     logger.warning(
                         f"Enable Context Parallel opt for MLA, "
                         f"Setting dp_size == {self.dp_size} and "
@@ -2142,7 +1999,7 @@ class ServerArgs:
                         f"ep_size == {self.ep_size}, "
                         f"tp_size == {self.tp_size}, "
                         f"moe_a2a_backend {self.moe_a2a_backend}, "
-                        f"cuda_graph_config[prefill].backend=disabled"
+                        f"disable_piecewise_cuda_graph=True"
                     )
 
             # Set moe backend for DeepSeek
@@ -2745,13 +2602,6 @@ class ServerArgs:
                 "as the first layer might not be an attention layer"
             )
 
-        elif model_arch in ["ZayaForCausalLM"]:
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
-            )
-
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]
             and is_hip()
@@ -3003,15 +2853,13 @@ class ServerArgs:
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
             )
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self.disable_cuda_graph = True
 
         if self.attention_backend == "flex_attention":
             logger.warning(
                 "Cuda graph is disabled because of using torch Flex Attention backend"
             )
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self.disable_cuda_graph = True
             assert (
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
@@ -3485,23 +3333,6 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
-        if self.quantization == "nvfp4_online":
-            if not is_sm100_supported():
-                raise ValueError(
-                    "--quantization nvfp4_online is supported only on "
-                    "NVIDIA Blackwell SM100/SM103 GPUs."
-                )
-            if self.moe_runner_backend == "auto":
-                self.moe_runner_backend = "flashinfer_trtllm"
-            elif self.moe_runner_backend not in [
-                "flashinfer_trtllm",
-                "flashinfer_trtllm_routed",
-            ]:
-                raise ValueError(
-                    "--quantization nvfp4_online supports only "
-                    "--moe-runner-backend flashinfer_trtllm or "
-                    "flashinfer_trtllm_routed."
-                )
         if self.quantization == "mxfp8":
             if self.moe_runner_backend == "auto":
                 self.moe_runner_backend = "flashinfer_trtllm"
@@ -3564,14 +3395,13 @@ class ServerArgs:
         if self.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert self.quantization in [
                 "modelopt_fp4",
-                "nvfp4_online",
                 "fp8",
                 "mxfp8",
                 "modelopt_fp8",
                 "modelopt_mixed",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -3582,9 +3412,8 @@ class ServerArgs:
                 "fp8",
                 "mxfp8",
                 "modelopt_fp4",
-                "nvfp4_online",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -3607,28 +3436,13 @@ class ServerArgs:
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
-        # TODO(yuwei): Fix piecewise cuda graph support for bypassed topk MoE backends.
-        # Exception: GptOssForCausalLM wraps the entire MoE block in its own
-        # custom op (moe_impl), so bypassed topk is handled inside the op body.
-        if (
-            (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked
-            and self.moe_runner_backend in ("flashinfer_trtllm", "flashinfer_mxfp4")
-            and self.get_model_config().hf_config.architectures[0]
-            != "GptOssForCausalLM"
-        ):
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            logger.info(
-                f"Piecewise cuda graph is disabled for MoE runner backend "
-                f"'{self.moe_runner_backend}' (bypassed topk is incompatible "
-                f"with torch.compile)."
-            )
-
     def cutedsl_moe_max_num_tokens(self) -> int:
         """Largest number of tokens a single forward routes through a CuteDSL
         MoE layer on one (DP) rank. Single source of truth for both the
         standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
         budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
-        capture, and decode/verify bounds; num_tokens_per_bs is
+        capture (piecewise_cuda_graph_max_tokens), and decode/verify
+        (cuda_graph_max_bs * num_tokens_per_bs) bounds; num_tokens_per_bs is
         speculative_num_draft_tokens under speculative decoding, else 1.
         """
         if self.speculative_algorithm:
@@ -3636,11 +3450,11 @@ class ServerArgs:
         else:
             num_tokens_per_bs = 1
         prefill_tokens = self.max_prefill_tokens
-        cg_config = self.cuda_graph_config
-        if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
-            prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
-        decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-        decode_tokens = decode_max_bs * num_tokens_per_bs
+        if not self.disable_piecewise_cuda_graph:
+            prefill_tokens = max(
+                prefill_tokens, self.piecewise_cuda_graph_max_tokens or 0
+            )
+        decode_tokens = (self.cuda_graph_max_bs or 0) * num_tokens_per_bs
         return max(prefill_tokens, decode_tokens)
 
     def _validate_cutedsl_a2a_token_budget(self):
@@ -3708,8 +3522,7 @@ class ServerArgs:
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self.disable_cuda_graph = True
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -4101,14 +3914,14 @@ class ServerArgs:
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 
-        Looks for consolidated*.safetensors with no competing
-        model-*.safetensors; when both weight formats ship in the
+        Looks for ``consolidated*.safetensors`` with no competing
+        ``model-*.safetensors``; when both weight formats ship in the
         same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
         preferred to avoid loading Mistral-named weights into an
         HF-named architecture.
 
-        Name override: mistral-large-3 / mistral-small-4 /
-        leanstral always treat as Mistral-native when params.json
+        Name override: ``mistral-large-3`` / ``mistral-small-4`` /
+        ``leanstral`` always treat as Mistral-native when ``params.json``
         is present -- those families need Mistral weight loading
         regardless of which weight files happen to be present.
         """
@@ -4492,15 +4305,11 @@ class ServerArgs:
             return
         # On AMD/HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
-            if (
-                self.cuda_graph_config.decode.backend != Backend.DISABLED
-                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
-            ):
+            if not self.disable_cuda_graph:
                 logger.warning(
                     "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
                 )
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self.disable_cuda_graph = True
             if self.attention_backend not in ["triton", "aiter"]:
                 logger.warning(
                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
@@ -4512,7 +4321,7 @@ class ServerArgs:
                     "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
                 )
                 self.attention_backend = "ascend"
-        elif self.cuda_graph_config.decode.backend != Backend.DISABLED:
+        elif not self.disable_cuda_graph:
             if self.attention_backend != "flashinfer":
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
@@ -4605,18 +4414,16 @@ class ServerArgs:
             logger.warning(
                 "Cuda graph and server warmup are disabled because of using tensor dump mode"
             )
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
         if self.msprobe_dump_config is not None:
             logger.warning(
                 "When msProbe is enabled, "
-                "cuda graph is disabled because msProbe only supports dump in eager mode, "
+                "cuda graph is disabled(disable_cuda_graph=True) because msProbe only supports dump in eager mode, "
                 "warmup is disabled(skip_server_warmup=True) because there is no need to dump data for this stage."
             )
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
         # Validate limit_mm_per_prompt modalities
@@ -6666,19 +6473,6 @@ class ServerArgs:
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
         )
-        # --- CUDA graph config: canonical JSON entry ---------------------
-        parser.add_argument(
-            "--cuda-graph-config",
-            type=parse_cuda_graph_config_arg,
-            default=ServerArgs.cuda_graph_config,
-            help="Per-phase CUDA graph settings as JSON, e.g. "
-            '\'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}\'. '
-            "Allowed backends per phase: full, breakable, tc_piecewise, disabled "
-            "(full is decode-only). JSON wins over the per-phase --cuda-graph-* "
-            "convenience flags and over legacy flags.",
-        )
-
-        # --- KV canary debug flags (upstream PR #26818-26821) ------------
         parser.add_argument(
             "--kv-canary",
             type=str,
@@ -6709,61 +6503,32 @@ class ServerArgs:
             default=ServerArgs.kv_canary_sweep_interval,
             help="Every N forward steps, run a full-pool sweep.",
         )
-
-        # --- CUDA graph: per-phase convenience flags ---------------------
         parser.add_argument(
-            "--cuda-graph-backend-decode",
-            type=str,
-            choices=Backend.ALL,
-            default=ServerArgs.cuda_graph_backend_decode,
-            help="Backend for the decode phase. Folds into cuda_graph_config[decode].backend.",
-        )
-        parser.add_argument(
-            "--cuda-graph-backend-prefill",
-            type=str,
-            choices=Backend.ALL,
-            default=ServerArgs.cuda_graph_backend_prefill,
-            help="Backend for the prefill phase. Folds into cuda_graph_config[prefill].backend.",
-        )
-        parser.add_argument(
-            "--cuda-graph-max-bs-decode",
+            "--cuda-graph-max-bs",
             type=int,
-            default=ServerArgs.cuda_graph_max_bs_decode,
-            help="Maximum batch size captured for the decode cuda graph.",
+            default=ServerArgs.cuda_graph_max_bs,
+            help="Set the maximum batch size for cuda graph. It will extend the cuda graph capture batch size to this value.",
         )
         parser.add_argument(
-            "--cuda-graph-max-bs-prefill",
-            type=int,
-            default=ServerArgs.cuda_graph_max_bs_prefill,
-            help="Maximum batch size captured for the prefill cuda graph.",
-        )
-        parser.add_argument(
-            "--cuda-graph-bs-decode",
+            "--cuda-graph-bs",
             type=int,
             nargs="+",
-            default=ServerArgs.cuda_graph_bs_decode,
-            help="Explicit list of batch sizes to capture for the decode cuda graph.",
+            help="Set the list of batch sizes for cuda graph.",
         )
         parser.add_argument(
-            "--cuda-graph-bs-prefill",
-            type=int,
-            nargs="+",
-            default=ServerArgs.cuda_graph_bs_prefill,
-            help="Explicit list of batch sizes to capture for the prefill cuda graph.",
+            "--disable-cuda-graph",
+            action="store_true",
+            help="Disable cuda graph.",
         )
-        parser.add_argument(
-            "--cuda-graph-tc-compiler",
-            type=str,
-            choices=["eager", "inductor"],
-            default=ServerArgs.cuda_graph_tc_compiler,
-            help="Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",
-        )
-
-        # --- CUDA graph: debug / profiling flags -------------------------
         parser.add_argument(
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--enable-breakable-cuda-graph",
+            action="store_true",
+            help="Use breakable CUDA graph for piecewise capture instead of torch.compile-based splitting.",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",
@@ -6782,111 +6547,6 @@ class ServerArgs:
             "When enabled, graph breaks are inserted so every operation runs eagerly "
             "while still going through the CUDA graph capture / replay path. "
             "Useful for debugging CUDA graph capture / replay issues.",
-        )
-
-        # --- CUDA graph related deprecated args. Remove them later. -----
-        parser.add_argument(
-            "--cuda-graph-max-bs",
-            type=int,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-max-bs-decode",
-            dest="cuda_graph_max_bs_decode",
-            help="Deprecated alias for --cuda-graph-max-bs-decode.",
-        )
-        parser.add_argument(
-            "--cuda-graph-bs",
-            type=int,
-            nargs="+",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-bs-decode",
-            dest="cuda_graph_bs_decode",
-            help="Deprecated alias for --cuda-graph-bs-decode.",
-        )
-        parser.add_argument(
-            "--disable-cuda-graph",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--cuda-graph-backend-{decode,prefill}=disabled",
-            help="Deprecated. Use --cuda-graph-backend-{decode,prefill}=disabled instead.",
-        )
-        parser.add_argument(
-            "--enable-breakable-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.BREAKABLE,
-            new_flag="--cuda-graph-backend-prefill=breakable",
-            help="Deprecated alias for --cuda-graph-backend-prefill=breakable.",
-        )
-        parser.add_argument(
-            "--prefill-cuda-graph-backend",
-            type=str,
-            choices=Backend.ALL,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-backend-prefill",
-            help="Deprecated alias for --cuda-graph-backend-prefill.",
-        )
-        parser.add_argument(
-            "--decode-cuda-graph-backend",
-            type=str,
-            choices=Backend.ALL,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-backend-decode",
-            help="Deprecated alias for --cuda-graph-backend-decode.",
-        )
-        parser.add_argument(
-            "--disable-prefill-cuda-graph",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--cuda-graph-backend-prefill=disabled",
-            help="Deprecated. Use --cuda-graph-backend-prefill=disabled instead.",
-        )
-        parser.add_argument(
-            "--disable-decode-cuda-graph",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--cuda-graph-backend-decode=disabled",
-            help="Deprecated. Use --cuda-graph-backend-decode=disabled instead.",
-        )
-        parser.add_argument(
-            "--disable-piecewise-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.DISABLED,
-            new_flag="--cuda-graph-backend-prefill=disabled",
-            help="Deprecated alias for --cuda-graph-backend-prefill=disabled.",
-        )
-        parser.add_argument(
-            "--enforce-piecewise-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.TC_PIECEWISE,
-            new_flag="--cuda-graph-backend-prefill=tc_piecewise",
-            help="Deprecated alias for --cuda-graph-backend-prefill=tc_piecewise. "
-            "Explicitly setting the prefill backend now skips the auto-disable "
-            "cascade automatically.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-tokens",
-            type=int,
-            nargs="+",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-bs-prefill",
-            dest="cuda_graph_bs_prefill",
-            help="Deprecated alias for --cuda-graph-bs-prefill.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-compiler",
-            type=str,
-            choices=["eager", "inductor"],
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-tc-compiler",
-            dest="cuda_graph_tc_compiler",
-            help="Deprecated alias for --cuda-graph-tc-compiler.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-max-tokens",
-            type=int,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-max-bs-prefill",
-            dest="cuda_graph_max_bs_prefill",
-            help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
             "--enable-layerwise-nvtx-marker",
@@ -6997,10 +6657,44 @@ class ServerArgs:
             help="Enable debug mode for torch compile",
         )
         parser.add_argument(
+            "--disable-piecewise-cuda-graph",
+            action="store_true",
+            help="Disable piecewise cuda graph for extend/prefill.",
+        )
+        parser.add_argument(
+            "--enable-piecewise-cuda-graph",
+            action=DeprecatedAction,
+            help="Deprecated: Piecewise cuda graph is enabled by default. Use --enforce-piecewise-cuda-graph to skip auto-disable conditions.",
+        )
+        parser.add_argument(
+            "--enforce-piecewise-cuda-graph",
+            action="store_true",
+            help="Enforce piecewise cuda graph, skipping all auto-disable conditions. Used for testing.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-tokens",
+            type=int,
+            nargs="+",
+            help="Set the list of token lengths for piecewise cuda graph capture.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-compiler",
+            type=str,
+            default=ServerArgs.piecewise_cuda_graph_compiler,
+            help="Set the compiler for piecewise cuda graph. Choices are: eager, inductor.",
+            choices=["eager", "inductor"],
+        )
+        parser.add_argument(
             "--torch-compile-max-bs",
             type=int,
             default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-max-tokens",
+            type=int,
+            default=ServerArgs.piecewise_cuda_graph_max_tokens,
+            help="Set the maximum tokens when using piecewise cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -7606,7 +7300,7 @@ class ServerArgs:
         return self.url(port=self.engine_info_bootstrap_port)
 
     def ssl_verify(self):
-        """Return the value for the requests library's verify= parameter.
+        """Return the value for the requests library's ``verify=`` parameter.
 
         When SSL is configured:
           - If a CA certificate file is provided, return its path so requests
@@ -7856,6 +7550,11 @@ class ServerArgs:
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+            )
+
+        if self.enable_two_batch_overlap and self.enforce_shared_experts_fusion:
+            raise ValueError(
+                "--enable-two-batch-overlap and --enforce-shared-experts-fusion cannot be used together."
             )
 
         # Check communications compression
@@ -8175,8 +7874,8 @@ class ServerArgs:
         `/server_info` so KV-aware routers (e.g. the SGLang model
         gateway) can subscribe per-worker without operator-supplied port
         coordination. The router constructs the per-DP-rank SUB endpoint
-        as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
-        every rank reported in dp_size.
+        as ``tcp://<worker_host>:<endpoint_port_base + dp_rank>`` for
+        every rank reported in ``dp_size``.
 
         Returned descriptor shape:
 
@@ -8198,23 +7897,23 @@ class ServerArgs:
                                                   # to open
             }
 
-        Returns None (i.e. "no publisher to describe") when any of:
+        Returns ``None`` (i.e. "no publisher to describe") when any of:
 
-        * --kv-events-config is unset / empty / malformed JSON,
-        * the configured publisher is "null",
-        * page_size is missing or non-positive (a placeholder
-          block_size would cause silent KV-cache misses by hashing
+        * ``--kv-events-config`` is unset / empty / malformed JSON,
+        * the configured publisher is ``"null"``,
+        * ``page_size`` is missing or non-positive (a placeholder
+          ``block_size`` would cause silent KV-cache misses by hashing
           prompts at the wrong granularity on the router side),
-        * the endpoint is not a routable TCP address (inproc:// /
-          ipc://, missing port, non-integer port, or port outside
-          1..65535).
+        * the endpoint is not a routable TCP address (``inproc://`` /
+          ``ipc://``, missing port, non-integer port, or port outside
+          ``1..65535``).
 
-        Reuses KVEventsConfig.from_cli for JSON parsing; the inline
-        rfind(":") endpoint split mirrors
-        ZmqEventPublisher.offset_endpoint_port rather than adding a
+        Reuses ``KVEventsConfig.from_cli`` for JSON parsing; the inline
+        ``rfind(":")`` endpoint split mirrors
+        ``ZmqEventPublisher.offset_endpoint_port`` rather than adding a
         new module-level helper.
         """
-        # Lazy import so loading server_args doesn't pull in
+        # Lazy import so loading ``server_args`` doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
         from sglang.srt.disaggregation.kv_events import KVEventsConfig
 
@@ -8226,7 +7925,7 @@ class ServerArgs:
             cfg = KVEventsConfig.from_cli(raw)
         except Exception:
             # Malformed JSON / schema mismatch. The publisher would
-            # have failed at server startup; /server_info must
+            # have failed at server startup; ``/server_info`` must
             # keep working, so just report "no publisher" to consumers.
             return None
         if cfg.publisher == "null" or not cfg.endpoint:
@@ -8448,3 +8147,41 @@ class PortArgs:
                 ).to_tcp(),
                 instance_id=instance_id,
             )
+
+
+def auto_choose_speculative_params(self: ServerArgs):
+    """
+    Automatically choose the parameters for speculative decoding.
+
+    You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
+    """
+    hf_config = self.get_model_config().hf_config
+    arch = hf_config.architectures[0]
+    if self.speculative_algorithm == "STANDALONE":
+        # The default value for standalone speculative decoding
+        return (3, 1, 4)
+    if arch in ["LlamaForCausalLM"]:
+        # The default value for llama
+        return (5, 4, 8)
+    elif arch in [
+        "DeepseekV32ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV2ForCausalLM",
+        "GptOssForCausalLM",
+        "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
+        "BailingMoeV2_5ForCausalLM",
+        "MistralLarge3ForCausalLM",
+        "PixtralForConditionalGeneration",
+        "MiMoV2ForCausalLM",
+        "MiMoV2FlashForCausalLM",
+    ]:
+        return (3, 1, 4)
+    elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
+        return (5, 4, 8)
+    else:
+        # The default value for all other models
+        return (3, 1, 4)

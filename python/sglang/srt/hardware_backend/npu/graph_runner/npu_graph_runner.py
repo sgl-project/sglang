@@ -11,23 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Run the model with NPU graph and torch.compile.
-
-NPUGraphRunner is a thin subclass of DecodeCudaGraphRunner: the
-factory returns NPUCudaGraphBackend for NPU devices, so all
-capture/replay mechanics live in the backend. This class adds:
-  - NPU-specific patch_model monkey-patch for the decode-Full +
-    torch.compile path.
-  - Profile context override (NPU profiler emits to disk, not in-mem).
-  - Replay override that issues an async NPUGraph.update for
-    seq_lens before replay (skipped for deepseek-nsa).
-  - Smaller cache_loc dtype (int32 instead of int64).
-"""
+"""Run the model with npu graph and torch.compile."""
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional, Union
@@ -35,10 +25,11 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import numpy as np
 import torch
 
+import sglang
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -80,8 +71,8 @@ def patch_model_npu(
         yield model.forward
 
 
-class NPUGraphRunner(DecodeCudaGraphRunner):
-    """A NPUGraphRunner runs the forward pass of a model with NPU graph and torch.compile."""
+class NPUGraphRunner(CudaGraphRunner):
+    """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(
         self,
@@ -91,11 +82,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
-        # NPU patch_model override: monkey-patch torch_compile_decoration's
-        # patch_model with the NPU-specific version.
-        from sglang.srt.compilation import torch_compile_decoration
-
-        torch_compile_decoration.patch_model = patch_model_npu
+        sglang.srt.model_executor.cuda_graph_runner.patch_model = patch_model_npu
         super().__init__(
             model_runner,
             attn_backend=attn_backend,
@@ -228,8 +215,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
-        graph_key = self._make_graph_key(self.bs)
-
+        self.update_attr_name = self._get_update_attr_name()
+        self.update_attr_type = self._get_update_attr_type()
+        # Replay
         if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():
                 seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
@@ -238,15 +226,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
-            output = self.backend.replay_with_input_update(
-                graph_key,
-                seq_lens=seq_lens,
-                attr_name=self.attr_name[AttentionArch.MLA],
-                attr_type=self.attr_type[AttentionArch.MLA],
-            )
+            thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
+            thread.start()
+            self.graphs[self.bs].replay()
+            thread.join()
         else:
-            output = self.backend.replay(graph_key, forward_batch)
+            self.graphs[self.bs].replay()
 
+        output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None

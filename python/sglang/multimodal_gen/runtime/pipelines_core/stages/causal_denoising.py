@@ -29,10 +29,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.realtime.states import (
-    RealtimeCausalDiTState,
-    get_realtime_causal_dit_state,
-)
+from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -317,7 +314,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         batch: Req,
     ) -> tuple[RealtimeCausalDiTState, bool]:
         if batch.session is not None:
-            state = get_realtime_causal_dit_state(batch.session)
+            state = batch.session.get_or_create_state(RealtimeCausalDiTState)
             return state, True
         return RealtimeCausalDiTState(), False
 

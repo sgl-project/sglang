@@ -77,7 +77,6 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -945,10 +944,7 @@ def latency_test(
 
 
 def main(server_args, bench_args):
-    # Post-init write to the legacy cuda_graph_max_bs_decode field would
-    # not propagate to cuda_graph_config; update the decode phase directly.
-    if server_args.cuda_graph_config is not None:
-        server_args.cuda_graph_config[Phase.DECODE].max_bs = max(bench_args.batch_size)
+    server_args.cuda_graph_max_bs = max(bench_args.batch_size)
 
     _set_envs_and_config(server_args)
 

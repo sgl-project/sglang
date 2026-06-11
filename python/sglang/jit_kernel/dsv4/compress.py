@@ -21,11 +21,8 @@ def _jit_compress_norm_rope_module(
     head_dim: int,
     rope_dim: int,
     page_size: int,
-    bf16_store: bool = False,
 ) -> Module:
-    args = make_cpp_args(
-        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
-    )
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
         cuda_wrappers.append(
@@ -42,14 +39,11 @@ def _jit_compress_norm_rope_module(
 @cache_once
 def _jit_compress_module(
     head_dim: int,
-    dtype_buf: torch.dtype,
     dtype_in: torch.dtype,
     dtype_out: torch.dtype,
     ratio: Literal[4, 128],
 ) -> Module:
-    args = make_cpp_args(
-        head_dim, dtype_buf, dtype_in, dtype_out, is_arch_support_pdl()
-    )
+    args = make_cpp_args(head_dim, dtype_in, dtype_out, is_arch_support_pdl())
     kernel_class = f"FlashCompress{ratio}Kernel<{args}>"
     return load_jit(
         make_name(f"compress_{ratio}_v2"),
@@ -336,17 +330,8 @@ def compress_forward(
         assert compress_ratio == 128 and head_dim == 512
         module = _jit_compress_128_online_module(512)
     else:
-        # kv_score_buffer (fp32 runtime state pool) may differ from input/ape, so
-        # the kernel keeps a BufFloat template and casts the buffer to fp32 at
-        # load. ape/weight are cast to bf16 at load (apply_ape_hotfix), matching
-        # kv_score_input's dtype, so they need no extra template params.
-        module = _jit_compress_module(
-            head_dim,
-            kv_score_buffer.dtype,
-            kv_score_input.dtype,
-            out.dtype,
-            compress_ratio,
-        )
+        dtype_in, dtype_out = kv_score_input.dtype, out.dtype
+        module = _jit_compress_module(head_dim, dtype_in, dtype_out, compress_ratio)
     fn = module.decode if plan.is_decode else module.prefill
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
@@ -363,13 +348,12 @@ def compress_norm_rope_store(
     kvcache: torch.Tensor,
     page_size: int,
     use_fp4: bool = False,
-    bf16_store: bool = False,
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
-        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
+        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
     )
     fn = module.forward_fp4 if use_fp4 else module.forward
     fn(

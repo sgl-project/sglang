@@ -976,8 +976,7 @@
                   {
                     "group": "Google",
                     "pages": [
-                      "cookbook/autoregressive/Google/Gemma4",
-                      "cookbook/autoregressive/Google/DiffusionGemma"
+                      "cookbook/autoregressive/Google/Gemma4"
                     ]
                   },
                   {
@@ -1205,6 +1204,7 @@
               "docs/sglang-diffusion/installation",
               "docs/sglang-diffusion/compatibility_matrix",
               "docs/sglang-diffusion/disaggregation",
+              "docs/sglang-diffusion/quantization",
               {
                 "group": "Usage",
                 "pages": [
@@ -1218,34 +1218,31 @@
                 "pages": [
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/deployment_cookbook",
-                  "docs/sglang-diffusion/attention_backends",
                   "docs/sglang-diffusion/ring_sp_performance",
-                  "docs/sglang-diffusion/dynamic_batching",
+                  "docs/sglang-diffusion/attention_backends",
                   {
-                    "group": "Caching Acceleration",
-                    "root": "docs/sglang-diffusion/caching-acceleration",
-                    "tag": "approx",
+                    "group": "Inference Batching",
                     "pages": [
-                      "docs/sglang-diffusion/cache_dit",
-                      "docs/sglang-diffusion/teacache"
+                      "docs/sglang-diffusion/dynamic_batching"
                     ]
                   },
-                  "docs/sglang-diffusion/progressive_resolution",
-                  "docs/sglang-diffusion/quantization",
-                  "docs/sglang-diffusion/profiling"
+                  "docs/sglang-diffusion/profiling",
+                  "docs/sglang-diffusion/ci_perf"
+                ]
+              },
+              {
+                "group": "Caching Strategies",
+                "pages": [
+                  "docs/sglang-diffusion/caching-acceleration",
+                  "docs/sglang-diffusion/cache_dit",
+                  "docs/sglang-diffusion/teacache"
                 ]
               },
               {
                 "group": "References",
                 "pages": [
-                  "docs/sglang-diffusion/environment_variables"
-                ]
-              },
-              {
-                "group": "Development",
-                "pages": [
+                  "docs/sglang-diffusion/environment_variables",
                   "docs/sglang-diffusion/support_new_models",
-                  "docs/sglang-diffusion/ci_perf",
                   "docs/sglang-diffusion/contributing"
                 ]
               }

@@ -16,7 +16,6 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.server_args import get_global_server_args
 
@@ -416,12 +415,10 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     return output_tensor
 
 
-def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=None):
+def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
     """
     Allgather KV cache from all CP ranks and write the full result
     into each rank's local memory pool.
-
-    swa_loc is the pre-translated full->SWA write target for hybrid SWA pools.
     """
     cache_loc = (
         forward_batch.out_cache_loc
@@ -441,7 +438,7 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=
 
     get_token_to_kv_pool().set_kv_buffer(
         layer,
-        KVWriteLoc(cache_loc, swa_loc),
+        cache_loc,
         key_cache_full,
         value_cache_full,
         layer.k_scale,

@@ -169,11 +169,7 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     spec_tokens = server_args.max_speculative_num_draft_tokens
     page_size = server_args.page_size
 
-    # NGRAM drafts are a flat candidate list written to contiguous slots after
-    # seq_lens (no per-topk page duplication), so the flat formula applies at
-    # any page_size.
-    is_ngram = (server_args.speculative_algorithm or "").upper() == "NGRAM"
-    if page_size == 1 or spec_topk == 1 or is_ngram:
+    if page_size == 1 or spec_topk == 1:
         return max(spec_steps * spec_topk, spec_tokens)
     else:
         # page_size > 1 + topk > 1 (spec v2 tree): worst-case page-aligned tree

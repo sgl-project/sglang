@@ -230,7 +230,7 @@ def _spawn_server_process(
         kv_canary="raise",
         kv_canary_real_data="partial",
         kv_canary_sweep_interval=100,
-        disable_prefill_cuda_graph=True,
+        disable_piecewise_cuda_graph=True,
     )
     launch_kwargs.update(engine_kwargs)
     http_port = launch_kwargs["port"]

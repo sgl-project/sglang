@@ -11,7 +11,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
-from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
@@ -252,9 +251,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     )
 
     server_args = get_global_server_args()
-    # CuteDSL wrapper preallocates CG buffers used by any captured graph
-    # that routes through this MoE — decode and prefill alike.
-    use_cuda_graph = not cuda_graph_fully_disabled()
+    use_cuda_graph = not server_args.disable_cuda_graph
 
     # Size the wrapper's CUDA-graph buffers for the largest number of tokens a
     # single forward can route through this layer.
@@ -304,17 +301,17 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
 
     Shared by the two CuteDSL runner entries:
 
-    * "v2" standard path (a2a=none/flashinfer): consumed by the
-      @register_fused_func("none", "flashinfer_cutedsl") entry, which
-      drives CuteDslMoEWrapper.run. Weights are [Up, Gate]
-      interleaved with MMA-layout blockscales. wrapper is set;
-      w*_scale are scalarized.
+    * "v2" standard path (a2a=``none``/``flashinfer``): consumed by the
+      ``@register_fused_func("none", "flashinfer_cutedsl")`` entry, which
+      drives ``CuteDslMoEWrapper.run``. Weights are ``[Up, Gate]``
+      interleaved with MMA-layout blockscales. ``wrapper`` is set;
+      ``w*_scale`` are scalarized.
 
-    * "v1" DeepEP low-latency path (a2a=deepep): consumed by the
-      @register_fused_func("deepep", "flashinfer_cutedsl") entry,
-      which drives flashinfer_cutedsl_moe_masked. Weights are
-      [Gate, Up] non-interleaved with swizzled blockscales.
-      wrapper is None; w*_scale are per-expert.
+    * "v1" DeepEP low-latency path (a2a=``deepep``): consumed by the
+      ``@register_fused_func("deepep", "flashinfer_cutedsl")`` entry,
+      which drives ``flashinfer_cutedsl_moe_masked``. Weights are
+      ``[Gate, Up]`` non-interleaved with swizzled blockscales.
+      ``wrapper`` is ``None``; ``w*_scale`` are per-expert.
     """
 
     # FP4 packed weights (uint8)
@@ -335,10 +332,10 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     a1_scale: torch.Tensor
     a2_scale: torch.Tensor
 
-    # v2 only: lazily-created CuteDslMoEWrapper (None on the v1 path).
+    # v2 only: lazily-created CuteDslMoEWrapper (``None`` on the v1 path).
     wrapper: Optional[Any] = None
 
-    # v1 only: True when DeepEP pre-quantizes activations to NVFP4.
+    # v1 only: ``True`` when DeepEP pre-quantizes activations to NVFP4.
     use_nvfp4_dispatch: bool = False
 
     # v1 only: SBO down-GEMM overlap args.

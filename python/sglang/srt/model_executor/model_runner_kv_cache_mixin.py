@@ -408,7 +408,6 @@ class ModelRunnerKVCacheMixin:
                 c128_state_pool_size=self.c128_state_pool_size,
                 page_size=self.page_size,
                 swa_page_size=swa_page_size,
-                sliding_window=self.model_config.window_size,
                 dtype=self.kv_cache_dtype,
                 state_dtype=self.state_dtype,
                 qk_nope_head_dim=self.model_config.qk_nope_head_dim,

@@ -95,7 +95,6 @@ def _fused_qk_norm_rope_store_kernel(
     FP8_MAX: tl.constexpr,
     BYTES_PER_TOKEN: tl.constexpr,
     SWA_PAGE_SIZE: tl.constexpr,
-    BF16_STORE: tl.constexpr,
 ):
     pid_m = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1).to(tl.int64)
@@ -207,24 +206,7 @@ def _fused_qk_norm_rope_store_kernel(
     VALUE_STRIDE: tl.constexpr = DIM_NOPE + ROPE_DIM * 2
     SCALE_BYTES: tl.constexpr = NUM_NOPE_TILES + 1
 
-    if HAS_SWA_STORE and BF16_STORE:
-        # unified_kv unified_kv: write the whole head_dim as plain bf16 into a
-        # [num_slots, head_dim] bf16 cache at row=loc (no fp8 / no scale).
-        loc = tl.load(swa_loc_ptr + src_id, mask=src_mask, other=0)
-        row_base = loc.to(tl.int64)[:, None] * swa_cache_stride_page
-        # nope
-        tl.store(
-            swa_cache_ptr + row_base + offs_d_full[None, :],
-            kv_normed.to(swa_cache_ptr.dtype.element_ty),
-            mask=src_mask[:, None] & nope_d_mask[None, :],
-        )
-        # pe
-        tl.store(
-            swa_cache_ptr + row_base + (NOPE_DIM + d_pe_offs[None, :]),
-            kv_pe.to(swa_cache_ptr.dtype.element_ty),
-            mask=src_mask[:, None],
-        )
-    elif HAS_SWA_STORE:
+    if HAS_SWA_STORE:
         loc = tl.load(swa_loc_ptr + src_id, mask=src_mask, other=0)
         page_id = loc // SWA_PAGE_SIZE
         page_off = loc % SWA_PAGE_SIZE
@@ -306,17 +288,15 @@ def fused_qk_norm_rope_swa_store(
     swa_page_size: int = 128,
     q_out: Optional[torch.Tensor] = None,
     dtype: torch.dtype = torch.bfloat16,
-    bf16_store: bool = False,
 ) -> torch.Tensor:
-    """Fused Q norm + KV norm + RoPE + optional SWA store.
+    """Fused Q norm + KV norm + RoPE + optional FP8 paged SWA store.
 
     Args:
         q: [M, N] or [splitk, M, N] where N = num_local_heads * head_dim
         kv: [M, head_dim=512] mutated in-place (norm + RoPE)
-        swa_cache: paged SWA KV pool buffer [num_pages, bytes_per_page] uint8 OR a plain [num_slots, head_dim] bf16 cache
+        swa_cache: paged SWA KV pool buffer [num_pages, bytes_per_page] uint8
         swa_loc: [M] int32 pre-translated paged indices
         swa_page_size: tokens per SWA page (default 128)
-        bf16_store: write the whole head_dim as plain bf16 at swa_cache[swa_loc]
     """
     head_dim = kv.shape[1]
 
@@ -395,7 +375,6 @@ def fused_qk_norm_rope_swa_store(
         FP8_MAX=fp8_info.max,
         BYTES_PER_TOKEN=bytes_per_token,
         SWA_PAGE_SIZE=swa_page_size,
-        BF16_STORE=bf16_store,
         num_warps=num_warps,
     )
     return q_out

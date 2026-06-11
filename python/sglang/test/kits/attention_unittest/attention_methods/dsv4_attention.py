@@ -27,11 +27,6 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    CudaGraphConfig,
-    PhaseConfig,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import set_global_server_args_for_scheduler
@@ -334,18 +329,8 @@ class MockDSV4ModelRunner:
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            cuda_graph_config=CudaGraphConfig(
-                decode=PhaseConfig(
-                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
-                ),
-                prefill=PhaseConfig(
-                    backend=(
-                        Backend.DISABLED
-                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
-                        else Backend.TC_PIECEWISE
-                    ),
-                ),
-            ),
+            disable_cuda_graph=disable_cuda_graph,
+            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
             disable_radix_cache=False,
             disaggregation_mode=None,
             dp_size=1,

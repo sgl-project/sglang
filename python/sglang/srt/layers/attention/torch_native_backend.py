@@ -7,8 +7,6 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -25,12 +23,6 @@ class TorchNativeAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.use_sliding_window_kv_pool = (
-            isinstance(self.token_to_kv_pool, SWAKVPool)
-            and self.token_to_kv_pool.swa_layer_nums > 0
-        )
-        # full->SWA translated out_cache_loc, computed once per forward
-        self.swa_out_cache_loc = None
 
     @staticmethod
     def _make_sliding_window_mask(
@@ -49,14 +41,7 @@ class TorchNativeAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            self.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
-            )
-        else:
-            self.swa_out_cache_loc = None
+        pass
 
     def _run_sdpa_forward_extend(
         self,
@@ -296,9 +281,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache and k is not None and v is not None:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
-            )
+            self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -364,9 +347,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
 
         if save_kv_cache and k is not None and v is not None:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, KVWriteLoc(cache_loc, self.swa_out_cache_loc), k, v
-            )
+            self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 

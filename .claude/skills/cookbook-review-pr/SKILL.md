@@ -96,12 +96,8 @@ than restating.
   Launch port must match client/curl port on the same page.
 
 ### 7. Frontmatter
-- Every new MDX page has `title:` and a **top-level** `description:` (a real one-line value
-  prop, not copied from another vendor) — NOT `metatags.description` (non-canonical; the
-  top-level field is what renders as the subtitle and SEO meta — see mintlify-authoring).
-- **No `mode: wide` on a model page** — it hides the right-hand "On this page" ToC that every
-  other model page has. Leave `mode` unset (the Deploy/Playground panels self-cap at 900px, so
-  the default column holds them fine). `mode: wide` belongs only on category `intro.mdx` grids.
+- Every new MDX page has `title:` and `metatags.description:` (a real one-line value prop,
+  not copied from another vendor).
 - `tag: NEW` only for genuine new launches; when one is added, stale `tag: NEW` on older
   pages should be dropped in the same PR (`grep -RlE "^tag: NEW" docs_new/cookbook/`).
 - MDX imports BOTH `Deployment` and `Playground` from `/src/snippets/...` (absolute).

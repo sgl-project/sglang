@@ -13,9 +13,9 @@ import torch.fx as fx
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
-from sglang.srt.compilation.compile_phase import (
+from sglang.srt.compilation.piecewise_context_manager import (
     get_pcg_capture_stream,
-    is_in_torch_compile_warmup,
+    is_in_pcg_torch_compile,
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 from sglang.srt.utils import is_hip
@@ -145,7 +145,7 @@ class CUDAPiecewiseBackend:
             if self.is_last_graph and not self.to_be_compiled_sizes:
                 self.check_for_ending_compilation()
 
-        if is_in_torch_compile_warmup():
+        if is_in_pcg_torch_compile():
             return entry.runnable(*args)
 
         if entry.cudagraph is None:

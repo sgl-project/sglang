@@ -7,7 +7,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
-    unwrap_write_loc,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
@@ -171,14 +170,13 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
-        loc_info,
+        loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
@@ -436,11 +434,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
-        loc_info,
+        loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)

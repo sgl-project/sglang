@@ -9,7 +9,7 @@ Per-tick pipeline:
     SanaWMRealtimeLatentPrepStage         -> batch.latents = this tick's pre-noised
                                              chunk(s); batch.extra["sana_wm_chunk_plan"]
     SanaWMCameraCondStage                 -> batch.extra camera_conditions/chunk_plucker
-    SanaWMStreamingDenoisingStage         (session path; RealtimeCausalDiTState)
+    SanaWMStreamingDenoisingStage         (session path; SanaWMStreamCacheState)
     SanaWMChunkedRefinerChainStage        -> batch.latents = refined buffer
     SanaWMCausalDecodeChainStage          -> OutputBatch (decodes past its frontier)
 
@@ -30,11 +30,10 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     compute_chunk_plucker,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
-from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
-from sglang.multimodal_gen.runtime.realtime.states import (
+from sglang.multimodal_gen.runtime.realtime.causal_state import (
     RealtimeCausalDecodeState,
-    get_realtime_causal_dit_state,
 )
+from sglang.multimodal_gen.runtime.realtime.session import BaseRealtimeState
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -54,7 +53,7 @@ from .realtime_stage import (
     SanaWMRealtimeStage,
     _motion_param,
 )
-from .streaming import SanaWMStreamingDenoisingStage
+from .streaming import SanaWMStreamCacheState, SanaWMStreamingDenoisingStage
 from .streaming_refiner import RefinerChunkRunner
 
 
@@ -220,7 +219,7 @@ class SanaWMRealtimeLatentPrepStage(SanaWMRealtimeStage):
         session = self.require_session(batch, context="SANA-WM realtime chain")
         inputs = session.get_or_create_state(SanaWMSessionInputsState)
         noise = session.get_or_create_state(SanaWMNoiseState)
-        cache = get_realtime_causal_dit_state(session)
+        cache = session.get_or_create_state(SanaWMStreamCacheState)
         first_latent = batch.image_latent
         if first_latent is None:
             raise ValueError("cond-frame latent missing (run the encode stage first)")
@@ -337,7 +336,7 @@ class SanaWMCameraCondStage(SanaWMRealtimeStage):
         )
         session = self.require_session(batch, context="SANA-WM realtime chain")
         inputs = session.get_or_create_state(SanaWMSessionInputsState)
-        cache = get_realtime_causal_dit_state(session)
+        cache = session.get_or_create_state(SanaWMStreamCacheState)
         plan = list(batch.extra.get("sana_wm_chunk_plan") or [])
         target_latent = cache.chunk_indices[-1] + sum(plan)
         if cache.chunk_idx == 0 and plan:

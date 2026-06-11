@@ -396,7 +396,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         scheduler.server_args = SimpleNamespace(
             enable_two_batch_overlap=False,
-            cuda_graph_config=None,
+            disable_piecewise_cuda_graph=True,
         )
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.req_to_token_pool = ReqToTokenPool(

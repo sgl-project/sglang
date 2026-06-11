@@ -1,126 +1,73 @@
 ---
 title: "Performance Optimization"
-description: "Choose performance levers for SGLang Diffusion by latency, throughput, memory, and quality tradeoffs."
+description: "Optimize SGLang diffusion performance with caching, kernels, and profiling."
 ---
+This section covers the main performance levers for SGLang Diffusion: attention backends, caching acceleration, and profiling.
 
-Use this page as the starting point for SGLang Diffusion performance work. It separates performance levers into two decision classes:
+## Overview
 
-- **Output-preserving / lossless-style:** system settings that should preserve model behavior while changing residency, parallelism, kernels, or scheduling.
-- **Quality-tradeoff / lossy or approximate:** techniques that can change the denoising path, numerical representation, or generated output.
-
-The docs use "output-preserving" instead of promising bit-exact "lossless" because different kernels, GPU types, or precision paths can still introduce small numerical differences. The decision boundary is whether the optimization intentionally trades quality or output equivalence for speed.
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "22%"}} />
+    <col style={{width: "18%"}} />
+    <col style={{width: "60%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Optimization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Cache-DiT</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Caching</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Block-level caching with DBCache, TaylorSeer, and SCM</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TeaCache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Caching</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Timestep-level caching based on temporal similarity</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Attention Backends</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kernel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Optimized attention implementations (FlashAttention, SageAttention, etc.)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Inference Batching</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Scheduler</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Request batching for native diffusion serving</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Profiling</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Diagnostics</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>PyTorch Profiler and Nsight Systems guidance</td>
+    </tr>
+  </tbody>
+</table>
 
 ## Start Here
 
-1. Pick a serving or generation mode from [Deployment and Performance Modes](./deployment_cookbook). `--performance-mode auto` is the default; use `speed` when the model fits in GPU memory and latency matters most, `memory` when GPU memory is the bottleneck, and `manual` when every performance flag should be explicit.
-2. Choose the right attention backend from [Attention Backends](./attention_backends).
-3. Use [Sequence Parallelism](./ring_sp_performance) only when the model and video shape benefit from sequence splitting.
-4. Use [Inference Batching](./dynamic_batching) for concurrent compatible requests during serving.
-5. Use [Profiling](./profiling) before changing several levers at once.
+- Use [Attention Backends](./attention_backends) to choose the best backend for your model and hardware.
+- Use [Inference Batching](./dynamic_batching) to improve throughput for compatible concurrent requests.
+- Use [Caching Acceleration](./caching-acceleration) to reduce denoising cost with Cache-DiT or TeaCache.
+- Use [Profiling](./profiling) when you need to diagnose a bottleneck rather than guess.
 
-## Output-Preserving / Lossless-Style Levers
+## Caching at a Glance
 
-These settings should preserve model behavior while changing residency, parallelism, kernels, or scheduling. They are the first choices for production tuning.
+- [Cache-DiT](./cache_dit) is block-level caching for diffusers pipelines and higher speedup-oriented tuning.
+- [TeaCache](./teacache) is timestep-level caching built into SGLang model families.
 
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "24%"}} />
-    <col style={{width: "30%"}} />
-    <col style={{width: "46%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Lever</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Use when</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Docs</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500}}><code>--performance-mode</code></td>
-      <td style={{padding: "9px 12px"}}>You want a safe preset for speed or memory without overriding explicit flags.</td>
-      <td style={{padding: "9px 12px"}}><a href="./deployment_cookbook">Deployment and Performance Modes</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500}}>Offload, FSDP, CFG parallelism</td>
-      <td style={{padding: "9px 12px"}}>GPU memory, multi-GPU residency, or CFG branch splitting is the main bottleneck.</td>
-      <td style={{padding: "9px 12px"}}><a href="./deployment_cookbook">Deployment and Performance Modes</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500}}>Sequence parallelism</td>
-      <td style={{padding: "9px 12px"}}>Long image/video sequences need sequence-level parallelism.</td>
-      <td style={{padding: "9px 12px"}}><a href="./ring_sp_performance">Sequence Parallelism</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500}}>Attention backend</td>
-      <td style={{padding: "9px 12px"}}>Kernel choice dominates DiT latency or memory.</td>
-      <td style={{padding: "9px 12px"}}><a href="./attention_backends">Attention Backends</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500}}>Dynamic batching</td>
-      <td style={{padding: "9px 12px"}}>Serving many compatible requests concurrently.</td>
-      <td style={{padding: "9px 12px"}}><a href="./dynamic_batching">Inference Batching</a></td>
-    </tr>
-  </tbody>
-</table>
 
-## Quality-Tradeoff / Lossy Or Approximate Levers
+## Current Baseline Snapshot
 
-These techniques can change the denoising path, numerical representation, or generated output. They are useful after you have a baseline and an acceptance criterion for quality.
+For Ring SP benchmark details, see:
 
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "24%"}} />
-    <col style={{width: "30%"}} />
-    <col style={{width: "46%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Lever</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Tradeoff</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Docs</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500}}>Cache-DiT</td>
-      <td style={{padding: "9px 12px"}}>Skips selected DiT block or step computation based on cache decisions.</td>
-      <td style={{padding: "9px 12px"}}><a href="./cache_dit">Cache-DiT</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500}}>TeaCache</td>
-      <td style={{padding: "9px 12px"}}>Reuses residuals when consecutive denoising steps are similar enough.</td>
-      <td style={{padding: "9px 12px"}}><a href="./teacache">TeaCache</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500}}>Progressive resolution</td>
-      <td style={{padding: "9px 12px"}}>Runs early denoising at lower latent resolution for supported pipelines.</td>
-      <td style={{padding: "9px 12px"}}><a href="./progressive_resolution">Progressive Resolution Generation</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500}}>Quantization</td>
-      <td style={{padding: "9px 12px"}}>Uses lower-precision transformer weights or activations.</td>
-      <td style={{padding: "9px 12px"}}><a href="./quantization">Quantization</a></td>
-    </tr>
-  </tbody>
-</table>
-
-## Practical Order
-
-1. Establish a baseline with the target model, resolution, frame count, step count, and GPU type.
-2. Select `--performance-mode` and explicit residency or parallelism flags.
-3. Tune attention backend and batching for the deployment pattern.
-4. Profile if the bottleneck is unclear.
-5. Add caching, progressive resolution, or quantization only after comparing output quality against your acceptance target.
-
-## Diagnostics
-
-[Profiling](./profiling) is not an optimization technique by itself. It belongs in the performance workflow because it tells you which stage, kernel, or denoising step is worth optimizing before you change multiple levers.
+- [Ring SP Performance](./ring_sp_performance)
 
 ## References
 
-- [Deployment and Performance Modes](./deployment_cookbook)
-- [Attention Backends](./attention_backends)
-- [Sequence Parallelism](./ring_sp_performance)
-- [Caching Strategies](./caching-acceleration)
-- [Profiling](./profiling)
+- [Cache-DiT Repository](https://github.com/vipshop/cache-dit)
+- [TeaCache Paper](https://arxiv.org/abs/2411.14324)

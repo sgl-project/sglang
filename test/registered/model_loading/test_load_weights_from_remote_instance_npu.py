@@ -197,7 +197,7 @@ def init_process_dst(
             model_path=model_name,
             base_gpu_id=base_gpu_id,
             tp_size=tp_size,
-            cuda_graph_max_bs_decode=2,
+            cuda_graph_max_bs=2,
             tokenizer_path=model_name,
             remote_instance_weight_loader_seed_instance_ip=seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=seed_instance_service_port,

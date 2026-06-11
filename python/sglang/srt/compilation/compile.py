@@ -9,9 +9,7 @@ from typing import Any, Callable, Optional, Union
 import torch
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
-)
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +186,7 @@ def install_torch_compiled(
         state["compiled_callable"] = compiled_callable
 
     def trampoline(self, *args, **kwargs):
-        use_compiled = is_in_tc_piecewise_cuda_graph()
+        use_compiled = is_in_piecewise_cuda_graph()
         if use_compiled:
             if not state["compiled"]:
                 _ensure_compiled(self, *args, **kwargs)

@@ -76,18 +76,6 @@ common_args = [
     "32",
 ]
 
-eplb_args = [
-    "--enable-eplb",
-    "--ep-num-redundant-experts",
-    "32",
-    "--eplb-rebalance-num-iterations",
-    "50",
-    "--expert-distribution-recorder-buffer-size",
-    "50",
-    "--ep-dispatch-algorithm",
-    "static",
-]
-
 mtp_args = [
     "--speculative-algo",
     "EAGLE",
@@ -517,62 +505,6 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         ]
         print(f"{avg_spec_accept_length=}")
         self.assertGreaterEqual(avg_spec_accept_length, 2.8)
-
-
-class TestEPLBMoriStat(CustomTestCase):
-    """EPLB with mori backend, stat mode (on_select_experts path)."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = (
-            common_args
-            + eplb_args
-            + [
-                "--deepep-mode",
-                "normal",
-                "--expert-distribution-recorder-mode",
-                "stat",
-            ]
-        )
-
-        env = dict(os.environ)
-        env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
-        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
-        env["SGLANG_ENABLE_SPEC_V2"] = "false"
-        env["SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"] = "32"
-        env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
-        # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
-        # env["MORI_DISABLE_P2P"] = "1"
-
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
-            other_args=other_args,
-            env=env,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-        wait_all_ports_release(cls.base_url)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.9)
 
 
 if __name__ == "__main__":

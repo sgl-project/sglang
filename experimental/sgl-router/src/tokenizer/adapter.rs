@@ -44,68 +44,23 @@ fn looks_like_path(source: &str) -> bool {
 }
 
 /// Download `tokenizer.json` for a HuggingFace repo id and return the cached
-/// local path, adding an actionable error context. The actual fetch (blocking
-/// `ureq`, `from_env` so `HF_TOKEN` / `HF_HOME` / endpoint overrides apply)
-/// lives in [`download_repo_file`].
+/// local path. Uses the blocking `ureq` API (this runs once at startup,
+/// before the server begins serving) and `from_env` so `HF_TOKEN` /
+/// `HF_HOME` / endpoint overrides are honored.
 fn download_tokenizer_json(repo_id: &str) -> Result<std::path::PathBuf> {
-    download_repo_file(repo_id, "tokenizer.json").with_context(|| {
-        format!(
-            "download tokenizer.json for HuggingFace repo {repo_id:?} \
-             (pass --tokenizer-path with a local tokenizer.json, or set HF_TOKEN \
-             for a gated/private repo)"
-        )
-    })
-}
-
-/// Download `file` from a HuggingFace repo id and return the cached local path.
-/// Shared by `tokenizer.json` (required) and `tokenizer_config.json` (optional).
-fn download_repo_file(repo_id: &str, file: &str) -> Result<std::path::PathBuf> {
     use hf_hub::api::sync::ApiBuilder;
     let api = ApiBuilder::from_env()
         .build()
         .context("initialize HuggingFace Hub client")?;
     api.model(repo_id.to_string())
-        .get(file)
-        .with_context(|| format!("download {file} for HuggingFace repo {repo_id:?}"))
-}
-
-/// Load the `tokenizer_config.json` co-located with the tokenizer named by
-/// `source` (the same value passed to [`load`]). For a local
-/// `.../tokenizer.json` path this is the sibling file; for an HF repo id it is
-/// downloaded from the same repo.
-///
-/// Returns `Ok(None)` when the model ships no `tokenizer_config.json` (rare but
-/// valid) — the caller then has no chat template and routes via raw prompt text.
-pub fn load_tokenizer_config(source: &str) -> Result<Option<serde_json::Value>> {
-    let path = if Path::new(source).is_file() || looks_like_path(source) {
-        match Path::new(source).parent() {
-            Some(dir) => dir.join("tokenizer_config.json"),
-            None => return Ok(None),
-        }
-    } else {
-        // HF repo id. The download error type doesn't distinguish a genuine
-        // 404 (repo ships no tokenizer_config.json — benign) from auth/network
-        // failures (wrong/expired HF_TOKEN, gated repo, timeout), so warn with
-        // the cause rather than asserting the benign case at debug: a swallowed
-        // auth error here silently disables chat-template routing.
-        match download_repo_file(source, "tokenizer_config.json") {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(repo = %source, error = %e,
-                    "could not download tokenizer_config.json; chat-template routing disabled for this model \
-                     (expected if the repo ships none — otherwise check HF_TOKEN / network for a gated or private repo)");
-                return Ok(None);
-            }
-        }
-    };
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("read tokenizer_config.json at {}", path.display()))?;
-    let value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse tokenizer_config.json at {}", path.display()))?;
-    Ok(Some(value))
+        .get("tokenizer.json")
+        .with_context(|| {
+            format!(
+                "download tokenizer.json for HuggingFace repo {repo_id:?} \
+                 (pass --tokenizer-path with a local tokenizer.json, or set HF_TOKEN \
+                 for a gated/private repo)"
+            )
+        })
 }
 
 pub fn encode(t: &Tokenizer, text: &str) -> Result<Vec<u32>> {

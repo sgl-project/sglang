@@ -5,11 +5,7 @@ import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.memory_pool import (
-    KVCache,
-    MHATokenToKVPool,
-    unwrap_write_loc,
-)
+from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 
 logger = logging.getLogger(__name__)
@@ -156,23 +152,20 @@ class SWAKVPool(BaseSWAKVPool):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc_info,
+        loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
     ):
-        # loc_info bundles the full loc and the pre-translated SWA loc.
-        loc, swa_loc = unwrap_write_loc(loc_info)
+
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            # swa_loc is the full->SWA translation, computed once per forward by
-            # the attention backend; set_kv_buffer never translates internally.
-            assert swa_loc is not None
+            loc = self.translate_loc_from_full_to_swa(loc)
             self.swa_kv_pool.set_kv_buffer(
                 None,
-                swa_loc,
+                loc,
                 cache_k,
                 cache_v,
                 k_scale,
