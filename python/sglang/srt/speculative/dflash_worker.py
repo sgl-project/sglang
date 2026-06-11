@@ -552,14 +552,9 @@ class DFlashWorker:
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
-        if (
-            lm_head is None
-            or not hasattr(lm_head, "weight")
-            or not hasattr(lm_head, "shard_indices")
-        ):
+        if lm_head is None or not hasattr(lm_head, "weight"):
             raise RuntimeError(
-                "DFLASH requires the target model to expose a vocab-parallel `lm_head` with `weight` and "
-                "`shard_indices` attributes."
+                "DFLASH requires the target model to expose `lm_head` with `weight`."
             )
 
         # --- 2) Draft a non-causal block with the draft model.
@@ -715,17 +710,27 @@ class DFlashWorker:
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
 
-        tp_group = get_tp_group()
-        tp_size = int(tp_group.world_size)
-
-        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
-            raise RuntimeError(
-                "DFLASH greedy sampling requires a vocab-parallel head with `weight` and `shard_indices`."
-            )
-
-        shard = lm_head.shard_indices
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
+        num_tokens = int(hidden_states.shape[0])
+        out_tokens = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+
+        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
+            return x if x.dtype == weight_dtype else x.to(weight_dtype)
+
+        if not hasattr(lm_head, "shard_indices"):
+            for start in range(0, num_tokens, int(chunk_size)):
+                end = min(num_tokens, start + int(chunk_size))
+                hs = _cast_hs(hidden_states[start:end])
+                logits = torch.matmul(hs, weight.T)
+                out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
+            return out_tokens
+
+        shard = lm_head.shard_indices
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
 
         # Valid ranges in the local shard (excluding padding):
         #   base vocab:  [0, num_org)
@@ -735,14 +740,6 @@ class DFlashWorker:
         num_added = int(shard.num_added_elements)
         org_vocab_start = int(shard.org_vocab_start_index)
         added_vocab_start = int(shard.added_vocab_start_index)
-
-        num_tokens = int(hidden_states.shape[0])
-        out_tokens = torch.empty(
-            (num_tokens,), dtype=torch.long, device=hidden_states.device
-        )
-
-        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
-            return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
         # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
