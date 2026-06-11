@@ -300,7 +300,7 @@ jobs:
 
       - name: Upload to PyPI
         run: |
-          pip install twine
+          pip install --upgrade twine "packaging>=24.2"
           python3 -m twine upload --skip-existing dist-pypi/* -u __token__ -p ${{ secrets.SGL_DEEP_GEMM_PYPI_TOKEN }}
 
       - name: Release
