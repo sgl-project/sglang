@@ -1651,37 +1651,6 @@ class MooncakeKVManager(CommonKVManager):
         ):
             self._run_one_probe_pass()
 
-    def _handle_node_failure(self, failed_bootstrap_addr):
-        with self.connection_lock:
-            keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
-            ]
-            for k in keys_to_remove:
-                del self.connection_pool[k]
-
-            possible_affected_rooms = self.addr_to_rooms_tracker.get(
-                failed_bootstrap_addr, []
-            )
-            self.prefill_info_table.pop(failed_bootstrap_addr, None)
-            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
-
-        # Report the requests associated with the failed bootstrap addr and mark their status as KVPoll.Failed
-        affected_rooms = []
-        for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != KVPoll.Success
-            ):
-                self.record_failure(
-                    room,
-                    f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
-                )
-                self.update_status(room, KVPoll.Failed)
-                affected_rooms.append(room)
-        logger.error(
-            f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), {len(affected_rooms)} requests affected"
-        )
-
 
 class MooncakeKVSender(CommonKVSender):
 
