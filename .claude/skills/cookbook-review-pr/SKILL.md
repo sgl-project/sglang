@@ -79,6 +79,9 @@ than restating.
 - NO `--nnodes` / `--node-rank` / `--dist-init-addr` literals in multi-node cells
   (the renderer injects them from `match.nodes`).
 - NO literal `--host` / `--port` — use `{{HOST_IP}}` / `{{PORT}}`.
+- NO `--reasoning-parser` / `--tool-call-parser` in any cell — parsers are a
+  Playground-only feature added on top of the base command (DSv4 convention);
+  flag any cell that bakes them in.
 - Flag order: `--model-path` first, then parallelism, then MoE, then tuning, `--host`/`--port`
   last (the playground's insert anchors assume this).
 - TP/memory sanity: `model_weight_GB / (tp × gpu_mem)` fits with ~20–30% headroom

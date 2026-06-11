@@ -13,7 +13,7 @@ this file is about the *mapping decisions*.
 | model-size / model-name radio | `variants` | One variant per deployable checkpoint family; single `{id:"default"}` when there's no variant axis (then `modelNames` keys drop the variant half). |
 | quantization radio | `quantizations` | Real precision ids (`bf16`/`fp8`/`fp4`/`int4`/…). One `fp4` id even when checkpoints differ per vendor — route via `hw\|variant\|quant` triple keys in `modelNames` (NVFP4 on Blackwell vs AMD MXFP4 is the precedent); per-hw greying falls out of which cells exist. |
 | toggle that **couples** with other parts of the command (changes TP/mem/EP) | `strategies` | The Playground applies pure flag diffs — it cannot do coupled changes. Example: Qwen3.5's MTP toggle bumps TP on three H100 combos → strategies `low-latency` (MTP on) / `high-throughput` (MTP off). GPU-count radios (GLM-4.7, MiniMax-M2.5/2.7) → budget-tier strategies with the legacy SUPPORT matrix preserved by which cells exist. `low-latency` + `high-throughput` are MANDATORY on every page (§4) — single-strategy pages are not acceptable. |
-| toggle that only adds/removes its own flags | Playground axis + bake | If the legacy default was ON (or the measured command included it), bake the flags into cells AND declare the axis so users can strip (red strikethrough). If default was OFF, keep cells clean and offer the axis preset only. parsers → `parsers` axis; MTP/EAGLE presets → `speculative` axis; dp-attention → `attention.dpAttn` or a strategy (DSv4 semantics) depending on coupling. |
+| toggle that only adds/removes its own flags | Playground axis (+ bake, EXCEPT parsers) | **Parsers (`--reasoning-parser` / `--tool-call-parser`) are NEVER baked into cells** — Deployment commands ship without them regardless of the legacy default or the measured command; the `parsers` axis adds them on top (DSv4 convention; cells mirror the legacy generator's parsers-OFF output). Other flag-only toggles: legacy default ON → bake into cells AND declare the axis so users can strip (red strikethrough); default OFF → keep cells clean, axis preset only. MTP/EAGLE presets → `speculative` axis; dp-attention → `attention.dpAttn` or a strategy (DSv4 semantics) depending on coupling. |
 | per-combo hidden option (e.g. spec hidden on Xeon) | absent cells | Don't create cells for combos the legacy widget couldn't produce; the engine greys them automatically. `# Error:` pseudo-commands → no cell + explanation in §2 tips and/or a chip `disable`/`disableReason`. |
 | coupled secondary knob with no axis (e.g. mamba cache V1/V2) | cells + prose | No new engine axis for a migration. Bake the correct value per cell following the legacy coupling (Qwen3.5: MTP ⇒ `--mamba-scheduler-strategy extra_buffer` on NVIDIA; AMD/Xeon ⇒ V1/no flag), document the knob in §2 tips. |
 
@@ -55,6 +55,11 @@ removal — e.g. MoE backend/EP greyed out on dense variants.
 the page — including the measured command's algorithm when it differs from
 the generator default (Qwen3.5 ships both NEXTN and EAGLE) — otherwise the
 verified cell's baseline can't be re-applied after a strip.
+
+The `parsers` axis is **add-only**: `--reasoning-parser` /
+`--tool-call-parser` are never part of any Deployment cell (see §1) — the
+axis adds them on top of the base command, so toggling a parser renders a
+green addition, never a strikethrough.
 
 ## 3. Verified policy mechanics
 
@@ -116,8 +121,10 @@ Decisions log, in the order they came up:
    no low-latency cells — the legacy widget hid the MTP toggle there).
 2. **Verified cell follows the measurement**: H200/397B/BF16/low-latency =
    `SGLANG_USE_CUDA_IPC_TRANSPORT=1` env + `--speculative-algorithm NEXTN`
-   (normalized spelling) + measured flag set; all other cells = generator
-   output verbatim with `EAGLE`. Both presets exposed on the speculative axis.
+   (normalized spelling) + measured flag set **minus the parser flags** (the
+   measured run had both parsers on; cells never carry them — noted in the
+   benchmarks header). All other cells = the generator's parsers-OFF output
+   verbatim with `EAGLE`. Both spec presets exposed on the speculative axis.
 3. **FP4 single quant id** with `hw|variant|quant` modelNames keys →
    `nvidia/...NVFP4` (b200/b300) vs `amd/...MXFP4` (mi355x).
 4. **Xeon** as `config.hardware` `vendor:"intel"`; cells carry

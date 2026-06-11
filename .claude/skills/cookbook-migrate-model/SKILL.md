@@ -36,10 +36,12 @@ Migration-specific references in this skill:
 3. **Verified policy (strictest tier).** `verified: true` ONLY when (a) the
    legacy page has concrete measured data for that exact 5-dim combo AND
    (b) the cell's flags equal the deployment command used for that measurement
-   (modulo `{{HOST_IP}}`/`{{PORT}}` and the four alias rewrites). When the
-   measured command diverges from the generator default, **the verified cell
-   follows the measured command**; the generator default stays as the sibling
-   strategy/cell or a tips note. Everything else is unverified (yellow) —
+   — modulo `{{HOST_IP}}`/`{{PORT}}`, the five alias rewrites, and **parser
+   flags**: `--reasoning-parser`/`--tool-call-parser` are stripped from every
+   cell (Playground-only feature; when the measured run had them on, say so in
+   the benchmarks file header). When the measured command diverges from the
+   generator default, **the verified cell follows the measured command**; the
+   generator default stays as the sibling strategy/cell or a tips note. Everything else is unverified (yellow) —
    including combos that look memory-infeasible; keep them verbatim and list
    them in the PR body for the re-verification track.
 4. **Engines are read-only.** `_deployment.jsx` / `_playground.jsx` must not
@@ -71,7 +73,9 @@ Apply [references/dimension-mapping.md](references/dimension-mapping.md). Key
 decision: a legacy toggle that **changes other parts of the command** (TP, mem)
 becomes a `strategies` entry (the Playground can't do coupled changes); a
 toggle that only adds/removes its own flags becomes a Playground axis with the
-flags baked into cells when the legacy default was ON. The strategy set
+flags baked into cells when the legacy default was ON — EXCEPT parsers:
+`--reasoning-parser`/`--tool-call-parser` are NEVER baked into cells, they are
+Playground-only (DSv4 convention). The strategy set
 defaults to the full trio `low-latency` / `balanced` / `high-throughput`;
 **`low-latency` and `high-throughput` are mandatory on every page** — a
 single-strategy page is not acceptable; include `balanced` whenever the page
@@ -136,8 +140,9 @@ changes**: docs.json path/title unchanged, vendor card + logo already exist.
   `cells[]`) with green badge; multi-node cells show the injected trio +
   header; AMD cells show env prefixes; Docker mode wraps with the pinned image
   and passes cell env as `--env`; condition-hidden combos grey out; benchmark
-  card values; Playground parser/spec toggles produce red strikethrough on
-  baked flags; Submit ↗ prefills this model. **Probe pitfall:** drive at most
+  card values; NO parser flags in any Deploy command; Playground parser
+  toggles ADD the parser flags (green additions) while spec toggles strike
+  the baked spec flags (red); Submit ↗ prefills this model. **Probe pitfall:** drive at most
   ONE programmatic click per evaluation and wait for React to settle —
   multiple clicks in one synchronous script batch and read stale DOM.
 - Token-level audit from step 3 passes.
