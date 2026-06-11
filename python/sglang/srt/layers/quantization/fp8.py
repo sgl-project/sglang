@@ -59,11 +59,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
-    get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
+    resolve_mxfp8_linear_backend,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -348,8 +348,10 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
+        self.mxfp8_backend = None
         if self.use_mxfp8:
-            self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
+            self.mxfp8_backend = resolve_mxfp8_linear_backend()
+            self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear(self.mxfp8_backend)
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
         self.is_checkpoint_fp8_serialized = (
@@ -579,7 +581,8 @@ class Fp8LinearMethod(LinearMethodBase):
         if not self.use_mxfp8:
             return
 
-        if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+        backend = self.mxfp8_backend
+        if backend.is_flashinfer_trtllm():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
             weight = layer.weight.data
@@ -605,7 +608,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
-        elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+        elif backend.is_flashinfer_cutlass():
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
@@ -768,7 +771,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+            if self.mxfp8_backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
             else:
                 weight_scale = layer.weight_scale_inv

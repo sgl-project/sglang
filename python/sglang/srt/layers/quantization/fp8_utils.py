@@ -289,6 +289,7 @@ if is_blackwell_supported() and is_flashinfer_available():
         input: torch.Tensor,
         _is_sf_swizzled_layout: bool = True,
         alignment: int = 32,
+        use_8x4_sf_layout: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Fake mode only needs dtypes and output rank to propagate compile graph.
         # The scale tensor shape is not consumed before the following fake mm op.
@@ -308,12 +309,16 @@ if is_blackwell_supported() and is_flashinfer_available():
         input: torch.Tensor,
         is_sf_swizzled_layout: bool = True,
         alignment: int = 32,
+        use_8x4_sf_layout: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return _raw_flashinfer_mxfp8_quantize(
             input,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             alignment=alignment,
-            sf_swizzle_layout=SfLayout.layout_128x4,
+            backend="cute-dsl",
+            sf_swizzle_layout=(
+                SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
+            ),
         )
 
     @register_custom_op(
@@ -366,16 +371,8 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     return _dispatch_auto_backend()
 
 
-def dispatch_w8a8_mxfp8_linear() -> Callable:
-    """Dispatch MXFP8 linear kernel by --fp8-gemm-backend.
-
-    For MXFP8, Triton remains the default path. We only route to FlashInfer
-    when backend is explicitly set to flashinfer_cutlass or flashinfer_trtllm.
-    """
-    backend = get_fp8_gemm_runner_backend()
-    if backend.is_flashinfer_trtllm():
-        return flashinfer_mxfp8_blockscaled_linear
-    elif backend.is_flashinfer_cutlass():
+def dispatch_w8a8_mxfp8_linear(backend: Fp8GemmRunnerBackend) -> Callable:
+    if backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
         return flashinfer_mxfp8_blockscaled_linear
     return triton_mxfp8_blockscaled_linear
 
@@ -482,6 +479,13 @@ def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
     if FP8_GEMM_RUNNER_BACKEND is None:
         FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend.AUTO
     return FP8_GEMM_RUNNER_BACKEND
+
+
+def resolve_mxfp8_linear_backend() -> Fp8GemmRunnerBackend:
+    backend = get_fp8_gemm_runner_backend()
+    if backend.is_auto() and _is_sm100_supported and is_flashinfer_available():
+        return Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+    return backend
 
 
 def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
@@ -1040,7 +1044,6 @@ def flashinfer_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """MXFP8 dense linear via FlashInfer mm_mxfp8."""
     input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
@@ -1053,9 +1056,27 @@ def flashinfer_mxfp8_blockscaled_linear(
     if weight.dtype != torch.float8_e4m3fn:
         raise TypeError("MXFP8 weight must be FP8 E4M3.")
 
+    if resolve_mxfp8_linear_backend().is_flashinfer_cutlass():
+        backend = "cutlass"
+        use_8x4 = False
+        weight_scale_t = (
+            weight_scale.contiguous().t()
+            if weight_scale.ndim == 2
+            else weight_scale.contiguous()
+        )
+    else:
+        # Note: we intentionally don't support 128x4 for perf reasons: 8x4 wins
+        # at small M, and cutlass beats trtllm 128x4 in ~all other (M, N, K).
+        backend = "trtllm"
+        use_8x4 = True
+        weight_scale_t = weight_scale.contiguous().view(-1)
+
     if input_scale is None:
         q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
-            input_2d, is_sf_swizzled_layout=True, alignment=32
+            input_2d,
+            is_sf_swizzled_layout=True,
+            alignment=32,
+            use_8x4_sf_layout=use_8x4,
         )
     else:
         q_input = input_2d
@@ -1067,36 +1088,17 @@ def flashinfer_mxfp8_blockscaled_linear(
         else:
             output_dtype = torch.bfloat16
 
-    # Ensure transposed tensors are contiguous for FlashInfer's internal runner.
     weight_t = weight.contiguous().t()
 
-    if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
-
-        weight_scale_t = weight_scale.contiguous().view(-1)
-        output = flashinfer_mm_mxfp8(
-            q_input,
-            weight_t,
-            x_scale_u8,
-            weight_scale_t,
-            out_dtype=output_dtype,
-            use_8x4_sf_layout=False,
-            backend="trtllm",
-        )
-    elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
-        weight_scale_t = (
-            weight_scale.contiguous().t()
-            if weight_scale.ndim == 2
-            else weight_scale.contiguous()
-        )
-        output = flashinfer_mm_mxfp8(
-            q_input,
-            weight_t,
-            x_scale_u8,
-            weight_scale_t,
-            out_dtype=output_dtype,
-            use_8x4_sf_layout=False,
-            backend="cutlass",
-        )
+    output = flashinfer_mm_mxfp8(
+        q_input,
+        weight_t,
+        x_scale_u8,
+        weight_scale_t,
+        out_dtype=output_dtype,
+        use_8x4_sf_layout=use_8x4,
+        backend=backend,
+    )
 
     if bias is not None:
         output += bias

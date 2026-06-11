@@ -279,6 +279,11 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     assert w13_scale.dtype == torch.uint8
     assert w2_scale.dtype == torch.uint8
 
+    if not is_gated:
+        intermediate = w2_weight.shape[2]
+        w13_weight = w13_weight[:, :intermediate, :].contiguous()
+        w13_scale = w13_scale[:, :intermediate, :].contiguous()
+
     # Pad for kernel alignment (non-gated needs 128, gated needs 16)
     min_alignment = 16 if is_gated else 128
     w13_weight, w13_scale, w2_weight, w2_scale, _ = _align_mxfp8_moe_weights(
