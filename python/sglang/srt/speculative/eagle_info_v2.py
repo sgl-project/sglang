@@ -48,7 +48,7 @@ from sglang.srt.speculative.triton_ops.eagle import (
 from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
-    maybe_warn_nan,
+    sanitize_nan_logits,
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu
 
@@ -478,12 +478,7 @@ class EagleVerifyInputV2Mixin:
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
 
-        # NaN logits (fp16 activation overflow on degenerate draft branches)
-        # are undefined behavior in the verify kernels; warn and sanitize
-        # (the CI assert probe already runs in the callers). +-1e30 instead of
-        # dtype min/max so the temperature division cannot overflow to +-Inf.
-        maybe_warn_nan(next_token_logits, "verify: target model logits")
-        torch.nan_to_num_(next_token_logits, nan=-1e30, posinf=1e30, neginf=-1e30)
+        sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.

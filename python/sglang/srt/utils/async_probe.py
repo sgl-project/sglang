@@ -70,6 +70,18 @@ def maybe_warn_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     _nan_warner.check(tensor, msg)
 
 
+def sanitize_nan_logits(logits: torch.Tensor, msg: str = ""):
+    """Detect NaN (assert in CI, throttled sync-free warning in prod), then
+    sanitize in place: NaN logits (e.g. fp16 activation overflow) are
+    undefined behavior in sampling kernels and can come back as out-of-vocab
+    token ids. Replacement is +-1e30 rather than dtype min/max because
+    callers divide logits by temperature, which would overflow dtype min/max
+    to +-Inf and softmax back to NaN."""
+    maybe_detect_nan(logits, msg)
+    maybe_warn_nan(logits, msg)
+    torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
+
+
 def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
     if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
