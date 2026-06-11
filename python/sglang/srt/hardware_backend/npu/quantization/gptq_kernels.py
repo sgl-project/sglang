@@ -84,31 +84,31 @@ class GPTQLinearAscendKernel:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
-        layer.weight_offset = torch.nn.Parameter(
+        layer.qweight_offset = torch.nn.Parameter(
             unpack_from_int32(
-                layer.weight_offset.data.contiguous(),
+                layer.qzeros.data.contiguous(),
                 self.quant_config.weight_bits,
                 packed_dim=1,
             ).to(layer.scales.dtype),
             requires_grad=False,
         )
         if not self.use_v2_format:
-            layer.weight_offset += 1
+            layer.qzeros += 1
 
-        weight_tmp = unpack_from_int32(
-            layer.weight.data.contiguous(), self.quant_config.weight_bits, packed_dim=0
+        qweight_tmp = unpack_from_int32(
+            layer.qweight.data.contiguous(), self.quant_config.weight_bits, packed_dim=0
         )
         # use int8 to store weight by default
         if self.quant_config.weight_bits != 4:
-            layer.weight = torch.nn.Parameter(
-                weight_tmp,
+            layer.qweight = torch.nn.Parameter(
+                qweight_tmp,
                 requires_grad=False,
             )
             return
 
         # for 4bit case we need to pack 4bit weight to int32 to save memory
-        layer.weight = torch.nn.Parameter(
-            torch_npu.npu_convert_weight_to_int4pack(weight_tmp.to(torch.int32)),
+        layer.qweight = torch.nn.Parameter(
+            torch_npu.npu_convert_weight_to_int4pack(qweight_tmp.to(torch.int32)),
             requires_grad=False,
         )
 
@@ -118,9 +118,9 @@ class GPTQLinearAscendKernel:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        weight = layer.weight
+        qweight = layer.qweight
         scales = layer.scales
-        weight_offset = layer.weight_offset
+        qzeros = layer.qzeros
 
         reshaped_x = x.reshape(-1, x.shape[-1])
 
