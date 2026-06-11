@@ -360,6 +360,65 @@ class NGRAMWorker(BaseSpecWorker):
             i += 1
         self.ngram_corpus.batch_put(batch_tokens)
 
+    def _mamba_verify_update(
+        self,
+        batch: ScheduleBatch,
+        accept_lens: torch.Tensor,
+        accept_index: torch.Tensor,
+        bs: int,
+    ) -> None:
+        """Commit accepted speculative states for hybrid linear attention backends."""
+        attn_backend = self.target_worker.model_runner.attn_backend
+        if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            return
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+
+        accept_indices_offset = torch.arange(
+            0,
+            bs * self.draft_token_num,
+            step=self.draft_token_num,
+            dtype=accept_lens.dtype,
+            device=accept_lens.device,
+        )
+        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+        last_correct_step_indices = (
+            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+            - accept_indices_offset
+        )
+
+        if batch.mamba_track_indices is not None:
+            seq_lens_pre_verify = batch.seq_lens
+            seq_lens_post_verify = batch.seq_lens + accept_lens
+            mamba_track_interval = self.server_args.mamba_track_interval
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
+            )
+            tracking_point = (
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+            )
+            to_track_ith = torch.clamp(
+                tracking_point - seq_lens_pre_verify - 1, min=0
+            ).to(torch.int64)
+            candidate_track_steps = (
+                accept_index[req_idx, to_track_ith] - accept_indices_offset
+            )
+            mamba_steps_to_track = torch.where(
+                to_track_mask,
+                candidate_track_steps,
+                torch.full_like(candidate_track_steps, -1),
+            )
+        else:
+            mamba_steps_to_track = None
+
+        attn_backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=self.target_worker.model_runner.model,
+        )
+
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None
     ) -> GenerationBatchResult:
@@ -426,6 +485,12 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
             ) = verify_input.sample(batch, logits_output, vocab_mask)
             new_seq_lens = batch.seq_lens + accept_lens
+            if (
+                self.target_worker.model_runner.hybrid_gdn_config is not None
+                or self.target_worker.model_runner.mamba2_config is not None
+                or self.target_worker.model_runner.hybrid_lightning_config is not None
+            ):
+                self._mamba_verify_update(batch, accept_lens, accept_index, bs)
             accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens
 
