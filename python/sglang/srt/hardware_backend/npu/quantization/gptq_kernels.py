@@ -161,7 +161,7 @@ class GPTQMoEAscendKernel:
                 packed_dim=1,
             )
             .reshape(layer.w13_weight_offset.shape[0], layer.w13_weight_offset.shape[1], -1)
-            .to(layer.w13_scales.dtype),
+            .to(layer.w13_weight_scale.dtype),
             requires_grad=False,
         )
         if not self.use_v2_format:
@@ -177,7 +177,7 @@ class GPTQMoEAscendKernel:
                 packed_dim=1,
             )
             .reshape(layer.w2_weight_offset.shape[0], layer.w2_weight_offset.shape[1], -1)
-            .to(layer.w2_scales.dtype),
+            .to(layer.w2_weight_scale.dtype),
             requires_grad=False,
         )
         if not self.use_v2_format:
@@ -194,7 +194,7 @@ class GPTQMoEAscendKernel:
 
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
-            scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)
+            scale_expanded = layer.w13_weight_scale.data.repeat_interleave(group_size, dim=1)
 
             neg_mask = scale_expanded < 0
 
@@ -206,7 +206,7 @@ class GPTQMoEAscendKernel:
                 if w13_weight_tmp.max() > 7:
                     w13_weight_tmp.clamp_(max=7)
 
-                layer.w13_scales.data.abs_()
+                layer.w13_weight_scale.data.abs_()
 
             layer.w13_weight = torch.nn.Parameter(
                 torch_npu.npu_convert_weight_to_int4pack(
@@ -244,7 +244,7 @@ class GPTQMoEAscendKernel:
 
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
-            scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)
+            scale_expanded = layer.w2_weight_scale.data.repeat_interleave(group_size, dim=1)
 
             neg_mask = scale_expanded < 0
 
@@ -256,7 +256,7 @@ class GPTQMoEAscendKernel:
                 if w2_weight_tmp.max() > 7:
                     w2_weight_tmp.clamp_(max=7)
 
-                layer.w2_scales.data.abs_()
+                layer.w2_weight_scale.data.abs_()
 
             layer.w2_weight = torch.nn.Parameter(
                 torch_npu.npu_convert_weight_to_int4pack(
