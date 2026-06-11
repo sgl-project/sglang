@@ -5,32 +5,14 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch_npu
 
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.torch_npu import (
-    TorchNpuQuantInfo,
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    npu_fused_experts,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
-    from sglang.srt.layers.moe.token_dispatcher import (
-        CombineInput,
-        StandardDispatchOutput,
-    )
-
-import torch_npu
-
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A16Int4MoEMethod,
-)
-from sglang.srt.layers.moe import (
-    MoeRunner,
-    MoeRunnerBackend,
-    MoeRunnerConfig,
-    get_moe_runner_backend,
-)
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
 
 def unpack_from_int32(
@@ -149,134 +131,143 @@ class GPTQMoEAscendKernel:
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
+        self.moe_runner_config: Optional["MoeRunnerConfig"] = None
+
+    def create_moe_runner(
+        self,
+        layer: torch.nn.Module,
+        moe_runner_config: "MoeRunnerConfig",
+        **extra_weight_attrs,
+    ):
+        self.moe_runner_config = moe_runner_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13_weight_offset_2d = layer.w13_weight_offset.data.contiguous().reshape(
-            -1, layer.w13_weight_offset.shape[-1]
+        w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
+            -1, layer.w13_qzeros.shape[-1]
         )
-        layer.w13_weight_offset = torch.nn.Parameter(
+        layer.w13_qzeros = torch.nn.Parameter(
             unpack_from_int32(
-                w13_weight_offset_2d,
+                w13_qzeros_2d,
                 self.quant_config.weight_bits,
                 packed_dim=1,
             )
-            .reshape(layer.w13_weight_offset.shape[0], layer.w13_weight_offset.shape[1], -1)
-            .to(layer.w13_weight_scale.dtype),
+            .reshape(layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1)
+            .to(layer.w13_scales.dtype),
             requires_grad=False,
         )
         if not self.use_v2_format:
-            layer.w13_weight_offset += 1
+            layer.w13_qzeros += 1
 
-        w2_weight_offset_2d = layer.w2_weight_offset.data.contiguous().reshape(
-            -1, layer.w2_weight_offset.shape[-1]
+        w2_qzeros_2d = layer.w2_qzeros.data.contiguous().reshape(
+            -1, layer.w2_qzeros.shape[-1]
         )
-        layer.w2_weight_offset = torch.nn.Parameter(
+        layer.w2_qzeros = torch.nn.Parameter(
             unpack_from_int32(
-                w2_weight_offset_2d,
+                w2_qzeros_2d,
                 self.quant_config.weight_bits,
                 packed_dim=1,
             )
-            .reshape(layer.w2_weight_offset.shape[0], layer.w2_weight_offset.shape[1], -1)
-            .to(layer.w2_weight_scale.dtype),
+            .reshape(layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1)
+            .to(layer.w2_scales.dtype),
             requires_grad=False,
         )
         if not self.use_v2_format:
-            layer.w2_weight_offset += 1
+            layer.w2_qzeros += 1
 
-        w13_weight_2d = (
-            layer.w13_weight.data.transpose(-1, -2)
+        w13_qweight_2d = (
+            layer.w13_qweight.data.transpose(-1, -2)
             .contiguous()
-            .reshape(-1, layer.w13_weight.shape[-2])
+            .reshape(-1, layer.w13_qweight.shape[-2])
         )
-        w13_weight_tmp = unpack_from_int32(
-            w13_weight_2d, self.quant_config.weight_bits, packed_dim=1
+        w13_qweight_tmp = unpack_from_int32(
+            w13_qweight_2d, self.quant_config.weight_bits, packed_dim=1
         )
 
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
-            scale_expanded = layer.w13_weight_scale.data.repeat_interleave(group_size, dim=1)
+            scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)
 
             neg_mask = scale_expanded < 0
 
             if neg_mask.any():
                 neg_mask = neg_mask.transpose(-1, -2)
-                neg_mask = neg_mask.contiguous().reshape(w13_weight_tmp.shape)
-                w13_weight_tmp[neg_mask] = -w13_weight_tmp[neg_mask]
+                neg_mask = neg_mask.contiguous().reshape(w13_qweight_tmp.shape)
+                w13_qweight_tmp[neg_mask] = -w13_qweight_tmp[neg_mask]
 
-                if w13_weight_tmp.max() > 7:
-                    w13_weight_tmp.clamp_(max=7)
+                if w13_qweight_tmp.max() > 7:
+                    w13_qweight_tmp.clamp_(max=7)
 
-                layer.w13_weight_scale.data.abs_()
+                layer.w13_scales.data.abs_()
 
-            layer.w13_weight = torch.nn.Parameter(
+            layer.w13_qweight = torch.nn.Parameter(
                 torch_npu.npu_convert_weight_to_int4pack(
-                    w13_weight_tmp.reshape(
-                        layer.w13_weight.shape[0], layer.w13_weight.shape[2], -1
+                    w13_qweight_tmp.reshape(
+                        layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
                     )
                     .transpose(-1, -2)
                     .contiguous()
-                    .reshape(-1, layer.w13_weight.shape[2])
+                    .reshape(-1, layer.w13_qweight.shape[2])
                     .to(torch.int32)
                 )
-                .reshape(layer.w13_weight.shape[0], layer.w13_weight.shape[1] * 8, -1)
+                .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
                 .contiguous(),
                 requires_grad=False,
             )
         # use int8 to store weight by default
         else:
-            layer.w13_weight = torch.nn.Parameter(
-                w13_weight_tmp.reshape(
-                    layer.w13_weight.shape[0], layer.w13_weight.shape[2], -1
+            layer.w13_qweight = torch.nn.Parameter(
+                w13_qweight_tmp.reshape(
+                    layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
                 )
                 .transpose(-1, -2)
                 .contiguous(),
                 requires_grad=False,
             )
 
-        w2_weight_2d = (
-            layer.w2_weight.data.transpose(-1, -2)
+        w2_qweight_2d = (
+            layer.w2_qweight.data.transpose(-1, -2)
             .contiguous()
-            .reshape(-1, layer.w2_weight.shape[-2])
+            .reshape(-1, layer.w2_qweight.shape[-2])
         )
-        w2_weight_tmp = unpack_from_int32(
-            w2_weight_2d, self.quant_config.weight_bits, packed_dim=1
+        w2_qweight_tmp = unpack_from_int32(
+            w2_qweight_2d, self.quant_config.weight_bits, packed_dim=1
         )
 
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
-            scale_expanded = layer.w2_weight_scale.data.repeat_interleave(group_size, dim=1)
+            scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)
 
             neg_mask = scale_expanded < 0
 
             if neg_mask.any():
                 neg_mask = neg_mask.transpose(-1, -2)
-                neg_mask = neg_mask.contiguous().reshape(w2_weight_tmp.shape)
-                w2_weight_tmp[neg_mask] = -w2_weight_tmp[neg_mask]
+                neg_mask = neg_mask.contiguous().reshape(w2_qweight_tmp.shape)
+                w2_qweight_tmp[neg_mask] = -w2_qweight_tmp[neg_mask]
 
-                if w2_weight_tmp.max() > 7:
-                    w2_weight_tmp.clamp_(max=7)
+                if w2_qweight_tmp.max() > 7:
+                    w2_qweight_tmp.clamp_(max=7)
 
-                layer.w2_weight_scale.data.abs_()
+                layer.w2_scales.data.abs_()
 
-            layer.w2_weight = torch.nn.Parameter(
+            layer.w2_qweight = torch.nn.Parameter(
                 torch_npu.npu_convert_weight_to_int4pack(
-                    w2_weight_tmp.reshape(
-                        layer.w2_weight.shape[0], layer.w2_weight.shape[2], -1
+                    w2_qweight_tmp.reshape(
+                        layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
                     )
                     .transpose(-1, -2)
                     .contiguous()
-                    .reshape(-1, layer.w2_weight.shape[2])
+                    .reshape(-1, layer.w2_qweight.shape[2])
                     .to(torch.int32)
                 )
-                .reshape(layer.w2_weight.shape[0], layer.w2_weight.shape[1] * 8, -1)
+                .reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1)
                 .contiguous(),
                 requires_grad=False,
             )
         # use int8 to store weight by default
         else:
-            layer.w2_weight = torch.nn.Parameter(
-                w2_weight_tmp.reshape(
-                    layer.w2_weight.shape[0], layer.w2_weight.shape[2], -1
+            layer.w2_qweight = torch.nn.Parameter(
+                w2_qweight_tmp.reshape(
+                    layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
                 )
                 .transpose(-1, -2)
                 .contiguous(),
