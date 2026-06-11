@@ -2892,6 +2892,9 @@ class MiniMaxSparseKVPool(KVCache):
         self.layer_num = self.main_pool.layer_num
         self.start_layer = self.main_pool.start_layer
         self.end_layer = self.main_pool.end_layer
+        # PD disaggregation reads these directly (no fallback) off the wrapper.
+        self.head_num = self.main_pool.head_num
+        self.head_dim = self.main_pool.head_dim
         self.layer_transfer_counter = None
 
     def register_layer_transfer_counter(
@@ -3092,15 +3095,18 @@ class MiniMaxSparseKVPool(KVCache):
         return sum(k for k, _ in sizes), sum(v for _, v in sizes)
 
     def get_contiguous_buf_infos(self):
-        # TODO: PD disaggregation needs to transfer BOTH main and index buffers
-        # for sparse layers. Currently only main_pool would be registered with
-        # the RDMA path, leaving index K/V stale on the decode side and
-        # silently producing wrong sparse-attention outputs. Disable explicitly
-        # until the index buffer plumbing is added.
-        raise NotImplementedError(
-            "PD disaggregation for MiniMaxSparseKVPool is not yet supported: "
-            "index K/V buffers also need to be registered for transfer."
-        )
+        # Main K/V only; index buffers ride the state-buffer channel.
+        return self.main_pool.get_contiguous_buf_infos()
+
+    def get_index_k_state_buf_infos(self):
+        # Per-page item_len (MHATokenToKVPool convention); index rows share the
+        # main-KV `loc`, so the transfer reuses the same page-ids.
+        pool = self.index_k_pool
+        n = pool.layer_num
+        data_ptrs = [pool.k_buffer[i].data_ptr() for i in range(n)]
+        data_lens = [pool.k_buffer[i].nbytes for i in range(n)]
+        item_lens = [pool.k_buffer[i][0].nbytes * pool.page_size for i in range(n)]
+        return data_ptrs, data_lens, item_lens
 
     def maybe_get_custom_mem_pool(self):
         return self.main_pool.maybe_get_custom_mem_pool()

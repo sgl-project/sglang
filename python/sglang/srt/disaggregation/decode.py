@@ -1030,6 +1030,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
+                elif st == StateType.MINIMAX_INDEX_K:
+                    # Index rows live at the same loc as main KV on the same
+                    # page_size, so reuse the full-seq page-ids.
+                    state_indices.append(_dsa_payload())
                 else:
                     state_indices.append(None)
 
