@@ -11,9 +11,15 @@ from sglang.srt.layers.moe.topk import (
     TopKConfig,
     remap_topk_for_per_rank_shared_slots,
 )
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def _set_dummy_server_args():
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
 
 def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
