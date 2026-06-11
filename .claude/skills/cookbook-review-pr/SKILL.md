@@ -51,7 +51,10 @@ than restating.
 - `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback).
 - `multiNodeHints` present ONLY for hw whose fabric needs manual NIC env (e.g. `gb200`
   NVL72) — NOT every `multi-N` hw (standard-IB DeepEP / Marlin multi-node don't need it).
-- `github.cookbookModel` matches the issue-template `model` dropdown value.
+- `github.cookbookModel` is set to the model's HF id (`<hf-org>/<model-slug>`). The issue
+  template's `model` field is a free-form input prefilled from this value; if the config
+  omits the `github` block, the engine falls back to `deepseek-ai/deepseek-v4` and the
+  page's submissions get mislabeled.
 - `playgroundFeatures` axes are pruned to what the model supports — no empty/stub axes
   (the `moe` axis's MegaMoE backend option + `megamoeQuant` block only on Blackwell MoE,
   gated by `requiresHw`; `hisparse` only DSA-style; `pdDisagg.router` only with a PD topology).
@@ -96,8 +99,12 @@ than restating.
   Launch port must match client/curl port on the same page.
 
 ### 7. Frontmatter
-- Every new MDX page has `title:` and `metatags.description:` (a real one-line value prop,
-  not copied from another vendor).
+- Every new MDX page has `title:` and a **top-level** `description:` (a real one-line value
+  prop, not copied from another vendor) — NOT `metatags.description` (non-canonical; the
+  top-level field is what renders as the subtitle and SEO meta — see mintlify-authoring).
+- **No `mode: wide` on a model page** — it hides the right-hand "On this page" ToC that every
+  other model page has. Leave `mode` unset (the Deploy/Playground panels self-cap at 900px, so
+  the default column holds them fine). `mode: wide` belongs only on category `intro.mdx` grids.
 - `tag: NEW` only for genuine new launches; when one is added, stale `tag: NEW` on older
   pages should be dropped in the same PR (`grep -RlE "^tag: NEW" docs_new/cookbook/`).
 - MDX imports BOTH `Deployment` and `Playground` from `/src/snippets/...` (absolute).
