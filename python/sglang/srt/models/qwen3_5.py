@@ -100,6 +100,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_musa,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -110,6 +111,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_musa = is_musa()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -134,6 +136,12 @@ def _disable_shared_experts_fusion() -> bool:
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
+    )
+
+if _is_musa:
+    from sglang.srt.hardware_backend.musa.jit_kernel import RMSNorm as RMSNormGated
+    from sglang.srt.hardware_backend.musa.jit_kernel import (
+        fused_qkvzba_split_reshape_cat_contiguous,
     )
 
 

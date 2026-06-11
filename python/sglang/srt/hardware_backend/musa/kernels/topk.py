@@ -31,7 +31,7 @@ def tanh(x):
         triton.Config({}, num_warps=32, num_stages=1),
         triton.Config({}, num_warps=32, num_stages=2),
     ],
-    key=["num_tokens", "num_experts", "has_correction_bias"],
+    key=["num_experts", "has_correction_bias"],
 )
 @triton.jit
 def topk_softmax_triton_kernel(
@@ -40,7 +40,6 @@ def topk_softmax_triton_kernel(
     moe_weights_ptr,
     renormalize_flag,
     num_experts,
-    num_tokens,  # for autotune key
     moe_softcapping,
     correction_bias_ptr,
     has_correction_bias: tl.constexpr,
@@ -74,6 +73,8 @@ def topk_softmax_triton_kernel(
 
     if moe_softcapping > 0.0:
         logits = moe_softcapping * tanh(logits / moe_softcapping)
+
+    logits = tl.where(mask_expert, logits, FLOAT_MINIMUM)
 
     row_max = tl.max(logits, axis=0)
     probs = tl.exp2((logits - row_max) * LOG2E)
@@ -146,7 +147,6 @@ def topk_softmax(
         topk_weights,
         renormalize,
         num_experts,
-        num_tokens,
         moe_softcapping,
         correction_bias,
         has_correction_bias,
@@ -174,7 +174,7 @@ def topk_softmax(
         triton.Config({}, num_warps=32, num_stages=1),
         triton.Config({}, num_warps=32, num_stages=2),
     ],
-    key=["num_tokens", "num_experts"],
+    key=["num_experts", "has_correction_bias"],
 )
 @triton.jit
 def topk_sigmoid_triton_kernel(
@@ -185,7 +185,6 @@ def topk_sigmoid_triton_kernel(
     correction_bias_ptr,
     has_correction_bias: tl.constexpr,
     num_experts,
-    num_tokens,  # for autotune key
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_WIDTH_SIZE_UP: tl.constexpr,
@@ -293,7 +292,6 @@ def topk_sigmoid(
         correction_bias,
         has_correction_bias,
         num_experts,
-        num_tokens,
         K=topk,
         BLOCK_K=triton.next_power_of_2(topk),
         BLOCK_WIDTH_SIZE_UP=block_width_up,

@@ -1273,6 +1273,14 @@ class ServerArgs:
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
+        if (
+            is_musa()
+            and self.speculative_algorithm is not None
+            and not envs.SGLANG_MAMBA_SSM_DTYPE.is_set()
+        ):
+            self.mamba_ssm_dtype = "bfloat16"
+            logger.info("Use bfloat16 as the default Mamba SSM state dtype for MTP.")
+
     def _handle_modelscope_paths(self):
         """Resolve model / tokenizer / speculative-draft paths from the local
         ModelScope cache when possible, falling back to snapshot_download
