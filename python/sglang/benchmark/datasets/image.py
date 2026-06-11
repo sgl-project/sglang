@@ -202,19 +202,17 @@ def _gen_sharegpt_text_prompts(
 
     for target_len in input_lens:
         # Find a non-empty prompt (cycle through dataset if needed)
-        prompt = None
-        while prompt is None:
+        prompt_token_ids = []
+        while not prompt_token_ids:
             try:
                 candidate = next(data_iter)
             except StopIteration:
+                # Re-shuffle and restart
                 random.shuffle(dataset)
                 data_iter = iter(dataset)
                 candidate = next(data_iter)
-            if len(tokenizer.encode(candidate)) == 0:
-                continue
-            prompt = candidate
+            prompt_token_ids = tokenizer.encode(candidate)
 
-        prompt_token_ids = tokenizer.encode(prompt)
         prompt_len = len(prompt_token_ids)
 
         if prompt_len > target_len:
