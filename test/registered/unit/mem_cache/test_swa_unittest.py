@@ -246,6 +246,30 @@ class TestSWA(unittest.TestCase):
         result = alloc.translate_loc_from_full_to_swa(index)
         print(result)
 
+    def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=16,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
+        )
+
+        full_indices = _swa_alloc(allocator, page_size)
+        self.assertEqual(allocator.swa_available_size(), 16 - page_size)
+
+        allocator.free_swa(full_indices[:1])
+        self.assertEqual(allocator.swa_available_size(), 16)
+        self.assertTrue(
+            torch.all(
+                allocator.full_to_swa_index_mapping[full_indices.to(torch.int64)] == 0
+            )
+        )
+
+        allocator.free_swa(full_indices[1:2])
+        self.assertEqual(allocator.swa_available_size(), 16)
+
     def test_swa_radix_cache_1(self):
         # args
         req_size = 10
