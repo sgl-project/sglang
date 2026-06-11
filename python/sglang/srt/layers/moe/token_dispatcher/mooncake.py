@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -373,7 +374,8 @@ class MooncakeEPDispatcher(BaseDispatcher):
         return self._get_impl().combine_b(*inner_state)
 
     def _get_impl(self) -> _MooncakeEPDispatcherImpl:
-        is_extend_in_batch = get_is_extend_in_batch()
+        is_extend_in_batch = get_flags().is_extend_in_batch
+        assert is_extend_in_batch == get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             raise NotImplementedError

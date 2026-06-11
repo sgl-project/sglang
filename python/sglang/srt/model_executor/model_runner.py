@@ -181,6 +181,12 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import (
+    get_context,
+    get_tp_rank,
+    get_tp_size,
+    init_context,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -537,8 +543,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu":
             self.init_threads_binding()
 
-        # Get available memory before model loading
-        pre_model_load_memory = self.init_torch_distributed()
+        # init_context runs init_torch_distributed, builds + publishes the context,
+        # and stashes the pre-model-load memory on ctx.metrics (read by init_memory_pool).
+        init_context(self)
 
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
@@ -567,7 +574,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._linear_attn_registry_cache: Any = _UNSET
 
         # Initialize the model runner
-        self.initialize(pre_model_load_memory)
+        self.initialize()
         self.check_quantized_moe_compatibility()
 
         if (
@@ -628,7 +635,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 port=self.dist_port,
             )
 
-    def initialize(self, pre_model_load_memory: float):
+    def initialize(self):
         server_args = self.server_args
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -756,7 +763,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
-        if self.tp_size > 1 and supports_torch_tp:
+        if get_tp_size() > 1 and supports_torch_tp:
             self.apply_torch_tp()
 
         # Init lora
@@ -780,7 +787,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(pre_model_load_memory)
+        self.init_memory_pool()
+
+        # Freeze the context: materialize static derived flags and close the static
+        # write surface (the flag inputs are all resolved by this point).
+        get_context().freeze()
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_device_graphs so warmup
@@ -1332,7 +1343,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.server_args.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
-            if self.tp_rank == 0:
+            if get_tp_rank() == 0:
                 instance_ip = NetworkAddress.resolve_host(socket.gethostname())
                 t = threading.Thread(
                     target=trigger_init_weights_send_group_for_remote_instance_request,

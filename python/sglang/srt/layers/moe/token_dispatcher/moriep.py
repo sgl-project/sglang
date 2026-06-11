@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     is_tbo_enabled,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -1105,7 +1106,8 @@ class MoriEPDispatcher(BaseDispatcher):
         return self._get_impl().combine_b(*inner_state)
 
     def _get_impl(self) -> _MoriEPDispatcherImplBase:
-        is_extend_in_batch = get_is_extend_in_batch()
+        is_extend_in_batch = get_flags().is_extend_in_batch
+        assert is_extend_in_batch == get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             return self._normal_dispatcher
