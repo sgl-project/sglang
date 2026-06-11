@@ -26,13 +26,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.evict_policy import PriorityStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PrefetchTimeoutConfig,
 )
-from sglang.srt.mem_cache.evict_policy import PriorityStrategy
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
