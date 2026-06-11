@@ -1135,10 +1135,14 @@ class DeepseekSparseAttnBackend(
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend(include_v2=True)
         ):
+            if forward_mode.is_draft_extend(include_v2=True):
+                schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
+            else:
+                schedule_seqlens_expanded = seqlens_expanded
             seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode,
                 metadata.cache_seqlens_int32,
-                seqlens_expanded,
+                schedule_seqlens_expanded,
                 bs,
             )
             new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
@@ -1352,7 +1356,7 @@ class DeepseekSparseAttnBackend(
                 seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                     forward_mode,
                     metadata.cache_seqlens_int32,
-                    metadata.dsa_seqlens_expanded[: precomputed.seqlens_expanded_size],
+                    metadata.dsa_seqlens_expanded,
                     bs,
                 )
             new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
@@ -1499,9 +1503,10 @@ class DeepseekSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
+            # flash_mla_sparse_fwd / tilelang require int32 page indices.
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
-            )
+            ).to(torch.int32)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2247,13 +2252,13 @@ class DeepseekSparseAttnBackend(
         """
         Decide all attention prefill dispatch strategies for this batch.
         """
-        from sglang.srt.compilation.piecewise_context_manager import (
-            is_in_piecewise_cuda_graph,
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            is_in_tc_piecewise_cuda_graph,
         )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         # Decide MHA vs MLA
-        if is_in_piecewise_cuda_graph():
+        if is_in_tc_piecewise_cuda_graph():
             # Can't branch on seq_lens_cpu in PCG, force mha off to guarantee correctness.
             self.use_mha = False
         elif (

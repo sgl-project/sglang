@@ -3,10 +3,16 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -89,6 +95,174 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertIn("('nixl', 'mooncake')", str(context.exception))
         self.assertIn("'fake'", str(context.exception))
+
+
+class TestContextParallelServerArgs(CustomTestCase):
+    def setUp(self):
+        self.parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(self.parser)
+
+    def _new_cp_args(self, **overrides):
+        server_args = object.__new__(ServerArgs)
+        defaults = dict(
+            enable_prefill_context_parallel=False,
+            enable_dsa_prefill_context_parallel=False,
+            enable_prefill_cp=False,
+            cp_strategy=None,
+            dsa_prefill_cp_mode="round-robin-split",
+            prefill_cp_mode="in-seq-split",
+            attn_cp_size=1,
+            tp_size=1,
+            dp_size=1,
+            moe_dp_size=1,
+            ep_size=1,
+            pp_size=1,
+            enable_aiter_allreduce_fusion=False,
+        )
+        defaults.update(overrides)
+        for key, value in defaults.items():
+            setattr(server_args, key, value)
+        return server_args
+
+    def test_canonical_prefill_cp_cli_sets_unified_fields(self):
+        args = self.parser.parse_args(
+            ["--model", "dummy", "--enable-prefill-cp", "--cp-strategy", "interleave"]
+        )
+
+        self.assertTrue(args.enable_prefill_cp)
+        self.assertEqual(args.cp_strategy, "interleave")
+
+    def test_canonical_prefill_cp_requires_strategy(self):
+        args = self.parser.parse_args(["--model", "dummy", "--enable-prefill-cp"])
+
+        self.assertTrue(args.enable_prefill_cp)
+        self.assertIsNone(args.cp_strategy)
+
+        server_args = self._new_cp_args(
+            enable_prefill_cp=args.enable_prefill_cp,
+            cp_strategy=args.cp_strategy,
+        )
+        with self.assertRaisesRegex(ValueError, "--cp-strategy"):
+            server_args._handle_context_parallelism()
+
+    def test_deprecated_dsa_cp_mode_maps_to_unified_strategy(self):
+        args = self.parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--enable-dsa-prefill-context-parallel",
+                "--dsa-prefill-cp-mode",
+                "round-robin-split",
+            ]
+        )
+        server_args = self._new_cp_args(
+            enable_dsa_prefill_context_parallel=(
+                args.enable_dsa_prefill_context_parallel
+            ),
+            dsa_prefill_cp_mode=args.dsa_prefill_cp_mode,
+        )
+
+        server_args._handle_legacy_cp_arguments()
+
+        self.assertTrue(server_args.enable_prefill_cp)
+        self.assertEqual(server_args.cp_strategy, "interleave")
+        self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
+
+    def test_canonical_interleave_cp_mirrors_to_dsa_runtime_aliases(self):
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attention_backend="dsa",
+        )
+
+        server_args._handle_legacy_cp_arguments()
+        server_args._handle_context_parallelism()
+
+        self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
+        self.assertFalse(server_args.enable_prefill_context_parallel)
+        self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
+        self.assertEqual(server_args.prefill_cp_mode, "round-robin-split")
+
+    def test_registered_cp_legacy_args_map_to_unified_strategy(self):
+        cases = [
+            (
+                "deepseek_v3_mla_cp",
+                dict(enable_prefill_context_parallel=True),
+                "zigzag",
+                "in-seq-split",
+                False,
+                True,
+            ),
+            (
+                "qwen3_gqa_cp",
+                dict(
+                    enable_prefill_context_parallel=True,
+                    tp_size=4,
+                    attn_cp_size=2,
+                ),
+                "zigzag",
+                "in-seq-split",
+                False,
+                True,
+            ),
+            (
+                "deepseek_v32_dsa_in_seq_split",
+                dict(
+                    enable_dsa_prefill_context_parallel=True,
+                    dsa_prefill_cp_mode="in-seq-split",
+                    tp_size=8,
+                    dp_size=2,
+                    attn_cp_size=4,
+                ),
+                "zigzag",
+                "in-seq-split",
+                True,
+                False,
+            ),
+            (
+                "deepseek_v32_dsa_round_robin_split",
+                dict(
+                    enable_dsa_prefill_context_parallel=True,
+                    tp_size=8,
+                    attn_cp_size=8,
+                ),
+                "interleave",
+                "round-robin-split",
+                True,
+                False,
+            ),
+            (
+                "deepseek_v4_flash_fp4_b200_dsa_round_robin_split",
+                dict(
+                    enable_dsa_prefill_context_parallel=True,
+                    dsa_prefill_cp_mode="round-robin-split",
+                    tp_size=4,
+                    attn_cp_size=4,
+                ),
+                "interleave",
+                "round-robin-split",
+                True,
+                False,
+            ),
+        ]
+
+        for name, overrides, strategy, mode, expect_dsa, expect_generic in cases:
+            with self.subTest(name=name):
+                server_args = self._new_cp_args(**overrides)
+
+                server_args._handle_legacy_cp_arguments()
+                server_args._handle_context_parallelism()
+
+                self.assertTrue(server_args.enable_prefill_cp)
+                self.assertEqual(server_args.cp_strategy, strategy)
+                self.assertEqual(server_args.dsa_prefill_cp_mode, mode)
+                self.assertEqual(server_args.prefill_cp_mode, mode)
+                self.assertEqual(
+                    server_args.enable_dsa_prefill_context_parallel, expect_dsa
+                )
+                self.assertEqual(
+                    server_args.enable_prefill_context_parallel, expect_generic
+                )
 
 
 class TestPortArgs(unittest.TestCase):
@@ -522,6 +696,38 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestAdaptiveSpecArgs(CustomTestCase):
+    def test_adaptive_defaults_to_config_step_when_spec_params_omitted(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 3, 5]},
+                    "8": {"candidate_steps": [1]},
+                },
+                f,
+            )
+            f.flush()
+
+            args = ServerArgs(model_path="dummy")
+            args.speculative_algorithm = "EAGLE"
+            args.speculative_adaptive = True
+            args.speculative_adaptive_config = f.name
+            args.device = "cuda"
+            args.get_model_config = lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["LlamaForCausalLM"],
+                    get_text_config=lambda: SimpleNamespace(),
+                )
+            )
+
+            handle_speculative_decoding(args)
+
+        self.assertTrue(args.speculative_adaptive)
+        self.assertEqual(args.speculative_eagle_topk, 1)
+        self.assertEqual(args.speculative_num_steps, 3)
+        self.assertEqual(args.speculative_num_draft_tokens, 4)
+
+
 class TestDeepEPWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
@@ -609,7 +815,7 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(attn_cp_size=2, tp_size=2))
 
     def test_rejects_prefill_context_parallel(self):
-        with self.assertRaisesRegex(ValueError, "--enable-prefill-context-parallel"):
+        with self.assertRaisesRegex(ValueError, "--enable-prefill-cp"):
             ServerArgs(**self._base_kwargs(enable_prefill_context_parallel=True))
 
     def test_rejects_hisparse(self):
@@ -621,9 +827,61 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
 
 
-class TestCutedslMoeMaxNumTokens(unittest.TestCase):
+class TestCudaGraphConfigDataclassAccess(CustomTestCase):
+    def test_overlap_force_cpu_seq_lens_with_tc_piecewise_prefill(self):
+        from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
+
+        server_args = SimpleNamespace(
+            enable_two_batch_overlap=False,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
+            ),
+        )
+        attn_backend = SimpleNamespace(needs_cpu_seq_lens=False)
+
+        self.assertTrue(decide_needs_cpu_seq_lens(server_args, [attn_backend]))
+
+    @patch(
+        "sglang.srt.model_executor.runner_backend."
+        "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
+    )
+    def test_tc_piecewise_build_config_reads_phase_config_dataclass(
+        self, mock_get_moe_a2a_backend
+    ):
+        from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+            TcPiecewiseCudaGraphBackend,
+        )
+
+        mock_backend = mock_get_moe_a2a_backend.return_value
+        mock_backend.is_deepep.return_value = False
+        mock_backend.is_mooncake.return_value = False
+        server_args = SimpleNamespace(
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(
+                    backend=Backend.TC_PIECEWISE,
+                    bs=[32, 64],
+                    tc_compiler="eager",
+                )
+            ),
+            enable_torch_compile_debug_mode=False,
+        )
+
+        config = TcPiecewiseCudaGraphBackend.build_compilation_config(server_args)
+
+        self.assertEqual(config.get_capture_sizes(), [32, 64])
+        self.assertEqual(config.compiler, "eager")
+
+
+class TestCutedslMoeMaxNumTokens(CustomTestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
-    to exercise the math independently of __post_init__ resolution."""
+    to exercise the math independently of __post_init__ resolution.
+
+    cg-refactor: the legacy disable_piecewise_cuda_graph /
+    piecewise_cuda_graph_max_tokens / cuda_graph_max_bs fields were
+    consolidated into cuda_graph_config; the helper accepts the legacy
+    kwarg names for test readability and translates them to the per-phase
+    dataclasses.
+    """
 
     def _args(self, **overrides):
         server_args = ServerArgs(model_path="dummy")
@@ -636,8 +894,21 @@ class TestCutedslMoeMaxNumTokens(unittest.TestCase):
             cuda_graph_max_bs=512,
         )
         fields.update(overrides)
+        disable_piecewise = fields.pop("disable_piecewise_cuda_graph")
+        piecewise_max = fields.pop("piecewise_cuda_graph_max_tokens")
+        cg_max_bs = fields.pop("cuda_graph_max_bs")
         for key, value in fields.items():
             setattr(server_args, key, value)
+        server_args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=cg_max_bs),
+            prefill=PhaseConfig(
+                backend=(
+                    Backend.DISABLED if disable_piecewise else Backend.TC_PIECEWISE
+                ),
+                max_bs=piecewise_max,
+                tc_compiler="eager",
+            ),
+        )
         return server_args
 
     def test_prefill_dominates_in_default_config(self):

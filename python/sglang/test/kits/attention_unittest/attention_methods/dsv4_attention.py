@@ -27,6 +27,11 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import set_global_server_args_for_scheduler
@@ -329,8 +334,18 @@ class MockDSV4ModelRunner:
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             disable_radix_cache=False,
             disaggregation_mode=None,
             dp_size=1,
@@ -518,9 +533,12 @@ class ProjectedDSV4Attention(nn.Module):
             # `[num_tokens, 1, hidden_dim]`.
             k_flat = k.reshape(k.shape[0], -1).to(torch.bfloat16)
             pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_flat)
-            attn_backend.token_to_kv_pool.set_swa_key_buffer_radix(
+            pool = attn_backend.token_to_kv_pool
+            pool.set_swa_key_buffer_radix(
                 layer_id=self.attn.layer_id,
-                raw_loc=forward_batch.out_cache_loc.to(torch.int64),
+                swa_loc=pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc.to(torch.int64)
+                ),
                 cache_nope_fp8_rope_bf16_pack=pack,
             )
         out = attn_backend.forward(
@@ -546,7 +564,9 @@ def _write_swa_cache(
     pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_bf16.to(torch.bfloat16))
     runner.token_to_kv_pool.set_swa_key_buffer_radix(
         layer_id=layer_id,
-        raw_loc=loc.to(torch.int64),
+        swa_loc=runner.token_to_kv_pool.translate_loc_from_full_to_swa(
+            loc.to(torch.int64)
+        ),
         cache_nope_fp8_rope_bf16_pack=pack,
     )
 

@@ -37,12 +37,14 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
 try:
@@ -82,12 +84,13 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
+from sglang.srt.utils.common import is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, temp_set_env
 from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
@@ -746,7 +749,43 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        model.load_weights(weights)
+        # Used in tests to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            peak_memory = torch.cuda.max_memory_allocated()
+            logger.debug(
+                "Peak GPU memory before loading weights: %s GiB",
+                f"{peak_memory / GIB_BYTES:.3f}",
+            )
+            memory_start = get_available_gpu_memory(
+                target_device.type, gpu_id=torch.cuda.current_device()
+            )
+
+        quant_config = getattr(model, "quant_config", None)
+        is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
+
+        if is_nvfp4_online:
+            # Scope exact FP4 quantization math to load-time conversion only;
+            # restore the original environment before serving starts.
+            with temp_set_env(
+                TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
+                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
+            ):
+                model.load_weights(weights)
+            if target_device.type == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        else:
+            model.load_weights(weights)
+
+        # Used in tests to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            memory_end = get_available_gpu_memory(
+                target_device.type, gpu_id=torch.cuda.current_device()
+            )
+            logger.debug(
+                "Memory increase during load_weights: %s GiB",
+                f"{memory_start - memory_end:.3f}",
+            )
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)

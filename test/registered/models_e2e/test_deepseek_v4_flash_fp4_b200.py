@@ -156,5 +156,56 @@ class TestDSV4FlashFP4NonMTPB200(
             kill_process_tree(cls.process.pid)
 
 
+class TestDSV4FlashFP4BreakableCudaGraphB200(
+    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
+):
+    """BCG recipe: TP=4, DP=4, DeepEP, DP attention, mixed chunk."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--dp",
+                "4",
+                "--enable-dp-attention",
+                "--enable-mixed-chunk",
+                "--cuda-graph-backend-prefill",
+                "breakable",
+                "--moe-a2a-backend",
+                "deepep",
+                "--deepep-config",
+                DEEPEP_CONFIG,
+                "--chunked-prefill-size",
+                "4096",
+                "--piecewise-cuda-graph-max-tokens",
+                "1024",
+                "--mem-fraction-static",
+                "0.80",
+                "--cuda-graph-max-bs",
+                "16",
+                "--max-running-requests",
+                "128",
+                "--watchdog-timeout",
+                "900",
+            ],
+            env=_DEEPEP_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,7 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     KVCache,
@@ -1874,7 +1875,7 @@ class LogicalHostPool:
         return 0
 
 
-class DeepSeekV4PagedHostPool(HostKVCache):
+class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     """Host mirror for a DeepSeek V4 paged KV/indexer sub-pool."""
 
     def __init__(
@@ -1979,13 +1980,27 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         )
         self.clear()
 
+    def get_contiguous_buf_infos(self):
+        """Return per-layer page-row buffers for PD direct-to-host transfer."""
+        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [self.item_bytes * self.dtype.itemsize] * self.layer_num
+        return data_ptrs, data_lens, item_lens
+
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        if indices.numel() % self.slot_page_size != 0:
-            raise ValueError(
-                f"{self.pool_name} transfer indices must be page-aligned, "
-                f"got numel={indices.numel()}, slot_page_size={self.slot_page_size}"
-            )
         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
+
+    def _has_transfer_indices(
+        self, host_indices: torch.Tensor | None, device_indices: torch.Tensor | None
+    ) -> bool:
+        if host_indices is None or device_indices is None:
+            return False
+        if host_indices.numel() != device_indices.numel():
+            raise ValueError(
+                f"{self.pool_name} transfer index size mismatch: "
+                f"host={host_indices.numel()}, device={device_indices.numel()}"
+            )
+        return host_indices.numel() > 0
 
     def get_size_per_token(self):
         return self.item_bytes
@@ -2026,12 +2041,26 @@ class DeepSeekV4PagedHostPool(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        if host_indices is None or device_indices is None:
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        if (
+            host_indices.numel() % self.slot_page_size != 0
+            or device_indices.numel() % self.slot_page_size != 0
+        ):
+            # Whole C4 pages can use the normal HiCache page-row copy below.
+            # Token-granular DSV4 C4 copy needs this helper because a token is
+            # not one contiguous byte range in the paged row:
+            # [value0..value63][scale0..scale63].
+            transfer_cache_dsv4_mla(
+                src_ptrs=self.device_ptrs,
+                dst_ptrs=self.data_ptrs,
+                src_indices=device_indices.to(dtype=torch.int64),
+                dst_indices=host_indices.to(dtype=torch.int64),
+            )
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":
-            assert self.data_ptrs is not None
             transfer_kv_all_layer_mla(
                 src_layers=self.device_ptrs,
                 dst_layers=self.data_ptrs,
@@ -2074,10 +2103,24 @@ class DeepSeekV4PagedHostPool(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
-        if host_indices is None or device_indices is None:
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        if (
+            host_indices.numel() % self.slot_page_size != 0
+            or device_indices.numel() % self.slot_page_size != 0
+        ):
+            # Same DSV4 C4 layout issue as backup: this is token-granular
+            # preload, so it cannot use the normal HiCache page-row copy.
+            transfer_cache_dsv4_mla(
+                src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
+                dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],
+                src_indices=host_indices.to(dtype=torch.int64),
+                dst_indices=device_indices.to(dtype=torch.int64),
+            )
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
+
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],
@@ -2531,8 +2574,8 @@ class PoolEntry:
     device_evict_fn: Optional[Callable] = None
     # Optional alloc/free overrides for the device side, used by
     # _resolve_pool_transfers_allocation. Set when entry.device_pool is the
-    # raw KV pool (layout) rather than an allocator (e.g. SWA, where alloc
-    # lives on a separate sub-allocator inside SWATokenToKVPoolAllocator).
+    # raw KV/state pool (layout) rather than an allocator (e.g. SWA/Mamba,
+    # where alloc lives on a separate allocator object).
     # When None, fall back to entry.device_pool.alloc/free.
     device_alloc_fn: Optional[Callable] = None
     device_free_fn: Optional[Callable] = None
