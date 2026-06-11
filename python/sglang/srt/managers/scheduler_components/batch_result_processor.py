@@ -561,12 +561,17 @@ class SchedulerBatchResultProcessor:
                 continue
 
             if req.finished():
-                # -1 because prepare_for_decode pre-claimed the bonus slot.
-                req.kv_committed_len -= 1
+                if not batch.spec_algorithm.is_dflash():
+                    # EAGLE prepare_for_decode pre-claimed the bonus slot.
+                    req.kv_committed_len -= 1
                 continue
 
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
+            if batch.spec_algorithm.is_dflash():
+                # DFLASH materialized accepted draft tokens plus the bonus token.
+                req.kv_committed_len += accept_lens[i]
+            else:
+                # EAGLE prepare_for_decode pre-claimed the bonus slot.
+                req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
