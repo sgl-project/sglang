@@ -158,6 +158,15 @@ class GenerateReqInput(BaseReq):
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
+    # Optional per-image hashes the caller has already computed (hex strings,
+    # one per image in `image_data`). When supplied, each MultimodalDataItem's
+    # `hash` is initialised from this list and `set_pad_value` skips the
+    # internal `hash_feature()` recompute, so the resulting `pad_value` is
+    # deterministic from the caller's hash. Intended for external KV routers
+    # that compute their own per-image hash for routing decisions and need
+    # sglang's prefix-cache key to align. When unset, behavior is unchanged
+    # (sglang hashes the processor feature tensor).
+    mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
     # The sampling_params. See descriptions below.
@@ -250,6 +259,9 @@ class GenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # Whether to return prompt token IDs without computing logprobs
+    return_prompt_token_ids: bool = False
+
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
@@ -258,6 +270,9 @@ class GenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
     mm_data_mooncake: Optional[List] = None
+    # Snapshot of encoder URLs at the time tokenizer-side computed
+    # ``num_items_assigned``.
+    encoder_urls: Optional[List[str]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -703,6 +718,7 @@ class GenerateReqInput(BaseReq):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             received_time=self.received_time,
@@ -802,6 +818,10 @@ class TokenizedGenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
     mm_data_mooncake: Optional[List] = None
+    # Encoder URL snapshot frozen at tokenizer-side dispatch time so that
+    # encoder_idx assignments stay consistent in the scheduler subprocess.
+    # Internal IPC only.
+    encoder_urls: Optional[List[str]] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
@@ -886,6 +906,9 @@ class EmbeddingReqInput(BaseReq):
 
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
+
+    # Whether to return prompt token IDs without computing logprobs
+    return_prompt_token_ids: bool = False
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
@@ -993,6 +1016,7 @@ class EmbeddingReqInput(BaseReq):
                 is_cross_encoder_request=True,
                 http_worker_ipc=self.http_worker_ipc,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
+                return_prompt_token_ids=self.return_prompt_token_ids,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
@@ -1022,6 +1046,7 @@ class EmbeddingReqInput(BaseReq):
                 http_worker_ipc=self.http_worker_ipc,
                 received_time=self.received_time,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
+                return_prompt_token_ids=self.return_prompt_token_ids,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
@@ -1650,7 +1675,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 @dataclass
 class CheckWeightsReqInput(BaseReq):
-    action: str
+    action: str = "checksum"
 
 
 @dataclass
@@ -1848,6 +1873,7 @@ class ParseFunctionCallReq(BaseReq):
 class SeparateReasoningReqInput(BaseReq):
     text: str  # The text to parse.
     reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
+    return_blocks: bool = False  # If True, also return segmented reasoning blocks.
 
 
 @dataclass
@@ -2061,6 +2087,14 @@ class GetLoadsReqOutput(BaseReq):
     )
     num_waiting_reqs: int = field(
         metadata={"metric": ("gauge", "Number of waiting requests")}
+    )
+    num_waiting_uncached_tokens: int = field(
+        metadata={
+            "metric": (
+                "gauge",
+                "Number of uncached input tokens waiting for prefill compute",
+            )
+        }
     )
     num_used_tokens: int = field(
         metadata={"metric": ("gauge", "Number of tokens in use")}
