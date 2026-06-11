@@ -2,7 +2,7 @@
 sgl_kernel AOT vs torch.
 
 Run on SM90+ (Hopper or later):
-    python -m sglang.jit_kernel.benchmark.bench_dsv3_fused_a_gemm
+    python test/registered/jit/benchmark/bench_dsv3_fused_a_gemm.py
 """
 
 import torch
