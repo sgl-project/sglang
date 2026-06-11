@@ -113,26 +113,43 @@ scaling  long_prefill_8k    32       680.0    ...       ...      4.03x    ...   
 
 ## Reference numbers
 
-From a complete run on `Qwen/Qwen2.5-7B-Instruct`, single A100 80GB-class GPU,
-3 reps, `N` swept to 32. `decode_tps` is the aggregate decode throughput across
-the `N` concurrent streams in a cell, averaged over the 3 reps; `p95×N1` is
-p95(wall latency at `N`) / p95(wall latency at `N=1`).
+From a complete run on `Qwen/Qwen2.5-7B-Instruct`, 1x A100-SXM4-80GB
+(driver 580, CUDA 13 stack), 3 reps, 64 prompts/cell, `N` swept over
+{1, 8, 32}, both server configs (default and `--disable-radix-cache`).
+`decode tok/s` is the aggregate decode throughput across the `N` concurrent
+streams in a cell, averaged over the 3 reps; `p95×N1` is
+p95(wall latency at `N`) / p95(wall latency at `N=1`). Zero failed requests
+across all 108 cells.
 
-| Phase | Workload | decode tok/s (N=32) | p95 wall-latency mult vs N=1 |
+| Phase | Workload | decode tok/s (N=32) | p95 wall mult vs N=1 | p95 TTFT (N=32) |
+|---|---|---:|---:|---:|
+| scaling | `long_decode` | 1518 | 1.48x | 889ms |
+| scaling | `long_prefill_8k` | 122 | 17.4x | 7374ms |
+| scaling | `repeated_prefix` | 1080 | 2.33x | 1274ms |
+| ttft | `long_decode` | 1489 | 1.44x | 216ms |
+| ttft | `long_prefill_8k` | 123 | 16.9x | 6493ms |
+| ttft | `repeated_prefix` | 1162 | 1.83x | 384ms |
+
+Radix cache on vs off (`--disable-radix-cache`), same run:
+
+| Workload (N=32) | Metric | radix on | radix off |
 |---|---|---:|---:|
-| scaling | `long_decode` | 2288 | 1.36x |
-| scaling | `long_prefill_8k` | 680 | 4.03x |
-| scaling | `repeated_prefix` | 1474 | 2.25x |
-| ttft | `long_decode` | 1719 | 1.38x |
-| ttft | `long_prefill_8k` | 461 | 4.82x |
-| ttft | `repeated_prefix` | 1236 | 2.12x |
+| `long_decode` / `long_prefill_8k` | all metrics | identical | identical |
+| `repeated_prefix` scaling | decode tok/s | 1080 | 648 |
+| `repeated_prefix` scaling | p95 wall | 2931ms | 5578ms |
+| `repeated_prefix` ttft | p95 TTFT | 384ms | 1157ms |
+
+The identical numbers on the two non-shared workloads double as a
+zero-overhead check: enabling the radix cache costs nothing when traffic has
+no reusable prefixes.
 
 ## How to read the boundary
 
 The signal is workload shape, not a single throughput ranking. **Long-decode**
-traffic stays comparatively stable through `N=32` (p95 multiplier ~1.36–1.38x).
-**Long-prefill** and **repeated-prefix** traffic cross a much sharper tail
-boundary (p95 multiplier ~2–5x) — these are the shapes operators tune with
-chunked-prefill size, prefix caching, and scheduling knobs. Running the same
-sweep against `--disable-radix-cache` and different `--chunked-prefill-size`
-values isolates how much each knob moves the boundary.
+traffic stays comparatively stable through `N=32` (p95 multiplier ~1.4x).
+**Long-prefill** traffic crosses a much sharper tail boundary (p95 multiplier
+~17x at N=32) — this is the shape operators tune with chunked-prefill size and
+scheduling knobs. **Repeated-prefix** traffic shows where prefix caching moves
+the boundary directly (+67% throughput, 3x tail TTFT at N=32 in the reference
+run). Running the same sweep against `--disable-radix-cache` and different
+`--chunked-prefill-size` values isolates how much each knob moves the boundary.
