@@ -60,9 +60,12 @@ on:
 # defines must be redeclared here for the called job to see the same context.
 env:
   SGLANG_IS_IN_CI: true
+  # base-a runs the fwd-occupancy sanity kit; async-assert probes add GPU work
+  # and skew the occupancy measurement, so keep them off in that stage.
+  SGLANG_ENABLE_ASYNC_ASSERT: ${{ startsWith(inputs.self_name, 'base-a') && 'false' || 'true' }}
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_PR_TEST_HEALTH_CHECK: ${{ fromJson(inputs.caller_inputs).skip_pr_test_health_check && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
   FORCE_REBUILD_DEEPEP: '1'
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -119,6 +122,8 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
+        env:
+          GRACE_BLACKWELL: ${{ steps.rc.outputs.grace_blackwell || '0' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 

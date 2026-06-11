@@ -957,7 +957,7 @@ class MllamaForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
 
         batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need = (
             self._batch_image_inputs(forward_batch)
@@ -968,9 +968,18 @@ class MllamaForConditionalGeneration(nn.Module):
         cross_attention_states = None
 
         if get_is_capture_mode():
-            # NOTE: when doing cuda graph capture, we do not want to skip cross attention
-            # Make is a constant value to avoid cuda graph capture issue
-            skip_cross_attention = False
+            # NOTE: during graph capture/replay skip_cross_attention must be a
+            # compile-time constant to avoid graph breaks from data-dependent
+            # branching.  CPUGraphRunner captures two graphs per batch size (one
+            # with skip=True, one with skip=False) and sets the override via
+            # capture_with_skip_cross_attention(); fall back to False for CUDA
+            # graph capture which only captures the no-skip variant.
+            from sglang.srt.model_executor.cpu_graph_runner import (
+                get_capture_skip_cross_attention,
+            )
+
+            _override = get_capture_skip_cross_attention()
+            skip_cross_attention = _override if _override is not None else False
         else:
             # NOTE: we do not need image_inputs when prefill
             assert len(forward_batch.encoder_lens) == len(forward_batch.seq_lens)
