@@ -267,10 +267,30 @@ class ReqToTokenPool:
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
+    def alloc_by_count(self, n: int) -> Optional[List[int]]:
+        """Allocate n slots and return their raw indices without touching any Req object.
+
+        This is the low-level counterpart of alloc() for callers (e.g. beam search)
+        that need bare pool slots not associated with a specific Req.
+        """
+        if n > len(self.free_slots):
+            return None
+        indices = self.free_slots[:n]
+        self.free_slots = self.free_slots[n:]
+        return indices
+
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
+
+    def free_by_indices(self, indices: List[int]):
+        """Free slots by raw pool indices without a Req object.
+
+        This is the low-level counterpart of free() for callers (e.g. beam search)
+        that hold bare pool indices rather than Req objects.
+        """
+        self.free_slots.extend(indices)
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))

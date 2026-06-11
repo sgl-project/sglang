@@ -69,6 +69,10 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.schedule_batch_beam_search_mixin import (
+    ReqBeamSearchMixin,
+    ScheduleBatchBeamSearchMixin,
+)
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -640,7 +644,7 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
-class Req(ReqDllmMixin):
+class Req(ReqDllmMixin, ReqBeamSearchMixin):
     """The input and output status of a request."""
 
     def __init__(
@@ -666,6 +670,7 @@ class Req(ReqDllmMixin):
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
+        is_beam_search: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -978,6 +983,9 @@ class Req(ReqDllmMixin):
         # For Matryoshka embeddings
         self.dimensions = dimensions
 
+        # beam search (initialized via mixin)
+        self._init_beam_search_attributes(is_beam_search, self.sampling_params)
+
         # Whether to return pooled hidden states (pre-head transformer output)
         self.return_pooled_hidden_states = return_pooled_hidden_states
         self.pooled_hidden_state = None
@@ -997,9 +1005,14 @@ class Req(ReqDllmMixin):
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
+        # NOTE: prefill-only skips sampling, so beam search cannot be prefill-only as it requires sampling to obtain logprobs
 
-        spec_alg = get_global_server_args().speculative_algorithm
-        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
+        server_args = get_global_server_args()
+        return (
+            self.sampling_params.max_new_tokens == 0
+            and server_args.speculative_algorithm is None
+            and not server_args.enable_beam_search
+        )
 
     @property
     def output_ids_through_stop(self) -> array[int]:
@@ -1602,7 +1615,9 @@ def _compute_chunked_req_next_prompt_token(
 
 
 @dataclasses.dataclass
-class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+class ScheduleBatch(
+    ScheduleBatchDisaggregationDecodeMixin, ScheduleBatchBeamSearchMixin
+):
     """Store all information of a batch on the scheduler."""
 
     # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
@@ -2547,6 +2562,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
+        if self.reqs and self.reqs[0].is_beam_search:
+            self.prepare_for_beam_search_decode()
+            return
+
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
@@ -2641,6 +2660,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
+        if self.reqs and self.reqs[0].is_beam_search:
+            self.filter_beam_search_batch(
+                chunked_req_to_exclude=chunked_req_to_exclude,
+                keep_indices=keep_indices,
+            )
+            return
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]

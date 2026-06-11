@@ -451,6 +451,7 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    enable_beam_search: bool = False
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -1082,6 +1083,9 @@ class ServerArgs:
 
         # Handle debug utilities.
         self._handle_debug_utils()
+
+        # Handle beam search mode.
+        self._handle_beam_search()
 
         # Handle any other necessary validations.
         self._handle_other_validations()
@@ -4619,6 +4623,43 @@ class ServerArgs:
                 f"(got {self.asr_max_concurrent_sessions})."
             )
 
+    def _handle_beam_search(self):
+        """
+        Handle beam search mode configuration.
+        When beam search is enabled, automatically disable incompatible features.
+        """
+        if not self.enable_beam_search:
+            return
+
+        # Beam search is incompatible with several optimization features.
+        # We automatically disable them and warn the user.
+        modified = []
+
+        if self.disaggregation_mode != "null":
+            self.disaggregation_mode = "null"
+            modified.append("PD separation")
+
+        if self.pp_size != 1:
+            self.pp_size = 1
+            modified.append("pipeline parallelism")
+
+        if not self.disable_overlap_schedule:
+            self.disable_overlap_schedule = True
+            modified.append("overlap schedule")
+
+        if self.chunked_prefill_size != -1:
+            self.chunked_prefill_size = -1
+            modified.append("chunked prefill")
+
+        if self.page_size != 1:
+            self.page_size = 1
+            modified.append("page_size (forced to 1)")
+
+        if modified:
+            logger.warning(
+                f"Beam search enabled. Automatically disabled incompatible features: {', '.join(modified)}"
+            )
+
     def _handle_other_validations(self):
         # Handle optimistic prefill validation
         if (
@@ -5170,6 +5211,11 @@ class ServerArgs:
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'priority' evicts lower-priority requests first.",
+        )
+        parser.add_argument(
+            "--enable-beam-search",
+            action="store_true",
+            help="Enable beam search sampling mode",
         )
         parser.add_argument(
             "--enable-prefill-delayer",
