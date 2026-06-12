@@ -440,6 +440,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        num_allocatable_reqs: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -499,6 +500,9 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        # Snapshot of allocatable request slots; None when not applicable
+        # this pass. Used by PrefillDelayer's slot-refill trigger.
+        self.num_allocatable_reqs = num_allocatable_reqs
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -865,6 +869,7 @@ class PrefillAdder:
                 max_prefill_bs=self.max_prefill_bs,
                 max_running_requests=self.max_running_requests,
                 waiting_queue_len=self.waiting_queue_len,
+                num_allocatable_reqs=self.num_allocatable_reqs,
             )
         ):
             return AddReqResult.OTHER

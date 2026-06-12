@@ -234,11 +234,7 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.speculative.dflash_utils import (
-    resolve_dflash_prefill_refill_target,
-    should_delay_dflash_prefill_for_batching,
-    validate_dflash_request,
-)
+from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -881,11 +877,6 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        self.dflash_prefill_refill_target = (
-            resolve_dflash_prefill_refill_target(self.max_running_requests)
-            if self.spec_algorithm.is_dflash()
-            else 1
-        )
         if not get_global_server_args().pp_max_micro_batch_size:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // self.ps.pp_size, 1
@@ -1033,6 +1024,14 @@ class Scheduler(
                     ),
                     max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
+                    # Cap at max_running_requests: a larger target could never
+                    # be reached and would always delay until the time cap.
+                    refill_target=(
+                        min(x, self.max_running_requests)
+                        if (x := self.server_args.prefill_delayer_refill_target)
+                        is not None
+                        else None
+                    ),
                     device=self.tp_group.device,
                 )
 
@@ -2593,19 +2592,6 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def _should_delay_dflash_prefill_for_batching(self, running_bs: int) -> bool:
-        if not self.spec_algorithm.is_dflash():
-            return False
-        if running_bs <= 0 or self.chunked_req is not None:
-            return False
-
-        return should_delay_dflash_prefill_for_batching(
-            running_bs=running_bs,
-            num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
-            max_running_requests=self.max_running_requests,
-            prefill_refill_target=self.dflash_prefill_refill_target,
-        )
-
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2648,8 +2634,7 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
-        if self._should_delay_dflash_prefill_for_batching(running_bs):
-            return None
+        num_allocatable_reqs = self.get_num_allocatable_reqs(running_bs)
 
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
@@ -2657,7 +2642,7 @@ class Scheduler(
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            num_allocatable_reqs <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
@@ -2698,6 +2683,12 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            # The refill trigger only batches fresh admissions; while a
+            # chunked prefill is in flight the pass must proceed regardless,
+            # so mark the slot count as not applicable.
+            num_allocatable_reqs=(
+                num_allocatable_reqs if self.chunked_req is None else None
+            ),
         )
 
         if self.chunked_req is not None:
