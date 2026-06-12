@@ -957,9 +957,7 @@ class Scheduler(
 
     def partially_extended_reqs(self) -> List[Req]:
         return [
-            r
-            for r in self.active_reqs.values()
-            if r.phase is ReqPhase.EXTEND_NON_LAST
+            r for r in self.active_reqs.values() if r.phase is ReqPhase.EXTEND_NON_LAST
         ]
 
     def init_chunked_prefill(self):
