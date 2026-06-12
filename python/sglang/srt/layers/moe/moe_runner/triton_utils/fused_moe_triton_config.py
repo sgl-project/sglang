@@ -143,6 +143,83 @@ def get_moe_configs(
     return None
 
 
+@functools.lru_cache(maxsize=1)
+def _get_max_shared_mem_bytes() -> Optional[int]:
+    """Per-block shared memory limit of the current device, or None if
+    it cannot be determined (non-CUDA platforms, mocked drivers, ...)."""
+    try:
+        index = torch.cuda.current_device()
+        return triton.runtime.driver.active.utils.get_device_properties(index)[
+            "max_shared_mem"
+        ]
+    except Exception:
+        return None
+
+
+def _estimate_fused_moe_smem_bytes(config: Dict[str, int], dtype: Optional[str]) -> int:
+    """Estimate the shared memory the fused-MoE Triton kernel needs for a
+    config: (num_stages - 1) double-buffered (BLOCK_M x BLOCK_K) A-tiles and
+    (BLOCK_K x BLOCK_N) B-tiles. Matches the requirement Triton reports in
+    OutOfResources (e.g. 147456 = (4-1) * (128 + 256) * 128 for fp8).
+    """
+    elem_bytes = 1 if dtype in ("fp8_w8a8", "int8_w8a8", "int8_w8a16") else 2
+    num_stages = config.get("num_stages", 2)
+    return (
+        max(num_stages - 1, 1)
+        * config["BLOCK_SIZE_K"]
+        * (config["BLOCK_SIZE_M"] + config["BLOCK_SIZE_N"])
+        * elem_bytes
+    )
+
+
+def clamp_config_to_shared_mem(
+    config: Dict[str, int],
+    dtype: Optional[str],
+    block_shape: Optional[List[int]] = None,
+) -> Dict[str, int]:
+    """Degrade a default fused-MoE config until it fits the device's
+    per-block shared memory limit (issue #28019).
+
+    Default configs are tuned for >=160KB-smem datacenter parts; SM120/SM121
+    (RTX 5090 / RTX PRO 6000 / GB10) expose only ~99KB per block, so e.g. the
+    fp8_w8a8 prefill default (128x256x128, 4 stages -> 147456B) aborts the
+    first forward pass with triton OutOfResources. Degrade num_stages first
+    (cheapest perf-wise), then halve BLOCK_SIZE_N / BLOCK_SIZE_K. For
+    block-quantized weights (block_shape set), BLOCK_SIZE_N/K are tied to the
+    quant block geometry, so only num_stages is degraded.
+    """
+    limit = _get_max_shared_mem_bytes()
+    if limit is None or _estimate_fused_moe_smem_bytes(config, dtype) <= limit:
+        return config
+    original = dict(config)
+    config = dict(config)
+    while (
+        _estimate_fused_moe_smem_bytes(config, dtype) > limit
+        and config.get("num_stages", 2) > 2
+    ):
+        config["num_stages"] -= 1
+    if block_shape is None:
+        while (
+            _estimate_fused_moe_smem_bytes(config, dtype) > limit
+            and config["BLOCK_SIZE_N"] > 64
+        ):
+            config["BLOCK_SIZE_N"] //= 2
+        while (
+            _estimate_fused_moe_smem_bytes(config, dtype) > limit
+            and config["BLOCK_SIZE_K"] > 64
+        ):
+            config["BLOCK_SIZE_K"] //= 2
+    logger.warning(
+        "Default fused-MoE Triton config %s needs more shared memory than the "
+        "device provides (%d bytes); degraded to %s. Consider contributing a "
+        "tuned config for this device (see benchmark/kernels/fused_moe_triton).",
+        original,
+        limit,
+        config,
+    )
+    return config
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -246,9 +323,15 @@ def try_get_optimal_moe_config(
             # optimal config
             config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
         else:
-            # Else use the default config
-            config = get_default_config(
-                M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
+            # Else use the default config, degraded if it would exceed the
+            # device's shared memory limit (issue #28019; tuned JSON configs
+            # are per-device and thus already fit).
+            config = clamp_config_to_shared_mem(
+                get_default_config(
+                    M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
+                ),
+                dtype,
+                block_shape,
             )
         if return_down_config:
             down_configs = get_moe_configs(
