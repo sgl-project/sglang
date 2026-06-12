@@ -6845,24 +6845,6 @@ class ServerArgs:
             help="Deprecated alias for --cuda-graph-backend-prefill=breakable.",
         )
         parser.add_argument(
-            "--prefill-cuda-graph-backend",
-            type=str,
-            choices=Backend.ALL,
-            action=DeprecatedAliasStoreAction,
-            dest="cuda_graph_backend_prefill",
-            new_flag="--cuda-graph-backend-prefill",
-            help="Deprecated alias for --cuda-graph-backend-prefill.",
-        )
-        parser.add_argument(
-            "--decode-cuda-graph-backend",
-            type=str,
-            choices=Backend.ALL,
-            action=DeprecatedAliasStoreAction,
-            dest="cuda_graph_backend_decode",
-            new_flag="--cuda-graph-backend-decode",
-            help="Deprecated alias for --cuda-graph-backend-decode.",
-        )
-        parser.add_argument(
             "--disable-prefill-cuda-graph",
             action=DeprecatedStoreTrueAction,
             new_flag="--cuda-graph-backend-prefill=disabled",
