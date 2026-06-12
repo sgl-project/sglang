@@ -1629,8 +1629,6 @@ class MambaPoolHost(HostKVCache):
                 io_backend=io_backend,
             )
             for conv_idx in range(len(self.conv_state_shapes)):
-                if self.conv_state_elem_sizes[conv_idx] <= 0:
-                    continue
                 self._copy_tensor_pf_lf(
                     src=self.conv_buffer[conv_idx],
                     dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
@@ -1649,8 +1647,6 @@ class MambaPoolHost(HostKVCache):
                 io_backend,
             )
             for conv_idx in range(len(self.conv_state_shapes)):
-                if self.conv_state_elem_sizes[conv_idx] <= 0:
-                    continue
                 self._copy_tensor(
                     self.conv_buffer[conv_idx][layer_id],
                     device_pool.mamba_cache.conv[conv_idx][layer_id],
@@ -1673,8 +1669,6 @@ class MambaPoolHost(HostKVCache):
                 io_backend=io_backend,
             )
             for conv_idx in range(len(self.conv_state_shapes)):
-                if self.conv_state_elem_sizes[conv_idx] <= 0:
-                    continue
                 self._copy_tensor_all_layers_lf_pf(
                     src_layers=device_pool.mamba_cache.conv[conv_idx],
                     dst=self.conv_buffer[conv_idx],
@@ -1694,8 +1688,6 @@ class MambaPoolHost(HostKVCache):
                     io_backend,
                 )
                 for conv_idx in range(len(self.conv_state_shapes)):
-                    if self.conv_state_elem_sizes[conv_idx] <= 0:
-                        continue
                     self._copy_tensor(
                         device_pool.mamba_cache.conv[conv_idx][layer_id],
                         self.conv_buffer[conv_idx][layer_id],
