@@ -361,12 +361,28 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         qw = torch_npu.npu_format_cast(qw.view(torch.int8), 29)
 
         # npu_dual_level_quant_matmul expects x2_level0_scale shape [in/512, out]:
-        # squeeze the trailing dim-1 axis, then transpose
-        w_dual_scale = w_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
+        # squeeze the trailing dim-1 axis, then transpose as a strided view.
+        # Mirrors the MXFP8 dense path: skipping .contiguous() avoids a physical
+        # reorder + alloc and keeps stride-1 access for the in-dim scan.
+        # TODO(NPU-validate): npu_dual_level_quant_matmul is a different kernel
+        # than npu_quant_matmul; its strided-view tolerance is NOT yet verified
+        # on Ascend 950/A3. Re-validate output (no garbled tokens) on hardware;
+        # if it regresses, restore `.contiguous()` on this line only.
+        w_dual_scale = w_dual_scale.squeeze(-1).transpose(0, 1)
 
         layer.weight = Parameter(qw, requires_grad=False)
         layer.weight_dual_scale = Parameter(w_dual_scale, requires_grad=False)
         layer.weight_scale = Parameter(w_scale, requires_grad=False)
+        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
+        if (
+            getattr(layer, "bias", None) is not None
+            and layer.bias.dtype != torch.float32
+        ):
+            layer.bias_fp32 = Parameter(
+                layer.bias.data.to(torch.float32), requires_grad=False
+            )
+        else:
+            layer.bias_fp32 = None
 
     def apply(
         self,
@@ -388,6 +404,18 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             x_2d, smooth_scale=None
         )
 
+        # Use the cached FP32 bias from process_weights_after_loading; fall back
+        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
+        if bias is None:
+            quant_bias = None
+        elif (
+            bias is getattr(layer, "bias", None)
+            and getattr(layer, "bias_fp32", None) is not None
+        ):
+            quant_bias = layer.bias_fp32
+        else:
+            quant_bias = bias.to(torch.float32)
+
         # MXFP4 matmul: W4A4 compute (weight already in NZ format + transposed scales)
         output = torch_npu.npu_dual_level_quant_matmul(
             qx,
@@ -396,7 +424,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             layer.weight_dual_scale,
             act_l1_scale,
             layer.weight_scale,
-            bias=bias.to(torch.float32) if bias is not None else None,
+            bias=quant_bias,
             output_dtype=original_dtype,
         )
 
