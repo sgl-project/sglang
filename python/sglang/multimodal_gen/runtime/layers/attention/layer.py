@@ -435,7 +435,7 @@ class USPAttention(nn.Module):
                     f"but got {backend_enum.name}. "
                     f"Please ensure your platform supports these backends."
                 )
-        impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
+        impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
         self.attn_impl = impl_cls(
             num_heads=num_heads,
@@ -648,15 +648,9 @@ class USPAttention(nn.Module):
 
         sp_size = get_ulysses_parallel_world_size()
         if (
-            sum(
-                bool(n)
-                for n in (
-                    num_replicated_prefix,
-                    num_replicated_suffix,
-                    num_replicated_kv_prefix,
-                )
-            )
-            > 1
+            (num_replicated_prefix > 0 and num_replicated_suffix > 0)
+            or (num_replicated_prefix > 0 and num_replicated_kv_prefix > 0)
+            or (num_replicated_suffix > 0 and num_replicated_kv_prefix > 0)
         ):
             raise ValueError(
                 "USPAttention supports at most one replicated-token mode per call."
