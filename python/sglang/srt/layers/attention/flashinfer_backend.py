@@ -1353,12 +1353,12 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         if prefix_lens is None:
-            accept_length = getattr(spec_info, "accept_length", None)
+            num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
             prefix_lens = (
                 seq_lens
-                if accept_length is None
+                if num_accept_tokens is None
                 else seq_lens
-                - accept_length[: seq_lens.shape[0]].to(
+                - num_accept_tokens[: seq_lens.shape[0]].to(
                     device=seq_lens.device, dtype=seq_lens.dtype
                 )
             )
