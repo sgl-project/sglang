@@ -32,8 +32,8 @@ class SwaDivergenceReporter:
         device: torch.device,
         d2h_stream: torch.cuda.Stream,
         interval: int,
-        swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
-        req_to_token_pool: Optional["ReqToTokenPool"] = None,
+        swa_allocator: Optional[SWATokenToKVPoolAllocator] = None,
+        req_to_token_pool: Optional[ReqToTokenPool] = None,
     ) -> None:
         self._interval = interval
         self._swa_allocator = swa_allocator
@@ -57,7 +57,7 @@ class SwaDivergenceReporter:
         self,
         *,
         outer_step_counter: int,
-        maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
+        maybe_inaccurate_forward_batch: Optional[ForwardBatch],
     ) -> None:
         self._forward_ct += 1
         self._handler.step(
@@ -72,7 +72,7 @@ class SwaDivergenceReporter:
         self,
         *,
         outer_step_counter: int,
-        maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
+        maybe_inaccurate_forward_batch: Optional[ForwardBatch],
     ) -> Optional[dict[str, Any]]:
         if outer_step_counter == 0 or outer_step_counter % self._interval != 0:
             return None
@@ -134,14 +134,14 @@ class SwaDivergenceLog:
         )
 
     @classmethod
-    def parse(cls, line: str) -> Optional["SwaDivergenceLog"]:
+    def parse(cls, line: str) -> Optional[SwaDivergenceLog]:
         match = _SWA_DIVERGENCE_LINE_RE.search(line)
         if match is None:
             return None
         return cls(**json.loads(match.group(1)))
 
     @classmethod
-    def find_last(cls, text: str) -> Optional[tuple["SwaDivergenceLog", str]]:
+    def find_last(cls, text: str) -> Optional[tuple[SwaDivergenceLog, str]]:
         last_match: Optional[re.Match] = None
         for match in _SWA_DIVERGENCE_LINE_RE.finditer(text):
             last_match = match
@@ -150,7 +150,7 @@ class SwaDivergenceLog:
         return cls(**json.loads(last_match.group(1))), last_match.group(0)
 
     @classmethod
-    def find_all(cls, text: str) -> list[tuple["SwaDivergenceLog", str]]:
+    def find_all(cls, text: str) -> list[tuple[SwaDivergenceLog, str]]:
         return [
             (cls(**json.loads(match.group(1))), match.group(0))
             for match in _SWA_DIVERGENCE_LINE_RE.finditer(text)
@@ -159,9 +159,9 @@ class SwaDivergenceLog:
 
 def compute_swa_out_of_window_tokens(
     *,
-    swa_allocator: "SWATokenToKVPoolAllocator",
-    req_to_token_pool: "ReqToTokenPool",
-    maybe_inaccurate_forward_batch: "ForwardBatch",
+    swa_allocator: SWATokenToKVPoolAllocator,
+    req_to_token_pool: ReqToTokenPool,
+    maybe_inaccurate_forward_batch: ForwardBatch,
 ) -> torch.Tensor:
     """Count tokens in the live req_to_token range whose SWA mapping is 0 (out-of-window)."""
     full_to_swa_index_mapping = swa_allocator.full_to_swa_index_mapping
@@ -180,9 +180,9 @@ def compute_swa_out_of_window_tokens(
 
 def compute_swa_full_idx_divergence(
     *,
-    swa_allocator: "SWATokenToKVPoolAllocator",
-    req_to_token_pool: "ReqToTokenPool",
-    maybe_inaccurate_forward_batch: "ForwardBatch",
+    swa_allocator: SWATokenToKVPoolAllocator,
+    req_to_token_pool: ReqToTokenPool,
+    maybe_inaccurate_forward_batch: ForwardBatch,
 ) -> torch.Tensor:
     """Count non-identity (full, swa) index pairs in the live req_to_token range."""
     full_to_swa_index_mapping = swa_allocator.full_to_swa_index_mapping

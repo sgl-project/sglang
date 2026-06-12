@@ -94,10 +94,10 @@ class TestHiSparseUnit(unittest.TestCase):
 
         global_page_size = 1 if is_hip() else PAGE_SIZE
 
-        from sglang.srt.mem_cache.hisparse_memory_pool import (
-            HiSparseDSATokenToKVPool,
+        from sglang.srt.mem_cache.allocator.hisparse import (
             HiSparseTokenToKVPoolAllocator,
         )
+        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 
         cls.device_pool = HiSparseDSATokenToKVPool(
             size=SIZE,
