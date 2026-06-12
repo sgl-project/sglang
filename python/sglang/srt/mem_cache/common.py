@@ -54,11 +54,13 @@ def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
 
-def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+def maybe_cache_unfinished_req(
+    req: Req, tree_cache: BasePrefixCache, is_partially_extended: bool = False
+) -> None:
     if getattr(req, "skip_radix_cache_insert", False):
         return
 
-    tree_cache.cache_unfinished_req(req, **kwargs)
+    tree_cache.cache_unfinished_req(req, is_partially_extended=is_partially_extended)
 
 
 def write_cache_indices(
