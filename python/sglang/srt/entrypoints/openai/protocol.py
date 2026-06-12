@@ -65,6 +65,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_NAME = "default"
 
 
+def _validate_temperature_range(v):
+    if v is not None and not 0.0 <= v <= 2.0:
+        raise ValueError(f"temperature must be in [0, 2], got {v}")
+    return v
+
+
 class ModelCard(BaseModel):
     """Model cards."""
 
@@ -382,6 +388,11 @@ class CompletionRequest(BaseModel):
         if v is not None and v <= 0:
             raise ValueError("max_tokens must be positive")
         return v
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature_range(cls, v):
+        return _validate_temperature_range(v)
 
 
 class SglExt(BaseModel):
@@ -765,6 +776,11 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature_range(cls, v):
+        return _validate_temperature_range(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -1368,6 +1384,11 @@ class ResponsesRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature_range(cls, v):
+        return _validate_temperature_range(v)
 
     def to_sampling_params(
         self, default_max_tokens: int, default_params: Optional[Dict] = None

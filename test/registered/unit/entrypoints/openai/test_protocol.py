@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     Function,
     ModelCard,
     ModelList,
+    ResponsesRequest,
     Tool,
     UsageInfo,
 )
@@ -82,6 +83,16 @@ class TestCompletionRequest(unittest.TestCase):
         self.assertFalse(request.stream)  # default
         self.assertFalse(request.echo)  # default
 
+    def test_completion_request_temperature_range(self):
+        CompletionRequest(model="test-model", prompt="Hello", temperature=0.0)
+        CompletionRequest(model="test-model", prompt="Hello", temperature=2.0)
+
+        with self.assertRaises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hello", temperature=-0.1)
+
+        with self.assertRaises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hello", temperature=2.1)
+
     def test_completion_request_sglang_extensions(self):
         """Test completion request with SGLang-specific extensions"""
         request = CompletionRequest(
@@ -124,6 +135,22 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
         self.assertEqual(request.tool_choice, "none")  # default when no tools
+
+    def test_chat_completion_temperature_range(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        ChatCompletionRequest(model="test-model", messages=messages, temperature=0.0)
+        ChatCompletionRequest(model="test-model", messages=messages, temperature=2.0)
+        ChatCompletionRequest(model="test-model", messages=messages, temperature=None)
+
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model", messages=messages, temperature=-0.1
+            )
+
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model", messages=messages, temperature=2.1
+            )
 
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
@@ -339,6 +366,19 @@ class TestChatCompletionRequest(unittest.TestCase):
         strict = json_format.strict
         self.assertEqual(name, "VoiceNote")
         self.assertEqual(strict, True)
+
+
+class TestResponsesRequest(unittest.TestCase):
+    def test_responses_request_temperature_range(self):
+        ResponsesRequest(input="Hello", temperature=0.0)
+        ResponsesRequest(input="Hello", temperature=2.0)
+        ResponsesRequest(input="Hello", temperature=None)
+
+        with self.assertRaises(ValidationError):
+            ResponsesRequest(input="Hello", temperature=-0.1)
+
+        with self.assertRaises(ValidationError):
+            ResponsesRequest(input="Hello", temperature=2.1)
 
 
 class TestModelSerialization(unittest.TestCase):
