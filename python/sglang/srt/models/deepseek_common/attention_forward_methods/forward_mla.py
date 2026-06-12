@@ -141,7 +141,7 @@ class DeepseekMLAForwardMixin:
         )
 
     def _use_capture_alt_stream(self: DeepseekV2AttentionMLA, num_tokens: int) -> bool:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
 
         return (
             self.alt_stream is not None
