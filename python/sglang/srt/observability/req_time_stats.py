@@ -903,7 +903,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             bootstrap_ms = (
                 self.bootstrap_done_time - self.prefill_bootstrap_queue_entry_time
             ) * 1000
-            alloc_ms = (self.wait_queue_entry_time - self.bootstrap_done_time) * 1000
+            if transfer_metric.alloc_latency_s is not None:
+                alloc_ms = transfer_metric.alloc_latency_s * 1000
+            else:
+                alloc_ms = (
+                    max(0.0, self.wait_queue_entry_time - self.bootstrap_done_time)
+                    * 1000
+                )
 
             result["bootstrap_ms"] = bootstrap_ms
             result["alloc_ms"] = alloc_ms
