@@ -13,6 +13,11 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
+DEFAULT_TRANSCRIBE_DIARIZE_PROMPT = (
+    "请将音频转写为文本，每一段需以起始时间戳和说话人编号"
+    "（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，"
+    "并在段末标注结束时间戳，以清晰标明该段语音范围。"
+)
 
 
 class MossTranscribeDiarizeMultimodalProcessor(BaseMultimodalProcessor):
@@ -47,6 +52,8 @@ class MossTranscribeDiarizeMultimodalProcessor(BaseMultimodalProcessor):
         input_text = input_text or ""
         if "<|audio_pad|>" in input_text:
             return input_text
+        if not input_text.strip():
+            input_text = DEFAULT_TRANSCRIBE_DIARIZE_PROMPT
 
         messages = [
             {
