@@ -111,7 +111,7 @@ class IncLockRefResult:
         default_factory=dict
     )
 
-    def to_dec_params(self) -> "DecLockRefParams":
+    def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
             swa_uuid_for_lock=self.swa_uuid_for_lock,
@@ -189,7 +189,7 @@ class MatchResult(NamedTuple):
     cache_protected_len: Optional[int] = None
 
 
-def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":
+def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
     if tree_cache.is_chunk_cache():
         # Chunk caches' match_prefix already returns a miss; no root_node to walk back to.
         return match_result

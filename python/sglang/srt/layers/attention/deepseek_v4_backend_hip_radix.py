@@ -996,7 +996,7 @@ class DeepseekV4HipRadixBackend(
             self.forward_metadata = current_raw
 
     def _attach_unified_kv_decode_streams(
-        self, core: "DSV4AttnMetadata", req_pool_indices: torch.Tensor
+        self, core: DSV4AttnMetadata, req_pool_indices: torch.Tensor
     ) -> None:
         """build the ragged decode index streams once per forward"""
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -1031,7 +1031,7 @@ class DeepseekV4HipRadixBackend(
 
     def _attach_unified_kv_prefill_meta(
         self,
-        core: "DSV4AttnMetadata",
+        core: DSV4AttnMetadata,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
@@ -1065,7 +1065,7 @@ class DeepseekV4HipRadixBackend(
         forward_batch: ForwardBatch,
         compress_ratio: Literal[0, 4, 128],
         attn_sink: torch.Tensor,
-        core_attn_metadata: "DSV4AttnMetadata",
+        core_attn_metadata: DSV4AttnMetadata,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
         """unified_kv paged-attention path over the bf16 unified_kv"""
@@ -1425,6 +1425,8 @@ class DeepseekV4HipRadixBackend(
         is_prefill: bool = False,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
+
+        seq_lens_casual = seq_lens_casual.to(torch.int32)
 
         swa_page_indices = self.get_swa_page_indices(
             seq_lens_casual=seq_lens_casual,

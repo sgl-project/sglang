@@ -1639,7 +1639,7 @@ class MMEncoder:
                 else:
                     sock.send_multipart([serialized_data], copy=False)
             finally:
-                sock.close()
+                sock.close(linger=5000)
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
@@ -2187,7 +2187,7 @@ class EncoderScheduler:
         self.send_sockets = send_sockets
         self.max_batch_size = max(1, int(max_batch_size))
         self.request_timeout = max(1.0, float(request_timeout))
-        self.pending_queue: "asyncio.Queue[PendingRequest]" = asyncio.Queue()
+        self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
 
     def start(self) -> None:

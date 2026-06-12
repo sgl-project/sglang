@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 import torch
 
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -43,14 +45,14 @@ class BaseCudaGraphBackend(ABC):
     @abstractmethod
     def capture_one(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         forward_fn,
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None: ...
 
     @abstractmethod
-    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool: ...
+    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool: ...
 
     @abstractmethod
     def replay_session(self) -> Iterator[None]: ...
@@ -58,7 +60,7 @@ class BaseCudaGraphBackend(ABC):
     @abstractmethod
     def replay(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any: ...
