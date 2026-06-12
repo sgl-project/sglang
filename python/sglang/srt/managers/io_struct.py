@@ -2143,7 +2143,7 @@ def enc_hook(obj: Any) -> Any:
     if isinstance(obj, torch.Tensor):
         # encode torch tensor as Tuple(shape, dtype, data)
         tensor_dtype = str(obj.dtype).split(".")[-1]  # e.g., "float32"
-        raw_data = obj.numpy().tobytes()
+        raw_data = obj.flatten().cpu().contiguous().view(torch.uint8).numpy().data
         return (obj.shape, tensor_dtype, raw_data)
     elif isinstance(obj, array):
         return (obj.typecode, obj.tobytes())

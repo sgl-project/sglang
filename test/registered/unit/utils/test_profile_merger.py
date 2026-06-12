@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import unittest
 
-from sglang.srt.entryponts.api_specs import ProfileReqInputSpec
+from sglang.srt.entrypoints.api_specs import ProfileReqInputSpec
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.test.ci.ci_register import (
