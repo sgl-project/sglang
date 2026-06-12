@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils.request_tracer import trace_req_event
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -229,6 +230,12 @@ class SchedulerBatchResultProcessor:
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.update_finish_state()
+                    trace_req_event(
+                        req.rid,
+                        "prefill_end",
+                        stage="scheduler",
+                        finished=req.finished(),
+                    )
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -831,6 +838,21 @@ class SchedulerBatchResultProcessor:
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
+
+            finish_reason = req.finished_reason
+            reason_type = (
+                finish_reason.__class__.__name__
+                if finish_reason is not None
+                else None
+            )
+            is_abort = reason_type == "FINISH_ABORT"
+            trace_req_event(
+                req.rid,
+                "aborted" if is_abort else "finished",
+                stage="scheduler",
+                finish_reason=reason_type,
+                num_output_tokens=len(req.output_ids),
+            )
 
         self._maybe_collect_customized_info(i, req, logits_output)
 

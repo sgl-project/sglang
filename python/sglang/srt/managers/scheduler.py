@@ -263,6 +263,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.request_tracer import trace_req_event
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -2199,6 +2200,13 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+        trace_req_event(
+            req.rid,
+            "queued",
+            stage="scheduler",
+            disagg_mode=self.disaggregation_mode.name,
+            is_retracted=is_retracted,
+        )
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -2772,6 +2780,14 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+
+        for _trace_req in can_run_list:
+            trace_req_event(
+                _trace_req.rid,
+                "prefill_start",
+                stage="scheduler",
+                batch_size=len(can_run_list),
+            )
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -3681,6 +3697,13 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+            trace_req_event(
+                req.rid,
+                "aborted",
+                stage="scheduler",
+                source="waiting_queue",
+                abort_all=recv_req.abort_all,
+            )
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
