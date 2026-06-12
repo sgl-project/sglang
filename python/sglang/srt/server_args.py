@@ -617,6 +617,8 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_dflash_mamba_cache_steps: Optional[int] = None
+    speculative_dflash_mamba_replay: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -6103,6 +6105,15 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-mamba-cache-steps",
+            type=int,
+            help="DFLASH only. Number of target-verify draft steps whose intermediate "
+            "Mamba/GDN SSM states are cached. Defaults to the full verify block size. "
+            "Values smaller than the block size reduce speculative SSM cache memory "
+            "and automatically replay the uncached accepted tail.",
+            default=ServerArgs.speculative_dflash_mamba_cache_steps,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

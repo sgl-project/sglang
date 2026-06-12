@@ -43,6 +43,8 @@ class ForwardMetadata:
 
     is_target_verify: bool = False
     draft_token_num: int = 1
+    mamba_cache_steps: Optional[int] = None
+    mamba_replay: bool = False
 
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
@@ -163,6 +165,8 @@ class Mamba2Metadata(ForwardMetadata):
         *,
         is_target_verify: bool,
         draft_token_num: int,
+        mamba_cache_steps: Optional[int] = None,
+        mamba_replay: bool = False,
     ) -> "Mamba2Metadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
         return Mamba2Metadata(
@@ -182,6 +186,8 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefill_tokens=0,
             is_target_verify=is_target_verify,
             draft_token_num=draft_token_num,
+            mamba_cache_steps=mamba_cache_steps,
+            mamba_replay=mamba_replay,
         )
 
     @classmethod
@@ -198,11 +204,23 @@ class Mamba2Metadata(ForwardMetadata):
                 if forward_batch.spec_info is not None
                 else 1
             )
+            mamba_cache_steps = (
+                getattr(forward_batch.spec_info, "mamba_cache_steps", None)
+                if forward_batch.spec_info is not None
+                else None
+            )
+            mamba_replay = (
+                getattr(forward_batch.spec_info, "mamba_replay", False)
+                if forward_batch.spec_info is not None
+                else False
+            )
             return cls.prepare_decode(
                 forward_metadata,
                 forward_batch.seq_lens,
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 draft_token_num=draft_token_num,
+                mamba_cache_steps=mamba_cache_steps,
+                mamba_replay=mamba_replay,
             )
         num_prefills = len(forward_batch.extend_seq_lens)
         num_prefill_tokens = forward_batch.extend_num_tokens
@@ -239,6 +257,16 @@ class Mamba2Metadata(ForwardMetadata):
             if forward_batch.spec_info is not None
             else 1
         )
+        mamba_cache_steps = (
+            getattr(forward_batch.spec_info, "mamba_cache_steps", None)
+            if forward_batch.spec_info is not None
+            else None
+        )
+        mamba_replay = (
+            getattr(forward_batch.spec_info, "mamba_replay", False)
+            if forward_batch.spec_info is not None
+            else False
+        )
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
@@ -256,6 +284,8 @@ class Mamba2Metadata(ForwardMetadata):
             num_decodes=num_decodes,
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             draft_token_num=draft_token_num,
+            mamba_cache_steps=mamba_cache_steps,
+            mamba_replay=mamba_replay,
             mixed_metadata=cls.MixedMetadata(
                 has_initial_states=has_initial_states,
                 prep_initial_states=prep_initial_states,

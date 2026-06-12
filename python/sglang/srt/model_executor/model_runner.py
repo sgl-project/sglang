@@ -2714,6 +2714,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     draft_token=None,
                     positions=None,
                     draft_token_num=self.server_args.speculative_num_draft_tokens,
+                    mamba_cache_steps=self.server_args.speculative_dflash_mamba_cache_steps,
+                    mamba_replay=self.server_args.speculative_dflash_mamba_replay,
                     custom_mask=None,
                     capture_hidden_mode=(
                         CaptureHiddenMode.NULL

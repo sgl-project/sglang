@@ -374,6 +374,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # CUDA graph variant key used by attention backends that keep per-graph buffers.
+    cuda_graph_key: Optional[object] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA

@@ -113,16 +113,20 @@ class BaseLinearStateParams(ABC):
     layers: list[int]
 
     @property
-    def mamba_cache_per_req(self) -> int:
+    def mamba_conv_cache_per_req(self) -> int:
         conv_numel = int(
             np.sum([np.prod(conv_shape) for conv_shape in self.shape.conv])
         )
+        return conv_numel * self.dtype.conv.itemsize * len(self.layers)
 
+    @property
+    def mamba_temporal_cache_per_req(self) -> int:
         ssm_numel = int(np.prod(self.shape.temporal))
-        return (
-            conv_numel * self.dtype.conv.itemsize
-            + ssm_numel * self.dtype.temporal.itemsize
-        ) * len(self.layers)
+        return ssm_numel * self.dtype.temporal.itemsize * len(self.layers)
+
+    @property
+    def mamba_cache_per_req(self) -> int:
+        return self.mamba_conv_cache_per_req + self.mamba_temporal_cache_per_req
 
 
 @dataclass(kw_only=True, frozen=True)

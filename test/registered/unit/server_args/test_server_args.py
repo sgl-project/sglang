@@ -696,6 +696,106 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestDFlashMambaReplayArgs(CustomTestCase):
+    def _make_dummy_dflash_args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "DFLASH"
+        args.speculative_draft_model_path = "dummy-draft"
+        args.speculative_num_draft_tokens = 16
+        args.speculative_num_steps = None
+        args.speculative_eagle_topk = None
+        args.max_running_requests = 16
+        args.device = "cuda"
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def _handle_dflash_args(self, args):
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=SimpleNamespace(architectures=[]),
+        ):
+            handle_speculative_decoding(args)
+
+    def test_reduced_mamba_cache_auto_enables_replay(self):
+        args = self._make_dummy_dflash_args(
+            speculative_dflash_mamba_cache_steps=0,
+        )
+
+        self._handle_dflash_args(args)
+
+        self.assertEqual(args.speculative_dflash_mamba_cache_steps, 0)
+        self.assertTrue(args.speculative_dflash_mamba_replay)
+
+    def test_full_mamba_cache_does_not_force_replay(self):
+        args = self._make_dummy_dflash_args(
+            speculative_dflash_mamba_cache_steps=16,
+        )
+
+        self._handle_dflash_args(args)
+
+        self.assertEqual(args.speculative_dflash_mamba_cache_steps, 16)
+        self.assertFalse(args.speculative_dflash_mamba_replay)
+
+    def test_mamba_cache_steps_must_be_non_negative(self):
+        args = self._make_dummy_dflash_args(
+            speculative_dflash_mamba_cache_steps=-1,
+        )
+
+        with self.assertRaises(ValueError) as context:
+            self._handle_dflash_args(args)
+
+        self.assertIn("non-negative", str(context.exception))
+
+    def test_mamba_cache_steps_must_fit_draft_budget(self):
+        args = self._make_dummy_dflash_args(
+            speculative_dflash_mamba_cache_steps=17,
+        )
+
+        with self.assertRaises(ValueError) as context:
+            self._handle_dflash_args(args)
+
+        self.assertIn("must be <=", str(context.exception))
+
+    def test_mamba_cache_steps_requires_dflash(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "EAGLE"
+        args.speculative_dflash_mamba_cache_steps = 0
+        args.device = "cuda"
+
+        with self.assertRaises(ValueError) as context:
+            handle_speculative_decoding(args)
+
+        self.assertIn("only supported", str(context.exception))
+
+    def test_draft_window_must_cover_dflash_block(self):
+        args = self._make_dummy_dflash_args(
+            speculative_draft_window_size=8,
+        )
+
+        with self.assertRaises(ValueError) as context:
+            self._handle_dflash_args(args)
+
+        self.assertIn("must be >=", str(context.exception))
+
+    def test_verify_reduced_mamba_cache_requires_replay(self):
+        import torch
+
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        draft_token_num = 4
+        spec_info = DFlashVerifyInput(
+            draft_token=torch.arange(draft_token_num, dtype=torch.int64),
+            positions=torch.arange(draft_token_num, dtype=torch.int64),
+            draft_token_num=draft_token_num,
+            mamba_cache_steps=0,
+            mamba_replay=False,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires replay"):
+            spec_info.check_mamba_replay_config()
+
+
 class TestAdaptiveSpecArgs(CustomTestCase):
     def test_adaptive_defaults_to_config_step_when_spec_params_omitted(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:

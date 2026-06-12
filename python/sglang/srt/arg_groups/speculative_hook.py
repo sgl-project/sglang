@@ -100,6 +100,15 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
                 server_args.speculative_algorithm,
             )
 
+    if (
+        server_args.speculative_dflash_mamba_cache_steps is not None
+        and server_args.speculative_algorithm != "DFLASH"
+    ):
+        raise ValueError(
+            "--speculative-dflash-mamba-cache-steps is only supported with "
+            "--speculative-algorithm DFLASH."
+        )
+
     if server_args.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang.srt.speculative.spec_registry import CustomSpecAlgo
@@ -231,6 +240,29 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
                 "--speculative-num-draft-tokens (block_size). "
                 f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
             )
+
+    if server_args.speculative_dflash_mamba_cache_steps is not None:
+        cache_steps = int(server_args.speculative_dflash_mamba_cache_steps)
+        draft_tokens = int(server_args.speculative_num_draft_tokens)
+        if cache_steps < 0:
+            raise ValueError(
+                "DFLASH requires --speculative-dflash-mamba-cache-steps "
+                f"to be non-negative, got {cache_steps}."
+            )
+        if cache_steps > draft_tokens:
+            raise ValueError(
+                "DFLASH --speculative-dflash-mamba-cache-steps must be <= "
+                "--speculative-num-draft-tokens. "
+                f"cache_steps={cache_steps}, draft_tokens={draft_tokens}."
+            )
+        server_args.speculative_dflash_mamba_cache_steps = cache_steps
+
+    if (
+        server_args.speculative_dflash_mamba_cache_steps is not None
+        and server_args.speculative_dflash_mamba_cache_steps
+        < server_args.speculative_num_draft_tokens
+    ):
+        server_args.speculative_dflash_mamba_replay = True
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
