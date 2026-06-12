@@ -671,8 +671,10 @@ class HiCacheController:
         )
 
     def reset(self):
+        # Core CPU<->GPU transfer path: no long-lived worker threads (it relies on
+        # TransferBuffer + CUDA streams), so pausing via `stop_event` around a drain
+        # of the queues/buffers is sufficient.
         self.stop_event.set()
-        self.storage_stop_event.set()
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -680,26 +682,21 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
-        if self.enable_storage:
-            self.prefetch_thread.join()
-            self.backup_thread.join()
-            self.prefetch_queue.queue.clear()
-            self.backup_queue.queue.clear()
-            self.prefetch_revoke_queue.queue.clear()
-            self.ack_backup_queue.queue.clear()
 
         self.stop_event.clear()
-        self.storage_stop_event.clear()
 
         if self.enable_storage:
-            self.prefetch_thread = threading.Thread(
-                target=self.prefetch_thread_func, daemon=True
-            )
-            self.backup_thread = threading.Thread(
-                target=self.backup_thread_func, daemon=True
-            )
-            self.prefetch_thread.start()
-            self.backup_thread.start()
+            # Reuse the canonical teardown/startup lifecycle rather than a
+            # hand-written join sequence. The old code joined only `prefetch_thread`
+            # and `backup_thread`, missing the `prefetch_io_aux_thread` that
+            # `prefetch_thread_func` spawns internally; that thread could survive the
+            # restart and drain the freshly re-created `prefetch_buffer` alongside the
+            # new aux thread (zombie thread + double consumer).
+            self._stop_storage_threads()
+            # `_stop_storage_threads` deliberately leaves `storage_stop_event` set;
+            # clear it to satisfy the assertion in `_start_storage_threads`.
+            self.storage_stop_event.clear()
+            self._start_storage_threads()
 
     def write(
         self,
