@@ -47,7 +47,8 @@ _RESOLVE = (
 _SS = "session/streaming_session.py"
 _OWNER_SITES = {
     # non-spec scheduler
-    (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
+    # sole owner of the decode clock, for spec and non-spec alike
+    (_SB, "ScheduleBatch._tick_decode_clock", "decode_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_decode", "kv_committed_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_decode", "kv_allocated_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
@@ -56,7 +57,6 @@ _OWNER_SITES = {
     ("mem_cache/common.py", "alloc_for_extend", "evict"): 1,
     ("mem_cache/common.py", "alloc_for_decode", "evict"): 1,
     # spec v2: pre-claim in the scheduler-driven mixin, settle in resolve
-    (*_MIXIN, "decode_batch_idx"): 1,
     (*_MIXIN, "evict"): 1,
     (*_MIXIN, "kv_committed_len"): 1,
     (*_MIXIN, "kv_allocated_len"): 1,

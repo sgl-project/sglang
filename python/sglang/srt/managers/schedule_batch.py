@@ -2517,6 +2517,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.mamba_next_track_idx = other_idx
 
+    def _tick_decode_clock(self):
+        # Sole owner of the per-iter decode clock, for every spec mode and
+        # non-spec alike. Runs after the branch's SWA evict pass so the
+        # first-decode-iter guard in maybe_evict_swa still sees the pre-tick
+        # value.
+        for req in self.reqs:
+            bk_on_clock_tick(req, self)
+            req.decode_batch_idx += 1
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bk_on_prepare_decode(self)
@@ -2534,6 +2543,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # (allocation, pre-claim, seq-lens bookkeeping).
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
+            self._tick_decode_clock()
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
@@ -2565,11 +2575,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self._tick_decode_clock()
 
         # Update req-level memory management fields
         for req in self.reqs:
-            bk_on_clock_tick(req, self)
-            req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
