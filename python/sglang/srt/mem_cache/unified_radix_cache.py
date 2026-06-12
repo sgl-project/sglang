@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeVar
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -55,7 +56,11 @@ from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
 )
-from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_STORAGE,
+    StorageMetricsCollector,
+    resolve_collector_class,
+)
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
@@ -307,11 +312,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
         self.attn_tp_group = params.attn_tp_cache_group
+        self.pp_group = params.pp_cache_group
         self.tp_world_size = (
             1
             if self.tp_group is None
             else torch.distributed.get_world_size(group=self.tp_group)
         )
+        self.pp_rank = params.pp_rank
+        self.pp_size = params.pp_size
+        self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -342,6 +351,49 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 waited = True
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
+
+    def _reap_completed_async_work(self):
+        """
+        Poll outstanding async work and reap completed ones.
+
+        Must be called in the scheduler thread.
+        """
+        count = 0
+        while count < len(self.work_list) and self.work_list[count].is_completed():
+            count += 1
+        if count > 0:
+            logger.debug(f"Reap {count} completed async work")
+            self.work_list = self.work_list[count:]
+
+    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
+        """
+        Synchronize data across all TP and PP ranks.
+
+        In particular, "tp_reduce_op" is performed on all TP ranks of the first PP rank,
+        and then the result is propagated to all following PP ranks.
+
+        Must be called in the scheduler thread.
+        """
+        if self.pp_rank == 0:
+            self._all_reduce_attn_groups(data, tp_reduce_op)
+        self._pp_sync(data)
+
+    def _pp_sync(self, data: torch.Tensor) -> None:
+        """
+        Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
+        """
+        if self.pp_size <= 1 or self.pp_group is None:
+            return
+        if self.pp_rank > 0:
+            torch.distributed.recv(
+                data, group_src=self.pp_rank - 1, group=self.pp_group, tag=2
+            )
+        if self.pp_rank + 1 < self.pp_size:
+            copy_of_data = data.clone()
+            send_work = torch.distributed.isend(
+                copy_of_data, group_dst=self.pp_rank + 1, group=self.pp_group, tag=2
+            )
+            self.work_list.append(send_work)
 
     def reset(self) -> None:
         self._reset_full()
@@ -463,7 +515,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
-        self.load_back_threshold = 256
+        self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         if storage_backend is not None:
@@ -675,7 +727,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -704,6 +756,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
+
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(
+                    req, effective_cache_len - 1, insert_params
+                )
 
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
@@ -1373,7 +1431,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.cache_controller is not None
                 and self.cache_controller.write_policy == "write_back"
             ):
-                self.write_backup(node, write_back=True)
+                written = self.write_backup(node, write_back=True)
+                if written == 0:
+                    return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
                 return
@@ -1540,6 +1600,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is None:
             return False
 
+        start_time = time.perf_counter()
+
         # Build KV transfer
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
             best_match_node, CacheTransferPhase.LOAD_BACK
@@ -1618,6 +1680,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             self.inc_lock_ref(best_match_node).to_dec_params(),
         )
+
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_load_back_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
+
         return True
 
     def _build_sidecar_transfers(
@@ -1808,7 +1877,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
-            prefetch_key.token_ids,
+            prefetch_key,
             last_hash,
             prefix_keys,
             extra_pools=aux_xfers or None,
@@ -2148,7 +2217,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 labels.update(extra_metric_labels)
             existing_collector = self.storage_metrics_collector
             if existing_collector is None:
-                self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
+                from sglang.srt.server_args import get_global_server_args
+
+                storage_cls = resolve_collector_class(
+                    get_global_server_args(),
+                    STAT_LOGGER_ROLE_STORAGE,
+                    StorageMetricsCollector,
+                )
+                self.storage_metrics_collector = storage_cls(labels=labels)
             elif set(existing_collector.labels.keys()) == set(labels.keys()):
                 existing_collector.labels = labels
             else:
@@ -2211,19 +2287,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # Every rank must enter the all_reduce below; ongoing_write_through can
+        # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
-        for _, finish_event, ack_list in cc.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if self.pp_rank == 0:
+            for _, finish_event, ack_list in cc.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
 
-        # Keep cache state transitions identical across CPxTP participants.
-        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
-        finish_count = int(queue_size.item())
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = finish_count_tensor.item()
 
         # Process completed acks
         while finish_count > 0:
@@ -2236,17 +2311,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def loading_check(self) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
-        if cc is None or not self.ongoing_load_back:
+        if cc is None:
             return
+        # Every rank must enter the all_reduce below; ongoing_load_back can
+        # diverge across ranks.
         finish_count = 0
-        for _, finish_event, ack_list in cc.ack_load_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if self.pp_rank == 0:
+            for _, finish_event, ack_list in cc.ack_load_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = finish_count_tensor.item()
+
+        while finish_count > 0:
+            _, finish_event, ack_list = cc.ack_load_queue.pop(0)
+            finish_event.synchronize()
             for ack_id in ack_list:
                 node, lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
-        del cc.ack_load_queue[:finish_count]
+            finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
 
@@ -2275,7 +2360,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_chunks.reverse()
             return torch.cat(prefix_chunks)
 
-        if best_match_node.evicted or params.host_hit_length > 0:
+        if (
+            best_match_node.evicted
+            or params.host_hit_length > 0
+            or (
+                req is not None
+                and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
+            )
+        ):
             if self.load_back(best_match_node, mem_quota, req=req):
                 new_indices = _collect_new_prefix_indices()
                 if new_indices.numel() == 0:
@@ -2302,6 +2394,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+        self._reap_completed_async_work()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -2455,7 +2548,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if ct.is_swa:
                 available_size = self.token_to_kv_pool_allocator.swa_available_size()
             elif ct.is_mamba:
-                available_size = self.req_to_token_pool.mamba_pool.available_size()
+                available_size = self.req_to_token_pool.mamba_allocator.available_size()
             else:
                 continue
 
@@ -2708,7 +2801,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _check_lru_linked_list(
         self,
-        lru: "UnifiedLRUList",
+        lru: UnifiedLRUList,
         ct: ComponentType,
         label: str,
         errors: list[str],

@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
@@ -60,6 +61,8 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
     swa_page_table: torch.Tensor = None
+    # full->SWA translated out_cache_loc (SWA KV-store write target)
+    swa_out_cache_loc: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -125,9 +128,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         # SWA hybrid models split the KV cache into full and SWA pools with
-        # separate index spaces; SWA layers need a translated page_table. Resolve
-        # the pool from the allocator (stable at construction), not from
-        # token_to_kv_pool, which FROZEN_KV MTP swaps per forward call.
+        # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
 
         # Forward metadata
@@ -147,14 +148,22 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
         """Return the SWAKVPool to translate against, or None for non-SWA models.
 
-        Read it from the allocator: in FROZEN_KV MTP the draft shares the
-        target's SWA allocator while its own token_to_kv_pool stays non-SWA
-        until swapped per call. The getattr only tolerates the minimal
-        allocator stub used by attention test fixtures.
+        EAGLE draft workers share the target allocator for token bookkeeping,
+        but own a separate draft KV pool. Do not use the target allocator's
+        SWA mapping for that draft pool. FROZEN_KV MTP is the exception: its
+        draft path reads target KV directly, so it still needs the allocator
+        pool when the active pool is not SWA.
         """
+        active_pool = model_runner.token_to_kv_pool
+        if isinstance(active_pool, SWAKVPool):
+            return active_pool
+
+        if model_runner.is_draft_worker:
+            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
+                return None
+
         allocator = model_runner.token_to_kv_pool_allocator
-        get_kvcache = getattr(allocator, "get_kvcache", None)
-        kvcache = get_kvcache() if get_kvcache is not None else None
+        kvcache = allocator.get_kvcache()
         return kvcache if isinstance(kvcache, SWAKVPool) else None
 
     def _maybe_translate_swa(
@@ -246,6 +255,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ),
         }
 
+        # SWA write-target buffer; bound as a [:num_tokens] view in
+        # _build_cuda_graph_metadata, refilled before each replay in
+        # init_forward_metadata_out_graph.
+        self.cuda_graph_swa_out_cache_loc = (
+            torch.zeros(max_num_tokens, dtype=torch.int64, device=self.device)
+            if self.use_sliding_window_kv_pool
+            else None
+        )
+
         if (
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
@@ -323,7 +341,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info,
         device: torch.device,
-    ) -> "TRTLLMMHAMetadata":
+    ) -> TRTLLMMHAMetadata:
         """Create TRTLLMMHAMetadata with pre-allocated buffer slice refs, stored in the dict."""
         metadata = TRTLLMMHAMetadata()
 
@@ -408,6 +426,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             self.draft_extend_metadata[bs] = metadata
 
+        # Bind the SWA write-target buffer slice (refilled at replay).
+        if self.use_sliding_window_kv_pool:
+            metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
+
         return metadata
 
     def _apply_cuda_graph_metadata(
@@ -484,7 +506,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-            metadata.max_seq_len_q = self.speculative_num_draft_tokens
         elif forward_mode.is_draft_extend(include_v2=True):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
@@ -615,6 +636,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
+        # Refill the SWA write-target buffer from the live out_cache_loc before
+        # replay (the per-bs metadata holds a view bound in _build).
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            n = forward_batch.out_cache_loc.shape[0]
+            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 
@@ -713,6 +745,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Compute SWA page table (None for non-SWA models)
         metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
 
+        # int64 scatter index (unlike the int32 read page table above).
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            metadata.swa_out_cache_loc = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
+
         # Convert the page tables to a strided format
         if self.page_size > 1:
             self.strided_indices = torch.arange(
@@ -758,7 +798,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
                 )
 
         # For XQA, q_dtype should be bf16
@@ -844,7 +889,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
                 )
 
         if self.data_type == torch.float8_e4m3fn:

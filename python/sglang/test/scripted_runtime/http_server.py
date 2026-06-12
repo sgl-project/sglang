@@ -52,7 +52,7 @@ class ScriptedHttpServer:
         self._dirty: Optional[str] = None
 
     @classmethod
-    def start(cls, **engine_kwargs: Any) -> "ScriptedHttpServer":
+    def start(cls, **engine_kwargs: Any) -> ScriptedHttpServer:
         out_of_band_error_path = _create_oob_error_file()
 
         ctx = zmq.Context()
@@ -151,12 +151,13 @@ class ScriptedHttpServer:
         # _reset_engine_state, which POSTs to this server's own HTTP port, so
         # block until the port is bound and routing before any script can run.
         #
-        # Wait for *any* HTTP response, not status 200: in scripted mode the
-        # scheduler is driven by the script, so normal warmup never completes
-        # and /health stays 503 (server_status == Starting) for the whole run.
-        # A 503 still proves the socket is bound and routes are registered,
-        # which is all the control POSTs need.
-        url = f"{self._base_url}/health"
+        # Poll /model_info rather than /health: once the server reports Up,
+        # /health runs the generation-based health check (a real probe request
+        # through the scheduler), which cannot complete while the scheduler
+        # waits for scripts between RunScript commands. Any /model_info
+        # response proves the socket is bound and routes are registered, which
+        # is all the control POSTs need.
+        url = f"{self._base_url}/model_info"
         deadline = time.monotonic() + HTTP_READY_TIMEOUT_S
         while time.monotonic() < deadline:
             if not self._server_process.is_alive():
@@ -229,7 +230,7 @@ def _spawn_server_process(
         kv_canary="raise",
         kv_canary_real_data="partial",
         kv_canary_sweep_interval=100,
-        disable_piecewise_cuda_graph=True,
+        disable_prefill_cuda_graph=True,
     )
     launch_kwargs.update(engine_kwargs)
     http_port = launch_kwargs["port"]

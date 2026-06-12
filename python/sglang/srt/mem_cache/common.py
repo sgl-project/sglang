@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.triton_ops.common import (
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
 
@@ -28,6 +28,7 @@ _is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
@@ -52,6 +53,49 @@ def kv_to_page_num(num_kv_indices: int, page_size: int):
 
 def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
+
+
+def free_swa_out_of_window_slots(
+    req: Req,
+    pre_len: int,
+    *,
+    sliding_window_size: int,
+    page_size: int,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> None:
+    from sglang.srt.environ import envs
+
+    # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
+    assert (
+        req.cache_protected_len % page_size == 0
+    ), "cache_protected_len must be page aligned"
+    req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+
+    # Subtract an extra page_size so the eviction frontier never reaches the
+    # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
+    # page of non-evicted SWA KV for the tree to store as a non-tombstone node,
+    # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
+    # may become tombstoned, causing SWA memory leak.
+    # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
+    if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
+        evict_threshold = pre_len - sliding_window_size
+    else:
+        evict_threshold = pre_len - sliding_window_size - page_size
+    new_swa_evicted_seqlen = max(
+        req.swa_evicted_seqlen,
+        evict_threshold,
+    )
+
+    if page_size > 1:
+        new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
+
+    if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+        free_slots = req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+        ]
+        token_to_kv_pool_allocator.free_swa(free_slots)
+        req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
@@ -150,6 +194,65 @@ def get_last_loc_torch(
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
         torch.full_like(prefix_lens_tensor, -1),
     )
+
+
+def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+    if server_args is None:
+        server_args = get_global_server_args()
+
+    if server_args.speculative_algorithm is None:
+        return 1
+
+    # Spec decoding allocates max(topk * num_steps, num_draft_tokens) per
+    # decode step (draft chain and verify block share the reservation).
+
+    spec_steps = server_args.speculative_num_steps or 1
+    spec_topk = server_args.speculative_eagle_topk or 1
+    spec_tokens = server_args.max_speculative_num_draft_tokens
+    page_size = server_args.page_size
+
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec_algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
+        return max(spec_steps * spec_topk, spec_tokens)
+    else:
+        # page_size > 1 + topk > 1 (spec v2 tree): worst-case page-aligned tree
+        # footprint. Per topk branch needs ceil((last_page_len + num_steps) / page)
+        # pages; the partial tail page can be up to page_size - 1, and each branch
+        # gets its own (duplicated) copy -- so reserve for all topk branches.
+        num_new_pages_per_topk = (
+            (page_size - 1) + spec_steps + page_size - 1
+        ) // page_size
+        return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
+
+
+def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+    """KV length reserved per request at each decode step.
+
+    The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
+    mode; see eagle_info_v2.prepare_for_decode.
+    """
+    return 2 * get_alloc_len_per_decode(server_args)
+
+
+def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
+    """req_to_token row headroom beyond the model context length.
+
+    Sized to hold the decode over-allocation (kv_committed_len +
+    get_alloc_reserve_per_decode). The spec v2 page>1 topk>1 holey draft footprint
+    can outgrow the default num_draft_tokens headroom (PR #26972).
+    """
+    # FIXME(lsyin): this is the temporary fix for the context length issue when
+    # using speculative decoding
+    extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
+    if (
+        server_args.speculative_algorithm is not None
+        and server_args.page_size > 1
+        and (server_args.speculative_eagle_topk or 1) > 1
+    ):
+        extra = max(extra, get_alloc_reserve_per_decode(server_args))
+    return extra
 
 
 def alloc_token_slots(
@@ -256,7 +359,7 @@ def alloc_req_slots(
     """Allocate request slots from the pool."""
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        mamba_available_size = req_to_token_pool.mamba_pool.available_size()
+        mamba_available_size = req_to_token_pool.mamba_allocator.available_size()
         if tree_cache.supports_mamba():
             factor = (
                 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
@@ -428,7 +531,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
-            tree_cache.req_to_token_pool.mamba_pool.free(
+            tree_cache.req_to_token_pool.mamba_allocator.free(
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
