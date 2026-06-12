@@ -101,10 +101,13 @@ class GenerationBatchResult:
                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if return_hidden_states and self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
-                "cpu", non_blocking=True
-            )
+        if self.logits_output.hidden_states is not None:
+            if return_hidden_states:
+                self.logits_output.hidden_states = self.logits_output.hidden_states.to(
+                    "cpu", non_blocking=True
+                )
+            else:
+                self.logits_output.hidden_states = None
         self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
 
         if self.accept_lens is not None:
