@@ -1101,20 +1101,6 @@ class Req(ReqDllmMixin):
     def get_fill_ids(self) -> array:
         return self.get_full_untruncated_fill_ids()[: self.extend_range.end]
 
-    def get_cached_fill_ids(self) -> array:
-        """Admitted fill ids for radix caching.
-
-        Excludes the dLLM mask tail: those positions are denoised in place,
-        so caching them would poison the tree with mask-id keys and advance
-        prefix_indices past the real tokens. A no-op for non-dLLM reqs, whose
-        admitted range never exceeds the real-token boundary.
-        """
-        end = min(
-            self.extend_range.end,
-            len(self.origin_input_ids) + len(self.output_ids),
-        )
-        return self.get_full_untruncated_fill_ids()[:end]
-
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
