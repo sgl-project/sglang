@@ -1365,6 +1365,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extend_num_tokens=fill_len,
                     swa_tail_len=self._swa_tail_len(fill_len),
                 )
+                req.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
             else:
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
                     prefix_lens=torch.tensor(
