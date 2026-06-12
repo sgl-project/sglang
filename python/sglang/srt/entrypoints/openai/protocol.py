@@ -1320,7 +1320,7 @@ class ResponseTool(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = None
 
     @model_validator(mode="after")
-    def validate_function_tool(self) -> "ResponseTool":
+    def validate_function_tool(self) -> ResponseTool:
         if self.type == "function" and not self.name:
             raise ValueError("Function tools must include a name.")
         return self
