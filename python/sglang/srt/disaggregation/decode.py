@@ -1873,8 +1873,11 @@ class SchedulerDisaggregationDecodeMixin:
             if i < num_not_used_batch:
                 can_run_list.append(req)
                 self._activate_req(req)
+                # Decode-radix path: new requests already matched in
+                # `pop_preallocated`. Retracted requests reset `last_node`,
+                # so re-match only when that state is missing.
                 if self.server_args.disaggregation_decode_enable_radix_cache:
-                    tree_cache = None
+                    tree_cache = self.tree_cache if req.last_node is None else None
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
