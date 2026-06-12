@@ -361,6 +361,11 @@ class DFlashWorker:
         # to flush here.
         pass
 
+    def iter_draft_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        # Explicit so DFlash's __getattr__ doesn't delegate this to the target
+        # (whose model_runner is aliased here) and miss the real draft.
+        return [("draft", self.draft_model_runner)]
+
     def _gather_req_to_token_masked(
         self,
         *,

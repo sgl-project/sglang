@@ -78,7 +78,7 @@ class WeightChecker:
         for name, param in self._model_state():
             if _is_non_persistent_buffer_name(name):
                 continue
-            param.copy_(_random_like(param))
+            param.copy_(_sentinel_like(param))
 
     def _compare(self):
         assert self._snapshot_tensors is not None
@@ -198,21 +198,19 @@ def _check_tensors(
         raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
 
-def _random_like(t: torch.Tensor):
-    device = t.device
-    shape = t.shape
-    dtype = t.dtype
+# Deterministic non-zero "poison" for reset: must differ from real weights so a
+# missed weight-sync is caught by compare. Avoid 0 (naturally-zero params) and 1.0
+# (RMSNorm/LayerNorm weights), both of which would alias a stale weight and mask the miss.
+_RESET_SENTINEL = 88.0  # representable in fp8 e4m3 (max 448), far from typical weight magnitudes
 
-    if dtype.is_floating_point:
-        return torch.rand(shape, device=device, dtype=torch.float32).to(dtype)
 
-    if dtype == torch.bool:
-        return torch.rand(shape, device=device) > 0.5
-
-    info = torch.iinfo(dtype)
-    return torch.randint(
-        low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype
-    )
+def _sentinel_like(t: torch.Tensor) -> torch.Tensor:
+    if t.dtype == torch.bool:
+        return torch.ones_like(t)
+    if t.dtype.is_floating_point:
+        return torch.full_like(t, _RESET_SENTINEL)
+    info = torch.iinfo(t.dtype)
+    return torch.full_like(t, min(int(_RESET_SENTINEL), info.max))
 
 
 def _postprocess_tensors(

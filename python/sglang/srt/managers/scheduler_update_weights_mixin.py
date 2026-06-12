@@ -230,7 +230,98 @@ class SchedulerUpdateWeightsMixin:
 
     def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
         try:
-            payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
+            selector = recv_req.selector if recv_req.selector is not None else "target"
+            # Validate before mutating any runner so a bad selector cannot leave
+            # weights partially reset (an empty string is rejected here, not
+            # silently coerced to "target").
+            if selector not in ("target", "draft", "all"):
+                raise ValueError(
+                    f"invalid selector {selector!r}; expected one of target/draft/all"
+                )
+
+            # Validate the action up front: the empty-draft-runner fast path below
+            # returns without dispatching to WeightChecker.handle, so an action that
+            # handle would reject (unsupported or since-removed) must be caught here
+            # too, or it would slip through as a success on draft-only selections.
+            if recv_req.action not in (
+                "snapshot",
+                "reset_tensors",
+                "compare",
+                "checksum",
+            ):
+                raise Exception(f"Unsupported action={recv_req.action!r}")
+
+            # Byte-identical fast path: the default /weights_checker payload keeps
+            # its exact top-level shape ({"checksums","parallelism_info"}, no
+            # "runners", target keys unprefixed).
+            if selector == "target":
+                payload = self.tp_worker.model_runner.check_weights(
+                    action=recv_req.action
+                )
+                return CheckWeightsReqOutput(
+                    success=True, message="Success.", payload=payload
+                )
+
+            # Target first so its parallelism_info is the checksum base.
+            runners = []
+            if selector == "all":
+                runners.append(("", self.tp_worker.model_runner))
+            if selector in ("draft", "all") and self.draft_worker is not None:
+                runners += self.draft_worker.iter_draft_runners()
+
+            if not runners:
+                payload = (
+                    {"checksums": {}, "parallelism_info": None, "runners": []}
+                    if recv_req.action == "checksum"
+                    else None
+                )
+                return CheckWeightsReqOutput(
+                    success=True,
+                    message="no separate draft weights to check",
+                    payload=payload,
+                )
+
+            def _check(role, r, **kwargs):
+                try:
+                    return r.check_weights(**kwargs)
+                except Exception as e:
+                    raise RuntimeError(f"[{role or 'target'}] {e}") from e
+
+            if recv_req.action == "reset_tensors":
+                # Selecting a runner resets its complete coverage, including any
+                # storage it shares with another runner (e.g. embed/head tied to
+                # the target via set_embed_and_head). The reset sentinel is
+                # idempotent, so a shared storage written by several selected
+                # runners ends at the same value regardless of order.
+                for role, r in runners:
+                    _check(role, r, action="reset_tensors")
+                payload = None
+            elif recv_req.action == "checksum":
+                merged = {}
+                runner_infos = []
+                base_parallelism = None
+                for role, r in runners:
+                    p = _check(role, r, action="checksum")
+                    for k, v in p["checksums"].items():
+                        key = k if role == "" else f"{role}.{k}"
+                        if key in merged:
+                            raise ValueError(f"checksum key collision: {key}")
+                        merged[key] = v
+                    if base_parallelism is None:
+                        base_parallelism = p["parallelism_info"]
+                    runner_infos.append(
+                        {"role": role or "target", **p["parallelism_info"]}
+                    )
+                payload = {
+                    "checksums": merged,
+                    "parallelism_info": base_parallelism,
+                    "runners": runner_infos,
+                }
+            else:
+                for role, r in runners:
+                    _check(role, r, action=recv_req.action)
+                payload = None
+
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )

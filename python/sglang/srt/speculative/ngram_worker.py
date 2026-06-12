@@ -84,6 +84,10 @@ class NGRAMWorker:
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
 
+    def iter_draft_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        # NGRAM shares the target's model_runner — no independent draft.
+        return []
+
     def update_weights_from_tensor(self, recv_req):
         # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
         # lookup structure built from request token streams — and its
