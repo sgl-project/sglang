@@ -162,7 +162,6 @@ fixture investigation; no test in the suite).
 | Backend | Mode | Status | Root cause |
 |---|---|---|---|
 | FlashInfer MLA | EAGLE draft CG, chain | `[gated on SM≥10]` `mla/test_flashinfer.py::test_runner_mode_eagle_draft_cuda_graph_runner_cases` | FlashInfer MLA decode kernel in container targets SM9x; on Blackwell falls back to a generic path that doesn't restore metadata buffers under graph replay (~22 abs-diff vs reference) |
-| FlashMLA | MLA `DRAFT_EXTEND` CUDA-graph replay | `[no test]` (`mla/README.md` Next Work) | Capture falls through to `FlashInferMLAAttnBackend.init_forward_metadata_capture_cuda_graph` (1D `cuda_graph_kv_indices`); FlashMLA decode uses 2D `[max_bs, (max_context + PAGE_SIZE) // PAGE_SIZE]` layout — buffer mismatch |
 | GDN / KDA / Lightning / Mamba2 | `DRAFT_EXTEND` and `DRAFT_EXTEND_V2` graph capture | `[no test]` for CG; eager-only paths covered | `HybridLinearAttnBackend` raises `ValueError("Invalid forward mode")` at `hybrid_linear_attn_backend.py:509,572` |
 | DSV4 | EAGLE draft_extend with `compress_ratio != 0` | `[no test]` (runner asserts `case.compress_ratio == 0`) | `DeepseekV4ModelNextN` hardcodes `compress_ratio_override=0`, making C4/C128 draft_extend production-unreachable |
 
