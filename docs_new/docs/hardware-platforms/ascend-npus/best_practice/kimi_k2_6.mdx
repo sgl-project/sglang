@@ -16,6 +16,7 @@ This guide describes the best practice data for Kimi-K2.6 on the Ascend NPU.
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Mixed | 64K+1K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
@@ -28,6 +29,109 @@ This guide describes the best practice data for Kimi-K2.6 on the Ascend NPU.
 
 
 ## Optimal Configuration
+
+### Kimi-K2.6 W4A8 16P IN64K OUT1K 100ms
+
+**Model**: Kimi-K2.6
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 16
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W4A8 INT8
+
+**Dataset**: 64K+1K
+
+**TPOT**: 100ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=4400
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --quantization modelslim \
+    --dtype bfloat16 \
+    --tp-size 32 \
+    --nnodes 2 \
+    --mem-fraction-static 0.55 \
+    --max-running-requests 32 \
+    --chunked-prefill-size 262144 \
+    --context-length 75000 \
+    --enable-multimodal \
+    --mm-attention-backend ascend_attn \
+    --sampling-backend ascend \
+    --enable-dp-attention \
+    --dp-size 32 \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --cuda-graph-bs 1 \
+    --disable-radix-cache \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 32 \
+    --random-input-len 64000 \
+    --random-output-len 1000 \
+    --num-prompts 32 \
+    --random-range-ratio 1
+```
 
 ### Kimi-K2.6 W4A8 1P1D 16P IN128K OUT1K 100ms
 
