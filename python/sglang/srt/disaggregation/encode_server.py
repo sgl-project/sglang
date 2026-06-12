@@ -48,6 +48,11 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
+from sglang.srt.observability.req_time_stats import EncoderReqTimeStats
+from sglang.srt.observability.trace import (
+    process_tracing_init,
+    trace_set_thread_info,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -2447,6 +2452,10 @@ async def _dp_worker_encode_and_send(
     # Mooncake returns metadata for main to forward; zmq inlines the send.
     # Soft errors raise MMError so the dispatcher route maps them to HTTP.
     req_id = request["req_id"]
+    time_stats_json = request.pop("time_stats_json", None)
+    time_stats = EncoderReqTimeStats()
+    if time_stats_json:
+        time_stats.decode_json(time_stats_json)
     request["enter_time"] = time.time()
     modality = Modality.from_str(request["modality"])
     backend = enc.server_args.encoder_transfer_backend
@@ -2461,14 +2470,20 @@ async def _dp_worker_encode_and_send(
             code=HTTPStatus.BAD_REQUEST,
         )
 
+    time_stats.set_mm_encode_start_time()
     encode_coro = (
         sched.submit(request)
         if sched is not None and modality in _BATCHABLE_MODALITIES
         else enc.encode_request(request, modality)
     )
-    nbytes, embedding_len, embedding_dim, error_msg, error_code = await encode_coro
+    try:
+        nbytes, embedding_len, embedding_dim, error_msg, error_code = await encode_coro
+    except asyncio.TimeoutError:
+        time_stats.trace_ctx.abort(abort_info={"reason": "encoder batch timed out"})
+        raise
 
     if error_msg:
+        time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
         # zmq backends still forward an error EmbeddingData to P so it
         # doesn't block; send failures here are swallowed.
         try:
@@ -2489,6 +2504,8 @@ async def _dp_worker_encode_and_send(
         else:
             enc.embedding_to_send.pop(req_id, None)
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    time_stats.set_mm_encode_end_time()
 
     if backend == "mooncake":
         request.pop("mm_items", None)
@@ -3275,6 +3292,13 @@ def launch_server(server_args: ServerArgs):
         dist_init_method = NetworkAddress(
             server_args.host or "127.0.0.1", port_args.nccl_port
         ).to_tcp()
+    if server_args.enable_trace:
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
+        trace_set_thread_info("Encoder")
     for rank in range(1, server_args.tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
@@ -3414,7 +3438,12 @@ async def get_condition(rid):
 async def handle_encode_request(request: dict):
     req_id = request["req_id"]
     start_time = time.monotonic()
+    time_stats_json = request.pop("time_stats_json", None)
+    time_stats = EncoderReqTimeStats()
     if dp_dispatcher is not None:
+        if time_stats_json:
+            request = dict(request)
+            request["time_stats_json"] = time_stats_json
         try:
             result = await dp_dispatcher.dispatch(request)
         except MMError as e:
@@ -3497,12 +3526,19 @@ async def handle_encode_request(request: dict):
         async with encoder.encode_dispatch_lock:
             request.update({"enter_time": time.time()})
             modality = Modality.from_str(request["modality"])
+            if time_stats_json:
+                time_stats.decode_json(time_stats_json)
+
+            time_stats.set_mm_encode_start_time()
             if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
                 try:
                     nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                         await encoder_scheduler.submit(request)
                     )
                 except asyncio.TimeoutError:
+                    time_stats.trace_ctx.abort(
+                        abort_info={"reason": "encoder batch timed out"}
+                    )
                     return ORJSONResponse(
                         status_code=HTTPStatus.GATEWAY_TIMEOUT,
                         content={
@@ -3517,6 +3553,11 @@ async def handle_encode_request(request: dict):
                 nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                     await encoder.encode_request(request, modality)
                 )
+
+        if error_msg:
+            time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        else:
+            time_stats.set_mm_encode_end_time()
 
         if error_msg:
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
