@@ -14,6 +14,7 @@ python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServe
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_tool_result_image_content_conversion
 """
 
+import asyncio
 import json
 import unittest
 
@@ -21,6 +22,15 @@ import requests
 
 from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse,
+    ChatMessage,
+    DeltaMessage,
+    UsageInfo,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -33,6 +43,149 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
+
+
+class TestAnthropicConversion(unittest.TestCase):
+    def test_pd_metadata_conversion(self):
+        anthropic_request = AnthropicMessagesRequest(
+            model="test-model",
+            max_tokens=64,
+            messages=[{"role": "user", "content": "hello"}],
+            bootstrap_host="10.0.0.1",
+            bootstrap_port=8998,
+            bootstrap_room=12345,
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+
+        self.assertEqual(chat_request.bootstrap_host, "10.0.0.1")
+        self.assertEqual(chat_request.bootstrap_port, 8998)
+        self.assertEqual(chat_request.bootstrap_room, 12345)
+
+    def test_non_streaming_reasoning_content_maps_to_thinking_block(self):
+        response = ChatCompletionResponse(
+            id="chatcmpl-test",
+            model="test-model",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant",
+                        reasoning_content="think first",
+                        content="final answer",
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=3, completion_tokens=5, total_tokens=8),
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        anthropic_response = serving._convert_response(response)
+
+        self.assertEqual(anthropic_response.content[0].type, "thinking")
+        self.assertEqual(anthropic_response.content[0].thinking, "think first")
+        self.assertEqual(anthropic_response.content[1].type, "text")
+        self.assertEqual(anthropic_response.content[1].text, "final answer")
+
+    def test_streaming_reasoning_content_maps_to_thinking_delta(self):
+        async def fake_openai_stream():
+            role_chunk = ChatCompletionStreamResponse(
+                id="chatcmpl-test",
+                model="test-model",
+                choices=[
+                    ChatCompletionResponseStreamChoice(
+                        index=0,
+                        delta=DeltaMessage(role="assistant", content=""),
+                    )
+                ],
+            )
+            yield f"data: {role_chunk.model_dump_json()}\n\n"
+
+            reasoning_chunk = ChatCompletionStreamResponse(
+                id="chatcmpl-test",
+                model="test-model",
+                choices=[
+                    ChatCompletionResponseStreamChoice(
+                        index=0,
+                        delta=DeltaMessage(reasoning_content="think first"),
+                    )
+                ],
+            )
+            yield f"data: {reasoning_chunk.model_dump_json()}\n\n"
+
+            text_chunk = ChatCompletionStreamResponse(
+                id="chatcmpl-test",
+                model="test-model",
+                choices=[
+                    ChatCompletionResponseStreamChoice(
+                        index=0,
+                        delta=DeltaMessage(content="final answer"),
+                    )
+                ],
+            )
+            yield f"data: {text_chunk.model_dump_json()}\n\n"
+
+            finish_chunk = ChatCompletionStreamResponse(
+                id="chatcmpl-test",
+                model="test-model",
+                choices=[
+                    ChatCompletionResponseStreamChoice(
+                        index=0,
+                        delta=DeltaMessage(),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+            yield f"data: {finish_chunk.model_dump_json()}\n\n"
+            yield "data: [DONE]\n\n"
+
+        class FakeOpenAIServingChat:
+            def _generate_chat_stream(
+                self, adapted_request, processed_request, raw_request
+            ):
+                return fake_openai_stream()
+
+        async def collect_events():
+            serving = AnthropicServing(openai_serving_chat=FakeOpenAIServingChat())
+            request = AnthropicMessagesRequest(
+                model="test-model",
+                max_tokens=64,
+                stream=True,
+                messages=[{"role": "user", "content": "hello"}],
+            )
+            raw_events = []
+            async for event in serving._generate_anthropic_stream(
+                object(), object(), request, object()
+            ):
+                _, data = event.split("data: ", 1)
+                raw_events.append(json.loads(data.strip()))
+            return raw_events
+
+        events = asyncio.run(collect_events())
+
+        thinking_starts = [
+            e
+            for e in events
+            if e["type"] == "content_block_start"
+            and e["content_block"]["type"] == "thinking"
+        ]
+        thinking_deltas = [
+            e
+            for e in events
+            if e["type"] == "content_block_delta"
+            and e["delta"]["type"] == "thinking_delta"
+        ]
+        text_deltas = [
+            e
+            for e in events
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "text_delta"
+        ]
+
+        self.assertEqual(len(thinking_starts), 1)
+        self.assertEqual(thinking_deltas[0]["delta"]["thinking"], "think first")
+        self.assertEqual(text_deltas[0]["delta"]["text"], "final answer")
 
 
 class TestAnthropicServer(CustomTestCase):
