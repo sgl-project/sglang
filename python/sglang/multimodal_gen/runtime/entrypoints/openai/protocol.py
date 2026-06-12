@@ -59,6 +59,8 @@ class ImageGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    # Presigned URLs for direct upload to client's object storage (one per output)
+    output_presigned_urls: Optional[List[str]] = None
 
 
 # Video API protocol models
@@ -127,6 +129,8 @@ class VideoGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    # Presigned URLs for direct upload to client's object storage (one per output)
+    output_presigned_urls: Optional[List[str]] = None
 
 
 class VideoListResponse(BaseModel):
@@ -193,6 +197,8 @@ class MeshGenerationsRequest(BaseModel):
     guidance_scale: Optional[float] = None
     negative_prompt: Optional[str] = None
     output_format: Optional[str] = "glb"
+    # Presigned URLs for direct upload to client's object storage (one per output)
+    output_presigned_urls: Optional[List[str]] = None
 
 
 class MeshListResponse(BaseModel):

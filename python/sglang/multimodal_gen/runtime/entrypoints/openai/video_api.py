@@ -185,6 +185,7 @@ async def _dispatch_job_async(
     *,
     temp_dirs: list[str] | None = None,
     output_persistent: bool = True,
+    output_presigned_urls: list[str] | None = None,
 ) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
@@ -194,7 +195,12 @@ async def _dispatch_job_async(
         )
         save_file_path = save_file_path_list[0]
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        output_presigned_url = (
+            output_presigned_urls[0] if output_presigned_urls else None
+        )
+        cloud_url = await cloud_storage.upload_and_cleanup(
+            save_file_path, presigned_url=output_presigned_url
+        )
 
         persistent_path = (
             save_file_path if not cloud_url and output_persistent else None
@@ -485,6 +491,7 @@ async def create_video(
             batch,
             temp_dirs=temp_dirs or None,
             output_persistent=output_persistent,
+            output_presigned_urls=req.output_presigned_urls,
         )
     )
     return VideoResponse(**job)

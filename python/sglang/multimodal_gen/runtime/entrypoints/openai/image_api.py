@@ -231,7 +231,12 @@ async def generations(
             else None
         )
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        output_presigned_url = (
+            request.output_presigned_urls[0] if request.output_presigned_urls else None
+        )
+        cloud_url = await cloud_storage.upload_and_cleanup(
+            save_file_path, presigned_url=output_presigned_url
+        )
 
         is_persistent = server_args.output_path is not None
         await IMAGE_STORE.upsert(

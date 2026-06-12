@@ -105,6 +105,22 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 > If `response_format=url` is used and cloud storage is not configured, the API returns
 > a relative URL like `/v1/images/<IMAGE_ID>/content`.
 
+**Direct Upload with Presigned URLs**
+
+For multi-tenant scenarios, clients can provide presigned URLs to have the server upload results directly to their own object storage:
+
+```bash
+curl -sS -X POST "http://localhost:30010/v1/images/generations" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "prompt": "A calico cat playing a piano on stage",
+        "output_presigned_urls": ["https://your-bucket.s3.amazonaws.com/output.png?X-Amz-Algorithm=..."]
+      }'
+```
+
+> **Note**
+> The presigned URL must be generated with signature version `s3v4` for S3-compatible storage.
+
 **Edit an image**
 
 **Endpoint:** `POST /v1/images/edits`
@@ -210,6 +226,22 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
         "size": "1280x720"
       }'
 ```
+
+**Direct Upload with Presigned URLs**
+
+For multi-tenant scenarios, clients can provide presigned URLs to have the server upload results directly to their own object storage:
+
+```bash
+curl -sS -X POST "http://localhost:30010/v1/videos" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "prompt": "A cat playing a piano",
+        "output_presigned_urls": ["https://your-bucket.s3.amazonaws.com/output.mp4?X-Amz-Algorithm=..."]
+      }'
+```
+
+> **Note**
+> The presigned URL must be generated with signature version `s3v4` for S3-compatible storage.
 
 **List videos**
 
