@@ -2169,6 +2169,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        del named_tensors
+        torch.cuda.ipc_collect()
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(

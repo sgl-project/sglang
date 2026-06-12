@@ -151,6 +151,33 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
+    def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
+        """Run deferred clear/COW ops on the forward stream to avoid races."""
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or self.is_draft_worker
+        ):
+            return
+        if (
+            forward_batch.mamba_clear_indices is not None
+            and len(forward_batch.mamba_clear_indices) > 0
+        ):
+            self.req_to_token_pool.mamba_pool.clear_slots(
+                forward_batch.mamba_clear_indices
+            )
+        if (
+            forward_batch.mamba_cow_src_indices is not None
+            and len(forward_batch.mamba_cow_src_indices) > 0
+        ):
+            self.req_to_token_pool.mamba_pool.copy_from(
+                forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
+            )
+        forward_batch.mamba_clear_indices = None
+        forward_batch.mamba_cow_src_indices = None
+        forward_batch.mamba_cow_dst_indices = None
+
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
@@ -166,6 +193,10 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
+        _real_bs = getattr(forward_batch, "_original_batch_size", None)
+        if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
+            mamba_cache_indices = mamba_cache_indices.clone()
+            mamba_cache_indices[_real_bs:] = -1
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
@@ -691,6 +722,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             seq_lens,
             is_target_verify=forward_mode.is_target_verify(),
             draft_token_num=draft_token_num,
+            num_decodes=getattr(self, "_replay_num_decodes", None),
         )
 
     def forward(
@@ -803,7 +835,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        replay_num_decodes = getattr(self, "_replay_num_decodes", None)
         for attn_backend in self.attn_backend_list:
+            attn_backend._replay_num_decodes = replay_num_decodes
             attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -814,6 +848,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 spec_info,
                 seq_lens_cpu,
             )
+            attn_backend._replay_num_decodes = None
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()
