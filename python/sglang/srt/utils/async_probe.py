@@ -11,6 +11,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -20,19 +21,22 @@ class _AsyncNanWarner:
     memory without any stream sync; the host reads the (slightly stale) flag
     on a later call, warns once, and stops detecting.
 
-    The device probe (isnan/any/cast/add/copy) is sampled once every
-    ``_PROBE_INTERVAL`` calls rather than on every call. ``check`` runs on the
-    sampler hot path (once per decode step, every model); enqueuing those
-    extra kernels on every step measurably lowered single-batch decode
-    ``fwd_occupancy`` (more non-overlapped per-step launch overhead). The
-    probe only feeds a throttled diagnostic warning -- sanitization itself is
-    done by ``nan_to_num_`` in ``sanitize_nan_logits`` independent of this --
-    so sampling it on a cadence keeps the hot path cheap while still surfacing
-    a persistent NaN within at most ``_PROBE_INTERVAL`` steps."""
+    On ROCm/HIP the device probe (isnan/any/cast/add/copy) is sampled once
+    every ``_PROBE_INTERVAL`` calls rather than on every call. ``check`` runs
+    on the sampler hot path (once per decode step, every model); on AMD,
+    enqueuing those extra kernels on every step measurably lowered
+    single-batch decode ``fwd_occupancy`` (more non-overlapped per-step launch
+    overhead). The probe only feeds a throttled diagnostic warning --
+    sanitization itself is done by ``nan_to_num_`` in ``sanitize_nan_logits``
+    independent of this -- so sampling it on a cadence keeps the hot path
+    cheap while still surfacing a persistent NaN within at most
+    ``_PROBE_INTERVAL`` steps. On CUDA the cadence is 1 (probe every call),
+    preserving the original detection latency."""
 
-    # Probe roughly every N calls. Cheap host-flag read still happens every
-    # call, so a landed hit is reported on the very next call after a probe.
-    _PROBE_INTERVAL = 128
+    # AMD only: probe roughly every N calls. The cheap host-flag read still
+    # happens every call, so a landed hit is reported on the very next call
+    # after a probe. CUDA keeps the original every-call behavior (interval 1).
+    _PROBE_INTERVAL = 128 if is_hip() else 1
 
     def __init__(self):
         self._dev = None
