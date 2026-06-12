@@ -30,7 +30,7 @@ def patched_post_init(self):
     # Disable CUDA graphs to avoid memory spikes during capture.
     # Notebooks only run a few sample requests, so perf is not critical.
     self.disable_cuda_graph = True
-    self.cuda_graph_max_bs = 4
+    self.cuda_graph_max_bs_decode = 4
 
 
 server_args_mod.ServerArgs.__post_init__ = patched_post_init
