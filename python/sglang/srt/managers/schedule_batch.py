@@ -1617,25 +1617,6 @@ def compute_extend_logprob_start_len(
     return min(resolved_start - prefix_len, extend_len)
 
 
-def compute_extend_logprob_start_len(
-    *,
-    logprob_start_len: int,
-    prefix_len: int,
-    extend_len: int,
-    full_untruncated_fill_len: int,
-) -> int:
-    # Key variables:
-    # - logprob_start_len: Absolute position in full sequence where logprob computation begins
-    # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
-    # - extend_input_len: Number of tokens that need to be processed in this extend batch
-    if logprob_start_len == -1:
-        resolved_start = full_untruncated_fill_len
-    else:
-        # logprob_start_len should be at least the length of the prefix indices
-        resolved_start = max(logprob_start_len, prefix_len)
-    return min(resolved_start - prefix_len, extend_len)
-
-
 def _compute_next_extend_prompt_token(
     partially_extended_req: Optional[Req],
 ) -> Optional[int]:
