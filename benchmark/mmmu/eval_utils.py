@@ -217,15 +217,22 @@ def prepare_samples(eval_args: EvalArgs):
     def process_sample(i, sample):
         sample = process_single_sample(sample)
         sample = construct_prompt(sample, eval_args.config)
-        image = sample["image"]
-        width, height = image.size
-        if 0 < eval_args.image_pixels_limit <= width * height:
+        images = sample.get("images") or []
+        if not images:
             return None, True
-        # Use a unique identifier for the image path to avoid potential collisions if indices reset
-        image_path = f"{images_path}/image_{sample['id']}.png"
-        if not os.path.exists(image_path):
-            image.save(image_path)
-        sample["image_path"] = image_path
+        if eval_args.image_pixels_limit > 0:
+            for img in images:
+                if img.size[0] * img.size[1] >= eval_args.image_pixels_limit:
+                    return None, True
+        image_paths = []
+        for idx, img in enumerate(images, start=1):
+            suffix = "" if len(images) == 1 else f"_{idx}"
+            path = f"{images_path}/image_{sample['id']}{suffix}.png"
+            if not os.path.exists(path):
+                img.save(path)
+            image_paths.append(path)
+        sample["image_path"] = image_paths[0]
+        sample["image_paths"] = image_paths
         return sample, False
 
     print("Processing samples...")
