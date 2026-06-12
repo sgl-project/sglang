@@ -767,7 +767,8 @@ class Envs:
     # (batch, num_splits) CTAs. The base kernel is latency-bound on per-row scan
     # depth (flat vs batch up to the SM count), off by default.
     SGLANG_SM120_INDEXER_SPLIT = EnvBool(False)
-    SGLANG_SM120_INDEXER_SPLIT_COUNT = EnvInt(128)
+    # KV-splits per row. More = shallower per-CTA scan
+    SGLANG_SM120_INDEXER_SPLIT_COUNT = EnvInt(256)
     # Upper batch bound for the split: the captured-graph batch ceiling.
     SGLANG_SM120_INDEXER_SPLIT_MAX_BS = EnvInt(128)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
