@@ -16,6 +16,7 @@ from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 _is_npu = is_npu()
+_is_musa = getattr(torch.version, "musa", None) is not None
 if _is_npu:
     import torch_npu
 
@@ -27,6 +28,25 @@ if _is_npu:
     apply_torch_npu_patches(torch_npu, patches)
 
 logger = logging.getLogger(__name__)
+
+
+def get_torch_profiler_gpu_activities():
+    """Return torch profiler activities that can carry accelerator events."""
+    if not _is_musa:
+        return [torch.profiler.ProfilerActivity.CUDA]
+
+    activities = []
+    for name in ("MUSA", "PrivateUse1"):
+        activity = getattr(torch.profiler.ProfilerActivity, name, None)
+        if activity is not None and activity not in activities:
+            activities.append(activity)
+    if not activities:
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    if os.getenv("SGLANG_MUSA_PROFILER_INCLUDE_CUDA", "0") == "1":
+        activity = torch.profiler.ProfilerActivity.CUDA
+        if activity not in activities:
+            activities.append(activity)
+    return activities
 
 
 class ProfileManager:
@@ -264,12 +284,12 @@ class _ProfilerTorch(_ProfilerConcreteBase):
 
     def start(self):
         activity_map = {
-            "CPU": torch.profiler.ProfilerActivity.CPU,
-            "GPU": torch.profiler.ProfilerActivity.CUDA,
+            "CPU": [torch.profiler.ProfilerActivity.CPU],
+            "GPU": get_torch_profiler_gpu_activities(),
         }
-        torchprof_activities = [
-            activity_map[a] for a in self.activities if a in activity_map
-        ]
+        torchprof_activities = []
+        for activity in self.activities:
+            torchprof_activities.extend(activity_map.get(activity, []))
 
         self.torch_profiler = torch.profiler.profile(
             activities=torchprof_activities,
