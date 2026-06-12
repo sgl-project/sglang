@@ -36,6 +36,10 @@ class TestPCGWithDFlash(PCGSpecBase, CustomTestCase):
         "1",
         "--max-running-requests",
         "64",
+        # Keep headroom for the draft KV pool + piecewise cuda graph
+        # private pools on 32GB CI cards.
+        "--mem-fraction-static",
+        "0.7",
         "--cuda-graph-bs-decode",
         *[str(i) for i in range(1, 65)],
     ]
