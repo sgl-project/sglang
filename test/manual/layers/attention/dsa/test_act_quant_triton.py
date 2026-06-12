@@ -10,7 +10,10 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
-from sglang.srt.layers.attention.dsa.triton_kernel import act_quant as act_quant_triton
+from sglang.srt.layers.attention.dsa.triton_kernel import (
+    act_quant as act_quant_triton,
+    act_quant_apply_scale,
+)
 
 
 def benchmark_kernel(
@@ -149,6 +152,31 @@ def check_accuracy(
     passed = y_close and s_close
 
     return passed, metrics
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("scale_fmt", [None, "ue8m0"])
+@pytest.mark.parametrize("shape", [(1, 32, 128), (2, 32, 128), (3, 5, 256)])
+def test_act_quant_apply_scale_matches_split_path(shape, scale_fmt):
+    torch.manual_seed(0)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(shape[:-1], device="cuda", dtype=torch.float32)
+    softmax_scale = 0.125
+
+    q_ref, scale_ref = act_quant_triton(x, block_size=128, scale_fmt=scale_fmt)
+    scaled_weights_ref = weights.unsqueeze(-1) * scale_ref * softmax_scale
+
+    q, scaled_weights = act_quant_apply_scale(
+        x,
+        weights,
+        softmax_scale,
+        block_size=128,
+        scale_fmt=scale_fmt,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(q, q_ref)
+    torch.testing.assert_close(scaled_weights, scaled_weights_ref, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -1327,10 +1327,14 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        act_quant_apply_scale = None
         if _is_hip:
             from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
-            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+            from sglang.srt.layers.attention.dsa.triton_kernel import (
+                act_quant,
+                act_quant_apply_scale,
+            )
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -1389,7 +1393,16 @@ class Indexer(MultiPlatformOp):
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            if act_quant_apply_scale is not None:
+                q_fp8, weights = act_quant_apply_scale(
+                    query,
+                    weights,
+                    self.softmax_scale,
+                    self.block_size,
+                    self.scale_fmt,
+                )
+            else:
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
@@ -1398,7 +1411,8 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
+            if act_quant_apply_scale is None:
+                weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch

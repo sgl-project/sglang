@@ -137,6 +137,131 @@ def act_quant(
 
 
 @triton.jit
+def _act_quant_apply_scale_kernel(
+    X_ptr,
+    W_ptr,
+    Y_ptr,
+    WS_ptr,
+    M,
+    N,
+    softmax_scale,
+    group_size: tl.constexpr,
+    round_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Triton kernel for activation quantization plus q-scale head-gate scaling.
+
+    Each block processes BLOCK_M rows and group_size columns. The per-row
+    quantization scale is immediately applied to the matching head-gate weight.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    fp8_min = -448.0
+    fp8_max = 448.0
+    fp8_max_inv = 1.0 / fp8_max
+
+    row_start = pid_m * BLOCK_M
+    col_start = pid_n * group_size
+
+    rows = row_start + tl.arange(0, BLOCK_M)
+    cols = col_start + tl.arange(0, BLOCK_N)
+
+    row_mask = rows < M
+    col_mask = cols < N
+    mask = row_mask[:, None] & col_mask[None, :]
+
+    x_ptrs = X_ptr + rows[:, None] * N + cols[None, :]
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    x_abs = tl.abs(x)
+    amax = tl.max(x_abs, axis=1)
+    amax = tl.maximum(amax, 1e-4)
+
+    if round_scale:
+        log_val = tl.log2(amax * fp8_max_inv)
+        log_ceil = tl.ceil(log_val)
+        scale = tl.exp2(log_ceil)
+    else:
+        scale = amax * fp8_max_inv
+
+    y = x / scale[:, None]
+    y = tl.minimum(tl.maximum(y, fp8_min), fp8_max)
+
+    y_ptrs = Y_ptr + rows[:, None] * N + cols[None, :]
+    tl.store(y_ptrs, y, mask=mask)
+
+    num_groups = N // group_size
+    scale_offsets = rows * num_groups + pid_n
+    weights = tl.load(W_ptr + rows, mask=row_mask, other=0.0)
+    scaled_weights = weights * scale * softmax_scale
+    tl.store(WS_ptr + scale_offsets, scaled_weights, mask=row_mask)
+
+
+def act_quant_apply_scale(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: float,
+    block_size: int = 128,
+    scale_fmt: Optional[str] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantizes `x` and applies the quantization scale to precomputed head gates.
+
+    This is equivalent to:
+      q, q_scale = act_quant(x, block_size, scale_fmt)
+      scaled_weights = weights.unsqueeze(-1) * q_scale * softmax_scale
+
+    Returns:
+        Tuple containing:
+            - The quantized tensor with dtype `torch.float8_e4m3fn`.
+            - Scaled head-gate weights with dtype `torch.float32`.
+    """
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert weights.is_contiguous(), "Weights tensor must be contiguous"
+    assert (
+        x.size(-1) % block_size == 0
+    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    assert (
+        weights.shape == x.shape[:-1]
+    ), "Weights tensor must match all input dimensions except the last"
+
+    N = x.size(-1)
+    x_flat = x.view(-1, N)
+    M = x_flat.size(0)
+    num_groups = N // block_size
+
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    y_flat = y.view(-1, N)
+    scaled_weights = x.new_empty(*x.size()[:-1], num_groups, dtype=torch.float32)
+    scaled_weights_flat = scaled_weights.view(-1, num_groups)
+
+    BLOCK_M = 32
+    BLOCK_N = block_size
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, block_size))
+    round_scale = scale_fmt is not None
+
+    _act_quant_apply_scale_kernel[grid](
+        x_flat,
+        weights.view(-1),
+        y_flat,
+        scaled_weights_flat,
+        M,
+        N,
+        softmax_scale,
+        group_size=block_size,
+        round_scale=round_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_stages=0 if round_scale else 2,
+    )
+
+    return y, scaled_weights
+
+
+@triton.jit
 def _get_valid_kv_indices_kernel(
     page_table_ptr,  # [bs, topk]
     kv_indptr_ptr,  # [bs + 1]
