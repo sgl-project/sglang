@@ -922,6 +922,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     else:
         gemm1_clamp_limit = None
 
+    # The TRTLLM FP4 kernels cannot run a parameterized swiglu: the
+    # gemm1_alpha/gemm1_beta tensors are ignored under ActivationType.Swiglu
+    # (verified bit-identical outputs with and without them), and
+    # ActivationType.SwigluBias is rejected by activationTypeToGatedActType.
+    # Fail fast instead of silently generating garbage.
+    if runner_config.gemm1_alpha is not None:
+        raise NotImplementedError(
+            "flashinfer_trtllm FP4 MoE does not support parameterized "
+            "(GPT-OSS-style) SwiGLU (gemm1_alpha is set); use "
+            "--moe-runner-backend flashinfer_cutlass instead."
+        )
+
     num_tokens = hs_fp4.shape[0]
     hidden_size = (
         hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
