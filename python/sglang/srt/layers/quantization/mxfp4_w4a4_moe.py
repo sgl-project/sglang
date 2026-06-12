@@ -131,6 +131,7 @@ class Mxfp4W4A4MoEMethod:
         # 128x4 weight-scale swizzle (shared with W4A8), then convert to the MMA
         # layout the fused kernel's _get_weight_views expects.
         from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
         from sglang.srt.layers.quantization.mxfp4_sm120_common import (
             swizzle_weight_scale_mxf4,
         )
@@ -145,7 +146,7 @@ class Mxfp4W4A4MoEMethod:
         Hhalf = w13.shape[2]
         H = Hhalf * 2
         Ihalf = w2.shape[2]
-        interm = Ihalf * 2
+        intermediate = Ihalf * 2
 
         # Fused kernel expects gate/up as [w3, w1] (up, gate), but the checkpoint
         # loads W13 as [w1, w3]; swap the I-row halves of weights and 3D scales.
@@ -161,7 +162,7 @@ class Mxfp4W4A4MoEMethod:
         # 128x4 block-scale swizzle (per expert), then convert to the MMA layout
         # the fused kernel reads (experts flattened into the leading row dim).
         w13_s_sw = swizzle_weight_scale_mxf4(w13_s_u8, E, twoI, H)
-        w2_s_sw = swizzle_weight_scale_mxf4(w2_s_u8, E, H, interm)
+        w2_s_sw = swizzle_weight_scale_mxf4(w2_s_u8, E, H, intermediate)
         w13_sf_mma = convert_sf_to_mma_layout(
             w13_s_sw.reshape(E * w13_s_sw.shape[1], w13_s_sw.shape[2]),
             m=twoI,
@@ -172,7 +173,7 @@ class Mxfp4W4A4MoEMethod:
         w2_sf_mma = convert_sf_to_mma_layout(
             w2_s_sw.reshape(E * w2_s_sw.shape[1], w2_s_sw.shape[2]),
             m=H,
-            k=interm,
+            k=intermediate,
             num_groups=E,
             sf_vec_size=_FP4_BLOCK_K,
         )
@@ -190,7 +191,7 @@ class Mxfp4W4A4MoEMethod:
             w2_sf_mma.contiguous(), requires_grad=False
         )
         layer._w4a4_H = H
-        layer._w4a4_I = interm
+        layer._w4a4_I = intermediate
         layer._w4a4_E = E
         layer._w4a4_weights_built = True
 
@@ -210,7 +211,7 @@ class Mxfp4W4A4MoEMethod:
             w2_blockscale=layer.w2_weight_scale_inv,
             w1_alphas=ones_e,
             w2_alphas=ones_e,
-            n=interm,
+            n=intermediate,
             k=H,
             activation_precision="fp4",
             quant_mode="mxfp4",
@@ -225,7 +226,7 @@ class Mxfp4W4A4MoEMethod:
         log_info_on_rank0(
             logger,
             f"SM120 MXFP4 W4A4 experts ready "
-            f"(E={E}, H={H}, I={interm}; layer: {self.prefix})",
+            f"(E={E}, H={H}, I={intermediate}; layer: {self.prefix})",
         )
 
     def apply(
@@ -234,10 +235,11 @@ class Mxfp4W4A4MoEMethod:
         dispatch_output: "DispatchOutput",
     ) -> "CombineInput":
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
-            launch_sm120_moe,
             _get_cached_workspace,
+            launch_sm120_moe,
             select_sm120_moe_backend,
         )
+
         from sglang.srt.layers.moe.token_dispatcher.standard import (
             StandardCombineInput,
         )
@@ -250,7 +252,7 @@ class Mxfp4W4A4MoEMethod:
         hidden_states = dispatch_output.hidden_states
         M = hidden_states.shape[0]
         H = layer._w4a4_H
-        interm = layer._w4a4_I
+        intermediate = layer._w4a4_I
         E_local = layer._w4a4_E
         # Global expert count bounds topk-id range; local count sizes the expert
         # buffers. Under EP global > local and the kernel remaps global->local.
@@ -276,7 +278,7 @@ class Mxfp4W4A4MoEMethod:
                 weight_E=E_global,
                 routed_rows=ws_cap,
                 k=H,
-                n=interm,
+                n=intermediate,
                 num_topk=top_k,
                 device=dev,
                 quant_mode="mxfp4",

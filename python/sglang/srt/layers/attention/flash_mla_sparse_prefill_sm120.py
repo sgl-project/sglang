@@ -147,9 +147,7 @@ def _torch_sparse_prefill_fwd(
 
         if sink is not None:
             lse_for_o = torch.logsumexp(
-                torch.stack(
-                    [orig_lse, sink.broadcast_to(n, h_q)], dim=0
-                ),
+                torch.stack([orig_lse, sink.broadcast_to(n, h_q)], dim=0),
                 dim=0,
             )
         else:

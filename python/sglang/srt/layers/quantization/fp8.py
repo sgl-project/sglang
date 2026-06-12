@@ -130,10 +130,6 @@ def _has_flashinfer_sm120_mxfp4_moe() -> bool:
     return "mxfp4" in sm120_moe_supported_quant_modes()
 
 
-
-
-
-
 def _require_fp4_dtype():
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4_dtype is None:
