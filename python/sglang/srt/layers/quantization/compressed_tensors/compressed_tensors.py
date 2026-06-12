@@ -37,6 +37,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsLinearScheme,
@@ -47,6 +48,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW4A16AiterMoE,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
@@ -519,6 +521,19 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         return is_mxint4 and input_quant_none and is_symmetric and is_static
 
+    def _is_int4a16_group(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        # Symmetric integer 4-bit group/channel weights in the compressed-tensors
+        # pack_quantized format -- the source the experimental W4A16->fp8 W8A8 requant
+        # path (SGLANG_MOE_W4A16_TO_W8A8) consumes. This intentionally includes the
+        # group_size==32 case that _is_mxint4a16 also flags: that is still stored as
+        # pack_quantized int4 (served today by CompressedTensorsWNA16TritonMoE), so
+        # unpack_from_int32 handles it. Only true fp4 (type != INT) is excluded.
+        return (
+            self._is_wNa16_group_channel(weight_quant, input_quant)
+            and weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.INT
+        )
+
     def _is_dynamic_token_w4(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -675,7 +690,15 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
-                if (
+                if envs.SGLANG_MOE_W4A16_AITER.get() and self._is_int4a16_group(
+                    weight_quant, input_quant
+                ):
+                    logger.info_once(
+                        "Using CompressedTensorsW4A16AiterMoE "
+                        "(native int4 a16wi4 aiter kernel; SGLANG_MOE_W4A16_AITER)"
+                    )
+                    return CompressedTensorsW4A16AiterMoE(self)
+                elif (
                     self._is_mxint4a16(weight_quant, input_quant)
                     and get_moe_runner_backend().is_flashinfer_trtllm()
                 ):
