@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -19,9 +22,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
-)
-from sglang.srt.mem_cache.hisparse_memory_pool import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
 
 if TYPE_CHECKING:
@@ -85,13 +85,10 @@ class ChunkCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
-        assert (
-            req.extend_range is None or req.extend_range.end == req.kv_committed_len
-        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.kv_committed_len
+            req.req_pool_idx, : req.extend_range.end
         ]
-        # `req.prefix_indices` will be used in `PrefillAdder::add_resumed_extend_req` later
+        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
     def evict(self, params: EvictParams) -> EvictResult:

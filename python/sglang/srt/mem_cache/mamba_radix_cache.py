@@ -146,12 +146,12 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    def get_prefix_hash_values(self, node: "TreeNode") -> List[str]:
+    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
         if node is None or node.hash_value is None:
             return []
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
-    def __lt__(self, other: "TreeNode"):
+    def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
 
@@ -319,7 +319,7 @@ class LRUList:
             return False
         return node.id in self.cache
 
-    def pretty_print(self, tree_cache: Optional["MambaRadixCache"] = None):
+    def pretty_print(self, tree_cache: Optional[MambaRadixCache] = None):
         """
         Pretty print the lru list
         """
@@ -358,7 +358,7 @@ class LRUList:
         return evictable_size
 
     # Note: this is expensive, only use for debug or idle check
-    def sanity_check(self, tree_cache: "MambaRadixCache"):
+    def sanity_check(self, tree_cache: MambaRadixCache):
         """
         Check if the lru list is valid by rebuilding the lru list from the tree, heapifying it, and
         checking if the lru list is valid.
@@ -610,23 +610,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         """Cache request when it is unfinished."""
 
         def _skip_cache_unfinished_req(req: Req) -> None:
-            assert (
-                req.extend_range is None or req.extend_range.end == req.kv_committed_len
-            ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.kv_committed_len
+                req.req_pool_idx, : req.extend_range.end
             ]
 
-            # `req.prefix_indices` will be used in `PrefillAdder::add_resumed_extend_req` later
+            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        assert (
-            req.extend_range is None or req.extend_range.end == req.kv_committed_len
-        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
-        token_ids = req.get_full_untruncated_fill_ids()[
-            : min(req.kv_committed_len, len(req.origin_input_ids))
-        ]
+        token_ids = req.get_fill_ids()
         cache_len = (
             req.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
@@ -708,7 +700,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_resumed_extend_req` later
+        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         # NOTE: this is needed for both page_size == 1 and page_size > 1
         req.prefix_indices = torch.cat(
             [new_indices, kv_indices_orig[len(new_indices) :]]

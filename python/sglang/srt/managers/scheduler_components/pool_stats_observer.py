@@ -140,9 +140,9 @@ class PoolStats:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerPoolStatsObserver:
-    tree_cache: "BasePrefixCache"
-    token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator"
-    req_to_token_pool: "ReqToTokenPool"
+    tree_cache: BasePrefixCache
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    req_to_token_pool: ReqToTokenPool
     session_controller: Any
     hisparse_coordinator: Any
     is_hybrid_swa: bool

@@ -726,12 +726,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
-        assert (
-            req.extend_range is None or req.extend_range.end == req.kv_committed_len
-        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
-        token_ids = req.get_full_untruncated_fill_ids()[
-            : min(req.kv_committed_len, len(req.origin_input_ids))
-        ]
+        token_ids = req.get_fill_ids()
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -1429,7 +1424,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.cache_controller is not None
                 and self.cache_controller.write_policy == "write_back"
             ):
-                self.write_backup(node, write_back=True)
+                written = self.write_backup(node, write_back=True)
+                if written == 0:
+                    return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
                 return
@@ -1873,7 +1870,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
-            prefetch_key.token_ids,
+            prefetch_key,
             last_hash,
             prefix_keys,
             extra_pools=aux_xfers or None,
@@ -2797,7 +2794,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _check_lru_linked_list(
         self,
-        lru: "UnifiedLRUList",
+        lru: UnifiedLRUList,
         ct: ComponentType,
         label: str,
         errors: list[str],

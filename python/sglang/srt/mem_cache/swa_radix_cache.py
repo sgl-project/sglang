@@ -101,7 +101,7 @@ class TreeNode:
     def backuped(self):
         return self.host_value is not None
 
-    def __lt__(self, other: "TreeNode"):
+    def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
 
@@ -288,7 +288,7 @@ class LRUList:
         return evictable_size
 
     # Note: this is expensive, only use for debug or idle check
-    def sanity_check(self, tree_cache: "SWARadixCache"):
+    def sanity_check(self, tree_cache: SWARadixCache):
         """
         Check if the lru list is valid by rebuilding the lru list from the tree, heapifying it, and
         checking if the lru list is valid.
@@ -487,23 +487,15 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
         if self.disable:
-            assert (
-                req.extend_range is None or req.extend_range.end == req.kv_committed_len
-            ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.kv_committed_len
+                req.req_pool_idx, : req.extend_range.end
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_resumed_extend_req` later
             req.prefix_indices = kv_indices
             return
 
-        assert (
-            req.extend_range is None or req.extend_range.end == req.kv_committed_len
-        ), f"Sanity check since migrating extend_fill_len to kv_committed_len: {req.extend_range.end=} {req.kv_committed_len=}"
-        token_ids = req.get_full_untruncated_fill_ids()[
-            : min(req.kv_committed_len, len(req.origin_input_ids))
-        ]
+        token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]

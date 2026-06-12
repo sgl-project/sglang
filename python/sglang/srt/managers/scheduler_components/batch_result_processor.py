@@ -61,22 +61,22 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
-    disaggregation_mode: "DisaggregationMode"
+    disaggregation_mode: DisaggregationMode
     enable_overlap: bool
     enable_overlap_mlx: bool
-    server_args: "ServerArgs"
-    model_config: "ModelConfig"
-    token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator"
-    tree_cache: "BasePrefixCache"
-    hisparse_coordinator: Optional["HiSparseCoordinator"]
-    req_to_token_pool: "ReqToTokenPool"
-    decode_offload_manager: Optional["DecodeKVCacheOffloadManager"]
-    metrics_collector: "SchedulerMetricsCollector"
-    metrics_reporter: "SchedulerMetricsReporter"
-    draft_worker: "BaseTpWorker"
-    model_worker: "BaseTpWorker"
-    logprob_result_processor: "SchedulerLogprobResultProcessor"
-    output_streamer: "SchedulerOutputStreamer"
+    server_args: ServerArgs
+    model_config: ModelConfig
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    tree_cache: BasePrefixCache
+    hisparse_coordinator: Optional[HiSparseCoordinator]
+    req_to_token_pool: ReqToTokenPool
+    decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
+    metrics_collector: SchedulerMetricsCollector
+    metrics_reporter: SchedulerMetricsReporter
+    draft_worker: BaseTpWorker
+    model_worker: BaseTpWorker
+    logprob_result_processor: SchedulerLogprobResultProcessor
+    output_streamer: SchedulerOutputStreamer
     abort_request: Callable
     deactivate_req: Callable
 
@@ -576,12 +576,17 @@ class SchedulerBatchResultProcessor:
                 continue
 
             if req.finished():
-                # -1 because prepare_for_decode pre-claimed the bonus slot.
-                req.kv_committed_len -= 1
+                if not batch.spec_algorithm.is_dflash():
+                    # EAGLE prepare_for_decode pre-claimed the bonus slot.
+                    req.kv_committed_len -= 1
                 continue
 
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
+            if batch.spec_algorithm.is_dflash():
+                # DFLASH materialized accepted draft tokens plus the bonus token.
+                req.kv_committed_len += accept_lens[i]
+            else:
+                # EAGLE prepare_for_decode pre-claimed the bonus slot.
+                req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -641,10 +646,6 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
-        # in the verify phase. Non-spec and V2 handle them here in post-processing.
-        is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
-
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -653,19 +654,6 @@ class SchedulerBatchResultProcessor:
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
-                continue
-
-            if is_spec_v1:
-                req.time_stats.set_last_decode_finish_time()
-                self._handle_finish_state_updated_req(
-                    req, batch, result, i, logits_output
-                )
-                if req.return_hidden_states and logits_output.hidden_states is not None:
-                    req.hidden_states.append(
-                        logits_output.hidden_states[i].cpu().clone().tolist()
-                    )
-                if req.grammar is not None:
-                    req.grammar.finished = req.finished()
                 continue
 
             # Non-spec and V2: full post-processing
@@ -725,31 +713,27 @@ class SchedulerBatchResultProcessor:
         next_token_ids: Union[torch.Tensor, List[int]],
     ) -> Tuple[Union[List[int], List[List[int]]], Optional[List[float]]]:
         next_token_logprobs = None
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
-            if batch.is_spec_v2:
-                next_token_ids = self._resolve_spec_v2_tokens(result, batch)
-            elif isinstance(next_token_ids, list):
-                pass  # MLX path: already a list[int], skip torch round-trip
-            else:
-                next_token_ids = next_token_ids.tolist()
+        if not batch.spec_algorithm.is_none():
+            next_token_ids = self._resolve_spec_v2_tokens(result, batch)
+        elif isinstance(next_token_ids, list):
+            pass  # MLX path: already a list[int], skip torch round-trip
+        else:
+            next_token_ids = next_token_ids.tolist()
 
-            if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs.tolist()
-                if logits_output.next_token_top_logprobs_val:
-                    logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
-                    ]
-                    logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                    ]
+        if batch.return_logprob:
+            next_token_logprobs = logits_output.next_token_logprobs.tolist()
+            if logits_output.next_token_top_logprobs_val:
+                logits_output.next_token_top_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                ]
+                logits_output.next_token_top_logprobs_idx = [
+                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                ]
 
-                if logits_output.next_token_token_ids_logprobs_val:
-                    logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
-                        for v in logits_output.next_token_token_ids_logprobs_val
-                    ]
-        # else: Spec V1 — output_ids, update_finish_state, grammar, and reasoning tokens
-        # are already handled in the verify phase (eagle_info.py / ngram_info.py).
+            if logits_output.next_token_token_ids_logprobs_val:
+                logits_output.next_token_token_ids_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                ]
         return next_token_ids, next_token_logprobs
 
     def _apply_decode_logprobs(
@@ -762,9 +746,8 @@ class SchedulerBatchResultProcessor:
         next_token_logprobs: list,
         logits_output: LogitsProcessorOutput,
     ) -> None:
-        # Spec v1 handles logprobs inside its own worker.
-        # Normalize: non-spec has 1 token, spec v2 has multiple.
-        if batch.is_spec_v2:
+        # Normalize: non-spec has 1 token, spec decoding has multiple.
+        if not batch.spec_algorithm.is_none():
             accepted_logprobs = next_token_logprobs[i]
             accepted_ids = next_token_id
             max_accept = len(accepted_logprobs)
@@ -805,7 +788,7 @@ class SchedulerBatchResultProcessor:
             if batch.spec_algorithm.is_none():
                 # Normal decode: single token
                 req.grammar.accept_token(next_token_id)
-            elif batch.is_spec_v2:
+            else:
                 # Speculative decode: next_token_id is a list of accepted tokens
                 for token_id in next_token_id:
                     req.grammar.accept_token(token_id)

@@ -23,6 +23,7 @@ from sglang.srt.entrypoints.warmup import warmup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 
@@ -169,8 +170,11 @@ def launch_server_process_and_send_one_request(
 
 
 def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
-    # Disable cuda graph and torch compile to save time
-    server_args.disable_cuda_graph = True
+    # Disable cuda graph and torch compile to save time. Writes after
+    # ServerArgs.__post_init__ don't propagate to cuda_graph_config via the
+    # legacy disable_cuda_graph field, so flip both phases directly.
+    server_args.cuda_graph_config[Phase.DECODE].backend = Backend.DISABLED
+    server_args.cuda_graph_config[Phase.PREFILL].backend = Backend.DISABLED
     server_args.enable_torch_compile = False
     print(f"Disable CUDA Graph and Torch Compile to save time...")
 
