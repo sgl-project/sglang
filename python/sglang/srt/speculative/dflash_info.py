@@ -52,7 +52,7 @@ class DFlashVerifyInput(SpecInput):
     def prepare_for_v2_verify(
         self,
         batch: ScheduleBatch,
-        target_worker: "TpModelWorker",
+        target_worker: TpModelWorker,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
