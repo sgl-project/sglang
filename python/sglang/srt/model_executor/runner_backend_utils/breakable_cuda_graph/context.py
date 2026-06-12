@@ -16,12 +16,26 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from typing import Any, Callable, TypeVar
 
 _in_breakable_cuda_graph = False
+T = TypeVar("T")
 
 
 def is_in_breakable_cuda_graph() -> bool:
     return _in_breakable_cuda_graph
+
+
+def call_with_graph_break(
+    bcg_fn: Callable[..., T],
+    default_fn: Callable[..., T],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> T:
+    """Call the BCG eager variant only while breakable CUDA graph is active."""
+    fn = bcg_fn if is_in_breakable_cuda_graph() else default_fn
+    return fn(*args, **kwargs)
 
 
 @contextmanager

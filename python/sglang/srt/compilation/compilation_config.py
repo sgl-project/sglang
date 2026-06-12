@@ -16,6 +16,13 @@ def register_split_op(op_name: Optional[str] = None):
     return decorator
 
 
+def is_graph_dsa_split_op_fusion_enabled() -> bool:
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import is_cuda
+
+    return is_cuda() and envs.SGLANG_ENABLE_GRAPH_DSA_SPLIT_OP_FUSION.get()
+
+
 # TODO(Yuwei): support better compile config support
 class CompilationConfig:
     def __init__(

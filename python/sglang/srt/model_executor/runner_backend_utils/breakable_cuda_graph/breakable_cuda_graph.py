@@ -24,6 +24,7 @@ buffers to keep break-point tensors at stable addresses.
 
 import logging
 import threading
+import warnings
 from contextvars import ContextVar
 from typing import Any, Callable
 
@@ -210,7 +211,7 @@ def eager_on_graph(enable: bool):
             logger.debug("Break graph due to function: %s", inner.__name__)
 
             # End the segment that captured up to this break point.
-            capture._end_current_segment()
+            segment_has_nodes = capture._end_current_segment(drop_empty=True)
 
             # Run the eager function once so it allocates its outputs and
             # writes real data into them.
@@ -228,7 +229,18 @@ def eager_on_graph(enable: bool):
                 new_out = captured_inner(*captured_args, **captured_kwargs)
                 return _copy_output(captured_output, new_out)
 
-            capture.cuda_graph._break_fns.append(replay_fn)
+            # Adjacent eager breaks leave no CUDA work between them. Chain the
+            # replay fns so we do not keep an empty graph segment.
+            if not segment_has_nodes and capture.cuda_graph._break_fns:
+                previous_replay_fn = capture.cuda_graph._break_fns[-1]
+
+                def chained_replay_fn():
+                    previous_replay_fn()
+                    return replay_fn()
+
+                capture.cuda_graph._break_fns[-1] = chained_replay_fn
+            else:
+                capture.cuda_graph._break_fns.append(replay_fn)
 
             # Start a fresh CUDAGraph segment for the remainder of the forward.
             capture._begin_new_segment()
@@ -322,7 +334,7 @@ class BreakableCUDAGraphCapture:
         )
         self.cuda_graph._segments.append(graph)
 
-    def _end_current_segment(self) -> None:
+    def _end_current_segment(self, drop_empty: bool = False) -> bool:
         # Auto-join any side streams forked during this segment but not joined.
         main_stream = get_current_stream()
         forked = _forked_streams_var.get()
@@ -332,7 +344,38 @@ class BreakableCUDAGraphCapture:
                 if _is_capturing(side.cuda_stream):
                     _original_wait_stream(main_stream, side)
             forked.clear()
-        self.cuda_graph._segments[-1].capture_end()
+        num_nodes = None
+        if drop_empty:
+            # Only eager break handling needs to inspect the open capture. If
+            # it is empty, capture_end() still has to run to close capture.
+            _check_cuda_bindings()
+            _, _, cuda_graph, *_ = checkCudaErrors(
+                rt.cudaStreamGetCaptureInfo(main_stream.cuda_stream)
+            )
+            _, num_nodes = checkCudaErrors(rt.cudaGraphGetNodes(cuda_graph))
+
+        graph = self.cuda_graph._segments[-1]
+        if num_nodes == 0:
+            # Empty captures are expected for adjacent eager breaks and are
+            # dropped below, so suppress PyTorch's empty-graph warning here.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="The CUDA Graph is empty.*",
+                    category=UserWarning,
+                )
+                graph.capture_end()
+        else:
+            graph.capture_end()
+
+        if (
+            num_nodes == 0
+            and self.cuda_graph._break_fns
+            and len(self.cuda_graph._segments) > 1
+        ):
+            self.cuda_graph._segments.pop()
+            return False
+        return True
 
 
 @eager_on_graph(True)
