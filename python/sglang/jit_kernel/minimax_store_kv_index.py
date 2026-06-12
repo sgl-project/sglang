@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_module(head_bytes: int) -> "Module":
+def _jit_module(head_bytes: int) -> Module:
     # Build marker is (head_bytes, kUsePDL); the index dtype (int32/int64) is a
     # runtime dispatch inside the C++ launcher.
     args = make_cpp_args(head_bytes, is_arch_support_pdl())

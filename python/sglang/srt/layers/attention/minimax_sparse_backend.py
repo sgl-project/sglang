@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
-    def __init__(self, runner: "ModelRunner"):
+    def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.kv_pool = runner.token_to_kv_pool
         self.req_to_token = runner.req_to_token_pool.req_to_token

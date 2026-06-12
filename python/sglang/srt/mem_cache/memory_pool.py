@@ -2747,7 +2747,7 @@ class MHATokenToKOnlyPool(KVCache):
         return self.k_buffer[layer_id - self.start_layer]
 
     def register_layer_transfer_counter(
-        self, layer_transfer_counter: "LayerDoneCounter"
+        self, layer_transfer_counter: LayerDoneCounter
     ) -> None:
         self.layer_transfer_counter = layer_transfer_counter
 
@@ -2898,7 +2898,7 @@ class MiniMaxSparseKVPool(KVCache):
         self.layer_transfer_counter = None
 
     def register_layer_transfer_counter(
-        self, layer_transfer_counter: "LayerDoneCounter"
+        self, layer_transfer_counter: LayerDoneCounter
     ) -> None:
         self.layer_transfer_counter = layer_transfer_counter
 
@@ -2946,7 +2946,7 @@ class MiniMaxSparseKVPool(KVCache):
 
     def set_kv_buffer(
         self,
-        layer: "RadixAttention",
+        layer: RadixAttention,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
@@ -2965,7 +2965,7 @@ class MiniMaxSparseKVPool(KVCache):
 
     def set_index_kv_buffer(
         self,
-        layer: "RadixAttention",
+        layer: RadixAttention,
         loc: torch.Tensor,
         cache_idx_k: torch.Tensor,
         cache_idx_v: torch.Tensor,
@@ -2991,7 +2991,7 @@ class MiniMaxSparseKVPool(KVCache):
 
     def set_index_k_buffer(
         self,
-        layer: "RadixAttention",
+        layer: RadixAttention,
         loc: torch.Tensor,
         cache_idx_k: torch.Tensor,
     ) -> None:
@@ -3011,7 +3011,7 @@ class MiniMaxSparseKVPool(KVCache):
 
     def _can_fuse_kv_index_store(
         self,
-        index_pool: "MHATokenToKVPool",
+        index_pool: MHATokenToKVPool,
         cache_k: torch.Tensor,
         cache_idx_k: torch.Tensor,
     ) -> bool:
@@ -3037,7 +3037,7 @@ class MiniMaxSparseKVPool(KVCache):
 
     def set_fused_kv_index_buffer(
         self,
-        layer: "RadixAttention",
+        layer: RadixAttention,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_module(group_size: int) -> "Module":
+def _jit_module(group_size: int) -> Module:
     args = make_cpp_args(group_size, is_arch_support_pdl())
     return load_jit(
         "minimax_per_token_quant_ue8m0",
@@ -29,7 +29,7 @@ def _jit_module(group_size: int) -> "Module":
 
 
 @cache_once
-def _jit_scatter_module(group_size: int, topk: int) -> "Module":
+def _jit_scatter_module(group_size: int, topk: int) -> Module:
     # topk is a template arg so the dst-row load/store loops fully unroll.
     args = make_cpp_args(group_size, topk, is_arch_support_pdl())
     return load_jit(

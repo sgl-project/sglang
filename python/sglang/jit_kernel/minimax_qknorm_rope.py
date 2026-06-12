@@ -36,7 +36,7 @@ _MAX_GROUPS = 4
 
 
 @cache_once
-def _jit_module(pos_dtype, head_dim, rope_dim) -> "Module":
+def _jit_module(pos_dtype, head_dim, rope_dim) -> Module:
     args = make_cpp_args(pos_dtype, head_dim, rope_dim, is_arch_support_pdl())
     return load_jit(
         "fused_gemma_qknorm_rope",
