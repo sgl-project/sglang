@@ -1,4 +1,5 @@
 import unittest
+import torch
 
 from sglang.srt.environ import envs
 from sglang.test.accuracy_test_runner import AccuracyTestParams
@@ -46,6 +47,7 @@ MTP_ARGS = [
 GSM8K_BASELINE = 0.935
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotron3SuperNightly(unittest.TestCase):
     """Unified nightly test class for Nemotron 3 Super 120B.
 

@@ -1,4 +1,5 @@
 import sys
+import unittest
 
 import pytest
 import torch
@@ -9,6 +10,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=2, suite="nightly-1-gpu", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.parametrize(
     "seq_length",
     list(range(1, 10))

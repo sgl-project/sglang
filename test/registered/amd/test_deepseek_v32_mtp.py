@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -26,6 +27,7 @@ register_amd_ci(
 FULL_DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_amd_ci(), "Skip DP test for AMD CI, run TP only.")
 class TestDeepseekV32DPMTP(CustomTestCase):
     @classmethod
@@ -122,6 +124,7 @@ class TestDeepseekV32DPMTP(CustomTestCase):
                 self.assertGreater(speed, 75)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekV32TPMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):

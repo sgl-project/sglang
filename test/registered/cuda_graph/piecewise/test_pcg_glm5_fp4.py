@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -16,6 +18,7 @@ register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-b200")
 GLM5_FP4_MODEL = "nvidia/GLM-5-NVFP4"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPCGGlm5Fp4(CustomTestCase):
     """PCG prefill on GLM-5-NVFP4 (DSA model, TP=4, B200).
 

@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.srt.utils import is_blackwell
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
@@ -9,18 +11,21 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 NVIDIA_NEMOTRON_NANO_V2_MODEL = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotronNanoV2BF16(GSM8KMixin, DefaultServerBase):
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
     gsm8k_accuracy_thres = 0.87
     other_args = ["--max-mamba-cache-size", "256"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotronNanoV2BF16PP(GSM8KMixin, DefaultServerBase):
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
     gsm8k_accuracy_thres = 0.87
     other_args = ["--max-mamba-cache-size", "256", "--pp-size", "2"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotronNanoV2BF16ExtraBuffer(
     GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
@@ -45,6 +50,7 @@ class TestNvidiaNemotronNanoV2FP8(GSM8KMixin, DefaultServerBase):
     other_args = ["--max-mamba-cache-size", "256"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(not is_blackwell(), "NVFP4 only supported on blackwell")
 class TestNvidiaNemotronNanoV2NVFP4(GSM8KMixin, DefaultServerBase):
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4"
@@ -74,6 +80,7 @@ SPECULATIVE_DECODING_OTHER_ARGS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase):
     model = NVIDIA_NEMOTRON_NANO_V2_MODEL
     gsm8k_accuracy_thres = 0.87
@@ -82,6 +89,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase)
     ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotronNanoV2SpeculativeDecodingExtraBuffer(
     GSM8KMixin, DefaultServerBase
 ):
@@ -93,6 +101,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecodingExtraBuffer(
     ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(
     GSM8KMixin, DefaultServerBase
 ):

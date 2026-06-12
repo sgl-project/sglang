@@ -40,6 +40,7 @@ from sglang.srt.lora.triton_ops.virtual_experts import (
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
     """Item B regression: post-EP-dispatch -1 sentinels must NOT be remapped."""
 
@@ -131,6 +132,7 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
         self.assertFalse(bool(mask[0].item()))
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
     """Shared tests for both the torch.compile and JIT align_block_size paths.
 

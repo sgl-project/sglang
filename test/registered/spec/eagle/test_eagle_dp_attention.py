@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -28,6 +29,7 @@ register_cuda_ci(est_time=99, stage="extra-b", runner_config="4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLE3EngineDPAttention(CustomTestCase):
     @classmethod
     def setUpClass(cls):

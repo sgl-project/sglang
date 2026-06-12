@@ -2,6 +2,7 @@ import unittest
 from urllib.parse import urlparse
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH
@@ -20,6 +21,7 @@ TEST_MODEL_MATRIX = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestAscendOffloadModes(CustomTestCase):
 
     @classmethod

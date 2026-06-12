@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -37,6 +38,7 @@ KIMI_K25_MXFP4_REVISION = "419004c8716cf22c929aa15d39b85e09a8a2091a"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKimiK25MXFP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):

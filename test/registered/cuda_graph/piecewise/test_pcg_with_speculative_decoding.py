@@ -7,6 +7,7 @@ test_pcg_with_speculative_decoding_extra.py.
 """
 
 import unittest
+import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
@@ -14,6 +15,7 @@ from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 register_cuda_ci(est_time=531, stage="base-b", runner_config="2-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPCGWithEAGLE3(PCGSpecBase, unittest.TestCase):
     """PCG + EAGLE3 on Qwen3-30B-A3B-Instruct-2507."""
 

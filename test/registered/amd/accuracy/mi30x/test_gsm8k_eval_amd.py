@@ -14,6 +14,8 @@ import unittest
 import warnings
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
@@ -202,6 +204,7 @@ def check_model_scores(results):
 
 
 # Do not use `CustomTestCase` since `test_gsm8k_all_models` does not want retry
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

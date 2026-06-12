@@ -283,6 +283,7 @@ REFERENCE_STATS = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMoELoraRegression(unittest.TestCase):
 
     def test_sglang_moe_parity_strict(self):

@@ -2,6 +2,8 @@ import time
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -17,6 +19,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=216, stage="base-c", runner_config="8-gpu-h20")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -94,6 +97,7 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
         time.sleep(5)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -172,6 +176,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
         time.sleep(5)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, is_in_ci, run_bench_one_batch
 
@@ -11,6 +13,7 @@ register_cuda_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDummyGrok1(CustomTestCase):
 
     def test_dummy_grok_1(self):

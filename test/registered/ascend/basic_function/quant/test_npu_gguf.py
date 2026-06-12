@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import QWEN3_4B_GGUF_Q4_K_M_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
@@ -25,6 +27,7 @@ TEST_MODEL_MATRIX = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestAscendGGUF(CustomTestCase):
 
     @classmethod

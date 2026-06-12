@@ -1,6 +1,7 @@
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -23,6 +24,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
     max_running_requests = 64
     attention_backend = "flashinfer"
@@ -124,6 +126,7 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
         assert self.process.poll() is None
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDFlashServerPage256(TestDFlashServerBase):
     page_size = 256
 

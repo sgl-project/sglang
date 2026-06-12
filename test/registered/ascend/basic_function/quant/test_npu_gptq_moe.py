@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_30B_A3B_GPTQ_2507_INT4_WEIGHTS_PATH,
@@ -28,6 +30,7 @@ TEST_MODEL_MATRIX = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestAscendGPTQMoEInt4(CustomTestCase):
 
     @classmethod

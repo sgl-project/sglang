@@ -15,6 +15,7 @@ from typing import Dict
 from urllib.parse import urlparse
 
 import requests
+import torch
 
 from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
@@ -35,6 +36,7 @@ register_cuda_ci(est_time=148, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class HiCacheStorageBaseMixin:
     """Base mixin class with common setup and utilities"""
 
@@ -225,6 +227,7 @@ class HiCacheStorageBaseMixin:
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase):
     """Page first layout tests for HiCache Storage functionality"""
@@ -236,6 +239,7 @@ class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase)
         return server_args, {}
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestHiCacheStorageMLA(HiCacheStorageBaseMixin, CustomTestCase):
     """MLA Model tests for HiCache Storage functionality"""
@@ -252,6 +256,7 @@ class TestHiCacheStorageMLA(HiCacheStorageBaseMixin, CustomTestCase):
         return server_args, {}
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCase):
     """Page first direct tests for HiCache Storage functionality"""
 
@@ -266,6 +271,7 @@ class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCas
         return server_args, {}
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
     """Accuracy tests for HiCache Storage functionality"""
 
@@ -285,6 +291,7 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
         run_eval_accuracy_test(self)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     """Generic eval accuracy test with configurable accuracy threshold
 

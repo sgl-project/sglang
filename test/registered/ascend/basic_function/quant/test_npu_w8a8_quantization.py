@@ -8,6 +8,7 @@ import time
 import unittest
 
 import requests
+import torch
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import (
@@ -20,6 +21,7 @@ register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a2", nightly=False)
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestAscendW8A8CompressedTensors(GSM8KAscendMixin, CustomTestCase):
     model = REDHATAI_QWEN2_5_0_5B_INSTRUCT_QUANTIZED_W8A8_WEIGHTS_PATH
     other_args = [

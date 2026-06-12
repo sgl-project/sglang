@@ -1,6 +1,8 @@
 import os
 import unittest
 
+import torch
+
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_8B_EAGLE3_WEIGHTS_PATH,
@@ -12,6 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNpuEagle3(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify GSM8K inference accuracy ≥0.81 for model with specified EAGLE3 speculative inference parameters.
 

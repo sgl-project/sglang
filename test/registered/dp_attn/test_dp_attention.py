@@ -1,6 +1,7 @@
 import unittest
 
 import requests
+import torch
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.environ import envs
@@ -24,6 +25,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDPAttentionDP2TP2(
     CustomTestCase,
     GSM8KMixin,
@@ -64,6 +66,7 @@ class TestDPAttentionDP2TP2(
         cls._env_override.__exit__(None, None, None)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDPAttentionMixedChunk(
     CustomTestCase,
     GSM8KMixin,
@@ -96,6 +99,7 @@ class TestDPAttentionMixedChunk(
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDPRetract(
     CustomTestCase,
     JSONConstrainedMixin,

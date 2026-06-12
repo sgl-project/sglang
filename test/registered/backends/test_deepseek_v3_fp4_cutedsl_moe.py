@@ -17,6 +17,8 @@ Or via the nightly suite:
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -35,6 +37,7 @@ SERVER_LAUNCH_TIMEOUT = 1000
 GSM8K_ACCURACY_THRESHOLD = 0.935
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekV3FP4CuteDSLMoE(CustomTestCase):
     """CuteDSL standard moe_runner path: flashinfer_cutedsl + modelopt_fp4, EP=1."""
 
@@ -90,6 +93,7 @@ class TestDeepseekV3FP4CuteDSLMoE(CustomTestCase):
         self.assertGreater(metrics["accuracy"], GSM8K_ACCURACY_THRESHOLD)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekV3FP4CuteDSLMoEEP4(CustomTestCase):
     """CuteDSL standard moe_runner path: flashinfer_cutedsl + modelopt_fp4, EP=TP=4."""
 

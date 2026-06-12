@@ -16,6 +16,7 @@ Usage:
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -68,6 +69,7 @@ def setup_class(cls, enable_lora=True):
     cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAOpenAICompatible(CustomTestCase):
     """Test OpenAI-compatible LoRA adapter usage."""
 
@@ -196,6 +198,7 @@ class TestLoRAOpenAICompatible(CustomTestCase):
         print(f"Base model response: {base_response.choices[0].message.content}")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRADisabledError(CustomTestCase):
     """Test error handling when LoRA is disabled."""
 
@@ -225,6 +228,7 @@ class TestLoRADisabledError(CustomTestCase):
         print(f"Expected error message: {error_message}")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAEdgeCases(CustomTestCase):
     """Test edge cases for LoRA adapter usage."""
 

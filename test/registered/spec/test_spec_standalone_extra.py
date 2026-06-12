@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.standalone_fixture import StandaloneServerBase
 from sglang.test.test_utils import CustomTestCase
@@ -9,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=406, stage="extra-a", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneSpeculativeDecodingBase(StandaloneServerBase, CustomTestCase):
     attention_backend = "fa3"
     speculative_eagle_topk = 2
@@ -16,6 +19,7 @@ class TestStandaloneSpeculativeDecodingBase(StandaloneServerBase, CustomTestCase
     disable_overlap = True
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneSpeculativeDecodingTriton(StandaloneServerBase, CustomTestCase):
     attention_backend = "triton"
     speculative_eagle_topk = 2
@@ -24,6 +28,7 @@ class TestStandaloneSpeculativeDecodingTriton(StandaloneServerBase, CustomTestCa
     enable_deterministic_inference = True
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneSpeculativeDecodingFlashinfer(StandaloneServerBase, CustomTestCase):
     attention_backend = "flashinfer"
     speculative_eagle_topk = 2

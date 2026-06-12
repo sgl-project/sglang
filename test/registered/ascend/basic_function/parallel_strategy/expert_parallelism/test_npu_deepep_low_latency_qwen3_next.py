@@ -1,4 +1,5 @@
 import os
+import torch
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
@@ -16,6 +17,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     """
     Testcase:Test the Qwen3-Next-80B-A3B-Instruct-W8A8 model with DeepEP's low_latency mode enabled, and verify that

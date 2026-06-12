@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import aiohttp
 import openai
 import requests
+import torch
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -24,6 +25,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=509, stage="base-b", runner_config="2-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -174,6 +176,7 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -215,6 +218,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 raise e from health_check_error
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -254,6 +258,7 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.74)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -282,6 +287,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.62)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
     """Regression test: pause_generation must not leak prefill requests into
     running_batch.  With a small --max-running-requests the leak fills the

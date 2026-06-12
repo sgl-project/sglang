@@ -2,6 +2,8 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -17,6 +19,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -87,6 +90,7 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.92)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDummyWithSBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
