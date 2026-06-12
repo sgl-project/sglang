@@ -51,8 +51,12 @@ def _fake_memory_pool_host_module():
     class HostTensorAllocator:
         pass
 
+    class MLATokenToKVPoolHost:
+        pass
+
     memory_pool_host.HostKVCache = HostKVCache
     memory_pool_host.HostTensorAllocator = HostTensorAllocator
+    memory_pool_host.MLATokenToKVPoolHost = MLATokenToKVPoolHost
     return memory_pool_host
 
 
@@ -88,6 +92,20 @@ def _fake_store_class():
         def batch_put_from(self, keys, ptrs, sizes, *args):
             self.batch_put_calls.append(
                 {
+                    "method": "batch_put_from",
+                    "keys": list(keys),
+                    "ptrs": list(ptrs),
+                    "sizes": list(sizes),
+                    "args": args,
+                }
+            )
+            self.existing_keys.update(keys)
+            return [0] * len(keys)
+
+        def batch_put_from_multi_buffers(self, keys, ptrs, sizes, *args):
+            self.batch_put_calls.append(
+                {
+                    "method": "batch_put_from_multi_buffers",
                     "keys": list(keys),
                     "ptrs": list(ptrs),
                     "sizes": list(sizes),
@@ -142,6 +160,27 @@ class FakeIndexerPool:
 
     def get_page_buffer_meta(self, indices):
         return [3000 + i for i in range(len(indices))], [8] * len(indices)
+
+
+class FakeMultiBufferPool:
+    page_size = 1
+
+    def __init__(self):
+        self.buffers = [
+            torch.empty((128,), dtype=torch.uint8),
+            torch.empty((128,), dtype=torch.uint8),
+        ]
+
+    def get_hybrid_pool_buffer(self):
+        return self.buffers
+
+    def get_page_buffer_meta(self, indices):
+        ptrs = []
+        sizes = []
+        for i in range(len(indices)):
+            ptrs.extend([4000 + i * 10, 4001 + i * 10])
+            sizes.extend([8, 16])
+        return ptrs, sizes
 
 
 def _make_config(
@@ -360,6 +399,35 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(result[PoolName.INDEXER], [True, True])
         call = fake_store.batch_put_calls[0]
         self.assertEqual(call["keys"], ["tag_page0__indexer", "tag_page1__indexer"])
+        self.assertEqual(
+            call["args"][0].group_ids,
+            ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
+        )
+
+    def test_v2_multi_buffer_put_passes_group_ids(self):
+        store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
+        multi_buffer_pool = FakeMultiBufferPool()
+        store.register_mem_host_pool_v2(multi_buffer_pool, PoolName.DEEPSEEK_V4_C4)
+
+        result = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["page0", "page1"],
+                    host_indices=torch.tensor([0, 1]),
+                )
+            ]
+        )
+
+        self.assertEqual(result[PoolName.DEEPSEEK_V4_C4], [True, True])
+        call = fake_store.batch_put_calls[0]
+        self.assertEqual(call["method"], "batch_put_from_multi_buffers")
+        self.assertEqual(
+            call["keys"],
+            ["tag_page0__deepseek_v4_c4", "tag_page1__deepseek_v4_c4"],
+        )
+        self.assertEqual(call["ptrs"], [[4000, 4001], [4010, 4011]])
+        self.assertEqual(call["sizes"], [[8, 16], [8, 16]])
         self.assertEqual(
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
