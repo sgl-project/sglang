@@ -1,0 +1,40 @@
+name: Prepare sgl-kernel build workspace
+description: |
+  On self-hosted build nodes the workspace is reused across runs and prior
+  builds leave root-owned files (e.g. under sgl-kernel/build/) that
+  actions/checkout cannot remove (EACCES on rmdir). Wipe the workspace via a
+  throwaway root container, check out the requested ref, and optionally set
+  up Python.
+
+inputs:
+  python-version:
+    description: 'Python version to set up. Empty = skip setup-python.'
+    required: false
+    default: ''
+  pr-number:
+    description: 'PR number to check out (refs/pull/<n>/head). Empty = use the workflow ref.'
+    required: false
+    default: ''
+  submodules:
+    description: 'actions/checkout submodules option.'
+    required: false
+    default: 'recursive'
+
+runs:
+  using: composite
+  steps:
+    - name: Clean workspace (remove root-owned files from prior runs)
+      shell: bash
+      run: |
+        docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+          sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+    - uses: actions/checkout@v4
+      with:
+        submodules: ${{ inputs.submodules }}
+        ref: ${{ inputs.pr-number && format('refs/pull/{0}/head', inputs.pr-number) || '' }}
+
+    - if: ${{ inputs.python-version != '' }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
