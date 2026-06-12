@@ -156,6 +156,12 @@ class PrefillMetadata:
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
+# Safety margin on the computed split-kv worst case for the dedicated
+# full-CG prefill workspace (absorbs allocator alignment and minor
+# flashinfer sizing drift across versions). Sizing logic lives in
+# FlashInferAttnBackend._full_cg_prefill_workspace_bytes.
+FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
+
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
@@ -351,6 +357,12 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+        # Plain EXTEND under full prefill CUDA graph: one wrapper set
+        # shared across all captured num_tokens buckets (bs fixed at 1).
+        # Created lazily on first capture in _prepare_cuda_graph_metadata.
+        self.full_cg_prefill_wrappers: Optional[
+            List[BatchPrefillWithPagedKVCacheWrapper]
+        ] = None
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -535,6 +547,29 @@ class FlashInferAttnBackend(AttentionBackend):
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=not self.use_paged,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=None,
+            )
+        elif forward_mode.is_extend():
+            # Plain EXTEND under full prefill CUDA graph (bs=1; padded
+            # num_tokens). plan() runs out-of-graph against the dedicated
+            # capture-stable wrappers; the captured kernels read the
+            # refreshed plan state at replay. Must stay below the
+            # target-verify / draft-extend / dllm branches — those modes
+            # are also is_extend().
+            # Split-kv must stay enabled here: its block_valid_mask is the
+            # only device-side signal that lets the padded/stale tiles of
+            # the captured fixed grid exit early at replay. The dedicated
+            # workspace is sized for its worst case (see
+            # _full_cg_prefill_workspace_bytes).
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                prefix_lens=forward_batch.extend_prefix_lens[:bs],
+                prefill_wrappers=self.full_cg_prefill_wrappers,
+                use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
@@ -757,6 +792,106 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         return wrappers
 
+    def _full_cg_prefill_workspace_bytes(
+        self, num_slots: int, max_num_tokens: int
+    ) -> int:
+        """Split-kv worst-case float-workspace demand for the plain-EXTEND
+        cudagraph wrappers, mirroring flashinfer's PrefillPlan sizing
+        (scheduler.cuh, enable_cuda_graph=True) for the largest captured
+        bucket:
+
+          cta_tile_q = FA2DetermineCtaTileQ(max packed qo len, head_dim)
+          tiles      = ceil(max_rows * gqa / cta_tile_q) + batch_size - 1
+          padded     = max(2 * num_SMs / num_kv_heads, tiles)
+          tmp_v      = num_qo_heads * padded * cta_tile_q * head_dim * fp32
+          tmp_s      = num_qo_heads * padded * cta_tile_q * fp32
+
+        Split-kv must stay enabled for these wrappers — its
+        block_valid_mask is what lets the padded/stale tiles of the fixed
+        captured grid exit early at replay; without it every replay
+        re-runs capture-sized attention (measured ~6.5 ms/layer). If a
+        future flashinfer outgrows the margin, plan() fails loudly at
+        startup ("Increase the workspace buffer size").
+        """
+        upd = self.indices_updater_prefill
+        gqa_group_size = upd.num_qo_heads // upd.num_kv_heads
+        max_qo_len = (max_num_tokens - num_slots + 1) * gqa_group_size
+        if max_qo_len > 64 and upd.head_dim < 256:
+            cta_tile_q = 128
+        elif max_qo_len > 16:
+            cta_tile_q = 64
+        else:
+            cta_tile_q = 16
+        tiles = -(-max_num_tokens * gqa_group_size // cta_tile_q) + num_slots - 1
+        num_sm = torch.cuda.get_device_properties(
+            self.workspace_buffer.device
+        ).multi_processor_count
+        padded_batch_size = max((2 * num_sm) // upd.num_kv_heads, tiles)
+        per_row = upd.num_qo_heads * padded_batch_size * cta_tile_q * 4
+        tmp_v = per_row * upd.head_dim
+        tmp_s = per_row
+        return int((tmp_v + tmp_s) * FULL_CG_PREFILL_WORKSPACE_MARGIN)
+
+    def _create_full_cg_prefill_wrappers(
+        self, num_slots: int, max_num_tokens: int
+    ) -> list:
+        """Wrappers for plain EXTEND captured under a full prefill CUDA
+        graph. plan() must keep its internal state at capture-stable
+        addresses (use_cuda_graph=True); the decode-side cuda-graph
+        wrappers permanently pin the shared workspace via their own
+        plans, so these get a dedicated workspace sized from the largest
+        captured bucket. The request-slot count is fixed at capture (the
+        runner pads real batches up to it with zero-length sentinel
+        requests); kv indices cover up to num_slots sequences of
+        max_context_len.
+        """
+        device = self.workspace_buffer.device
+        self.full_cg_prefill_req_slots = num_slots
+        workspace_bytes = self._full_cg_prefill_workspace_bytes(
+            num_slots, max_num_tokens
+        )
+        logger.info(
+            "Full-CG prefill workspace: %.0f MB (max bucket %d tokens, "
+            "%d request slots)",
+            workspace_bytes / (1024 * 1024),
+            max_num_tokens,
+            num_slots,
+        )
+        self.full_cg_prefill_workspace_buffer = torch.empty(
+            workspace_bytes, dtype=torch.uint8, device=device
+        )
+        self.full_cg_prefill_qo_indptr = [
+            torch.zeros((num_slots + 1,), dtype=torch.int32, device=device)
+            for _ in range(self.num_wrappers)
+        ]
+        self.full_cg_prefill_kv_indptr = [
+            torch.zeros((num_slots + 1,), dtype=torch.int32, device=device)
+            for _ in range(self.num_wrappers)
+        ]
+        # call_begin_forward materializes paged_kernel_lens_sum + 256
+        # indices; size the fixed buffer for the worst case.
+        self.full_cg_prefill_kv_indices = [
+            torch.zeros(
+                (num_slots * self.max_context_len + 256,),
+                dtype=torch.int32,
+                device=device,
+            )
+            for _ in range(self.num_wrappers)
+        ]
+        return [
+            BatchPrefillWithPagedKVCacheWrapper(
+                self.full_cg_prefill_workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                backend=self.prefill_backend,
+                qo_indptr_buf=self.full_cg_prefill_qo_indptr[i],
+                paged_kv_indptr_buf=self.full_cg_prefill_kv_indptr[i],
+                paged_kv_indices_buf=self.full_cg_prefill_kv_indices[i],
+                paged_kv_last_page_len_buf=self.kv_last_page_len[:num_slots],
+            )
+            for i in range(self.num_wrappers)
+        ]
+
     def _prepare_cuda_graph_metadata(
         self,
         bs: int,
@@ -782,6 +917,20 @@ class FlashInferAttnBackend(AttentionBackend):
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
+            )
+        elif forward_mode.is_extend():
+            # Plain EXTEND under full prefill CUDA graph. One wrapper set
+            # is shared across all num_tokens buckets: the first plan (the
+            # largest bucket — capture iterates descending) fixes
+            # max_total_num_rows, so num_tokens here is also the worst case
+            # the workspace must fit. bs is the runner's fixed request-slot
+            # count.
+            if self.full_cg_prefill_wrappers is None:
+                self.full_cg_prefill_wrappers = self._create_full_cg_prefill_wrappers(
+                    bs, num_tokens
+                )
+            self.forward_metadata = PrefillMetadata(
+                self.full_cg_prefill_wrappers, False, False
             )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -1291,6 +1440,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        disable_split_kv: bool = False,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1309,6 +1459,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        disable_split_kv: bool = False,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1334,6 +1485,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            disable_split_kv=disable_split_kv,
         )
 
     def update_sliding_window(
@@ -1350,6 +1502,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        disable_split_kv: bool = False,
     ):
         for wrapper_id in range(2):
             swa_paged_custom_mask = None
@@ -1401,6 +1554,7 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                disable_split_kv=disable_split_kv,
             )
 
     def _build_swa_prefix_custom_mask(
@@ -1458,6 +1612,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        disable_split_kv: bool = False,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1489,6 +1644,7 @@ class FlashInferIndicesUpdaterPrefill:
                 cross_attention_custom_mask=(
                     cross_attention_custom_mask if wrapper_id == 1 else None
                 ),
+                disable_split_kv=disable_split_kv,
             )
 
     def call_begin_forward(
@@ -1509,6 +1665,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        disable_split_kv: bool = False,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1595,6 +1752,7 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask=use_custom_mask,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
             prefix_len_ptr=prefix_len_ptr,
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,

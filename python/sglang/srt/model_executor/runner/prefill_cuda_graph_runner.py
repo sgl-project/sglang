@@ -20,13 +20,21 @@ Backend selection comes from cuda_graph_config.prefill:
   - "breakable" — BreakableCudaGraphBackend: segmented capture (no
                       torch.compile). Captures with bs=1; rejects multi-req
                       prefill in can_run.
-  - "full"      — rejected at config validation; not supported for prefill.
+  - "full"      — FullCudaGraphBackend: one whole-forward graph per
+                      num_tokens bucket, captured with a fixed number of
+                      request slots (FULL_CG_PREFILL_REQ_SLOTS). Replay
+                      pads num_tokens up to the nearest bucket and pads
+                      the request axis with zero-length sentinel requests;
+                      bs > slots falls back to eager. Attention metadata
+                      follows the decode-style 2-step contract
+                      (init_forward_metadata_out_graph before capture/replay).
   - "disabled"  — handled at the model_runner level — runner not
                       constructed.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import warnings
 from typing import TYPE_CHECKING, Dict, Optional, Union
@@ -62,6 +70,9 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    FullCudaGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
@@ -87,6 +98,14 @@ logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# Request slots captured per num_tokens bucket under the Full backend.
+# One graph per bucket serves any real bs <= this value: unused slots are
+# zero-length sentinel requests (their metadata entries are zeroed each
+# replay; attention plans no work for them and the logits-processor rows
+# they gather are sliced off). Larger batches fall back to eager.
+# TODO: promote to a cuda_graph_config[prefill] knob.
+FULL_CG_PREFILL_REQ_SLOTS = 16
 
 # Names of the static prefill input tensors a Breakable-backed prefill
 # runner owns. Each is a 1-D int64 tensor of length max_bs; captured
@@ -204,7 +223,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
         self.layer_model = None
         self.backend = resolve_prefill_backend(self)
-        if isinstance(self.backend, BreakableCudaGraphBackend):
+        self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
+        # Request slots baked into each Full-backend graph (1 elsewhere —
+        # BCG captures bs=1 and handles multi-req via its eager tail).
+        self._capture_req_slots = (
+            min(FULL_CG_PREFILL_REQ_SLOTS, self.max_bs) if self._is_full_backend else 1
+        )
+        # Pinned CPU staging for the R-padded seq_lens_cpu handed to the
+        # attention backend's plan at replay.
+        self._full_cg_seq_lens_cpu = (
+            torch.zeros((self._capture_req_slots,), dtype=torch.int64, device="cpu")
+            if self._is_full_backend
+            else None
+        )
+        # Full CG has the same stable-address requirement as Breakable:
+        # captured graphs hold these tensors' data_ptrs, so replay rebinds
+        # serving values into the same buffers.
+        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -262,6 +297,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.capture()
 
         self.raw_num_tokens = 0
+        self.raw_bs = 0
 
     # -----------------------------------------------------------------
     # Helpers
@@ -410,8 +446,31 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """Replay-time metadata refresh for the BCG-with-captured-metadata
         contract. For opt-in backends, refresh the stashed per-bucket
         metadata in place against the current batch; otherwise fall back
-        to the generic eager init."""
+        to the generic eager init. Full CG instead refreshes the
+        capture-stable wrapper state planned at capture time with the
+        real seq_lens / prefix_lens; the captured kernels read the
+        updated state at replay."""
         attn_backend = self.model_runner.attn_backend
+        if self._is_full_backend:
+            # The captured wrappers were planned with R fixed request
+            # slots, so plan must always see exactly R entries: hand the
+            # backend a shallow view whose request-axis tensors are the
+            # R-slot static buffers (real values in [:bs], zero-length
+            # sentinels in [bs:R] — already populated by replay_prepare).
+            r = self._capture_req_slots
+            bs = forward_batch.batch_size
+            s = self._prefill_static_buffers
+            self._full_cg_seq_lens_cpu.zero_()
+            self._full_cg_seq_lens_cpu[:bs].copy_(forward_batch.seq_lens_cpu)
+            padded_view = copy.copy(forward_batch)
+            padded_view.batch_size = r
+            padded_view.seq_lens = s["seq_lens"][:r]
+            padded_view.seq_lens_cpu = self._full_cg_seq_lens_cpu
+            padded_view.req_pool_indices = s["req_pool_indices"][:r]
+            padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
+            padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
+            attn_backend.init_forward_metadata_out_graph(padded_view)
+            return
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
             return
@@ -435,6 +494,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.forward_mode.is_target_verify():
             return False
         if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+            return False
+        # Full CG captures the entire model.forward (including the
+        # logits-processor tail) with R fixed request slots; batches with
+        # more requests than slots fall back to eager.
+        if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
         # BCG-with-captured-metadata under DP attention: every rank must
         # have local tokens, and the batch must declare itself replayable.
@@ -484,27 +548,35 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_prepare signature.
         """
         buffers = self.buffers
-        bs = 1
+        # Full backend: R request slots — slot 0 carries the whole bucket,
+        # slots 1..R-1 are zero-length sentinels (the multi-bs replay
+        # contract). Other backends capture a single real request.
+        bs = self._capture_req_slots
+        # Per-request dummy values: [num_tokens, 0, 0, ...] for lengths,
+        # zeros elsewhere. extend_start_loc for sentinels sits at the flat
+        # end of the real tokens (= num_tokens).
+        lens_cpu = [num_tokens] + [0] * (bs - 1)
+        start_loc_cpu = [0] + [num_tokens] * (bs - 1)
 
         with torch.device(self.device):
             shape_inputs = {
                 "req_pool_indices": torch.arange(bs, device=self.device),
-                "seq_lens": torch.tensor([num_tokens], device=self.device),
-                "orig_seq_lens": torch.tensor([num_tokens], device=self.device),
-                "extend_seq_lens": torch.tensor([num_tokens], device=self.device),
-                "extend_prefix_lens": torch.tensor([0], device=self.device),
-                "extend_start_loc": torch.tensor([0], device=self.device),
+                "seq_lens": torch.tensor(lens_cpu, device=self.device),
+                "orig_seq_lens": torch.tensor(lens_cpu, device=self.device),
+                "extend_seq_lens": torch.tensor(lens_cpu, device=self.device),
+                "extend_prefix_lens": torch.zeros((bs,), dtype=torch.int64),
+                "extend_start_loc": torch.tensor(start_loc_cpu, device=self.device),
             }
         if self._prefill_static_buffers is not None:
             s = self._prefill_static_buffers
-            s["seq_lens"][:bs].fill_(num_tokens)
-            s["extend_seq_lens"][:bs].fill_(num_tokens)
+            s["seq_lens"][:bs].copy_(shape_inputs["seq_lens"])
+            s["extend_seq_lens"][:bs].copy_(shape_inputs["extend_seq_lens"])
             s["extend_prefix_lens"][:bs].zero_()
-            s["extend_start_loc"][:bs].zero_()
+            s["extend_start_loc"][:bs].copy_(shape_inputs["extend_start_loc"])
             s["req_pool_indices"][:bs].copy_(
                 torch.arange(bs, device=s["req_pool_indices"].device)
             )
-            s["orig_seq_lens"][:bs].fill_(num_tokens)
+            s["orig_seq_lens"][:bs].copy_(shape_inputs["orig_seq_lens"])
             for name in _PREFILL_STATIC_FIELDS:
                 shape_inputs[name] = s[name][:bs]
 
@@ -544,7 +616,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 seq_lens=shape_inputs["seq_lens"],
                 next_token_logits_buffer=None,
                 orig_seq_lens=shape_inputs["orig_seq_lens"],
-                seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                seq_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
                 out_cache_loc=_slot("out_cache_loc"),
                 seq_lens_sum=num_tokens,
                 mamba_track_indices=(
@@ -568,9 +640,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 extend_seq_lens=shape_inputs["extend_seq_lens"],
                 extend_prefix_lens=shape_inputs["extend_prefix_lens"],
                 extend_start_loc=shape_inputs["extend_start_loc"],
-                extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
-                extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_prefix_lens_cpu=torch.zeros(
+                    (bs,), dtype=torch.int64, device="cpu"
+                ),
+                extend_seq_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
+                extend_logprob_start_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
                 positions=_slot("positions"),
                 global_num_tokens_gpu=global_num_tokens_gpu,
                 global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -639,7 +713,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
-        self._init_forward_metadata_for_capture(forward_batch, num_tokens)
+        if self._is_full_backend:
+            # Full CG uses the decode-style 2-step metadata contract:
+            # plan() against capture-stable wrappers outside the graph;
+            # replay refreshes the same wrapper state in place.
+            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+        else:
+            self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
@@ -678,6 +758,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_num_tokens = num_tokens
 
         bs = forward_batch.batch_size
+        self.raw_bs = bs
 
         self.buffer_registry.fill_from(
             forward_batch,
@@ -781,7 +862,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         )
 
-        # Under Breakable, copy serving-time values into the static
+        # Under Breakable / Full, copy serving-time values into the static
         # buffers so the addresses captured segments hold stay live with
         # current data.
         if self._prefill_static_buffers is not None:
@@ -794,6 +875,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             s["req_pool_indices"][:bs].copy_(forward_batch.req_pool_indices)
             if forward_batch.orig_seq_lens is not None:
                 s["orig_seq_lens"][:bs].copy_(forward_batch.orig_seq_lens)
+            if self._is_full_backend and bs < self._capture_req_slots:
+                # Sentinel tail for slots [bs:R]: the captured graph reads
+                # all R entries (e.g. the logits-processor cumsum), so
+                # stale values from the previous replay must be cleared.
+                # Zero lengths make the sentinels no-ops; extend_start_loc
+                # sentinels sit at the flat end of the real tokens.
+                r = self._capture_req_slots
+                s["seq_lens"][bs:r].zero_()
+                s["extend_seq_lens"][bs:r].zero_()
+                s["extend_prefix_lens"][bs:r].zero_()
+                s["extend_start_loc"][bs:r].fill_(self.raw_num_tokens)
+                s["req_pool_indices"][bs:r].zero_()
+                s["orig_seq_lens"][bs:r].zero_()
 
         self._prepare_forward_metadata_for_replay(
             forward_batch, static_forward_batch, static_num_tokens
@@ -852,9 +946,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 finally:
                     self.layer_model.forward = original_layer_forward
             else:
-                # TC_PIECEWISE path. backend.replay calls the compiled
-                # outer model.forward directly (torch.compile handles
-                # multi-req via bs-invariant FX-traced kernels).
+                # TC_PIECEWISE / FULL path. TC_PIECEWISE's backend.replay
+                # calls the compiled outer model.forward directly
+                # (torch.compile handles multi-req via bs-invariant
+                # FX-traced kernels); FULL's fires the captured
+                # whole-forward graph for this bucket (bs=1, gated in
+                # can_run) and returns its captured output.
                 with forward_context(
                     ForwardContext(attn_backend=self.model_runner.attn_backend)
                 ), set_tc_piecewise_forward_context(
@@ -868,7 +965,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     raw_num_tokens=raw_num_tokens,
                 ):
                     output = self.backend.replay(
-                        self._static_num_tokens, static_forward_batch, **kwargs
+                        ShapeKey(size=self._static_num_tokens),
+                        static_forward_batch,
+                        **kwargs,
                     )
 
             if isinstance(output, LogitsProcessorOutput):
@@ -879,8 +978,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     and output.mm_input_embeds is not None
                 ):
                     mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
+                # next_token_logits is request-axis-shaped. Under Full CG
+                # the captured tail produced R rows (sentinel rows are
+                # duplicates of the last real one) — keep the real bs.
+                # Other backends ran the tail with the live bs, where
+                # [:raw_num_tokens] was always a no-op (bs <= num_tokens);
+                # keep their slice unchanged.
+                logits_rows = (
+                    self.raw_bs if self._is_full_backend else self.raw_num_tokens
+                )
                 return LogitsProcessorOutput(
-                    next_token_logits=output.next_token_logits[: self.raw_num_tokens],
+                    next_token_logits=output.next_token_logits[:logits_rows],
                     hidden_states=(
                         output.hidden_states[: self.raw_num_tokens]
                         if output.hidden_states is not None

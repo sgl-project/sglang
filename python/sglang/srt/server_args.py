@@ -756,7 +756,7 @@ class ServerArgs:
         Literal["full", "breakable", "tc_piecewise", "disabled"]
     ] = None
     cuda_graph_backend_prefill: Optional[
-        Literal["breakable", "tc_piecewise", "disabled"]
+        Literal["full", "breakable", "tc_piecewise", "disabled"]
     ] = None
     cuda_graph_max_bs_decode: Optional[int] = None
     cuda_graph_max_bs_prefill: Optional[int] = None
@@ -1387,6 +1387,17 @@ class ServerArgs:
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
         self._validate_cuda_graph_config()
+        # Warn on the final resolved config (not inside the compat cascade —
+        # that path is skipped when the user explicitly sets the backend,
+        # which is the only way to get 'full' for prefill today).
+        if self.cuda_graph_config.prefill.backend == Backend.FULL:
+            logger.warning(
+                "cuda_graph_config[prefill].backend='full' is experimental. "
+                "Whole-forward prefill capture is new and may be buggy; "
+                "validated only on dense models with the flashinfer / fa4 "
+                "attention backends so far. Use breakable or tc_piecewise "
+                "for production workloads."
+            )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -1466,6 +1477,8 @@ class ServerArgs:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
             self._disable_breakable_cudagraph_if_incompatible()
+        elif self.cuda_graph_config.prefill.backend == Backend.FULL:
+            self._disable_full_prefill_cudagraph_if_incompatible()
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
         """TcPiecewise (torch.compile + piecewise) is incompatible with
@@ -1540,6 +1553,27 @@ class ServerArgs:
             if predicate():
                 logger.warning(
                     "Breakable CUDA graph is incompatible with %s; "
+                    "disabling prefill CUDA graph.",
+                    name,
+                )
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                return
+
+    def _disable_full_prefill_cudagraph_if_incompatible(self):
+        """Full prefill CG (whole-forward capture with fixed request slots).
+
+        "full" is never a resolved default for prefill today, so this arm
+        is only reachable if that changes; the rule list starts empty.
+        When rules are added they will likely be a superset of Breakable's
+        (Full reuses its static-buffer machinery) plus an attention-backend
+        gate (plain-EXTEND init_forward_metadata_out_graph support —
+        flashinfer / fa4 today).
+        """
+        rules = []
+        for name, predicate in rules:
+            if predicate():
+                logger.warning(
+                    "Full prefill CUDA graph is incompatible with %s; "
                     "disabling prefill CUDA graph.",
                     name,
                 )

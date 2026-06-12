@@ -39,10 +39,15 @@ ALLOWED_BACKENDS_PER_PHASE = {
         Backend.TC_PIECEWISE,
         Backend.DISABLED,
     ),
-    # full is rejected for prefill — full CUDA graph capture only
-    # fits fixed-shape and prefill is variable-shape. Use breakable
-    # or tc_piecewise for prefill.
-    Phase.PREFILL: (Backend.BREAKABLE, Backend.TC_PIECEWISE, Backend.DISABLED),
+    # full for prefill captures one whole-forward graph per num_tokens
+    # bucket (bs=1 only); replay pads num_tokens up to the nearest
+    # captured bucket. Opt-in: the padding waste is the operator's call.
+    Phase.PREFILL: (
+        Backend.FULL,
+        Backend.BREAKABLE,
+        Backend.TC_PIECEWISE,
+        Backend.DISABLED,
+    ),
 }
 
 # Per-phase settings schema. Keys other than backend are runner-level
