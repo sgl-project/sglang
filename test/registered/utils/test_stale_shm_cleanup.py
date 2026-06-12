@@ -62,7 +62,7 @@ class TestCleanupStaleShm(unittest.TestCase):
         # must never touch them even when their creator is dead.
         foreign = self._make_segment("psm_testforeign")
 
-        with patch("sglang.utils.is_in_ci", return_value=True):
+        with patch.dict(os.environ, {"SGLANG_IS_IN_CI": "true"}):
             cleanup_stale_shm()
 
         self.assertFalse(os.path.exists(f"/dev/shm/{stale}"))
@@ -73,7 +73,7 @@ class TestCleanupStaleShm(unittest.TestCase):
         dead_pid = _spawn_dead_pid()
         stale = self._make_segment(f"sgl_shm_mq_{dead_pid}_cccc0000")
 
-        with patch("sglang.utils.is_in_ci", return_value=False):
+        with patch.dict(os.environ, {"SGLANG_IS_IN_CI": "false"}):
             cleanup_stale_shm()
 
         self.assertTrue(os.path.exists(f"/dev/shm/{stale}"))
@@ -92,11 +92,31 @@ class TestCleanupStaleShm(unittest.TestCase):
             buf.shared_memory.close()
             buf.shared_memory.unlink()
 
+    def test_run_by_path_without_sglang_importable(self):
+        """ci_install_dependency.sh runs the module by file path before
+        sglang is installed; it must work with an empty PYTHONPATH."""
+        import sglang.srt.utils.stale_shm_cleanup as mod
+
+        dead_pid = _spawn_dead_pid()
+        stale = self._make_segment(f"sgl_shm_mm_{dead_pid}_eeee0000")
+
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["SGLANG_IS_IN_CI"] = "true"
+        result = subprocess.run(
+            [sys.executable, mod.__file__],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd="/",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(os.path.exists(f"/dev/shm/{stale}"))
+
     def test_multi_tokenizer_args_cleanup(self):
         dead_pid = _spawn_dead_pid()
         stale = self._make_segment(f"multi_tokenizer_args_{dead_pid}")
 
-        with patch("sglang.utils.is_in_ci", return_value=True):
+        with patch.dict(os.environ, {"SGLANG_IS_IN_CI": "true"}):
             cleanup_stale_shm()
 
         self.assertFalse(os.path.exists(f"/dev/shm/{stale}"))

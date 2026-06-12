@@ -122,6 +122,17 @@ kill_existing_processes() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+cleanup_stale_shm() {
+    # Reclaim /dev/shm segments leaked by SIGKILLed processes from earlier
+    # jobs; leaked segments accumulate until the tmpfs fills and scheduler
+    # init dies with SIGBUS. Runs right after killall so every dead creator's
+    # segments are reclaimable. The module is dependency-free and runnable by
+    # path, so this works before sglang is installed.
+    SGLANG_IS_IN_CI=true python3 "${REPO_ROOT}/python/sglang/srt/utils/stale_shm_cleanup.py" || true
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 install_apt_packages() {
     apt-get update || true
     CI_APT_PACKAGES=(
@@ -511,6 +522,7 @@ main() {
     configure_environment "$@"
     detect_host
     kill_existing_processes
+    cleanup_stale_shm
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain

@@ -106,7 +106,6 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
-from sglang.srt.utils.stale_shm_cleanup import cleanup_stale_shm
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -774,9 +773,6 @@ class Engine(EngineScoreMixin, EngineBase):
         # Configure global environment
         configure_logger(server_args)
         _set_envs_and_config(server_args)
-
-        # Reclaim /dev/shm segments leaked by SIGKILLed predecessors (CI-only).
-        cleanup_stale_shm()
 
         # Defensive: ensure plugins loaded (may already be loaded by
         # Engine.__init__ or CLI entry).

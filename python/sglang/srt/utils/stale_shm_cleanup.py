@@ -74,10 +74,15 @@ def cleanup_stale_shm() -> None:
         )
 
 
-def _cleanup_stale_shm_impl() -> None:
-    from sglang.utils import is_in_ci
+def _is_in_ci() -> bool:
+    # Read the env var directly (same semantics as sglang.utils.is_in_ci) so
+    # this module stays import-free and runnable by path from CI scripts
+    # before sglang is installed.
+    return os.environ.get("SGLANG_IS_IN_CI", "false").lower() in ("true", "1")
 
-    if not is_in_ci():
+
+def _cleanup_stale_shm_impl() -> None:
+    if not _is_in_ci():
         return
     if not _SHM_DIR.is_dir():
         return
@@ -111,3 +116,8 @@ def _cleanup_stale_shm_impl() -> None:
             removed,
             freed_bytes / (1 << 20),
         )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    cleanup_stale_shm()
