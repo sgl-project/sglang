@@ -29,9 +29,6 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
-    create_extend_after_decode_spec_info as create_extend_after_decode_spec_info,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
     filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (

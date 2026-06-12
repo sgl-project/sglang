@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import copy
 import json
 import logging
 import math
@@ -198,13 +199,18 @@ class ModelConfig:
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
-        self.hf_config = get_config(
-            self.model_path,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            model_override_args=self.model_override_args,
-            model_config_parser=model_config_parser,
-            **kwargs,
+        # get_config() is cached. ModelConfig mutates hf_config for draft-model
+        # remapping and architecture-specific normalization, so each instance
+        # must own an isolated copy.
+        self.hf_config = copy.deepcopy(
+            get_config(
+                self.model_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                model_override_args=self.model_override_args,
+                model_config_parser=model_config_parser,
+                **kwargs,
+            )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
@@ -589,27 +595,28 @@ class ModelConfig:
 
     def _derive_model_shapes(self):
         # Unify the config keys for hf_text_config
-        self.head_dim = getattr(
-            self.hf_text_config,
-            "head_dim",
-            self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
-        )
-        self.v_head_dim = getattr(
-            self.hf_text_config,
-            "v_head_dim",
-            self.head_dim,
-        )
+        self.head_dim = getattr(self.hf_text_config, "head_dim", None)
+        if self.head_dim is None:
+            self.head_dim = (
+                self.hf_text_config.hidden_size
+                // self.hf_text_config.num_attention_heads
+            )
+            setattr(self.hf_text_config, "head_dim", self.head_dim)
 
-        self.swa_head_dim = getattr(
-            self.hf_text_config,
-            "swa_head_dim",
-            self.head_dim,
-        )
-        self.swa_v_head_dim = getattr(
-            self.hf_text_config,
-            "swa_v_head_dim",
-            self.swa_head_dim,
-        )
+        self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
+        if self.v_head_dim is None:
+            self.v_head_dim = self.head_dim
+            setattr(self.hf_text_config, "v_head_dim", self.v_head_dim)
+
+        self.swa_head_dim = getattr(self.hf_text_config, "swa_head_dim", None)
+        if self.swa_head_dim is None:
+            self.swa_head_dim = self.head_dim
+            setattr(self.hf_text_config, "swa_head_dim", self.swa_head_dim)
+
+        self.swa_v_head_dim = getattr(self.hf_text_config, "swa_v_head_dim", None)
+        if self.swa_v_head_dim is None:
+            self.swa_v_head_dim = self.swa_head_dim
+            setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
