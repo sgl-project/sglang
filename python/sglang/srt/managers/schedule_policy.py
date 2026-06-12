@@ -864,11 +864,11 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def add_first_extend_req(
+    def add_unstarted_extend_req(
         self, req: Req, truncation_align_size: Optional[int]
     ) -> AddReqResult:
         assert not req.is_partially_extended or req.is_dllm(), (
-            f"add_first_extend_req called on partially-extended req {req.rid}; "
+            f"add_unstarted_extend_req called on partially-extended req {req.rid}; "
             f"scheduler-side dispatch broken"
         )
 
