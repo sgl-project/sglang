@@ -55,7 +55,11 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+    EagleVerifyInput,
+)
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -66,6 +70,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    commit_mamba_states_after_verify,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
@@ -654,16 +659,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
                 pt += extend_len
 
-        # Construct spec_info
-        next_draft_input = EagleDraftInput(
+        # Draft-extend spec_info for the extend forward; carries only
+        # hidden_states + shape info.
+        batch.spec_info = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
-            bonus_tokens=next_token_ids,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
-
-        batch.spec_info = next_draft_input
 
         # Run forward (LAST mode: only the final hidden state per request,
         # to feed the next draft step which expects [bs, hidden_dim]).
@@ -695,20 +698,27 @@ class EagleDraftWorker(BaseDraftWorker):
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
-        # Update spec_info for the next draft step
+        # Assemble the next-iter draft spec_info from the extend output.
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
-            probs, self.topk, dim=-1
+        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        return EagleDraftInput(
+            topk_p=topk_p,
+            topk_index=topk_index,
+            hidden_states=logits_output.hidden_states,
+            bonus_tokens=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
-        next_draft_input.hidden_states = logits_output.hidden_states
-        return next_draft_input
 
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
-        draft_input = EagleDraftInput(
+        draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
+            # accept_lens includes the bonus token; correct drafts exclude it.
+            num_correct_drafts=batch_result.accept_lens - 1,
+            num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
@@ -723,7 +733,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
-            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+            forward_batch = draft_extend_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
                 batch_result.next_token_ids,
                 self.speculative_num_draft_tokens,
@@ -735,12 +745,6 @@ class EagleDraftWorker(BaseDraftWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
-
-        if forward_batch.spec_info.num_correct_drafts is None:
-            # `batch_result.accept_lens` already includes the bonus token, so use it
-            # directly for `num_accept_tokens` and subtract 1 for `num_correct_drafts`.
-            forward_batch.spec_info.num_correct_drafts = batch_result.accept_lens - 1
-            forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
@@ -1285,12 +1289,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification
-        if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-            or self.target_worker.model_runner.hybrid_lightning_config is not None
-        ):
-            self._mamba_verify_update(batch, accept_lens, accept_index, bs)
+        commit_mamba_states_after_verify(
+            self.target_worker,
+            batch,
+            accept_lens,
+            accept_index,
+            self.speculative_num_draft_tokens,
+        )
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
@@ -1336,65 +1341,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
         )
-
-    def _mamba_verify_update(
-        self,
-        batch: ScheduleBatch,
-        accept_lens: torch.Tensor,
-        accept_index: torch.Tensor,
-        bs: int,
-    ):
-        """Update mamba state for hybrid GDN models after verification."""
-        # `accept_lens` already includes the bonus token (drafts + 1 per req).
-        if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-            accept_indices_offset = torch.arange(
-                0,
-                bs * self.speculative_num_draft_tokens,
-                step=self.speculative_num_draft_tokens,
-                dtype=accept_lens.dtype,
-                device=accept_lens.device,
-            )
-            req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-            # Per-req tree step of the last accepted node, i.e. the step whose
-            # mamba state to commit; reduces to accept_lens - 1 for topk == 1.
-            last_correct_step_indices = (
-                accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
-                - accept_indices_offset
-            )
-
-            if batch.mamba_track_indices is not None:
-                # If after verify, the request's seq_lens has crossed a mamba track interval,
-                # we need to update the mamba state for the request at the crossing point.
-                seq_lens_pre_verify = batch.seq_lens
-                seq_lens_post_verify = batch.seq_lens + accept_lens
-                mamba_track_interval = self.server_args.mamba_track_interval
-                to_track_mask = (
-                    seq_lens_pre_verify // mamba_track_interval
-                    != seq_lens_post_verify // mamba_track_interval
-                )
-                tracking_point = (
-                    seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-                )
-                to_track_ith = torch.clamp(
-                    tracking_point - seq_lens_pre_verify - 1, min=0
-                ).to(torch.int64)
-                candidate_track_steps = (
-                    accept_index[req_idx, to_track_ith] - accept_indices_offset
-                )
-                mamba_steps_to_track = torch.where(
-                    to_track_mask,
-                    candidate_track_steps,
-                    torch.full_like(candidate_track_steps, -1),
-                )
-            else:
-                mamba_steps_to_track = None
-
-            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
-                model=self.target_worker.model_runner.model,
-            )
 
     def _finalize_accept_tree_path(
         self,
