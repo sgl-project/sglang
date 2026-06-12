@@ -166,7 +166,7 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
                 type(self.draft_model_runner.model).__name__,
             )
 
-        self.kv_context: Optional["FrozenKVMTPContext"] = None
+        self.kv_context: Optional[FrozenKVMTPContext] = None
         if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
             self._bind_kv_context()
 

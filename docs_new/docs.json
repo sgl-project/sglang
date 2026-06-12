@@ -976,7 +976,14 @@
                   {
                     "group": "Google",
                     "pages": [
-                      "cookbook/autoregressive/Google/Gemma4"
+                      "cookbook/autoregressive/Google/Gemma4",
+                      "cookbook/autoregressive/Google/DiffusionGemma"
+                    ]
+                  },
+                  {
+                    "group": "LiquidAI",
+                    "pages": [
+                      "cookbook/autoregressive/LiquidAI/LFM2.5"
                     ]
                   },
                   {
