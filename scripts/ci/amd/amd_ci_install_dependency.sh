@@ -26,9 +26,9 @@ done
 OPTIONAL_DEPS="${1:-}"
 
 # Build python extras
-EXTRAS="dev_hip"
+EXTRAS="dev_hip,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
-    EXTRAS="dev_hip,${OPTIONAL_DEPS}"
+    EXTRAS="dev_hip,tracing,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
 
@@ -110,6 +110,7 @@ if [ -n "$SKIP_SGLANG_BUILD" ]; then
   echo "Didn't build checkout SGLang"
 else
   docker exec ci_sglang pip uninstall sgl-kernel -y || true
+  docker exec ci_sglang pip uninstall sglang-kernel -y || true
   docker exec ci_sglang pip uninstall sglang -y || true
   # Clear Python cache to ensure latest code is used
   docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
@@ -127,7 +128,12 @@ if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
   # For lmms_evals evaluating MMMU
-  docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+  # Clone on host (with retry), then copy into the container. The checkout is
+  # owned by the runner (non-root); mark it safe so setuptools_scm /
+  # vcs_versioning can run `git` introspection during pip install.
+  git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
+  docker cp lmms-eval ci_sglang:/
+  docker exec ci_sglang git config --global --add safe.directory /lmms-eval
   install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
@@ -167,12 +173,8 @@ EOF
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
 
-  # Install tvm-ffi for JIT kernel support (QK-norm, etc.)
-  echo "Installing tvm-ffi for JIT kernel support..."
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache git+https://github.com/apache/tvm-ffi.git || echo "tvm-ffi installation failed, JIT kernels will use fallback"
-
   # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache cache-dit || echo "cache-dit installation failed"
+  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
 
   # Install accelerate for distributed training and inference support
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
@@ -203,15 +205,15 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 if [[ "${GPU_ARCH}" == "mi35x" ]]; then
     echo "[CI-AITER-CHECK] Using gfx950 block from Dockerfile..."
     REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_950 AS gfx950' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT=' \
+                        | grep 'AITER_COMMIT_DEFAULT=' \
                         | head -n1 \
-                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
+                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
 else
     echo "[CI-AITER-CHECK] Using gfx942 block from Dockerfile..."
     REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942 AS gfx942' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT=' \
+                        | grep 'AITER_COMMIT_DEFAULT=' \
                         | head -n1 \
-                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
+                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
 fi
 
 
@@ -234,7 +236,11 @@ echo "[CI-AITER-CHECK] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
 #############################################
 NEED_REBUILD="false"
 
-if [[ "${IMAGE_AITER_VERSION}" == "vnone" || "${IMAGE_AITER_VERSION}" == "v" ]]; then
+if [[ -n "${AITER_COMMIT_OVERRIDE:-}" ]]; then
+    echo "[CI-AITER-CHECK] AITER_COMMIT_OVERRIDE=${AITER_COMMIT_OVERRIDE} → forcing rebuild"
+    REPO_AITER_COMMIT="${AITER_COMMIT_OVERRIDE}"
+    NEED_REBUILD="true"
+elif [[ "${IMAGE_AITER_VERSION}" == "vnone" || "${IMAGE_AITER_VERSION}" == "v" ]]; then
     echo "[CI-AITER-CHECK] No AITER found in image → rebuild needed"
     NEED_REBUILD="true"
 elif [[ "${IMAGE_AITER_VERSION}" == "${REPO_AITER_COMMIT}" ]]; then
@@ -263,12 +269,13 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # clone a fresh copy to /sgl-workspace/aiter
     docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
 
-    # checkout correct version
+    # checkout correct version and install requirements
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
         git checkout ${REPO_AITER_COMMIT} && \
-        git submodule update --init --recursive
+        git submodule update --init --recursive && \
+        pip install -r requirements.txt
     "
 
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
@@ -278,10 +285,28 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
+    # Re-apply Dockerfile hotpatches for ROCm 7.2 (the fresh clone lost them, can be removed after triton fixed this problem)
+    ROCM_VERSION=$(docker exec ci_sglang bash -c "cat /opt/rocm/.info/version 2>/dev/null || echo unknown")
+    if [[ "${ROCM_VERSION}" == 7.2* ]]; then
+        echo "[CI-AITER-CHECK] ROCm 7.2 detected (${ROCM_VERSION}), applying AITER hotpatches..."
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            TARGET_FILE='aiter/ops/triton/attention/pa_mqa_logits.py' && \
+            if [ -f \"\${TARGET_FILE}\" ]; then \
+                sed -i '459 s/if.*:/if False:/' \"\${TARGET_FILE}\" && \
+                echo '[CI-AITER-CHECK] Hotpatch applied to pa_mqa_logits.py'; \
+            else \
+                echo '[CI-AITER-CHECK] pa_mqa_logits.py not found, skipping hotpatch'; \
+            fi
+        "
+    else
+        echo "[CI-AITER-CHECK] ROCm version=${ROCM_VERSION}, no hotpatch needed"
+    fi
+
     # build AITER
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="

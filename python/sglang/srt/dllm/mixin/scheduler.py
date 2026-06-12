@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.schedule_batch import Req, RequestStage, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.req_time_stats import set_time_batch
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
 
 
 class SchedulerDllmMixin:
@@ -27,7 +28,7 @@ class SchedulerDllmMixin:
 
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
-        if self.try_preemption:
+        if self.enable_priority_preemption:
             self.running_batch.batch_is_full = False
 
         # Early exit if batch is full or no requests available
@@ -52,11 +53,52 @@ class SchedulerDllmMixin:
             return None
 
         # Record metrics and update state
-        self._update_metrics_and_state_for_batch(can_run_list, adder, running_bs)
+        set_time_batch(can_run_list, "set_forward_entry_time")
+        self._update_state_for_batch(can_run_list, adder, running_bs)
 
         # Create and prepare batch
         new_batch = self._create_dllm_batch(can_run_list, forward_mode)
         return new_batch
+
+    def process_batch_result_dllm(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        if result.next_token_ids:
+            self.token_to_kv_pool_allocator.free_group_begin()
+
+            for idx in range(batch.batch_size()):
+                req = batch.reqs[idx]
+
+                next_token_ids = result.next_token_ids[idx].tolist()
+                new_tokens = len(next_token_ids)
+                if new_tokens == 0:
+                    continue
+
+                req.fill_ids[-new_tokens:] = next_token_ids[:]
+                self.metrics_reporter.num_generated_tokens += new_tokens
+
+                req.output_ids.extend(next_token_ids)
+                req.update_finish_state(new_accepted_len=new_tokens)
+
+                if req.finished():
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.set_completion_time()
+
+            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+            self.token_to_kv_pool_allocator.free_group_end()
+
+        can_run_cuda_graph = result.can_run_cuda_graph
+        self.metrics_reporter.report_prefill_stats(
+            batch=batch,
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=can_run_cuda_graph,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
@@ -81,7 +123,7 @@ class SchedulerDllmMixin:
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.dllm_manager.is_empty()
-            and not self.try_preemption
+            and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
             return True
@@ -95,7 +137,7 @@ class SchedulerDllmMixin:
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
-            self.new_token_ratio,
+            self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
@@ -147,13 +189,10 @@ class SchedulerDllmMixin:
         if incoming_reqs:
             self.process_dllm_incoming_reqs(adder, incoming_reqs)
 
-    def _update_metrics_and_state_for_batch(
+    def _update_state_for_batch(
         self: Scheduler, can_run_list: List[Req], adder: PrefillAdder, running_bs: int
     ) -> None:
-        """Update metrics and state for the batch."""
-        if self.enable_metrics:
-            for req in can_run_list:
-                req.add_latency(RequestStage.PREFILL_WAITING)
+        """Update state for the batch."""
 
         if adder.preempt_list:
             for req in adder.preempt_list:
@@ -161,19 +200,11 @@ class SchedulerDllmMixin:
 
         if can_run_list:
             self.dllm_manager.add_staging_reqs(can_run_list)
-            self.dllm_manager.increment_chunked_count()
+            self.dllm_manager.increment_inflight_middle_chunks()
 
         self.adder = adder
         self.can_run_list = can_run_list
         self.running_bs = len(self.running_batch.reqs)
-
-        for req in can_run_list:
-            if req.time_stats.forward_entry_time == 0:
-                req.time_stats.forward_entry_time = time.perf_counter()
-                if self.enable_metrics:
-                    self.metrics_collector.observe_queue_time(
-                        req.time_stats.get_queueing_time(),
-                    )
 
     def _create_dllm_batch(
         self: Scheduler, can_run_list: List[Req], forward_mode: ForwardMode
@@ -194,14 +225,12 @@ class SchedulerDllmMixin:
         new_batch.decoding_reqs = None
 
         # Record prefill stats for logging after forward
-        from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
 
-        new_batch.prefill_stats = PrefillStats(
-            log_input_tokens=self.adder.log_input_tokens,
-            log_hit_tokens=self.adder.log_hit_tokens,
-            new_token_ratio=self.adder.new_token_ratio,
-            running_bs=len(self.running_batch.reqs),
-            num_new_seqs=len(can_run_list),
+        new_batch.prefill_stats = PrefillStats.from_adder(
+            self.adder, self.running_batch.reqs, self.enable_priority_scheduling
         )
 
         return new_batch
@@ -219,8 +248,9 @@ class SchedulerDllmMixin:
 
             # Try preemption if batch is full
             if self.running_batch.batch_is_full:
-                if not self.try_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
 
@@ -308,10 +338,10 @@ class DllmManager:
             return True
         return len(self.waiting_queue) == 0
 
-    def increment_chunked_count(self) -> None:
+    def increment_inflight_middle_chunks(self) -> None:
         """Increment chunked count for all staging requests."""
         for req in self.staging_queue:
-            req.is_chunked += 1
+            req.inflight_middle_chunks += 1
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""

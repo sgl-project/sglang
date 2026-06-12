@@ -18,6 +18,7 @@ KV caching events
 """
 
 import atexit
+import enum
 import logging
 import queue
 import threading
@@ -56,9 +57,30 @@ class KVCacheEvent(
     """Base class for all KV cache-related events"""
 
 
-# Medium values for hicache storage tiers
-MEDIUM_GPU = "GPU"
-MEDIUM_CPU = "CPU_PINNED"
+class StorageMedium(str, enum.Enum):
+    """Storage tier for KV cache events."""
+
+    GPU = "GPU"  # L1: device HBM
+    CPU = "CPU_PINNED"  # L2: host pinned memory
+    DISK = "DISK"  # L3: SSD / NVMe
+    EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
+
+
+class OffloadedState:
+    """
+    OffloadedState represents the state of a KV cache block offloaded to the hicache.
+
+    - prefill_len (int): The length of the prefill part of the KV cache block.
+    - inc_len (int): The length of the incremental part of the KV cache block.
+    - last_hash (Optional[str]): The hash of the last token in the KV cache block.
+    """
+
+    def __init__(
+        self, prefill_len: int, inc_len: int = 0, last_hash: Optional[str] = None
+    ):
+        self.prefill_len = prefill_len
+        self.inc_len = inc_len
+        self.last_hash = last_hash
 
 
 class BlockStored(KVCacheEvent):
@@ -96,9 +118,6 @@ class EventPublisher(ABC):
     - Publishers annotate events with the dp rank
     - This allows consumers to distinguish events from different DP ranks
     """
-
-    def __init__(self, attn_dp_rank: int = 0):
-        self._attn_dp_rank = attn_dp_rank
 
     @abstractmethod
     def publish(self, events: EventBatch) -> None:
@@ -161,7 +180,6 @@ class ZmqEventPublisher(EventPublisher):
         topic: str = "",
     ) -> None:
         # Storage
-        super().__init__(attn_dp_rank)
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
 

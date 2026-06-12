@@ -130,6 +130,7 @@ def get_zmq_socket(
     endpoint: str,
     bind: bool,
     max_bind_retries: int = 10,
+    same_port: bool = False,
 ) -> tuple[zmq.Socket, str]:
     """
     Create and configure a ZMQ socket.
@@ -140,10 +141,13 @@ def get_zmq_socket(
         endpoint: Endpoint string (e.g., "tcp://localhost:5555")
         bind: Whether to bind (True) or connect (False)
         max_bind_retries: Maximum number of retries if bind fails due to address already in use
+        same_port: If True, retry on the same port instead of incrementing.
+            Useful when the port must be fixed (e.g., disagg sockets where
+            DiffusionServer connects to a pre-determined port).
 
     Returns:
         A tuple of (socket, actual_endpoint). The actual_endpoint may differ from the
-        requested endpoint if bind retry was needed.
+        requested endpoint if bind retry was needed (and same_port is False).
     """
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
@@ -182,13 +186,15 @@ def get_zmq_socket(
         port_match = re.search(r":(\d+)$", endpoint)
 
         if port_match and max_bind_retries > 1:
+            import time as _time
+
             original_port = int(port_match.group(1))
             last_exception = None
 
             for attempt in range(max_bind_retries):
                 try:
                     current_endpoint = endpoint
-                    if attempt > 0:
+                    if attempt > 0 and not same_port:
                         # Try next port (increment by 42 to match settle_port logic)
                         current_port = original_port + attempt * 42
                         current_endpoint = re.sub(
@@ -197,6 +203,11 @@ def get_zmq_socket(
                         logger.info(
                             f"ZMQ bind failed for port {original_port + (attempt - 1) * 42}, "
                             f"retrying with port {current_port} (attempt {attempt + 1}/{max_bind_retries})"
+                        )
+                    elif attempt > 0:
+                        logger.info(
+                            f"ZMQ bind attempt {attempt + 1}/{max_bind_retries} "
+                            f"on same port {original_port}..."
                         )
 
                     socket.bind(current_endpoint)
@@ -212,7 +223,21 @@ def get_zmq_socket(
                 except zmq.ZMQError as e:
                     last_exception = e
                     if e.errno == zmq.EADDRINUSE and attempt < max_bind_retries - 1:
-                        # Address already in use, try next port
+                        # Address already in use, retry
+                        # Longer sleep for same_port (waiting for TIME_WAIT release)
+                        _time.sleep(1.0 if same_port else 0.5)
+                        # Re-create socket since ZMQ socket state may be invalid after failed bind
+                        socket.close()
+                        socket = context.socket(socket_type)
+                        if endpoint.find("[") != -1:
+                            socket.setsockopt(zmq.IPV6, 1)
+                        if socket_type == zmq.PUSH:
+                            set_send_opt()
+                        elif socket_type == zmq.PULL:
+                            set_recv_opt()
+                        elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP, zmq.ROUTER]:
+                            set_send_opt()
+                            set_recv_opt()
                         continue
                     elif attempt == max_bind_retries - 1:
                         # Last attempt failed
@@ -256,9 +281,21 @@ def is_host_cpu_x86() -> bool:
 
 
 def set_cuda_arch():
+    """Set CUDA architecture for compilation. Only applies to CUDA devices."""
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        arch = f"{capability[0]}.{capability[1]}"
+        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+    # For XPU or other platforms, no arch setting needed
+
+
+# musa
+
+
+def set_musa_arch():
     capability = torch.cuda.get_device_capability()
-    arch = f"{capability[0]}.{capability[1]}"
-    os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+    arch = f"{capability[0]}{capability[1]}"
+    os.environ["TORCH_MUSA_ARCH_LIST"] = f"{arch}"
 
 
 # env var managements

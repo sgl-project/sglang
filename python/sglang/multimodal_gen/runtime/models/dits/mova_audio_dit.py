@@ -18,8 +18,10 @@ from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 
 # Reuse common functions and classes from mova_video_dit
 from .mova_video_dit import DiTBlock, precompute_freqs_cis, sinusoidal_embedding_1d
@@ -101,7 +103,7 @@ class Conv1dLocalIsland(nn.Conv1d):
             return super().forward(input)
 
 
-class WanAudioModel(CachableDiT, OffloadableDiTMixin):
+class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = MOVAAudioConfig()._fsdp_shard_conditions
     _compile_conditions = MOVAAudioConfig()._compile_conditions
     _supported_attention_backends = MOVAAudioConfig()._supported_attention_backends
@@ -130,7 +132,7 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
         num_layers = config.num_layers
         has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
-        seperated_timestep = config.seperated_timestep
+        separated_timestep = config.separated_timestep
         require_vae_embedding = config.require_vae_embedding
         require_clip_embedding = config.require_clip_embedding
         fuse_vae_embedding_in_latents = config.fuse_vae_embedding_in_latents
@@ -139,7 +141,7 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
         self.dim = dim
         self.freq_dim = freq_dim
         self.patch_size = patch_size
-        self.seperated_timestep = seperated_timestep
+        self.separated_timestep = separated_timestep
         self.require_vae_embedding = require_vae_embedding
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents

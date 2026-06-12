@@ -13,11 +13,16 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
+    _is_musa,
     _is_npu,
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator, next_power_of_2
+from sglang.srt.utils import BumpAllocator, get_bool_env_var, next_power_of_2
+
+_use_fp8_prefill_attn = (
+    get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
+)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -28,7 +33,16 @@ if _is_cuda:
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
+    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+
+
+def _resolve_attn_backend(forward_batch: ForwardBatch):
+    backend = forward_batch.attn_backend
+    if isinstance(backend, TboAttnBackend):
+        backend = backend.primary
+    return backend
+
 
 # Configs for DeepSeek-V3:
 # num_local_heads = 128
@@ -47,7 +61,7 @@ if _use_aiter_gfx95:
 #   The minimum sum_prefix_length to enable mha with kv chunking, 8192 by default (can be changed with SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD)
 #   For batches with smaller sum_prefix_length > 0, MLA kernel with absorption will be used instead.
 # max_kv_chunk_capacity:
-#   The maximum number of tokens in each kv chunk, 128 * 1024 by default (can be get with forward_batch.get_max_chunk_capacity())
+#   The maximum number of tokens in each kv chunk, 128 * 1024 by default (can be changed with SGLANG_MAX_KV_CHUNK_CAPACITY, or get with forward_batch.get_max_chunk_capacity())
 
 # The forward methods for MHA in DeepSeek models:
 #
@@ -232,17 +246,31 @@ class DeepseekMHAForwardMixin:
                     q.dtype,
                     forward_batch,
                 )
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-            kv = self.kv_b_proj(
-                kv_a_quanted,
+        if _use_fp8_prefill_attn and self.kv_b_proj.weight.dtype == torch.uint8:
+            # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
+            # into a single kernel (fused_gemm_afp4wfp4_split_cat) that writes k and v
+            # directly in FP8, avoiding a separate elementwise cast
+            k, v = self.kv_b_proj(
+                (
+                    kv_a,
+                    k_pe.expand(-1, self.num_local_heads, -1),
+                    self.qk_nope_head_dim,
+                    self.v_head_dim,
+                    fp8_dtype,
+                )
             )[0]
         else:
-            kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
+            if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+                kv = self.kv_b_proj(kv_a_quanted)[0]
+            else:
+                kv = self.kv_b_proj(kv_a)[0]
+            kv = kv.view(
+                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope = kv[..., : self.qk_nope_head_dim]
+            v = kv[..., self.qk_nope_head_dim :]
 
-        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+            k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
     def forward_normal_core(
@@ -349,6 +377,11 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
+        # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
+        backend = _resolve_attn_backend(forward_batch)
+        pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
+        kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
+
         assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
             forward_batch.set_prefix_chunk_idx(i)
@@ -356,7 +389,7 @@ class DeepseekMHAForwardMixin:
             kv_indices = forward_batch.prefix_chunk_kv_indices[i]
             # Fetch latent cache from memory pool with precomputed chunked kv indices
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
-                kv_indices, q.dtype, forward_batch
+                kv_indices, kv_a_dtype, forward_batch
             )
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
@@ -365,17 +398,20 @@ class DeepseekMHAForwardMixin:
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
-            k = torch.empty(
-                (
-                    k_nope.shape[0],
-                    self.num_local_heads,
-                    self.qk_nope_head_dim + self.qk_rope_head_dim,
-                ),
-                dtype=v.dtype,
-                device=v.device,
-            )
-            k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
+            if pack_fn is not None:
+                k, v = pack_fn(k_nope, k_pe, v)
+            else:
+                k = torch.empty(
+                    (
+                        k_nope.shape[0],
+                        self.num_local_heads,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    ),
+                    dtype=v.dtype,
+                    device=v.device,
+                )
+                k[..., : self.qk_nope_head_dim] = k_nope
+                k[..., self.qk_nope_head_dim :] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             tmp_output = torch.empty_like(accum_output)
@@ -405,7 +441,7 @@ class DeepseekMHAForwardMixin:
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-            latent_cache[:, :, self.kv_lora_rank :] = k_pe
+            latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
 
             # Save latent cache
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -472,7 +508,7 @@ class DeepseekMHAForwardMixin:
         # Temporary for DeepSeek V3/R1 only, but can generalize if needed
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
         if (
-            _is_cuda
+            (_is_cuda or _is_musa)
             and (self.num_local_heads == 128)
             and (self.qk_nope_head_dim == 128)
             and (self.qk_rope_head_dim == 64)

@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mistral_large_3_eagle.py
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Optional
 
 import torch
@@ -18,7 +19,10 @@ from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 from sglang.srt.utils import add_prefix
 
 
-class MistralLarge3Model(DeepseekV2Model):
+class MistralLarge3EagleModel(DeepseekV2Model):
+    """EAGLE draft model with an fc layer that fuses token embeddings and
+    target-model hidden states before passing through transformer layers."""
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -99,9 +103,14 @@ class MistralLarge3ForCausalLMEagle(MistralLarge3ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        config.quant_config = quant_config
-        self.model_cls = MistralLarge3Model
+        # DeepseekV2ForCausalLM.__init__ hardcodes self.model = DeepseekV2Model.
+        # We let the parent init run (it sets up weight loading attrs, lm_head,
+        # etc.), then replace self.model with MistralLarge3EagleModel which has
+        # the EAGLE fc layer. The discarded 2-layer DeepseekV2Model is tiny.
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        self.model = MistralLarge3EagleModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
 
 
 EntryClass = [MistralLarge3ForCausalLMEagle]
