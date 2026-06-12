@@ -57,6 +57,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import ServerStatus
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
@@ -168,8 +169,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
 
-        # FIXME: If the engine is dead, raise an error
-        # This is required for the streaming case
+        if self.tokenizer_manager.server_status == ServerStatus.UnHealthy:
+            return self.create_error_response(
+                "The engine is not healthy and cannot serve requests.",
+                err_type="InternalServerError",
+                status_code=503,
+            )
 
         # Handle the previous response ID
         prev_response_id = request.previous_response_id
@@ -259,6 +264,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                     # Account for reserved tokens (e.g., EAGLE speculative decoding slots)
                     # that the tokenizer_manager adds during validation
                     num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
+
+                    # Enforce truncation="disabled": reject requests whose prompt
+                    # already exceeds the available context window.  When
+                    # truncation="auto" the engine silently clamps, which is the
+                    # existing behaviour.
+                    if request.truncation == "disabled":
+                        available_tokens = context_len - num_reserved_tokens
+                        if prompt_length > available_tokens:
+                            return self.create_error_response(
+                                f"Input length ({prompt_length} tokens) exceeds the "
+                                f"model's context length ({context_len} tokens). "
+                                "Set truncation='auto' to allow automatic truncation.",
+                                err_type="BadRequestError",
+                                status_code=400,
+                            )
+
                     default_max_tokens = max(
                         context_len - prompt_length - num_reserved_tokens, 512
                     )  # Ensure minimum 512 tokens
@@ -627,6 +648,38 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.extend(request.input)  # type: ignore
         return messages
 
+    def _build_harmony_system_messages(
+        self, request: "ResponsesRequest"
+    ) -> tuple["OpenAIMessage", "OpenAIMessage"]:
+        """Build the system and developer messages for a Harmony request.
+
+        Extracted to avoid duplicating this logic between the first-turn and
+        continuation branches of _construct_input_messages_with_harmony.
+        """
+        reasoning_effort = request.reasoning.effort if request.reasoning else None
+        tool_types = [tool.type for tool in request.tools]
+        enable_browser = (
+            "web_search_preview" in tool_types and self.tool_server is not None
+        )
+        enable_code_interpreter = (
+            "code_interpreter" in tool_types and self.tool_server is not None
+        )
+        sys_msg = get_system_message(
+            reasoning_effort=reasoning_effort,
+            browser_description=(
+                self.tool_server.get_tool_description("browser")
+                if self.tool_server and enable_browser
+                else None
+            ),
+            python_description=(
+                self.tool_server.get_tool_description("python")
+                if self.tool_server and enable_code_interpreter
+                else None
+            ),
+        )
+        dev_msg = get_developer_message(request.instructions, request.tools)
+        return sys_msg, dev_msg
+
     def _construct_input_messages_with_harmony(
         self,
         request: ResponsesRequest,
@@ -635,35 +688,33 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages: list[OpenAIMessage] = []
         if prev_response is None:
             # New conversation.
-            reasoning_effort = request.reasoning.effort if request.reasoning else None
-            tool_types = [tool.type for tool in request.tools]
-            enable_browser = (
-                "web_search_preview" in tool_types and self.tool_server is not None
-            )
-            enable_code_interpreter = (
-                "code_interpreter" in tool_types and self.tool_server is not None
-            )
-            sys_msg = get_system_message(
-                reasoning_effort=reasoning_effort,
-                browser_description=(
-                    self.tool_server.get_tool_description("browser")
-                    if self.tool_server and enable_browser
-                    else None
-                ),
-                python_description=(
-                    self.tool_server.get_tool_description("python")
-                    if self.tool_server and enable_code_interpreter
-                    else None
-                ),
-            )
+            sys_msg, dev_msg = self._build_harmony_system_messages(request)
             messages.append(sys_msg)
-            dev_msg = get_developer_message(request.instructions, request.tools)
             messages.append(dev_msg)
         else:
             # Continue the previous conversation.
-            # FIXME: Currently, request params like reasoning and
-            # instructions are ignored.
-            prev_msgs = self.msg_store[prev_response.id]
+            # Re-build sys_msg and dev_msg from the current request so that
+            # updated instructions, reasoning effort, or tools take effect on
+            # this turn (previously they were silently ignored).
+            fresh_sys_msg, fresh_dev_msg = self._build_harmony_system_messages(request)
+            if prev_response.id not in self.msg_store:
+                raise ValueError(
+                    f"Conversation history for response ID {prev_response.id} not found. "
+                    "Ensure 'store=True' was used in the previous request."
+                )
+            # Use a shallow copy so we do not destructively mutate the stored
+            # history (important for branching / multi-fork scenarios).
+            prev_msgs = list(self.msg_store[prev_response.id])
+            # Replace the stored sys_msg (index 0) and dev_msg (index 1) so
+            # the new turn uses the caller's current params.
+            if len(prev_msgs) >= 2:
+                prev_msgs[0] = fresh_sys_msg
+                prev_msgs[1] = fresh_dev_msg
+            elif len(prev_msgs) == 1:
+                prev_msgs[0] = fresh_sys_msg
+                prev_msgs.append(fresh_dev_msg)
+            else:
+                prev_msgs = [fresh_sys_msg, fresh_dev_msg]
             # Remove the previous chain-of-thoughts if there is a new "final"
             # message.
             if (
