@@ -12,10 +12,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
-    set_mamba_track_indices_from_reqs,
-)
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -35,23 +32,22 @@ from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
+    prepare_mamba_track_for_verify,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_draft_cache_locs_contiguous as assign_draft_cache_locs_contiguous,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
-)
-from sglang.srt.speculative.triton_ops.eagle import (
-    fill_accept_out_cache_loc as fill_accept_out_cache_loc,
 )
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
 )
-from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils.async_probe import (
+    maybe_detect_nan,
+    maybe_detect_oob,
+    sanitize_nan_logits,
+)
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu
 
 _is_cuda = is_cuda()
@@ -64,7 +60,11 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
-    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.eagle_info import (
+        EagleDraftExtendInput,
+        EagleDraftInput,
+        EagleVerifyInput,
+    )
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -306,8 +306,10 @@ class EagleDraftInputV2Mixin:
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
+
+class EagleDraftExtendInputV2Mixin:
     def prepare_for_extend_to_fill_draft_kvcache(
-        self,
+        self: EagleDraftExtendInput,
         batch: ScheduleBatch,
         predict: torch.Tensor,
         num_draft_tokens: int,
@@ -374,6 +376,19 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
+    @property
+    def max_tree_depth(self: EagleVerifyInput) -> int:
+        """Longest root-to-leaf chain of the verify tree, incl. the root;
+        bounds the accept_index row width. EAGLE trees are depth-bounded by
+        the draft loop. Algorithms with other tree shapes override this."""
+        return self.spec_steps + 1
+
+    @property
+    def tree_topk(self: EagleVerifyInput) -> int:
+        """Branching factor passed to the tree-verify kernels; -1 means an
+        irregular tree (no fixed per-level branching)."""
+        return self.topk
+
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,
@@ -401,10 +416,7 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
-            if get_global_server_args().enable_mamba_extra_buffer():
-                set_mamba_track_indices_from_reqs(batch)
-                batch.mamba_track_mask = None
-                batch.mamba_track_seqlens = None
+            prepare_mamba_track_for_verify(batch)
 
             # TBO's split_spec_info reads these; no-verify-sync leaves both None.
             self.seq_lens_cpu = batch.seq_lens_cpu
@@ -467,6 +479,8 @@ class EagleVerifyInputV2Mixin:
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
 
+        sanitize_nan_logits(next_token_logits, "verify: target model logits")
+
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.
         if sampling_info.acc_additive_penalties is not None:
@@ -500,7 +514,7 @@ class EagleVerifyInputV2Mixin:
         predict_shape = list(next_token_logits.shape)[:-1]
         predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
         accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
+            (bs, self.max_tree_depth), -1, dtype=torch.int32, device=device
         )
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
@@ -517,7 +531,7 @@ class EagleVerifyInputV2Mixin:
                 retrieve_next_token=self.retrieve_next_token,
                 retrieve_next_sibling=self.retrieve_next_sibling,
                 target_predict=target_predict,
-                topk=self.topk,
+                topk=self.tree_topk,
             )
         else:
             # Apply temperature and get target probs
@@ -586,14 +600,16 @@ class EagleVerifyInputV2Mixin:
                 tp_group.broadcast(num_correct_drafts, src=0)
 
         if SIMULATE_ACC_LEN > 0:
-            # Do simulation
+            # Do simulation. The helper builds (and returns) a replacement
+            # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
+            # to keep the simulated width identical to the real one.
             accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
                 num_correct_drafts=num_correct_drafts,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
-                spec_steps=self.spec_steps,
+                spec_steps=self.max_tree_depth - 1,
             )
 
         # `num_correct_drafts` stays drafts-only inside this function; the returned

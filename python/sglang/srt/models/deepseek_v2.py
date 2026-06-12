@@ -286,8 +286,7 @@ class DeepseekV2MLP(nn.Module):
             and self.swiglu_limit is None
             and not isinstance(x, tuple)
         ):
-            from flashinfer import fp4_quantize
-
+            from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
             from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
                 nvfp4_gemm_swiglu_nvfp4_quant,
             )
@@ -1339,9 +1338,7 @@ class DeepseekV2MoE(nn.Module):
             return None
 
     def op_gate(self, state):
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):
+        if state.hidden_states_mlp_input.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             state.router_logits = self.gate(state.hidden_states_mlp_input)
         else:

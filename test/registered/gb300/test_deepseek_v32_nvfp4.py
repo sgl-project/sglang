@@ -62,7 +62,6 @@ class TestDeepseekV32Nvfp4(unittest.TestCase):
                 ]
                 + MTP_ARGS,
                 variant="TP4+DP4+DPA+MTP",
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
 

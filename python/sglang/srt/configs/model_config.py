@@ -1120,6 +1120,7 @@ class ModelConfig:
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
+            "nvfp4_online",
             "modelopt_mixed",
         ]
         modelopt_quantization_specified = (
@@ -1164,6 +1165,7 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "nvfp4_online",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -1185,6 +1187,7 @@ class ModelConfig:
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "modelopt_mixed": ["modelopt"],
+            "nvfp4_online": ["fp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
@@ -1545,6 +1548,7 @@ multimodal_model_archs = [
     "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     *MIMO_V2_MULTIMODAL_ARCHS,
+    "MiMoV2ASRForCausalLM",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -1676,6 +1680,11 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     Used by DeepSeek, BailingMoe, SarvamMLA and similar MLA models.
     Warns if 'factor' is missing from rope_scaling (common in v5 configs).
     """
+    if not rope_scaling.get("apply_yarn_scaling", True) or not rope_scaling.get(
+        "apply_scale", True
+    ):
+        return base_scaling
+
     mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
     if "factor" not in rope_scaling:
         logger.warning(

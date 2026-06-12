@@ -47,10 +47,11 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
+    ShapeKey,
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
-from sglang.srt.model_executor.runner_backend import FullCudaGraphBackend
+from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -272,10 +273,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
 
-        self.backend = FullCudaGraphBackend(
-            self,
-            enable_memory_saver=self.model_runner.server_args.enable_memory_saver,
-        )
+        self.backend = resolve_decode_backend(self)
 
         try:
             with model_capture_mode():
@@ -285,8 +283,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def _replay_graph(self, shape_key, forward_batch):
+        return self.backend.replay(shape_key, forward_batch)
+
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        return bs
+        return ShapeKey(size=bs)
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -576,7 +577,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             + (bs - raw_bs) * self.seq_len_fill_value,
             seq_lens_cpu=buffers.seq_lens_cpu,
             encoder_lens=None,
-            out_cache_loc=forward_batch.out_cache_loc,
+            # per-step write target (advanced in-graph by assign_new_state);
+            # forward_batch.out_cache_loc is frozen at step 0.
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
             spec_info=forward_batch.spec_info,
         )
         self.eagle_worker.draft_extend_attn_backend_list[
@@ -586,7 +589,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
-        out = self.backend.replay(shape_key, forward_batch)
+        out = self._replay_graph(shape_key, forward_batch)
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             unpadding_bs = num_tokens

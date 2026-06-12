@@ -52,6 +52,7 @@ from sglang.srt.configs import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    ZayaConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
@@ -170,6 +171,10 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     _allocate_decode_buffers,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    enable_tc_piecewise_cuda_graph,
+    set_tc_piecewise_forward_context,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -348,7 +353,7 @@ class ModelRunnerOutput:
 @dataclass
 class _EagerBufferRegistry:
     # Lazily-built eager input-buffer registry plus the capacity it was sized to.
-    registry: Optional["CudaGraphBufferRegistry"] = None
+    registry: Optional[CudaGraphBufferRegistry] = None
     max_bs: int = 0
     max_num_tokens: int = 0
 
@@ -1971,7 +1976,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
@@ -2181,7 +2186,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             | NemotronHConfig
             | Lfm2Config
             | Lfm2MoeConfig
-            | Lfm2VlConfig,
+            | Lfm2VlConfig
+            | ZayaConfig,
         ):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
@@ -2721,7 +2727,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 spec_info = NgramVerifyInput(
                     draft_token=None,
-                    tree_mask=buffers.custom_mask,
+                    custom_mask=buffers.custom_mask,
                     positions=None,
                     retrieve_index=None,
                     retrieve_next_token=None,
@@ -2977,6 +2983,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
                     attn_layer = layer.self_attn.attn_mqa
+                    if _is_hip and hasattr(layer.self_attn, "attn_mha"):
+                        attn_layer._pcg_mha_companion = layer.self_attn.attn_mha
             # For hybrid model
             elif hasattr(layer, "attn"):
                 attn_layer = layer.attn
@@ -3099,8 +3107,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         cache: _EagerBufferRegistry,
         raw_bs: int,
         raw_num_tokens: int,
-        build: Callable[[int, int], "CudaGraphBufferRegistry"],
-    ) -> "CudaGraphBufferRegistry":
+        build: Callable[[int, int], CudaGraphBufferRegistry],
+    ) -> CudaGraphBufferRegistry:
         # Built on first use and grown (next power of two) when a batch exceeds
         # the current capacity.
         if (
@@ -3118,7 +3126,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _ensure_eager_decode_registry(
         self, raw_bs: int, raw_num_tokens: int
-    ) -> "CudaGraphBufferRegistry":
+    ) -> CudaGraphBufferRegistry:
         is_encoder_decoder = self.model_config.is_encoder_decoder
         return self._ensure_eager_registry(
             self._eager_decode_registry,
@@ -3154,7 +3162,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _ensure_eager_prefill_registry(
         self, raw_bs: int, raw_num_tokens: int
-    ) -> "CudaGraphBufferRegistry":
+    ) -> CudaGraphBufferRegistry:
         return self._ensure_eager_registry(
             self._eager_prefill_registry,
             raw_bs,
@@ -3204,7 +3212,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch: ForwardBatch,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if not self.server_args.enable_pdmux and self.device == "cuda":
+        if not self.server_args.enable_pdmux:
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
         # Set extra arguments
         pdmux_override = False
@@ -3294,7 +3302,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ret = self.prefill_cuda_graph_runner.replay(forward_batch, **kwargs)
             return (ret, can_run_graph)
 
-        if not self.server_args.enable_pdmux and self.device == "cuda":
+        if not self.server_args.enable_pdmux:
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
 
         # Launch model forward
@@ -3311,12 +3319,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         with ctx:
-            ret = self.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
+            if _is_hip and self.prefill_cuda_graph_runner is not None:
+                # AMD/HIP: when PCG is enabled but the batch exceeds max captured
+                # size, run eagerly under enable_tc_piecewise_cuda_graph() and
+                # set_tc_piecewise_forward_context() so that (a) Dynamo guards on
+                # _in_tc_piecewise_cuda_graph stay consistent with the PCG-traced
+                # graph (preventing runtime recompilation) and (b) PCG-specific
+                # code paths (MoE, attention) can access their layer objects.
+                with (
+                    enable_tc_piecewise_cuda_graph(),
+                    set_tc_piecewise_forward_context(
+                        forward_batch,
+                        self.attention_layers,
+                        getattr(self.model, "quant_config", None),
+                        self.moe_layers,
+                        self.moe_fusions,
+                        dsa_indexers=self.dsa_indexers,
+                    ),
+                ):
+                    ret = self.model.forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
+            else:
+                ret = self.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
         return (ret, can_run_graph)
 
     def forward_idle(
@@ -3330,7 +3363,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # called from the idle path can re-read a prior batch's req_pool
         # indices and trigger SWA mapping use-after-free.
         if forward_batch.batch_size > 0:
-            if not self.server_args.enable_pdmux and self.device == "cuda":
+            if not self.server_args.enable_pdmux:
                 forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
             self.attn_backend.init_forward_metadata(forward_batch)
         else:

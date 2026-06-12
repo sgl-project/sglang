@@ -284,7 +284,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--quantization`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The quantization method.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>awq</code>, <code>fp8</code>, <code>gptq</code>, <code>marlin</code>, <code>gptq_marlin</code>, <code>awq_marlin</code>, <code>bitsandbytes</code>, <code>gguf</code>, <code>modelopt</code>, <code>modelopt_fp8</code>, <code>modelopt_fp4</code>, <code>petit_nvfp4</code>, <code>w8a8_int8</code>, <code>w8a8_fp8</code>, <code>moe_wna16</code>, <code>qoq</code>, <code>w4afp8</code>, <code>mxfp4</code>, <code>mxfp8</code>, <code>auto-round</code>, <code>compressed-tensors</code>, <code>modelslim</code>, <code>quark_int4fp8_moe</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>awq</code>, <code>fp8</code>, <code>gptq</code>, <code>marlin</code>, <code>gptq_marlin</code>, <code>awq_marlin</code>, <code>bitsandbytes</code>, <code>gguf</code>, <code>modelopt</code>, <code>modelopt_fp8</code>, <code>modelopt_fp4</code>, <code>nvfp4_online</code>, <code>petit_nvfp4</code>, <code>w8a8_int8</code>, <code>w8a8_fp8</code>, <code>moe_wna16</code>, <code>qoq</code>, <code>w4afp8</code>, <code>mxfp4</code>, <code>mxfp8</code>, <code>auto-round</code>, <code>compressed-tensors</code>, <code>modelslim</code>, <code>quark_int4fp8_moe</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--quantization-param-path`</td>
@@ -2416,16 +2416,16 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
 <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--enable-dsa-prefill-context-parallel</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--enable-prefill-cp</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable context parallelism for the prefill phase. Select the layout with <code>--cp-strategy</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>False</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
 <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--dsa-prefill-cp-mode</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: <code>round-robin-split</code>(default),<code>in-seq-split</code>. <code>round-robin-split</code> distributes tokens across ranks based on <code>token_idx % cp_size</code>. It supports multi-batch prefill, fused MoE, and FP8 KV cache.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>in-seq-split</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>in-seq-split</code>, <code>round-robin-split</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cp-strategy</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Sharding strategy for prefill CP. <code>zigzag</code> is the former <code>in-seq-split</code> mode; <code>interleave</code> is the former <code>round-robin-split</code> mode.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>zigzag</code>, <code>interleave</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--enable-fused-qk-norm-rope</code></td>
