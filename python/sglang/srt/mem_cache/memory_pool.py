@@ -865,7 +865,7 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -2003,10 +2003,9 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
-        # ROCm uses the e4m3fnuz fp8 variant, so match both fn and fnuz here.
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
-            and dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
         # When override_kv_cache_dim is provided with dsa model, we assume the
