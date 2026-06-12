@@ -3151,8 +3151,11 @@ class Scheduler(
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
             if batch.return_logprob:
+                # Decode reqs have no extend_range (it is only consumed for
+                # input-logprob processing on extend/mixed reqs).
                 batch_result.extend_input_len_per_req = [
-                    req.extend_input_len for req in batch.reqs
+                    req.extend_input_len if req.extend_range is not None else 0
+                    for req in batch.reqs
                 ]
                 batch_result.extend_logprob_start_len_per_req = [
                     req.extend_logprob_start_len for req in batch.reqs
