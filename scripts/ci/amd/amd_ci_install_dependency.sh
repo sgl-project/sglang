@@ -228,6 +228,8 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     if [[ '${LEGACY_EDITABLE_INSTALL}' == 1 ]]; then
       python3 setup.py develop
     else
+      # Fix for ROCm SDK: add find_package(NUMA) before hsakmt
+      sed -i '/find_package(hsa-runtime64 REQUIRED)/i find_package(NUMA REQUIRED)' src/application/CMakeLists.txt; \
       ROCM_PATH=\${ROCM_HOME} \
       PATH=\${ROCM_HOME}/bin:\${PATH} \
       CMAKE_PREFIX_PATH=\${ROCM_HOME}/lib/rocm_sysdeps/lib/cmake:\${ROCM_HOME}/lib/cmake:\${ROCM_HOME} \
