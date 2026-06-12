@@ -180,33 +180,71 @@ pub(crate) fn process_content_format(
         .collect()
 }
 
-/// Transform a single content field based on content format
+/// Extract text from content parts array, joining multiple text parts with spaces.
+fn extract_text_from_content_parts(parts: &[Value]) -> Option<String> {
+    let text_parts: Vec<&str> = parts
+        .iter()
+        .filter_map(|part| {
+            let obj = part.as_object()?;
+            let part_type = obj.get("type")?.as_str()?;
+            if part_type == "text" {
+                obj.get("text")?.as_str()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if text_parts.is_empty() {
+        None
+    } else {
+        Some(text_parts.join(" "))
+    }
+}
+
+/// Check if content array contains any multimodal parts (images, videos, audio).
+fn has_multimodal_content(parts: &[Value]) -> bool {
+    parts.iter().any(|part| {
+        part.as_object()
+            .and_then(|obj| obj.get("type")?.as_str())
+            .is_some_and(|t| matches!(t, "image_url" | "video_url" | "audio_url"))
+    })
+}
+
+/// Transform a single content field based on content format.
+///
+/// For text-only content arrays (e.g., `[{"type": "text", "text": "Hello"}]`),
+/// this always flattens to a simple string. This ensures compatibility with
+/// chat templates that only handle string content (like Qwen3's template which
+/// checks `message.content is string` and ignores non-string content).
+///
+/// Multimodal content (with images/videos/audio) is preserved as an array,
+/// with media URLs simplified to type placeholders for template rendering.
 fn transform_content_field(content_value: &mut Value, content_format: ChatTemplateContentFormat) {
     let Some(content_array) = content_value.as_array() else {
-        return; // Not multimodal, keep as-is
+        return; // Already a string or other type, keep as-is
     };
 
+    // Text-only arrays should always be flattened to strings for template compatibility.
+    // Many templates (Qwen3, Llama, etc.) only handle string content and silently
+    // ignore or error on array content.
+    if !has_multimodal_content(content_array) {
+        if let Some(text) = extract_text_from_content_parts(content_array) {
+            *content_value = Value::String(text);
+        }
+        return;
+    }
+
+    // Multimodal content handling based on format
     match content_format {
         ChatTemplateContentFormat::String => {
-            // Extract and join text parts only
-            let text_parts: Vec<String> = content_array
-                .iter()
-                .filter_map(|part| {
-                    part.as_object()?
-                        .get("type")?
-                        .as_str()
-                        .filter(|&t| t == "text")
-                        .and_then(|_| part.as_object()?.get("text")?.as_str())
-                        .map(String::from)
-                })
-                .collect();
-
-            if !text_parts.is_empty() {
-                *content_value = Value::String(text_parts.join(" "));
+            // Extract only text parts, discarding media
+            if let Some(text) = extract_text_from_content_parts(content_array) {
+                *content_value = Value::String(text);
             }
         }
         ChatTemplateContentFormat::OpenAI => {
-            // Replace media URLs with simple type placeholders
+            // Replace media URLs with simple type placeholders for template rendering
             let processed_parts: Vec<Value> = content_array
                 .iter()
                 .map(|part| {
@@ -1237,5 +1275,56 @@ mod tests {
         assert_eq!(content_array.len(), 2);
         assert_eq!(content_array[0]["type"], "text");
         assert_eq!(content_array[1], json!({"type": "image"}));
+    }
+
+    #[test]
+    fn test_transform_text_only_array_openai_format_flattens_to_string() {
+        // Bug fix test: When content is an array with only text parts and OpenAI format
+        // is detected, the content should be flattened to a string. This fixes templates
+        // like Qwen3 that check `message.content is string` and set content='' otherwise.
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![ContentPart::Text {
+                text: "Write a short essay about artificial intelligence.".to_string(),
+            }]),
+            name: None,
+        }];
+
+        // Even with OpenAI format, text-only arrays should be flattened to strings
+        let result = process_content_format(&messages, ChatTemplateContentFormat::OpenAI).unwrap();
+
+        assert_eq!(result.len(), 1);
+        let transformed_message = &result[0];
+
+        // Content should be a string, not an array
+        assert!(
+            transformed_message["content"].is_string(),
+            "Text-only array should be flattened to string even with OpenAI format"
+        );
+        assert_eq!(
+            transformed_message["content"].as_str().unwrap(),
+            "Write a short essay about artificial intelligence."
+        );
+    }
+
+    #[test]
+    fn test_transform_multiple_text_parts_openai_format_joins_with_space() {
+        // Test that multiple text parts are joined with spaces
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Hello".to_string(),
+                },
+                ContentPart::Text {
+                    text: "World".to_string(),
+                },
+            ]),
+            name: None,
+        }];
+
+        let result = process_content_format(&messages, ChatTemplateContentFormat::OpenAI).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0]["content"].is_string());
+        assert_eq!(result[0]["content"].as_str().unwrap(), "Hello World");
     }
 }
