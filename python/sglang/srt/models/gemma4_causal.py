@@ -658,7 +658,11 @@ class Gemma4DecoderLayer(nn.Module):
         # gemma_fused_add_rmsnorm which computes:
         #   residual = h + residual (in-place)
         #   h = gemma_norm(residual)
-        residual = hidden_states
+        #
+        # pre_feedforward_layernorm uses the *in-place* fused_add_rmsnorm, which
+        # OVERWRITES the `residual` buffer with (attn_out + residual).
+        # `hidden_states` is still live outside this layer.
+        residual = hidden_states.clone()
 
         # Apply input layernorm
         hidden_states = self.input_layernorm(hidden_states)
