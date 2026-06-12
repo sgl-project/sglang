@@ -634,14 +634,13 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     ):
         done_event: Optional[torch.cuda.Event] = None
 
-        if self._comm_stream:
+        # Only overlap the a2a on the comm stream during CUDA graph capture
+        # (decode). In eager mode (e.g. prefill) the dual-stream path lets the
+        # MoRI a2a contend with the other microbatch's compute for the same
+        # intra-node CUs and can stall forward progress, so run inline instead.
+        if self._comm_stream and torch.cuda.is_current_stream_capturing():
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream  # comm stream
-
-            for t in (hidden_states, topk_weights, topk_ids):
-                t.record_stream(comm_stream)
-            if scale is not None:
-                scale.record_stream(comm_stream)
 
             with torch.cuda.stream(comm_stream):
                 # if (previous_event) stream_wait(comm_stream, previous_event)
@@ -678,15 +677,6 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     done_event.record(comm_stream)
                 else:
                     compute_stream.wait_stream(comm_stream)
-
-            for t in (
-                packed_recv_hidden,
-                recv_topk_weights,
-                recv_scales,
-                recv_topk_ids,
-            ):
-                if t is not None:
-                    t.record_stream(comm_stream)
         else:
 
             (
@@ -749,12 +739,12 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     ):
         done_event: Optional[torch.cuda.Event] = None
 
-        if self._comm_stream:
+        # See _dispatch_core: only overlap on the comm stream during CUDA graph
+        # capture (decode); run inline in eager mode to avoid a2a/compute CU
+        # contention that can stall forward progress.
+        if self._comm_stream and torch.cuda.is_current_stream_capturing():
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream
-
-            for t in (hidden_states, topk_ids, topk_weights):
-                t.record_stream(comm_stream)
 
             with torch.cuda.stream(comm_stream):
                 if previous_event is not None:
@@ -776,8 +766,6 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     done_event.record(comm_stream)
                 else:
                     compute_stream.wait_stream(comm_stream)
-
-            combined_hidden_states.record_stream(comm_stream)
 
         else:
             combined_hidden_states = self.mori_op.combine(
