@@ -1,4 +1,5 @@
 import functools
+import logging
 import math
 from typing import Tuple
 
@@ -11,7 +12,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
 
+logger = logging.getLogger(__name__)
+
 tilelang.set_log_level("WARNING")
+
+# Set once mhc_pre() has compiled every n_splits bucket at startup.
+_mhc_pre_warmed = False
 
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -450,6 +456,49 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
+def get_mhc_pre_token_count_representatives(
+    max_num_tokens: int, hc_hidden_size: int
+) -> Tuple[int, ...]:
+    """One representative token count per distinct mhc_pre n_splits bucket over
+    [1, max_num_tokens] (the kernel is specialized only by n_splits)."""
+    reps = {}
+    for grid in range(1, (max(1, max_num_tokens) + 63) // 64 + 1):
+        num_tokens = min(grid * 64, max_num_tokens)
+        reps[_compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)] = num_tokens
+    return tuple(sorted(reps.values()))
+
+
+def _maybe_prewarm_mhc_pre(call_args):
+    """Compile the prenorm kernel for every n_splits bucket on the first
+    non-capturing mhc_pre() call, replaying it with the call's real weights.
+    Skipped while capturing so warmup launches never enter a CUDA graph."""
+    global _mhc_pre_warmed
+    if (
+        _mhc_pre_warmed
+        or not envs.SGLANG_DSV4_MHC_PREWARM.get()
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    _mhc_pre_warmed = True
+
+    from sglang.srt.server_args import get_global_server_args
+
+    residual = call_args["residual"]
+    hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
+    max_num_tokens = get_global_server_args().chunked_prefill_size
+    buckets = get_mhc_pre_token_count_representatives(max_num_tokens, hc_mult * hidden_size)
+
+    logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
+    with torch.inference_mode():
+        for num_tokens in buckets:
+            mhc_pre(
+                **{
+                    **call_args,
+                    "residual": residual.new_zeros(num_tokens, hc_mult, hidden_size),
+                }
+            )
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -638,6 +687,7 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _maybe_prewarm_mhc_pre(locals())
 
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
