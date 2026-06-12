@@ -142,7 +142,8 @@ class DumperConfig(_BaseConfig):
     non_intrusive_mode: str = "core"
     source_patcher_config: Optional[str] = None
     grafter_enable: bool = False
-    grafter_role: str = ""  # required if enabled: "baseline" or "target"
+    grafter_role: str = ""  # required if enabled: "baseline", "target", or "file_inject"
+    grafter_file_inject_dir: Optional[str] = None  # dir of .pt files when role=file_inject
     grafter_b2t_filter: Optional[str] = None  # names flowing baseline -> target
     grafter_t2b_filter: Optional[str] = None  # names flowing target -> baseline
     grafter_master_address: str = ""  # required if enabled
@@ -167,32 +168,44 @@ class DumperConfig(_BaseConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.grafter_enable:
-            assert self.grafter_role in ("baseline", "target"), (
-                f"grafter_role must be 'baseline' or 'target' when grafter_enable=True, "
+            assert self.grafter_role in ("baseline", "target", "file_inject"), (
+                f"grafter_role must be 'baseline', 'target', or 'file_inject' when grafter_enable=True, "
                 f"got {self.grafter_role!r}"
             )
-            assert (
-                self.grafter_master_address
-            ), "grafter_master_address must be set when grafter_enable=True"
-            assert self.grafter_master_port > 0, (
-                f"grafter_master_port must be a positive port when grafter_enable=True, "
-                f"got {self.grafter_master_port}"
-            )
-            assert self.grafter_baseline_world_size > 0, (
-                f"grafter_baseline_world_size must be > 0 when grafter_enable=True, "
-                f"got {self.grafter_baseline_world_size}"
-            )
-            assert self.grafter_target_world_size > 0, (
-                f"grafter_target_world_size must be > 0 when grafter_enable=True, "
-                f"got {self.grafter_target_world_size}"
-            )
-            assert (
-                self.grafter_b2t_filter is not None
-                or self.grafter_t2b_filter is not None
-            ), (
-                "grafter_enable=True but neither grafter_b2t_filter nor "
-                "grafter_t2b_filter is set; nothing would ever be grafted"
-            )
+            if self.grafter_role == "file_inject":
+                assert self.grafter_file_inject_dir, (
+                    "grafter_file_inject_dir must be set when grafter_role='file_inject'"
+                )
+                assert (
+                    self.grafter_b2t_filter is not None
+                    or self.grafter_t2b_filter is not None
+                ), (
+                    "grafter_enable=True with role=file_inject but neither grafter_b2t_filter nor "
+                    "grafter_t2b_filter is set; nothing would ever be injected"
+                )
+            else:
+                assert self.grafter_master_address, (
+                    "grafter_master_address must be set when grafter_enable=True"
+                )
+                assert self.grafter_master_port > 0, (
+                    f"grafter_master_port must be a positive port when grafter_enable=True, "
+                    f"got {self.grafter_master_port}"
+                )
+                assert self.grafter_baseline_world_size > 0, (
+                    f"grafter_baseline_world_size must be > 0 when grafter_enable=True, "
+                    f"got {self.grafter_baseline_world_size}"
+                )
+                assert self.grafter_target_world_size > 0, (
+                    f"grafter_target_world_size must be > 0 when grafter_enable=True, "
+                    f"got {self.grafter_target_world_size}"
+                )
+                assert (
+                    self.grafter_b2t_filter is not None
+                    or self.grafter_t2b_filter is not None
+                ), (
+                    "grafter_enable=True but neither grafter_b2t_filter nor "
+                    "grafter_t2b_filter is set; nothing would ever be grafted"
+                )
 
     @property
     def server_port_parsed(self) -> Optional[Union[int, Literal["reuse"]]]:
@@ -855,6 +868,8 @@ class _Grafter:
     def __init__(self, *, config: DumperConfig):
         self._config = config
         self._pg = None
+        self._file_inject_cache: dict = {}  # module_name -> tensor (CPU)
+        self._file_inject_logged_mismatches: set = set()
 
     @property
     def enabled(self) -> bool:
@@ -872,6 +887,11 @@ class _Grafter:
 
         direction = self._classify_direction(tags)
         if direction is None:
+            return
+
+        # File-inject mode: load tensor from .pt file and copy_ into value, no network.
+        if cfg.grafter_role == "file_inject":
+            self._maybe_inject_from_file(value=value, tags=tags)
             return
 
         if not isinstance(value, torch.Tensor):
@@ -974,6 +994,82 @@ class _Grafter:
             return False
         return _evaluate_filter(expr, tags)
 
+    def _maybe_inject_from_file(self, *, value: Any, tags: dict) -> None:
+        """File-inject mode: scan grafter_file_inject_dir for a dumper-saved .pt file
+        whose filename contains the dump name, load it, apply transform, and copy_ into value.
+
+        Dumper saves files as: step=N___rank=R___dump_index=I___name=<name>___....pt
+        (_format_tags uses '___' triple-underscore as separator)
+        We match by looking for '___name=<name>___' in the filename or ending with '___name=<name>.pt'.
+        """
+        if not isinstance(value, torch.Tensor):
+            return
+        cfg = self._config
+        name = tags.get("name", "")
+        if not name:
+            return
+
+        if name not in self._file_inject_cache:
+            inject_dir = cfg.grafter_file_inject_dir
+            # Match dumper filename pattern: contains ___name=<name>___ or ends with ___name=<name>.pt
+            name_tag = f"___name={name}___"
+            name_tag_end = f"___name={name}.pt"
+            matched = None
+            try:
+                for fname in os.listdir(inject_dir):
+                    if name_tag in fname or fname.endswith(name_tag_end):
+                        matched = os.path.join(inject_dir, fname)
+                        break
+            except OSError:
+                return
+            if matched is None:
+                return
+            raw = torch.load(matched, map_location="cpu", weights_only=True)
+            self._file_inject_cache[name] = raw
+            _log(f"[Grafter/file_inject] Loaded '{name}' from {matched}")
+
+        raw = self._file_inject_cache[name]
+        if not isinstance(raw, torch.Tensor):
+            return
+
+        # Warn on dtype mismatch (will be cast by .to(), but may hide bugs).
+        if raw.dtype != value.dtype and name not in self._file_inject_logged_mismatches:
+            _log(
+                f"[Grafter/file_inject] dtype mismatch for '{name}': "
+                f"loaded={raw.dtype} runtime={value.dtype}; casting loaded tensor."
+            )
+
+        # Rank (ndim) mismatch means shapes are fundamentally incompatible;
+        # log and skip rather than letting copy_() raise an opaque error.
+        if raw.ndim != value.ndim:
+            if name not in self._file_inject_logged_mismatches:
+                _log(
+                    f"[Grafter/file_inject] ndim mismatch for '{name}': "
+                    f"loaded ndim={raw.ndim} {tuple(raw.shape)} vs runtime ndim={value.ndim} {tuple(value.shape)}; "
+                    f"skipping. Provide DUMPER_GRAFTER_TRANSFORM_PATH to reshape."
+                )
+                self._file_inject_logged_mismatches.add(name)
+            return
+
+        repl = raw.to(device=value.device, dtype=value.dtype)
+        try:
+            value_to_override = self._apply_transform(
+                tags=tags,
+                received_list=[repl],
+                received_extras_list=[None],
+                target=value,
+            )
+            value.copy_(value_to_override)
+            _log(f"[Grafter/file_inject] Injected '{name}' {tuple(repl.shape)}")
+        except Exception as e:
+            if name not in self._file_inject_logged_mismatches:
+                _log(
+                    f"[Grafter/file_inject] transform/copy_ failed for '{name}': {e}; "
+                    f"skipping. Provide DUMPER_GRAFTER_TRANSFORM_PATH to handle "
+                    f"shape mismatch between loaded {tuple(repl.shape)} and runtime {tuple(value.shape)}."
+                )
+                self._file_inject_logged_mismatches.add(name)
+
     def _ensure_group(self) -> None:
         if self._pg is not None:
             return
@@ -1035,7 +1131,12 @@ class _Grafter:
             target=target,
         )
         path = self._config.grafter_transform_path
-        fn = self._default_transform if path is None else _load_function(path)
+        if path is not None:
+            fn = _load_function(path)
+        elif self._config.grafter_role == "file_inject":
+            fn = self._file_inject_default_transform
+        else:
+            fn = self._default_transform
         return fn(graft_input)
 
     @staticmethod
@@ -1064,6 +1165,11 @@ class _Grafter:
                 )
             )
         return candidate
+
+    @staticmethod
+    def _file_inject_default_transform(graft_input: GraftTransformInput) -> torch.Tensor:
+        """Identity transform for file_inject mode: received_list has exactly 1 tensor."""
+        return graft_input.received_list[0]
 
     @staticmethod
     def _default_transform_error(detail: str) -> str:
