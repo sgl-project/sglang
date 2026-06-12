@@ -289,7 +289,7 @@ impl WorkerRegistry {
                 worker.model_id().to_string(),
                 worker.url().to_string(),
                 worker.is_healthy(),
-                0.0, // TODO: Get actual load
+                worker.load() as f64,
             );
         }
 
@@ -413,7 +413,7 @@ impl WorkerRegistry {
                     worker.model_id().to_string(),
                     worker.url().to_string(),
                     is_healthy,
-                    0.0, // TODO: Get actual load
+                    worker.load() as f64,
                 );
             }
         }
