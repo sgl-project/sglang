@@ -214,7 +214,7 @@ class VerifierCommitSegment:
         token_ids = [int(token_id) for token_id in message.committed_token_ids]
         self.committed_token_ids.extend(token_ids)
 
-    def extract_prefix(self, num_tokens: int) -> "VerifierCommitSegment":
+    def extract_prefix(self, num_tokens: int) -> VerifierCommitSegment:
         num_tokens = int(num_tokens)
         if num_tokens <= 0:
             raise ValueError(
@@ -308,7 +308,7 @@ class DraftControlInbox:
     def extract_ready_controls_locked(
         self,
         consumable_commit_len: Callable[[VerifierCommitSegment], int],
-    ) -> "ReadyDraftControls":
+    ) -> ReadyDraftControls:
         ready_controls = ReadyDraftControls()
 
         if self.close_keys:
@@ -361,7 +361,7 @@ class DraftMeshMessage:
     tail_stream_output_batch: Optional[DraftTailStreamOutputBatch] = None
 
     @staticmethod
-    def from_control_batch(message: DraftControlBatch) -> "DraftMeshMessage":
+    def from_control_batch(message: DraftControlBatch) -> DraftMeshMessage:
         return DraftMeshMessage(
             message_type=DraftMeshMessageType.CONTROL_BATCH,
             control_batch=message,
@@ -370,7 +370,7 @@ class DraftMeshMessage:
     @staticmethod
     def from_tail_stream_output_batch(
         message: DraftTailStreamOutputBatch,
-    ) -> "DraftMeshMessage":
+    ) -> DraftMeshMessage:
         return DraftMeshMessage(
             message_type=DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH,
             tail_stream_output_batch=message,
