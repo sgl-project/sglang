@@ -2548,6 +2548,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.is_extend_intermediate = [False] * bs
 
+        # Must precede the spec early-return below so spec reqs also leave
+        # the EXTEND_* phases.
+        for req in self.reqs:
+            req.phase = ReqPhase.DECODE
+
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
@@ -2591,7 +2596,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update req-level memory management fields
         for req in self.reqs:
-            req.phase = ReqPhase.DECODE
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
