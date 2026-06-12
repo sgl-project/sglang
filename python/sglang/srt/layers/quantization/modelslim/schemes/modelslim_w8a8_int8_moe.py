@@ -109,15 +109,15 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEScheme):
         self.kernel.process_weights_after_loading(layer)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
 
     def apply_weights(
         self,
         layer,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         return self.kernel.apply(layer, dispatch_output)
 
     def apply_without_routing_weights(

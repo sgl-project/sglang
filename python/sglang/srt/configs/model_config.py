@@ -674,6 +674,17 @@ class ModelConfig:
                 self.scaling = compute_mla_mscale_scaling(
                     self.hf_config.rope_scaling, self.scaling
                 )
+        elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
+            if self.head_dim is None:
+                self.head_dim = (
+                    self.hf_text_config.hidden_size
+                    // self.hf_text_config.num_attention_heads
+                )
+            if self.swa_head_dim is None:
+                self.swa_head_dim = self.head_dim
+            self.v_head_dim = self.head_dim
+            self.swa_v_head_dim = self.swa_head_dim
+            self.attention_arch = AttentionArch.MHA
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -1109,6 +1120,7 @@ class ModelConfig:
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
+            "nvfp4_online",
             "modelopt_mixed",
         ]
         modelopt_quantization_specified = (
@@ -1153,6 +1165,7 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "nvfp4_online",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -1174,6 +1187,7 @@ class ModelConfig:
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "modelopt_mixed": ["modelopt"],
+            "nvfp4_online": ["fp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
@@ -1534,6 +1548,7 @@ multimodal_model_archs = [
     "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     *MIMO_V2_MULTIMODAL_ARCHS,
+    "MiMoV2ASRForCausalLM",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -1665,6 +1680,11 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     Used by DeepSeek, BailingMoe, SarvamMLA and similar MLA models.
     Warns if 'factor' is missing from rope_scaling (common in v5 configs).
     """
+    if not rope_scaling.get("apply_yarn_scaling", True) or not rope_scaling.get(
+        "apply_scale", True
+    ):
+        return base_scaling
+
     mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
     if "factor" not in rope_scaling:
         logger.warning(
