@@ -20,6 +20,7 @@ import os
 import unittest
 
 import torch
+from sglang.test.ci.ci_register import register_xpu_ci
 
 # Must be set before lmcache imports
 os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
@@ -43,6 +44,8 @@ except ImportError:
 from sglang.srt.configs.model_config import ModelConfig
 
 XPU_AVAILABLE = hasattr(torch, "xpu") and torch.xpu.is_available()
+
+register_xpu_ci(est_time=300, suite="stage-a-test-1-gpu-xpu")
 
 
 @unittest.skipUnless(XPU_AVAILABLE, "Intel XPU not available")
