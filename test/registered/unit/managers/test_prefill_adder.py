@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 from sglang.srt.managers.schedule_batch import (
     Req,
+    ReqPhase,
     _compute_is_extend_intermediate,
     _compute_next_extend_prompt_token,
 )
@@ -119,10 +120,12 @@ class TestPrefillAdder(CustomTestCase):
         req.origin_input_ids = array("q", range(origin_len))
         req.output_ids = array("q", range(origin_len, origin_len + output_len))
         req.extend_range = Range(0, extend_end)
+        req.phase = ReqPhase.EXTEND_NON_LAST
         req.retracted_stain = True
         return req
 
     def test_retracted_decode_req_pending_bound_uses_full_fill_sequence(self):
+        """A retracted-decode replay uses the full fill sequence for its pending bound."""
         req = self.create_retracted_decode_req(
             origin_len=367,
             output_len=438,
@@ -137,6 +140,8 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(_compute_next_extend_prompt_token(req), 600)
 
         req.extend_range = Range(0, 805)
+        # prepare_for_extend re-derives the phase at each chunk's admission.
+        req.phase = ReqPhase.EXTEND_LAST
 
         self.assertFalse(req.is_partially_extended)
         self.assertFalse(
@@ -145,11 +150,13 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(_compute_next_extend_prompt_token(req))
 
     def test_decoded_req_output_ids_do_not_extend_chunked_prefill_bound(self):
+        """Accumulated output_ids never make a decode or last-chunk req look partially extended."""
         req = Req.__new__(Req)
         req.rid = "decoded-req"
         req.dllm_config = None
         req.origin_input_ids = array("q", range(128))
         req.output_ids = array("q", range(128, 132))
+        req.phase = ReqPhase.DECODE
         req.retracted_stain = False
 
         # A completed-prompt decoding req has entered decode, so extend_range is
@@ -166,6 +173,7 @@ class TestPrefillAdder(CustomTestCase):
         last_chunk_req.origin_input_ids = array("q", range(128))
         last_chunk_req.output_ids = array("q", [])
         last_chunk_req.extend_range = Range(0, len(last_chunk_req.origin_input_ids))
+        last_chunk_req.phase = ReqPhase.EXTEND_LAST
         last_chunk_req.retracted_stain = False
 
         self.assertEqual(last_chunk_req.get_full_untruncated_fill_len(), 128)
