@@ -321,24 +321,6 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
-    # Re-apply Dockerfile hotpatches for ROCm 7.2 (the fresh clone lost them, can be removed after triton fixed this problem)
-    ROCM_VERSION=$(docker exec ci_sglang bash -c "cat /opt/rocm/.info/version 2>/dev/null || echo unknown")
-    if [[ "${ROCM_VERSION}" == 7.2* ]]; then
-        echo "[CI-AITER-CHECK] ROCm 7.2 detected (${ROCM_VERSION}), applying AITER hotpatches..."
-        docker exec ci_sglang bash -c "
-            cd /sgl-workspace/aiter && \
-            TARGET_FILE='aiter/ops/triton/attention/pa_mqa_logits.py' && \
-            if [ -f \"\${TARGET_FILE}\" ]; then \
-                sed -i '459 s/if.*:/if False:/' \"\${TARGET_FILE}\" && \
-                echo '[CI-AITER-CHECK] Hotpatch applied to pa_mqa_logits.py'; \
-            else \
-                echo '[CI-AITER-CHECK] pa_mqa_logits.py not found, skipping hotpatch'; \
-            fi
-        "
-    else
-        echo "[CI-AITER-CHECK] ROCm version=${ROCM_VERSION}, no hotpatch needed"
-    fi
-
     # build AITER
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
