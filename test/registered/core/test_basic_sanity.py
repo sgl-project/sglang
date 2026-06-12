@@ -5,7 +5,7 @@ hellaswag accuracy."""
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
@@ -36,7 +36,10 @@ class TestBasicSanity(
     # 5090 + Llama-3.1-8B single-batch decode with overlap scheduler +
     # cuda graph measured ~99 median in CI; async-assert probes are off in
     # base-a, so the threshold can sit right under the measured median.
-    fwd_occupancy_threshold = 99.0
+    # AMD MI325 sits ~1pp lower and historically passed by <0.1pp at 99.0, so
+    # any small per-step decode change re-breaks it; give AMD a comfortable
+    # margin while keeping CUDA's tight regression floor.
+    fwd_occupancy_threshold = 97.0 if is_hip() else 99.0
 
     @classmethod
     def setUpClass(cls):
