@@ -404,14 +404,71 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def _get_dead_peer_prefill_reqs(self: Scheduler, reqs: List[Req]) -> List[Req]:
+        candidates = [
+            req
+            for req in reqs
+            if not is_aborted(req)
+            and getattr(req, "disagg_kv_sender", None) is not None
+            and callable(getattr(req.disagg_kv_sender, "poll", None))
+        ]
+        if not candidates:
+            return []
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in candidates],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        return [req for req, poll in zip(candidates, polls) if poll == KVPoll.Failed]
+
+    def abort_dead_peer_prefill_req(self: Scheduler, req: Req) -> bool:
+        if req not in self._get_dead_peer_prefill_reqs([req]):
+            return False
+
+        self.handle_bootstrap_failure(req)
+        return True
+
+    def abort_dead_peer_prefill_reqs(self: Scheduler) -> None:
+        """Abort waiting prefill requests whose decode peer died before admission."""
+        failed = set(self._get_dead_peer_prefill_reqs(self.waiting_queue))
+        if not failed:
+            return
+
+        for req in failed:
+            self.handle_bootstrap_failure(req)
+        self.waiting_queue = [req for req in self.waiting_queue if req not in failed]
+
+    def abort_dead_peer_chunked_req(self: Scheduler) -> None:
+        req = self.chunked_req
+        if req is None or req not in self._get_dead_peer_prefill_reqs([req]):
+            return
+
+        error_message = (
+            f"PD peer failed for chunked prefill request rank={self.ps.tp_rank} "
+            f"{req.rid=} {req.bootstrap_room=}"
+        )
+        logger.warning(error_message)
+        self._abort_chunked_prefill_req(
+            req,
+            error_message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            include_finished_reason=True,
+        )
+
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
+        self.process_pending_chunked_abort()
+
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
         self.running_batch.batch_is_full = False
 
+        self.abort_dead_peer_chunked_req()
         self.process_prefill_chunk()
+
+        self.abort_dead_peer_prefill_reqs()
 
         batch = self.get_new_batch_prefill()
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
