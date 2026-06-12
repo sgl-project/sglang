@@ -1,0 +1,4 @@
+sampled_frames=5
+resize=512x288
+mean_abs_diff=1.1662
+rms_diff=1.7676
