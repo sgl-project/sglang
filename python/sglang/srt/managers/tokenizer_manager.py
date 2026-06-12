@@ -2860,7 +2860,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "zmq_to_scheduler",
                     "mooncake",
                 ]:
-                    self.mm_receiver.send_encode_request(obj)
+                    time_stats_json = None
+                    if self.server_args.enable_trace:
+                        state = self.rid_to_state.get(obj.rid)
+                        if state is not None:
+                            time_stats_json = state.time_stats.encode_json()
+
+                    self.mm_receiver.send_encode_request(
+                        obj, time_stats_json=time_stats_json
+                    )
             else:
                 obj.need_wait_for_mm_inputs = False
 
