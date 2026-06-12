@@ -561,12 +561,12 @@ class SchedulerBatchResultProcessor:
                 continue
 
             if req.finished():
-                # Stale result of an over-decoded step (the req finished in an
-                # earlier iteration); the step never settles.
+                # Over-decoded result of an already-finished req; the step
+                # never settles.
                 continue
 
-            # Settle this step's commit now that the verify forward has
-            # completed and its KV is written.
+            # Settle at result: the verify forward that wrote this step's
+            # KV is done.
             req.kv_committed_len += accept_lens[i]
             req.spec_verify_ct += 1
 
@@ -702,10 +702,9 @@ class SchedulerBatchResultProcessor:
             next_token_ids = next_token_ids.tolist()
 
         if batch.spec_algorithm.is_none():
-            # Settle the decode ledger now that the forward that wrote this
-            # step's KV has completed (mirror of _resolve_spec_v2_tokens).
-            # Skip stale results of reqs that finished or retracted in an
-            # earlier iteration: their step never settles.
+            # Settle the decode ledger (mirror of _resolve_spec_v2_tokens):
+            # the forward that wrote this step's KV is done. Reqs finished or
+            # retracted in an earlier iteration never settle their step.
             for req in batch.reqs:
                 if req.is_retracted or req.finished():
                     continue
