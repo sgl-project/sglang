@@ -538,6 +538,7 @@ class ServerArgs:
     served_model_name: Optional[str] = None
     weight_version: str = "default"
     chat_template: Optional[str] = None
+    trust_request_chat_template: bool = False
     hf_chat_template_name: Optional[str] = None
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
@@ -5654,6 +5655,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.chat_template,
             help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
+        )
+        parser.add_argument(
+            "--trust-request-chat-template",
+            action="store_true",
+            help="Allow a request to override the server chat template via "
+            "its chat_template_kwargs. Off by default for safety.",
         )
         parser.add_argument(
             "--hf-chat-template-name",
