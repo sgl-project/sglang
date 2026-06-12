@@ -162,12 +162,12 @@ class GraphSlot:
     pad_value: Optional[Any] = None
     enabled: bool = True
     copy_from_fb: bool = True
-    post_fill: Optional[
-        Callable[[torch.Tensor, "ForwardBatch", "FillContext"], None]
-    ] = None
+    post_fill: Optional[Callable[[torch.Tensor, ForwardBatch, FillContext], None]] = (
+        None
+    )
     slice_fn: Optional[Callable[[torch.Tensor, int], torch.Tensor]] = None
     source_fn: Optional[
-        Callable[["ForwardBatch", "FillContext"], Optional[torch.Tensor]]
+        Callable[[ForwardBatch, FillContext], Optional[torch.Tensor]]
     ] = None
 
     # runtime
@@ -365,7 +365,7 @@ class CudaGraphBufferRegistry:
 
     def fill_from(
         self,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         *,
         raw_bs: int,
         padded_bs: int,
@@ -460,8 +460,8 @@ class CudaGraphBufferRegistry:
         *,
         padded_bs: int,
         padded_num_tokens: int,
-        forward_batch_template: "ForwardBatch",
-    ) -> "ForwardBatch":
+        forward_batch_template: ForwardBatch,
+    ) -> ForwardBatch:
         """Return a FB view (``dataclasses.replace`` of ``forward_batch_template``)
         whose slot fields are buffer views and whose non-slot fields are carried
         from the template. A plain copy slot whose FB field is ``None`` this iter

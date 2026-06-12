@@ -435,7 +435,7 @@ class USPAttention(nn.Module):
                     f"but got {backend_enum.name}. "
                     f"Please ensure your platform supports these backends."
                 )
-        impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
+        impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
         self.attn_impl = impl_cls(
             num_heads=num_heads,

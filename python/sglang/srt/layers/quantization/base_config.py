@@ -109,7 +109,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> CombineInput:
         raise NotImplementedError
 
-    def get_triton_quant_info(self, layer: torch.nn.Module) -> "TritonMoeQuantInfo":
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         """Return a ``TritonMoeQuantInfo`` describing the quantisation state
         stored on *layer*.
 
@@ -163,7 +163,7 @@ class QuantizationConfig(ABC):
 
     @classmethod
     @abstractmethod
-    def from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+    def from_config(cls, config: Dict[str, Any]) -> QuantizationConfig:
         """Create a config class from the model's quantization config."""
         raise NotImplementedError()
 
@@ -246,7 +246,7 @@ class QuantizationConfig(ABC):
         raise NotImplementedError()
 
     def apply_weight_name_mapper(
-        self, hf_to_sglang_mapper: "WeightsMapper"
+        self, hf_to_sglang_mapper: WeightsMapper
     ):  # noqa: B027
         """
         Interface for models to update module names referenced in
