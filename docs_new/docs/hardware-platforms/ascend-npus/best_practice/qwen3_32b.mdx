@@ -77,7 +77,9 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --nnodes 1 \
     --node-rank 0 \
@@ -173,7 +175,9 @@ export SGLANG_NPU_USE_DEEPGEMM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --nnodes 1 \
     --node-rank 0 \

@@ -81,7 +81,9 @@ export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -177,7 +179,9 @@ export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=10
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -275,7 +279,9 @@ export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=20
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -370,7 +376,9 @@ export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -465,7 +473,9 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -559,7 +569,9 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -655,7 +667,9 @@ export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -751,7 +765,9 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 4 \
     --nnodes 1 \
     --attention-backend ascend \

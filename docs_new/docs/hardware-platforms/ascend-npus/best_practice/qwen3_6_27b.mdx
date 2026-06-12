@@ -79,7 +79,9 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -178,7 +180,9 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -273,7 +277,9 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -371,7 +377,9 @@ export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -467,7 +475,9 @@ export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 4 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -559,7 +569,9 @@ export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 4 \
     --nnodes 1 \
     --attention-backend ascend \
@@ -655,7 +667,9 @@ export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 4 \
     --nnodes 1 \
     --attention-backend ascend \

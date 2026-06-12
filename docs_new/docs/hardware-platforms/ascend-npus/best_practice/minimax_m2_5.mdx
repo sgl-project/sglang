@@ -115,7 +115,13 @@ do
         export PROFILING_step=30
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8998 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank 0 \
         --trust-remote-code \
         --tp-size 16 \
         --mem-fraction-static 0.43 \
@@ -160,7 +166,12 @@ do
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_FUSED_MOE_MODE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --node-rank 0 \
         --trust-remote-code \
         --tp-size 16 \
         --mem-fraction-static 0.76 \
@@ -314,7 +325,13 @@ do
         export PROFILING_step=30
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8998 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank 0 \
         --trust-remote-code \
         --tp-size 16 \
         --mem-fraction-static 0.43 \
@@ -359,7 +376,12 @@ do
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_FUSED_MOE_MODE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --node-rank 0 \
         --trust-remote-code \
         --tp-size 16 \
         --mem-fraction-static 0.76 \
@@ -494,7 +516,9 @@ export ZBAL_ENABLE_GRAPH=1
 export ZBAL_HCCL_OP=allreduce,_allgather_base,allgather,broadcast,scatter,reduce_scatter,_reduce_scatter_base,alltoall_base
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 8 \
     --disable-radix-cache \
     --mem-fraction-static 0.74 \
@@ -595,7 +619,9 @@ export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 8 \
     --mem-fraction-static 0.63 \
     --max-running-requests 26 \
@@ -699,7 +725,9 @@ export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
     --dp-size 2 \
     --enable-dp-attention \
@@ -805,7 +833,9 @@ export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
     --dp-size 2 \
     --enable-dp-attention \
@@ -911,7 +941,9 @@ export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
     --enable-dp-attention \
     --dp-size 16 \
@@ -1016,7 +1048,9 @@ export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
     --enable-dp-attention \
     --dp-size 16 \

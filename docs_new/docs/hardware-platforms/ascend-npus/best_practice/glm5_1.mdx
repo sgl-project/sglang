@@ -81,7 +81,9 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --attention-backend ascend \
     --device npu \
     --tp-size 32 \
@@ -205,7 +207,14 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --dist-init-addr ${P_IP[0]}:5000 --disaggregation-bootstrap-port 8998 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
         --tp-size 4 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -249,7 +258,13 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -392,7 +407,14 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --dist-init-addr ${P_IP[0]}:5000 --disaggregation-bootstrap-port 8998 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.75 \
@@ -437,7 +459,13 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -587,7 +615,14 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --dist-init-addr ${P_IP[0]}:5000 --disaggregation-bootstrap-port 8998 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
         --tp-size 4 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -631,7 +666,13 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -774,7 +815,14 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --dist-init-addr ${P_IP[0]}:5000 --disaggregation-bootstrap-port 8998 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.75 \
@@ -819,7 +867,13 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -966,7 +1020,14 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --dist-init-addr ${P_IP[0]}:5000 --disaggregation-bootstrap-port 8998 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -1003,7 +1064,13 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --tp-size 64 \
         --nnodes 4 \
         --dp-size 64 \
@@ -1156,7 +1223,14 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --dist-init-addr ${P_IP[$((i / 2 * 2))]}:5000 --disaggregation-bootstrap-port $((8998+$((i / 2)))) --node-rank $((i % 2)) \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[$((i / 2 * 2))]}:5000 \
+        --disaggregation-bootstrap-port $((8998+$((i / 2)))) \
+        --node-rank $((i % 2)) \
         --tp-size 4 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -1200,7 +1274,13 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \
@@ -1352,7 +1432,13 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --disaggregation-bootstrap-port $((8998+$i)) \
+        --node-rank 0 \
         --tp-size 4 \
         --nnodes 1 \
         --mem-fraction-static 0.72 \
@@ -1396,7 +1482,13 @@ do
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
         --dp-size 32 \

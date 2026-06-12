@@ -98,7 +98,14 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --dist-init-addr ${P_IP[0]}:5000 --disaggregation-bootstrap-port 8998 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -140,7 +147,13 @@ do
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --nnodes 2 \
         --tp 32 \
         --dp 8 \
@@ -279,7 +292,14 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --dist-init-addr ${P_IP[0]}:5000 --disaggregation-bootstrap-port 8998 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -321,7 +341,13 @@ do
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --nnodes 2 \
         --tp 32 \
         --dp 8 \
@@ -460,7 +486,14 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --dist-init-addr ${P_IP[0]}:5000 --disaggregation-bootstrap-port 8998 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -502,7 +535,13 @@ do
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --nnodes 2 \
         --tp 32 \
         --dp 8 \

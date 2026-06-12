@@ -111,7 +111,13 @@ do
         export ZBAL_HCCL_OP=send,recv
         export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8998 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -152,7 +158,12 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -296,7 +307,13 @@ do
         export ZBAL_HCCL_OP=send,recv
         export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8998 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -335,7 +352,12 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -479,7 +501,13 @@ do
         export ZBAL_HCCL_OP=send,recv
         export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8998 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -520,7 +548,12 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -664,7 +697,13 @@ do
         export ZBAL_HCCL_OP=send,recv
         export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8998 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -703,7 +742,12 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -843,7 +887,13 @@ do
         export HCCL_BUFFSIZE=1800
         export HCCL_SOCKET_IFNAME=<network-interface>
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8998 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --nnodes 1 \
@@ -879,7 +929,13 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --quantization modelslim \
         --dtype bfloat16 \
         --nnodes 2 \
@@ -1023,7 +1079,13 @@ do
         export HCCL_BUFFSIZE=1800
         export HCCL_SOCKET_IFNAME=<network-interface>
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8998 --node-rank 0 \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --nnodes 1 \
@@ -1059,7 +1121,13 @@ do
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
-        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
         --quantization modelslim \
         --dtype bfloat16 \
         --nnodes 2 \
@@ -1182,7 +1250,9 @@ export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --quantization modelslim \
     --dtype bfloat16 \
     --model-loader-extra-config {"enable_multithread_load": true} \
@@ -1288,7 +1358,9 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --quantization modelslim \
     --dtype bfloat16 \
     --model-loader-extra-config {"enable_multithread_load": true} \
@@ -1397,7 +1469,9 @@ export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
@@ -1506,7 +1580,9 @@ export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
