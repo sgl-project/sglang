@@ -20,11 +20,11 @@ This section describes the best practice data for Qwen3.5-397B on the Ascend NPU
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-prefix90-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K (prefix90) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-prefix90-50ms) |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-50ms) |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in3k5-out1k5-50ms) |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K (prefix90) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
 
 
 ## Optimal Configuration
@@ -263,7 +263,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128K+1K (prefix90)
 
 **TPOT**: 50ms
 
@@ -346,11 +346,11 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
+    --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -360,7 +360,8 @@ python -m sglang.bench_serving \
     --num-prompts 40 \
     --random-range-ratio 1 \
     --request-rate inf \
-    --warmup-requests 0
+    --warmup-requests 0 \
+    --extra-request-body repeat_rate=0.9
 ```
 
 ### qwen3 5 397b w4a8 8p in16k out1k 20ms
@@ -1063,7 +1064,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64K+1K (prefix90)
 
 **TPOT**: 50ms
 
@@ -1149,11 +1150,11 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
+    --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -1163,5 +1164,6 @@ python -m sglang.bench_serving \
     --num-prompts 128 \
     --random-range-ratio 1 \
     --request-rate inf \
-    --warmup-requests 0
+    --warmup-requests 0 \
+    --extra-request-body repeat_rate=0.9
 ```

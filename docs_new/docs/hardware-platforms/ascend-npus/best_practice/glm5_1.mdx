@@ -11,7 +11,7 @@ This section describes the best practice data for GLM-5.1 on the Ascend NPU.
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in64k-out1k-20ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65K+1.5K | 25ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65K+1.5K (prefix90) | 25ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
 
 ### High Throughput
 
@@ -20,9 +20,9 @@ This section describes the best practice data for GLM-5.1 on the Ascend NPU.
 | GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-16p-in3k5-out1k5-50ms) |
 | GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in128k-out1k) |
 | GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65K+1.5K | 33ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65K+1.5K (prefix100) | 33ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K (prefix90) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K (prefix90) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
 
 
 ## Optimal Configuration
@@ -748,7 +748,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65K+1.5K
+**Dataset**: 65K+1.5K (prefix90)
 
 **TPOT**: 25ms
 
@@ -926,11 +926,11 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
+    --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -939,7 +939,8 @@ python -m sglang.bench_serving \
     --random-output-len 1536 \
     --num-prompts 480 \
     --random-range-ratio 1 \
-    --request-rate inf
+    --request-rate inf \
+    --extra-request-body repeat_rate=0.9
 ```
 
 ### glm5 1 w4a8 1p1d 48p in65k out1k5 prefix100 33ms
@@ -954,7 +955,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65K+1.5K
+**Dataset**: 65K+1.5K (prefix100)
 
 **TPOT**: 33ms
 
@@ -1153,7 +1154,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128K+1K (prefix90)
 
 **TPOT**: 50ms
 
@@ -1334,11 +1335,11 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
+    --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -1347,7 +1348,8 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 576 \
     --random-range-ratio 1 \
-    --request-rate inf
+    --request-rate inf \
+    --extra-request-body repeat_rate=0.9
 ```
 
 ### glm5 1 w4a8 4p1d 48p in64k out1k prefix90 50ms
@@ -1362,7 +1364,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64K+1K (prefix90)
 
 **TPOT**: 50ms
 
@@ -1542,11 +1544,11 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
+    --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -1555,5 +1557,6 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 1280 \
     --random-range-ratio 1 \
-    --request-rate inf
+    --request-rate inf \
+    --extra-request-body repeat_rate=0.9
 ```

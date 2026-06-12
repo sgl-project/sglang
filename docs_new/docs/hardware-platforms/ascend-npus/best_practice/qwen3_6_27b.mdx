@@ -12,7 +12,7 @@ This section describes the best practice data for Qwen3.6-27B on the Ascend NPU.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024_30+1024 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-1p-in1024x1024-30-out1024-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-1p-in1080p-30-out256-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-2p-in64k-out1k-prefix90-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K (prefix90) | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-2p-in64k-out1k-prefix90-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in3k5-out1k5-50ms-gpqa) |
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 128K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in128k-out1k-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 16K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in16k-out1k-50ms) |
@@ -235,7 +235,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64K+1K (prefix90)
 
 **TPOT**: 50ms
 
@@ -305,11 +305,11 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
+    --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -319,7 +319,8 @@ python -m sglang.bench_serving \
     --num-prompts 80 \
     --random-range-ratio 1 \
     --request-rate inf \
-    --warmup-requests 1
+    --warmup-requests 1 \
+    --extra-request-body repeat_rate=0.9
 ```
 
 ### qwen3 6 27b w8a8 1p in3k5 out1k5 50ms gpqa

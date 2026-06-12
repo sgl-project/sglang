@@ -17,11 +17,11 @@ This section describes the best practice data for Kimi-K2.6 on the Ascend NPU.
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K (prefix90) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 24 | PD Disaggregation | 128K+1K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-24p-in128k-out1k-prefix90-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 24 | PD Disaggregation | 64K+1.5K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-24p-in64k-out1k5-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K (prefix90) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 24 | PD Disaggregation | 128K+1K (prefix90) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-24p-in128k-out1k-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 24 | PD Disaggregation | 64K+1.5K (prefix90) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-24p-in64k-out1k5-prefix90-100ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1024x1024_30+1024 | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1080p_30+256 | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
@@ -237,7 +237,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128K+1K (prefix90)
 
 **TPOT**: 100ms
 
@@ -403,11 +403,11 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
+    --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -416,7 +416,8 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 8 \
     --random-range-ratio 1 \
-    --request-rate inf
+    --request-rate inf \
+    --extra-request-body repeat_rate=0.9
 ```
 
 ### kimi k2 6 w4a8 1p1d 16p in64k out1k5 100ms
@@ -627,7 +628,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1.5K
+**Dataset**: 64K+1.5K (prefix90)
 
 **TPOT**: 100ms
 
@@ -793,11 +794,11 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
+    --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -806,7 +807,8 @@ python -m sglang.bench_serving \
     --random-output-len 1536 \
     --num-prompts 16 \
     --random-range-ratio 1 \
-    --request-rate inf
+    --request-rate inf \
+    --extra-request-body repeat_rate=0.9
 ```
 
 ### kimi k2 6 w4a8 1p1d 24p in128k out1k prefix90 100ms
@@ -821,7 +823,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128K+1K (prefix90)
 
 **TPOT**: 100ms
 
@@ -985,11 +987,11 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
+    --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -998,7 +1000,8 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --num-prompts 8 \
     --random-range-ratio 1 \
-    --request-rate inf
+    --request-rate inf \
+    --extra-request-body repeat_rate=0.9
 ```
 
 ### kimi k2 6 w4a8 1p1d 24p in64k out1k5 prefix90 100ms
@@ -1013,7 +1016,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1.5K
+**Dataset**: 64K+1.5K (prefix90)
 
 **TPOT**: 100ms
 
@@ -1177,11 +1180,11 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
+    --dataset-name generated-shared-prefix \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -1190,7 +1193,8 @@ python -m sglang.bench_serving \
     --random-output-len 1536 \
     --num-prompts 16 \
     --random-range-ratio 1 \
-    --request-rate inf
+    --request-rate inf \
+    --extra-request-body repeat_rate=0.9
 ```
 
 ### kimi k2 6 w4a8 8p in1024x1024 30 out1024 50ms
@@ -1286,12 +1290,12 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `IMAGE` dataset.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
-    --backend sglang \
+    --dataset-name image \
+    --backend sglang-oai-chat \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 160 \
@@ -1300,7 +1304,9 @@ python -m sglang.bench_serving \
     --num-prompts 640 \
     --random-range-ratio 1 \
     --request-rate inf \
-    --warmup-requests 16
+    --warmup-requests 16 \
+    --image-count 1 \
+    --image-resolution 1024x1024
 ```
 
 ### kimi k2 6 w4a8 8p in1080p 30 out256 50ms
@@ -1392,12 +1398,12 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `RANDOM` dataset.
+We tested it based on the `IMAGE` dataset.
 
 ```shell Command
 python -m sglang.bench_serving \
-    --dataset-name random \
-    --backend sglang \
+    --dataset-name image \
+    --backend sglang-oai-chat \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 20 \
@@ -1405,7 +1411,9 @@ python -m sglang.bench_serving \
     --random-output-len 256 \
     --num-prompts 20 \
     --random-range-ratio 1 \
-    --request-rate inf
+    --request-rate inf \
+    --image-count 1 \
+    --image-resolution 1920x1080
 ```
 
 ### kimi k2 6 w4a8 8p in3k5 out1k5 20ms
