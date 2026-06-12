@@ -193,7 +193,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
-    create_capture_spec_info,
+    create_dummy_verify_input,
 )
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
@@ -2686,7 +2686,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             global_dp_buffer_len = None
             global_num_tokens_cpu = None
 
-        spec_info = create_capture_spec_info(
+        spec_info = create_dummy_verify_input(
             self.spec_algorithm,
             self.server_args,
             buffers.custom_mask,

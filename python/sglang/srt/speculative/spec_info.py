@@ -273,7 +273,7 @@ class SpecInput(ABC):
         return global_num_tokens, global_num_tokens_for_logprob
 
 
-def create_capture_spec_info(
+def create_dummy_verify_input(
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
     custom_mask: torch.Tensor,
