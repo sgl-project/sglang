@@ -43,7 +43,10 @@ class TestGlm51Fp8(unittest.TestCase):
             ModelLaunchSettings(
                 GLM_51_FP8_MODEL_PATH,
                 tp_size=8,
-                extra_args=COMMON_ARGS + dp_args,
+                # Cap running requests to bound FlashInfer autotune's dummy
+                # batch, whose logits all-gather across dp=8 otherwise OOMs
+                # on B200 (transient ~6.4 GiB peak during startup).
+                extra_args=COMMON_ARGS + dp_args + ["--max-running-requests=48"],
                 variant="TP8+DP8",
             ),
             ModelLaunchSettings(
