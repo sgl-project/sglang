@@ -644,16 +644,53 @@ class SchedulerBatchResultProcessor:
             # Non-spec and V2: full post-processing
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
+            # Spec V2 + grammar: the verify phase proposes several tokens at once,
+            # but the grammar may terminate partway through that list. Accept the
+            # proposed tokens one at a time and stop as soon as the request finishes
+            # so we don't advance output_ids, the grammar FSM, reasoning state, or
+            # logprob bookkeeping past grammar completion. grammar_advanced records
+            # that the grammar/finish state was already handled inline below.
+            grammar_advanced = False
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+            elif batch.is_spec_v2 and req.grammar is not None:
+                accept_tokens = []
+                try:
+                    for token_id in next_token_id:
+                        req.output_ids.append(token_id)
+                        accept_tokens.append(token_id)
+                        self._maybe_update_reasoning_tokens(req, token_id)
+                        req.grammar.accept_token(token_id)
+                        req.update_finish_state()
+                        if req.finished():
+                            break
+                except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not
+                    # in the grammar. This can happen if the grammar is not set
+                    # correctly or the token is invalid.
+                    logger.error(
+                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                    )
+                    self.abort_request(AbortReq(rid=req.rid))
+
+                # Drop speculative tokens proposed after the grammar reached a
+                # terminal state. The request is finished, so the over-advanced
+                # KV/draft state is released instead of reused, and downstream
+                # logprob handling only sees the retained prefix.
+                next_token_id = accept_tokens
+                next_token_ids[i] = accept_tokens
+                new_accepted_len = len(accept_tokens)
+                grammar_advanced = True
             else:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
-            self._maybe_update_reasoning_tokens(req, next_token_id)
+            if not grammar_advanced:
+                self._maybe_update_reasoning_tokens(req, next_token_id)
 
             req.time_stats.set_last_decode_finish_time()
-            req.update_finish_state(new_accepted_len)
+            if not grammar_advanced:
+                req.update_finish_state(new_accepted_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
@@ -673,9 +710,14 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.grammar is not None:
-                self._apply_decode_grammar(
-                    req=req, next_token_id=next_token_id, batch=batch
-                )
+                if grammar_advanced:
+                    # Grammar was already advanced token-by-token above; just sync
+                    # the terminal flag without re-accepting the trimmed tokens.
+                    req.grammar.finished = req.finished()
+                else:
+                    self._apply_decode_grammar(
+                        req=req, next_token_id=next_token_id, batch=batch
+                    )
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

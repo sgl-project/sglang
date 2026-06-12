@@ -1770,6 +1770,22 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
+            # Spec V2 grammar decode depends on the grammar state produced by the
+            # previous batch. With overlap scheduling that result is still sitting
+            # in result_queue, so process it now (before run_batch) to advance the
+            # grammar; otherwise the new batch would propose tokens against a stale
+            # grammar and could emit output past grammar completion.
+            need_grammar_sync = (
+                batch
+                and batch.is_spec_v2
+                and batch.has_grammar
+                and batch.forward_mode.is_decode()
+                and len(self.result_queue) > 0
+            )
+            if need_grammar_sync:
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
@@ -1779,8 +1795,10 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                # Skip if need_grammar_sync already drained the queued result above.
+                if not need_grammar_sync:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.on_idle()
 
