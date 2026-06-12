@@ -1172,9 +1172,9 @@ class Scheduler(
         self.device_module = torch.get_device_module(self.device)
 
         # FutureMap is always-on: input_ids relay used in both modes.
-        # Workers not on BaseSpecWorker (e.g. NGRAM / DFLASH) lack the
-        # override; fall back to target-only so the helper still produces a
-        # safe decision (no accidental opt-out for unaudited shapes).
+        # Workers without the spec_v2_attn_backends override fall back to
+        # target-only so the helper still produces a safe decision (no
+        # accidental opt-out for unaudited shapes).
         if self.draft_worker is not None:
             attn_backends = getattr(
                 self.draft_worker,
@@ -1377,8 +1377,7 @@ class Scheduler(
         )
 
     def _abort_on_running_timeout(self):
-        # NOTE: this should be called before a batch is launched,
-        # as current spec-v1 still filters batch inside verify stage.
+        # NOTE: this should be called before a batch is launched.
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
@@ -1424,7 +1423,9 @@ class Scheduler(
         # DFLASH fences its shared req_to_token writes with verify_done /
         # plan-stream deps, so the global WAR barrier only serializes plan
         # overlap. TODO: generalize this global-barrier enablement policy.
-        self._war_barrier_enabled = is_cuda() and not self.spec_algorithm.is_dflash()
+        self._war_barrier_enabled = (
+            is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        ) and not self.spec_algorithm.is_dflash()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -1539,7 +1540,7 @@ class Scheduler(
         # TODO(lsyin): support overlap + spec + grammar
         need_grammar_sync = (
             batch
-            and batch.is_spec_v2
+            and not batch.spec_algorithm.is_none()
             and batch.has_grammar
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
@@ -2820,7 +2821,7 @@ class Scheduler(
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
+            self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
@@ -2865,7 +2866,7 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        batch.filter_batch(v1_spec_info_filtered=True)
+        batch.filter_batch()
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
@@ -2985,7 +2986,7 @@ class Scheduler(
            passes overlap=False.
         """
         # 1. snapshot
-        snapshot_v2_full = batch.is_spec_v2
+        snapshot_v2_full = not batch.spec_algorithm.is_none()
         sched_snapshot = (
             {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
             if snapshot_v2_full
@@ -3059,7 +3060,7 @@ class Scheduler(
                                     self.future_map.publish, future_indices
                                 )
                             }
-                            if batch.is_spec_v2
+                            if not batch.spec_algorithm.is_none()
                             else {}
                         )
 
@@ -3067,7 +3068,7 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
-                        if not batch.is_spec_v2:
+                        if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
@@ -3081,7 +3082,7 @@ class Scheduler(
                         if batch_result.delay_sample_func is None:
                             stash_payload = (
                                 batch_result.next_draft_input
-                                if batch.is_spec_v2
+                                if not batch.spec_algorithm.is_none()
                                 else batch_result.next_token_ids
                             )
                             self.future_map.stash(future_indices, stash_payload)
@@ -3095,7 +3096,7 @@ class Scheduler(
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
 
-                if batch.is_spec_v2:
+                if not batch.spec_algorithm.is_none():
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
@@ -3106,8 +3107,8 @@ class Scheduler(
                         batch.req_pool_indices, batch_result.next_token_ids
                     )
                 batch.input_ids = None
-            elif batch.is_spec_v2:
-                # Non-overlap V2: drive the V2 worker synchronously (no
+            elif not batch.spec_algorithm.is_none():
+                # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
@@ -3139,17 +3140,11 @@ class Scheduler(
                     batch, **kwargs
                 )
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    if self.spec_algorithm.is_none():
-                        # Non-spec: relay via future_map, gathered next iter.
-                        self.future_map.stash(
-                            batch.req_pool_indices, batch_result.next_token_ids
-                        )
-                        batch.input_ids = None
-                    else:
-                        # Spec_v1 (NGRAM / DFLASH, non-overlap): worker shape
-                        # doesn't match req_pool_indices; relay is unused (worker
-                        # rebuilds input_ids inside verify).
-                        batch.input_ids = batch_result.next_token_ids.to(torch.int64)
+                    # Non-spec: relay via future_map, gathered next iter.
+                    self.future_map.stash(
+                        batch.req_pool_indices, batch_result.next_token_ids
+                    )
+                    batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
@@ -3385,6 +3380,7 @@ class Scheduler(
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
+                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
@@ -3794,7 +3790,7 @@ class Scheduler(
         self.cur_batch = None
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
+            self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:

@@ -6,8 +6,8 @@ backend, env overrides). Pair it with the kits in
 ``sglang.test.kits.spec_server_kits`` to assemble test classes.
 
 The primary axis is ``disable_overlap``:
-  - ``False`` -> spec v2 (overlap scheduler)
-  - ``True``  -> spec v1 (overlap disabled)
+  - ``False`` -> overlap scheduler
+  - ``True``  -> synchronous (non-overlap) scheduling
 """
 
 import contextlib
@@ -56,7 +56,7 @@ class SpecEagleServerBase(CustomTestCase):
     # -- runtime config --
     page_size = 1
     attention_backend = "flashinfer"
-    # Primary axis: False -> spec v2 (overlap); True -> spec v1 (overlap off).
+    # Primary axis: False -> overlap scheduler; True -> synchronous (non-overlap).
     disable_overlap = False
     mem_fraction_static = 0.75
     max_running_requests = 8
@@ -220,7 +220,7 @@ class Eagle3Base(SpecEagleServerBase):
 
 
 class EagleLlama2Base(SpecEagleServerBase):
-    """EAGLE (Llama-2) config preset. topk=8 tree -> spec v1; gsm8k is low."""
+    """EAGLE (Llama-2) config preset. topk=8 tree -> synchronous path; gsm8k is low."""
 
     model = DEFAULT_TARGET_MODEL_EAGLE
     draft_model = DEFAULT_DRAFT_MODEL_EAGLE
@@ -234,5 +234,5 @@ class EagleLlama2Base(SpecEagleServerBase):
     gsm8k_score_thres = 0.20
     acc_length_thres = 3.0
     batch_accept_len_thres = 1.8
-    # EAGLE topk>1 already routes to v1; force it explicitly to preserve intent.
-    env_overrides = ((envs.SGLANG_ENABLE_SPEC_V2, False),)
+    # topk>1 tree verify runs on the synchronous (non-overlap) path.
+    disable_overlap = True
