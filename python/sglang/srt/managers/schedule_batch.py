@@ -2747,8 +2747,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = None
         # Cat only when both sides hold a real token tensor; otherwise drop to
         # None and let resolve_forward_inputs rebuild from the merged
-        # req_pool_indices. Mismatch arises e.g. with spec_v1, which keeps its
-        # tensor while a relay-staged side is None -- there the worker rebuilds.
+        # req_pool_indices (e.g. when one side keeps its tensor while a
+        # relay-staged side is None).
         if self.input_ids is not None and other.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
         else:
