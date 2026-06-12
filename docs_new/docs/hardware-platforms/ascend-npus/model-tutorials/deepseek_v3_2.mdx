@@ -139,7 +139,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Multi-node PD disaggregation deployment
 
 PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
-throughput for high-concurrency scenarios. The following command is based on the W8A8 quantized model.
+throughput for high-concurrency scenarios. The following command is based on the **W8A8** quantized model.
 
 #### 4 x Atlas 800I A3
 
@@ -262,7 +262,7 @@ do
         --disable-radix-cache \
         --chunked-prefill-size -1 --max-prefill-tokens 68000 \
         --max-running-requests 32 \
-        --cuda-graph-max-bs-decode 4 \
+        --cuda-graph-max-bs 4 \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency \
         --quantization modelslim \

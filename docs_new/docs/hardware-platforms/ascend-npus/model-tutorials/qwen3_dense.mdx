@@ -26,7 +26,7 @@ v0.5.10 or a later version.
 | Tensor Parallelism            | `--tp-size 4`                                                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 16384`                                        |
-| NPU Graph                     | `--cuda-graph-bs-decode 1 4 8 16`                                                                    |
+| NPU Graph                     | `--cuda-graph-bs 1 4 8 16`                                                                    |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path <draft-model-path> --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 
@@ -138,7 +138,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Single-node online deployment (Qwen3-32B)
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the Qwen3-32B model with W8A8 quantization.
+with limited hardware resources. The following command is based on the **Qwen3-32B** model with **W8A8** quantization.
 
 ```bash Launch server
 #============================================================
@@ -186,7 +186,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
-    --tp-size 4 --mem-fraction-static 0.843 --cuda-graph-bs-decode 1 4 8 16 --dtype bfloat16
+    --tp-size 4 --mem-fraction-static 0.843 --cuda-graph-bs 1 4 8 16 --dtype bfloat16
 ```
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
