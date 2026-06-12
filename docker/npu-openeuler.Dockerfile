@@ -20,6 +20,7 @@ ARG TRITON_URL_AMD64="https://gitcode.com/Ascend/triton-ascend/releases/download
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=2026.6.0
+ARG EULER_MIRROR=""
 
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 
@@ -38,7 +39,6 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 WORKDIR /workspace
 
 # Define environments
-ARG EULER_MIRROR=""
 RUN pip config set global.index-url $PIP_INDEX_URL
 RUN if [ -n "$EULER_MIRROR" ]; then \
       sed -i "s|http://repo.openeuler.org|${EULER_MIRROR}|g; s|https://repo.openeuler.org|${EULER_MIRROR}|g" /etc/yum.repos.d/openEuler.repo && \
