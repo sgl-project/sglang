@@ -22,4 +22,3 @@ except ImportError:
             # Fallback for development without build
             __version__ = "0.0.0.dev0"
             __version_tuple__ = (0, 0, 0, "dev0")
-# ci-retrigger: dummy touch (will be reverted)
