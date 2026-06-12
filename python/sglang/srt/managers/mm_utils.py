@@ -1562,6 +1562,12 @@ class ShmPointerMMData:
             tensor = tensor.contiguous()
         self.shape = tensor.shape
         self.dtype = tensor.dtype
+        self._owner_tensor = tensor
+        self.tensor = tensor
+        self._shm_handle = None
+
+    @staticmethod
+    def _create_shm_for_tensor(tensor: torch.Tensor) -> str:
         nbytes = tensor.numel() * tensor.element_size()
         shm = shared_memory.SharedMemory(create=True, size=nbytes)
         try:
@@ -1571,13 +1577,19 @@ class ShmPointerMMData:
             shm.close()
             shm.unlink()
             raise
-        self.shm_name = shm.name
+        shm_name = shm.name
         shm.close()
-        self._shm_handle = None
+        return shm_name
 
     def __getstate__(self):
+        # Each pickle gets a distinct shared-memory segment. The receiver
+        # unlinks its segment after materializing, so reusing one shm_name
+        # across repeated sends or broadcasts can make later unpickles fail.
+        tensor = getattr(self, "_owner_tensor", None)
+        if tensor is None:
+            tensor = self.tensor
         return {
-            "shm_name": self.shm_name,
+            "shm_name": self._create_shm_for_tensor(tensor),
             "shape": self.shape,
             "dtype": self.dtype,
         }
@@ -1586,6 +1598,7 @@ class ShmPointerMMData:
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
+        self._owner_tensor = None
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
