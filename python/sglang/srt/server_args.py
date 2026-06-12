@@ -769,12 +769,6 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_prefill_cuda_graph: bool = False
     disable_decode_cuda_graph: bool = False
-    prefill_cuda_graph_backend: Optional[
-        Literal["breakable", "tc_piecewise", "disabled"]
-    ] = None
-    decode_cuda_graph_backend: Optional[
-        Literal["full", "breakable", "tc_piecewise", "disabled"]
-    ] = None
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -1419,10 +1413,6 @@ class ServerArgs:
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
         if self.disable_decode_cuda_graph:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
-        if self.prefill_cuda_graph_backend is not None:
-            _set(Phase.PREFILL, "backend", self.prefill_cuda_graph_backend)
-        if self.decode_cuda_graph_backend is not None:
-            _set(Phase.DECODE, "backend", self.decode_cuda_graph_backend)
 
         # ---- Per-phase convenience flags ----
         if self.cuda_graph_backend_decode is not None:
@@ -6859,6 +6849,7 @@ class ServerArgs:
             type=str,
             choices=Backend.ALL,
             action=DeprecatedAliasStoreAction,
+            dest="cuda_graph_backend_prefill",
             new_flag="--cuda-graph-backend-prefill",
             help="Deprecated alias for --cuda-graph-backend-prefill.",
         )
@@ -6867,6 +6858,7 @@ class ServerArgs:
             type=str,
             choices=Backend.ALL,
             action=DeprecatedAliasStoreAction,
+            dest="cuda_graph_backend_decode",
             new_flag="--cuda-graph-backend-decode",
             help="Deprecated alias for --cuda-graph-backend-decode.",
         )
