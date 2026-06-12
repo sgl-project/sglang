@@ -83,7 +83,7 @@ class EncoderBootstrapServer:
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
         self._lock = threading.Lock()
-        self._server: Optional["uvicorn.Server"] = None  # set in _run_server
+        self._server: Optional[uvicorn.Server] = None  # set in _run_server
         self._health_check_interval = (
             health_check_interval
             if health_check_interval is not None

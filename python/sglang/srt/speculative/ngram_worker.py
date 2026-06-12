@@ -16,8 +16,10 @@ from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWor
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
+    commit_mamba_states_after_verify,
     generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
+    prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
@@ -324,6 +326,9 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=self.draft_token_num,
             device=self.device,
         )
+
+        prepare_mamba_track_for_verify(batch)
+
         batch.spec_info = NgramVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -426,6 +431,13 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
             ) = verify_input.sample(batch, logits_output, vocab_mask)
             new_seq_lens = batch.seq_lens + accept_lens
+            commit_mamba_states_after_verify(
+                self.target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                self.draft_token_num,
+            )
             accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens
 

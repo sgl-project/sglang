@@ -12,10 +12,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
-    set_mamba_track_indices_from_reqs,
-)
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -35,6 +32,7 @@ from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
+    prepare_mamba_track_for_verify,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_draft_cache_locs_contiguous as assign_draft_cache_locs_contiguous,
@@ -45,7 +43,11 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
 )
-from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils.async_probe import (
+    maybe_detect_nan,
+    maybe_detect_oob,
+    sanitize_nan_logits,
+)
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu
 
 _is_cuda = is_cuda()
@@ -408,10 +410,7 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
-            if get_global_server_args().enable_mamba_extra_buffer():
-                set_mamba_track_indices_from_reqs(batch)
-                batch.mamba_track_mask = None
-                batch.mamba_track_seqlens = None
+            prepare_mamba_track_for_verify(batch)
 
             # TBO's split_spec_info reads these; no-verify-sync leaves both None.
             self.seq_lens_cpu = batch.seq_lens_cpu
@@ -473,6 +472,8 @@ class EagleVerifyInputV2Mixin:
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
+
+        sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.
