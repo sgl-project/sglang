@@ -491,6 +491,11 @@ class Indexer(MultiPlatformOp):
         kw, _ = self.wk_weights_proj(x)
         return kw.split([self.head_dim, self.n_heads], dim=-1)
 
+    def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
+        # Fusion drops the (logit-preserving) Hadamard rotation; without it the
+        # index-K cache here matches the fused path that decode reads back.
+        return x if _use_dsa_indexer_fusion else rotate_activation(x)
+
     def _get_q_k_bf16(
         self,
         q_lora: torch.Tensor,
@@ -552,20 +557,20 @@ class Indexer(MultiPlatformOp):
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = rotate_activation(query)
+            query = self._maybe_rotate(query)
 
             with torch.cuda.stream(self.alt_stream):
-                key = rotate_activation(key)
+                key = self._maybe_rotate(key)
             current_stream.wait_stream(self.alt_stream)
         elif (
             self.alt_stream is not None
             and forward_batch.attn_cp_metadata is not None
             and self.dsa_enable_prefill_cp
         ):
-            key = rotate_activation(key)
+            key = self._maybe_rotate(key)
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            query = rotate_activation(query)
+            query = self._maybe_rotate(query)
 
             with torch.cuda.stream(self.alt_stream):
                 key = cp_all_gather_rerange_output(
@@ -577,8 +582,8 @@ class Indexer(MultiPlatformOp):
             current_stream.wait_stream(self.alt_stream)
             return query, key, weights_raw
         else:
-            query = rotate_activation(query)
-            key = rotate_activation(key)
+            query = self._maybe_rotate(query)
+            key = self._maybe_rotate(key)
 
         # allgather+rerrange
         if forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
@@ -596,11 +601,8 @@ class Indexer(MultiPlatformOp):
         positions: torch.Tensor,
         enable_dual_stream: bool,
     ):
-        # Compute only key, skip query
-        if _use_dsa_indexer_fusion:
-            key, _ = self._fused_k_weights(x)
-        else:
-            key, _ = self.wk(x)
+        # Non-fusion path only; self.wk does not exist when fusion is on.
+        key, _ = self.wk(x)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -1125,18 +1127,24 @@ class Indexer(MultiPlatformOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        # Fast path: only compute and store k cache, skip all q and weights ops
-        key = self._get_k_bf16(x, positions, enable_dual_stream)
-
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
 
-        self._store_index_k_cache(
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            key=key,
-            act_quant=act_quant,
-        )
+        # Must write the same K representation as the decode path: fused
+        # (no-Hadamard) when fusion is on, else the legacy Hadamard path.
+        if _use_dsa_indexer_fusion:
+            key_raw, _ = self._fused_k_weights(x)
+            self._fused_k_prepare_and_store(
+                key_raw, positions, forward_batch, layer_id, act_quant
+            )
+        else:
+            key = self._get_k_bf16(x, positions, enable_dual_stream)
+            self._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                key=key,
+                act_quant=act_quant,
+            )
 
         # MHA doesn't need topk_indices
         if not return_indices:
