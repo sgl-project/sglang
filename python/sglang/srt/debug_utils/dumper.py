@@ -142,8 +142,12 @@ class DumperConfig(_BaseConfig):
     non_intrusive_mode: str = "core"
     source_patcher_config: Optional[str] = None
     grafter_enable: bool = False
-    grafter_role: str = ""  # required if enabled: "baseline", "target", or "file_inject"
-    grafter_file_inject_dir: Optional[str] = None  # dir of .pt files when role=file_inject
+    grafter_role: str = (
+        ""  # required if enabled: "baseline", "target", or "file_inject"
+    )
+    grafter_file_inject_dir: Optional[str] = (
+        None  # dir of .pt files when role=file_inject
+    )
     grafter_b2t_filter: Optional[str] = None  # names flowing baseline -> target
     grafter_t2b_filter: Optional[str] = None  # names flowing target -> baseline
     grafter_master_address: str = ""  # required if enabled
@@ -173,9 +177,9 @@ class DumperConfig(_BaseConfig):
                 f"got {self.grafter_role!r}"
             )
             if self.grafter_role == "file_inject":
-                assert self.grafter_file_inject_dir, (
-                    "grafter_file_inject_dir must be set when grafter_role='file_inject'"
-                )
+                assert (
+                    self.grafter_file_inject_dir
+                ), "grafter_file_inject_dir must be set when grafter_role='file_inject'"
                 assert (
                     self.grafter_b2t_filter is not None
                     or self.grafter_t2b_filter is not None
@@ -184,9 +188,9 @@ class DumperConfig(_BaseConfig):
                     "grafter_t2b_filter is set; nothing would ever be injected"
                 )
             else:
-                assert self.grafter_master_address, (
-                    "grafter_master_address must be set when grafter_enable=True"
-                )
+                assert (
+                    self.grafter_master_address
+                ), "grafter_master_address must be set when grafter_enable=True"
                 assert self.grafter_master_port > 0, (
                     f"grafter_master_port must be a positive port when grafter_enable=True, "
                     f"got {self.grafter_master_port}"
@@ -1184,7 +1188,9 @@ class _Grafter:
         return candidate
 
     @staticmethod
-    def _file_inject_default_transform(graft_input: GraftTransformInput) -> torch.Tensor:
+    def _file_inject_default_transform(
+        graft_input: GraftTransformInput,
+    ) -> torch.Tensor:
         """Identity transform for file_inject mode: received_list has exactly 1 tensor."""
         return graft_input.received_list[0]
 
