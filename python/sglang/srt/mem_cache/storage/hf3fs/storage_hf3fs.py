@@ -224,6 +224,8 @@ class HiCacheHF3FS(HiCacheStorage):
             self.rank = 0
 
         self.is_zero_copy = False
+        
+        self.registered_pools = {}
 
         logger.info(
             f"[Rank {self.rank}] HiCacheHF3FS Client Initializing: "
@@ -914,6 +916,178 @@ class HiCacheHF3FS(HiCacheStorage):
         len_keys = len(keys)
         keys, values = self._batch_set_preprocess(keys, host_indices)
         results = self._batch_set(keys, values)
+        return results
+
+    # =======================================================================
+    # V2 API ADDITIONS (Hybrid Model Support: Mamba, DSA, etc.)
+    # =======================================================================
+
+    def register_mem_host_pool_v2(self, host_pool: Any, host_pool_name: PoolName):
+        if host_pool_name == getattr(PoolName, "KV", None):
+            return
+        self.registered_pools[host_pool_name] = host_pool
+
+    def _get_hf3fs_hybrid_keys_and_tensors(self, page_keys: List[str], transfer: PoolTransfer) -> Tuple[List[str], List[torch.Tensor]]:
+        """
+        Transforms logical page keys into physical HF3FS component keys 
+        and extracts corresponding memory view tensors via Zero-Copy from the pool.
+        """
+        name = transfer.name
+        host_pool = self.registered_pools.get(name)
+
+        if not host_pool or not page_keys:
+            return [], []
+
+        suffixes = []
+        if name == getattr(PoolName, "INDEXER", None):
+            suffixes = [f"_{name.value}"]
+        elif name == getattr(PoolName, "MAMBA", None):
+            conv_num = len(getattr(host_pool, "conv_state_shapes", [])) if host_pool else 0
+            suffixes = ["_temporal"] + [f"_conv_{i}" for i in range(conv_num)]
+        else:
+            suffixes = [""]
+
+        component_keys = []
+        for page_key in page_keys:
+            for suffix in suffixes:
+                component_keys.append(f"{name.value}:{page_key}{suffix}")
+
+        tensors = []
+        page_size = getattr(host_pool, "page_size", 1) or 1
+        num_pages = len(transfer.host_indices) // page_size
+        
+        for i in range(num_pages):
+            idx = transfer.host_indices[i * page_size]
+            idx_val = idx.item() if isinstance(idx, torch.Tensor) else idx
+            
+            # Use MambaPoolHost's built-in tensor iterator to extract memory views
+            if name == getattr(PoolName, "MAMBA", None) and hasattr(host_pool, "_iter_page_tensors"):
+                tensors.extend(list(host_pool._iter_page_tensors(idx_val)))
+            else:
+                # Fallback extraction for other potential hybrid structures
+                tensors.append(host_pool.get_data_page(idx_val, flat=not self.is_zero_copy))
+                
+        return component_keys, tensors
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        kv_pages = self.batch_exists(keys, extra_info)
+        hit_count: dict = {getattr(PoolName, "KV", "KV"): kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+                
+            name = transfer.name
+            host_pool = self.registered_pools.get(name)
+            
+            suffixes = []
+            if name == getattr(PoolName, "INDEXER", None):
+                suffixes = [f"_{name.value}"]
+            elif name == getattr(PoolName, "MAMBA", None):
+                conv_num = len(getattr(host_pool, "conv_state_shapes", [])) if host_pool else 0
+                suffixes = ["_temporal"] + [f"_conv_{i}" for i in range(conv_num)]
+            else:
+                suffixes = [""]
+
+            key_multiplier = max(1, len(suffixes))
+            component_keys = []
+            for page_key in keys:
+                for suffix in suffixes:
+                    component_keys.append(f"{name.value}:{page_key}{suffix}")
+
+            # Verify existence through metadata_client
+            ex = self.metadata_client.exists(self.rank, component_keys)
+            
+            page_exists = []
+            for i in range(kv_pages):
+                start = i * key_multiplier
+                end = start + key_multiplier
+                page_exists.append(all(ex[start:end]))
+
+            boundary = 0
+            if transfer.hit_policy == getattr(PoolHitPolicy, "ALL_PAGES", None):
+                try:
+                    boundary = page_exists.index(False)
+                except ValueError:
+                    boundary = kv_pages
+            elif transfer.hit_policy == getattr(PoolHitPolicy, "TRAILING_PAGES", None):
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(kv_pages, 0, -1):
+                    start_idx = max(0, prefix_len - trailing)
+                    if all(page_exists[start_idx:prefix_len]):
+                        boundary = prefix_len
+                        break
+                        
+            if boundary > 0:
+                hit_count[name] = boundary
+            final_pages = min(final_pages, boundary)
+
+        return PoolTransferResult(final_pages, hit_count)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        results = {}
+        for transfer in transfers:
+            pool_name = transfer.name
+            # 100% Backward Compatibility: Reroute KV logic to V1
+            if pool_name == getattr(PoolName, "KV", None):
+                results[pool_name.value] = self.batch_set_v1(transfer.keys, transfer.host_indices, extra_info)
+                continue
+                
+            comp_keys, tensors = self._get_hf3fs_hybrid_keys_and_tensors(transfer.keys, transfer)
+            if not comp_keys:
+                results[pool_name.value] = []
+                continue
+                
+            # Leverage underlying _batch_set
+            set_res = self._batch_set(comp_keys, tensors)
+            
+            key_multiplier = len(comp_keys) // max(1, len(transfer.keys))
+            condensed = []
+            for i in range(len(transfer.keys)):
+                start = i * key_multiplier
+                condensed.append(all(set_res[start:start+key_multiplier]))
+            results[pool_name.value] = condensed
+            
+        return results
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        results = {}
+        for transfer in transfers:
+            pool_name = transfer.name
+            # 100% Backward Compatibility: Reroute KV logic to V1
+            if pool_name == getattr(PoolName, "KV", None):
+                results[pool_name.value] = self.batch_get_v1(transfer.keys, transfer.host_indices, extra_info)
+                continue
+                
+            comp_keys, tensors = self._get_hf3fs_hybrid_keys_and_tensors(transfer.keys, transfer)
+            if not comp_keys:
+                results[pool_name.value] = []
+                continue
+                
+            # Leverage underlying _batch_get (it writes directly to tensors)
+            get_res = self._batch_get(comp_keys, tensors)
+            
+            key_multiplier = len(comp_keys) // max(1, len(transfer.keys))
+            condensed = []
+            for i in range(len(transfer.keys)):
+                start = i * key_multiplier
+                condensed.append(all(get_res[start:start+key_multiplier]))
+            results[pool_name.value] = condensed
+            
         return results
 
     # Deprecated
