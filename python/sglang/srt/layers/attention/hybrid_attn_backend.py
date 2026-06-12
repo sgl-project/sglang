@@ -170,3 +170,24 @@ class HybridAttnBackend(AttentionBackend):
             save_kv_cache=save_kv_cache,
             **kwargs,
         )
+
+    def update_mamba_state_after_mtp_verify(
+        self,
+        accepted_steps: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+        model,
+    ):
+        """Delegate mamba state update to the backend selected for target verify.
+
+        This method is always called during the target_verify phase, so we must
+        delegate to the same backend that was used in init_forward_metadata for
+        that phase — otherwise forward_metadata will be None.
+        """
+        backend = self._select_backend(ForwardMode.TARGET_VERIFY)
+        backend.update_mamba_state_after_mtp_verify(
+            accepted_steps=accepted_steps,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=model,
+        )
