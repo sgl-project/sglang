@@ -1701,6 +1701,15 @@ class MooncakeKVSender(CommonKVSender):
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
+            if self.bootstrap_room not in self.kv_mgr.request_status:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "KV transfer status disappeared before Mooncake sender completed",
+                )
+                self.conclude_state = KVPoll.Failed
+                self.trace_ctx.trace_req_finish()
+                return self.conclude_state
+
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
