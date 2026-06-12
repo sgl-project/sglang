@@ -2821,10 +2821,6 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        # Queried after prepare_for_extend so the partially-extended check sees
-        # this round's freshly chunked req. prepare_for_extend only reads the
-        # inputs of is_partially_extended, so the values are unaffected;
-        # all consumers below run after prepare anyway.
         partially_extended_in_batch = [
             r for r in can_run_list if r.is_partially_extended
         ]
