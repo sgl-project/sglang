@@ -65,6 +65,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
 
         self.mock_lora_manager = MagicMock(spec=LoRAManager)
         self.mock_lora_manager.device = "cuda:0"
+        self.mock_lora_manager.enable_lora_pipelined_loading = False
         self.mock_lora_manager.memory_pool = MagicMock()
         self.mock_lora_manager.memory_pool.uid_to_buffer_id = {}
         self.mock_lora_manager.validate_lora_batch.return_value = True
@@ -76,7 +77,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
     def _create_loader(self) -> LoRAOverlapLoader:
         return LoRAOverlapLoader(cast(LoRAManager, self.mock_lora_manager))
 
-    def _mark_loras_loaded(self, new_loras, _loras_to_be_loaded):
+    def _mark_loras_loaded(self, new_loras, _loras_to_be_loaded, **kwargs):
         for lora_id in new_loras:
             self.mock_lora_manager.memory_pool.uid_to_buffer_id[lora_id] = len(
                 self.mock_lora_manager.memory_pool.uid_to_buffer_id
@@ -110,7 +111,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.assertNotIn("stale_lora", loader.lora_to_overlap_load_event)
         self.assertIn("new_lora", loader.lora_to_overlap_load_event)
         self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
-            {"new_lora"}, set()
+            {"new_lora"}, set(), loading_stream=None
         )
 
     def test_loaded_lora_reused_after_stale_event_drain(self):
@@ -134,7 +135,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.assertNotIn("lora_A", loader.lora_to_overlap_load_event)
         self.assertIn("lora_B", loader.lora_to_overlap_load_event)
         self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
-            {"lora_B"}, set()
+            {"lora_B"}, set(), loading_stream=None
         )
 
         self.mock_lora_manager.fetch_new_loras.reset_mock()
@@ -167,7 +168,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.assertFalse(result)
         self.assertIn("lora_A", loader.lora_to_overlap_load_event)
         self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
-            {"lora_A"}, set()
+            {"lora_A"}, set(), loading_stream=None
         )
 
         # Simulate load still in progress - returns False, event persists
