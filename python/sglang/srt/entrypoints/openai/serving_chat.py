@@ -98,6 +98,23 @@ def normalize_tool_content(role: str, content):
     return content
 
 
+def parse_tool_call_arguments(arguments: str) -> Dict[str, Any]:
+    """Parse OpenAI tool call arguments for chat templates."""
+    try:
+        parsed_arguments = orjson.loads(arguments)
+    except orjson.JSONDecodeError as exc:
+        raise ValueError(
+            "Assistant tool call function.arguments must be valid JSON."
+        ) from exc
+
+    if not isinstance(parsed_arguments, dict):
+        raise ValueError(
+            "Assistant tool call function.arguments must be a JSON object."
+        )
+
+    return parsed_arguments
+
+
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
     vid_vals = []
@@ -763,7 +780,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         if "arguments" in item["function"] and isinstance(
                             item["function"]["arguments"], str
                         ):
-                            item["function"]["arguments"] = orjson.loads(
+                            item["function"]["arguments"] = parse_tool_call_arguments(
                                 item["function"]["arguments"]
                             )
 
