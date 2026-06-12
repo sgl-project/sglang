@@ -305,7 +305,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cpu_amx_available:
-            return torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+            torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
                 positions,
                 query,
                 key,
@@ -315,6 +315,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 self.mrope_interleaved,
                 self.is_neox_style,
             )
+            return query, key
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     def forward_cuda(

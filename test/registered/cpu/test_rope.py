@@ -69,9 +69,9 @@ class TestROPE(CustomTestCase):
 
             with torch.no_grad(), torch.amp.autocast("cpu", enabled=enable_autocast):
                 q = torch.randn(seq_len, num_heads * head_size, dtype=dtype)
-                q_clone = q.clone()
+                q_sgl = q.clone()
                 k = torch.randn(seq_len, num_kv_heads * head_size, dtype=dtype)
-                k_clone = k.clone()
+                k_sgl = k.clone()
 
                 # ref kernel
                 q_ref, k_ref = rope.forward_native(
@@ -80,10 +80,10 @@ class TestROPE(CustomTestCase):
                     positions=positions,
                 )
                 # fused rope kernel
-                q_sgl, k_sgl = torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+                torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
                     positions,
-                    q_clone,
-                    k_clone,
+                    q_sgl,
+                    k_sgl,
                     rope.head_size,
                     rope.cos_sin_cache,
                     rope.mrope_section,
@@ -280,6 +280,78 @@ class TestROPE(CustomTestCase):
             )
             torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
             torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
+
+    def test_apply_multidimensional_rope(self):
+        """Test apply_multidimensional_rope_cpu against the native Python reference."""
+
+        def _rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        def _apply_rotary(x, cos, sin):
+            return (x * cos) + (_rotate_half(x) * sin)
+
+        def _apply_multidimensional_rope_ref(x, cos, sin):
+            ndim = 2
+            chunk_size = x.shape[-1] // ndim
+            cos_3d = cos.unsqueeze(1)
+            sin_3d = sin.unsqueeze(1)
+            x_parts = x.split(chunk_size, dim=-1)
+            cos_parts = cos_3d.split(chunk_size, dim=-1)
+            sin_parts = sin_3d.split(chunk_size, dim=-1)
+            y_parts = [
+                _apply_rotary(x_parts[k], cos_parts[k], sin_parts[k])
+                for k in range(ndim)
+            ]
+            return torch.cat(y_parts, dim=-1)
+
+        test_configs = [
+            # (num_tokens, num_heads, head_dim, dtype, sincos_dtype)
+            (4, 8, 64, torch.bfloat16, torch.bfloat16),
+            (32, 16, 128, torch.bfloat16, torch.bfloat16),
+            (128, 4, 256, torch.bfloat16, torch.bfloat16),
+            (1, 1, 32, torch.bfloat16, torch.float32),
+            (32, 16, 128, torch.bfloat16, torch.float32),
+            (2520, 12, 64, torch.bfloat16, torch.bfloat16),
+            (2520, 12, 64, torch.bfloat16, torch.float32),
+        ]
+
+        for num_tokens, num_heads, head_dim, dtype, sincos_dtype in test_configs:
+            with self.subTest(
+                num_tokens=num_tokens,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                sincos_dtype=sincos_dtype,
+            ):
+                torch.manual_seed(42)
+                query = torch.randn(
+                    num_tokens, num_heads, head_dim, dtype=dtype, device="cpu"
+                )
+                key = torch.randn(
+                    num_tokens, num_heads, head_dim, dtype=dtype, device="cpu"
+                )
+                cos = torch.randn(
+                    num_tokens, head_dim, dtype=sincos_dtype, device="cpu"
+                )
+                sin = torch.randn(
+                    num_tokens, head_dim, dtype=sincos_dtype, device="cpu"
+                )
+
+                q_expected = _apply_multidimensional_rope_ref(
+                    query.float(), cos.float(), sin.float()
+                ).to(dtype)
+                k_expected = _apply_multidimensional_rope_ref(
+                    key.float(), cos.float(), sin.float()
+                ).to(dtype)
+
+                q_out, k_out = torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(
+                    query, key, cos, sin
+                )
+                atol = rtol = precision[dtype]
+                torch.testing.assert_close(q_out, q_expected, atol=atol, rtol=rtol)
+                torch.testing.assert_close(k_out, k_expected, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":

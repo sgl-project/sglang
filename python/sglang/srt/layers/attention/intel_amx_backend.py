@@ -152,12 +152,12 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
-            layer.is_cross_attention,
+            layer.is_cross_attention or k is None or v is None,
             layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
             sinks,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -169,8 +169,20 @@ class IntelAMXAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
-        attn_logits, _ = self.forward_metadata
-
+        if layer.v_head_dim == self.v_head_dim and layer.tp_q_head_num == self.num_head:
+            attn_logits, _ = self.forward_metadata
+        else:
+            bs = forward_batch.batch_size
+            attn_logits = torch.zeros(
+                (
+                    bs,
+                    layer.tp_q_head_num,
+                    8,  # self.num_kv_splits,
+                    layer.v_head_dim + 1,
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:
@@ -201,7 +213,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             forward_batch.encoder_lens,
             sinks,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def support_triton(self):
         return False

@@ -23,6 +23,7 @@ def flash_attn_varlen_ref(
     cu_seqlens_k,
     is_causal,
     enable_gqa,
+    scale=None,
 ):
     cu_q = cu_seqlens_q.tolist()
     cu_k = cu_seqlens_k.tolist()
@@ -43,6 +44,7 @@ def flash_attn_varlen_ref(
             v[:, :, start_k:end_k, :],
             is_causal=is_causal,
             enable_gqa=enable_gqa,
+            scale=scale,
         )
 
     # [1, H, T, D] -> [T, H, D]
@@ -58,6 +60,7 @@ def flash_attn_non_varlen_ref(
     cu_seqlens_k,
     is_causal,
     enable_gqa,
+    scale=None,
 ):
     cu_q = cu_seqlens_q.tolist()
     cu_k = cu_seqlens_k.tolist()
@@ -75,6 +78,7 @@ def flash_attn_non_varlen_ref(
         v,
         is_causal=is_causal,
         enable_gqa=enable_gqa,
+        scale=scale,
     )
     # [B, H, T, D] -> [B * T, H, D]
     return out.transpose(1, 2).reshape(batch * T, H, D)
@@ -138,6 +142,71 @@ class TestFlashAttn(CustomTestCase):
             seqlens_q.max().item(),
             seqlens_k.max().item(),
             is_causal,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(out_ref, out, atol=atol, rtol=rtol)
+
+    @parametrize(
+        batch=[4],
+        max_seqlen_q=[35, 96],
+        max_seqlen_k=[35, 96],
+        num_heads=[16],
+        num_heads_kv=[16, 2],
+        head_dim=[32],
+        head_dim_v=[32],
+        is_causal=[True, False],
+        scale=[0.1, 0.05],
+    )
+    def test_flash_attn_varlen_custom_scale(
+        self,
+        batch,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads,
+        num_heads_kv,
+        head_dim,
+        head_dim_v,
+        is_causal,
+        scale,
+    ):
+        dtype = torch.bfloat16
+
+        # random seqlens for k and kv
+        seqlens_q = torch.randint(1, max_seqlen_q, (batch,), dtype=torch.int32)
+        seqlens_k = torch.randint(1, max_seqlen_k, (batch,), dtype=torch.int32)
+        cu_seqlens_q = torch.zeros((batch + 1,), dtype=torch.int32)
+        cu_seqlens_k = torch.zeros((batch + 1,), dtype=torch.int32)
+        cu_seqlens_q[1:] = torch.cumsum(seqlens_q, 0)
+        cu_seqlens_k[1:] = torch.cumsum(seqlens_k, 0)
+
+        sum_seqlen_q = seqlens_q.sum().item()
+        sum_seqlen_k = seqlens_k.sum().item()
+        q = torch.randn(sum_seqlen_q, num_heads, head_dim).to(dtype)
+        k = torch.randn(sum_seqlen_k, num_heads_kv, head_dim).to(dtype)
+        v = torch.randn(sum_seqlen_k, num_heads_kv, head_dim_v).to(dtype)
+
+        out_ref = flash_attn_varlen_ref(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            is_causal=is_causal,
+            enable_gqa=num_heads != num_heads_kv,
+            scale=scale,
+        )
+
+        out = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlens_q.max().item(),
+            seqlens_k.max().item(),
+            is_causal,
+            scale,
         )
 
         atol = rtol = precision[dtype]

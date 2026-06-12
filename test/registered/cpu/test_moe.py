@@ -8,7 +8,7 @@ from sglang.srt.layers.amx_utils import CPUQuantMethod
 
 kernel = torch.ops.sgl_kernel
 
-torch.manual_seed(1183)
+torch.manual_seed(800)
 
 from utils import (
     BLOCK_K,
@@ -33,7 +33,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
 
-def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
+def fused_moe(a, w1, w2, score, topk, renormalize, prepack, activation="silu"):
 
     G = 1
     topk_group = 1
@@ -67,6 +67,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         None,
         None,
         prepack,
+        activation,
     )
 
 
@@ -84,6 +85,26 @@ class TestFusedExperts(CustomTestCase):
 
         torch_output = torch_naive_fused_moe(a, w1, w2, score, topk, renormalize)
         fused_output = fused_moe(a, w1, w2, score, topk, renormalize, prepack)
+
+        atol = rtol = precision[torch_output.dtype]
+        torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
+
+    @parametrize(m=[2, 114], n=[32], k=[32], e=[4], topk=[2], renormalize=[False, True])
+    def test_bf16_moe_gelu(self, m, n, k, e, topk, renormalize):
+        dtype = torch.bfloat16
+        prepack = True
+
+        a = torch.randn((m, k), device="cpu", dtype=dtype) / 10
+        w1 = torch.randn((e, 2 * n, k), device="cpu", dtype=dtype) / 10
+        w2 = torch.randn((e, k, n), device="cpu", dtype=dtype) / 10
+        score = torch.randn((m, e), device="cpu", dtype=dtype)
+
+        torch_output = torch_naive_fused_moe(
+            a, w1, w2, score, topk, renormalize, activation="gelu"
+        )
+        fused_output = fused_moe(
+            a, w1, w2, score, topk, renormalize, prepack, activation="gelu"
+        )
 
         atol = rtol = precision[torch_output.dtype]
         torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
@@ -252,6 +273,64 @@ class TestFusedExperts(CustomTestCase):
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
     @parametrize(M=[2, 121], N=[352, 512], K=[256, 320], E=[8], topk=[4])
+    def test_fp8_moe_gelu(self, M, N, K, E, topk):
+        dtype = torch.bfloat16
+
+        a = torch.randn(M, K, dtype=dtype) / math.sqrt(K)
+
+        w1_fp32 = torch.randn(E, 2 * N, K)
+        w1 = (w1_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+
+        w2_fp32 = torch.randn(E, K, N)
+        w2 = (w2_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+
+        w1s = (
+            torch.randn(E, math.ceil(2 * N / BLOCK_N), math.ceil(K / BLOCK_K))
+            * factor_for_scale
+        )
+        w2s = (
+            torch.randn(E, math.ceil(K / BLOCK_N), math.ceil(N / BLOCK_K))
+            * factor_for_scale
+        )
+
+        w1_scaled = scaled_weight(w1, w1s)
+        w2_scaled = scaled_weight(w2, w2s)
+
+        score = torch.randn((M, E), dtype=dtype)
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+
+        w1 = kernel.convert_weight_packed(w1)
+        w2 = kernel.convert_weight_packed(w2)
+
+        ref_out = native_fp8_fused_moe(
+            a, w1_scaled, w2_scaled, topk_weight, topk_ids, topk, activation="gelu"
+        )
+        out = kernel.fused_experts_cpu(
+            a,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids.to(torch.int32),
+            False,
+            CPUQuantMethod.FP8_W8A16,
+            w1s,
+            w2s,
+            None,
+            None,
+            [BLOCK_N, BLOCK_K],
+            None,
+            None,
+            None,
+            None,
+            True,
+            "gelu",
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
+
+    @parametrize(M=[2, 121], N=[352, 512], K=[256, 320], E=[8], topk=[4])
     def test_mxfp4_moe(self, M, N, K, E, topk):
         dtype = torch.bfloat16
 
@@ -297,6 +376,64 @@ class TestFusedExperts(CustomTestCase):
             None,
             None,
             True,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
+
+    @parametrize(M=[2, 121], N=[352, 512], K=[256, 320], E=[8], topk=[4])
+    def test_mxfp4_moe_gelu(self, M, N, K, E, topk):
+        dtype = torch.bfloat16
+
+        a = torch.randn(M, K, dtype=dtype) / 10
+
+        w1_bf16 = torch.randn((E, 2 * N, K), dtype=dtype) / 10
+        w1q, w1s = MXFP4QuantizeUtil.quantize(w1_bf16)
+        w1s = w1s.reshape(E, 2 * N, K // 32)
+        w1dq = MXFP4QuantizeUtil.dequantize(w1q, dtype, w1s)
+
+        w2_bf16 = torch.randn((E, K, N), dtype=dtype) / 10
+        w2q, w2s = MXFP4QuantizeUtil.quantize(w2_bf16)
+        w2s = w2s.reshape(E, K, N // 32)
+        w2dq = MXFP4QuantizeUtil.dequantize(w2q, dtype, w2s)
+
+        score = torch.randn((M, E), dtype=dtype)
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+
+        w1 = kernel.convert_weight_packed(w1q)
+        w2 = kernel.convert_weight_packed(w2q)
+        w1s = kernel.convert_scale_packed(w1s)
+        w2s = kernel.convert_scale_packed(w2s)
+
+        ref_out = native_fp8_fused_moe(
+            a,
+            w1dq.float(),
+            w2dq.float(),
+            topk_weight,
+            topk_ids,
+            topk,
+            activation="gelu",
+        )
+        out = kernel.fused_experts_cpu(
+            a,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids.to(torch.int32),
+            False,
+            CPUQuantMethod.MXFP4,
+            w1s,
+            w2s,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            True,
+            "gelu",
         )
 
         atol = rtol = precision[dtype]

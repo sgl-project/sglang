@@ -443,7 +443,8 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& cu_seqlens_k,
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
-    bool causal) {
+    bool causal,
+    std::optional<double> scale) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
@@ -480,7 +481,7 @@ at::Tensor flash_attn_varlen_func(
   TORCH_CHECK(head_size_v % 2 == 0, "invalid head_size_v ", head_size_v);
 
   // softmax scale
-  double sm_scale = 1.0 / std::sqrt(static_cast<double>(head_size));
+  double sm_scale = scale.has_value() ? scale.value() : 1.0 / std::sqrt(static_cast<double>(head_size));
 
   // check whether the batch has variant lengths
   const bool is_varlen =
