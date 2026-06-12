@@ -23,6 +23,7 @@ from sglang.srt.speculative.draft_tail_buffer import (
     DraftTailSnapshot,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -80,7 +81,7 @@ def _stream(*outputs) -> DraftTailStreamOutputBatch:
     return DraftTailStreamOutputBatch(outputs=list(outputs))
 
 
-class TestDraftTailBufferBasics(unittest.TestCase):
+class TestDraftTailBufferBasics(CustomTestCase):
     def _buf(self, required_tail_len=2):
         return DraftTailBuffer(verifier_rank=0, required_tail_len=required_tail_len)
 
@@ -195,7 +196,7 @@ class TestDraftTailBufferBasics(unittest.TestCase):
         self.assertEqual(stats["num_unknown_request_outputs"], 1)
 
 
-class TestDraftTailBufferCommitReconciliation(unittest.TestCase):
+class TestDraftTailBufferCommitReconciliation(CustomTestCase):
     def _buf(self):
         return DraftTailBuffer(verifier_rank=0, required_tail_len=2)
 
@@ -302,7 +303,7 @@ class TestDraftTailBufferCommitReconciliation(unittest.TestCase):
         self.assertFalse(buf.has_request("ghost"))
 
 
-class TestDraftTailBufferControlBatchAndSnapshots(unittest.TestCase):
+class TestDraftTailBufferControlBatchAndSnapshots(CustomTestCase):
     def _buf(self, required_tail_len=2):
         return DraftTailBuffer(verifier_rank=0, required_tail_len=required_tail_len)
 
@@ -353,7 +354,7 @@ class TestDraftTailBufferControlBatchAndSnapshots(unittest.TestCase):
         self.assertEqual(snap.raw_tail_tokens, [10])
 
 
-class TestDraftTailBufferWaiting(unittest.TestCase):
+class TestDraftTailBufferWaiting(CustomTestCase):
     """Threaded tests for the blocking wait path (allow_partial=False)."""
 
     def test_waiter_wakes_when_tokens_arrive(self):
@@ -398,8 +399,47 @@ class TestDraftTailBufferWaiting(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("closed while waiting", str(result["error"]))
 
+    def test_waiter_blocks_on_pending_then_wakes(self):
+        # A request stuck in the pending-expected state (committed_len advanced,
+        # tail empty) must keep a blocking waiter parked even though tokens were
+        # "committed": the consumable tail is 0 until the drafter confirms the
+        # pending token. This exercises the pending-queue branch of
+        # _has_min_draft_tokens_locked, distinct from the tail-too-short branch.
+        buf = DraftTailBuffer(verifier_rank=0, required_tail_len=2)
+        buf.open_requests([_sync("r", committed_len=0)])
+        buf.append_draft_stream_batch(_stream(_out("r", base=0, pos=0, tok=10)))
+        # Commit [10, 11]: 10 matches the tail, 11 outruns the drafter -> pending.
+        buf.apply_verify_commits([_commit("r", pre=0, tokens=[10, 11])])
+        result = {}
 
-class TestDraftTailBufferPendingEdgeCases(unittest.TestCase):
+        def waiter():
+            try:
+                snaps = buf.get_draft_snapshots([_FakeReq("r")], allow_partial=False)
+                result["tail"] = snaps[0].tail_tokens
+            except Exception as exc:  # pragma: no cover - failure path
+                result["error"] = exc
+
+        t = threading.Thread(target=waiter)
+        t.start()
+        # The waiter must NOT return while the request is blocked on pending.
+        t.join(timeout=0.2)
+        self.assertTrue(t.is_alive(), "waiter should stay blocked while pending")
+        # Drafter confirms the pending token, then streams enough tail to satisfy
+        # required_tail_len; the append notifies the waiting condition.
+        buf.append_draft_stream_batch(
+            _stream(
+                _out("r", base=1, pos=1, tok=11),  # confirms pending -> committed=2
+                _out("r", base=2, pos=2, tok=12),
+                _out("r", base=2, pos=3, tok=13),
+            )
+        )
+        t.join(timeout=5.0)
+        self.assertFalse(t.is_alive(), "waiter did not wake after pending resolved")
+        self.assertNotIn("error", result)
+        self.assertEqual(result["tail"], [12, 13])
+
+
+class TestDraftTailBufferPendingEdgeCases(CustomTestCase):
     """Coverage for the pending_expected_tokens branches (drafter lagging the verifier)."""
 
     def _buf(self):
@@ -489,6 +529,167 @@ class TestDraftTailBufferPendingEdgeCases(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             buf.apply_verify_commits([_commit("r", pre=2, tokens=[12])])
         self.assertIn("must be empty while expected prefix", str(ctx.exception))
+
+
+class TestDraftTailBufferMultiRequest(CustomTestCase):
+    """Batch-level coverage: one buffer driving several distinct requests at once.
+
+    The per-request stats arrays (``*_by_req``) and the ``index_by_request_id``
+    bookkeeping are only exercised when a single batch carries more than one
+    distinct rid, so these tests interleave outputs across requests (plus a
+    same-batch duplicate) and assert the parallel arrays line up with the rids.
+    """
+
+    def _buf(self):
+        return DraftTailBuffer(verifier_rank=0, required_tail_len=2)
+
+    def test_interleaved_stream_batch_tracks_each_request(self):
+        buf = self._buf()
+        buf.open_requests(
+            [
+                _sync("r0", committed_len=0),
+                _sync("r1", committed_len=0),
+                _sync("r2", committed_len=0),
+            ]
+        )
+        # One batch interleaves three requests; r0 repeats pos=1 within the batch
+        # (a same-batch duplicate), so its raw-output count and appended count
+        # diverge while r1/r2 stay in lockstep.
+        stats = buf.append_draft_stream_batch(
+            _stream(
+                _out("r0", base=0, pos=0, tok=10),
+                _out("r1", base=0, pos=0, tok=20),
+                _out("r0", base=0, pos=1, tok=11),
+                _out("r2", base=0, pos=0, tok=30),
+                _out("r0", base=0, pos=1, tok=11),  # duplicate within the batch
+                _out("r1", base=0, pos=1, tok=21),
+            ),
+            collect_stats=True,
+        )
+        # rids follow first-appearance order; the duplicate r0 is deduped here.
+        self.assertEqual(stats["rids"], ["r0", "r1", "r2"])
+        # draft_token_lens counts every output (incl. the duplicate); appended
+        # excludes it -> r0 is [3] vs [2], r1/r2 match.
+        self.assertEqual(stats["draft_token_lens_by_req"], [3, 2, 1])
+        self.assertEqual(stats["appended_token_lens_by_req"], [2, 2, 1])
+        self.assertEqual(stats["num_appended_outputs"], 5)
+        self.assertEqual(stats["num_duplicate_outputs"], 1)
+        # The append-side after-len arrays are per-request and ordered like rids.
+        self.assertEqual(stats["tail_lens_after_by_req"], [2, 2, 1])
+        self.assertEqual(stats["consumable_tail_lens_after_by_req"], [2, 2, 1])
+        self.assertEqual(stats["committed_lens_after_by_req"], [0, 0, 0])
+        self.assertEqual(stats["pending_expected_lens_after_by_req"], [0, 0, 0])
+        # Each request keeps an independent tail.
+        snaps = buf.get_draft_snapshots(
+            [_FakeReq("r0"), _FakeReq("r1"), _FakeReq("r2")]
+        )
+        self.assertEqual(
+            [snap.tail_tokens for snap in snaps], [[10, 11], [20, 21], [30]]
+        )
+
+    def test_control_batch_commits_multiple_requests(self):
+        buf = self._buf()
+        buf.open_requests([_sync("a", committed_len=0), _sync("b", committed_len=0)])
+        buf.append_draft_stream_batch(
+            _stream(
+                _out("a", base=0, pos=0, tok=10),
+                _out("a", base=0, pos=1, tok=11),
+                _out("b", base=0, pos=0, tok=20),
+            )
+        )
+        # a: its single committed token fully matches the tail. b: the drafter
+        # lags (verifier commits two, only one is buffered) -> one matches and one
+        # becomes pending. The commit-side *_by_req arrays must track both.
+        stats = buf.apply_control_batch(
+            DraftControlBatch(
+                dst_drafter_rank=0,
+                verify_commit_messages=[
+                    _commit("a", pre=0, tokens=[10]),
+                    _commit("b", pre=0, tokens=[20, 21]),
+                ],
+            ),
+            collect_stats=True,
+        )
+        self.assertEqual(stats["commit_rids"], ["a", "b"])
+        self.assertEqual(stats["committed_segment_lens_by_req"], [1, 2])
+        self.assertEqual(stats["matched_tail_lens_by_req"], [1, 1])
+        self.assertEqual(stats["pending_expected_lens_after_by_req"], [0, 1])
+        self.assertEqual(buf.get_committed_len("a"), 1)
+        self.assertEqual(buf.get_committed_len("b"), 1)
+
+
+class TestDraftTailBufferLifecycle(CustomTestCase):
+    """End-to-end trajectory through every reconciliation phase in sequence.
+
+    Isolated single-transition tests can miss state that accumulates across
+    steps. This drives one request through open -> stream -> full-match commit ->
+    partial commit (pending) -> drafter confirm -> re-stream -> close, asserting
+    committed_len / tail / pending after each step.
+    """
+
+    def _snapshot(self, buf, rid):
+        return buf.get_draft_snapshots([_FakeReq(rid)])[0]
+
+    def test_full_request_trajectory(self):
+        buf = DraftTailBuffer(verifier_rank=0, required_tail_len=2)
+        # Open through a control batch (the scheduler's real combined entry point)
+        # rather than open_requests(), exercising the sync_messages leg.
+        buf.apply_control_batch(
+            DraftControlBatch(
+                dst_drafter_rank=0, sync_messages=[_sync("r", committed_len=0)]
+            )
+        )
+        self.assertTrue(buf.has_request("r"))
+        self.assertEqual(buf.get_committed_len("r"), 0)
+
+        # 1) Drafter streams three guesses ahead of the committed prefix.
+        buf.append_draft_stream_batch(
+            _stream(
+                _out("r", base=0, pos=0, tok=10),
+                _out("r", base=0, pos=1, tok=11),
+                _out("r", base=0, pos=2, tok=12),
+            )
+        )
+        snap = self._snapshot(buf, "r")
+        self.assertEqual(snap.committed_len, 0)
+        self.assertEqual(snap.tail_tokens, [10, 11, 12])
+
+        # 2) Verifier commits a fully-matched prefix; the tail shrinks.
+        buf.apply_verify_commits([_commit("r", pre=0, tokens=[10, 11])])
+        snap = self._snapshot(buf, "r")
+        self.assertEqual(snap.committed_len, 2)
+        self.assertEqual(snap.tail_tokens, [12])
+
+        # 3) Verifier commits [12, 13]: 12 matches the buffered tail, 13 outruns
+        #    the drafter and becomes pending. While pending, nothing is consumable.
+        buf.apply_verify_commits([_commit("r", pre=2, tokens=[12, 13])])
+        snap = self._snapshot(buf, "r")
+        self.assertEqual(snap.committed_len, 3)
+        self.assertEqual(snap.tail_tokens, [])
+        self.assertEqual(snap.raw_tail_len, 0)
+
+        # 4) Drafter catches up and confirms the pending token.
+        stats = buf.append_draft_stream_batch(
+            _stream(_out("r", base=3, pos=3, tok=13)), collect_stats=True
+        )
+        self.assertEqual(stats["num_pending_expected_match_outputs"], 1)
+        self.assertEqual(buf.get_committed_len("r"), 4)
+
+        # 5) Drafter resumes buffering fresh guesses ahead of the prefix.
+        buf.append_draft_stream_batch(
+            _stream(
+                _out("r", base=4, pos=4, tok=14),
+                _out("r", base=4, pos=5, tok=15),
+            )
+        )
+        snap = self._snapshot(buf, "r")
+        self.assertEqual(snap.committed_len, 4)
+        self.assertEqual(snap.tail_tokens, [14, 15])
+
+        # 6) Close tears the request state down.
+        buf.close_requests([_close("r")])
+        self.assertFalse(buf.has_request("r"))
+        self.assertIsNone(buf.get_committed_len("r"))
 
 
 if __name__ == "__main__":
