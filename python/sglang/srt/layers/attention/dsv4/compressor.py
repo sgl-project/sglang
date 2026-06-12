@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -472,7 +473,7 @@ class Compressor(MultiPlatformOp):
         self,
         x: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: AttentionBackend,
+        attn_backend: Optional[AttentionBackend] = None,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
@@ -486,7 +487,7 @@ class Compressor(MultiPlatformOp):
                 torch.cuda.current_stream(),
             )
 
-        return forward_batch.attn_backend.forward_compress(
+        return get_attn_backend().forward_compress(
             self, x, forward_batch
         )
 

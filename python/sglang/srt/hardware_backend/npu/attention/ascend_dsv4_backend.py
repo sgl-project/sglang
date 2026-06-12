@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -55,15 +56,15 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         fm = self.forward_metadata
         is_decode = forward_batch.forward_mode.is_decode()
         result = self._compute_compress_locs(
-            pool=forward_batch.token_to_kv_pool,
-            req_to_token=forward_batch.req_to_token_pool.req_to_token,
+            pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             out_cache_loc=forward_batch.out_cache_loc,
             is_decode=is_decode,
             bs=forward_batch.batch_size,
             device=forward_batch.seq_lens.device,
-            req_to_token_pool=forward_batch.req_to_token_pool,
+            req_to_token_pool=self.req_to_token_pool,
             out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
         )
         for k, v in result.items():
@@ -298,7 +299,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         self._ensure_compressor_hadamard(compressor, device)
         self._ensure_fused_caches(compressor)
 
-        fm = forward_batch.attn_backend.forward_metadata
+        fm = self.forward_metadata
         positions_cmp = getattr(fm, f"positions_cmp_padding_c{ratio}", None)
         page_table = getattr(fm, f"c{ratio}_state_page_table", None)
         start_pos = getattr(fm, "start_pos", None)
@@ -312,7 +313,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         assert start_pos is not None, "fused compressor needs start_pos"
         assert cu_seqlens is not None, "fused compressor needs cu_seqlens"
 
-        pool = forward_batch.token_to_kv_pool
+        pool = self.token_to_kv_pool
         state_cache = pool.get_state_cache(compressor.layer_id, compressor.is_in_indexer)
 
         cos, sin = get_fused_compressor_rope_cos_sin(
@@ -345,7 +346,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if loc is not None and loc.numel() < cmp_kv.shape[0]:
             cmp_kv = cmp_kv[: loc.numel()]
 
-        if forward_batch.attn_backend.graph_mode or cmp_kv.shape[0] > 0:
+        if self.graph_mode or cmp_kv.shape[0] > 0:
             if compressor.rotate:
                 cmp_kv = _apply_hadamard(cmp_kv, compressor.hadamard_matrix)
             self._compressor_epilog_npu(compressor, cmp_kv, forward_batch)
@@ -386,9 +387,9 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if override_loc is not None:
             loc = override_loc
         else:
-            backend_fm = forward_batch.attn_backend.forward_metadata
+            backend_fm = self.forward_metadata
             loc = backend_fm.c4_loc if compressor.ratio == 4 else backend_fm.c128_loc
-        forward_batch.token_to_kv_pool.set_compress_buffer(
+        self.token_to_kv_pool.set_compress_buffer(
             compressor.layer_id,
             loc,
             kv,
@@ -409,6 +410,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_compressor: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.dp_attention import get_attention_tp_group
 
@@ -426,7 +428,8 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         weights, _ = c4_indexer.weights_proj(x)
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
 
-        c4_indexer.compressor(x, forward_batch)
+        if not skip_compressor:
+            c4_indexer.compressor(x, forward_batch)
 
         li_kv_dtype = getattr(c4_indexer.compressor, "li_kv_dtype", "bf16")
         if li_kv_dtype == "int8":
@@ -438,11 +441,11 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
                     dtype=torch.int32,
                     device=device,
                 )
-            li_cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
+            li_cmp_kv = self.token_to_kv_pool.get_compress_buffer(
                 c4_indexer.layer_id, True
             )
             li_kv_scale = (
-                forward_batch.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                self.token_to_kv_pool.get_compress_dequant_scale_buffer(
                     c4_indexer.layer_id, True
                 )
             )
@@ -453,7 +456,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         # bf16 fallback: per-request einsum + topk, slow but architecture-faithful
         seqlens_cpu = forward_batch.seq_lens_cpu
         end_pos = forward_batch.seq_lens.cumsum(dim=0)
-        page_table = forward_batch.attn_backend.forward_metadata.c4_page_table
+        page_table = self.forward_metadata.c4_page_table
         attn_tp_size = get_attention_tp_size()
         topk_idxs: list[torch.Tensor] = []
         for i, _end_token in enumerate(end_pos):
@@ -462,7 +465,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
                 forward_batch, seq_i // ratio, page_table, i, seq_i // ratio
             )
             kv_cache_value = (
-                forward_batch.token_to_kv_pool.get_compress_buffer(
+                self.token_to_kv_pool.get_compress_buffer(
                     c4_indexer.layer_id, True, kv_indices
                 )
             )
@@ -547,7 +550,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         import torch_npu
 
         q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
-        fm = forward_batch.attn_backend.forward_metadata
+        fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
         kwargs = dict(
             query=q_int8,
@@ -580,10 +583,13 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         alt_streams=None,
         enable_multi_stream: bool = False,
         q_lora_ready=None,
+        skip_compressor: bool = False,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        topk_idxs = self.forward_c4_indexer_npu(c4_indexer, x, q_lora, forward_batch)
+        topk_idxs = self.forward_c4_indexer_npu(
+            c4_indexer, x, q_lora, forward_batch, skip_compressor=skip_compressor
+        )
         self.forward_metadata.c4_topk_indices = topk_idxs
 
 
@@ -656,25 +662,27 @@ class DeepseekV4AscendAttnBackend(
             device=device,
         )
 
-    def init_forward_metadata_capture_cuda_graph(
+    def init_forward_metadata_out_graph(
         self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: "ForwardMode",
-        spec_info: Optional["SpecInput"],
+        forward_batch: "ForwardBatch",
+        in_capture: bool = False,
     ):
-        super().init_forward_metadata_capture_cuda_graph(
-            bs=bs,
-            num_tokens=num_tokens,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-        )
+        # Parent creates+refreshes the shared (block_tables / seq_lens) metadata and
+        # points self.forward_metadata at graph_metadata[bs]. We then layer the DSV4
+        # fields on top: capture allocates+zeros them; replay refreshes them in place.
+        # (Upstream's init_forward_metadata 3-method ABC replaced the old
+        # capture/replay overrides and the _replay_forward_batch side channel; the
+        # replay forward_batch now arrives here directly as build_replay_fb_view.)
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        bs = forward_batch.batch_size
+        if in_capture:
+            self._init_dsv4_graph_metadata(bs, forward_batch.forward_mode)
+        else:
+            self._apply_dsv4_graph_metadata(forward_batch)
+
+    def _init_dsv4_graph_metadata(
+        self, bs: int, forward_mode: "ForwardMode"
+    ) -> None:
         metadata = self.graph_metadata[bs]
         device = self.device
 
@@ -736,36 +744,13 @@ class DeepseekV4AscendAttnBackend(
 
         self.forward_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: "ForwardMode",
-        spec_info: Optional["SpecInput"],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        super().init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=seq_lens_sum,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=seq_lens_cpu,
-        )
+    def _apply_dsv4_graph_metadata(self, forward_batch: "ForwardBatch") -> None:
         fm = self.forward_metadata
-
-        forward_batch = getattr(self, "_replay_forward_batch", None)
-        if forward_batch is None:
-            raise RuntimeError(
-                "V4 graph replay called without a forward_batch — "
-                "cuda_graph_runner.replay_prepare must set "
-                "attn_backend._replay_forward_batch before calling replay_cuda_graph."
-            )
+        forward_mode = forward_batch.forward_mode
+        bs = forward_batch.batch_size
+        seq_lens = forward_batch.seq_lens
+        req_pool_indices = forward_batch.req_pool_indices
+        device = seq_lens.device
 
         if (
             forward_mode.is_target_verify()
@@ -776,31 +761,30 @@ class DeepseekV4AscendAttnBackend(
         else:
             tokens_per_bs = 1
 
+        seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None, (
-            "V4 graph replay requires seq_lens_cpu — buffers.seq_lens is stale on "
+            "V4 graph replay requires seq_lens_cpu - buffers.seq_lens is stale on "
             "NPU (Graph.update only refreshes fm.actual_seq_lengths_kv inside the "
             "captured graph, not the device-side buffers.seq_lens)."
         )
         live_seq_lens = seq_lens_cpu[:bs].to(
-            device=seq_lens.device, dtype=torch.int32
+            device=device, dtype=torch.int32
         )
         fm.actual_seq_lengths_kv.copy_(live_seq_lens.clamp(min=1))
 
-        pool = forward_batch.token_to_kv_pool
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        pool = self.token_to_kv_pool
         out_cache_loc = forward_batch.out_cache_loc
-        device = seq_lens.device
 
         result = self._compute_compress_locs(
             pool=pool,
-            req_to_token=req_to_token,
+            req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices[:bs],
             seq_lens=live_seq_lens,
             out_cache_loc=out_cache_loc,
             is_decode=forward_mode.is_decode(),
             bs=bs,
             device=device,
-            req_to_token_pool=forward_batch.req_to_token_pool,
+            req_to_token_pool=self.req_to_token_pool,
             out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
             is_graph=True,
         )
@@ -1079,7 +1063,7 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor],
     ) -> torch.Tensor:
         fm = self.forward_metadata
-        pool = forward_batch.token_to_kv_pool
+        pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 
         attn_kwargs = dict(
@@ -1109,7 +1093,7 @@ class DeepseekV4AscendAttnBackend(
         compress_ratio: int,
     ) -> torch.Tensor:
         fm = self.forward_metadata
-        pool = forward_batch.token_to_kv_pool
+        pool = self.token_to_kv_pool
         metadata = fm.kernel_metadata.get(f"c{compress_ratio}a_metadata")
         cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
 
@@ -1165,7 +1149,7 @@ class DeepseekV4AscendAttnBackend(
         return out
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
-        pool = forward_batch.token_to_kv_pool
+        pool = self.token_to_kv_pool
         swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
         pool.set_swa_buffer(
             layer_id=layer_id,
@@ -1183,7 +1167,7 @@ def _get_kv_indices(
 ) -> torch.Tensor:
     logic_start = max(0, seqlen - kv_len)
     logic_end = seqlen
-    page_size = forward_batch.attn_backend.page_size
+    page_size = get_attn_backend().page_size
     if page_size == 1:
         return page_table[req_idx, logic_start:logic_end]
     logic_pos = torch.arange(logic_start, logic_end, device=page_table.device)

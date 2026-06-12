@@ -11,6 +11,9 @@ from sglang.jit_kernel.utils import (
 )
 
 from .utils import make_name
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 @cache_once
@@ -175,6 +178,17 @@ def silu_and_mul_clamp(
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
+    if _is_npu:
+        # NPU has no tvm_ffi JIT toolchain; replicate SiluAndMulClampKernel
+        # (silu_and_mul_masked_post_quant.cuh): clamp in input dtype, then
+        # silu(gate) * up in fp32, cast back to the output dtype.
+        d = input.shape[-1] // 2
+        gate = torch.clamp(input[..., :d], max=swiglu_limit)
+        up = torch.clamp(input[..., d:], min=-swiglu_limit, max=swiglu_limit)
+        g = gate.to(torch.float32)
+        u = up.to(torch.float32)
+        output.copy_((g / (1.0 + torch.exp(-g)) * u).to(output.dtype))
+        return
     module = _jit_silu_and_mul_clamp_module(input.dtype)
     module.run(input, output, float(swiglu_limit))
 

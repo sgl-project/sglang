@@ -156,6 +156,7 @@ def build_replay_fb_view(
         seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
     )
 

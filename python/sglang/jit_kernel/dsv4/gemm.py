@@ -2,9 +2,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -16,6 +17,10 @@ _linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
 def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     if _use_aiter:
         return tgemm.mm(x, y, otype=x.dtype).float()
+    elif _is_npu:
+        # NPU lacks the aten::mm.dtype (out_dtype=) overload and silently falls
+        # back to CPU; upcast inputs to fp32 and run a plain mm for fp32 output.
+        return torch.mm(x.to(torch.float32), y.to(torch.float32).t())
     elif _linear_bf16_fp32_algo == "deep_gemm":
         z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
         deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
