@@ -1089,6 +1089,11 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
+    def maybe_run_spec_startup_profiling(self) -> None:
+        """Run optional speculative-decoding profiling before serving."""
+        if self.draft_worker is not None:
+            self.draft_worker.run_startup_spec_profiling(self.tree_cache)
+
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
@@ -5793,6 +5798,8 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+
+        scheduler.maybe_run_spec_startup_profiling()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
