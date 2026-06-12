@@ -74,7 +74,7 @@ void build_tree_kernel_efficient_cpu(
 
   auto* parent_ptr = parent_list.data_ptr<int64_t>();
   auto* sel_ptr = selected_index.data_ptr<int64_t>();
-  auto* seqlen_ptr = verified_seq_len.data_ptr<int32_t>();
+  auto* seqlen_ptr = verified_seq_len.data_ptr<int64_t>();
   auto* pos_ptr = positions.data_ptr<int64_t>();
   auto* ri_ptr = retrive_index.data_ptr<int64_t>();
   auto* rnt_ptr = retrive_next_token.data_ptr<int64_t>();
@@ -191,8 +191,7 @@ void assign_req_to_token_pool_cpu(
     const at::Tensor& start_offset,
     const at::Tensor& end_offset,
     const at::Tensor& out_cache_loc,
-    int64_t pool_len,
-    int64_t bs_upper) {
+    int64_t pool_len) {
   int64_t batch_size = req_pool_indices.size(0);
   auto* rpi_ptr = req_pool_indices.data_ptr<int32_t>();
   auto* rtt_ptr = req_to_token.data_ptr<int32_t>();

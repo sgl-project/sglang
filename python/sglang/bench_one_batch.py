@@ -600,15 +600,7 @@ class _SpecBenchRunner:
         # req_to_token rows survive `clear()` (it only resets the free
         # lists) and are re-exposed when the next run reuses the same
         # req_pool_indices. Zero them so every run starts from the same
-        # all-zero mapping table as a fresh engine (bit-reproducible runs).
-        # Historical note: the accept-length collapse this used to paper
-        # over (~3.0 -> ~1.6 on the second run with EAGLE topk=4) was really
-        # caused by decode() below not advancing kv_committed_len: with
-        # committed lagging seq_lens, eagle_info_v2.prepare_for_decode
-        # under-writes the rows and the draft/verify gathers read past the
-        # written watermark, picking up stale slot ids. With the bookkeeping
-        # mirrored correctly, stale rows are never read; this zero_() is
-        # determinism hygiene, not a correctness fix.
+        # all-zero mapping table as a fresh engine.
         self.model_runner.req_to_token_pool.req_to_token.zero_()
 
     @torch.no_grad()

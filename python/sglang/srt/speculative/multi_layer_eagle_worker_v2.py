@@ -365,7 +365,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                             (tree_info[2].size(0), 1),
                             i,
                             dtype=torch.long,
-                            device="cpu" if _is_cpu else "cuda",
+                            device=tree_info[2].device,
                         )
                     )
 

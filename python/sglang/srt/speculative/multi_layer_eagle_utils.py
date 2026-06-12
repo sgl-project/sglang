@@ -19,11 +19,11 @@ from sglang.srt.utils import is_cpu
 _is_cpu = is_cpu()
 
 if _is_cpu:
-    from sgl_kernel import rotate_input_ids_cpu as _rotate_input_ids_cpp
+    from sgl_kernel import rotate_input_ids_cpu
 else:
     from sglang.srt.speculative.triton_ops.multi_layer_eagle import (
-        assign_hidden_states_pool_triton as _assign_hidden_states_pool_triton_gpu,
-        rotate_input_ids_triton as _rotate_input_ids_triton_gpu,
+        assign_hidden_states_pool_triton,
+        rotate_input_ids_triton,
     )
 
 from sglang.srt.speculative.triton_ops.multi_layer_eagle import (
@@ -36,29 +36,19 @@ def rotate_input_ids(
     input_ids, extend_start_loc, extend_seq_lens, topk_index, select_index=None
 ):
     if _is_cpu:
-        # _rotate_input_ids_cpp requires int64 tensors; input_ids is mutated in
-        # place and may be int32, so rotate an int64 copy and write it back.
-        if extend_start_loc.dtype != torch.int64:
-            extend_start_loc = extend_start_loc.to(torch.int64)
-        if extend_seq_lens.dtype != torch.int64:
-            extend_seq_lens = extend_seq_lens.to(torch.int64)
-        if topk_index.dtype != torch.int64:
-            topk_index = topk_index.to(torch.int64)
-        if select_index is not None and select_index.dtype != torch.int64:
-            select_index = select_index.to(torch.int64)
-        input_ids64 = (
-            input_ids if input_ids.dtype == torch.int64 else input_ids.to(torch.int64)
+        # rotate_input_ids_cpu mutates input_ids in place (callers rely on
+        # this) and requires int64 tensors; extend_* may arrive int32.
+        rotate_input_ids_cpu(
+            input_ids,
+            extend_start_loc.to(torch.int64),
+            extend_seq_lens.to(torch.int64),
+            topk_index.to(torch.int64),
+            select_index.to(torch.int64) if select_index is not None else None,
         )
-        _rotate_input_ids_cpp(
-            input_ids64, extend_start_loc, extend_seq_lens, topk_index, select_index
-        )
-        if input_ids64 is not input_ids:
-            input_ids.copy_(input_ids64)
-    else:
-        return _rotate_input_ids_triton_gpu(
-            input_ids, extend_start_loc, extend_seq_lens, topk_index, select_index
-        )
-    return input_ids
+        return input_ids
+    return rotate_input_ids_triton(
+        input_ids, extend_start_loc, extend_seq_lens, topk_index, select_index
+    )
 
 
 def assign_hidden_states_pool(
@@ -81,7 +71,7 @@ def assign_hidden_states_pool(
             extend_start_loc,
         )
     else:
-        _assign_hidden_states_pool_triton_gpu(
+        assign_hidden_states_pool_triton(
             hidden_states,
             req_pool_indices,
             req_to_hidden_states_pool,

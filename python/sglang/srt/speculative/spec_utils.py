@@ -191,7 +191,6 @@ def assign_req_to_token_pool_func(
             end_offset.to(torch.int32),
             out_cache_loc,
             req_to_token.shape[1],
-            next_power_of_2(batch_size),
         )
     else:
         assign_req_to_token_pool[(batch_size,)](

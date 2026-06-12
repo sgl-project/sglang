@@ -203,7 +203,7 @@ def build_tree_kernel_efficient(
         sgl_build_tree_kernel_efficient_cpu(
             parent_list,
             top_scores_index,
-            seq_lens.to(torch.int32),
+            seq_lens,
             tree_mask,
             positions,
             retrieve_index,

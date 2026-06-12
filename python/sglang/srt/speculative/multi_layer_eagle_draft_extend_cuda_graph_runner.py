@@ -437,10 +437,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch,
             )
 
-            # Chain-style MTP: overwrite buffers.hidden_states with the draft model's
-            # output (hidden_states_before_norm) so that assign_new_state
-            # propagates each MTP layer's own output to the next MTP layer,
-            # rather than always feeding the target model's hidden states.
             if (
                 self.eagle_worker.chain_mtp_hidden_states
                 and ret.hidden_states is not None

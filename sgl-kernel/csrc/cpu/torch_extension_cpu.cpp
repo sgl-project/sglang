@@ -86,8 +86,7 @@ void assign_req_to_token_pool_cpu(
     const at::Tensor& start_offset,
     const at::Tensor& end_offset,
     const at::Tensor& out_cache_loc,
-    int64_t pool_len,
-    int64_t bs_upper);
+    int64_t pool_len);
 
 at::Tensor build_draft_decode_metadata_cpu(
     const at::Tensor& req_to_token,
@@ -579,7 +578,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "assign_req_to_token_pool_cpu(Tensor req_pool_indices, Tensor(a!) req_to_token, "
       "Tensor start_offset, Tensor end_offset, Tensor out_cache_loc, "
-      "int pool_len, int bs_upper) -> ()");
+      "int pool_len) -> ()");
   m.impl("assign_req_to_token_pool_cpu", torch::kCPU, &assign_req_to_token_pool_cpu);
 
   m.def(

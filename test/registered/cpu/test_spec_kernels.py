@@ -18,8 +18,6 @@ PAD_SLOT_ID = -1
 
 
 def _topk1_chain_inputs(bs, num_steps):
-    # Mirrors EAGLEWorkerV2._rebuild_topk1_chain_buffers: for topk=1 the tree
-    # degenerates to a chain with runtime-invariant parent_list / selected_index.
     parent_width = num_steps if num_steps > 1 else 0
     parent_list = torch.arange(-1, parent_width - 1, dtype=torch.int64).repeat(bs, 1)
     selected_index = torch.arange(num_steps, dtype=torch.int64).repeat(bs, 1)
@@ -137,7 +135,7 @@ def _run_build_tree_kernel(
     torch.ops.sgl_kernel.build_tree_kernel_efficient_cpu(
         parent_list,
         selected_index,
-        seq_lens.to(torch.int32),
+        seq_lens,
         tree_mask,
         positions,
         retrieve_index,
@@ -894,7 +892,6 @@ class TestAssignCacheLocKernels(CustomTestCase):
             end_offset,
             out_cache_loc,
             pool_len,
-            4,  # bs_upper = next_power_of_2(bs)
         )
         offset = 0
         for i in range(bs):

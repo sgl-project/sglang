@@ -185,7 +185,6 @@ def assign_req_to_token_pool_cpu(
     end_offset: torch.Tensor,
     out_cache_loc: torch.Tensor,
     pool_len: int,
-    bs_upper: int,
 ) -> None:
     torch.ops.sgl_kernel.assign_req_to_token_pool_cpu(
         req_pool_indices,
@@ -194,7 +193,6 @@ def assign_req_to_token_pool_cpu(
         end_offset,
         out_cache_loc,
         pool_len,
-        bs_upper,
     )
 
 

@@ -486,7 +486,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a=a,
                 b=b,
                 ssm_states=ssm_states,
-                # [:batch_size] slices are zero-copy no-ops on CUDA (triton reads only the first N entries); required by the CPU kernel's length validation.
                 cache_indices=cache_indices[:batch_size],
                 query_start_loc=query_start_loc,
                 intermediate_states_buffer=intermediate_state_cache,
