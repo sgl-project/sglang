@@ -390,8 +390,13 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         "sglang.multimodal_gen.runtime.layers.attention.selector.get_global_server_args",
         return_value=SimpleNamespace(attention_backend=None),
     )
+    @patch(
+        "sglang.multimodal_gen.runtime.models.dits.flux.get_tp_world_size",
+        return_value=1,
+    )
     def test_flux_single_transformer_block_modelopt_excludes_use_full_prefix(
         self,
+        _mock_tp_world_size,
         _mock_server_args,
         _mock_ring_world_size,
         _mock_tp_group,
