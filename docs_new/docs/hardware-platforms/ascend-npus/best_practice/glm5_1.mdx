@@ -1186,9 +1186,9 @@ do
         --disaggregation-mode prefill \
         --host ${P_IP[$i]} \
         --port 8000 \
-        --dist-init-addr ${P_IP[$((i / 2 * 2))]}:5000 \
-        --disaggregation-bootstrap-port $((8998 + i / 2)) \
-        --node-rank $((i % 2)) \
+        --dist-init-addr ${P_IP[$(( $i / 2 * 2 ))]}:5000 \
+        --disaggregation-bootstrap-port $((8998 + $i / 2)) \
+        --node-rank $(( $i % 2 )) \
         --tp-size 4 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -1389,7 +1389,8 @@ do
         --disaggregation-mode prefill \
         --host ${P_IP[$i]} \
         --port 8000 \
-        --disaggregation-bootstrap-port $((8998 + i)) \
+        --disaggregation-bootstrap-port $((8998 + $i)) \
+        --node-rank 0 \
         --tp-size 4 \
         --nnodes 1 \
         --mem-fraction-static 0.72 \
