@@ -557,8 +557,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # node values are whole page-aligned page runs, so the page indices
         # can be derived with a fixed-shape strided slice instead: no sync,
         # pure async kernels.
+        # self.page_size (not the allocator's) is the contract that node
+        # values are page-aligned: the tree is built with it.
         allocator = self.token_to_kv_pool_allocator
-        page_size = allocator.page_size
+        page_size = self.page_size
         freed_values = []
 
         num_evicted = 0
