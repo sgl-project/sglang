@@ -302,28 +302,36 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            # vLLM (and similar) emit usage-only chunks with
+                            # an empty `choices` list when stream_options
+                            # include_usage is set; sglang itself emits a
+                            # final chunk with empty `text` that carries the
+                            # usage summary. Both must be tolerated, mirroring
+                            # the chat path's handling.
+                            choices = data.get("choices") or []
+                            choice = choices[0] if choices else {}
+                            text = choice.get("text") or ""
+
+                            if text:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
+                                    ttft = timestamp - st
                                     output.ttft = ttft
-
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
+                                    output.text_chunks.append(text)
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
+                                generated_text += text
+
+                            # Always update output_len from the usage summary
+                            # if present; the trailing chunk has no text but
+                            # carries the authoritative completion_tokens.
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
 
                     output.generated_text = generated_text
                     output.success = True
