@@ -1,7 +1,7 @@
 """Benchmark fused_sigmoid_mul: auto-dispatch vs PyTorch eager.
 
-The auto-dispatch path uses strided Triton kernel for small batch (decode)
-and falls back to PyTorch for large batch (prefill).
+The auto-dispatch path uses a strided Triton kernel for Qwen3.5 MoE attention
+output gates.
 
 Both paths start from a strided 3D gate (from torch.chunk) to ensure
 a fair comparison — the reshape/contiguous cost is included.
@@ -12,15 +12,15 @@ import triton
 
 from sglang.srt.layers.elementwise import fused_sigmoid_mul
 
-NUM_HEADS = 28
-HEAD_DIM = 128
-HIDDEN_DIM = NUM_HEADS * HEAD_DIM  # 3584
+NUM_HEADS = 32
+HEAD_DIM = 256
+HIDDEN_DIM = NUM_HEADS * HEAD_DIM  # 8192
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["num_tokens"],
-        x_vals=[1, 4, 16, 64, 512, 1024, 2048, 8192],
+        x_vals=[1, 2, 4, 8, 16, 1024, 2048, 4096, 8192],
         line_arg="impl",
         line_vals=["auto", "auto_inplace", "pytorch_from_strided"],
         line_names=[
@@ -30,7 +30,7 @@ HIDDEN_DIM = NUM_HEADS * HEAD_DIM  # 3584
         ],
         styles=[("blue", "-"), ("green", "-"), ("orange", "--")],
         ylabel="us",
-        plot_name="fused_sigmoid_mul_auto_dispatch",
+        plot_name="fused_sigmoid_mul_qwen3_5_moe_target",
         args={},
     )
 )

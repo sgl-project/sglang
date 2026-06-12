@@ -538,21 +538,23 @@ def _fused_sigmoid_mul_kernel(
     gate_ptr,
     gate_stride_row,
     gate_stride_head,
-    hidden_dim,
+    hidden_dim: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     pid_row = tl.program_id(0).to(tl.int64)
-    pid_head = tl.program_id(1)
+    pid_block = tl.program_id(1)
 
-    d_offsets = tl.arange(0, BLOCK_D)
-    mask = d_offsets < HEAD_DIM
+    offsets = pid_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offsets < hidden_dim
+    head = offsets // HEAD_DIM
+    d = offsets - head * HEAD_DIM
 
-    attn_off = pid_row * hidden_dim + pid_head * HEAD_DIM + d_offsets
+    attn_off = pid_row * hidden_dim + offsets
     attn = tl.load(attn_output_ptr + attn_off, mask=mask, other=0.0).to(tl.float32)
 
-    gate_off = pid_row * gate_stride_row + pid_head * gate_stride_head + d_offsets
+    gate_off = pid_row * gate_stride_row + head * gate_stride_head + d
     g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0).to(tl.float32)
 
     result = attn * tl.sigmoid(g)
@@ -569,8 +571,8 @@ def fused_sigmoid_mul(
 
     Equivalent to: attn_output * sigmoid(gate)
 
-    Only beneficial when num_tokens <= 512 (decode). For larger batches,
-    PyTorch eager (attn_output * torch.sigmoid(gate)) is faster.
+    The production Qwen3.5 path passes a 3D strided gate. A single hidden-block
+    Triton kernel handles both that path and flat contiguous inputs.
 
     When inplace=True, writes result back to attn_output and returns it.
 
@@ -590,15 +592,15 @@ def fused_sigmoid_mul(
         assert (
             attn_output.shape == gate.shape
         ), "attn_output and gate must have the same shape"
-        num_tokens, hidden_dim = attn_output.shape[0], attn_output.shape[-1]
-        num_heads = 1
+        hidden_dim = attn_output.shape[-1]
+        num_tokens = attn_output.numel() // hidden_dim
         head_dim = hidden_dim
         gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
 
     out = attn_output if inplace else torch.empty_like(attn_output)
-    BLOCK_D = triton.next_power_of_2(head_dim)
-    grid = (num_tokens, num_heads)
+    block_h = 1024 if num_tokens < 1024 else 2048
+    grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
     _fused_sigmoid_mul_kernel[grid](
         out,
         attn_output,
@@ -607,8 +609,8 @@ def fused_sigmoid_mul(
         gate_stride_head,
         hidden_dim,
         HEAD_DIM=head_dim,
-        BLOCK_D=BLOCK_D,
-        num_warps=min(max(BLOCK_D // 32, 1), 8),
+        BLOCK_H=block_h,
+        num_warps=4,
     )
     return out
 
@@ -683,6 +685,9 @@ def fused_gate_sigmoid_mul_add(
             min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
         ),
     }
+
+    if num_tokens >= 1024:
+        config["num_warps"] = min(config["num_warps"], 8)
 
     pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 

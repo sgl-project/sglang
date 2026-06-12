@@ -1,7 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-
 import itertools
 
 import pytest
@@ -10,7 +6,7 @@ import torch
 from sglang.srt.layers.elementwise import fused_sigmoid_mul
 
 DTYPES = [torch.float16, torch.bfloat16]
-TOKEN_COUNTS = [1, 4, 16, 64, 512, 1024, 2048, 8192]
+TOKEN_COUNTS = [1, 2, 4, 8, 16, 64, 512, 1024, 2048, 4096, 8192]
 HIDDEN_DIMS = [2048, 3072, 4096, 6144]
 NUM_HEADS = [1, 28]
 
@@ -81,6 +77,27 @@ def test_strided_gate(num_tokens, num_heads, dtype):
     gate_flat = gate.reshape(num_tokens, hidden_dim)
 
     ref = _reference(attn_output, gate_flat)
+    out = fused_sigmoid_mul(attn_output, gate, inplace=False)
+
+    torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    "num_tokens, dtype", list(itertools.product(TOKEN_COUNTS, DTYPES))
+)
+def test_qwen3_5_moe_target_strided_gate(num_tokens, dtype):
+    """Qwen3.5 MoE target config: 32 attention heads, head_dim 256."""
+    rtol, atol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
+    num_heads, head_dim = 32, 256
+    hidden_dim = num_heads * head_dim
+
+    q_gate = torch.randn(
+        num_tokens, num_heads, 2 * head_dim, dtype=dtype, device="cuda"
+    )
+    _, gate = torch.chunk(q_gate, 2, dim=-1)
+    attn_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+
+    ref = _reference(attn_output, gate.reshape(num_tokens, hidden_dim))
     out = fused_sigmoid_mul(attn_output, gate, inplace=False)
 
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)

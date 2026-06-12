@@ -1,7 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-
 import itertools
 
 import pytest
@@ -10,7 +6,7 @@ import torch
 from sglang.srt.layers.elementwise import fused_gate_sigmoid_mul_add
 
 DTYPES = [torch.float16, torch.bfloat16]
-TOKEN_COUNTS = [1, 4, 16, 64, 512, 1024, 2048, 8192]
+TOKEN_COUNTS = [1, 2, 4, 8, 16, 64, 512, 1024, 2048, 4096, 8192]
 HIDDEN_DIMS = [2048, 3072, 4096, 6144]
 
 
