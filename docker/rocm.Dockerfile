@@ -646,7 +646,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/rocm_sysdeps/lib/cmake:${ROCM_HOME}/lib/cmake:${ROCM_HOME} \
     pip install -e . --no-build-isolation; \
   else \
-    pip install -e .; \
+    python3 setup.py develop;  \
   fi; \
   python3 -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))" > /etc/ld.so.conf.d/torch.conf; \
   ldconfig; \

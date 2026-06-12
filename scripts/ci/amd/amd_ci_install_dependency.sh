@@ -196,6 +196,20 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
   MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
 
+  ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || echo unknown')
+
+  # Check if ROCm version >= 7.14.0
+  if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.14.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
+    echo "[MORI] ROCm version ${ROCM_VERSION} >= 7.14.0 detected"
+    ROCM_PATH=${ROCM_HOME}
+    PATH=${ROCM_HOME}/bin:${PATH}
+    CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/rocm_sysdeps/lib/cmake:${ROCM_HOME}/lib/cmake:${ROCM_HOME}
+    LEGACY_EDITABLE_INSTALL=0
+  else
+    echo "[MORI] ROCm version ${ROCM_VERSION} < 7.14.0 or unknown"
+    LEGACY_EDITABLE_INSTALL=1
+  fi
+
   if [[ "${GPU_ARCH}" == "mi35x" ]]; then
     MORI_GPU_ARCHS="gfx950"
   else
@@ -211,7 +225,11 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
-    python3 setup.py develop
+    if [[ '${LEGACY_EDITABLE_INSTALL}' == 1 ]]; then
+      python3 setup.py develop
+    else
+      python3 -m pip install -e . --no-build-isolation
+    fi
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
     ldconfig
   "
@@ -329,11 +347,26 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
-    # build AITER
-    docker exec ci_sglang bash -c "
-        cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
-    "
+    # Detect ROCm version for build method selection
+    ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || cat /opt/rocm/.info/version 2>/dev/null || echo unknown')
+    echo "[CI-AITER-CHECK] ROCm version=${ROCM_VERSION}"
+
+    # build AITER with ROCm 7.14 awareness
+    if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.14.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
+        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} >= 7.14.0 detected, using pip install --no-build-isolation"
+        docker exec ci_sglang bash -c "
+            set -euo pipefail
+            cd /sgl-workspace/aiter
+            export AITER_USE_SYSTEM_TRITON=1
+            PATH=\$ROCM_HOME/llvm/bin:\$PATH GPU_ARCHS=${GPU_ARCH_LIST} pip install --no-build-isolation -e .
+        "
+    else
+        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} < 7.14.0 or unknown, using setup.py develop"
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        "
+    fi
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi
