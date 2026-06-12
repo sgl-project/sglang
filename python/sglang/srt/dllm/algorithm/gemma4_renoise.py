@@ -132,8 +132,11 @@ class Gemma4Renoise(DllmAlgorithm):
             logits = (out.logits_output.full_logits / self._temperature(step)).view(
                 bs, L, -1
             )
-            token_entropy = torch.distributions.Categorical(logits=logits).entropy()
-            probs = torch.softmax(logits, dim=-1)
+            # One log_softmax pass yields both probs and entropy (the
+            # Categorical equivalent allocates extra full-vocab buffers).
+            log_probs = torch.log_softmax(logits, dim=-1)
+            probs = torch.exp(log_probs)
+            token_entropy = -torch.sum(probs * log_probs, dim=-1)
             denoiser = torch.multinomial(
                 probs.reshape(bs * L, -1), num_samples=1, generator=gen
             ).view(bs, L)
@@ -155,6 +158,9 @@ class Gemma4Renoise(DllmAlgorithm):
             if bool(done.all()):
                 break
 
+        # One D2H copy for the whole batch, so the scheduler's per-request
+        # tolist() reads host memory.
+        argmax = argmax.cpu()
         next_token_ids = [argmax[i] for i in range(bs)]
         return out.logits_output, next_token_ids, out.can_run_graph
 
