@@ -13,8 +13,8 @@ from typing import (
 )
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import ReqPhase
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import ReqPhase
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
