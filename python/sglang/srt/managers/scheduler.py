@@ -527,8 +527,19 @@ class Scheduler(
         # Init profiler
         self.init_profiler()
 
-        # Init prefill-decodedisaggregation
+        # Init prefill-decode disaggregation
         self.init_disaggregation()
+        if self.server_args.grpc_mode:
+            if self.max_queued_requests is None:
+                logger.info(
+                    "gRPC mode queue limit is INACTIVE: "
+                    "--max-queued-requests is not set"
+                )
+            else:
+                logger.info(
+                    "gRPC mode queue limit is ACTIVE: "
+                    f"max_queued_requests={self.max_queued_requests}"
+                )
 
         # Init overlap schedule
         self.init_overlap()
@@ -2186,12 +2197,16 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self._abort_on_disagg_queued_limit(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if not is_retracted and self._abort_on_disagg_queued_limit(req):
+                return
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
@@ -2273,6 +2288,73 @@ class Scheduler(
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
+
+    def _abort_on_disagg_queued_limit(self, recv_req: Req) -> bool:
+        """Abort an incoming request if disagg queues exceed max_queued_requests.
+
+        Counts requests across ALL disaggregation pipeline stages, not just the
+        waiting queue. In PD mode the bottleneck is typically the bootstrap/prealloc
+        queue (where requests wait for cross-engine handshakes and KV cache
+        allocation), so checking only waiting_queue misses the real backlog.
+
+        Returns True if the incoming request is aborted.
+        """
+        if not self.server_args.grpc_mode:
+            return False
+        if self.max_queued_requests is None:
+            return False
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            bootstrap_depth = len(self.disagg_prefill_bootstrap_queue.queue)
+            waiting_depth = len(self.waiting_queue)
+            inflight_depth = len(self.disagg_prefill_inflight_queue)
+            total_queued = bootstrap_depth + waiting_depth + inflight_depth
+            detail = (
+                f"bootstrap={bootstrap_depth}, waiting={waiting_depth}, "
+                f"inflight={inflight_depth}"
+            )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc_depth = len(self.disagg_decode_prealloc_queue.queue)
+            pending_depth = len(self.disagg_decode_prealloc_queue.pending_reqs)
+            transfer_depth = len(self.disagg_decode_prealloc_queue.transfer_queue.queue)
+            waiting_depth = len(self.waiting_queue)
+            total_queued = (
+                prealloc_depth + pending_depth + transfer_depth + waiting_depth
+            )
+            detail = (
+                f"prealloc={prealloc_depth}, pending={pending_depth}, "
+                f"transfer={transfer_depth}, waiting={waiting_depth}"
+            )
+        else:
+            total_queued = len(self.waiting_queue)
+            detail = f"waiting={total_queued}"
+
+        logger.debug(
+            f"Disagg {self.disaggregation_mode.name.lower()} admission check: "
+            f"total={total_queued} ({detail}), limit={self.max_queued_requests}"
+        )
+
+        if total_queued < self.max_queued_requests:
+            return False
+
+        message = (
+            f"The disaggregation request queue is full "
+            f"(total={total_queued} [{detail}], limit={self.max_queued_requests})."
+        )
+        logger.warning(f"Rejecting request {recv_req.rid}: {message}")
+        self.send_to_detokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=recv_req.rid,
+            ),
+            recv_req,
+        )
+        recv_req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        return True
 
     def _abort_on_waiting_timeout(self):
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
