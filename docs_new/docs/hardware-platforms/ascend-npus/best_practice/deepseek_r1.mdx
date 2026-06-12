@@ -77,10 +77,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
-
 P_IP=('<your prefill ip>')
 D_IP=('<your decode ip>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
+
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -363,10 +364,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
-
 P_IP=('<your prefill ip1>' '<your prefill ip2>')
 D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -472,7 +474,7 @@ done
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
-#   <your decode ip>: decode node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
 export SGLANG_DP_ROUND_ROBIN=1
@@ -481,7 +483,7 @@ python -m sglang_router.launch_router \
     --policy cache_aware \
     --prefill http://<your prefill ip1>:8000 8998 \
     --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip>:8001 \
+    --decode http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -557,10 +559,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
-
 P_IP=('<your prefill ip1>' '<your prefill ip2>')
 D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -668,7 +671,7 @@ done
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
-#   <your decode ip>: decode node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
 export SGLANG_DP_ROUND_ROBIN=1
@@ -677,7 +680,7 @@ python -m sglang_router.launch_router \
     --policy cache_aware \
     --prefill http://<your prefill ip1>:8000 8998 \
     --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip>:8001 \
+    --decode http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -751,10 +754,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
-
 P_IP=('<your prefill ip1>' '<your prefill ip2>')
 D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -860,7 +864,7 @@ done
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
-#   <your decode ip>: decode node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
 export SGLANG_DP_ROUND_ROBIN=1
@@ -869,7 +873,7 @@ python -m sglang_router.launch_router \
     --policy cache_aware \
     --prefill http://<your prefill ip1>:8000 8998 \
     --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip>:8001 \
+    --decode http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -943,10 +947,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
-
 P_IP=('<your prefill ip1>' '<your prefill ip2>')
 D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -1052,7 +1057,7 @@ done
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
-#   <your decode ip>: decode node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
 export SGLANG_DP_ROUND_ROBIN=1
@@ -1061,7 +1066,7 @@ python -m sglang_router.launch_router \
     --policy cache_aware \
     --prefill http://<your prefill ip1>:8000 8998 \
     --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip>:8001 \
+    --decode http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -1135,10 +1140,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
-
 P_IP=('<your prefill ip1>' '<your prefill ip2>')
 D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -1242,7 +1248,7 @@ done
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
-#   <your decode ip>: decode node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
 export SGLANG_DP_ROUND_ROBIN=1
@@ -1251,7 +1257,7 @@ python -m sglang_router.launch_router \
     --policy cache_aware \
     --prefill http://<your prefill ip1>:8000 8998 \
     --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip>:8001 \
+    --decode http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb

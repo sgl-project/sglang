@@ -70,10 +70,11 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
-
 P_IP=('<your prefill ip1>' '<your prefill ip2>')
 D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -180,14 +181,14 @@ done
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
-#   <your decode ip>: decode node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+    --decode http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -258,10 +259,11 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
-
 P_IP=('<your prefill ip1>' '<your prefill ip2>')
 D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -368,14 +370,14 @@ done
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
-#   <your decode ip>: decode node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+    --decode http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -446,10 +448,11 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
-
 P_IP=('<your prefill ip1>' '<your prefill ip2>')
 D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -556,14 +559,14 @@ done
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
-#   <your decode ip>: decode node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
 # ============================================================
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+    --decode http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
