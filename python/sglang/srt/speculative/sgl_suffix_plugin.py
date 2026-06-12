@@ -43,6 +43,25 @@ class _SuffixLike(CustomSpecAlgo):
 
         return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
 
+    def build_disagg_draft_input(
+        self,
+        batch,
+        server_args,
+        last_tokens_tensor,
+        future_map,
+    ):
+        # PD disaggregation: reconstruct the first decode batch's draft input
+        # on the decode instance (see suffix_disaggregation.py). SUFFIX is
+        # model-free, so unlike EAGLE nothing beyond the bonus token has to be
+        # shipped from the prefill instance.
+        from sglang.srt.speculative.suffix_disaggregation import (
+            build_suffix_disagg_draft_input,
+        )
+
+        return build_suffix_disagg_draft_input(
+            batch, server_args, last_tokens_tensor, future_map
+        )
+
 
 def _suffix_factory(server_args: "ServerArgs") -> Type:
     from sglang.srt.speculative.suffix_worker import SuffixWorker

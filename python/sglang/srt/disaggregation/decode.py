@@ -1896,6 +1896,12 @@ class SchedulerDisaggregationDecodeMixin:
             # if there are still retracted requests, we do not allocate new requests
             return
 
+        # Model-free spec (SUFFIX): drain one budgeted prewarm step per loop
+        # iteration (duck-typed; None / EAGLE draft workers have no such method).
+        prewarm_step = getattr(self.draft_worker, "prewarm_step", None)
+        if prewarm_step is not None:
+            prewarm_step()
+
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
             self.polling_interval = (
@@ -1907,6 +1913,12 @@ class SchedulerDisaggregationDecodeMixin:
         if self.polling_count % self.polling_interval == 0:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
             self.disagg_decode_transfer_queue.extend(req_conns)
+            # Model-free spec (SUFFIX): start rebuilding the per-request suffix
+            # tree while the KV transfer is in flight, so the build cost does
+            # not land on the first decode step.
+            prewarm = getattr(self.draft_worker, "prewarm_disagg_requests", None)
+            if prewarm is not None and req_conns:
+                prewarm([decode_req.req for decode_req in req_conns])
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
