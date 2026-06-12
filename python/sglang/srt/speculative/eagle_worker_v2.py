@@ -409,6 +409,18 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
             )
 
+    def _record_plan_input_ready(self):
+        # Fence for plan-stream upstream ordering: everything the verify /
+        # draft-extend plan reads or overwrites (batch inputs, the shared
+        # req_to_token cells draft just used) is enqueued on the fwd stream
+        # before this point.
+        if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+            evt = torch.get_device_module(self.device).Event()
+            evt.record(torch.get_device_module(self.device).current_stream())
+            self._plan_input_ready_evt = evt
+        else:
+            self._plan_input_ready_evt = None
+
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
@@ -433,6 +445,14 @@ class EagleDraftWorker(BaseDraftWorker):
         with canary_outside_ctx:
             # Run draft
             if can_cuda_graph:
+                # All draft-side req_to_token writes/reads (cache-loc assign +
+                # per-step metadata, enqueued by prepare_for_v2_draft) are in
+                # the fwd-stream queue at this point; the graph replay below is
+                # pure compute. Plan streams wait on this event so their
+                # req_to_token overwrite of the shared [seq_lens, seq_lens+N)
+                # cells orders after draft's accesses while still overlapping
+                # with the draft forward itself.
+                self._record_plan_input_ready()
                 parent_list, top_scores_index, draft_tokens = (
                     self.cuda_graph_runner.replay(forward_batch)
                 )
@@ -445,6 +465,9 @@ class EagleDraftWorker(BaseDraftWorker):
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
+                # Same fence as the cuda-graph branch: multi-step metadata
+                # (req_to_token reads) is fully enqueued, draft forward is not.
+                self._record_plan_input_ready()
                 parent_list, top_scores_index, draft_tokens = self.draft_forward(
                     forward_batch
                 )
@@ -732,6 +755,17 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Prepare for draft extend in a separate stream
+        # Order the plan stream after the same fence as verify (event recorded
+        # in draft(); verify outputs consumed here are covered by the
+        # replay-time input re-copy on the forward stream).
+        if self.plan_stream:
+            evt = getattr(self, "_plan_input_ready_evt", None)
+            if evt is not None:
+                self.plan_stream.wait_event(evt)
+            else:
+                self.plan_stream.wait_stream(
+                    torch.get_device_module(self.device).current_stream()
+                )
         with self.plan_stream_ctx:
             forward_batch = draft_extend_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
@@ -1196,6 +1230,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
+        # Order the plan stream after its upstream producers (event recorded in
+        # draft() once all req_to_token accesses are enqueued). Without this,
+        # the plan kernels race ahead of in-flight schedule/forward-stream
+        # writes (seq_lens etc.) and clobber the shared req_to_token cells
+        # draft is still reading. Fall back to a full wait_stream on paths
+        # that did not record the event.
+        if self.plan_stream:
+            evt = getattr(self.draft_worker, "_plan_input_ready_evt", None)
+            if evt is not None:
+                self.plan_stream.wait_event(evt)
+            else:
+                self.plan_stream.wait_stream(fwd_stream)
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
