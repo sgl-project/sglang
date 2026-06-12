@@ -13,6 +13,14 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
 )
+from sglang.srt.layers.cp.strategy import cp_active, get_cp_strategy, use_cp_v2
+from sglang.srt.layers.cp.utils import (
+    cp_all_gather_rerange_output,
+    cp_round_robin_input_ids,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
@@ -26,13 +34,6 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_round_robin_input_ids,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    prepare_context_parallel_metadata,
-)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -167,7 +168,11 @@ class DeepseekV4ModelNextN(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if dsa_use_prefill_cp(forward_batch):
+        if cp_active(forward_batch):
+            input_ids = getattr(forward_batch, "cp_v2_input_ids", input_ids)
+            if not get_moe_a2a_backend().is_none():
+                input_ids_global = input_ids
+        elif dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
             input_ids = cp_round_robin_input_ids(input_ids)
@@ -185,7 +190,13 @@ class DeepseekV4ModelNextN(nn.Module):
             # deferred fused hc_post state.
             hidden_states = self.decoder.hc_post(hidden_states, residual, post, comb)
 
-        if dsa_use_prefill_cp(forward_batch):
+        if cp_active(forward_batch):
+            hidden_states = get_cp_strategy().gather_tokens(
+                hidden_states,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+        elif dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
@@ -204,7 +215,6 @@ class DeepseekV4ModelNextN(nn.Module):
 
 
 class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -236,6 +246,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.use_cp_v2_model_runner_split = True
 
     @torch.no_grad()
     def forward(
@@ -243,8 +254,9 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp:
+        if not use_cp_v2() and self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
@@ -264,7 +276,9 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
 
-        hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)
+        hidden_states, pre_hc_head = self.model(
+            input_ids, positions, forward_batch, input_embeds
+        )
         return self.logits_processor(
             input_ids,
             hidden_states,

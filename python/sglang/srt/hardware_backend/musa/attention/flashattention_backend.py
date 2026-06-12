@@ -18,10 +18,10 @@ from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMultiStepBackend,
     merge_state_v2_wrapper,
 )
-from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import (
+from sglang.srt.layers.cp.utils import (
     cp_allgather_and_save_kv_cache,
 )
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.server_args import get_global_server_args
 
