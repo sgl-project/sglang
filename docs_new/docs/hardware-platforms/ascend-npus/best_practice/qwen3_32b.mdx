@@ -16,12 +16,12 @@ This section describes the best practice data for Qwen3-32B on the Ascend NPU.
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-32B | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms-gpqa) |
+| Qwen3-32B | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms) |
 
 
 ## Optimal Configuration
 
-### qwen3 32b bf16 8p in18k out4k 6ms
+### Qwen3-32B BF16 8P IN18K OUT4K 6ms
 
 **Model**: Qwen3-32B
 
@@ -64,8 +64,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_OP_EXPANSION_MODE=AIV
@@ -118,7 +116,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 32b w8a8 2p in3k5 out1k5 50ms gpqa
+### Qwen3-32B W8A8 2P IN3K5 OUT1K5 50ms
 
 **Model**: Qwen3-32B
 
@@ -161,8 +159,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_OP_EXPANSION_MODE=AIV

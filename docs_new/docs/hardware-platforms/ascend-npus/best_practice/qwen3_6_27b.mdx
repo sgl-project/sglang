@@ -10,10 +10,10 @@ This section describes the best practice data for Qwen3.6-27B on the Ascend NPU.
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024_30+1024 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-1p-in1024x1024-30-out1024-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-1p-in1024x1024-30-out1024-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-1p-in1080p-30-out256-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K (prefix90) | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-2p-in64k-out1k-prefix90-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in3k5-out1k5-50ms-gpqa) |
+| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-2p-in64k-out1k-prefix90-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in3k5-out1k5-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 128K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in128k-out1k-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 16K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in16k-out1k-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in64k-out1k-50ms) |
@@ -21,7 +21,7 @@ This section describes the best practice data for Qwen3.6-27B on the Ascend NPU.
 
 ## Optimal Configuration
 
-### qwen3 6 27b 1p in1024x1024 30 out1024 50ms
+### Qwen3.6-27B 1P IN1024X1024 30 OUT1024 50ms
 
 **Model**: Qwen3.6-27B
 
@@ -33,7 +33,9 @@ This section describes the best practice data for Qwen3.6-27B on the Ascend NPU.
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 1024x1024_30+1024
+**Dataset**: 1024x1024 (30)+1024
+
+*Format: resolution (input tokens) + output tokens*
 
 **TPOT**: 50ms
 
@@ -61,8 +63,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export GLOO_SOCKET_IFNAME=<network-interface>
@@ -122,7 +122,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 6 27b 1p in1080p 30 out256 50ms
+### Qwen3.6-27B 1P IN1080P 30 OUT256 50ms
 
 **Model**: Qwen3.6-27B
 
@@ -162,8 +162,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export GLOO_SOCKET_IFNAME=<network-interface>
@@ -223,7 +221,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 6 27b 2p in64k out1k prefix90 50ms
+### Qwen3.6-27B 2P IN64K OUT1K PREFIX90 50ms
 
 **Model**: Qwen3.6-27B
 
@@ -235,7 +233,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 64K+1K (prefix90)
+**Dataset**: 64K+1K (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -263,8 +261,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export GDN_ATTN_BACKEND_TRITON=1
@@ -323,7 +319,7 @@ python -m sglang.bench_serving \
     --extra-request-body repeat_rate=0.9
 ```
 
-### qwen3 6 27b w8a8 1p in3k5 out1k5 50ms gpqa
+### Qwen3.6-27B W8A8 1P IN3K5 OUT1K5 50ms
 
 **Model**: Qwen3.6-27B
 
@@ -363,8 +359,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export GLOO_SOCKET_IFNAME=<network-interface>
@@ -421,7 +415,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 6 27b w8a8 2p in128k out1k 50ms
+### Qwen3.6-27B W8A8 2P IN128K OUT1K 50ms
 
 **Model**: Qwen3.6-27B
 
@@ -461,8 +455,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export GLOO_SOCKET_IFNAME=<network-interface>
@@ -515,7 +507,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 6 27b w8a8 2p in16k out1k 50ms
+### Qwen3.6-27B W8A8 2P IN16K OUT1K 50ms
 
 **Model**: Qwen3.6-27B
 
@@ -555,8 +547,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export GLOO_SOCKET_IFNAME=<network-interface>
@@ -613,7 +603,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 6 27b w8a8 2p in64k out1k 50ms
+### Qwen3.6-27B W8A8 2P IN64K OUT1K 50ms
 
 **Model**: Qwen3.6-27B
 
@@ -653,8 +643,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export GLOO_SOCKET_IFNAME=<network-interface>

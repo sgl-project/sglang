@@ -26,7 +26,7 @@ This section describes the best practice data for DeepSeek-R1 on the Ascend NPU.
 
 ## Optimal Configuration
 
-### deepseek r1 w4a8 1p1d 16p in3k5 out1k5 41ms
+### DeepSeek-R1 W4A8 1P1D 16P IN3K5 OUT1K5 41ms
 
 **Model**: DeepSeek-R1
 
@@ -56,12 +56,10 @@ This section describes the best practice data for DeepSeek-R1 on the Ascend NPU.
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -69,12 +67,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export ENABLE_MOE_NZ=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -111,7 +105,6 @@ do
         --host ${P_IP[$i]} \
         --port 8000 \
         --disaggregation-bootstrap-port 8998 \
-        --node-rank 0 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.62 \
@@ -130,7 +123,7 @@ do
         --dp-size 8 \
         --enable-dp-attention \
         --disable-shared-experts-fusion \
-        --dtype bfloat16 \
+        --dtype bfloat16
         NODE_RANK=$i
         break
     fi
@@ -155,7 +148,6 @@ do
         --disaggregation-mode decode \
         --host ${D_IP[$i]} \
         --port 8001 \
-        --node-rank 0 \
         --nnodes 1 \
         --tp-size 16 \
         --dp-size 16 \
@@ -177,7 +169,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --tokenizer-worker-num 4 \
-        --load-balance-method round_robin \
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -218,7 +210,7 @@ python -m sglang.bench_serving \
     --request-rate 24
 ```
 
-### deepseek r1 w4a8 8p in3k5 out1k5 50.36ms
+### DeepSeek-R1 W4A8 8P IN3K5 OUT1K5 50.36ms
 
 **Model**: DeepSeek-R1
 
@@ -258,8 +250,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
@@ -322,7 +312,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### deepseek r1 w8a8 2p1d 32p in3k5 out1k5 18.9ms
+### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K5 18.9ms
 
 **Model**: DeepSeek-R1
 
@@ -352,12 +342,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -365,12 +353,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_NPU_USE_MLAPO=1
@@ -380,8 +364,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -405,8 +389,7 @@ do
         --disaggregation-mode prefill \
         --host ${P_IP[$i]} \
         --port 8000 \
-        --disaggregation-bootstrap-port $((8998+$i)) \
-        --node-rank 0 \
+        --disaggregation-bootstrap-port $((8998 + i)) \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -426,7 +409,7 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --enable-attn-tp-input-scattered \
+        --enable-attn-tp-input-scattered
         NODE_RANK=$i
         break
     fi
@@ -476,7 +459,7 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method round_robin \
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -486,7 +469,7 @@ done
 ```shell Command
 # ============================================================
 # Before running, replace the following placeholders:
-#   <your prefill ip>: prefill node IP address
+#   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip>: decode node IP address
 # ============================================================
 
@@ -494,8 +477,8 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --prefill http://<your prefill ip>:8000 8999 \
+    --prefill http://<your prefill ip1>:8000 8998 \
+    --prefill http://<your prefill ip2>:8000 8999 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
@@ -520,7 +503,7 @@ python -m sglang.bench_serving \
     --request-rate 16
 ```
 
-### deepseek r1 w8a8 2p1d 32p in3k5 out1k5 50ms
+### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K5 50ms
 
 **Model**: DeepSeek-R1
 
@@ -550,12 +533,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -563,12 +544,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -580,8 +557,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -608,8 +585,7 @@ do
         --disaggregation-mode prefill \
         --host ${P_IP[$i]} \
         --port 8000 \
-        --disaggregation-bootstrap-port $((8998+$i)) \
-        --node-rank 0 \
+        --disaggregation-bootstrap-port $((8998 + i)) \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.778 \
@@ -628,7 +604,7 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --enable-attn-tp-input-scattered \
+        --enable-attn-tp-input-scattered
         NODE_RANK=$i
         break
     fi
@@ -678,7 +654,7 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method round_robin \
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -688,7 +664,7 @@ done
 ```shell Command
 # ============================================================
 # Before running, replace the following placeholders:
-#   <your prefill ip>: prefill node IP address
+#   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip>: decode node IP address
 # ============================================================
 
@@ -696,8 +672,8 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --prefill http://<your prefill ip>:8000 8999 \
+    --prefill http://<your prefill ip1>:8000 8998 \
+    --prefill http://<your prefill ip2>:8000 8999 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
@@ -722,7 +698,7 @@ python -m sglang.bench_serving \
     --request-rate 40
 ```
 
-### deepseek r1 w8a8 2p1d 32p in3k5 out1k 19.0ms
+### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K 19.0ms
 
 **Model**: DeepSeek-R1
 
@@ -752,12 +728,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -765,12 +739,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_NPU_USE_MLAPO=1
@@ -780,8 +750,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -805,8 +775,7 @@ do
         --disaggregation-mode prefill \
         --host ${P_IP[$i]} \
         --port 8000 \
-        --disaggregation-bootstrap-port $((8998+$i)) \
-        --node-rank 0 \
+        --disaggregation-bootstrap-port $((8998 + i)) \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -826,7 +795,7 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --enable-attn-tp-input-scattered \
+        --enable-attn-tp-input-scattered
         NODE_RANK=$i
         break
     fi
@@ -876,7 +845,7 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method round_robin \
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -886,7 +855,7 @@ done
 ```shell Command
 # ============================================================
 # Before running, replace the following placeholders:
-#   <your prefill ip>: prefill node IP address
+#   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip>: decode node IP address
 # ============================================================
 
@@ -894,8 +863,8 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --prefill http://<your prefill ip>:8000 8999 \
+    --prefill http://<your prefill ip1>:8000 8998 \
+    --prefill http://<your prefill ip2>:8000 8999 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
@@ -920,7 +889,7 @@ python -m sglang.bench_serving \
     --request-rate 16
 ```
 
-### deepseek r1 w8a8 2p1d 32p in3k9 out1k 19.0ms
+### DeepSeek-R1 W8A8 2P1D 32P IN3K9 OUT1K 19.0ms
 
 **Model**: DeepSeek-R1
 
@@ -950,12 +919,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -963,12 +930,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_NPU_USE_MLAPO=1
@@ -978,8 +941,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -1003,8 +966,7 @@ do
         --disaggregation-mode prefill \
         --host ${P_IP[$i]} \
         --port 8000 \
-        --disaggregation-bootstrap-port $((8998+$i)) \
-        --node-rank 0 \
+        --disaggregation-bootstrap-port $((8998 + i)) \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -1024,7 +986,7 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --enable-attn-tp-input-scattered \
+        --enable-attn-tp-input-scattered
         NODE_RANK=$i
         break
     fi
@@ -1074,7 +1036,7 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method round_robin \
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -1084,7 +1046,7 @@ done
 ```shell Command
 # ============================================================
 # Before running, replace the following placeholders:
-#   <your prefill ip>: prefill node IP address
+#   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip>: decode node IP address
 # ============================================================
 
@@ -1092,8 +1054,8 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --prefill http://<your prefill ip>:8000 8999 \
+    --prefill http://<your prefill ip1>:8000 8998 \
+    --prefill http://<your prefill ip2>:8000 8999 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
@@ -1118,7 +1080,7 @@ python -m sglang.bench_serving \
     --request-rate 16
 ```
 
-### deepseek r1 w8a8 2p1d 32p in6k out1k6 20.5ms
+### DeepSeek-R1 W8A8 2P1D 32P IN6K OUT1K6 20.5ms
 
 **Model**: DeepSeek-R1
 
@@ -1148,12 +1110,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -1161,12 +1121,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_NPU_USE_MLAPO=1
@@ -1176,8 +1132,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -1201,8 +1157,7 @@ do
         --disaggregation-mode prefill \
         --host ${P_IP[$i]} \
         --port 8000 \
-        --disaggregation-bootstrap-port $((8998+$i)) \
-        --node-rank 0 \
+        --disaggregation-bootstrap-port $((8998 + i)) \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -1221,7 +1176,7 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --enable-attn-tp-input-scattered \
+        --enable-attn-tp-input-scattered
         NODE_RANK=$i
         break
     fi
@@ -1270,7 +1225,7 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method round_robin \
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -1280,7 +1235,7 @@ done
 ```shell Command
 # ============================================================
 # Before running, replace the following placeholders:
-#   <your prefill ip>: prefill node IP address
+#   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip>: decode node IP address
 # ============================================================
 
@@ -1288,8 +1243,8 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --prefill http://<your prefill ip>:8000 8999 \
+    --prefill http://<your prefill ip1>:8000 8998 \
+    --prefill http://<your prefill ip2>:8000 8999 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \

@@ -11,18 +11,18 @@ This section describes the best practice data for Qwen3-8B on the Ascend NPU.
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 5ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in3k5-out1k5-5ms) |
-| Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 6K+1.5K | 11.79ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in6k-out1k5-bs16-gpqa) |
+| Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 6K+1.5K | 11.79ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in6k-out1k5-bs16) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 37ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in3k5-out1k5-50ms-gpqa) |
+| Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 37ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in3k5-out1k5-37ms) |
 
 
 ## Optimal Configuration
 
-### qwen3 8b w8a8 1p in3k5 out1k5 50ms gpqa
+### Qwen3-8B QWEN3 8B W8A8 1P IN3K5 OUT1K5 37ms
 
 **Model**: Qwen3-8B
 
@@ -65,8 +65,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_OP_EXPANSION_MODE=AIV
@@ -120,7 +118,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 8b w8a8 1p in3k5 out1k5 5ms
+### Qwen3-8B QWEN3 8B W8A8 1P IN3K5 OUT1K5 5ms
 
 **Model**: Qwen3-8B
 
@@ -163,8 +161,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_OP_EXPANSION_MODE=AIV
@@ -216,7 +212,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 8b w8a8 1p in6k out1k5 bs16 gpqa
+### Qwen3-8B QWEN3 8B W8A8 1P IN6K OUT1K5 BS16
 
 **Model**: Qwen3-8B
 
@@ -259,8 +255,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_OP_EXPANSION_MODE=AIV

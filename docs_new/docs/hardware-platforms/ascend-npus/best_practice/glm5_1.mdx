@@ -11,7 +11,7 @@ This section describes the best practice data for GLM-5.1 on the Ascend NPU.
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in64k-out1k-20ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65K+1.5K (prefix90) | 25ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65K+1.5K (90% prefix cache hit rate) | 25ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
 
 ### High Throughput
 
@@ -20,14 +20,14 @@ This section describes the best practice data for GLM-5.1 on the Ascend NPU.
 | GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-16p-in3k5-out1k5-50ms) |
 | GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in128k-out1k) |
 | GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65K+1.5K (prefix100) | 33ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K (prefix90) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K (prefix90) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65K+1.5K (100% prefix cache hit rate) | 33ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
 
 
 ## Optimal Configuration
 
-### glm5 1 w4a8 16p in3k5 out1k5 50ms
+### GLM-5.1 W4A8 16P IN3K5 OUT1K5 50ms
 
 **Model**: GLM-5.1
 
@@ -67,8 +67,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GLOO_SOCKET_IFNAME=<network-interface>
@@ -125,7 +123,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### glm5 1 w4a8 1p1d 32p in128k out1k
+### GLM-5.1 W4A8 1P1D 32P IN128K OUT1K
 
 **Model**: GLM-5.1
 
@@ -155,12 +153,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -168,12 +164,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
@@ -183,8 +175,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -237,7 +229,7 @@ do
         --attn-cp-size 4 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --pp-size 8 \
+        --pp-size 8
         NODE_RANK=$i
         break
     fi
@@ -287,7 +279,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --speculative-draft-model-quantization unquant \
+        --speculative-draft-model-quantization unquant
         NODE_RANK=$i
         break
     fi
@@ -303,7 +295,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -328,7 +319,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### glm5 1 w4a8 1p1d 32p in16k out1k 50ms
+### GLM-5.1 W4A8 1P1D 32P IN16K OUT1K 50ms
 
 **Model**: GLM-5.1
 
@@ -358,12 +349,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -371,12 +360,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
@@ -385,8 +370,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -438,7 +423,7 @@ do
         --nsa-prefill-cp-mode in-seq-split \
         --attn-cp-size 8 \
         --enable-dp-lm-head \
-        --moe-dense-tp 1 \
+        --moe-dense-tp 1
         NODE_RANK=$i
         break
     fi
@@ -492,7 +477,7 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4 \
+        --speculative-num-draft-tokens 4
         NODE_RANK=$i
         break
     fi
@@ -508,7 +493,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -533,7 +517,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### glm5 1 w4a8 1p1d 32p in64k out1k 20ms
+### GLM-5.1 W4A8 1P1D 32P IN64K OUT1K 20ms
 
 **Model**: GLM-5.1
 
@@ -563,12 +547,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -576,12 +558,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
@@ -591,8 +569,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -645,7 +623,7 @@ do
         --attn-cp-size 4 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --pp-size 8 \
+        --pp-size 8
         NODE_RANK=$i
         break
     fi
@@ -695,7 +673,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --speculative-draft-model-quantization unquant \
+        --speculative-draft-model-quantization unquant
         NODE_RANK=$i
         break
     fi
@@ -711,7 +689,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -736,7 +713,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### glm5 1 w4a8 1p1d 32p in65k out1k5 prefix90 25ms
+### GLM-5.1 W4A8 1P1D 32P IN65K OUT1K5 PREFIX90 25ms
 
 **Model**: GLM-5.1
 
@@ -748,7 +725,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65K+1.5K (prefix90)
+**Dataset**: 65K+1.5K (90% prefix cache hit rate)
 
 **TPOT**: 25ms
 
@@ -766,12 +743,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -779,12 +754,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
@@ -793,8 +764,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -846,7 +817,7 @@ do
         --nsa-prefill-cp-mode in-seq-split \
         --attn-cp-size 8 \
         --enable-dp-lm-head \
-        --moe-dense-tp 1 \
+        --moe-dense-tp 1
         NODE_RANK=$i
         break
     fi
@@ -900,7 +871,7 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4 \
+        --speculative-num-draft-tokens 4
         NODE_RANK=$i
         break
     fi
@@ -916,7 +887,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -943,7 +913,7 @@ python -m sglang.bench_serving \
     --extra-request-body repeat_rate=0.9
 ```
 
-### glm5 1 w4a8 1p1d 48p in65k out1k5 prefix100 33ms
+### GLM-5.1 W4A8 1P1D 48P IN65K OUT1K5 PREFIX100 33ms
 
 **Model**: GLM-5.1
 
@@ -955,7 +925,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65K+1.5K (prefix100)
+**Dataset**: 65K+1.5K (100% prefix cache hit rate)
 
 **TPOT**: 33ms
 
@@ -973,12 +943,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -986,12 +954,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
@@ -1000,8 +964,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>' '<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>' '<your decode ip3>' '<your decode ip4>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -1043,7 +1007,7 @@ do
         --deepep-mode normal \
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
-        --dtype bfloat16 \
+        --dtype bfloat16
         NODE_RANK=$i
         break
     fi
@@ -1101,7 +1065,7 @@ do
         --prefill-round-robin-balance \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --load-balance-method round_robin \
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -1117,7 +1081,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -1142,7 +1105,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### glm5 1 w4a8 2p1d 48p in128k out1k prefix90 50ms
+### GLM-5.1 W4A8 2P1D 48P IN128K OUT1K PREFIX90 50ms
 
 **Model**: GLM-5.1
 
@@ -1154,7 +1117,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K (prefix90)
+**Dataset**: 128K+1K (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -1172,12 +1135,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -1185,12 +1146,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
@@ -1200,8 +1157,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>' '<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>' '<your prefill ip3>' '<your prefill ip4>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -1230,7 +1187,7 @@ do
         --host ${P_IP[$i]} \
         --port 8000 \
         --dist-init-addr ${P_IP[$((i / 2 * 2))]}:5000 \
-        --disaggregation-bootstrap-port $((8998+$((i / 2)))) \
+        --disaggregation-bootstrap-port $((8998 + i / 2)) \
         --node-rank $((i % 2)) \
         --tp-size 4 \
         --nnodes 2 \
@@ -1254,7 +1211,7 @@ do
         --attn-cp-size 4 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --pp-size 8 \
+        --pp-size 8
         NODE_RANK=$i
         break
     fi
@@ -1308,7 +1265,7 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4 \
+        --speculative-num-draft-tokens 4
         NODE_RANK=$i
         break
     fi
@@ -1318,15 +1275,14 @@ done
 ```shell Command
 # ============================================================
 # Before running, replace the following placeholders:
-#   <your prefill ip>: prefill node IP address
+#   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip>: decode node IP address
 # ============================================================
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --prefill http://<your prefill ip>:8000 8999 \
+    --prefill http://<your prefill ip1>:8000 8998 \
+    --prefill http://<your prefill ip2>:8000 8999 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
@@ -1352,7 +1308,7 @@ python -m sglang.bench_serving \
     --extra-request-body repeat_rate=0.9
 ```
 
-### glm5 1 w4a8 4p1d 48p in64k out1k prefix90 50ms
+### GLM-5.1 W4A8 4P1D 48P IN64K OUT1K PREFIX90 50ms
 
 **Model**: GLM-5.1
 
@@ -1364,7 +1320,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K (prefix90)
+**Dataset**: 64K+1K (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -1382,12 +1338,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -1395,12 +1349,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
@@ -1410,8 +1360,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>' '<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>' '<your prefill ip3>' '<your prefill ip4>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -1439,8 +1389,7 @@ do
         --disaggregation-mode prefill \
         --host ${P_IP[$i]} \
         --port 8000 \
-        --disaggregation-bootstrap-port $((8998+$i)) \
-        --node-rank 0 \
+        --disaggregation-bootstrap-port $((8998 + i)) \
         --tp-size 4 \
         --nnodes 1 \
         --mem-fraction-static 0.72 \
@@ -1463,7 +1412,7 @@ do
         --attn-cp-size 4 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --pp-size 4 \
+        --pp-size 4
         NODE_RANK=$i
         break
     fi
@@ -1517,7 +1466,7 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4 \
+        --speculative-num-draft-tokens 4
         NODE_RANK=$i
         break
     fi
@@ -1527,17 +1476,16 @@ done
 ```shell Command
 # ============================================================
 # Before running, replace the following placeholders:
-#   <your prefill ip>: prefill node IP address
+#   <your prefill ip1>, <your prefill ip2>, <your prefill ip3>, <your prefill ip4>: prefill node IP addresses
 #   <your decode ip>: decode node IP address
 # ============================================================
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --prefill http://<your prefill ip>:8000 8999 \
-    --prefill http://<your prefill ip>:8000 9000 \
-    --prefill http://<your prefill ip>:8000 9001 \
+    --prefill http://<your prefill ip1>:8000 8998 \
+    --prefill http://<your prefill ip2>:8000 8999 \
+    --prefill http://<your prefill ip3>:8000 9000 \
+    --prefill http://<your prefill ip4>:8000 9001 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \

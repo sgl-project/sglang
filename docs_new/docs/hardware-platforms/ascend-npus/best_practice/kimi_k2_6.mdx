@@ -17,19 +17,19 @@ This section describes the best practice data for Kimi-K2.6 on the Ascend NPU.
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K (prefix90) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K (prefix90) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 24 | PD Disaggregation | 128K+1K (prefix90) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-24p-in128k-out1k-prefix90-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 24 | PD Disaggregation | 64K+1.5K (prefix90) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-24p-in64k-out1k5-prefix90-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1024x1024_30+1024 | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K (90% prefix cache hit rate) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 24 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-24p-in128k-out1k-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 24 | PD Disaggregation | 64K+1.5K (90% prefix cache hit rate) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-24p-in64k-out1k5-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1080p_30+256 | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
 
 
 ## Optimal Configuration
 
-### kimi k2 6 w4a8 1p1d 16p in128k out1k 100ms
+### Kimi-K2.6 W4A8 1P1D 16P IN128K OUT1K 100ms
 
 **Model**: Kimi-K2.6
 
@@ -59,12 +59,10 @@ This section describes the best practice data for Kimi-K2.6 on the Ascend NPU.
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -72,12 +70,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -117,7 +111,6 @@ do
         --host ${P_IP[$i]} \
         --port 8000 \
         --disaggregation-bootstrap-port 8998 \
-        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -137,7 +130,7 @@ do
         --max-prefill-tokens 131072 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend \
+        --sampling-backend ascend
         NODE_RANK=$i
         break
     fi
@@ -163,7 +156,6 @@ do
         --disaggregation-mode decode \
         --host ${D_IP[$i]} \
         --port 8001 \
-        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -183,7 +175,7 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 1 2 4 6 8 12 16 \
+        --cuda-graph-bs 1 2 4 6 8 12 16
         NODE_RANK=$i
         break
     fi
@@ -199,7 +191,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -225,7 +216,7 @@ python -m sglang.bench_serving \
     --request-rate inf
 ```
 
-### kimi k2 6 w4a8 1p1d 16p in128k out1k prefix90 100ms
+### Kimi-K2.6 W4A8 1P1D 16P IN128K OUT1K PREFIX90 100ms
 
 **Model**: Kimi-K2.6
 
@@ -237,7 +228,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K (prefix90)
+**Dataset**: 128K+1K (90% prefix cache hit rate)
 
 **TPOT**: 100ms
 
@@ -255,12 +246,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -268,12 +257,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -313,7 +298,6 @@ do
         --host ${P_IP[$i]} \
         --port 8000 \
         --disaggregation-bootstrap-port 8998 \
-        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -331,7 +315,7 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend \
+        --sampling-backend ascend
         NODE_RANK=$i
         break
     fi
@@ -357,7 +341,6 @@ do
         --disaggregation-mode decode \
         --host ${D_IP[$i]} \
         --port 8001 \
-        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -377,7 +360,7 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 1 2 4 6 8 12 \
+        --cuda-graph-bs 1 2 4 6 8 12
         NODE_RANK=$i
         break
     fi
@@ -393,7 +376,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -420,7 +402,7 @@ python -m sglang.bench_serving \
     --extra-request-body repeat_rate=0.9
 ```
 
-### kimi k2 6 w4a8 1p1d 16p in64k out1k5 100ms
+### Kimi-K2.6 W4A8 1P1D 16P IN64K OUT1K5 100ms
 
 **Model**: Kimi-K2.6
 
@@ -450,12 +432,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -463,12 +443,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -508,7 +484,6 @@ do
         --host ${P_IP[$i]} \
         --port 8000 \
         --disaggregation-bootstrap-port 8998 \
-        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -528,7 +503,7 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend \
+        --sampling-backend ascend
         NODE_RANK=$i
         break
     fi
@@ -554,7 +529,6 @@ do
         --disaggregation-mode decode \
         --host ${D_IP[$i]} \
         --port 8001 \
-        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -574,7 +548,7 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 16 \
+        --cuda-graph-bs 16
         NODE_RANK=$i
         break
     fi
@@ -590,7 +564,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -616,7 +589,7 @@ python -m sglang.bench_serving \
     --request-rate inf
 ```
 
-### kimi k2 6 w4a8 1p1d 16p in64k out1k5 prefix90 100ms
+### Kimi-K2.6 W4A8 1P1D 16P IN64K OUT1K5 PREFIX90 100ms
 
 **Model**: Kimi-K2.6
 
@@ -628,7 +601,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1.5K (prefix90)
+**Dataset**: 64K+1.5K (90% prefix cache hit rate)
 
 **TPOT**: 100ms
 
@@ -646,12 +619,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -659,12 +630,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -704,7 +671,6 @@ do
         --host ${P_IP[$i]} \
         --port 8000 \
         --disaggregation-bootstrap-port 8998 \
-        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -722,7 +688,7 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend \
+        --sampling-backend ascend
         NODE_RANK=$i
         break
     fi
@@ -748,7 +714,6 @@ do
         --disaggregation-mode decode \
         --host ${D_IP[$i]} \
         --port 8001 \
-        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --disaggregation-transfer-backend ascend \
@@ -768,7 +733,7 @@ do
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
-        --cuda-graph-bs 1 2 4 6 8 12 \
+        --cuda-graph-bs 1 2 4 6 8 12
         NODE_RANK=$i
         break
     fi
@@ -784,7 +749,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -811,7 +775,7 @@ python -m sglang.bench_serving \
     --extra-request-body repeat_rate=0.9
 ```
 
-### kimi k2 6 w4a8 1p1d 24p in128k out1k prefix90 100ms
+### Kimi-K2.6 W4A8 1P1D 24P IN128K OUT1K PREFIX90 100ms
 
 **Model**: Kimi-K2.6
 
@@ -823,7 +787,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K (prefix90)
+**Dataset**: 128K+1K (90% prefix cache hit rate)
 
 **TPOT**: 100ms
 
@@ -842,12 +806,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -855,12 +817,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -871,7 +829,7 @@ export STREAMS_PER_DEVICE=32
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
 P_IP=('<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 DRAFT_MODEL_PATH=/path/to/draft-model-weights
 
@@ -895,7 +853,6 @@ do
         --host ${P_IP[$i]} \
         --port 8000 \
         --disaggregation-bootstrap-port 8998 \
-        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --nnodes 1 \
@@ -910,7 +867,7 @@ do
         --mm-attention-backend ascend_attn \
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
-        --deepep-mode auto \
+        --deepep-mode auto
         NODE_RANK=$i
         break
     fi
@@ -961,7 +918,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --speculative-draft-model-quantization unquant \
+        --speculative-draft-model-quantization unquant
         NODE_RANK=$i
         break
     fi
@@ -977,7 +934,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -1004,7 +960,7 @@ python -m sglang.bench_serving \
     --extra-request-body repeat_rate=0.9
 ```
 
-### kimi k2 6 w4a8 1p1d 24p in64k out1k5 prefix90 100ms
+### Kimi-K2.6 W4A8 1P1D 24P IN64K OUT1K5 PREFIX90 100ms
 
 **Model**: Kimi-K2.6
 
@@ -1016,7 +972,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1.5K (prefix90)
+**Dataset**: 64K+1.5K (90% prefix cache hit rate)
 
 **TPOT**: 100ms
 
@@ -1035,12 +991,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -1048,12 +1002,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -1064,7 +1014,7 @@ export STREAMS_PER_DEVICE=32
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
 P_IP=('<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 DRAFT_MODEL_PATH=/path/to/draft-model-weights
 
@@ -1088,7 +1038,6 @@ do
         --host ${P_IP[$i]} \
         --port 8000 \
         --disaggregation-bootstrap-port 8998 \
-        --node-rank 0 \
         --quantization modelslim \
         --dtype bfloat16 \
         --nnodes 1 \
@@ -1103,7 +1052,7 @@ do
         --mm-attention-backend ascend_attn \
         --sampling-backend ascend \
         --moe-a2a-backend deepep \
-        --deepep-mode auto \
+        --deepep-mode auto
         NODE_RANK=$i
         break
     fi
@@ -1154,7 +1103,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --speculative-draft-model-quantization unquant \
+        --speculative-draft-model-quantization unquant
         NODE_RANK=$i
         break
     fi
@@ -1170,7 +1119,6 @@ done
 
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --policy cache_aware \
     --prefill http://<your prefill ip>:8000 8998 \
     --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
@@ -1197,7 +1145,7 @@ python -m sglang.bench_serving \
     --extra-request-body repeat_rate=0.9
 ```
 
-### kimi k2 6 w4a8 8p in1024x1024 30 out1024 50ms
+### Kimi-K2.6 W4A8 8P IN1024X1024 30 OUT1024 50ms
 
 **Model**: Kimi-K2.6
 
@@ -1209,7 +1157,9 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 1024x1024_30+1024
+**Dataset**: 1024x1024 (30)+1024
+
+*Format: resolution (input tokens) + output tokens*
 
 **TPOT**: 50ms
 
@@ -1240,8 +1190,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export HCCL_BUFFSIZE=1500
@@ -1290,7 +1238,7 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `IMAGE` dataset.
+We tested it based on the `IMAGE` dataset with 1024x1024 resolution.
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -1309,7 +1257,7 @@ python -m sglang.bench_serving \
     --image-resolution 1024x1024
 ```
 
-### kimi k2 6 w4a8 8p in1080p 30 out256 50ms
+### Kimi-K2.6 W4A8 8P IN1080P 30 OUT256 50ms
 
 **Model**: Kimi-K2.6
 
@@ -1352,8 +1300,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export HCCL_BUFFSIZE=1800
@@ -1398,7 +1344,7 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `IMAGE` dataset.
+We tested it based on the `IMAGE` dataset with 1920x1080 resolution.
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -1416,7 +1362,7 @@ python -m sglang.bench_serving \
     --image-resolution 1920x1080
 ```
 
-### kimi k2 6 w4a8 8p in3k5 out1k5 20ms
+### Kimi-K2.6 W4A8 8P IN3K5 OUT1K5 20ms
 
 **Model**: Kimi-K2.6
 
@@ -1459,8 +1405,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GLOO_SOCKET_IFNAME=<network-interface>
@@ -1529,7 +1473,7 @@ python -m sglang.bench_serving \
     --warmup-requests 0
 ```
 
-### kimi k2 6 w4a8 8p in3k5 out1k5 50ms
+### Kimi-K2.6 W4A8 8P IN3K5 OUT1K5 50ms
 
 **Model**: Kimi-K2.6
 
@@ -1572,8 +1516,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GLOO_SOCKET_IFNAME=<network-interface>

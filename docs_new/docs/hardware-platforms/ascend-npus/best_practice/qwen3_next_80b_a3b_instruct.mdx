@@ -11,7 +11,7 @@ This section describes the best practice data for Qwen3-Next-80B-A3B-Instruct on
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 20ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-w8a8-2p-in3k5-out1k5-20ms) |
-| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 6K+1.5K | 15.62ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-w8a8-2p-in6k-out1k5-bs16-aime25) |
+| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 6K+1.5K | 15.62ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-w8a8-2p-in6k-out1k5-bs16) |
 
 ### High Throughput
 
@@ -22,7 +22,7 @@ This section describes the best practice data for Qwen3-Next-80B-A3B-Instruct on
 
 ## Optimal Configuration
 
-### qwen3 next 80b w8a8 2p in3k5 out1k5 20ms
+### Qwen3-Next-80B-A3B-Instruct QWEN3 NEXT 80B W8A8 2P IN3K5 OUT1K5 20ms
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
 
@@ -65,8 +65,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
@@ -135,7 +133,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 next 80b w8a8 2p in3k5 out1k5 50ms
+### Qwen3-Next-80B-A3B-Instruct QWEN3 NEXT 80B W8A8 2P IN3K5 OUT1K5 50ms
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
 
@@ -178,8 +176,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
@@ -251,7 +247,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 next 80b w8a8 2p in6k out1k5 bs16 aime25
+### Qwen3-Next-80B-A3B-Instruct QWEN3 NEXT 80B W8A8 2P IN6K OUT1K5 BS16
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
 
@@ -294,8 +290,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048

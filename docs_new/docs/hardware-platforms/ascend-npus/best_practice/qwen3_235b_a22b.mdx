@@ -21,7 +21,7 @@ This section describes the best practice data for Qwen3-235B-A22B on the Ascend 
 
 ## Optimal Configuration
 
-### qwen3 235b bf16 8p in11k out1k5 8ms
+### Qwen3-235B-A22B QWEN3 235B BF16 8P IN11K OUT1K5 8ms
 
 **Model**: Qwen3-235B-A22B
 
@@ -64,8 +64,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=1600
@@ -118,7 +116,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### qwen3 235b w8a8 8p in3k5 out1k5 50.1ms
+### Qwen3-235B-A22B QWEN3 235B W8A8 8P IN3K5 OUT1K5 50.1ms
 
 **Model**: Qwen3-235B-A22B
 
@@ -161,8 +159,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=570

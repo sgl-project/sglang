@@ -20,16 +20,16 @@ This section describes the best practice data for Qwen3.5-397B on the Ascend NPU
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K (prefix90) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-prefix90-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-prefix90-50ms) |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-50ms) |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in3k5-out1k5-50ms) |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K (prefix90) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
 
 
 ## Optimal Configuration
 
-### qwen3 5 397b w4a8 8p in128k out1k 20ms
+### Qwen3.5-397B W4A8 8P IN128K OUT1K 20ms
 
 **Model**: Qwen3.5-397B
 
@@ -69,8 +69,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
@@ -140,7 +138,7 @@ python -m sglang.bench_serving \
     --warmup-requests 2
 ```
 
-### qwen3 5 397b w4a8 8p in128k out1k 50ms
+### Qwen3.5-397B W4A8 8P IN128K OUT1K 50ms
 
 **Model**: Qwen3.5-397B
 
@@ -180,8 +178,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
@@ -251,7 +247,7 @@ python -m sglang.bench_serving \
     --warmup-requests 8
 ```
 
-### qwen3 5 397b w4a8 8p in128k out1k prefix90 50ms
+### Qwen3.5-397B W4A8 8P IN128K OUT1K PREFIX90 50ms
 
 **Model**: Qwen3.5-397B
 
@@ -263,7 +259,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K (prefix90)
+**Dataset**: 128K+1K (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -291,8 +287,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
@@ -364,7 +358,7 @@ python -m sglang.bench_serving \
     --extra-request-body repeat_rate=0.9
 ```
 
-### qwen3 5 397b w4a8 8p in16k out1k 20ms
+### Qwen3.5-397B W4A8 8P IN16K OUT1K 20ms
 
 **Model**: Qwen3.5-397B
 
@@ -404,8 +398,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
@@ -479,7 +471,7 @@ python -m sglang.bench_serving \
     --warmup-requests 32
 ```
 
-### qwen3 5 397b w4a8 8p in16k out1k 50ms
+### Qwen3.5-397B W4A8 8P IN16K OUT1K 50ms
 
 **Model**: Qwen3.5-397B
 
@@ -519,8 +511,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
@@ -594,7 +584,7 @@ python -m sglang.bench_serving \
     --warmup-requests 8
 ```
 
-### qwen3 5 397b w4a8 8p in3k5 out1k5 20ms
+### Qwen3.5-397B W4A8 8P IN3K5 OUT1K5 20ms
 
 **Model**: Qwen3.5-397B
 
@@ -634,8 +624,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
@@ -708,7 +696,7 @@ python -m sglang.bench_serving \
     --warmup-requests 64
 ```
 
-### qwen3 5 397b w4a8 8p in3k5 out1k5 50ms
+### Qwen3.5-397B W4A8 8P IN3K5 OUT1K5 50ms
 
 **Model**: Qwen3.5-397B
 
@@ -748,8 +736,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
@@ -822,7 +808,7 @@ python -m sglang.bench_serving \
     --warmup-requests 16
 ```
 
-### qwen3 5 397b w4a8 8p in64k out1k 20ms
+### Qwen3.5-397B W4A8 8P IN64K OUT1K 20ms
 
 **Model**: Qwen3.5-397B
 
@@ -862,8 +848,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
@@ -937,7 +921,7 @@ python -m sglang.bench_serving \
     --warmup-requests 8
 ```
 
-### qwen3 5 397b w4a8 8p in64k out1k 50ms
+### Qwen3.5-397B W4A8 8P IN64K OUT1K 50ms
 
 **Model**: Qwen3.5-397B
 
@@ -977,8 +961,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
@@ -1052,7 +1034,7 @@ python -m sglang.bench_serving \
     --warmup-requests 8
 ```
 
-### qwen3 5 397b w4a8 8p in64k out1k prefix90 50ms
+### Qwen3.5-397B W4A8 8P IN64K OUT1K PREFIX90 50ms
 
 **Model**: Qwen3.5-397B
 
@@ -1064,7 +1046,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K (prefix90)
+**Dataset**: 64K+1K (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -1092,8 +1074,6 @@ unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export ASCEND_USE_FIA=1
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096

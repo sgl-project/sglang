@@ -22,7 +22,7 @@ This section describes the best practice data for DeepSeek-V3.2 on the Ascend NP
 
 ## Optimal Configuration
 
-### deepseek v3 2 w8a8 1p1d 32p in128k out1k 26ms
+### DeepSeek-V3.2 W8A8 1P1D 32P IN128K OUT1K 26ms
 
 **Model**: DeepSeek-V3.2
 
@@ -52,12 +52,10 @@ This section describes the best practice data for DeepSeek-V3.2 on the Ascend NP
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -65,12 +63,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_SET_CPU_AFFINITY=1
@@ -78,8 +72,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -126,7 +120,7 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2 \
+        --speculative-num-draft-tokens 2
         NODE_RANK=$i
         break
     fi
@@ -175,7 +169,7 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend \
+        --disaggregation-transfer-backend ascend
         NODE_RANK=$i
         break
     fi
@@ -216,7 +210,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### deepseek v3 2 w8a8 1p1d 32p in128k out1k bs16
+### DeepSeek-V3.2 W8A8 1P1D 32P IN128K OUT1K BS16
 
 **Model**: DeepSeek-V3.2
 
@@ -246,12 +240,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -259,12 +251,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_SET_CPU_AFFINITY=1
@@ -272,8 +260,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -320,7 +308,7 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2 \
+        --speculative-num-draft-tokens 2
         NODE_RANK=$i
         break
     fi
@@ -369,7 +357,7 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend \
+        --disaggregation-transfer-backend ascend
         NODE_RANK=$i
         break
     fi
@@ -410,7 +398,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### deepseek v3 2 w8a8 1p1d 32p in128k out1k bs8
+### DeepSeek-V3.2 W8A8 1P1D 32P IN128K OUT1K BS8
 
 **Model**: DeepSeek-V3.2
 
@@ -440,12 +428,10 @@ python -m sglang.bench_serving \
 # ============================================================
 
 
-
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-
 
 unset https_proxy
 unset http_proxy
@@ -453,12 +439,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
-
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_SET_CPU_AFFINITY=1
@@ -466,8 +448,8 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('<your prefill ip>' '<your prefill ip>')
-D_IP=('<your decode ip>' '<your decode ip>')
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
 MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
@@ -514,7 +496,7 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 2 \
+        --speculative-num-draft-tokens 2
         NODE_RANK=$i
         break
     fi
@@ -563,7 +545,7 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend \
+        --disaggregation-transfer-backend ascend
         NODE_RANK=$i
         break
     fi
