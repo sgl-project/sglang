@@ -43,8 +43,7 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
 def chunked_req_of(scheduler: Any) -> Any:
     reqs = scheduler.partially_extended_reqs()
     assert len(reqs) <= 1, (
-        f"expected at most one partially-extended req, got "
-        f"{[r.rid for r in reqs]}"
+        f"expected at most one partially-extended req, got " f"{[r.rid for r in reqs]}"
     )
     return reqs[0] if reqs else None
 

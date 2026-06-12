@@ -4,7 +4,6 @@ from typing import Optional
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
-    chunked_req_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
@@ -13,6 +12,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     VERY_LONG_PROMPT_LEN,
     advance_to_decode_step,
     base_engine_kwargs,
+    chunked_req_of,
     exhaust_row_pool,
     run_until,
     run_until_finished,
@@ -99,7 +99,11 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
         t.abort(r)
         for _ in range(12):
-            if chunked_req_of(t.scheduler) is None and r.kv_pages == 0 and r.lock_refs == 0:
+            if (
+                chunked_req_of(t.scheduler) is None
+                and r.kv_pages == 0
+                and r.lock_refs == 0
+            ):
                 break
             yield
 
@@ -138,7 +142,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert r.finished
         assert saw_match, "getter must return r.rid at least once while r.is_chunking"
         assert (
-            chunked_req_of(t.scheduler).rid if chunked_req_of(t.scheduler) is not None else None
+            chunked_req_of(t.scheduler).rid
+            if chunked_req_of(t.scheduler) is not None
+            else None
         ) is None
 
     @unittest.skip(

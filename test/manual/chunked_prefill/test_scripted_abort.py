@@ -5,7 +5,6 @@ from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
-    chunked_req_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
@@ -13,6 +12,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     SMALL_KV_POOL_MAX_TOTAL_TOKENS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    chunked_req_of,
     run_until,
     run_until_all_finished,
     run_until_finished,
@@ -476,7 +476,9 @@ class TestAbortBasic(ScriptedTestCase):
         )
         yield from run_until(r1, lambda h: h.is_chunking)
         assert (
-            chunked_req_of(t.scheduler).rid if chunked_req_of(t.scheduler) is not None else None
+            chunked_req_of(t.scheduler).rid
+            if chunked_req_of(t.scheduler) is not None
+            else None
         ) == r1.rid, (
             f"r1 should hold the chunked slot before abort; got "
             f"{(chunked_req_of(t.scheduler).rid if chunked_req_of(t.scheduler) is not None else None)!r}"
@@ -487,7 +489,9 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r1)
 
         cur = (
-            chunked_req_of(t.scheduler).rid if chunked_req_of(t.scheduler) is not None else None
+            chunked_req_of(t.scheduler).rid
+            if chunked_req_of(t.scheduler) is not None
+            else None
         )
         assert cur != r1.rid, f"chunked slot still points to aborted r1; got {cur!r}"
         assert r1.kv_pages == 0
