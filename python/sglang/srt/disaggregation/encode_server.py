@@ -1071,6 +1071,7 @@ class MMEncoder:
                     )
                 else:
                     mm_hashes = hashes
+                str_mm_hashes = [str(h) for h in mm_hashes]
 
             # All ranks: launch background task for cache check + VIT forward.
             # Do NOT use run_in_executor: get_feature_fn relies on a session
@@ -1082,7 +1083,7 @@ class MMEncoder:
                     # Step 1: Rank 0 checks cache, broadcast mask if TP > 1
                     if self.rank == 0:
                         exist_mask = await self.mm_global_cache.batch_is_exist(
-                            mm_hashes
+                            str_mm_hashes
                         )
                         mask_tensor = torch.tensor(
                             [1 if e else 0 for e in exist_mask],
@@ -1122,7 +1123,7 @@ class MMEncoder:
                     cached_slices = []
 
                     if self.rank == 0 and hit_indices:
-                        hit_hashes = [mm_hashes[i] for i in hit_indices]
+                        hit_hashes = [str_mm_hashes[i] for i in hit_indices]
                         hit_tokens = [
                             self.get_num_tokens(grid_thw[i], modality)
                             for i in hit_indices
@@ -1224,7 +1225,7 @@ class MMEncoder:
                         # Release cache refs after data is copied to GPU
                         if cached_slices:
                             loaded_hashes = [
-                                mm_hashes[idx]
+                                str_mm_hashes[idx]
                                 for idx in hit_indices
                                 if fallback_mask[idx].item() == 0
                             ]
@@ -1233,10 +1234,10 @@ class MMEncoder:
 
                         # Background insert: store newly computed embeddings into global cache.
                         # Includes both original misses and fallback-recomputed hits.
-                        all_new_hashes = [mm_hashes[i] for i in missing_indices]
+                        all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
                         all_new_slices = list(new_slices)
                         if fallback_slices is not None:
-                            all_new_hashes += [mm_hashes[i] for i in fallback_indices]
+                            all_new_hashes += [str_mm_hashes[i] for i in fallback_indices]
                             all_new_slices += list(fallback_slices)
                         if all_new_hashes:
 
