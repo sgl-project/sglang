@@ -7,9 +7,11 @@ context length, GGUF detection, etc.) that don't require actual model files.
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from transformers import PretrainedConfig
 
+from sglang.srt.utils.hf_transformers import processor as processor_utils
 from sglang.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
@@ -23,6 +25,7 @@ from sglang.srt.utils.hf_transformers.common import (
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -261,6 +264,73 @@ class TestDeepseekOcrDetection(unittest.TestCase):
         cfg.auto_map = {}
         self.assertFalse(_is_deepseek_ocr_model(cfg))
         self.assertFalse(_is_deepseek_ocr2_model(cfg))
+
+
+# ---------------------------------------------------------------------------
+# get_processor TokenizersBackend handling
+# ---------------------------------------------------------------------------
+
+
+class TokenizersBackend:
+    chat_template = "chat-template"
+
+    def get_added_vocab(self):
+        return {}
+
+
+class TestProcessorTokenizersBackend(CustomTestCase):
+    def _run_get_processor(self, model_type: str):
+        config = SimpleNamespace(model_type=model_type)
+        processor = SimpleNamespace(tokenizer=TokenizersBackend())
+        replacement_tokenizer = SimpleNamespace(
+            chat_template="chat-template",
+            get_added_vocab=lambda: {},
+        )
+
+        with (
+            patch.object(
+                processor_utils.AutoConfig,
+                "from_pretrained",
+                return_value=config,
+            ),
+            patch.object(
+                processor_utils.AutoProcessor,
+                "from_pretrained",
+                return_value=processor,
+            ),
+            patch.object(
+                processor_utils,
+                "get_tokenizer_from_processor",
+                side_effect=lambda proc: proc.tokenizer,
+            ),
+            patch(
+                "sglang.srt.utils.hf_transformers.tokenizer.get_tokenizer"
+            ) as mock_get_tokenizer,
+            patch.object(processor_utils, "patch_mistral_common_tokenizer"),
+            patch.object(processor_utils, "_fix_special_tokens_pattern"),
+            patch.object(processor_utils, "_fix_added_tokens_encoding"),
+            patch.object(processor_utils, "attach_additional_stop_token_ids"),
+        ):
+            mock_get_tokenizer.return_value = replacement_tokenizer
+            result = processor_utils.get_processor("dummy-model")
+
+        return processor, result, mock_get_tokenizer
+
+    def test_llava_keeps_processor_tokenizersbackend(self):
+        processor, result, mock_get_tokenizer = self._run_get_processor("llava")
+
+        self.assertIs(result, processor)
+        self.assertIsInstance(processor.tokenizer, TokenizersBackend)
+        mock_get_tokenizer.assert_not_called()
+
+    def test_non_llava_still_reloads_tokenizersbackend(self):
+        processor, result, mock_get_tokenizer = self._run_get_processor(
+            "deepseek_vl_v2"
+        )
+
+        self.assertIs(result, processor)
+        self.assertIs(processor.tokenizer, mock_get_tokenizer.return_value)
+        mock_get_tokenizer.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
