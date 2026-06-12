@@ -114,6 +114,7 @@ def create_mm_data_row(
     except Exception as e:
         # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
         print(f"Error applying chat template: {e}, fallback to <image> tag")
+        # Some tokenizers do not support list content; fall back to a placeholder in the text
         if type(processor).__name__ == "MiniCPMOProcessor":
             prompt_str = f"(<image>./</image>){text_prompt}"
         else:
