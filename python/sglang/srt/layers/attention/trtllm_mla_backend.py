@@ -1073,7 +1073,7 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
 
     def __init__(
         self,
-        model_runner: "ModelRunner",
+        model_runner: ModelRunner,
         topk: int,
         speculative_num_steps: int,
         backend: str = "trtllm-gen",

@@ -69,10 +69,6 @@ _OWNER_SITES = {
         "DFlashDraftInputV2.prepare_for_decode",
         "kv_allocated_len",
     ): 1,
-    # spec v1: each verify path owns its own settlement
-    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "kv_committed_len"): 1,
-    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "kv_allocated_len"): 1,
-    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "spec_verify_ct"): 1,
     # disaggregation decode prealloc
     (
         "disaggregation/decode.py",
