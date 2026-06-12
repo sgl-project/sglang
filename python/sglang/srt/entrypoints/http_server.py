@@ -425,6 +425,47 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 app.include_router(v1_loads_router)
 
 
+def _log_http_exception(request: Request, status_code: int, detail: Any) -> None:
+    """Log request context for client-visible HTTP errors."""
+    client = request.client.host if request.client else "unknown"
+    logger.warning(
+        "HTTP %s on %s from %s: %s",
+        status_code,
+        request.url.path,
+        client,
+        _stringify_http_error_detail(detail),
+    )
+
+
+def _stringify_http_error_detail(detail: Any) -> str:
+    """Convert HTTP error details into a single log-friendly line."""
+    if isinstance(detail, RequestValidationError):
+        return _format_validation_error_message(detail.errors())
+    if isinstance(detail, list):
+        return _format_validation_error_message(detail)
+    if isinstance(detail, dict):
+        return str(detail).replace("\n", " | ")
+    return str(detail).replace("\n", " | ")
+
+
+def _format_validation_error_message(errors: List[Dict[str, Any]]) -> str:
+    """Render validation errors in a compact single-line format."""
+    formatted_errors = []
+    for error in errors:
+        loc = ".".join(str(part) for part in error.get("loc", [])) or "unknown"
+        msg = error.get("msg", "Validation error")
+        err_type = error.get("type")
+        if err_type:
+            formatted_errors.append(f"{loc}: {msg} (type={err_type})")
+        else:
+            formatted_errors.append(f"{loc}: {msg}")
+
+    if not formatted_errors:
+        return "Validation error"
+
+    return "; ".join(formatted_errors)
+
+
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
@@ -432,6 +473,7 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     For /v1/responses, emit OpenAI-style nested error envelope:
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     """
+    _log_http_exception(request, exc.status_code, exc.detail)
     # adjust fmt for responses api
     if request.url.path.startswith("/v1/responses"):
         nested_error = {
@@ -460,13 +502,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     For /v1/responses, emit OpenAI-style nested error envelope; for other endpoints keep legacy format.
     """
-    exc_str = str(exc)
-    errors_str = str(exc.errors())
+    message = _format_validation_error_message(exc.errors())
 
-    if errors_str and errors_str != exc_str:
-        message = f"{exc_str} {errors_str}"
-    else:
-        message = exc_str
+    _log_http_exception(request, HTTPStatus.BAD_REQUEST.value, message)
 
     if request.url.path.startswith("/v1/responses"):
         # adapt specially, for v1/responses API only (notice the error key is different)
