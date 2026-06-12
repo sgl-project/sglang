@@ -45,7 +45,7 @@ overlap scheduling).
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -95,6 +95,47 @@ class SuffixWorker(NGRAMWorker):
         # Cap per-request draft length so verify can't overshoot the context
         # window (the -1 leaves room for the bonus token).
         self._max_context_len = int(target_worker.model_runner.model_config.context_len)
+        # PD disaggregation (decode instance): prebuilt requests whose suffix
+        # tree should be rebuilt while their KV transfer is still in flight
+        # (rid -> Req). Drained by prewarm_step(), enqueued by
+        # prewarm_disagg_requests() from the decode scheduler's transfer-queue
+        # polling loop. Empty (and unused) on colocated / prefill instances.
+        self._prewarm_pending: Dict[str, object] = {}
+
+    # ------------------------------------------------------------------
+    # PD disaggregation: decode-side suffix-tree prewarm
+    #
+    # Correctness does NOT depend on prewarm: a prebuilt request that reaches
+    # its first decode step un-prewarmed is cold-started lazily inside the
+    # adapter's batch_get (_get_or_create_cache_req_id), and the transferred
+    # output tail (the prefill-produced bonus token) is appended there by the
+    # normal absolute-length delta. Prewarm only moves the tens-of-ms prompt
+    # tree build off the first decode step, overlapping it with KV transfer.
+    # ------------------------------------------------------------------
+    def prewarm_disagg_requests(self, reqs) -> None:
+        """Enqueue prebuilt requests for suffix-tree prewarm. Idempotent per
+        rid; skips requests whose tree the adapter already tracks."""
+        for req in reqs:
+            rid = req.rid
+            if rid in self.ngram_corpus.req_state or rid in self._prewarm_pending:
+                continue
+            self._prewarm_pending[rid] = req
+
+    def prewarm_step(self, token_budget: int = 32768) -> None:
+        """Build at most ``token_budget`` prompt tokens worth of pending
+        prewarm trees. Runs on the scheduler thread (arctic is not
+        thread-safe); the budget bounds the per-iteration stall. The adapter's
+        own grace window keeps a prewarmed tree alive until its first decode."""
+        spent = 0
+        while self._prewarm_pending and spent < token_budget:
+            rid, req = self._prewarm_pending.popitem()
+            if rid in self.ngram_corpus.req_state:
+                continue
+            prompt = list(req.origin_input_ids)
+            # Seed the backend tree with the prompt; the transferred output
+            # tail is appended later as the batch_get delta on first decode.
+            self.ngram_corpus._get_or_create_cache_req_id(rid, prompt)
+            spent += len(prompt)
 
     def _create_draft_source(self, server_args: ServerArgs):
         # The inherited forward flow reaches self.ngram_corpus only through
