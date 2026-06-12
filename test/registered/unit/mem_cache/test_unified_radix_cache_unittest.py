@@ -916,7 +916,7 @@ class UnifiedRadixCacheSuite:
         req.set_extend_range(
             len(req.prefix_indices), req.get_full_untruncated_fill_len()
         )
-        kv_len = req.fill_len
+        kv_len = req.extend_range.end
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
