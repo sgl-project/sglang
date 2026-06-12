@@ -41,7 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -92,7 +92,7 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
-class MultiLayerEagleDraftWorker(BaseDraftWorker):
+class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
         server_args: ServerArgs,

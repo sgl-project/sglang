@@ -262,7 +262,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         # DFLASH drives the draft model through a plain TpModelWorker: the
         # draft KV is materialized from target hidden states, so there is no
-        # BaseDraftWorker draft/draft_extend split to wrap it in.
+        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
         return self._draft_worker
 
     @property

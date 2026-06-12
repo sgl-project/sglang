@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 
 
-class BaseDraftWorker(ABC):
+class EagleDraftWorkerBase(ABC):
     @abstractmethod
     def draft():
         pass
@@ -120,7 +120,7 @@ class BaseSpecWorker(ABC):
 
     @property
     @abstractmethod
-    def draft_worker(self) -> BaseDraftWorker:
+    def draft_worker(self) -> EagleDraftWorkerBase:
         pass
 
     @property
