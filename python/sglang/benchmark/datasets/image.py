@@ -114,8 +114,12 @@ def create_mm_data_row(
     except Exception as e:
         # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
         print(f"Error applying chat template: {e}, fallback to <image> tag")
-        # Some tokenizers do not support list content; fall back to a placeholder in the text
-        prompt_str = f"<image>{text_prompt}"
+        # Use the model-specific image placeholder token when no chat template is available.
+        # MiniCPM-o (MiniCPMOProcessor) expects (<image>./</image>); others use <image>.
+        if type(processor).__name__ == "MiniCPMOProcessor":
+            prompt_str = f"(<image>./</image>){text_prompt}"
+        else:
+            prompt_str = f"<image>{text_prompt}"
 
     # Calculate total tokens (text + vision)
     if type(processor).__name__ == "KimiK25Processor":
@@ -124,6 +128,14 @@ def create_mm_data_row(
             text=prompt_str,
             medias=medias,
             return_tensors="pt",
+        )["input_ids"].numel()
+    elif type(processor).__name__ == "VLChatProcessor":
+        # Janus processor: __call__ expects prompt= kwarg, not text=; text= is silently
+        # ignored via **kwargs which leaves prompt=None and causes tokenizer.encode(None).
+        prompt_len = processor(
+            prompt=prompt_str,
+            images=images,
+            force_batchify=False,
         )["input_ids"].numel()
     else:
         prompt_len = processor(
