@@ -995,6 +995,7 @@
                   {
                     "group": "Moonshotai",
                     "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2",
@@ -1004,6 +1005,7 @@
                   {
                     "group": "MiniMax",
                     "pages": [
+                      "cookbook/autoregressive/MiniMax/MiniMax-M3",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2.7",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2.5"
