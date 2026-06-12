@@ -210,15 +210,14 @@ struct ActivationKernel {
   static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL>;
 
 #ifdef USE_ROCM
-  // ROCm-only: deduce decltype() of the `static constexpr auto unary_kernel`
-  // var yields a const-qualified function-pointer type, which clang-HIP
+  // ROCm-only signature: decltype() of the `static constexpr auto unary_kernel`
+  // var deduces a const-qualified function-pointer type, which clang-HIP
   // (gfx942) refuses to initialize from an lvalue / nullptr. Use the explicit
   // non-const fn-pointer type instead (mirrors select_kernel's kernel_fn_t).
+  // The body is identical to the CUDA branch below; only the return type
+  // differs (kept as separate branches so each has balanced braces for
+  // clang-format).
   static unary_kernel_fn_t select_unary_kernel(const std::string& type) {
-#else
-  static auto select_unary_kernel(const std::string& type)
-      -> decltype(ActivationKernel::template unary_kernel<ActivationKind::kReLU2>) {
-#endif
     using namespace host;
     if (type == "relu2") {
       return ActivationKernel::template unary_kernel<ActivationKind::kReLU2>;
@@ -227,6 +226,18 @@ struct ActivationKernel {
     }
     return nullptr;
   }
+#else
+  static auto select_unary_kernel(const std::string& type)
+      -> decltype(ActivationKernel::template unary_kernel<ActivationKind::kReLU2>) {
+    using namespace host;
+    if (type == "relu2") {
+      return ActivationKernel::template unary_kernel<ActivationKind::kReLU2>;
+    } else {
+      Panic("unsupported unary activation type: ", type);
+    }
+    return nullptr;
+  }
+#endif
 
   static void run_unary_activation(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
     using namespace host;
