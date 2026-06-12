@@ -177,6 +177,16 @@ class TestRandomLike(CustomTestCase):
         _random_like(t)
         torch.testing.assert_close(t, before)
 
+    def test_floating_point_chunked_generation(self):
+        with patch("sglang.srt.utils.weight_checker._CHUNK_NUMEL", 8):
+            out = _random_like(torch.zeros(64, dtype=torch.bfloat16))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertEqual(out.shape, (64,))
+        self.assertGreater(out.unique().numel(), 8)
+        self.assertGreaterEqual(out.float().min().item(), 0.0)
+        # bf16 rounding may carry values just below 1.0 up to exactly 1.0
+        self.assertLessEqual(out.float().max().item(), 1.0)
+
 
 # ---------------------------------------------------------------------------
 # _postprocess_tensors
@@ -404,7 +414,7 @@ class TestCompareQuantPair(CustomTestCase):
 
     def test_chunked_result_matches_unchunked(self):
         reference = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
-        with patch("sglang.srt.utils.weight_checker._COMPARE_CHUNK_NUMEL", 128 * 128):
+        with patch("sglang.srt.utils.weight_checker._CHUNK_NUMEL", 128 * 128):
             chunked = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
         self.assertEqual(chunked, reference)
 

@@ -246,13 +246,25 @@ def _check_tensors(
         raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
 
+# Bounds GPU transients during chunked randomize/compare: full-size fp32
+# intermediates of large MoE weights do not fit next to the KV-cache pool.
+_CHUNK_NUMEL = 64 * 1024 * 1024
+
+
 def _random_like(t: torch.Tensor):
     device = t.device
     shape = t.shape
     dtype = t.dtype
 
     if dtype.is_floating_point:
-        return torch.rand(shape, device=device, dtype=torch.float32).to(dtype)
+        # Generate chunked: a full-size fp32 rand of a large weight does not
+        # fit next to the KV-cache pool.
+        out = torch.empty(shape, device=device, dtype=dtype)
+        for chunk in out.view(-1).split(_CHUNK_NUMEL):
+            chunk.copy_(
+                torch.rand(chunk.shape, device=device, dtype=torch.float32).to(dtype)
+            )
+        return out
 
     if dtype == torch.bool:
         return torch.rand(shape, device=device) > 0.5
@@ -289,17 +301,12 @@ def _block_size_of(w_q: torch.Tensor, w_s: torch.Tensor) -> list:
     ]
 
 
-# Bounds GPU transients during chunked compare: full dequantized tensors of
-# large MoE models do not fit next to the KV-cache pool.
-_COMPARE_CHUNK_NUMEL = 64 * 1024 * 1024
-
-
 def _iter_quant_chunks(w_q: torch.Tensor, w_s: torch.Tensor, block_n: int):
     """Yields block-row-aligned (q_slice, s_slice) pairs of bounded size."""
     q3 = w_q.reshape(-1, *w_q.shape[-2:])
     s3 = w_s.reshape(-1, *w_s.shape[-2:])
     n, k = q3.shape[-2:]
-    rows = max(block_n, _COMPARE_CHUNK_NUMEL // k // block_n * block_n)
+    rows = max(block_n, _CHUNK_NUMEL // k // block_n * block_n)
     for b in range(q3.shape[0]):
         for r0 in range(0, n, rows):
             r1 = min(r0 + rows, n)
