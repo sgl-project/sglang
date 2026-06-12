@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    supports_dflash_mamba_replay = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -43,6 +45,15 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+
+    def replay_mamba_state_after_verify(self, **kwargs) -> None:
+        raise NotImplementedError(
+            "DFLASH reduced Mamba cache replay is only implemented for GDN "
+            "linear attention backends."
+        )
+
+    def clear_mamba_replay_inputs(self) -> None:
+        pass
 
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
@@ -139,6 +150,11 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_track_mask is not None
             and forward_batch.mamba_track_mask.any()
         )
+        draft_token_num = (
+            forward_batch.spec_info.draft_token_num
+            if forward_batch.spec_info is not None
+            else 1
+        )
 
         return ForwardMetadata(
             query_start_loc=query_start_loc,
@@ -152,6 +168,8 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
             has_mamba_track_mask=has_mamba_track_mask,
+            is_target_verify=forward_batch.forward_mode.is_target_verify(),
+            draft_token_num=draft_token_num,
         )
 
     def init_forward_metadata_out_graph(
@@ -394,6 +412,17 @@ class MambaAttnBackendBase(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
+        mamba_cache_steps = (
+            getattr(spec_info, "mamba_cache_steps", None)
+            if spec_info is not None
+            else None
+        )
+        mamba_replay = (
+            getattr(spec_info, "mamba_replay", False)
+            if spec_info is not None
+            else False
+        )
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and self.topk > 1:
@@ -406,11 +435,19 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=draft_token_num,
+                mamba_cache_steps=mamba_cache_steps,
+                mamba_replay=mamba_replay,
             )
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=draft_token_num,
+                mamba_cache_steps=mamba_cache_steps,
+                mamba_replay=mamba_replay,
             )
 
     def _replay_metadata(
@@ -458,6 +495,17 @@ class MambaAttnBackendBase(AttentionBackend):
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
+        mamba_cache_steps = (
+            getattr(spec_info, "mamba_cache_steps", None)
+            if spec_info is not None
+            else None
+        )
+        mamba_replay = (
+            getattr(spec_info, "mamba_replay", False)
+            if spec_info is not None
+            else False
+        )
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and self.topk > 1:
@@ -478,11 +526,19 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=draft_token_num,
+                mamba_cache_steps=mamba_cache_steps,
+                mamba_replay=mamba_replay,
             )
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=draft_token_num,
+                mamba_cache_steps=mamba_cache_steps,
+                mamba_replay=mamba_replay,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -587,11 +643,23 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
+        mamba_cache_steps = (
+            getattr(spec_info, "mamba_cache_steps", None)
+            if spec_info is not None
+            else None
+        )
+        mamba_replay = (
+            getattr(spec_info, "mamba_replay", False)
+            if spec_info is not None
+            else False
+        )
         self.forward_metadata = Mamba2Metadata.prepare_decode(
             metadata,
             forward_batch.seq_lens,
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             draft_token_num=draft_token_num,
+            mamba_cache_steps=mamba_cache_steps,
+            mamba_replay=mamba_replay,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -675,9 +743,37 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
+        self._mamba_zero_steps_cache = {}
+        self._mamba_clamped_steps_cache = {}
         # Dispatcher aliases the full-attn backend's pool refs.
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
+
+    @staticmethod
+    def _mamba_buffer_cache_key(device: torch.device, size: int):
+        return (device.type, -1 if device.index is None else device.index, size)
+
+    def _get_mamba_zero_steps(self, size: int, device: torch.device) -> torch.Tensor:
+        key = self._mamba_buffer_cache_key(device, size)
+        zero_steps = self._mamba_zero_steps_cache.get(key)
+        if zero_steps is None:
+            zero_steps = torch.zeros((size,), dtype=torch.int32, device=device)
+            self._mamba_zero_steps_cache[key] = zero_steps
+        return zero_steps
+
+    def _clamp_mamba_steps(self, steps: torch.Tensor, max_step: int) -> torch.Tensor:
+        if steps.dtype != torch.int32:
+            return torch.clamp(steps, max=max_step)
+
+        key = self._mamba_buffer_cache_key(steps.device, steps.shape[0])
+        clamped_steps = self._mamba_clamped_steps_cache.get(key)
+        if clamped_steps is None:
+            clamped_steps = torch.empty(
+                (steps.shape[0],), dtype=torch.int32, device=steps.device
+            )
+            self._mamba_clamped_steps_cache[key] = clamped_steps
+        torch.clamp(steps, max=max_step, out=clamped_steps)
+        return clamped_steps
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
@@ -863,10 +959,12 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def update_mamba_state_after_mtp_verify(
         self,
-        last_correct_step_indices: torch.Tensor,
-        mamba_track_indices: Optional[torch.Tensor],
-        mamba_steps_to_track: Optional[torch.Tensor],
-        model,
+        last_correct_step_indices: Optional[torch.Tensor] = None,
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        mamba_steps_to_track: Optional[torch.Tensor] = None,
+        model=None,
+        accepted_steps: Optional[torch.Tensor] = None,
+        accepted_lengths: Optional[torch.Tensor] = None,
     ):
         """
         Update mamba states after MTP verify using fully fused Triton kernel.
@@ -877,7 +975,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        request_number = last_correct_step_indices.shape[0]
+        if accepted_steps is None:
+            if last_correct_step_indices is None:
+                raise ValueError(
+                    "update_mamba_state_after_mtp_verify requires accepted_steps "
+                    "or last_correct_step_indices."
+                )
+            accepted_steps = last_correct_step_indices
+
+        request_number = accepted_steps.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -894,34 +1000,118 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Use fully fused kernel that handles masking internally
-        # This avoids separate nonzero() and index_select() calls
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
+        mamba_cache_steps = getattr(
+            self.linear_attn_backend.forward_metadata, "mamba_cache_steps", None
         )
+        mamba_replay = bool(
+            getattr(self.linear_attn_backend.forward_metadata, "mamba_replay", False)
+        )
+        draft_token_num = int(self.linear_attn_backend.forward_metadata.draft_token_num)
+        replay_enabled = (
+            mamba_replay
+            and mamba_cache_steps is not None
+            and int(mamba_cache_steps) < draft_token_num
+        )
+        effective_cache_steps = (
+            int(mamba_cache_steps) if mamba_cache_steps is not None else draft_token_num
+        )
+        zero_cache_replay = replay_enabled and effective_cache_steps == 0
+        dense_active_replay = replay_enabled and effective_cache_steps <= 1
+
+        if replay_enabled and not self.linear_attn_backend.supports_dflash_mamba_replay:
+            raise NotImplementedError(
+                "DFLASH reduced Mamba cache replay is only implemented for GDN "
+                "linear attention backends."
+            )
+
+        if replay_enabled:
+            replay_start_step = effective_cache_steps - 1
+            if zero_cache_replay:
+                ssm_accepted_steps = None
+            elif effective_cache_steps == 1:
+                ssm_accepted_steps = self._get_mamba_zero_steps(
+                    request_number, accepted_steps.device
+                )
+            else:
+                ssm_accepted_steps = self._clamp_mamba_steps(
+                    accepted_steps, replay_start_step
+                )
+        else:
+            ssm_accepted_steps = accepted_steps
+
+        # Scatter accepted SSM step from intermediate cache to main buffer
+        if not zero_cache_replay:
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                ssm_accepted_steps,
+            )
+        # Scatter accepted conv window state (always from intermediate cache)
         fused_mamba_state_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
             state_indices_tensor,
-            last_correct_step_indices,
+            accepted_steps,
         )
 
-        # Track indices used for tracking mamba states for prefix cache
-        if mamba_track_indices is not None:
+        tracked_mamba_state_updated = False
+
+        def update_tracked_mamba_state_after_verify():
             assert mamba_steps_to_track is not None
-            # Use fully fused kernel for track scatter operations
-            fused_mamba_state_scatter_with_mask(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
+            if zero_cache_replay:
+                ssm_steps_to_track = mamba_steps_to_track
+            elif replay_enabled:
+                ssm_steps_to_track = self._clamp_mamba_steps(
+                    mamba_steps_to_track, replay_start_step
+                )
+            else:
+                ssm_steps_to_track = mamba_steps_to_track
+            if ssm_steps_to_track is not None:
+                if not zero_cache_replay:
+                    fused_mamba_state_scatter_with_mask(
+                        ssm_states,
+                        intermediate_state_cache,
+                        mamba_track_indices,
+                        ssm_steps_to_track,
+                    )
+                fused_mamba_state_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
+            if replay_enabled:
+                self.linear_attn_backend.replay_mamba_state_after_verify(
+                    target_steps=mamba_steps_to_track,
+                    destination_state_indices=mamba_track_indices,
+                    mamba_cache_steps=effective_cache_steps,
+                    replay_raw_requests=zero_cache_replay,
+                    initial_state_indices=(
+                        state_indices_tensor if zero_cache_replay else None
+                    ),
+                )
+
+        # K=0 replay must compute prefix-cache tracking slots before the main
+        # request slots are replayed, because the main slots hold the pre-verify
+        # initial states.
+        if zero_cache_replay and mamba_track_indices is not None:
+            update_tracked_mamba_state_after_verify()
+            tracked_mamba_state_updated = True
+
+        # Replay remaining SSM steps beyond what was cached
+        if replay_enabled:
+            self.linear_attn_backend.replay_mamba_state_after_verify(
+                target_steps=accepted_steps,
+                target_lengths=accepted_lengths if zero_cache_replay else None,
+                destination_state_indices=state_indices_tensor,
+                mamba_cache_steps=effective_cache_steps,
+                replay_all_requests=dense_active_replay,
             )
-            fused_mamba_state_scatter_with_mask(
-                conv_states,
-                intermediate_conv_window_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
+
+        # Track indices used for tracking mamba states for prefix cache
+        if mamba_track_indices is not None and not tracked_mamba_state_updated:
+            update_tracked_mamba_state_after_verify()
+
+        if replay_enabled:
+            self.linear_attn_backend.clear_mamba_replay_inputs()

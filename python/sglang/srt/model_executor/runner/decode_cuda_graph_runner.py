@@ -157,6 +157,7 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         spec_info=forward_batch.spec_info,
+        cuda_graph_key=getattr(forward_batch, "cuda_graph_key", None),
     )
 
 
@@ -836,6 +837,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             size, stream_idx=stream_idx
         )
+        shape_key = self._make_graph_key(bs, stream_idx, variant_label)
+        forward_batch.cuda_graph_key = shape_key
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -893,7 +896,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 else contextlib.nullcontext()
             )
             with canary_ctx:
-                shape_key = self._make_graph_key(bs, stream_idx, variant_label)
                 self.backend.capture_one(
                     shape_key,
                     run_once,
@@ -959,6 +961,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._replay_graph_key = self._make_graph_key(
                 self.bs, stream_idx, variant_label
             )
+            forward_batch.cuda_graph_key = self._replay_graph_key
             return
 
         buffers = self.buffers
@@ -1008,7 +1011,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
+            stream_idx = None
             attn_backend = self.attn_backend
+        variant_label = self._resolve_lora_variant(forward_batch)
+        self._replay_graph_key = self._make_graph_key(bs, stream_idx, variant_label)
+        forward_batch.cuda_graph_key = self._replay_graph_key
         fb_view = build_replay_fb_view(
             forward_batch=forward_batch,
             buffers=buffers,
@@ -1027,12 +1034,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
-
-        variant_label = self._resolve_lora_variant(forward_batch)
-        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        self._replay_graph_key = self._make_graph_key(
-            self.bs, stream_idx, variant_label
-        )
 
     # -----------------------------------------------------------------
     # replay
@@ -1131,6 +1132,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 draft_token=None,
                 positions=None,
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                mamba_cache_steps=(
+                    self.model_runner.server_args.speculative_dflash_mamba_cache_steps
+                ),
+                mamba_replay=(
+                    self.model_runner.server_args.speculative_dflash_mamba_replay
+                ),
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)

@@ -316,6 +316,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        speculative_mamba_cache_steps: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -379,13 +380,18 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
+                ssm_cache_steps = (
+                    speculative_num_draft_tokens
+                    if speculative_mamba_cache_steps is None
+                    else int(speculative_mamba_cache_steps)
+                )
                 # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # Shape: [num_layers, size + 1, ssm_cache_steps, HV, K, V]
                 intermediate_ssm_state_cache = torch.zeros(
                     size=(
                         num_mamba_layers,
                         spec_state_size + 1,
-                        speculative_num_draft_tokens,
+                        ssm_cache_steps,
                         temporal_state_shape[0],
                         temporal_state_shape[1],
                         temporal_state_shape[2],
@@ -420,6 +426,7 @@ class MambaPool:
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                    f"intermediate_ssm_cache_steps: {ssm_cache_steps}, "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
                 )
@@ -561,6 +568,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
+        speculative_mamba_cache_steps: int = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
     ):
@@ -585,6 +593,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_mamba_cache_steps=speculative_mamba_cache_steps,
         )
 
     def _init_mamba_pool(
@@ -596,6 +605,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        speculative_mamba_cache_steps: int = None,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -605,6 +615,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_mamba_cache_steps=speculative_mamba_cache_steps,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

@@ -30,6 +30,8 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
+    mamba_cache_steps: int | None = None
+    mamba_replay: bool = False
     # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
     # DFLASH verify is linear (non-tree), so this is always 1.
     topk: int = 1
@@ -49,6 +51,18 @@ class DFlashVerifyInput(SpecInput):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
+    def check_mamba_replay_config(self) -> None:
+        if (
+            self.mamba_cache_steps is not None
+            and self.mamba_cache_steps < self.draft_token_num
+            and not self.mamba_replay
+        ):
+            raise RuntimeError(
+                "DFLASH reduced Mamba/GDN cache requires replay, but replay was "
+                "not enabled. This should be auto-enabled when "
+                "speculative_dflash_mamba_cache_steps < speculative_num_draft_tokens."
+            )
+
     def prepare_for_v2_verify(
         self,
         batch: ScheduleBatch,
@@ -61,6 +75,7 @@ class DFlashVerifyInput(SpecInput):
         metadata or eager attention metadata so the actual forward can run with
         `skip_attn_backend_init=True`.
         """
+        self.check_mamba_replay_config()
         batch.input_ids = self.draft_token
         batch.spec_info = self
         batch.forward_mode = (
