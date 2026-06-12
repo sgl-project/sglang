@@ -844,6 +844,7 @@ class AiterAttnBackend(AttentionBackend):
             reduce_final_map,
             reduce_partial_map,
             tile_q,
+            0,
             output,
             final_lse,
         )
