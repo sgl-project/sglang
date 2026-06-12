@@ -16,7 +16,7 @@ This section describes the best practice data for Qwen3-32B on the Ascend NPU.
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-32B | Atlas 800I A3 | 2 | PD Mixed | 3.6K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms-gpqa) |
+| Qwen3-32B | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms-gpqa) |
 
 
 ## Optimal Configuration
@@ -128,7 +128,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.6K+1.5K
+**Dataset**: 3.5K+1.5K
 
 **TPOT**: 50ms
 
