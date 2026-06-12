@@ -118,7 +118,7 @@ def _extract_prefix_lens_and_extend_seq_lens(
         out_prefix_lens.copy_(forward_batch.seq_lens[:bs].to(torch.int64))
         out_extend_seq_lens.fill_(int(spec_info.draft_token_num))
     elif forward_mode.is_draft_extend_v2():
-        # Evidence: EagleDraftInputV2Mixin.prepare_for_extend_to_fill_draft_kvcache bumps
+        # Evidence: EagleDraftExtendInputV2Mixin.prepare_for_extend_to_fill_draft_kvcache bumps
         # seq_lens by num_draft_tokens. FlashAttentionBackend.init_forward_metadata reads the
         # draft-extend-v2 query length from spec_info.extend_seq_lens_tensor when available.
         # CUDA-graph replay passes extend_seq_lens but omits extend_prefix_lens, so derive the

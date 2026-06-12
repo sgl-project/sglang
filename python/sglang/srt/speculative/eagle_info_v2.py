@@ -60,7 +60,11 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
-    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.eagle_info import (
+        EagleDraftExtendInput,
+        EagleDraftInput,
+        EagleVerifyInput,
+    )
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -302,8 +306,10 @@ class EagleDraftInputV2Mixin:
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
+
+class EagleDraftExtendInputV2Mixin:
     def prepare_for_extend_to_fill_draft_kvcache(
-        self,
+        self: EagleDraftExtendInput,
         batch: ScheduleBatch,
         predict: torch.Tensor,
         num_draft_tokens: int,
@@ -364,7 +370,11 @@ class EagleDraftInputV2Mixin:
             # (the `_batch_size == batch_size` assertion, see #27091); the
             # marked pre-pad metadata is used as-is, matching the proven
             # skip_attn_backend_init=True behavior.
-            forward_batch.mark_forward_metadata_ready()
+            # On NPU with --disable-cuda-graph, block_table shape won't match
+            # after prepare_mlp_sync_batch padding; defer re-init to
+            # forward_extend (post-pad) instead.
+            if not _is_npu or can_cuda_graph:
+                forward_batch.mark_forward_metadata_ready()
         return forward_batch
 
 
