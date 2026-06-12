@@ -540,14 +540,14 @@ def _merged_experts_fused_moe_lora_add_impl(
     assert n_b in (1, 2), f"lora_b must be length 1 or 2, got {n_b}"
     b_rank = lora_b_list[0].shape[3]
     for b in lora_b_list[1:]:
-        assert b.shape == lora_b_list[0].shape, (
-            f"all lora_b tensors must share shape; got {[tuple(t.shape) for t in lora_b_list]}"
-        )
+        assert (
+            b.shape == lora_b_list[0].shape
+        ), f"all lora_b tensors must share shape; got {[tuple(t.shape) for t in lora_b_list]}"
 
     max_loras, _, max_lora_rank, _ = lora_a.shape
-    assert max_lora_rank == n_b * b_rank, (
-        f"lora_a rank {max_lora_rank} != n_b ({n_b}) * lora_b rank {b_rank}"
-    )
+    assert (
+        max_lora_rank == n_b * b_rank
+    ), f"lora_a rank {max_lora_rank} != n_b ({n_b}) * lora_b rank {b_rank}"
     input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
 
     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
@@ -720,8 +720,14 @@ def _merged_experts_fused_moe_lora_add_impl(
             inter_arg = intermediate.view(-1, b_rank)
             out_arg = output
         else:
-            inter_arg = intermediate[..., b_idx * b_rank : (b_idx + 1) * b_rank].contiguous().view(-1, b_rank)
-            out_arg = output[..., b_idx * half_out : (b_idx + 1) * half_out].contiguous()
+            inter_arg = (
+                intermediate[..., b_idx * b_rank : (b_idx + 1) * b_rank]
+                .contiguous()
+                .view(-1, b_rank)
+            )
+            out_arg = output[
+                ..., b_idx * half_out : (b_idx + 1) * half_out
+            ].contiguous()
         invoke_fused_moe_kernel(
             inter_arg,
             b_virtual,

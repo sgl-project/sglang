@@ -222,9 +222,7 @@ def _compute_token_lora_mapping(
         right=True,
     )
     req_to_lora = lora_info.req_to_lora.to(torch.int32)
-    req_to_lora_padded = torch.cat(
-        [req_to_lora, req_to_lora.new_full((1,), -1)], dim=0
-    )
+    req_to_lora_padded = torch.cat([req_to_lora, req_to_lora.new_full((1,), -1)], dim=0)
     return req_to_lora_padded[req_indices]
 
 
