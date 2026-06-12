@@ -105,8 +105,6 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 ```shell Command
 python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 \
-  --host 0.0.0.0 \
-  --port 30000 \
   --trust-remote-code \
   --tp 8 \
   --mamba-scheduler-strategy extra_buffer \
@@ -441,9 +439,7 @@ python3 -m sglang.launch_server \
   --tp 4 \
   --mamba-scheduler-strategy extra_buffer \
   --attention-backend trtllm_mha \
-  --max-running-requests 1024 \
-  --host 0.0.0.0 \
-  --port 30000
+  --max-running-requests 1024
 ```
 
 - Benchmark Command:
@@ -451,8 +447,6 @@ python3 -m sglang.launch_server \
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
-  --host 0.0.0.0 \
-  --port 30000 \
   --model nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --dataset-name random \
   --random-input-len 1024 \
@@ -526,7 +520,7 @@ python3 -m sglang.launch_server \
 
 **Run Benchmark**
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py --port 30000
+python3 benchmark/gsm8k/bench_sglang.py
 ```
 
 **Test Results:**
@@ -541,7 +535,7 @@ Output throughput: 745.333 token/s
 
 **Run Benchmark**
 ```bash Command
-python3 benchmark/mmlu/bench_sglang.py --port 30000
+python3 benchmark/mmlu/bench_sglang.py
 ```
 
 **Test Results:**
