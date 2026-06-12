@@ -97,6 +97,64 @@ class DummyProcessor:
         return {"input_ids": _DummyTokenTensor(text_len + image_tokens)}
 
 
+class KimiK25Processor:
+    def __init__(self, tokenizer: PreTrainedTokenizerFast):
+        self.tokenizer = tokenizer
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
+        return self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=tokenize,
+            return_dict=False,
+        )
+
+    def __call__(
+        self,
+        messages=None,
+        medias=None,
+        text=None,
+        return_tensors="pt",
+        **kwargs,
+    ):
+        if messages is not None:
+            image_tokens = 0
+            for message in messages:
+                content = message.get("content", [])
+                if isinstance(content, str):
+                    continue
+                for item in content:
+                    if item.get("type") == "text":
+                        continue
+                    if item.get("type") != "image_url" or not isinstance(
+                        item.get("image_url"), str
+                    ):
+                        raise ValueError(
+                            "KimiK25Processor expects string image_url content items"
+                        )
+                    image_tokens += 4
+
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=kwargs.get("add_generation_prompt", False),
+                tokenize=False,
+                return_dict=False,
+            )
+            text_len = len(self.tokenizer.encode(prompt))
+            return {"input_ids": _DummyTokenTensor(text_len + image_tokens)}
+
+        if isinstance(text, list):
+            raise ValueError(
+                "KimiK25Processor only supports string text input; list text should fall back"
+            )
+        if text is None:
+            raise ValueError("KimiK25Processor requires text or messages input")
+
+        image_tokens = 4 * len(medias) if medias else 0
+        text_len = len(self.tokenizer.encode(text))
+        return {"input_ids": _DummyTokenTensor(text_len + image_tokens)}
+
+
 class _FakeMMMUDataset:
     def __init__(self, records):
         self.records = records
@@ -435,6 +493,63 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             )
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
+
+    def test_mmmu_sampler_with_kimi_k25_processor(self):
+        fake_dataset = _FakeMMMUDataset(
+            [{"image_1": Image.new("RGB", (4, 4), color="white"), "question": "q1"}]
+        )
+        with patch(
+            "sglang.benchmark.datasets.mmmu.load_dataset", return_value=fake_dataset
+        ):
+            rows = sample_mmmu_requests(
+                num_requests=1,
+                processor=KimiK25Processor(self.tokenizer),
+                backend="sglang",
+                fixed_output_len=6,
+                random_sample=False,
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0].prompt.startswith("<image>"))
+        self.assertEqual(
+            rows[0].prompt_len, len(self.tokenizer.encode(rows[0].prompt)) + 4
+        )
+        self.assertGreater(rows[0].vision_prompt_len, 0)
+
+    def test_image_sampler_with_kimi_k25_processor(self):
+        fixed_text_prompt = "tok_1 tok_2 tok_3 tok_4 tok_5 tok_6 tok_7 tok_8"
+        with patch(
+            "sglang.benchmark.datasets.image.gen_mm_prompt",
+            return_value=fixed_text_prompt,
+        ):
+            rows = sample_image_requests(
+                num_requests=1,
+                image_count=1,
+                input_len=8,
+                output_len=4,
+                range_ratio=0.0,
+                processor=KimiK25Processor(self.tokenizer),
+                image_content="blank",
+                image_format="png",
+                image_resolution="8x8",
+                backend="sglang",
+                random_image_count=False,
+            )
+        row = rows[0]
+        self.assertEqual(len(rows), 1)
+        text_only_templated = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": fixed_text_prompt}],
+            add_generation_prompt=True,
+            tokenize=False,
+            return_dict=False,
+        )
+        self.assertEqual(
+            row.text_prompt_len, len(self.tokenizer.encode(text_only_templated))
+        )
+        self.assertEqual(
+            row.text_prompt_len + row.vision_prompt_len,
+            row.prompt_len,
+        )
+        self.assertGreater(row.vision_prompt_len, 0)
 
     def test_mooncake_scheduler(self):
         records = [
