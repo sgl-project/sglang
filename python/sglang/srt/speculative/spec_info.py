@@ -151,14 +151,6 @@ class SpeculativeAlgorithm(Enum):
             )
         return None
 
-    def supports_spec_v2(self) -> bool:
-        return (
-            self.is_eagle()
-            or self.is_standalone()
-            or self.is_ngram()
-            or self.is_dflash()
-        )
-
     def need_topk(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 

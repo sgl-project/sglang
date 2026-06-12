@@ -95,7 +95,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
 
     # Only the overlap path relays spec extras through the future_map; the
     # synchronous (non-overlap) V2 path installs next_draft_input directly.
-    if batch.enable_overlap and batch.is_spec_v2:
+    if batch.enable_overlap and not batch.spec_algorithm.is_none():
         future_map._resolve_spec_extras(batch)
 
 
@@ -326,8 +326,8 @@ class FutureMap:
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
-        # Dispatch by payload type, not spec_algo: spec_v1 (non-overlap spec)
-        # also passes a token Tensor here.
+        # Dispatch by payload type, not spec_algo: non-spec decode passes a
+        # token Tensor here.
         # FIXME(lsyin): unify this relay path with a dataclass instead of the
         # Tensor / EagleDraftInput type switch.
         if isinstance(payload, torch.Tensor):

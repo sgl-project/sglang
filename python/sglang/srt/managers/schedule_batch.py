@@ -2355,25 +2355,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
             return new_pages * page_size
 
-        if self.is_spec_v2:
-            return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
-
-        server_args = get_global_server_args()
-        len_per_topk = server_args.speculative_num_steps or 1
-        spec_topk = server_args.speculative_eagle_topk or 1
-        spec_tokens = server_args.speculative_num_draft_tokens
-
-        if page_size > 1 and spec_topk > 1:
-            # last partial page and ceil alignment
-            len_per_topk = ceil_align(len_per_topk + page_size, page_size)
-            spec_tokens = ceil_align(spec_tokens, page_size)
-        elif page_size > 1:
-            # only page alignment
-            len_per_topk = ceil_align(len_per_topk, page_size)
-            spec_tokens = ceil_align(spec_tokens, page_size)
-
-        num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
-        return num_tokens
+        return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
@@ -2498,12 +2480,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
-    @property
-    def is_spec_v2(self):
-        # Whether the V2 worker/schema is used. Independent of overlap: the
-        # non-overlap path also drives the V2 worker, just synchronously.
-        return self.spec_algorithm.supports_spec_v2()
-
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
 
@@ -2547,14 +2523,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
-        if self.is_spec_v2:
-            # TODO(spec-v2): all spec v2 should go through this path
+        if not self.spec_algorithm.is_none():
+            # Spec decoding: the draft input owns decode preparation
+            # (allocation, pre-claim, seq-lens bookkeeping).
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
-
-        if not self.spec_algorithm.is_none():
-            # if spec decoding is used, the decode batch is prepared inside
-            # `forward_batch_speculative_generation` after running draft models.
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
@@ -2638,8 +2611,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
-        # FIXME(lsyin): deprecate this API after spec v1 is deprecated
-        v1_spec_info_filtered: Optional[bool] = False,
     ):
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2706,15 +2677,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
-        # NOTE: spec_info filtered before batch filtering only happens in:
-        # - Spec v1's verify phase
-        # - Only for decode batch (running_batch)
-        has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
-
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
-                has_been_filtered=has_been_filtered,
+                has_been_filtered=False,
             )
 
     def merge_batch(self, other: ScheduleBatch):
