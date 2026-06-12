@@ -166,9 +166,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 "127.0.0.1", self.master_port
             ).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
-            use_cfg_ranks_for_decode_parallel=(
-                self.server_args.performance_mode == "speed"
-            ),
+            use_cfg_ranks_for_decode_parallel=self.server_args.enable_cfg_parallel,
         )
 
         # set proc title
