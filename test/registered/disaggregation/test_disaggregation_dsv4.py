@@ -2,6 +2,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.spec_decoding_kit import MTPAcceptanceLengthMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -38,9 +39,12 @@ _EAGLE_SPEC_ARGS = [
 ]
 
 
-class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
-
+class TestDisaggregationDSV4(
+    MTPAcceptanceLengthMixin, PDDisaggregationServerBase, GSM8KMixin
+):
     gsm8k_accuracy_thres = 0.93
+    mtp_accept_length_thres = 1.6
+    mtp_summary_name = "deepseek-v4-flash-fp8-disaggregation"
 
     @classmethod
     def setUpClass(cls):
@@ -128,7 +132,6 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
 
 
 class TestDisaggregationDSV4HiSparseMooncake(PDDisaggregationServerBase, GSM8KMixin):
-
     gsm8k_accuracy_thres = 0.93
     gsm8k_num_questions = 200
     gsm8k_num_shots = 20
