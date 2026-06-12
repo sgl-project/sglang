@@ -24,7 +24,10 @@ from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_size,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -48,6 +51,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
     next_power_of_2,
+    require_gathered_buffer,
 )
 
 if TYPE_CHECKING:
@@ -55,6 +59,19 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
+    """Pad max_bs to the alignment cuda-graph capture uses (see get_batch_sizes_to_capture)."""
+    mul_base = 1
+    if server_args.enable_two_batch_overlap:
+        mul_base *= 2
+    if require_gathered_buffer(server_args):
+        mul_base *= get_attention_tp_size()
+    if mul_base % get_attention_cp_size() != 0:
+        mul_base *= get_attention_cp_size()
+    return (max_bs + mul_base - 1) // mul_base * mul_base
+
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
@@ -266,7 +283,9 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self.workspace_buffer = global_workspace_buffer
-        max_bs = model_runner.req_to_token_pool.size
+        max_bs = _cuda_graph_capture_max_bs(
+            model_runner.server_args, model_runner.req_to_token_pool.size
+        )
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -1180,7 +1199,7 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
-        if spec_info is None:
+        if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -1646,7 +1665,9 @@ class FlashInferMultiStepDraftBackend:
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         self.page_size = model_runner.page_size
 
-        max_bs = model_runner.req_to_token_pool.size * self.topk
+        max_bs = _cuda_graph_capture_max_bs(
+            model_runner.server_args, model_runner.req_to_token_pool.size * self.topk
+        )
         self.kv_indptr = torch.zeros(
             (
                 self.speculative_num_steps,
