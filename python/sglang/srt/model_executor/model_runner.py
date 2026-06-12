@@ -66,6 +66,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
+from sglang.srt.debug_utils.input_loader import register_input_loaders
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
@@ -866,6 +867,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
+
+        if server_args.load_input_dir:
+            register_input_loaders(self.model, server_args.load_input_dir)
 
         # Initialize piecewise CUDA graph
         self.init_prefill_cuda_graph()
