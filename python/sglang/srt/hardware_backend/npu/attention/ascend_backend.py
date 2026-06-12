@@ -530,7 +530,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
-    ) -> "ForwardMetadata":
+    ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
@@ -847,7 +847,7 @@ class AscendAttnBackend(AttentionBackend):
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        layer: "RadixAttention",
+        layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """CP-aware attention for standard (non-MLA) models using FIA on Ascend NPU.
@@ -1770,26 +1770,45 @@ class AscendAttnBackend(AttentionBackend):
                 mask = self.mtp_mask
                 sparse_mode = 4 if is_swa_layer else 3
 
-            attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                query,
-                k_cache,
-                v_cache,
-                block_table=block_table,
-                block_size=self.page_size,
-                num_query_heads=layer.tp_q_head_num,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="TND",
-                atten_mask=mask,
-                softmax_scale=layer.scaling,
-                actual_seq_qlen=actual_seq_lengths,
-                actual_seq_kvlen=actual_seq_lengths_kv,
-                sparse_mode=sparse_mode,
-                pre_tokens=(
-                    layer.sliding_window_size if is_swa_layer else FULL_ATTENTION_WINDOW
-                ),
-                next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
-                learnable_sink=sinks,
-            )
+            if self.is_hybrid_swa:
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=block_table,
+                    block_size=self.page_size,
+                    num_query_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    atten_mask=mask,
+                    softmax_scale=layer.scaling,
+                    actual_seq_qlen=actual_seq_lengths,
+                    actual_seq_kvlen=actual_seq_lengths_kv,
+                    sparse_mode=sparse_mode,
+                    pre_tokens=(
+                        layer.sliding_window_size
+                        if is_swa_layer
+                        else FULL_ATTENTION_WINDOW
+                    ),
+                    next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
+                    learnable_sink=sinks,
+                )
+            else:
+                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    atten_mask=mask,
+                    scale=layer.scaling,
+                    actual_seq_lengths=actual_seq_lengths,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    sparse_mode=sparse_mode,
+                )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
