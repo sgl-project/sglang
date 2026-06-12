@@ -563,31 +563,22 @@ def sglang_per_token_group_quant_fp8(
                 scale_ue8m0=scale_ue8m0,
             )
         elif enable_sgl_per_token_group_quant_8bit:
-            if enable_v2:
-                sgl_per_token_group_quant_8bit(
-                    x,
-                    x_q,
-                    x_s,
-                    group_size,
-                    eps,
-                    fp8_min,
-                    fp8_max,
-                    scale_ue8m0,
-                    fuse_silu_and_mul,
-                    masked_m,
-                    enable_v2=True,
-                )
-            else:
-                sgl_per_token_group_quant_8bit_jit(
-                    input=x,
-                    output_q=x_q,
-                    output_s=x_s,
-                    group_size=group_size,
-                    eps=eps,
-                    fp8_min=fp8_min,
-                    fp8_max=fp8_max,
-                    scale_ue8m0=scale_ue8m0,
-                )
+            # enable_v2 is False only for group_size outside the v2/JIT set
+            # {16,32,64,128}; the AOT kernel's v1 path handles those, whereas
+            # the restricted JIT kernel (use_jit_quant above) would static_assert.
+            sgl_per_token_group_quant_8bit(
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                fuse_silu_and_mul,
+                masked_m,
+                enable_v2=enable_v2,
+            )
         else:
             assert not enable_v2
             sgl_per_token_group_quant_fp8(
