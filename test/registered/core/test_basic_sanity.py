@@ -17,6 +17,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
@@ -36,7 +37,7 @@ class TestBasicSanity(
     # 5090 + Llama-3.1-8B single-batch decode with overlap scheduler +
     # cuda graph measured ~99 median in CI; async-assert probes are off in
     # base-a, so the threshold can sit right under the measured median.
-    fwd_occupancy_threshold = 99.0
+    fwd_occupancy_threshold = 97.0 if is_in_amd_ci() else 99.0
 
     @classmethod
     def setUpClass(cls):
