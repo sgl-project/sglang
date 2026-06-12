@@ -1405,7 +1405,7 @@ class MambaPoolHost(HostKVCache):
                 allocator=self.allocator,
             )
             self.conv_buffer = []
-            for i, conv_shape in enumerate(self.conv_state_shapes):
+            for conv_shape in self.conv_state_shapes:
                 conv_dims = (self.size, self.num_mamba_layers, 1) + conv_shape
                 self.conv_buffer.append(
                     alloc_func(
@@ -1430,7 +1430,7 @@ class MambaPoolHost(HostKVCache):
                 allocator=self.allocator,
             )
             self.conv_buffer = []
-            for i, conv_shape in enumerate(self.conv_state_shapes):
+            for conv_shape in self.conv_state_shapes:
                 conv_dims = (self.num_mamba_layers, self.size) + conv_shape
                 self.conv_buffer.append(
                     alloc_func(
