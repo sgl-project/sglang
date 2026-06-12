@@ -518,7 +518,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Prepare for draft extend in a separate stream
         # Notice that here we use batch_result.next_token_ids as the input ids
         with self.plan_stream_ctx:
-            forward_batch = draft_extend_input.prepare_for_extend_to_fill_draft_kvcache(
+            forward_batch = self.prepare_for_extend_to_fill_draft_kvcache(
+                draft_extend_input,
                 batch,
                 batch_result.next_token_ids,
                 self.speculative_num_draft_tokens,
