@@ -109,9 +109,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
         )
+        # MSA fmha_sm100 decode is NOT cuda-graph-safe: captured & replayed it returns
+        # wrong results that compound across replays (silent ~14% GSM8K loss on B200;
+        # masked early by radix-cache prefix reuse, then cliffs under sustained load).
+        # Use the MSA decode kernel only when decode does NOT run under cuda graph;
+        # otherwise route the decode step through the cuda-graph-safe Triton sparse path.
+        # MSA still serves prefill (run eager — prefill cuda graph is disabled), where
+        # its long-context speedup matters.
+        _sa = getattr(runner, "server_args", None)
+        _decode_cuda_graph = _sa is not None and not (
+            _sa.disable_cuda_graph or _sa.disable_decode_cuda_graph
+        )
+        self._use_msa_decode = self.use_msa and not _decode_cuda_graph
         # MSA owns the main decode step unless dense-sparse-decode does; the dense
         # path only engages when k_cache.shape[1] == 1 (see forward_decode).
-        self._msa_owns_decode = self.use_msa and not (
+        self._msa_owns_decode = self._use_msa_decode and not (
             self.use_dense_sparse_decode and self.kv_pool.main_pool.head_num == 1
         )
         # The page table + effective KV length are allocated and returned by the
@@ -430,7 +442,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # init_forward_metadata_out_graph (eager, outside graph capture) and shared
         # across all sparse layers; here we just consume the cached metadata.
         msa_kv_indices = msa_plan = None
-        if self.use_msa and attn_fn is None:
+        if self._use_msa_decode and attn_fn is None:
             if self._msa_dec_meta is not None:
                 msa_kv_indices, msa_plan = self._msa_dec_meta
             elif q.shape[0] > 0:
@@ -463,7 +475,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_value,
             dense_main_attn_fn=attn_fn,
             page_size=self.page_size,
-            use_msa=self.use_msa,
+            use_msa=self._use_msa_decode,
             msa_kv_indices=msa_kv_indices,
             msa_plan=msa_plan,
         )
