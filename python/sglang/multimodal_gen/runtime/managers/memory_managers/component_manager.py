@@ -193,16 +193,26 @@ class ComponentResidencyManager:
         self._custom_strategies[component_name] = strategy
         self.strategy_for.cache_clear()
 
+    @staticmethod
+    def _batch_is_warmup(batch: ResidencyBatch | list[ResidencyBatch]) -> bool:
+        if isinstance(batch, list):
+            return bool(batch) and all(
+                getattr(item, "is_warmup", False) for item in batch
+            )
+        return batch.is_warmup
+
     def begin_request(
         self,
         stages: Sequence[ComponentResidencyStage],
-        batch: ResidencyBatch,
+        batch: ResidencyBatch | list[ResidencyBatch],
         server_args: ServerArgs,
     ) -> None:
         """A hook called before processing an actual request"""
         self.refresh_server_args(server_args)
         self.state = ResidencyState(
-            stages=stages, batch_is_warmup=batch.is_warmup, trace_enabled=False
+            stages=stages,
+            batch_is_warmup=self._batch_is_warmup(batch),
+            trace_enabled=False,
         )
         self._active_use = None
         self._active_use_module = None
