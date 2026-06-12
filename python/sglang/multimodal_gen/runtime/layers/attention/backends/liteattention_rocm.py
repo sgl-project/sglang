@@ -25,7 +25,6 @@ class LiteAttentionROCMBackend(AttentionBackend):
     constraints:
     - bf16 inputs/outputs
     - head_dim == 128
-    - seq_len % 64 == 0
     - No causal masking
     - No GQA (query/key/value must have same shape)
     - gfx942 / MI300X only (CDNA3)
@@ -78,6 +77,7 @@ class LiteAttentionROCMImpl(AttentionImpl):
 
         try:
             from moonmath_attention import LiteAttention
+            from moonmath_attention import forward as moonmath_forward
         except ImportError as e:
             raise ImportError(
                 "LiteAttentionROCM backend requires moonmath_attention package, which is "
@@ -114,6 +114,7 @@ class LiteAttentionROCMImpl(AttentionImpl):
             )
 
         self._lite = LiteAttention(threshold=-6.0, round_mode="rtz", layout="bshd")
+        self._moonmath_forward = moonmath_forward
 
         # Validate softmax scale (moonmath bakes in 1/sqrt(D))
         expected_scale = self.head_size**-0.5
@@ -142,16 +143,6 @@ class LiteAttentionROCMImpl(AttentionImpl):
         Returns:
             Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
         """
-        # Lazy import to avoid breaking platforms without moonmath_attention
-        try:
-            from moonmath_attention import forward as moonmath_forward
-        except ImportError as e:
-            raise ImportError(
-                "LiteAttentionROCM backend requires moonmath_attention package, which is "
-                "only available on AMD MI300X (gfx942). Install it from the "
-                "moonmath_attention repository or use a different attention backend."
-            ) from e
-
         # Validate dtype
         if query.dtype != torch.bfloat16:
             raise NotImplementedError(
@@ -169,7 +160,7 @@ class LiteAttentionROCMImpl(AttentionImpl):
         if query.shape[1] == key.shape[1]:
             output = self._lite(query, key, value)
         else:
-            output = moonmath_forward(
+            output = self._moonmath_forward(
                 query, key, value, round_mode="rtz", layout="bshd"
             )
 
