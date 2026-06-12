@@ -18,22 +18,34 @@ logger = logging.getLogger(__name__)
 class _AsyncNanWarner:
     """One-shot NaN monitor: device-side detection lands in pinned host
     memory without any stream sync; the host reads the (slightly stale) flag
-    on a later call, warns once, and stops detecting."""
+    on a later call, warns once, and stops detecting.
+
+    The device probe (isnan/any/cast/add/copy) is sampled once every
+    ``_PROBE_INTERVAL`` calls rather than on every call. ``check`` runs on the
+    sampler hot path (once per decode step, every model); enqueuing those
+    extra kernels on every step measurably lowered single-batch decode
+    ``fwd_occupancy`` (more non-overlapped per-step launch overhead). The
+    probe only feeds a throttled diagnostic warning -- sanitization itself is
+    done by ``nan_to_num_`` in ``sanitize_nan_logits`` independent of this --
+    so sampling it on a cadence keeps the hot path cheap while still surfacing
+    a persistent NaN within at most ``_PROBE_INTERVAL`` steps."""
+
+    # Probe roughly every N calls. Cheap host-flag read still happens every
+    # call, so a landed hit is reported on the very next call after a probe.
+    _PROBE_INTERVAL = 128
 
     def __init__(self):
         self._dev = None
         self._host = None
         self._warned = False
+        self._calls = 0
 
     def check(self, tensor: torch.Tensor, msg: str):
         if self._warned or not tensor.is_cuda:
             return
-        if self._dev is None:
-            self._dev = torch.zeros(1, dtype=torch.int32, device=tensor.device)
-            self._host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
 
-        # Report a hit enqueued on an earlier step (pinned read, no sync).
-        if int(self._host[0]):
+        # Report a hit enqueued on an earlier probe (pinned read, no sync).
+        if self._host is not None and int(self._host[0]):
             logger.warning(
                 "NaN detected in %s; values were sanitized before sampling. "
                 "This usually indicates numerical overflow (e.g. fp16 "
@@ -43,6 +55,17 @@ class _AsyncNanWarner:
             )
             self._warned = True
             return
+
+        # Only enqueue the device-side detection on a cadence to keep the
+        # per-step kernel-launch overhead off the decode hot path.
+        sample = self._calls % self._PROBE_INTERVAL == 0
+        self._calls += 1
+        if not sample:
+            return
+
+        if self._dev is None:
+            self._dev = torch.zeros(1, dtype=torch.int32, device=tensor.device)
+            self._host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
 
         # Enqueue this step's detection (async, no sync).
         self._dev.add_(torch.isnan(tensor).any().to(torch.int32))
