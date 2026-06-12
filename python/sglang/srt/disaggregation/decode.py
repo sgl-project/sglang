@@ -146,7 +146,7 @@ class DecodeReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
+    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
@@ -170,7 +170,7 @@ class DecodeReqToTokenPool:
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
-    def free(self, req: "Req"):
+    def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
@@ -186,7 +186,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        cache_params: "Mamba2CacheParams",
+        cache_params: Mamba2CacheParams,
         mamba_layer_ids: List[int],
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
@@ -241,7 +241,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        self.mamba_pool.clear()
+        self.mamba_allocator.clear()
 
 
 @dataclass
@@ -397,6 +397,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
         )
+        if self.scheduler.enable_hisparse and isinstance(
+            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
+        ):
+            device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
+            c4_layer_num = self.scheduler.hisparse_coordinator.mem_pool_host.layer_num
+            kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
+            kv_data_lens += device_kv_data_lens[c4_layer_num:]
+            kv_item_lens += device_kv_item_lens[c4_layer_num:]
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -555,6 +565,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
 
+    def release_memory_occupation(self):
+        self.queue.clear()
+        self.retracted_queue.clear()
+        if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
+            self.kv_manager.deregister_buffer_to_engine()
+
+    def resume_memory_occupation(self):
+        if hasattr(self.kv_manager, "register_buffer_to_engine"):
+            self.kv_manager.register_buffer_to_engine()
+
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -633,11 +653,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                is_propagated = False
                 try:
                     decode_req.kv_receiver.failure_exception()
                 except Exception as e:
                     error_message += f" with exception {e}"
-                logger.error(error_message)
+                    is_propagated = getattr(e, "is_from_another_rank", False)
+                # Mute error message for propagated exceptions to avoid duplicate logging
+                if is_propagated:
+                    logger.debug(error_message)
+                else:
+                    logger.error(error_message)
                 prepare_abort(
                     decode_req.req,
                     error_message,
@@ -932,7 +958,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.req.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
+            kv_transfer_page_size = page_size
             if self.scheduler.enable_hisparse:
+                # Direct-to-host sends host/C4 rows; keep allocator.page_size
+                # logical and use the compressed page size only for these indices.
+                kv_transfer_page_size = getattr(
+                    self.token_to_kv_pool_allocator,
+                    "hisparse_page_size",
+                    page_size,
+                )
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
                 kv_indices = (
                     dst_kv_indices[: origin_input_len - prefix_len]
@@ -1003,7 +1037,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1030,9 +1064,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     @property
     def num_tokens_pre_allocated(self):
-        return sum(
-            len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
-        )
+        return sum(decode_req.req.fill_len for decode_req in self.transfer_queue.queue)
 
     def _need_space_for_single_req(
         self, retractable_tokens: Optional[int] = None
@@ -1299,13 +1331,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
+
             # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
-                fill_len,
+                coordinator.host_token_len(fill_len),
             )
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
@@ -1361,10 +1394,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_loc,
         )
 
-        # Truncate fill_ids to kv_committed_len so cache_unfinished_req only
+        # Truncate fill_len to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token
-        # hasn't had KV committed yet (fill_ids is 1 ahead).
-        req.fill_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
+        # hasn't had KV committed yet (output_ids is 1 ahead).
+        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+        req.fill_len = req.kv_committed_len
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
         # this is done inside init_next_round_input, but decode-disagg needs
@@ -1372,7 +1406,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
-        req.set_extend_input_len(len(req.fill_ids) - total_prefix_len)
+        req.set_extend_input_len(req.fill_len - total_prefix_len)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1591,13 +1625,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
+                is_propagated = False
                 if poll == KVPoll.Failed:
                     try:
                         decode_req.kv_receiver.failure_exception()
                     except Exception as e:
                         error_message += f" with exception {e}"
+                        is_propagated = getattr(e, "is_from_another_rank", False)
                 self._clean_hicache_prefetch_resources(decode_req)
-                logger.error(error_message)
+                # Mute error message for propagated exceptions to avoid duplicate logging
+                if is_propagated:
+                    logger.debug(error_message)
+                else:
+                    logger.error(error_message)
                 prepare_abort(
                     decode_req.req,
                     error_message,
@@ -1657,6 +1697,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
+            # Reset so the next owner sees actual_room == 0 ("not yet written")
+            # instead of the stale value, avoiding a false-positive mismatch.
+            self.metadata_buffers.bootstrap_room[idx] = 0
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -1664,6 +1707,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ]
 
         return transferred_reqs
+
+    def release_memory_occupation(self):
+        """Clean up in-flight transfers before releasing GPU memory."""
+        self.queue.clear()
+
+    def resume_memory_occupation(self):
+        """Queues are already cleared on release; new transfers can be accepted."""
+        pass
 
 
 class SchedulerDisaggregationDecodeMixin:
@@ -1817,13 +1868,12 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
-                # Truncate fill_ids to kv_committed_len so cache_unfinished_req
-                # only sees committed KV (fill_ids includes one uncommitted token).
+                # Truncate fill_len to kv_committed_len so cache_unfinished_req
+                # only sees committed KV (full array includes one uncommitted
+                # token because init_next_round_input rebuilt it as full).
                 if req.kv_committed_len is not None:
-                    req.fill_ids = req.fill_ids[: req.kv_committed_len]
-                    req.set_extend_input_len(
-                        len(req.fill_ids) - len(req.prefix_indices)
-                    )
+                    req.fill_len = req.kv_committed_len
+                    req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
             else:
                 waiting_queue.append(req)
 

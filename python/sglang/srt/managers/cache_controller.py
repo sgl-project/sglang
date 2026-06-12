@@ -34,6 +34,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 from sglang.srt.distributed import (
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -207,7 +209,7 @@ class StorageOperation:
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
 
-    def __lt__(self, other: "StorageOperation"):
+    def __lt__(self, other: StorageOperation):
         return self.id < other.id
 
 
@@ -254,19 +256,19 @@ class HiCacheController:
         load_cache_event: threading.Event,
         attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
         attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
-        pp_rank: int = 0,
-        pp_size: int = 1,
         enable_storage_metrics: bool = False,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
+        self.pp_group = pp_group
         self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -282,8 +284,6 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
@@ -623,6 +623,9 @@ class HiCacheController:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
             self.dp_rank = 0
+
+        self.pp_rank = get_pipeline_model_parallel_rank()
+        self.pp_size = get_pipeline_model_parallel_world_size()
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
