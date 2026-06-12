@@ -64,7 +64,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state import _use_torchcomms_enabled, get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -1611,6 +1611,9 @@ class Scheduler(
             self.scripted_scheduler_hook = None
 
     def init_request_receiver(self) -> None:
+        # Requests forwarded from the previous PP stage via the TorchComms
+        # consolidated ring exchange; populated each step in the PP event loop.
+        self._tc_pp_incoming_reqs: List = []
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -1633,6 +1636,13 @@ class Scheduler(
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
+            # TorchComms PP routes forwarded requests through the scheduler's
+            # consolidated ring exchange instead of point_to_point_pyobj.
+            pp_recv_from_prev=(
+                (lambda: self._tc_pp_incoming_reqs)
+                if _use_torchcomms_enabled()
+                else None
+            ),
         )
 
     def init_dp_attn_adapter(self) -> None:

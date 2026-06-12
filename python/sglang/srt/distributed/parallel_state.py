@@ -1486,6 +1486,97 @@ class GroupCoordinator:
                 tensor_dict[key] = value
         return tensor_dict
 
+    def pipeline_send_recv_tensor_dict(
+        self,
+        send_dict: Optional[Dict[str, Union[torch.Tensor, Any]]],
+        dst: int,
+        src: int,
+    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        """Coalesced send-to-`dst` + recv-from-`src` of a tensor dict, issued as
+        a single ``batch_isend_irecv`` per phase/group.
+
+        TorchComms P2P only progresses when the matching send and recv are issued
+        together (a deferred isend never advances), so pipeline-parallel exchanges
+        must pair the send-to-next with the recv-from-prev (the concurrently-ready
+        1F1B counterparts) rather than issuing them separately. Metadata is
+        exchanged first (so the receiver can size buffers), then tensors; cpu and
+        device tensors are batched per group. `dst`/`src` are local ranks.
+        """
+        metadata_list, _ = _split_tensor_dict(
+            send_dict if send_dict is not None else {}
+        )
+        send_tensors = (
+            [t for t in _split_tensor_dict(send_dict)[1] if t.numel() > 0]
+            if send_dict is not None
+            else []
+        )
+
+        # Phase 1: exchange metadata (variable-size object) on the cpu group,
+        # paired so both sides progress.
+        send_bytes = torch.frombuffer(pickle.dumps(metadata_list), dtype=torch.uint8)
+        send_size = torch.tensor([send_bytes.numel()], dtype=torch.long, device="cpu")
+        recv_size = torch.empty(1, dtype=torch.long, device="cpu")
+        for w in torch.distributed.batch_isend_irecv(
+            [
+                torch.distributed.P2POp(
+                    torch.distributed.isend, send_size, self.ranks[dst], self.cpu_group
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, recv_size, self.ranks[src], self.cpu_group
+                ),
+            ]
+        ):
+            w.wait()
+        recv_bytes = torch.empty(recv_size.item(), dtype=torch.uint8, device="cpu")
+        for w in torch.distributed.batch_isend_irecv(
+            [
+                torch.distributed.P2POp(
+                    torch.distributed.isend, send_bytes, self.ranks[dst], self.cpu_group
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, recv_bytes, self.ranks[src], self.cpu_group
+                ),
+            ]
+        ):
+            w.wait()
+        recv_metadata_list = pickle.loads(recv_bytes.numpy())
+
+        # Phase 2: allocate recv tensors, then batch every send+recv tensor by
+        # group (cpu vs device) in one coalesced call each.
+        recv_dict: Dict[str, Any] = {}
+        device_ops: List[Any] = []
+        cpu_ops: List[Any] = []
+        for t in send_tensors:
+            (cpu_ops if t.is_cpu else device_ops).append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    t,
+                    self.ranks[dst],
+                    self.cpu_group if t.is_cpu else self.device_group,
+                )
+            )
+        for key, value in recv_metadata_list:
+            if isinstance(value, TensorMetadata):
+                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                recv_dict[key] = tensor
+                if tensor.numel() == 0:
+                    continue
+                (cpu_ops if tensor.is_cpu else device_ops).append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        tensor,
+                        self.ranks[src],
+                        self.cpu_group if tensor.is_cpu else self.device_group,
+                    )
+                )
+            else:
+                recv_dict[key] = value
+        for ops in (cpu_ops, device_ops):
+            if ops:
+                for w in torch.distributed.batch_isend_irecv(ops):
+                    w.wait()
+        return recv_dict
+
     def barrier(self):
         """Barrier synchronization among the group.
         NOTE: don't use `device_group` here! `barrier` in NCCL is

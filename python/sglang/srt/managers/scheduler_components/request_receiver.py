@@ -61,6 +61,10 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
     scripted_scheduler_hook: Optional["ScriptedSchedulerHook"] = None
+    # TorchComms PP only: supplies the requests forwarded from the previous PP
+    # stage via the scheduler's consolidated ring exchange, replacing the
+    # point_to_point_pyobj recv below (which deadlocks under TorchComms).
+    pp_recv_from_prev: Optional[Callable[[], List]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -118,14 +122,19 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         else:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                )
+                if self.pp_recv_from_prev is not None:
+                    # TorchComms PP: the forwarded reqs already arrived via the
+                    # scheduler's consolidated ring exchange.
+                    recv_reqs = self.pp_recv_from_prev()
+                else:
+                    dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+                    recv_reqs = point_to_point_pyobj(
+                        [],
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    )
             else:
                 recv_reqs = None
         return recv_reqs
