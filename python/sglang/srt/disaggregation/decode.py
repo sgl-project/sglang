@@ -1883,12 +1883,11 @@ class SchedulerDisaggregationDecodeMixin:
                 # Truncate extend_fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
-                if req.kv_committed_len is not None:
-                    req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
-                    # This prebuilt path never goes through the PrefillAdder,
-                    # so enter the extend phase here; prepare_for_decode moves
-                    # it to DECODE later.
-                    req.phase = ReqPhase.EXTEND_NON_LAST
+                req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
+                # This prebuilt path never goes through the PrefillAdder,
+                # so enter the extend phase here; prepare_for_decode moves
+                # it to DECODE later.
+                req.phase = ReqPhase.EXTEND_NON_LAST
             else:
                 waiting_queue.append(req)
 

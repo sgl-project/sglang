@@ -3199,12 +3199,7 @@ class Scheduler(
                 # extend/mixed batches consume these lengths for input-logprob
                 # processing, so report 0 for decode batches.
                 batch_result.extend_input_len_per_req = [
-                    (
-                        req.extend_range.length
-                        if batch.forward_mode.is_extend()
-                        and req.extend_range is not None
-                        else 0
-                    )
+                    req.extend_range.length if batch.forward_mode.is_extend() else 0
                     for req in batch.reqs
                 ]
                 batch_result.extend_logprob_start_len_per_req = (

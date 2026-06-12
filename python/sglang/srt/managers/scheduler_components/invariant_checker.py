@@ -213,8 +213,12 @@ class SchedulerInvariantChecker:
         # past the extend frontier coincides with entering decode. A missed
         # phase transition shows up here.
         for req in self.get_active_reqs().values():
-            if req.is_dllm() or req.extend_range is None:
+            if req.is_dllm():
                 continue
+            assert req.extend_range is not None, (
+                f"active req without an admitted extend range: {req.rid=} "
+                f"{req.phase=}"
+            )
             if req.phase is ReqPhase.DECODE:
                 assert req.kv_committed_len >= req.extend_range.end, (
                     f"DECODE req behind its extend frontier: {req.rid=} "
