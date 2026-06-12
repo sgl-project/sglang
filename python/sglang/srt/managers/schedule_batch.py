@@ -415,7 +415,7 @@ class MultimodalProcessorOutput:
     token_type_ids: Optional[torch.Tensor] = None
 
     @staticmethod
-    def from_dict(d: dict) -> "MultimodalProcessorOutput":
+    def from_dict(d: dict) -> MultimodalProcessorOutput:
         return MultimodalProcessorOutput(
             mm_items=d["mm_items"],
             input_ids=d.get("input_ids"),
@@ -498,7 +498,7 @@ class MultimodalInputs:
             item.feature = None
 
     @staticmethod
-    def from_processor_output(obj: "MultimodalProcessorOutput"):
+    def from_processor_output(obj: MultimodalProcessorOutput):
         mm_items = obj.mm_items
         assert isinstance(mm_items, list)
         mm_items = [item for item in mm_items if item.is_valid()]
@@ -2199,7 +2199,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
         req: Req,
-    ) -> "_MambaRadixCacheV2TrackEntry":
+    ) -> _MambaRadixCacheV2TrackEntry:
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
 
         def _force_track_h(i: int) -> int:
@@ -2308,7 +2308,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
-    def mix_with_running(self, running_batch: "ScheduleBatch"):
+    def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
@@ -2717,7 +2717,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 has_been_filtered=has_been_filtered,
             )
 
-    def merge_batch(self, other: "ScheduleBatch"):
+    def merge_batch(self, other: ScheduleBatch):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.

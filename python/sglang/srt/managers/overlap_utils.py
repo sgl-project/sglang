@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 
 
 def decide_needs_cpu_seq_lens(
-    server_args: "ServerArgs",
-    attn_backends: Sequence["AttentionBackend"],
+    server_args: ServerArgs,
+    attn_backends: Sequence[AttentionBackend],
 ) -> bool:
     """Whether FutureMap must publish seq_lens_cpu / sum.
 

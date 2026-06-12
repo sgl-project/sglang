@@ -673,7 +673,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def forward_npu(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -767,7 +767,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def _forward_npu_deepep(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
         from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
             npu_fused_moe_without_routing_weights_bf16,

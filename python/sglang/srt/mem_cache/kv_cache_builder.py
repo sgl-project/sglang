@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 def get_draft_kv_pool(
     *,
-    draft_worker: "BaseTpWorker",
+    draft_worker: BaseTpWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
 ):
@@ -71,8 +71,8 @@ def get_draft_kv_pool(
 
 def maybe_register_hicache_draft(
     *,
-    tree_cache: "BasePrefixCache",
-    draft_worker: "BaseTpWorker",
+    tree_cache: BasePrefixCache,
+    draft_worker: BaseTpWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
     enable_hierarchical_cache: bool,
@@ -129,21 +129,21 @@ def maybe_register_hicache_draft(
 
 def build_kv_cache(
     *,
-    server_args: "ServerArgs",
-    model_config: "ModelConfig",
-    tp_worker: "BaseTpWorker",
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    tp_worker: BaseTpWorker,
     page_size: int,
-    spec_algorithm: "SpeculativeAlgorithm",
-    attn_tp_cpu_group: "ProcessGroup",
-    tp_cpu_group: "ProcessGroup",
-    attn_cp_cpu_group: "ProcessGroup",
+    spec_algorithm: SpeculativeAlgorithm,
+    attn_tp_cpu_group: ProcessGroup,
+    tp_cpu_group: ProcessGroup,
+    attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    ps: "ParallelState",
-    tp_group: "GroupCoordinator",
-    pp_group: "GroupCoordinator",
+    ps: ParallelState,
+    tp_group: GroupCoordinator,
+    pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
-) -> "KVCacheBuildResult":
+) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
