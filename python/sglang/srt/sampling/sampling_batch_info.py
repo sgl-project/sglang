@@ -195,7 +195,7 @@ class SamplingBatchInfo:
         pass
 
     # placeholder for override
-    def adjusted_merge_batch(self, other: "SamplingBatchInfo"):
+    def adjusted_merge_batch(self, other: SamplingBatchInfo):
         pass
 
     # placeholder for override
@@ -352,7 +352,7 @@ class SamplingBatchInfo:
 
         return merged_dict
 
-    def merge_batch(self, other: "SamplingBatchInfo"):
+    def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         # Merge the custom logit processors and custom params lists

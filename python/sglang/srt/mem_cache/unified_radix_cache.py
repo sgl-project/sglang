@@ -2794,7 +2794,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _check_lru_linked_list(
         self,
-        lru: "UnifiedLRUList",
+        lru: UnifiedLRUList,
         ct: ComponentType,
         label: str,
         errors: list[str],

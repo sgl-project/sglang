@@ -116,7 +116,7 @@ class DSAFlashMLAMetadata:
             num_splits=self.num_splits[sli],
         )
 
-    def copy_(self, other: "DSAFlashMLAMetadata"):
+    def copy_(self, other: DSAFlashMLAMetadata):
         self.flashmla_metadata.copy_(other.flashmla_metadata)
         self.num_splits.copy_(other.num_splits)
 
@@ -866,7 +866,7 @@ class DeepseekSparseAttnBackend(
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
-        actual_forward_mode: Optional["ForwardMode"] = None,
+        actual_forward_mode: Optional[ForwardMode] = None,
     ):
         """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
         self.set_dsa_prefill_impl(forward_batch=None)
