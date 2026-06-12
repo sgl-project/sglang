@@ -151,7 +151,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port 8998 --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -173,7 +173,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -219,7 +219,7 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --disaggregation-transfer-backend ascend \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -311,7 +311,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port 8998 --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -333,7 +333,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -379,7 +379,7 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --disaggregation-transfer-backend ascend \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -471,7 +471,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port 8998 --dist-init-addr ${P_IP[0]}:5000 \
         --nnodes 2 \
         --tp 32 \
         --watchdog-timeout 9000 \
@@ -493,7 +493,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -539,7 +539,7 @@ do
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
         --disaggregation-transfer-backend ascend \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi

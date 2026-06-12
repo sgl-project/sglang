@@ -194,7 +194,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port 8998 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.62 \
@@ -214,7 +214,7 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -259,7 +259,7 @@ do
         --dtype bfloat16 \
         --tokenizer-worker-num 4 \
         --load-balance-method round_robin \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -439,7 +439,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -460,7 +460,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -507,7 +507,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -608,7 +608,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.778 \
@@ -628,7 +628,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -675,7 +675,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -771,7 +771,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -792,7 +792,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -839,7 +839,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -935,7 +935,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -956,7 +956,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -1003,7 +1003,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -1099,7 +1099,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -1119,7 +1119,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -1165,7 +1165,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi

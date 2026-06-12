@@ -211,7 +211,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port 8998 \
         --trust-remote-code \
         --tp-size 16 \
         --mem-fraction-static 0.43 \
@@ -236,7 +236,7 @@ do
         --speculative-num-draft-tokens 3 \
         --speculative-draft-model-quantization unquant \
         --skip-server-warmup \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -284,7 +284,7 @@ do
         --speculative-draft-model-quantization unquant \
         --skip-server-warmup \
         --cuda-graph-bs 2 4 8 \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -387,7 +387,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        --port 8000 --disaggregation-bootstrap-port 8998 \
         --trust-remote-code \
         --tp-size 16 \
         --mem-fraction-static 0.43 \
@@ -412,7 +412,7 @@ do
         --speculative-num-draft-tokens 4 \
         --speculative-draft-model-quantization unquant \
         --skip-server-warmup \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -460,7 +460,7 @@ do
         --speculative-draft-model-quantization unquant \
         --skip-server-warmup \
         --cuda-graph-bs 2 4 8 16 24 32 40 \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi

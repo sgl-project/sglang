@@ -287,7 +287,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port 8998 --dist-init-addr ${P_IP[0]}:5000 \
         --tp-size 4 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -311,7 +311,7 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -358,7 +358,7 @@ do
         --dtype bfloat16 \
         --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -453,7 +453,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port 8998 --dist-init-addr ${P_IP[0]}:5000 \
         --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.75 \
@@ -478,7 +478,7 @@ do
         --attn-cp-size 8 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -529,7 +529,7 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -627,7 +627,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port 8998 --dist-init-addr ${P_IP[0]}:5000 \
         --tp-size 4 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -651,7 +651,7 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -698,7 +698,7 @@ do
         --dtype bfloat16 \
         --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -793,7 +793,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port 8998 --dist-init-addr ${P_IP[0]}:5000 \
         --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.75 \
@@ -818,7 +818,7 @@ do
         --attn-cp-size 8 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -869,7 +869,7 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -964,7 +964,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port 8998 --dist-init-addr ${P_IP[0]}:5000 \
         --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -980,7 +980,7 @@ do
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
         --dtype bfloat16 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -1035,7 +1035,7 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -1106,7 +1106,7 @@ export STREAMS_PER_DEVICE=32
 
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
+P_IP=('your prefill ip1' 'your prefill ip2' 'your prefill ip3' 'your prefill ip4')
 D_IP=('your decode ip1' 'your decode ip2')
 
 MODEL_PATH=xxx
@@ -1133,7 +1133,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$((i / 2)))) --dist-init-addr ${P_IP[$((i / 2 * 2))]}:5000 \
         --tp-size 4 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
@@ -1157,7 +1157,7 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
-        --node-rank $i
+        --node-rank $((i % 2)) \
         NODE_RANK=$i
         break
     fi
@@ -1208,7 +1208,7 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -1307,7 +1307,7 @@ do
         export TASK_QUEUE_ENABLE=2
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --dist-init-addr ${P_IP[0]}:5000 \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
         --tp-size 4 \
         --nnodes 1 \
         --mem-fraction-static 0.72 \
@@ -1331,7 +1331,7 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 4 \
-        --node-rank $i
+        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -1382,7 +1382,7 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --node-rank $i
+        --node-rank $i \
         NODE_RANK=$i
         break
     fi
