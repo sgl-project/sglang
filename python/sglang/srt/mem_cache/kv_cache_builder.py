@@ -157,11 +157,35 @@ def build_kv_cache(
     )
 
     sliding_window_size = None
+    swa_num_layers: Optional[int] = None
     if is_hybrid_swa:
         sliding_window_size = tp_worker.sliding_window_size
         full_tokens_per_layer, swa_tokens_per_layer = (
             tp_worker.get_tokens_per_layer_info()
         )
+        swa_num_layers = model_config.num_hidden_layers
+        if envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            if not getattr(model_config, "is_deepseek_v4_arch", False):
+                raise ValueError(
+                    "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is only supported on the "
+                    "DeepSeek V4 architecture. Got "
+                    f"architectures={model_config.hf_config.architectures}."
+                )
+            if not spec_algorithm.is_none():
+                raise ValueError(
+                    "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "
+                    f"speculative decoding ({spec_algorithm})."
+                )
+            if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+                raise ValueError(
+                    "SGLANG_OPT_SWA_RECOMPUTE_WINDOW requires "
+                    "SGLANG_OPT_USE_COMPRESSOR_V2=1."
+                )
+            if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+                raise ValueError(
+                    "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "
+                    "SGLANG_OPT_USE_ONLINE_COMPRESS=1."
+                )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
 
@@ -217,6 +241,7 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        swa_num_layers=swa_num_layers,
     )
 
     tree_cache = create_tree_cache(

@@ -451,6 +451,73 @@ def alloc_for_extend(
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
+def alloc_for_extend_swa_recompute(
+    batch: ScheduleBatch,
+    recompute_lens: list[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Heterogeneous extend allocation for SWA-window recompute.
+
+    The recompute window reuses existing FULL slots; only new tail tokens get
+    fresh FULL/SWA allocation here.
+    """
+    batch.maybe_evict_swa()
+
+    reqs = batch.reqs
+    device = batch.device
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    page_size = batch.tree_cache.page_size
+
+    req_pool_indices = alloc_req_slots(batch.req_to_token_pool, reqs, batch.tree_cache)
+    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    req_pool_indices_device = req_pool_indices_cpu.to(device, non_blocking=True)
+
+    out_cache_parts: list[torch.Tensor] = []
+    for i, req in enumerate(reqs):
+        R = recompute_lens[i]
+        P = len(req.prefix_indices)
+        seq_len = req.fill_len
+        new_tokens = seq_len - P
+        assert R >= 0 and R % page_size == 0, f"{R=} {page_size=}"
+        assert R <= P, f"{R=} {P=}"
+        assert new_tokens >= 0, f"{new_tokens=}"
+
+        req_idx = req_pool_indices[i]
+        batch.req_to_token_pool.req_to_token[req_idx, 0:P] = req.prefix_indices
+
+        window_full = req.prefix_indices[P - R : P] if R > 0 else None
+        if new_tokens > 0:
+            if P > 0:
+                last_loc = req.prefix_indices[P - 1 : P]
+            else:
+                last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+            if page_size == 1:
+                tail = alloc_token_slots(batch.tree_cache, new_tokens)
+            else:
+                tail = alloc_paged_token_slots_extend(
+                    tree_cache=batch.tree_cache,
+                    prefix_lens=torch.tensor([P], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([P], dtype=torch.int64),
+                    seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
+                    last_loc=last_loc,
+                    extend_num_tokens=new_tokens,
+                )
+            batch.req_to_token_pool.req_to_token[req_idx, P:seq_len] = tail
+            if R > 0:
+                out_cache_parts.append(torch.cat([window_full, tail]))
+            else:
+                out_cache_parts.append(tail)
+        else:
+            assert R > 0, (
+                f"alloc_for_extend_swa_recompute: req has no new tokens and no "
+                f"recompute window (R={R}, P={P}, seq_len={seq_len})"
+            )
+            out_cache_parts.append(window_full)
+
+    out_cache_loc = torch.cat(out_cache_parts)
+    return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
+
+
 def alloc_paged_token_slots_decode(
     tree_cache: BasePrefixCache,
     seq_lens: torch.Tensor,

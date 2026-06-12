@@ -73,6 +73,7 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -82,6 +83,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
+    alloc_for_extend_swa_recompute,
     evict_from_tree_cache,
     free_swa_out_of_window_slots,
     get_alloc_reserve_per_decode,
@@ -837,6 +839,8 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # Trailing matched tokens whose SWA KV must be recomputed.
+        self.swa_recompute_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1145,6 +1149,8 @@ class Req(ReqDllmMixin):
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
+            self.swa_recompute_len = match_result.swa_recompute_len
+
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
@@ -1388,6 +1394,7 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
+        self.swa_recompute_len = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_input_len = 0
@@ -1722,6 +1729,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
 
+    # Per-req boundary P below which recompute suppresses compressed-KV writes.
+    swa_recompute_boundaries: Optional[List[int]] = None
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -1936,7 +1946,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
-    def prepare_for_extend(self):
+    def prepare_for_extend(self, swa_recompute_lens: Optional[List[int]] = None):
+        """Build an EXTEND batch."""
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
@@ -1945,12 +1956,54 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
+        is_swa_recompute = swa_recompute_lens is not None and any(
+            r > 0 for r in swa_recompute_lens
+        )
+        if is_swa_recompute:
+            assert isinstance(
+                self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            ), "SWA-window recompute requires a SWATokenToKVPoolAllocator"
+            assert len(swa_recompute_lens) == len(reqs)
+            recompute_lens = list(swa_recompute_lens)
+            input_ids = [
+                r.get_fill_ids()[len(r.prefix_indices) - recompute_lens[i] :]
+                for i, r in enumerate(reqs)
+            ]
+            prefix_lens = [
+                len(r.prefix_indices) - recompute_lens[i] for i, r in enumerate(reqs)
+            ]
+            self.swa_recompute_boundaries = [len(r.prefix_indices) for r in reqs]
+            for i, req in enumerate(reqs):
+                R = recompute_lens[i]
+                if R <= 0:
+                    continue
+                assert (
+                    req.input_embeds is None
+                ), "SWA-window recompute does not support input_embeds"
+                assert (
+                    req.positional_embed_overrides is None
+                ), "SWA-window recompute does not support positional embed overrides"
+                wants_input_logprobs = (
+                    req.return_logprob
+                    and req.extend_logprob_start_len < req.extend_input_len
+                )
+                assert not wants_input_logprobs, (
+                    "SWA-window recompute supports OUTPUT logprobs only; "
+                    "use logprob_start_len = -1 (or prompt len) to score the "
+                    "first generated token."
+                )
+        else:
+            recompute_lens = None
+            input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
+            prefix_lens = [len(r.prefix_indices) for r in reqs]
+            self.swa_recompute_boundaries = None
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [r.fill_len for r in reqs]
         orig_seq_lens = [max(r.fill_len, len(r.origin_input_ids)) for r in reqs]
-        prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+        if is_swa_recompute:
+            extend_lens = [s - pre for s, pre in zip(seq_lens, prefix_lens)]
+        else:
+            extend_lens = [r.extend_input_len for r in reqs]
 
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
@@ -1972,9 +2025,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
-        )
+        if is_swa_recompute:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                alloc_for_extend_swa_recompute(self, recompute_lens)
+            )
+            for i, req in enumerate(reqs):
+                R = recompute_lens[i]
+                if R <= 0:
+                    continue
+                P = len(req.prefix_indices)
+                window_full = req.prefix_indices[P - R : P]
+                allocator_sw = self.token_to_kv_pool_allocator
+                swa_avail = allocator_sw.swa_attn_allocator.available_size()
+                if R > swa_avail:
+                    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+                    self.tree_cache.evict(
+                        EvictParams(num_tokens=0, swa_num_tokens=R - swa_avail)
+                    )
+                swa_indices = allocator_sw.alloc_swa_for_recompute_window(window_full)
+                if swa_indices is None:
+                    swa_avail_after = allocator_sw.swa_attn_allocator.available_size()
+                    raise AssertionError(
+                        "SWA-window recompute: SWA alloc failed despite "
+                        f"pre-check; R={R}, "
+                        f"swa_avail_before_evict={swa_avail}, "
+                        f"swa_avail_after_evict={swa_avail_after}, "
+                        f"swa_evictable={self.tree_cache.swa_evictable_size()}, "
+                        f"page_size={allocator_sw.page_size}, rid={req.rid}"
+                    )
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                alloc_for_extend(self)
+            )
 
         # Set fields
         input_embeds = []
@@ -1990,7 +2073,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            assert seq_len - pre_len == req.extend_input_len
+            # For SWA-window recompute the merged extend is longer than the
+            # logical extend by R (the recomputed window); the req's own
+            # extend_input_len still counts only the new tail.
+            R_i = recompute_lens[i] if recompute_lens is not None else 0
+            assert seq_len - pre_len == req.extend_input_len + R_i
 
             req.extend_batch_idx += 1
 
@@ -2164,7 +2251,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
 
-        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        # extend_logprob_start_len is relative to the logical prefix P. For
+        # SWA-window recompute reqs the merged extend prepends R cached tokens,
+        # so shift the per-req start by R to stay consistent with the batch-
+        # level extend_lens (else num_tokens_for_logprob == batch_size breaks).
+        if is_swa_recompute:
+            self.extend_logprob_start_lens = [
+                r.extend_logprob_start_len + recompute_lens[i]
+                for i, r in enumerate(reqs)
+            ]
+        else:
+            self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_global_server_args().enable_mamba_extra_buffer():

@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -278,6 +280,48 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 alloc_full_indices[:-swa_tail_len].to(torch.int64)
             ] = 0
         return alloc_full_indices
+
+    def alloc_swa_for_recompute_window(
+        self, full_indices: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Allocate SWA slots for an already-live FULL-KV window."""
+        need_size = int(full_indices.numel())
+        if need_size == 0:
+            return full_indices[:0]
+
+        self.free_swa(full_indices)
+
+        if self.page_size == 1:
+            if need_size > self.swa_attn_allocator.available_size():
+                return None
+            alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        else:
+            assert (
+                need_size % self.page_size == 0
+            ), f"recompute window must be page-aligned, {need_size=}, {self.page_size=}"
+            num_pages = need_size // self.page_size
+            if num_pages > self.swa_attn_allocator.available_size() // self.page_size:
+                return None
+            device = self.device
+            swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
+            swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
+            swa_seq_lens = torch.tensor([need_size], dtype=torch.int64, device=device)
+            swa_seq_lens_cpu = torch.tensor([need_size], dtype=torch.int64)
+            swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+            alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
+                swa_prefix_lens,
+                swa_prefix_lens_cpu,
+                swa_seq_lens,
+                swa_seq_lens_cpu,
+                swa_last_loc,
+                need_size,
+            )
+
+        if alloc_swa_indices is None:
+            return None
+
+        self.set_full_to_swa_mapping(full_indices, alloc_swa_indices)
+        return alloc_swa_indices
 
     def alloc_decode(
         self,

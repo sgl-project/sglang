@@ -253,12 +253,19 @@ class DSV4AttnMetadata:
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
-    _CP_REINDEX_FIELDS = [
+    # Always populated by make_core_attn_metadata (independent of need_compress).
+    _CP_REINDEX_FIELDS_CORE = [
         "seq_lens_casual",
         "positions_casual",
         "swa_page_indices",
         "swa_topk_lengths",
         "page_table",
+    ]
+    # Populated whenever read metadata is built (init_compression_metadata):
+    # need_compress=True. They are None only on a need_compress=False forward with
+    # no read metadata (e.g. draft-extend) and are skipped via the `has_compress`
+    # guard below.
+    _CP_REINDEX_FIELDS_COMPRESS = [
         "c4_topk_lengths_raw",
         "c4_topk_lengths_clamp1",
         "c128_page_indices",
@@ -281,14 +288,21 @@ class DSV4AttnMetadata:
             "CP round-robin requires padding to ensure divisibility."
         )
         expected_local_len = pre_global_len // cp_size
-        for field_name in self._CP_REINDEX_FIELDS:
+
+        # Compress fields are present iff this is a need_compress=True forward.
+        has_compress = self.c4_topk_lengths_raw is not None
+        reindex_fields = list(self._CP_REINDEX_FIELDS_CORE)
+        if has_compress:
+            reindex_fields += self._CP_REINDEX_FIELDS_COMPRESS
+
+        for field_name in reindex_fields:
             val = getattr(self, field_name, None)
             assert isinstance(
                 val, torch.Tensor
             ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             setattr(self, field_name, val[idx].contiguous())
 
-        for field_name in self._CP_REINDEX_FIELDS:
+        for field_name in reindex_fields:
             val = getattr(self, field_name)
             assert val.shape[0] == expected_local_len, (
                 f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
@@ -542,6 +556,7 @@ class DeepseekV4AttnBackend(
         extend_start_loc: Optional[torch.Tensor] = None,
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
+        recompute_boundaries: Optional[List[int]] = None,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -591,6 +606,7 @@ class DeepseekV4AttnBackend(
                         extend_lens_cpu=None,
                         use_prefill_cuda_graph=True,
                         num_q_tokens=out_cache_loc.shape[0],
+                        recompute_boundaries=recompute_boundaries,
                     )
                 return create_paged_compressor_data(
                     compress_ratio=compress_ratio,
@@ -603,6 +619,7 @@ class DeepseekV4AttnBackend(
                     extend_lens=extend_seq_lens,
                     extend_lens_cpu=extend_seq_lens_cpu,
                     use_prefill_cuda_graph=use_graph_plan,
+                    recompute_boundaries=recompute_boundaries,
                 )
 
         c4_compress_metadata = create(compress_ratio=4)
@@ -1029,6 +1046,7 @@ class DeepseekV4AttnBackend(
                 extend_start_loc=forward_batch.extend_start_loc,
                 need_compress=not is_draft,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                recompute_boundaries=forward_batch.swa_recompute_boundaries,
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")

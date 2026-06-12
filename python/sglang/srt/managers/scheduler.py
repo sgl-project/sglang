@@ -506,6 +506,10 @@ class Scheduler(
         # Init chunked prefill
         self.init_chunked_prefill()
 
+        # Fail fast at startup if --chunked-prefill-size cannot fit the SWA
+        # recompute window + at least one page of tail.
+        self._assert_swa_recompute_chunk_size_compatible()
+
         # Init diffusion LLM
         self.init_diffusion_llm()
 
@@ -962,6 +966,28 @@ class Scheduler(
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
+
+    def _assert_swa_recompute_chunk_size_compatible(self):
+        """Ensure chunked prefill can fit one recompute window plus tail page."""
+        if not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            return
+        if self.chunked_prefill_size is None:
+            return
+        get_w_r = getattr(self.tree_cache, "_swa_recompute_window_size", None)
+        if get_w_r is None:
+            return
+        w_r = int(get_w_r())
+        required = w_r + self.page_size
+        if self.chunked_prefill_size < required:
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1 requires "
+                f"--chunked-prefill-size >= W_r + page_size = {required} "
+                f"for this model (W_r = n_win * L = {w_r}, "
+                f"page_size = {self.page_size}). Got "
+                f"--chunked-prefill-size={self.chunked_prefill_size}. "
+                "Either raise the chunked prefill size or disable the "
+                "SWA-window recompute feature."
+            )
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
@@ -2773,6 +2799,12 @@ class Scheduler(
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
+        swa_recompute_lens: Optional[List[int]] = None
+        if envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get() and any(
+            req.swa_recompute_len > 0 for req in can_run_list
+        ):
+            swa_recompute_lens = [max(0, req.swa_recompute_len) for req in can_run_list]
+
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -2796,7 +2828,10 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        new_batch.prepare_for_extend(swa_recompute_lens=swa_recompute_lens)
+
+        if swa_recompute_lens is not None:
+            self._revive_swa_recompute(can_run_list, swa_recompute_lens)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -2833,6 +2868,19 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch
+
+    def _revive_swa_recompute(
+        self, can_run_list: List[Req], recompute_lens: List[int]
+    ) -> None:
+        """Flip recompute-window SWA tombstones after allocation, before forward."""
+        for req, R in zip(can_run_list, recompute_lens):
+            if R <= 0:
+                continue
+            P = len(req.prefix_indices)
+            self.tree_cache.revive_swa_tombstone_window(req.last_node, R)
+            req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, P - R)
+            # Consumed; clear so downstream treats this as an ordinary hit at P.
+            req.swa_recompute_len = 0
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]

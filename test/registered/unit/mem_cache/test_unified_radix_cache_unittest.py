@@ -2038,6 +2038,81 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     # ================================================================
+    # SWA-window recompute (SGLANG_OPT_SWA_RECOMPUTE_WINDOW)
+    # ================================================================
+
+    def _enable_swa_recompute(self, tree):
+        """Set the SWA layer count used by recompute window sizing."""
+        swa = tree.components[ComponentType.SWA]
+        swa.swa_num_layers = 1
+        return swa
+
+    def test_swa_recompute_zero_when_all_live(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._enable_swa_recompute(tree)
+        seq = self._make_seq(1, 4)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(result.swa_recompute_len, 0)
+        self.assertEqual(result.device_indices.shape[0], len(seq))
+
+    def test_swa_recompute_defers_on_host_only_full(self):
+        """Host-only FULL should defer recompute and trigger load_back."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._enable_swa_recompute(tree)
+        page_size = self.cfg.page_size
+        n_pages = 4
+        seq = self._make_seq(1, n_pages)
+        for i in range(2, n_pages + 1):
+            self._insert(tree, allocator, req_to_token_pool, seq[: i * page_size])
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+        self.assertIsNot(leaf, tree.root_node, "need at least one matched node")
+        cd_full = leaf.component_data[ComponentType.FULL]
+        self.assertIsNotNone(cd_full.value)
+        # FULL backed up to host; SWA is a true recompute tombstone.
+        cd_full.host_value = cd_full.value.clone()
+        cd_full.value = None
+        cd_swa = leaf.component_data[ComponentType.SWA]
+        cd_swa.value = None
+        cd_swa.host_value = None
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+
+            self.assertEqual(
+                result.swa_recompute_len,
+                0,
+                "host-only FULL must defer recompute (=0)",
+            )
+            self.assertGreater(
+                result.host_hit_length,
+                0,
+                "host-only FULL must emit host_hit_length for load_back",
+            )
+
+            # LOAD_BACK may walk across true SWA tombstones under recompute.
+            swa_comp = tree.components[ComponentType.SWA]
+            from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+                CacheTransferPhase,
+            )
+
+            swa_transfers = swa_comp.build_hicache_transfers(
+                result.best_match_node, CacheTransferPhase.LOAD_BACK
+            )
+            if swa_transfers is not None:
+                xfer = swa_transfers[0]
+                for n in xfer.nodes_to_load or []:
+                    self.assertIsNotNone(n.component_data[ComponentType.SWA].host_value)
+
+    # ================================================================
     # HiCache Unit Tests (real cache_controller D<->H backup/load)
     # ================================================================
 

@@ -546,6 +546,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
+        # Recompute path returns -1 when the length gate wants legacy matching.
+        if (
+            envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
+            and ComponentType.SWA in self.components
+        ):
+            (
+                value,
+                best_match_node,
+                best_match_device_node,
+                best_match_device_value_len,
+                swa_recompute_len,
+            ) = self._match_prefix_helper_recompute(key)
+            if swa_recompute_len >= 0:
+                return self._match_post_processor(
+                    params,
+                    value,
+                    best_match_node,
+                    best_match_device_node,
+                    best_match_device_value_len,
+                    swa_recompute_len=swa_recompute_len,
+                )
+
         (
             value,
             best_match_node,
@@ -598,14 +620,57 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
 
+    def revive_swa_tombstone_window(
+        self, last_node: UnifiedTreeNode, recompute_len: int
+    ) -> int:
+        """Flip SWA tombstones to live for the trailing recompute window."""
+        assert (
+            recompute_len % self.page_size == 0
+        ), f"recompute_len must be page aligned, {recompute_len=}, {self.page_size=}"
+        if recompute_len <= 0 or last_node is self.root_node:
+            return 0
+        swa_comp = self.components.get(ComponentType.SWA)
+        assert (
+            swa_comp is not None
+        ), "revive_swa_tombstone_window requires an SWA component"
+
+        revived = 0
+        covered = 0
+        node = last_node
+        while node is not self.root_node and covered < recompute_len:
+            remaining = recompute_len - covered
+            node_len = len(node.key)
+            if node_len > remaining:
+                # Boundary inside this node: split so the trailing `remaining`
+                # tokens become their own child; revive only that tail.
+                self._split_node(node.key, node, node_len - remaining)
+                node_len = len(node.key)
+
+            if swa_comp.is_swa_recompute_tombstone(node):
+                swa_comp.revive_tombstoned_node(node)
+                revived += node_len
+
+            covered += node_len
+            node = node.parent
+
+        return revived
+
+    def _should_skip_swa_for_recompute(self, node: Any) -> bool:
+        """Skip SWA locking when the matched node is still a tombstone."""
+        swa = self.components.get(ComponentType.SWA)
+        return swa is not None and swa.should_skip_lock_for_recompute(node)
+
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         result = self.session.try_inc_lock_ref(node)
         if result is not None:
             return result
         if self.disable:
             return IncLockRefResult()
-        result = IncLockRefResult()
+        skip_swa = self._should_skip_swa_for_recompute(node)
+        result = IncLockRefResult(swa_skipped=skip_swa)
         for component in self._components_tuple:
+            if skip_swa and component.component_type == ComponentType.SWA:
+                continue
             result = component.acquire_component_lock(node=node, result=result)
 
         self._update_evictable_leaf_sets(node)
@@ -619,7 +684,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return result
         if self.disable:
             return DecLockRefResult()
+        skip_swa = params is not None and params.swa_skipped
         for component in self._components_tuple:
+            if skip_swa and component.component_type == ComponentType.SWA:
+                continue
             component.release_component_lock(node=node, params=params)
 
         self._update_evictable_leaf_sets(node)
@@ -629,8 +697,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult()
-        result = IncLockRefResult()
+        skip_swa = self._should_skip_swa_for_recompute(node)
+        result = IncLockRefResult(swa_skipped=skip_swa)
         for component in self._components_tuple:
+            if skip_swa and component.component_type == ComponentType.SWA:
+                continue
             result = component.acquire_component_lock(
                 node=node, result=result, lock_host=True
             )
@@ -643,7 +714,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult()
+        skip_swa = params is not None and params.swa_skipped
         for component in self._components_tuple:
+            if skip_swa and component.component_type == ComponentType.SWA:
+                continue
             component.release_component_lock(node=node, params=params, lock_host=True)
 
         self._update_evictable_leaf_sets(node)
@@ -906,6 +980,86 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_device_value_len,
         )
 
+    def _match_prefix_helper_recompute(
+        self, key: RadixKey
+    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, int]:
+        """Match through SWA tombstones and compute trailing recompute length."""
+        swa_comp = self.components[ComponentType.SWA]
+        node = self.root_node
+        child_key = key.child_key(self.page_size)
+        value: list[torch.Tensor] = []
+        last_device_node = self.root_node
+        last_device_value_len = 0
+        has_host_only_full = False
+        # (token-length, is_recompute_tombstone) per matched segment.
+        segments: list[tuple[int, bool]] = []
+
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            # FULL gone on both device and host → stop the walk.
+            if child.evicted and not child.backuped:
+                break
+
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                node = self._split_node(child.key, child, prefix_len)
+                if not node.evicted:
+                    value.append(node.component_data[BASE_COMPONENT_TYPE].value)
+                    last_device_node = node
+                    last_device_value_len = len(value)
+                else:
+                    has_host_only_full = True
+                segments.append((prefix_len, swa_comp.is_swa_recompute_tombstone(node)))
+                break
+
+            if not child.evicted:
+                value.append(child.component_data[BASE_COMPONENT_TYPE].value)
+                last_device_node = child
+                last_device_value_len = len(value)
+            else:
+                has_host_only_full = True
+            node = child
+            segments.append((len(child.key), swa_comp.is_swa_recompute_tombstone(node)))
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        if has_host_only_full:
+            return value, node, last_device_node, last_device_value_len, 0
+
+        total_len = sum(seg_len for seg_len, _ in segments)
+        w_r = swa_comp.swa_recompute_window_size()
+
+        dist_from_end = 0
+        has_tombstone_in_window = False
+        for seg_len, is_tombstone in reversed(segments):
+            if is_tombstone and dist_from_end < w_r:
+                has_tombstone_in_window = True
+                break
+            dist_from_end += seg_len
+            if dist_from_end >= w_r:
+                break
+
+        if has_tombstone_in_window:
+            swa_recompute_len = min(w_r, total_len) // self.page_size * self.page_size
+        else:
+            swa_recompute_len = 0
+
+        gated = (
+            swa_recompute_len > 0
+            and total_len < swa_comp.swa_recompute_gate_threshold()
+        )
+
+        if gated:
+            return value, node, last_device_node, last_device_value_len, -1
+        return (
+            value,
+            node,
+            last_device_node,
+            last_device_value_len,
+            swa_recompute_len,
+        )
+
     def _match_post_processor(
         self,
         params: MatchPrefixParams,
@@ -913,6 +1067,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
+        swa_recompute_len: int = 0,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self._components_tuple:
@@ -946,9 +1101,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
+            swa_recompute_len=swa_recompute_len,
         )
 
         for component in self._components_tuple:
+            # Recompute rewrites the trailing SWA window; skip SWA load-back
+            # bookkeeping for this match.
+            if swa_recompute_len > 0 and component.component_type == ComponentType.SWA:
+                continue
             result = component.finalize_match_result(
                 result=result,
                 params=params,
@@ -2418,6 +2578,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def sliding_window_size(self):
         swa = self.components.get(ComponentType.SWA)
         return swa.sliding_window_size if swa else None
+
+    def _swa_recompute_window_size(self) -> int:
+        """Proxy to ``SWAComponent.swa_recompute_window_size``. Exposed so the
+        scheduler's startup chunk-size compatibility assert can duck-type both
+        cache implementations behind the same name."""
+        swa = self.components.get(ComponentType.SWA)
+        assert (
+            swa is not None
+        ), "_swa_recompute_window_size called without an SWA component"
+        return swa.swa_recompute_window_size()
 
     def supports_swa(self) -> bool:
         return ComponentType.SWA in self.components

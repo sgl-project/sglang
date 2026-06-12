@@ -45,6 +45,7 @@ def _build_swa_tree(
     kv_size_swa: int = 32,
     sliding_window_size: int = 4,
     enable_kv_cache_events: bool = False,
+    swa_num_layers: int = 1,
 ):
     head_num = 8
     head_dim = 128
@@ -94,6 +95,7 @@ def _build_swa_tree(
             is_eagle=is_eagle,
             sliding_window_size=sliding_window_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            swa_num_layers=swa_num_layers,
         ),
     )
     return tree, allocator, req_to_token_pool
@@ -785,6 +787,158 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
         self.assertEqual(tree.swa_protected_size_, 0)
         self.assertEqual(tree.full_protected_size_, 0)
         tree.sanity_check()
+
+
+class TestSWARecomputeWindow(CustomTestCase):
+    def _build_chain_with_tombstone(
+        self, *, window, page_size, chain_len, swa_num_layers=1, seg=None, evict=True
+    ):
+        """Build a multi-node chain and optionally tombstone its SWA path."""
+        if seg is None:
+            seg = window  # one segment per sliding window
+        assert chain_len % seg == 0
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=256,
+            kv_size_swa=128,
+            sliding_window_size=window,
+            page_size=page_size,
+            swa_num_layers=swa_num_layers,
+        )
+        token_ids = list(range(chain_len))
+        for end in range(seg, chain_len + 1, seg):
+            _insert(tree, allocator, token_ids[:end])
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+        )
+        # Keep FULL alive while SWA eviction tombstones internal nodes.
+        tree.inc_lock_ref(match.last_device_node)
+        if evict:
+            tree.evict(EvictParams(num_tokens=0, swa_num_tokens=chain_len))
+        return tree, allocator, token_ids
+
+    def test_recompute_zero_when_all_live(self):
+        tree, _, token_ids = self._build_chain_with_tombstone(
+            window=4, page_size=1, chain_len=12, evict=False
+        )
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            match = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+            )
+        self.assertEqual(match.swa_recompute_len, 0)
+        self.assertEqual(match.device_indices.shape[0], len(token_ids))
+
+    def test_recompute_extends_match_across_tombstone(self):
+        window, page_size, chain_len, num_layers = 4, 1, 24, 2
+        tree, _, token_ids = self._build_chain_with_tombstone(
+            window=window,
+            page_size=page_size,
+            chain_len=chain_len,
+            swa_num_layers=num_layers,
+        )
+        key = RadixKey(array("q", token_ids))
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(False):
+            legacy = tree.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(legacy.swa_recompute_len, 0)
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            recompute = tree.match_prefix(MatchPrefixParams(key=key))
+
+        w_r = (window * num_layers + page_size - 1) // page_size * page_size
+        self.assertEqual(recompute.device_indices.shape[0], chain_len)
+        self.assertGreater(recompute.swa_recompute_len, 0)
+        self.assertLessEqual(recompute.swa_recompute_len, w_r)
+        self.assertEqual(recompute.swa_recompute_len % page_size, 0)
+
+    def test_recompute_respects_w_r_cap_and_page_alignment(self):
+        window, page_size, chain_len, num_layers = 3, 2, 24, 2
+        tree, _, token_ids = self._build_chain_with_tombstone(
+            window=window,
+            page_size=page_size,
+            chain_len=chain_len,
+            swa_num_layers=num_layers,
+            seg=6,
+        )
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            recompute = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+            )
+        w_r = (window * num_layers + page_size - 1) // page_size * page_size  # = 6
+        self.assertLessEqual(recompute.swa_recompute_len, w_r)
+        self.assertEqual(recompute.swa_recompute_len % page_size, 0)
+
+    def test_revive_clears_tombstone_and_keeps_accounting(self):
+        window, page_size, chain_len, num_layers = 4, 1, 24, 2
+        tree, _, token_ids = self._build_chain_with_tombstone(
+            window=window,
+            page_size=page_size,
+            chain_len=chain_len,
+            swa_num_layers=num_layers,
+        )
+        key = RadixKey(array("q", token_ids))
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            recompute = tree.match_prefix(MatchPrefixParams(key=key))
+        recompute_len = recompute.swa_recompute_len
+        self.assertGreater(recompute_len, 0)
+
+        swa_evictable_before = tree.swa_evictable_size_
+        revived = tree.revive_swa_tombstone_window(
+            recompute.last_device_node, recompute_len
+        )
+        # Revive restores swa-evictable accounting by exactly the revived amount.
+        self.assertGreaterEqual(revived, 0)
+        self.assertEqual(tree.swa_evictable_size_, swa_evictable_before + revived)
+
+    def test_window_size_scales_with_num_layers(self):
+        window, page_size, num_layers = 4, 2, 5
+        tree, _, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=256,
+            kv_size_swa=128,
+            sliding_window_size=window,
+            page_size=page_size,
+            swa_num_layers=num_layers,
+        )
+        expected = (
+            (window * num_layers + page_size - 1) // page_size * page_size
+        )  # ceil(20/2)*2 = 20
+        self.assertEqual(tree._swa_recompute_window_size(), expected)
+        self.assertEqual(tree._swa_recompute_gate_threshold(), 2 * expected)
+
+    def test_length_gate_falls_back_to_truncation(self):
+        window, page_size, chain_len, num_layers = 4, 1, 24, 4
+        tree, _, token_ids = self._build_chain_with_tombstone(
+            window=window,
+            page_size=page_size,
+            chain_len=chain_len,
+            swa_num_layers=num_layers,
+        )
+        key = RadixKey(array("q", token_ids))
+
+        self.assertGreater(tree._swa_recompute_gate_threshold(), chain_len)
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            gated = tree.match_prefix(MatchPrefixParams(key=key))
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(False):
+            legacy = tree.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(gated.swa_recompute_len, 0)
+        self.assertEqual(gated.device_indices.shape[0], legacy.device_indices.shape[0])
+
+    def test_recompute_taken_when_above_gate(self):
+        window, page_size, num_layers = 4, 1, 2  # W_r = 8, 2*W_r = 16
+        chain_len = 24
+        tree, _, token_ids = self._build_chain_with_tombstone(
+            window=window,
+            page_size=page_size,
+            chain_len=chain_len,
+            swa_num_layers=num_layers,
+        )
+        key = RadixKey(array("q", token_ids))
+        self.assertLessEqual(tree._swa_recompute_gate_threshold(), chain_len)
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            recompute = tree.match_prefix(MatchPrefixParams(key=key))
+        self.assertGreater(recompute.swa_recompute_len, 0)
+        self.assertEqual(recompute.device_indices.shape[0], len(token_ids))
 
 
 if __name__ == "__main__":

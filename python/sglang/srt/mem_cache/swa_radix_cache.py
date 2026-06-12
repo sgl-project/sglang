@@ -360,6 +360,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             self.init_metrics_collector()
 
         self.sliding_window_size = params.sliding_window_size
+        # Used to size the SWA-window recompute window W_r = n_win * L. Only
+        # required when SGLANG_OPT_SWA_RECOMPUTE_WINDOW is enabled.
+        self.swa_num_layers = params.swa_num_layers
+        if envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            assert self.swa_num_layers is not None and self.swa_num_layers > 0, (
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW requires swa_num_layers to be set "
+                f"(got {self.swa_num_layers})"
+            )
         self.reset()
 
     ##### Public API #####
@@ -410,6 +418,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 last_host_node=self.root_node,
                 best_match_node=self.root_node,
             )
+
+        if envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            (
+                value,
+                last_node,
+                best_value_len,
+                swa_recompute_len,
+            ) = self._match_prefix_helper_recompute(key)
+            # swa_recompute_len == -1 → length gate vetoed; fall back to the
+            # legacy truncating match below.
+            if swa_recompute_len >= 0:
+                return self._match_post_processor(
+                    params,
+                    value,
+                    last_node,
+                    best_value_len,
+                    swa_recompute_len=swa_recompute_len,
+                )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)
@@ -552,6 +578,53 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
 
+    def revive_swa_tombstone_window(
+        self, last_node: TreeNode, recompute_len: int
+    ) -> int:
+        """Clear SWA tombstones for the trailing ``recompute_len`` matched
+        tokens. Walks up from ``last_node``, splitting the boundary node when
+        the window does not align, and for each tombstoned node in the window
+        flips ``swa_tombstone`` off and restores SWA LRU / evictable
+        accounting. Returns the number of tokens actually revived.
+
+        Used by SWA-window recompute after the allocator has produced fresh
+        SWA slots for the window. Must run BEFORE any ``inc_lock_ref`` on
+        ``last_node`` (the SWA-lock asserts forbid tombstones in the locked
+        window).
+        """
+        assert (
+            recompute_len % self.page_size == 0
+        ), f"recompute_len must be page aligned, {recompute_len=}, {self.page_size=}"
+        if recompute_len <= 0 or last_node is self.root_node:
+            return 0
+
+        revived = 0
+        covered = 0
+        node = last_node
+        while node is not self.root_node and covered < recompute_len:
+            remaining = recompute_len - covered
+            node_len = len(node.key)
+            if node_len > remaining:
+                # Boundary inside this node: split so the trailing `remaining`
+                # tokens become their own child; revive only that tail.
+                self._split_node(node.key, node, node_len - remaining)
+                node_len = len(node.key)
+
+            if node.swa_tombstone:
+                assert node.swa_lock_ref == 0, (
+                    f"tombstone swa_lock_ref should always be 0, "
+                    f"{node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
+                )
+                node.swa_tombstone = False
+                self.swa_lru_list.insert_mru(node)
+                self.swa_evictable_size_ += len(node.value)
+                revived += len(node.value)
+
+            covered += node_len
+            node = node.parent
+
+        return revived
+
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
         total_size, total_swa_size = self._total_size_helper()
@@ -568,6 +641,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         swa_num_tokens = params.swa_num_tokens
         full_num_evicted = 0
         swa_num_evicted = 0
+        # Under recompute_mode the SWA-branch leaf path tombstones instead of
+        # free+delete, so full + compressed KV stay alive for a later
+        # match_prefix(recompute) to revive.
+        recompute_mode = envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
         if full_num_tokens > 0:
             # get the least recently used leaf node that is not locked
             x = self.full_lru_list.get_leaf_lru_no_lock()
@@ -628,9 +705,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     # 3. tombstone the node
                     self._tombstone_internal_node(x)
                 elif x.full_lock_ref > 0:
-                    # Leaf still holds a full-side lock (can happen when the
-                    # SWA leaf-lock early-release optimization revived a
-                    # tombstoned leaf. Treat it like an internal tombstone.
+                    # Leaf still holds a full-side lock (SWA leaf-lock
+                    # early-release revived a tombstoned leaf). Drop SWA only.
+                    self.token_to_kv_pool_allocator.free_swa(x.value)
+                    swa_num_evicted += len(x.value)
+
+                    x_next = self.swa_lru_list.get_prev_no_lock(x)
+                    self.swa_lru_list.remove_node(x)
+
+                    self.swa_evictable_size_ -= len(x.value)
+                    x.swa_tombstone = True
+                elif recompute_mode:
+                    # SWA-window recompute: tombstone instead of free+delete so
+                    # full + compressed KV stay alive and a subsequent
+                    # match_prefix(recompute) can revive the chain. Full pool
+                    # pressure still collapses these via the full-LRU branch.
+                    assert (
+                        x.full_lock_ref == 0
+                    ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     self.token_to_kv_pool_allocator.free_swa(x.value)
                     swa_num_evicted += len(x.value)
 
@@ -662,6 +754,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 x = x_next
 
+        if recompute_mode and (full_num_tokens > 0 or swa_num_tokens > 0):
+            logger.debug(
+                "SWARadix.evict req=(full=%d,swa=%d) freed=(full=%d,swa=%d)",
+                full_num_tokens,
+                swa_num_tokens,
+                full_num_evicted,
+                swa_num_evicted,
+            )
         self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
         return EvictResult(
             num_tokens_evicted=full_num_evicted, swa_num_tokens_evicted=swa_num_evicted
@@ -673,9 +773,32 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         to be passed to dec_lock_ref.
         It locks the full_lock_ref for nodes between the [last node, root), exclusive.
         It locks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
+
+        SWA-window recompute: when ``last_node`` is a tombstone the SWA chain
+        has no slots to lock — the inc_lock_swa assert would fire immediately.
+        Skip the SWA walk and return ``swa_skipped=True``; ``dec_lock_ref``
+        mirrors via ``params.swa_skipped``. The window's SWA slots are
+        allocated later in ``prepare_for_extend`` and the tombstones flipped
+        by ``_revive_swa_recompute`` (Python-single-threaded
+        scheduler, so no race).
         """
         if self.disable:
             return IncLockRefResult()
+
+        if node.swa_tombstone:
+            # Full-lock-only walk. Does not touch swa_lock_ref /
+            # swa_evictable_size_ / swa_protected_size_ / node.swa_uuid for
+            # ANY ancestor; dec_lock_ref must skip SWA symmetrically.
+            while node != self.root_node:
+                assert (
+                    node.full_lock_ref >= 0
+                ), f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
+                if node.full_lock_ref == 0:
+                    self.full_evictable_size_ -= len(node.value)
+                    self.full_protected_size_ += len(node.value)
+                node.full_lock_ref += 1
+                node = node.parent
+            return IncLockRefResult(swa_uuid_for_lock=None, swa_skipped=True)
 
         swa_lock_size = 0
         swa_uuid_for_lock = None
@@ -721,9 +844,16 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         If swa_uuid_for_lock is None, it unlocks to the root, exclusive.
 
         If skip_swa is True, only the full_lock_ref is decremented; the SWA lock is
-        assumed to have been released already (e.g. via `dec_swa_lock_only`).
+        assumed to have been released already (e.g. via `dec_swa_lock_only`) or was
+        never taken at inc time (SWA-window recompute path: see ``inc_lock_ref``
+        and ``IncLockRefResult.swa_skipped``). ``params.swa_skipped`` is the
+        latter case and is treated identically here.
         """
         swa_uuid_for_lock = params.swa_uuid_for_lock if params is not None else None
+        # Mirror inc_lock_ref's SWA-skip; otherwise the swa_lock_ref / tombstone
+        # asserts below fire on a node that was never inc-locked on the SWA side.
+        if params is not None and params.swa_skipped:
+            skip_swa = True
 
         if self.disable:
             return DecLockRefResult()
@@ -871,6 +1001,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         the matched node is guaranteed to either 1. connected to root without swa tombstone,
         or 2. the number of matching tokens from the matched node to the last swa tombstone
         node is greater than or equal to the sliding window size.
+
+        This is the legacy (truncating) path. When
+        ``SGLANG_OPT_SWA_RECOMPUTE_WINDOW`` is enabled, ``match_prefix`` calls
+        ``_match_prefix_helper_recompute`` instead.
         """
         node = self.root_node
         child_key = key.child_key(self.page_size)
@@ -920,6 +1054,87 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         return value, best_last_node, best_value_len
 
+    def _swa_recompute_window_size(self) -> int:
+        """Page-aligned trailing recompute window."""
+        assert (
+            self.swa_num_layers is not None and self.swa_num_layers > 0
+        ), "swa_num_layers must be set for SWA-window recompute"
+        n_win_times_layers = self.sliding_window_size * self.swa_num_layers
+        return (
+            (n_win_times_layers + self.page_size - 1) // self.page_size * self.page_size
+        )
+
+    def _swa_recompute_gate_threshold(self) -> int:
+        """Min matched-prefix length to take the recompute path."""
+        return 2 * self._swa_recompute_window_size()
+
+    def _match_prefix_helper_recompute(
+        self, key: RadixKey
+    ) -> Tuple[List[torch.Tensor], TreeNode, int, int]:
+        """SWA prefix match that allows recomputing a tombstoned trailing
+        window. Unlike :meth:`_match_prefix_helper` the walk does NOT truncate
+        at SWA tombstones; it returns the full matched prefix together with
+        the recompute length.
+
+        Returns ``(value, last_node, best_value_len, swa_recompute_len)``.
+        ``swa_recompute_len == -1`` signals the length gate vetoed and the
+        caller should fall back to :meth:`_match_prefix_helper`.
+        """
+        node = self.root_node
+        child_key = key.child_key(self.page_size)
+
+        value: List[torch.Tensor] = []
+        # (token-length, is_tombstone) per matched segment.
+        segments: List[Tuple[int, bool]] = []
+        enable_compact = envs.SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.get()
+        while len(key) > 0 and child_key in node.children.keys():
+            child = node.children[child_key]
+
+            if enable_compact:
+                self._compact_single_child_chain(child)
+
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                new_node = self._split_node(child.key, child, prefix_len)
+                value.append(new_node.value)
+                segments.append((len(new_node.value), new_node.swa_tombstone))
+                node = new_node
+                break
+            else:
+                value.append(child.value)
+                segments.append((len(child.value), child.swa_tombstone))
+                node = child
+                key = key[prefix_len:]
+
+                if len(key):
+                    child_key = key.child_key(self.page_size)
+
+        total_len = sum(seg_len for seg_len, _ in segments)
+        w_r = self._swa_recompute_window_size()
+
+        dist_from_end = 0
+        has_tombstone_in_window = False
+        for seg_len, is_tombstone in reversed(segments):
+            if is_tombstone and dist_from_end < w_r:
+                has_tombstone_in_window = True
+                break
+            dist_from_end += seg_len
+            if dist_from_end >= w_r:
+                break
+
+        if has_tombstone_in_window:
+            swa_recompute_len = min(w_r, total_len) // self.page_size * self.page_size
+        else:
+            swa_recompute_len = 0
+
+        gated = (
+            swa_recompute_len > 0 and total_len < self._swa_recompute_gate_threshold()
+        )
+
+        if gated:
+            return value, node, len(value), -1
+        return value, node, len(value), swa_recompute_len
+
     def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
         """Preprocess the key before matching."""
         key = params.key
@@ -937,12 +1152,16 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         value: List[torch.Tensor],
         last_node: TreeNode,
         best_value_len: int,
+        swa_recompute_len: int = 0,
     ) -> MatchResult:
         """Post-process the matched result."""
         node_update = last_node
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows swa to evict nodes closer to root first
         self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+        # reset_node_and_parents_mru skips swa-tombstone nodes for the swa list,
+        # so this stays correct even when the match (recompute mode) spans
+        # tombstoned nodes between last_node and the root.
         self.swa_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
         # This last_access_time is for sanity check, can be deleted after validation in production
@@ -965,6 +1184,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             last_device_node=last_node,
             last_host_node=last_node,
             best_match_node=last_node,
+            swa_recompute_len=swa_recompute_len,
         )
 
     def _compact_single_child_chain(self, node: TreeNode) -> None:
@@ -1243,6 +1463,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self, node: TreeNode
     ) -> Tuple[TreeNode, int]:
         full_num_evicted = 0
+        deleted_count = 0
         while node.parent.swa_tombstone and len(node.parent.children) == 0:
             # root node is not evictable
             if node.parent == self.root_node:
@@ -1257,10 +1478,18 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             self._record_remove_event(node.parent)
             self.token_to_kv_pool_allocator.free(node.parent.value)
             full_num_evicted += len(node.parent.value)
+            deleted_count += 1
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)
             node = node.parent
 
+        if deleted_count > 0 and envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            logger.debug(
+                "SWARadix._iter_delete_tomb_leaf collapsed %d tombstone ancestors, "
+                "freed_full_tok=%d",
+                deleted_count,
+                full_num_evicted,
+            )
         return node, full_num_evicted
 
     def _delete_leaf(self, node: TreeNode) -> None:

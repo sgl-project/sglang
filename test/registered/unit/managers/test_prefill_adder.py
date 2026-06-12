@@ -82,6 +82,7 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
+        req.swa_recompute_len = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
@@ -519,15 +520,17 @@ class TestPrefillAdder(CustomTestCase):
 
     def test_swa_budget_for_req(self):
         cases = [
-            # (extend, rem_chunk, window, page, expected, label)
-            (64, None, 128, 16, 128 + 16, "no_cap_floor_active"),
-            (200, None, 256, 32, 256 + 32, "no_cap_floor_active_other_dims"),
-            (300, None, 128, 16, 300 + 16, "no_cap_floor_inactive"),
-            (200, 50, 64, 8, 64 + 8, "cap_binds_then_floor"),
-            (300, 500, 64, 64, 300 + 64, "cap_does_not_bind"),
-            (0, None, 128, 16, 128 + 16, "extend_zero_floor_only"),
+            # (extend, rem_chunk, window, page, recompute, expected, label)
+            (64, None, 128, 16, 0, 128 + 16, "no_cap_floor_active"),
+            (200, None, 256, 32, 0, 256 + 32, "no_cap_floor_active_other_dims"),
+            (300, None, 128, 16, 0, 300 + 16, "no_cap_floor_inactive"),
+            (200, 50, 64, 8, 0, 64 + 8, "cap_binds_then_floor"),
+            (300, 500, 64, 64, 0, 300 + 64, "cap_does_not_bind"),
+            (0, None, 128, 16, 0, 128 + 16, "extend_zero_floor_only"),
+            (64, None, 128, 16, 96, 128 + 16 + 96, "recompute_adds_window"),
+            (300, None, 128, 16, 64, 300 + 16 + 64, "recompute_with_floor_inactive"),
         ]
-        for extend, rem_chunk, window, page, expected, label in cases:
+        for extend, rem_chunk, window, page, recompute, expected, label in cases:
             with self.subTest(label=label):
                 self.mock_tree_cache.sliding_window_size = window
                 adder = self.create_adder(
@@ -535,7 +538,10 @@ class TestPrefillAdder(CustomTestCase):
                     page_size=page,
                     rem_chunk_tokens=rem_chunk,
                 )
-                self.assertEqual(adder._swa_budget_for_req(extend), expected)
+                self.assertEqual(
+                    adder._swa_budget_for_req(extend, recompute_len=recompute),
+                    expected,
+                )
 
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise

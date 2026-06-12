@@ -198,6 +198,7 @@ class CompressorPrefillPlan(NamedTuple):
         ring_size: int,
         num_q_tokens: int,
         use_cuda_graph: bool = False,
+        recompute_boundary: Optional[torch.Tensor] = None,
     ) -> CompressorPrefillPlan:
         is_gpu_input = seq_lens.device.type == "cuda"
         pin_buffer = torch.empty(
@@ -205,6 +206,11 @@ class CompressorPrefillPlan(NamedTuple):
             dtype=torch.uint8,
             pin_memory=not is_gpu_input,
         )
+        # Empty boundary tensor means normal prefill.
+        if recompute_boundary is None:
+            recompute_boundary = torch.empty(
+                0, dtype=torch.int64, device=seq_lens.device
+            )
         module = _jit_compress_plan_module()
         plan_c, plan_w = module.plan_prefill(
             req_pool_indices,
@@ -212,6 +218,7 @@ class CompressorPrefillPlan(NamedTuple):
             full_to_swa,
             seq_lens,
             extend_lens,
+            recompute_boundary,
             pin_buffer,
             int(num_q_tokens),
             int(compress_ratio),

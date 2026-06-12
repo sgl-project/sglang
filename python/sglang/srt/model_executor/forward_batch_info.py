@@ -444,6 +444,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
+    # Per-req boundary P below which recompute suppresses compressed-KV writes.
+    swa_recompute_boundaries: Optional[List[int]] = None
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
@@ -651,6 +653,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            swa_recompute_boundaries=batch.swa_recompute_boundaries,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,

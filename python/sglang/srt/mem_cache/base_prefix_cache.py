@@ -110,6 +110,11 @@ class IncLockRefResult:
     skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
         default_factory=dict
     )
+    # SWA-window recompute: True iff inc_lock_ref skipped the SWA walk because
+    # last_node was a recompute tombstone. The matching dec_lock_ref must skip
+    # SWA symmetrically. Propagated through to_dec_params; long-lived per-req
+    # locks mirror it onto req.swa_prefix_lock_released.
+    swa_skipped: bool = False
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
@@ -120,6 +125,7 @@ class IncLockRefResult:
                 component_type: set(node_ids)
                 for component_type, node_ids in self.skip_lock_node_ids.items()
             },
+            swa_skipped=self.swa_skipped,
         )
 
 
@@ -132,6 +138,8 @@ class DecLockRefParams:
     skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
         default_factory=dict
     )
+    # See IncLockRefResult.swa_skipped. dec_lock_ref treats this as skip_swa=True.
+    swa_skipped: bool = False
 
 
 @dataclasses.dataclass
@@ -176,6 +184,11 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        swa_recompute_len: Number of trailing matched tokens whose SWA KV was
+                                tombstoned while FULL + compressed KV stay alive.
+                                Under SWA-window recompute the match extends across
+                                these tombstones and the scheduler recomputes just
+                                this trailing window. 0 = no recompute needed.
     """
 
     device_indices: torch.Tensor
@@ -187,6 +200,7 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    swa_recompute_len: int = 0
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
@@ -204,6 +218,7 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
+        swa_recompute_len=0,
     )
 
 

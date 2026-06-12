@@ -45,6 +45,9 @@ class CacheInitParams:
 
     sliding_window_size: Optional[int] = None
 
+    # SWA layer count used to size the recompute window. Only set for hybrid SWA.
+    swa_num_layers: Optional[int] = None
+
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
 
