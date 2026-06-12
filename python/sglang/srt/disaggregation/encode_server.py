@@ -901,8 +901,9 @@ class MMEncoder:
                 mm_feature, mm_inputs, missing_indices, modality, get_feature_fn
             )
 
-        # Step 3: Rank 0 prefetches cache-hit embeddings from global cache.
-        prefetch_status = torch.tensor([1], dtype=torch.int32)
+        # Step 3: Rank 0 prefetches cache-hit embeddings and builds fallback_mask.
+        fallback_mask = torch.zeros(num_items, dtype=torch.int32)
+        cached_slices = []
 
         if self.rank == 0:
             if hit_indices:
@@ -919,32 +920,46 @@ class MMEncoder:
                             await asyncio.sleep(0.005)
 
                     await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
+
+                    # Prefetch IO completed; check which items actually loaded.
+                    cached_slices = self.mm_global_cache.get_embeddings(hit_hashes)
+                    for i, idx in enumerate(hit_indices):
+                        if cached_slices[i] is None:
+                            fallback_mask[idx] = 1
+                    num_partial_fail = int(fallback_mask.sum().item())
+                    if num_partial_fail > 0:
+                        logger.warning(
+                            f"Req {req_id}: {num_partial_fail}/{len(hit_indices)} "
+                            f"cache-hit items failed to load (pool full), "
+                            f"falling back to ViT"
+                        )
                 except (asyncio.TimeoutError, Exception) as e:
                     logger.error(
                         f"Prefetch failed for req {req_id}: {e}. "
                         f"Falling back to ViT for {len(hit_indices)} hit items."
                     )
-                    prefetch_status[0] = 0
+                    for idx in hit_indices:
+                        fallback_mask[idx] = 1
 
-        # Step 4: Broadcast prefetch result to all ranks so they stay in sync.
+        # Step 4: Broadcast fallback_mask to all ranks so they stay in sync.
         if self.server_args.tp_size > 1:
             torch.distributed.broadcast(
-                prefetch_status,
+                fallback_mask,
                 src=0,
                 group=self.mm_global_cache.prefetch_tp_group,
             )
 
-        # Step 5: If prefetch failed, all ranks fallback to ViT for the hit mm items.
-        if prefetch_status.item() == 0 and hit_indices:
+        # Step 5: All ranks run ViT for items that need fallback recomputation.
+        fallback_indices = [i for i in range(num_items) if fallback_mask[i].item() == 1]
+        fallback_slices = None
+        if fallback_indices:
             logger.info(
-                f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
-                f"for {len(hit_indices)} mm items."
+                f"Req {req_id}: All ranks running ViT fallback "
+                f"for {len(fallback_indices)} items."
             )
             fallback_slices = self._encode_missing(
-                mm_feature, mm_inputs, hit_indices, modality, get_feature_fn
+                mm_feature, mm_inputs, fallback_indices, modality, get_feature_fn
             )
-        else:
-            fallback_slices = None
 
         # Step 6: Rank 0 assembles final embedding and prepares for sending.
         if self.rank == 0:
@@ -953,25 +968,37 @@ class MMEncoder:
             for i, idx in enumerate(missing_indices):
                 final_slices[idx] = new_slices[i]
 
-            # Fill in cache-hit embeddings (from prefetch or fallback)
-            if prefetch_status.item() == 1 and hit_indices:
-                cached_slices = self.mm_global_cache.get_embeddings(
-                    [str_mm_hashes[i] for i in hit_indices]
-                )
+            # Fill in successfully loaded cache-hit embeddings
+            if cached_slices:
                 for i, idx in enumerate(hit_indices):
-                    final_slices[idx] = cached_slices[i]
-            elif fallback_slices is not None:
-                for i, idx in enumerate(hit_indices):
+                    if cached_slices[i] is not None:
+                        final_slices[idx] = cached_slices[i]
+
+            # Fill in ViT fallback results for failed items
+            if fallback_slices is not None:
+                for i, idx in enumerate(fallback_indices):
                     final_slices[idx] = fallback_slices[i]
 
             mm_embedding = torch.cat(final_slices, dim=0)
+
+            # Release embedding cache references now that torch.cat has
+            # copied the data into a new tensor.  This allows the cache
+            # entries to be evicted under memory pressure.
+            if cached_slices:
+                loaded_hashes = [
+                    str_mm_hashes[idx]
+                    for idx in hit_indices
+                    if fallback_mask[idx].item() == 0
+                ]
+                if loaded_hashes:
+                    self.mm_global_cache.release_embeddings(loaded_hashes)
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
             all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
             all_new_slices = list(new_slices)
             if fallback_slices is not None:
-                all_new_hashes += [str_mm_hashes[i] for i in hit_indices]
+                all_new_hashes += [str_mm_hashes[i] for i in fallback_indices]
                 all_new_slices += list(fallback_slices)
 
             if all_new_hashes:

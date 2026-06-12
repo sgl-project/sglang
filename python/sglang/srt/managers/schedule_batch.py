@@ -83,6 +83,7 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     evict_from_tree_cache,
+    free_swa_out_of_window_slots,
     get_alloc_reserve_per_decode,
     release_kv_cache,
 )
@@ -2835,40 +2836,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        sliding_window_size = self.tree_cache.sliding_window_size
-
-        # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-        assert (
-            req.cache_protected_len % self.tree_cache.page_size == 0
-        ), "cache_protected_len must be page aligned"
-        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
-
-        # Subtract an extra page_size so the eviction frontier never reaches the
-        # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
-        # page of non-evicted SWA KV for the tree to store as a non-tombstone node,
-        # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
-        # may become tombstoned, causing SWA memory leak.
-        # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
-        if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
-            evict_threshold = pre_len - sliding_window_size
-        else:
-            evict_threshold = pre_len - sliding_window_size - self.tree_cache.page_size
-        new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen,
-            evict_threshold,
+        free_swa_out_of_window_slots(
+            req,
+            pre_len,
+            sliding_window_size=self.tree_cache.sliding_window_size,
+            page_size=self.tree_cache.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
-
-        if self.tree_cache.page_size > 1:
-            new_swa_evicted_seqlen = (
-                new_swa_evicted_seqlen // self.tree_cache.page_size
-            ) * self.tree_cache.page_size
-
-        if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
-            free_slots = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
-            ]
-            self.token_to_kv_pool_allocator.free_swa(free_slots)
-            req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def __str__(self):
         return (
