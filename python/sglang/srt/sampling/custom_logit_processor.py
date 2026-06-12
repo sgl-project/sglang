@@ -201,3 +201,94 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             logits[batch_idx, indices] = -float("inf")
 
         return logits
+
+
+# Port of mineru-vl-utils' MinerULogitsProcessor (HF-style ``no_repeat_ngram_size``):
+# https://github.com/opendatalab/mineru-vl-utils/blob/main/mineru_vl_utils/logits_processor/vllm_v1_no_repeat_ngram.py
+class MinerUNoRepeatNGramLogitProcessor(CustomLogitProcessor):
+    """Forbid repeating any ``ngram_size``-gram over the generated output.
+
+    This is the SGLang equivalent of ``mineru_vl_utils.MinerULogitsProcessor``,
+    the ``no_repeat_ngram_size`` guard the vLLM / Transformers paths apply for
+    MinerU2.5. A token is banned whenever emitting it would reproduce an
+    ``ngram_size``-token sequence that already appeared earlier in the output,
+    which breaks long verbatim repetition loops on degenerate documents while
+    leaving short legitimate repeats (e.g. table cells) untouched.
+
+    Custom params:
+        ngram_size (int): n-gram length to forbid repeating. Defaults to 100
+            (matching mineru-vl-utils) only when the key is absent; an explicit
+            value of ``0`` or less disables the processor. ``ngram_size=1`` bans
+            every token already seen in the scanned output.
+        window_size (int, optional): only scan the last ``window_size`` output
+            tokens for repeats. A positive value bounds the per-step cost; the
+            default (``None``, or any non-positive value) scans the full output
+            history, which is faithful to mineru-vl-utils but costs ``O(L)`` per
+            decode step (``O(L^2)`` over an ``L``-token generation). Set
+            ``window_size`` for long outputs.
+
+    Note: this rescans the output each step (like the sibling
+    ``DeepseekOCRNoRepeatNGramLogitProcessor``) rather than keeping a persistent
+    cross-step cache, since the processor instance is shared across requests and
+    the interface offers no per-request teardown hook.
+    """
+
+    DEFAULT_NGRAM_SIZE = 100
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        custom_param_list: Optional[List[Dict[str, Any]]] = None,
+    ) -> torch.Tensor:
+        if not custom_param_list:
+            return logits
+
+        for batch_idx, params in enumerate(custom_param_list):
+            if not params:
+                continue
+
+            req = params.get("__req__")
+            if req is None:
+                continue
+
+            try:
+                ngram_size = int(params.get("ngram_size", self.DEFAULT_NGRAM_SIZE))
+            except (TypeError, ValueError):
+                continue
+            if ngram_size <= 0:
+                continue
+
+            window = params.get("window_size")
+            try:
+                window_size = int(window) if window is not None else None
+            except (TypeError, ValueError):
+                window_size = None
+
+            # MinerU operates on the generated tokens only (not the prompt).
+            output_ids: List[int] = req.output_ids
+            if window_size is not None and window_size > 0:
+                output_ids = output_ids[-window_size:]
+            if len(output_ids) < ngram_size:
+                continue
+
+            # The trailing (ngram_size - 1)-gram that the next token would extend.
+            current_prefix = (
+                tuple(output_ids[-(ngram_size - 1) :]) if ngram_size > 1 else tuple()
+            )
+            # Cheap filter: only positions whose prefix ends in the same token as
+            # current_prefix can match, so we skip the tuple build/compare for the
+            # rest (keeps the common case ~O(L) instead of O(L * ngram_size)).
+            prefix_last = current_prefix[-1] if ngram_size > 1 else None
+
+            # Ban every token that already completed this same prefix earlier.
+            banned_tokens: Set[int] = set()
+            for idx in range(len(output_ids) - ngram_size + 1):
+                if ngram_size > 1 and output_ids[idx + ngram_size - 2] != prefix_last:
+                    continue
+                if tuple(output_ids[idx : idx + ngram_size - 1]) == current_prefix:
+                    banned_tokens.add(output_ids[idx + ngram_size - 1])
+
+            if banned_tokens:
+                logits[batch_idx, list(banned_tokens)] = -float("inf")
+
+        return logits
