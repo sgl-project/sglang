@@ -3,12 +3,12 @@ import unittest
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
-    inflight_middle_chunks_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     chunked_req_of,
+    inflight_middle_chunks_of,
     run_until,
     run_until_all_finished,
     run_until_finished,
