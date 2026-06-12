@@ -10,19 +10,19 @@ This guide describes the best practice data for GLM-5.1 on the Ascend NPU.
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in64k-out1k-20ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65K+1.5K (90% prefix cache hit rate) | 25ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-20ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65K+1.5K (90% prefix cache hit rate) | 25ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-16p-in3k5-out1k5-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in128k-out1k) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65K+1.5K (100% prefix cache hit rate) | 33ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65K+1.5K (100% prefix cache hit rate) | 33ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
 
 
 ## Optimal Configuration
