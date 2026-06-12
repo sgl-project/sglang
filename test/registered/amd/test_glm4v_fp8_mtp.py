@@ -1,0 +1,118 @@
+import unittest
+from types import SimpleNamespace
+
+import requests
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.send_one import BenchArgs, send_one_prompt
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    is_in_amd_ci,
+    is_in_ci,
+    popen_launch_server,
+    write_github_step_summary,
+)
+
+register_amd_ci(est_time=980, suite="stage-c-test-large-8-gpu-amd")
+
+GLM_4_7_FP8_MODEL_PATH = "zai-org/GLM-4.7-FP8"
+
+
+class TestGLM47FP8TPMTP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = GLM_4_7_FP8_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--trust-remote-code",
+            "--tp",
+            "8",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
+        ]
+        if not is_in_amd_ci():
+            other_args += ["--mem-frac", "0.7"]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        requests.get(self.base_url + "/flush_cache")
+
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            parallel=128,
+            max_new_tokens=512,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"{metrics=}")
+
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=:.2f}")
+
+        loads_info = requests.get(self.base_url + "/v1/loads?include=spec")
+        spec_accept_rate = loads_info.json()["loads"][0]["speculative"]["accept_rate"]
+        print(f"{spec_accept_rate=:.3f}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (glm-4.7-fp8 tp mtp)\n"
+                f'{metrics["accuracy"]=:.3f}\n'
+                f"{avg_spec_accept_length=:.2f}\n"
+                f"{spec_accept_rate=:.2f}\n"
+            )
+
+            self.assertGreater(metrics["accuracy"], 0.80)
+            self.assertGreater(spec_accept_rate, 0.5)
+            self.assertGreater(avg_spec_accept_length, 2.0)
+
+    def test_bs_1_speed(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
+
+        print(f"{acc_length=:.2f} {speed=:.2f}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_bs_1_speed (glm-4.7-fp8 tp mtp)\n"
+                f"{acc_length=:.2f}\n"
+                f"{speed=:.2f} token/s\n"
+            )
+
+            self.assertGreater(acc_length, 2.0)
+        if is_in_amd_ci():
+            self.assertGreater(speed, 15)
+        else:
+            self.assertGreater(speed, 50)
+
+
+if __name__ == "__main__":
+    unittest.main()
