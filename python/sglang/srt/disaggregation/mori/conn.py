@@ -272,7 +272,7 @@ class TransferTarget:
 
 @dataclasses.dataclass
 class _TransferChunk:
-    sender: "MoriKVSender"
+    sender: MoriKVSender
     kv_indices: npt.NDArray[np.int32]
     index_slice: slice
     is_last_chunk: bool
