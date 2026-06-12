@@ -1,7 +1,7 @@
 ---
 title: "Kimi-K2.5"
 metatags:
-  description: "Deploy Kimi-K2.5 model with SGLang on Ascend NPUs, including single-node deployment modes."
+  description: "Deploy Kimi-K2.5 model with SGLang on Ascend NPUs, including single-node, multi-node, and PD disaggregation modes."
 ---
 
 ## Introduction
@@ -12,8 +12,8 @@ pretraining on approximately 15 trillion mixed visual and text tokens atop Kimi-
 active parameters. The model seamlessly integrates vision and language understanding with advanced agentic
 capabilities, supporting both instant and thinking modes as well as conversational and agentic paradigms.
 
-This document demonstrates the deployment of Kimi-K2.5 on Ascend NPUs using SGLang, including single-node PD mixed
-mode, feature configuration, and performance optimization.
+This document demonstrates the deployment of Kimi-K2.5 on Ascend NPUs using SGLang, including single-node and multi-node
+PD mixed mode, multi-node PD disaggregation mode, feature configuration, and performance optimization.
 
 This document is validated and written based on **SGLang v0.5.10**. The current model (Kimi-K2.5) is fully supported in
 this version. To use the latest features (e.g., speculative decoding, multimodal), it is recommended to use
@@ -26,6 +26,7 @@ v0.5.10 or a later version.
 | Tensor Parallelism            | `--tp-size 16`                                                                                |
 | Data Parallelism              | `--enable-dp-attention --dp-size 16`                                                          |
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                                 |
+| PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size 32768 --max-prefill-tokens 16384`                                     |
 | NPU Graph                     | `--cuda-graph-bs 1 2 4 8 12 16 24 32 48 64 96 120`                                            |
@@ -202,6 +203,234 @@ python3 -m sglang.launch_server \
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
 
+### Multi-node online deployment
+
+Multi-node deployment distributes tensor parallelism across multiple nodes for models that require more compute resources.
+The following command is based on the **W4A8** quantized model with 2 Atlas 800I A3 nodes.
+
+#### 2 x Atlas 800I A3
+
+This configuration uses 2 nodes with TP=32 and DP=32 across both nodes. The following command is based on the **W4A8**
+quantized model.
+
+Modify the IP addresses of the 2 nodes, then run the same script on both nodes.
+
+```bash Launch multi-node server
+#============================================================
+# Before running, update the following variables:
+#   NODES_IP: IP addresses of the two nodes
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_PATH: path to the EAGLE3 draft model directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+#============================================================
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+export SGLANG_SET_CPU_AFFINITY=1
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
+export HCCL_BUFFSIZE=2400
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
+export SGLANG_NPU_USE_MLAPO=1
+
+export HCCL_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=<network-interface>
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_PATH=/path/to/draft-model
+
+NODES_IP=(<your ip1> <your ip2>)
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+for i in "${!NODES_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${NODES_IP[$i]}" || "$LOCAL_HOST2" == "${NODES_IP[$i]}" ]];
+    then
+        echo "${NODES_IP[$i]}"
+        python3 -m sglang.launch_server \
+            --model-path $MODEL_PATH --quantization modelslim --dtype bfloat16 \
+            --model-loader-extra-config '{"enable_multithread_load": true}' \
+            --host 0.0.0.0 --port 6699 --dist-init-addr ${NODES_IP[0]}:5000 --nnodes 2 --node-rank $i \
+            --trust-remote-code --device npu --attention-backend ascend \
+            --tp-size 32 --base-gpu-id 0 --mem-fraction-static 0.62 --max-running-requests 386 \
+            --chunked-prefill-size 65536 --context-length 8192 --max-prefill-tokens 16384 \
+            --enable-multimodal --mm-attention-backend ascend_attn --sampling-backend ascend \
+            --enable-dp-attention --dp-size 32 \
+            --moe-a2a-backend deepep --deepep-mode auto \
+            --cuda-graph-bs 1 2 4 6 8 10 12 --disable-radix-cache \
+            --speculative-algorithm EAGLE3 \
+            --speculative-draft-model-path $DRAFT_PATH \
+            --speculative-num-steps 4 \
+            --speculative-eagle-topk 1 \
+            --speculative-num-draft-tokens 5 \
+            --speculative-draft-model-quantization unquant
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+### Multi-node PD disaggregation deployment
+
+PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
+throughput for high-concurrency scenarios. The following command is based on the **W4A8** quantized model.
+
+#### 5 x Atlas 800I A3
+
+This configuration uses 3 nodes for prefill (TP=16, DP=4 on each) and 2 nodes for decode (TP=32, DP=32 across 2 nodes),
+for a total of 5 Atlas 800I A3 nodes (3P1D). Modify the IP addresses before running.
+
+1. Run the following command on all prefill and decode nodes.
+
+```bash Prefill / Decode nodes
+#============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP addresses (3 nodes)
+#   D_IP: decode node IP addresses (2 nodes)
+#   ASCEND_MF_STORE_URL: first prefill node IP with port (e.g., tcp://192.168.1.1:24669)
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME (decode section): network interface name for HCCL
+#   GLOO_SOCKET_IFNAME (decode section): network interface name for Gloo
+#============================================================
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=10
+sysctl -w kernel.numa_balancing=0
+
+export SGLANG_SET_CPU_AFFINITY=1
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+
+P_IP=(<your prefill ip1> <your prefill ip2> <your prefill ip3>)
+D_IP=(<your decode ip1> <your decode ip2>)
+
+MODEL_PATH=/path/to/model-weights
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24669"
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "Prefill -> ${P_IP[$i]}"
+
+        export HCCL_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=lo
+
+        export HCCL_BUFFSIZE=3600
+        export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=60
+
+        python3 -m sglang.launch_server \
+            --model-path $MODEL_PATH --quantization modelslim --dtype bfloat16 \
+            --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
+            --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --nnodes 1 --node-rank 0 \
+            --trust-remote-code --device npu --attention-backend ascend \
+            --tp-size 16 --base-gpu-id 0 --mem-fraction-static 0.68 --max-running-requests 8 \
+            --chunked-prefill-size 32768 --context-length 81920 \
+            --enable-multimodal --mm-attention-backend ascend_attn --sampling-backend ascend \
+            --enable-dp-attention --dp-size 4 \
+            --disable-radix-cache \
+            --moe-a2a-backend deepep --deepep-mode auto
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "Decode -> ${D_IP[$i]}"
+
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
+
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
+        export HCCL_BUFFSIZE=2400
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=60
+
+        python3 -m sglang.launch_server \
+            --model-path $MODEL_PATH --quantization modelslim --dtype bfloat16 \
+            --disaggregation-mode decode --disaggregation-transfer-backend ascend \
+            --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i \
+            --trust-remote-code --device npu --attention-backend ascend \
+            --tp-size 32 --base-gpu-id 0 --mem-fraction-static 0.74 --max-running-requests 128 \
+            --chunked-prefill-size 65536 --context-length 81920 \
+            --disable-radix-cache \
+            --enable-multimodal --mm-attention-backend ascend_attn --sampling-backend ascend \
+            --enable-dp-attention --dp-size 32 \
+            --moe-a2a-backend deepep --deepep-mode auto \
+            --cuda-graph-bs 4
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+2. Launch the SGLang Router (on any reachable node):
+
+```bash Router
+#============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip1/2/3>: prefill node IP addresses
+#   <your decode ip1>: decode node IP address
+#============================================================
+
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://<your prefill ip1>:8000 8998 \
+    --prefill http://<your prefill ip2>:8000 8999 \
+    --prefill http://<your prefill ip3>:8000 9000 \
+    --decode http://<your decode ip1>:8001 \
+    --host 127.0.0.1 \
+    --port 6699
+```
+
+The full sglang server will serve on `http://127.0.0.1:6699`.
+
 ## Functional verification
 
 After the service is started, you can invoke the model by sending a prompt:
@@ -242,10 +471,12 @@ on the Best Practice page.
 
 #### Scenario overview
 
-| Scenario                      | Deployment mode | Total NPUs | Weight version |
-|-------------------------------|-----------------|------------|----------------|
-| Low latency (3.5K+1.5K)       | PD mixed        | 8 (A3)     | W4A8      |
-| High throughput (3.5K+1.5K)   | PD mixed        | 8 (A3)     | W4A8      |
+| Scenario                      | Deployment mode     | Total NPUs | Weight version |
+|-------------------------------|---------------------|------------|----------------|
+| Low latency (3.5K+1.5K)       | PD mixed            | 8 (A3)     | W4A8      |
+| High throughput (3.5K+1.5K)   | PD mixed            | 8 (A3)     | W4A8      |
+| High throughput (3.5K+1.5K)   | PD mixed            | 32 (A3)    | W4A8      |
+| High throughput (3.5K+1.5K)   | PD disaggregation   | 80 (A3)    | W4A8      |
 
 `Total NPUs` indicates the total number of NPUs used across all nodes.
 
