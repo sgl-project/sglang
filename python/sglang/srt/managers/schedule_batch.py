@@ -1092,11 +1092,6 @@ class Req(ReqDllmMixin):
 
     # TODO: inline this method into its callers — it has no side effects, it only sets extend_range.
     def set_extend_range(self, start: int, end: int) -> None:
-        # Setting an extend range is what admits the req into the extend
-        # phase (PrefillAdder admission, chunk resume, disagg prebuilt).
-        # mix_with_running is the one caller that only borrows the range for
-        # batch assembly; it restores DECODE right after.
-        self.phase = ReqPhase.EXTEND
         self.extend_range = Range(start, end)
 
     def get_fill_ids(self) -> array:
@@ -2033,6 +2028,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             assert seq_len - pre_len == req.extend_range.length
 
             req.extend_batch_idx += 1
+            req.phase = ReqPhase.EXTEND
 
             # update req-level memory management fields
             req.kv_committed_len = seq_len
@@ -2356,9 +2352,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in running_batch.reqs:
             full_len = req.get_full_untruncated_fill_len()
             req.set_extend_range(full_len - 1, full_len)
-            # The running rows stay in decode; the range above only feeds the
-            # mixed batch assembly.
-            req.phase = ReqPhase.DECODE
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None

@@ -59,7 +59,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqPhase, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1410,6 +1410,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # decode prefetch, but it is behavior-neutral — only .end is read before
         # get_new_prebuilt_batch resets extend_range ahead of the prebuilt forward.
         req.set_extend_range(total_prefix_len, req.kv_committed_len)
+        # This prebuilt path never goes through prepare_for_extend, so enter
+        # the extend phase here; prepare_for_decode moves it to DECODE later.
+        req.phase = ReqPhase.EXTEND
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1876,6 +1879,10 @@ class SchedulerDisaggregationDecodeMixin:
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv_committed_len is not None:
                     req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
+                    # This prebuilt path never goes through prepare_for_extend,
+                    # so enter the extend phase here; prepare_for_decode moves
+                    # it to DECODE later.
+                    req.phase = ReqPhase.EXTEND
             else:
                 waiting_queue.append(req)
 
