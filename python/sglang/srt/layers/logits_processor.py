@@ -23,7 +23,11 @@ from torch import nn
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -258,6 +262,28 @@ class LogitsMetadata:
             dtype=dtype,
             device=device,
         )
+
+
+# Workspace for _all_gather_logits, shared by all CUDA graphs.
+_gather_logits_workspace: Optional[torch.Tensor] = None
+
+
+def get_gather_logits_workspace(
+    shape: Tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> Optional[torch.Tensor]:
+    """The workspace viewed as ``shape``/``dtype``, or None if it doesn't fit."""
+    global _gather_logits_workspace
+    numel = torch.Size(shape).numel()
+    ws = _gather_logits_workspace
+    if ws is None:
+        # Allocate on the first request, which is expected to be the largest
+        with use_symmetric_memory(get_tp_group()):
+            ws = torch.empty(numel, dtype=torch.float32, device=device)
+        _gather_logits_workspace = ws
+    # Take slice from workspace. A request that doesn't fit gets
+    # None, and the caller falls back to the generic all-gather.
+    fits = dtype.itemsize <= ws.element_size() and numel * dtype.itemsize <= ws.nbytes
+    return ws.view(dtype)[:numel].view(shape) if fits else None
 
 
 class LogitsProcessor(nn.Module):
@@ -856,7 +882,7 @@ class LogitsProcessor(nn.Module):
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
-                logits = tensor_model_parallel_all_gather(logits)
+                logits = self._all_gather_logits(logits, logits_metadata)
 
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
@@ -958,6 +984,62 @@ class LogitsProcessor(nn.Module):
             )
         return global_logits
 
+    def _all_gather_logits(
+        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> torch.Tensor:
+        """All-gather the per-rank logits shards [num_tokens, vocab // tp]."""
+        tp_size = get_tensor_model_parallel_world_size()
+        row_start = self._buffer_row_start_in_gather(logits, logits_metadata)
+        shards = (
+            get_gather_logits_workspace(
+                (tp_size, *logits.shape), logits.dtype, logits.device
+            )
+            if row_start is not None
+            else None
+        )  # [tp_ranks, num_tokens, shard_width]
+        if shards is None:
+            return tensor_model_parallel_all_gather(logits)
+
+        shard_width = logits.shape[1]  # vocab_size / tp_size
+        get_tp_group().all_gather_into_tensor(shards.view(-1, shard_width), logits)
+        buf = logits_metadata.next_token_logits_buffer
+        # Transpose copy
+        # shards: [tp_ranks, num_tokens, vocab_size / tp_size]
+        # buf: [num_tokens, tp_size, vocab_size / tp_size]
+        # In DP attention, only the local tokens are copied out (can be optimized further)
+        buf.view(len(buf), tp_size, shard_width).copy_(
+            shards[:, row_start : row_start + len(buf), :].movedim(0, 1)
+        )
+        return buf
+
+    def _buffer_row_start_in_gather(
+        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> Optional[int]:
+        """Row of the gathered logits where this rank's buffer rows start,
+        or None when the gather cannot write the buffer directly."""
+        buf = logits_metadata.next_token_logits_buffer
+        tp_size = get_tensor_model_parallel_world_size()
+        if (
+            buf is None
+            or logits.dim() != 2
+            or not logits.is_cuda
+            or not logits.is_contiguous()
+            or not buf.is_contiguous()
+            or buf.shape[1] != tp_size * logits.shape[1]  # TODO: vocab padding
+        ):
+            return None
+        if not self.do_tensor_parallel_all_gather_dp_attn:
+            # Plain TP: the gathered rows are exactly the buffer rows.
+            return 0 if logits.shape[0] == buf.shape[0] else None
+        # DP attention: the gather covers the dp-padded global batch and the
+        # buffer holds only this rank's rows.
+        dp_graph_layout = (
+            logits_metadata.dp_padding_mode is not None
+            and logits_metadata.dp_padding_mode.is_max_len()
+            and logits.shape[0] == get_attention_dp_size() * buf.shape[0]
+        )
+        return get_attention_dp_rank() * buf.shape[0] if dp_graph_layout else None
+
     def _scatter_dp_attn_logits(
         self,
         logits: torch.Tensor,
@@ -965,6 +1047,9 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
     ) -> torch.Tensor:
         if self.do_tensor_parallel_all_gather_dp_attn:
+            if logits is logits_metadata.next_token_logits_buffer:
+                # _all_gather_logits already scattered this rank's rows
+                return logits
             global_logits = logits
             logits = torch.empty(
                 (local_hidden_states.shape[0], global_logits.shape[1]),
@@ -979,6 +1064,9 @@ class LogitsProcessor(nn.Module):
     ) -> torch.Tensor:
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
+            if logits is logits_buffer:
+                # _all_gather_logits already wrote into the buffer
+                return logits
             assert logits_buffer.dtype == torch.float
             logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
