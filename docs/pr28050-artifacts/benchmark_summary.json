@@ -1,254 +1,294 @@
 {
-  "main_commit": "18989f3d4812f144d862a63c873bf1f93034ebc0",
-  "pr_commit": "df7501b5d2b62169fdcec4550cb166040d4fca34",
-  "model": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-  "preset": "wan-ti2v",
-  "runs": {
-    "main": [
-      {
-        "run": 1,
-        "e2e_s": 32.23467191820964,
-        "denoise_s": 27.983076953329146,
-        "decode_s": 3.5550471767783165,
-        "step2plus_s": 26.545366961043328,
-        "median_step_ms": 541.6930271312594,
-        "peak_gb": 40.421875,
-        "warmup_s": 60.82,
-        "pixel_total_s": 95.19,
-        "mode": "max-autotune-no-cudagraphs",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-120329_2e83a4a5.mp4"
-      },
-      {
-        "run": 2,
-        "e2e_s": 31.76215082872659,
-        "denoise_s": 27.511249939911067,
-        "decode_s": 3.5570264677517116,
-        "step2plus_s": 26.55745329009369,
-        "median_step_ms": 541.891316883266,
-        "peak_gb": 42.912109375,
-        "warmup_s": 27.49,
-        "pixel_total_s": 61.21,
-        "mode": "max-autotune-no-cudagraphs",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-121027_265128e7.mp4"
-      },
-      {
-        "run": 3,
-        "e2e_s": 31.808230224065483,
-        "denoise_s": 27.560228142887354,
-        "decode_s": 3.551153123844415,
-        "step2plus_s": 26.58390336902812,
-        "median_step_ms": 542.5066971220076,
-        "peak_gb": 42.912109375,
-        "warmup_s": 29.51,
-        "pixel_total_s": 63.25,
-        "mode": "max-autotune-no-cudagraphs",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-121531_6e891a25.mp4"
-      },
-      {
-        "run": 4,
-        "e2e_s": 31.824443184770644,
-        "denoise_s": 27.563290889840573,
-        "decode_s": 3.5591842057183385,
-        "step2plus_s": 26.618588166777045,
-        "median_step_ms": 543.137330096215,
-        "peak_gb": 42.912109375,
-        "warmup_s": 25.25,
-        "pixel_total_s": 59.04,
-        "mode": "max-autotune-no-cudagraphs",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-122020_6c7a1795.mp4"
-      },
-      {
-        "run": 5,
-        "e2e_s": 31.716570316348225,
-        "denoise_s": 27.46196174202487,
-        "decode_s": 3.5589411980472505,
-        "step2plus_s": 26.60759491380304,
-        "median_step_ms": 543.1689256802201,
-        "peak_gb": 42.912109375,
-        "warmup_s": 27.61,
-        "pixel_total_s": 61.11,
-        "mode": "max-autotune-no-cudagraphs",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-122519_63ed292f.mp4"
-      },
-      {
-        "run": 6,
-        "e2e_s": 31.577205471228808,
-        "denoise_s": 27.31899143802002,
-        "decode_s": 3.560944341123104,
-        "step2plus_s": 26.53386930655688,
-        "median_step_ms": 541.3615773431957,
-        "peak_gb": 42.912109375,
-        "warmup_s": 24.9,
-        "pixel_total_s": 58.41,
-        "mode": "max-autotune-no-cudagraphs",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-123017_7811e994.mp4"
-      }
-    ],
-    "pr": [
-      {
-        "run": 1,
-        "e2e_s": 31.983091169036925,
-        "denoise_s": 27.720117594115436,
-        "decode_s": 3.5636136271059513,
-        "step2plus_s": 26.580439056735486,
-        "median_step_ms": 542.4578208476305,
-        "peak_gb": 42.912109375,
-        "warmup_s": 31.85,
-        "pixel_total_s": 65.83,
-        "mode": "default",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-120650_edda7f28.mp4"
-      },
-      {
-        "run": 2,
-        "e2e_s": 31.60067579196766,
-        "denoise_s": 27.334915840998292,
-        "decode_s": 3.56945742899552,
-        "step2plus_s": 26.572777394670993,
-        "median_step_ms": 542.4141720868647,
-        "peak_gb": 42.912109375,
-        "warmup_s": 23.88,
-        "pixel_total_s": 57.42,
-        "mode": "default",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-121259_5635937f.mp4"
-      },
-      {
-        "run": 3,
-        "e2e_s": 31.56306359404698,
-        "denoise_s": 27.31191465817392,
-        "decode_s": 3.5561334840022027,
-        "step2plus_s": 26.564551084302366,
-        "median_step_ms": 542.06857457757,
-        "peak_gb": 42.912109375,
-        "warmup_s": 24.44,
-        "pixel_total_s": 58.13,
-        "mode": "default",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-121752_4a4fd6b0.mp4"
-      },
-      {
-        "run": 4,
-        "e2e_s": 31.631535186897963,
-        "denoise_s": 27.37162417313084,
-        "decode_s": 3.563505438156426,
-        "step2plus_s": 26.630626363214105,
-        "median_step_ms": 543.4565721079707,
-        "peak_gb": 42.912109375,
-        "warmup_s": 29.26,
-        "pixel_total_s": 62.91,
-        "mode": "default",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-122255_daa2997d.mp4"
-      },
-      {
-        "run": 5,
-        "e2e_s": 31.57366428663954,
-        "denoise_s": 27.318381468299776,
-        "decode_s": 3.5585196409374475,
-        "step2plus_s": 26.5765912248753,
-        "median_step_ms": 542.6133736036718,
-        "peak_gb": 42.912109375,
-        "warmup_s": 26.03,
-        "pixel_total_s": 59.78,
-        "mode": "default",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-122757_d065991a.mp4"
-      },
-      {
-        "run": 6,
-        "e2e_s": 31.65650253696367,
-        "denoise_s": 27.355892217252403,
-        "decode_s": 3.6041018231771886,
-        "step2plus_s": 26.604143635369837,
-        "median_step_ms": 542.9657818749547,
-        "peak_gb": 42.912109375,
-        "warmup_s": 24.04,
-        "pixel_total_s": 57.67,
-        "mode": "default",
-        "output": "outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-123441_d4950d7f.mp4"
-      }
-    ]
+  "model": "ltx23-ti2v-two-stage",
+  "nightly": "ltx2.3_twostage_ti2v_2gpus",
+  "gpu": "NVIDIA B200",
+  "cuda_visible_devices": "0,3",
+  "main_commit": "fcae6767d530634a52306d0b82279924eb97c46f",
+  "pr_commit": "9d532a4e4181d27d57f85c0082b787a2b1ada928",
+  "production_command": {
+    "helper": "python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model ltx23-ti2v-two-stage --label <label> --output-dir <json_dir>",
+    "expanded": "sglang generate --backend=sglang --model-path=Lightricks/LTX-2.3 --prompt=\"The cat starts walking slowly towards the camera.\" --seed=42 --image-path=<repo>/inputs/diffusion_benchmark/figs/cat.png --pipeline-class-name=LTX2TwoStagePipeline --width=768 --height=512 --num-frames=121 --num-gpus=2 --cfg-parallel-size=2 --save-output --warmup --enable-torch-compile --perf-dump-path <json>"
   },
-  "metrics": {
+  "runs": [
+    {
+      "side": "main",
+      "run": 1,
+      "label": "main_run1",
+      "path": "/tmp/pr28050_ltx_bench/main/ltx23-ti2v-two-stage_main_run1.json",
+      "e2e_s": 9.97009791014716,
+      "denoise_s": 8.574778000358492,
+      "denoise_step2_sum_s": 8.23804460465908,
+      "denoise_median_step_ms": 260.25238656438887,
+      "peak_mem_gb": 120.427734375,
+      "commit_hash": "fcae6767d530634a52306d0b82279924eb97c46f"
+    },
+    {
+      "side": "main",
+      "run": 2,
+      "label": "main_run2",
+      "path": "/tmp/pr28050_ltx_bench/main/ltx23-ti2v-two-stage_main_run2.json",
+      "e2e_s": 9.99399100895971,
+      "denoise_s": 8.617629753891379,
+      "denoise_step2_sum_s": 8.217358176596463,
+      "denoise_median_step_ms": 263.1101126316935,
+      "peak_mem_gb": 120.099609375,
+      "commit_hash": "fcae6767d530634a52306d0b82279924eb97c46f"
+    },
+    {
+      "side": "main",
+      "run": 3,
+      "label": "main_run3",
+      "path": "/tmp/pr28050_ltx_bench/main/ltx23-ti2v-two-stage_main_run3.json",
+      "e2e_s": 9.739091670140624,
+      "denoise_s": 8.402019189670682,
+      "denoise_step2_sum_s": 8.114403755869716,
+      "denoise_median_step_ms": 251.48714310489595,
+      "peak_mem_gb": 120.099609375,
+      "commit_hash": "fcae6767d530634a52306d0b82279924eb97c46f"
+    },
+    {
+      "side": "pr",
+      "run": 1,
+      "label": "pr_run1",
+      "path": "/tmp/pr28050_ltx_bench/pr/ltx23-ti2v-two-stage_pr_run1.json",
+      "e2e_s": 10.863554426003247,
+      "denoise_s": 9.320576452184469,
+      "denoise_step2_sum_s": 9.047357459086925,
+      "denoise_median_step_ms": 282.6818460598588,
+      "peak_mem_gb": 120.099609375,
+      "commit_hash": "9d532a4e4181d27d57f85c0082b787a2b1ada928"
+    },
+    {
+      "side": "pr",
+      "run": 2,
+      "label": "pr_run2",
+      "path": "/tmp/pr28050_ltx_bench/pr/ltx23-ti2v-two-stage_pr_run2.json",
+      "e2e_s": 8.836743155959994,
+      "denoise_s": 7.522727297618985,
+      "denoise_step2_sum_s": 7.2559917024336755,
+      "denoise_median_step_ms": 228.62632269971073,
+      "peak_mem_gb": 120.099609375,
+      "commit_hash": "9d532a4e4181d27d57f85c0082b787a2b1ada928"
+    },
+    {
+      "side": "pr",
+      "run": 3,
+      "label": "pr_run3",
+      "path": "/tmp/pr28050_ltx_bench/pr/ltx23-ti2v-two-stage_pr_run3.json",
+      "e2e_s": 8.565152036957443,
+      "denoise_s": 7.247375555336475,
+      "denoise_step2_sum_s": 6.965546620544046,
+      "denoise_median_step_ms": 218.01063930615783,
+      "peak_mem_gb": 120.099609375,
+      "commit_hash": "9d532a4e4181d27d57f85c0082b787a2b1ada928"
+    }
+  ],
+  "summary_all_runs": {
     "e2e_s": {
       "main": {
-        "mean": 31.820545323891565,
-        "stdev": 0.22140582389711
+        "mean": 9.901060196415832,
+        "std": 0.14077667658578438,
+        "values": [
+          9.97009791014716,
+          9.99399100895971,
+          9.739091670140624
+        ]
       },
       "pr": {
-        "mean": 31.668088760925457,
-        "stdev": 0.15823254841000833
+        "mean": 9.421816539640227,
+        "std": 1.255944478753398,
+        "values": [
+          10.863554426003247,
+          8.836743155959994,
+          8.565152036957443
+        ]
       },
-      "speedup": 1.0048142015805583,
-      "delta_pct": 0.4791136085642146
+      "speedup": 1.0508653140038646
     },
     "denoise_s": {
       "main": {
-        "mean": 27.56646651766884,
-        "stdev": 0.22308172971893248
+        "mean": 8.531475647973517,
+        "std": 0.11414157499546858,
+        "values": [
+          8.574778000358492,
+          8.617629753891379,
+          8.402019189670682
+        ]
       },
       "pr": {
-        "mean": 27.40214099199511,
-        "stdev": 0.15738806495145152
+        "mean": 8.030226435046643,
+        "std": 1.125924962215597,
+        "values": [
+          9.320576452184469,
+          7.522727297618985,
+          7.247375555336475
+        ]
       },
-      "speedup": 1.0059968133775288,
-      "delta_pct": 0.5961065977331671
+      "speedup": 1.0624203086900827
     },
-    "step2plus_s": {
+    "denoise_step2_sum_s": {
       "main": {
-        "mean": 26.574462667883683,
-        "stdev": 0.034402419343698455
+        "mean": 8.189935512375087,
+        "std": 0.06622512179745205,
+        "values": [
+          8.23804460465908,
+          8.217358176596463,
+          8.114403755869716
+        ]
       },
       "pr": {
-        "mean": 26.588188126528014,
-        "stdev": 0.02468326893895724
+        "mean": 7.7562985940215485,
+        "std": 1.1274814105768622,
+        "values": [
+          9.047357459086925,
+          7.2559917024336755,
+          6.965546620544046
+        ]
       },
-      "speedup": 0.9994837760821078,
-      "delta_pct": -0.05164905426636631
+      "speedup": 1.0559077133373616
     },
-    "median_step_ms": {
+    "denoise_median_step_ms": {
       "main": {
-        "mean": 542.2931457093606,
-        "stdev": 0.7635011953249229
+        "mean": 258.2832141003261,
+        "std": 6.056532448533013,
+        "values": [
+          260.25238656438887,
+          263.1101126316935,
+          251.48714310489595
+        ]
       },
       "pr": {
-        "mean": 542.6627158497771,
-        "stdev": 0.4860558089084125
+        "mean": 243.10626935524246,
+        "std": 34.682025418150936,
+        "values": [
+          282.6818460598588,
+          228.62632269971073,
+          218.01063930615783
+        ]
       },
-      "speedup": 0.9993189689845602,
-      "delta_pct": -0.06814951347634562
+      "speedup": 1.0624292610196167
     },
-    "peak_gb": {
+    "peak_mem_gb": {
       "main": {
-        "mean": 42.4970703125,
-        "stdev": 1.0166339264480964
+        "mean": 120.208984375,
+        "std": 0.18944305707784595,
+        "values": [
+          120.427734375,
+          120.099609375,
+          120.099609375
+        ]
       },
       "pr": {
-        "mean": 42.912109375,
-        "stdev": 0.0
+        "mean": 120.099609375,
+        "std": 0.0,
+        "values": [
+          120.099609375,
+          120.099609375,
+          120.099609375
+        ]
       },
-      "speedup": 0.9903281598470711,
-      "delta_pct": -0.9766298228278604
-    },
-    "warmup_s": {
-      "main": {
-        "mean": 32.596666666666664,
-        "stdev": 13.930119406044827
-      },
-      "pr": {
-        "mean": 26.583333333333332,
-        "stdev": 3.273497619774096
-      },
-      "speedup": 1.226206896551724,
-      "delta_pct": 18.447694038245217
-    },
-    "pixel_total_s": {
-      "main": {
-        "mean": 66.36833333333333,
-        "stdev": 14.224700231170662
-      },
-      "pr": {
-        "mean": 60.29,
-        "stdev": 3.3936116454302763
-      },
-      "speedup": 1.1008182672637805,
-      "delta_pct": 9.158484216870486
+      "speedup": 1.0009107023792099
     }
-  }
+  },
+  "summary_warm_runs_2_3": {
+    "e2e_s": {
+      "main": {
+        "mean": 9.866541339550167,
+        "std": 0.18024105099894347,
+        "values": [
+          9.99399100895971,
+          9.739091670140624
+        ]
+      },
+      "pr": {
+        "mean": 8.700947596458718,
+        "std": 0.1920439219567463,
+        "values": [
+          8.836743155959994,
+          8.565152036957443
+        ]
+      },
+      "speedup": 1.1339617013169745
+    },
+    "denoise_s": {
+      "main": {
+        "mean": 8.50982447178103,
+        "std": 0.15245969205591223,
+        "values": [
+          8.617629753891379,
+          8.402019189670682
+        ]
+      },
+      "pr": {
+        "mean": 7.38505142647773,
+        "std": 0.19470308417949328,
+        "values": [
+          7.522727297618985,
+          7.247375555336475
+        ]
+      },
+      "speedup": 1.1523040234047166
+    },
+    "denoise_step2_sum_s": {
+      "main": {
+        "mean": 8.16588096623309,
+        "std": 0.07279976904901517,
+        "values": [
+          8.217358176596463,
+          8.114403755869716
+        ]
+      },
+      "pr": {
+        "mean": 7.110769161488861,
+        "std": 0.20537568696643904,
+        "values": [
+          7.2559917024336755,
+          6.965546620544046
+        ]
+      },
+      "speedup": 1.1483822327489686
+    },
+    "denoise_median_step_ms": {
+      "main": {
+        "mean": 257.2986278682947,
+        "std": 8.218680569923134,
+        "values": [
+          263.1101126316935,
+          251.48714310489595
+        ]
+      },
+      "pr": {
+        "mean": 223.31848100293428,
+        "std": 7.506421714510676,
+        "values": [
+          228.62632269971073,
+          218.01063930615783
+        ]
+      },
+      "speedup": 1.1521600304316684
+    },
+    "peak_mem_gb": {
+      "main": {
+        "mean": 120.099609375,
+        "std": 0.0,
+        "values": [
+          120.099609375,
+          120.099609375
+        ]
+      },
+      "pr": {
+        "mean": 120.099609375,
+        "std": 0.0,
+        "values": [
+          120.099609375,
+          120.099609375
+        ]
+      },
+      "speedup": 1.0
+    }
+  },
+  "notes": [
+    "main_run1 pixel wall includes the initial Hugging Face LTX-2.3 download and is not used for cold-compile wall claims.",
+    "Warm-cache summary uses run2 and run3 after model weights and compiler caches were populated for each side."
+  ]
 }

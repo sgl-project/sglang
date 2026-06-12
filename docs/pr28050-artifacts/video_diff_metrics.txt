@@ -1,4 +1,14 @@
-sampled_frames=5
-resize=512x288
-mean_abs_diff=1.1662
-rms_diff=1.7676
+LTX-2.3 TI2V two-stage generated video check
+main video: /tmp/sglang_pr28050_ltx_main/outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-144528_ff884432.mp4
+pr video: /tmp/sglang_pr28050_ltx_candidate/outputs/The_cat_starts_walking_slowly_towards_the_camera._20260612-145557_0c16ff18.mp4
+sampled frames: [0, 30, 60, 90, 120]
+resolution: 768x512 RGB
+mean absolute diff: 6.0980
+RMS diff: 13.8778
+
+per-frame:
+frame 0: mean_abs_diff=0.8894, rms_diff=1.6278
+frame 30: mean_abs_diff=3.3716, rms_diff=8.6368
+frame 60: mean_abs_diff=9.0926, rms_diff=18.7077
+frame 90: mean_abs_diff=8.6455, rms_diff=17.1508
+frame 120: mean_abs_diff=8.4909, rms_diff=15.5432
