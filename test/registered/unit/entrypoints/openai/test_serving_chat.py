@@ -1933,6 +1933,127 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         self.assertIsNone(tool_calls)
 
 
+class TestQwen3AutoToolCallsAfterReasoning(unittest.TestCase):
+    def setUp(self):
+        tm = _MockTokenizerManager()
+        tm.server_args.reasoning_parser = "qwen3"
+        tm.server_args.tool_call_parser = "qwen3_coder"
+        self.chat = OpenAIServingChat(tm, _MockTemplateManager())
+
+    def test_non_streaming_tool_call_is_not_swallowed_by_reasoning(self):
+        request = ChatCompletionRequest(
+            model="qwen",
+            messages=[{"role": "user", "content": "Weather in Boston?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_current_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+        ret_item = {
+            "text": (
+                "<tool_call>\n"
+                "<function=get_current_weather>\n"
+                "<parameter=location>\nBoston\n</parameter>\n"
+                "</function>\n"
+                "</tool_call>"
+            ),
+            "meta_info": {
+                "id": f"chatcmpl-{uuid.uuid4()}",
+                "prompt_tokens": 10,
+                "completion_tokens": 26,
+                "weight_version": "default",
+                "finish_reason": {"type": "stop", "matched": None},
+            },
+            "index": 0,
+        }
+
+        response = self.chat._build_chat_response(request, [ret_item], created=0)
+        choice = response.choices[0]
+        message = choice.message
+
+        self.assertIsNone(message.reasoning_content)
+        self.assertIsNone(message.content)
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(len(message.tool_calls), 1)
+        self.assertEqual(
+            message.tool_calls[0].function.name,
+            "get_current_weather",
+        )
+        self.assertEqual(
+            json.loads(message.tool_calls[0].function.arguments),
+            {"location": "Boston"},
+        )
+
+    def test_streaming_tool_call_reaches_tool_parser_after_reasoning(self):
+        request = ChatCompletionRequest(
+            model="qwen",
+            messages=[{"role": "user", "content": "Weather in Boston?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_current_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+            stream=True,
+        )
+        xml = (
+            "<tool_call>\n"
+            "<function=get_current_weather>\n"
+            "<parameter=location>\nBoston\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+
+        reasoning, delta = self.chat._process_reasoning_stream(
+            index=0,
+            delta=xml,
+            reasoning_parser_dict={},
+            content={"meta_info": {"id": "chatcmpl-test"}},
+            request=request,
+        )
+        self.assertEqual(reasoning, "")
+        self.assertEqual(delta, xml)
+
+        async def collect_tool_chunks():
+            chunks = []
+            async for emitted in self.chat._process_tool_call_stream(
+                index=0,
+                delta=delta,
+                parser_dict={},
+                content={"meta_info": {"id": "chatcmpl-test"}},
+                request=request,
+                has_tool_calls={},
+            ):
+                chunks.append(json.loads(emitted[len("data: ") :]))
+            return chunks
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(collect_tool_chunks())
+        tool_deltas = [
+            chunk["choices"][0]["delta"]["tool_calls"][0] for chunk in chunks
+        ]
+
+        self.assertEqual(tool_deltas[0]["function"]["name"], "get_current_weather")
+        arguments = "".join(t_delta["function"]["arguments"] or "" for t_delta in tool_deltas)
+        self.assertEqual(json.loads(arguments), {"location": "Boston"})
+
+
 class TestNormalizeToolContent(unittest.TestCase):
     """Unit tests for normalize_tool_content()."""
 
