@@ -64,7 +64,7 @@ _OWNER_SITES = {
     # Non-spec decode settles its ledger in the result processor too.
     (
         "managers/scheduler_components/batch_result_processor.py",
-        "SchedulerBatchResultProcessor._normalize_decode_outputs",
+        "SchedulerBatchResultProcessor.process_batch_result_decode",
         "kv_committed_len",
     ): 1,
     (

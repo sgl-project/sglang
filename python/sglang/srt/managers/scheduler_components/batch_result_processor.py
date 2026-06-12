@@ -615,6 +615,17 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
+        if batch.spec_algorithm.is_none():
+            # Settle the decode ledger: the forward that wrote this step's KV
+            # is done (spec settles in _resolve_spec_v2_tokens instead). Must
+            # run before the per-req loop -- the mamba track-boundary check
+            # reads kv_committed_len with this step included. Reqs finished or
+            # retracted in an earlier iteration never settle their step.
+            for req in batch.reqs:
+                if req.is_retracted or req.finished():
+                    continue
+                req.kv_committed_len += 1
+
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
@@ -700,15 +711,6 @@ class SchedulerBatchResultProcessor:
             pass  # MLX path: already a list[int], skip torch round-trip
         else:
             next_token_ids = next_token_ids.tolist()
-
-        if batch.spec_algorithm.is_none():
-            # Settle the decode ledger (mirror of _resolve_spec_v2_tokens):
-            # the forward that wrote this step's KV is done. Reqs finished or
-            # retracted in an earlier iteration never settle their step.
-            for req in batch.reqs:
-                if req.is_retracted or req.finished():
-                    continue
-                req.kv_committed_len += 1
 
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
