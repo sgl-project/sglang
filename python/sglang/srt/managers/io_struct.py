@@ -1546,8 +1546,6 @@ class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
 
 @dataclass
 class BeginWeightUpdateReqInput(BaseReq):
-    # Opens a weight-update session: restores in-place-packed weights to a
-    # loadable state (no-op for schemes that don't repack, e.g. plain fp8).
     pass
 
 
@@ -1559,9 +1557,6 @@ class BeginWeightUpdateReqOutput(BaseReq):
 
 @dataclass
 class EndWeightUpdateReqInput(BaseReq):
-    # Closes the session: quant finalize on the full model. Whether to also run
-    # model.post_load_weights() is decided internally by the engine, which tracks
-    # whether model.load_weights() ran this session (P2P/RDMA bypasses it).
     pass
 
 
