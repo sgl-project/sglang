@@ -67,7 +67,7 @@ class BaseTpWorker(ABC):
 
     @property
     @abstractmethod
-    def model_runner(self) -> "ModelRunner":
+    def model_runner(self) -> ModelRunner:
         pass
 
     @property
@@ -400,7 +400,7 @@ class TpModelWorker(BaseTpWorker):
             self.dllm_algorithm = None
 
     @property
-    def model_runner(self) -> "ModelRunner":
+    def model_runner(self) -> ModelRunner:
         return self._model_runner
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):

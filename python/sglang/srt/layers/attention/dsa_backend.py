@@ -116,7 +116,7 @@ class DSAFlashMLAMetadata:
             num_splits=self.num_splits[sli],
         )
 
-    def copy_(self, other: "DSAFlashMLAMetadata"):
+    def copy_(self, other: DSAFlashMLAMetadata):
         self.flashmla_metadata.copy_(other.flashmla_metadata)
         self.num_splits.copy_(other.num_splits)
 
@@ -564,9 +564,9 @@ class DeepseekSparseAttnBackend(
                     page_table, repeats=self.speculative_num_draft_tokens, dim=0
                 )
             else:
-                # DRAFT_EXTEND (v1): V1 worker extends by (num_correct_drafts + 1) per request
-                # after verification. Lengths vary per request based on how many tokens
-                # were accepted.
+                # DRAFT_EXTEND: the draft worker extends by (num_correct_drafts + 1)
+                # per request after verification. Lengths vary per request based on
+                # how many tokens were accepted.
                 page_table = torch.repeat_interleave(
                     page_table, repeats=forward_batch.extend_seq_lens, dim=0
                 )
@@ -866,7 +866,7 @@ class DeepseekSparseAttnBackend(
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
-        actual_forward_mode: Optional["ForwardMode"] = None,
+        actual_forward_mode: Optional[ForwardMode] = None,
     ):
         """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
         self.set_dsa_prefill_impl(forward_batch=None)
@@ -2252,13 +2252,13 @@ class DeepseekSparseAttnBackend(
         """
         Decide all attention prefill dispatch strategies for this batch.
         """
-        from sglang.srt.compilation.piecewise_context_manager import (
-            is_in_piecewise_cuda_graph,
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            is_in_tc_piecewise_cuda_graph,
         )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         # Decide MHA vs MLA
-        if is_in_piecewise_cuda_graph():
+        if is_in_tc_piecewise_cuda_graph():
             # Can't branch on seq_lens_cpu in PCG, force mha off to guarantee correctness.
             self.use_mha = False
         elif (

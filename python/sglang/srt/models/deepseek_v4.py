@@ -18,8 +18,6 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.dsv4 import (
@@ -27,6 +25,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
@@ -59,6 +58,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
     is_dp_attention_enabled,
@@ -67,7 +67,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.mhc import mhc_fused_post_pre
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -81,14 +81,28 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
-from sglang.srt.model_executor.cuda_graph_runner import (
-    compile_in_capture_mode,
-    get_is_capture_mode,
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
+)
+from sglang.srt.model_executor.runner import (
+    compile_in_capture_mode,
+    get_is_capture_mode,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -96,7 +110,11 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
+from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.triton_ops.deepseek_v4 import (
+    rms_normalize_triton as rms_normalize_triton,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -112,6 +130,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
@@ -150,6 +169,7 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
         dtype_quant=torch.float8_e4m3fn,
         res1=None,
         output_unquantized_inp1=True,
+        transpose_scale=_use_aiter_bpreshuffle_gfx95,
     )
     return x_quant, x_bf16
 
@@ -188,55 +208,55 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-@triton.jit
-def _rms_normalize_kernel(
-    x_ptr,
-    weight_ptr,
-    eps,
-    stride_row,
-    dim,
-    BLOCK_SIZE: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-):
-    pid = tl.program_id(0)
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def deepseek_v4_attention_with_output(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+    compress_ratio: int,
+    attn_sink: torch.Tensor,
+    save_kv_cache: bool,
+) -> None:
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
 
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < dim
+    query = query[:real_num_tokens]
+    key_value = key_value[:real_num_tokens]
 
-    base = pid * stride_row
-    x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+    original_out_cache_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
-    mean_sq = tl.sum(x * x, axis=0) / dim
-    rms_inv = tl.rsqrt(mean_sq + eps)
-    out = x * rms_inv
+    attn_backend = get_attn_backend()
+    try:
+        ret = attn_backend.forward(
+            q=query,
+            k=key_value,
+            v=key_value,
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            compress_ratio=compress_ratio,
+            attn_sink=attn_sink,
+            save_kv_cache=save_kv_cache,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
 
-    if HAS_WEIGHT:
-        weight = tl.load(weight_ptr + offs, mask=mask, other=0.0)
-        out = out * weight
+    assert (
+        output[:real_num_tokens].numel() == ret.numel()
+    ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
 
-    tl.store(x_ptr + base + offs, out, mask=mask)
+    output[:real_num_tokens].view(ret.shape).copy_(ret)
+    return
 
 
-def rms_normalize_triton(
-    x: torch.Tensor, eps: float, weight: torch.Tensor = None
-) -> torch.Tensor:
-    dim = x.shape[-1]
-    x_flat = x.view(-1, dim)
-    num_rows = x_flat.shape[0]
-
-    BLOCK_SIZE = triton.next_power_of_2(dim)
-    grid = (num_rows,)
-
-    _rms_normalize_kernel[grid](
-        x_flat,
-        weight,
-        eps,
-        x_flat.stride(0),
-        dim,
-        BLOCK_SIZE=BLOCK_SIZE,
-        HAS_WEIGHT=(weight is not None),
-    )
-    return x
+bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
+    deepseek_v4_attention_with_output
+)
 
 
 class MQALayer(nn.Module):
@@ -715,8 +735,17 @@ class MQALayer(nn.Module):
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
 
-        if self.use_fused_qk_norm_rope:
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
 
+        unified = is_unified_kv_triton()
+        is_decode = forward_batch.forward_mode.is_decode_or_idle()
+        do_fused_store = (unified and is_decode) or (
+            not unified and self.use_fused_qk_norm_rope
+        )
+
+        if do_fused_store:
             if _is_gfx95_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
@@ -734,14 +763,32 @@ class MQALayer(nn.Module):
                 else self.wkv(x_linear)[0]
             )
 
+            token_to_kv_pool = get_token_to_kv_pool()
+            if unified:
+                swa_ring_size = token_to_kv_pool.unified_swa_ring_size
+                swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
+                # ring slot = req_slot * ring + pos % ring, per token.
+                # positions is per-token; req_pool_indices is per-req.
+                req_slot = forward_batch.req_pool_indices.to(torch.int64)
+                if req_slot.shape[0] != positions.shape[0]:
+                    req_slot = req_slot.repeat_interleave(
+                        positions.shape[0] // req_slot.shape[0]
+                    )
+                swa_loc = (
+                    req_slot * swa_ring_size + positions.to(torch.int64) % swa_ring_size
+                ).to(torch.int32)
+                swa_page_size, bf16_store = 1, True
+            else:
+                swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+                swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
+                swa_page_size, bf16_store = (
+                    token_to_kv_pool.swa_kv_pool.page_size,
+                    False,
+                )
+
             from sglang.srt.layers.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
             )
-
-            token_to_kv_pool = get_token_to_kv_pool()
-            swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
-            swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
-            swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
             q = fused_qk_norm_rope_swa_store(
                 q=q,
@@ -759,9 +806,11 @@ class MQALayer(nn.Module):
                 swa_page_size=swa_page_size,
                 q_out=q_out,
                 dtype=x.dtype,
+                bf16_store=bf16_store,
             )
+            kv = None
 
-            if use_cp:
+            if not unified and use_cp:
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
@@ -774,7 +823,11 @@ class MQALayer(nn.Module):
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
-            if use_cp:
+            if unified:
+                # unified_kv prefill: keep bf16 kv; the backend writes
+                # the ring AFTER attention (2-source path).
+                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+            elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
@@ -887,17 +940,49 @@ class MQALayer(nn.Module):
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
-        o = attn_backend.forward(
-            q=q_padded if q_padded is not None else q,
-            k=attn_k,
-            v=attn_k,
-            layer=self.attn_mqa,
-            forward_batch=forward_batch,
-            compress_ratio=self.compress_ratio,
-            attn_sink=self.attn_sink,
-            save_kv_cache=False,
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
         )
-        o = o[:, tp_slice, :]
+
+        if is_unified_kv_triton():
+            o = attn_backend.forward(
+                q=q_out if q_out is not None else q,
+                k=attn_k,
+                v=attn_k,
+                layer=self.attn_mqa,
+                forward_batch=forward_batch,
+                compress_ratio=self.compress_ratio,
+                attn_sink=self.attn_sink,
+                save_kv_cache=kv is not None,
+            )
+        else:
+            attn_q = q_padded if q_padded is not None else q
+            save_kv_cache = False
+            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+                o = attn_q.new_empty(
+                    (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                )
+                bcg_deepseek_v4_attention_with_output(
+                    attn_q,
+                    attn_k,
+                    o,
+                    self.attn_mqa.layer_id,
+                    self.compress_ratio,
+                    self.attn_sink,
+                    save_kv_cache,
+                )
+            else:
+                o = attn_backend.forward(
+                    q=attn_q,
+                    k=attn_k,
+                    v=attn_k,
+                    layer=self.attn_mqa,
+                    forward_batch=forward_batch,
+                    compress_ratio=self.compress_ratio,
+                    attn_sink=self.attn_sink,
+                    save_kv_cache=save_kv_cache,
+                )
+            o = o[:, tp_slice, :]
         fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
             None,
@@ -1431,7 +1516,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            if should_use_dp_reduce_scatterv():
+                get_tp_group().reduce_scatterv(
+                    global_hidden_states,
+                    output=hidden_states,
+                    sizes=get_dp_global_num_tokens(),
+                )
+            else:
+                dp_scatter(hidden_states, global_hidden_states, forward_batch)
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
@@ -1592,7 +1684,7 @@ class DeepseekV4Model(nn.Module):
             last_layer = layer
             ctx = (
                 nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
