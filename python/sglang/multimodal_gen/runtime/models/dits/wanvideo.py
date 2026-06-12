@@ -1227,7 +1227,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         # Determine boundary step
-        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
+        is_boundary_step = self.cnt < start_skipping - 1 or self.cnt >= end_skipping + 1
 
         timestep_proj = kwargs["timestep_proj"]
         temb = kwargs["temb"]

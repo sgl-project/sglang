@@ -22,19 +22,16 @@ class TeaCacheParams(CacheParams):
             forward pass is skipped. Recommended values: 0.25 for ~1.5x speedup, 0.4 for ~1.8x,
             0.6 for ~2.0x.
         start_skipping (`int` or `float`, defaults to `5`):
-            The number of timesteps after which we may skip a forward pass. These early
-            steps define the global structure and are too critical to not skip.
-            int: The number of timesteps after which we can skip. If negative,
-                 this is an offset from the end of the schedule.
-            float (0.0 - 1.0): A percentage of the total steps (e.g., 0.1
-                               computes the first 10%).
+            The first step (1-indexed) where skipping is allowed. For example,
+            `start_skipping=5` means the first 4 steps are always fully computed,
+            and skipping begins on the 5th step.
+            - int: The specific step number. If negative, counted from the end.
+            - float: A percentage of total steps (e.g., 0.1).
         end_skipping (`int` or `float`, defaults to `-1`):
-            The number of timesteps after which we are no longer able to skip
-            forward passes. The last steps refine fine textures and details.
-            int: The number of timesteps after which skipping ends. If negative,
-                 this is an offset from the total number of steps.
-            float (0.0 - 1.0): A percentage of the total steps (e.g., 0.1
-                               computes the first 10%).
+            The step (1-indexed) where skipping stops (exclusive). For example,
+            `end_skipping=45` means steps 45 and onward are always fully computed.
+            - int: The specific step number. If negative, an offset from the total steps.
+            - float: A percentage of total steps (e.g., 0.9).
         coefficients (`List[float]`, defaults to `[]`):
             Polynomial coefficients for rescaling the raw relative L1 distance,
             evaluated as `c[0]*x**4 + c[1]*x**3 + c[2]*x**2 + c[3]*x + c[4]`.
