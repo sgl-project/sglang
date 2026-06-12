@@ -124,6 +124,15 @@ class SpeculativeAlgorithm(Enum):
         per-topk page rounding; see get_alloc_len_per_decode."""
         return not self.is_ngram()
 
+    def carries_draft_hidden_states(self) -> bool:
+        """Whether the prefill->decode disaggregation transfer carries target
+        hidden states for the draft. Only EAGLE-family drafts read transferred
+        hidden states; STANDALONE runs a vanilla LLM draft that ignores them
+        (build_disagg_draft_input returns None and prefill never collects them),
+        so its metadata buffer needs only minimal RDMA padding. Sizes the disagg
+        MetadataBuffers hidden-states buffer."""
+        return self.is_eagle()
+
     def create_future_map(
         self,
         device: torch.device,
@@ -266,3 +275,68 @@ class SpecInput(ABC):
             x * c2 for x in batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
+
+
+def create_capture_spec_info(
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+    custom_mask: torch.Tensor,
+    num_tokens_per_bs: int,
+    is_draft_worker: bool,
+) -> Optional[SpecInput]:
+    """Build the shape-only dummy verify ``SpecInput`` used during CUDA-graph
+    capture. Centralizes the per-algorithm dispatch so the model runner stays
+    algorithm-agnostic (mirrors ``SpeculativeAlgorithm.create_worker``)."""
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+    spec_info = None
+    if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        if is_draft_worker:
+            raise RuntimeError("This should not happen.")
+        else:
+            spec_info = EagleVerifyInput(
+                draft_token=None,
+                custom_mask=custom_mask,
+                positions=None,
+                retrieve_index=None,
+                retrieve_next_token=None,
+                retrieve_next_sibling=None,
+                retrieve_cum_len=None,
+                spec_steps=server_args.speculative_num_steps,
+                topk=server_args.speculative_eagle_topk,
+                draft_token_num=server_args.speculative_num_draft_tokens,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+            )
+    elif spec_algorithm.is_dflash():
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+        spec_info = DFlashVerifyInput(
+            draft_token=None,
+            positions=None,
+            draft_token_num=server_args.speculative_num_draft_tokens,
+            custom_mask=None,
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
+            ),
+        )
+
+    elif spec_algorithm.is_ngram():
+        from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+        spec_info = NgramVerifyInput(
+            draft_token=None,
+            custom_mask=custom_mask,
+            positions=None,
+            retrieve_index=None,
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            draft_token_num=num_tokens_per_bs,
+        )
+        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+    return spec_info
