@@ -804,15 +804,21 @@ class SchedulerDisaggregationPrefillMixin:
         if not self.waiting_queue:
             return
 
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.waiting_queue],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+
         remaining_waiting: List[Req] = []
-        for req in self.waiting_queue:
-            sender = getattr(req, "disagg_kv_sender", None)
-            if sender is not None and sender.poll() == KVPoll.Failed:
+        for req, poll in zip(self.waiting_queue, polls):
+            if poll == KVPoll.Failed:
                 if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
                     release_kv_cache(req, self.tree_cache)
                 maybe_release_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
+                sender = req.disagg_kv_sender
                 if hasattr(sender, "clear"):
                     sender.clear()
                 if self.enable_hicache_storage:
