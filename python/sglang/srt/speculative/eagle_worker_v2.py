@@ -55,7 +55,11 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+    EagleVerifyInput,
+)
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -655,16 +659,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
                 pt += extend_len
 
-        # Construct spec_info
-        next_draft_input = EagleDraftInput(
+        # Draft-extend spec_info for the extend forward; carries only
+        # hidden_states + shape info.
+        batch.spec_info = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
-            bonus_tokens=next_token_ids,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
-
-        batch.spec_info = next_draft_input
 
         # Run forward (LAST mode: only the final hidden state per request,
         # to feed the next draft step which expects [bs, hidden_dim]).
@@ -696,20 +698,27 @@ class EagleDraftWorker(BaseDraftWorker):
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
-        # Update spec_info for the next draft step
+        # Assemble the next-iter draft spec_info from the extend output.
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
-            probs, self.topk, dim=-1
+        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        return EagleDraftInput(
+            topk_p=topk_p,
+            topk_index=topk_index,
+            hidden_states=logits_output.hidden_states,
+            bonus_tokens=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
-        next_draft_input.hidden_states = logits_output.hidden_states
-        return next_draft_input
 
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
-        draft_input = EagleDraftInput(
+        draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
+            # accept_lens includes the bonus token; correct drafts exclude it.
+            num_correct_drafts=batch_result.accept_lens - 1,
+            num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
@@ -724,7 +733,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
-            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+            forward_batch = draft_extend_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
                 batch_result.next_token_ids,
                 self.speculative_num_draft_tokens,
@@ -736,12 +745,6 @@ class EagleDraftWorker(BaseDraftWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
-
-        if forward_batch.spec_info.num_correct_drafts is None:
-            # `batch_result.accept_lens` already includes the bonus token, so use it
-            # directly for `num_accept_tokens` and subtract 1 for `num_correct_drafts`.
-            forward_batch.spec_info.num_correct_drafts = batch_result.accept_lens - 1
-            forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (

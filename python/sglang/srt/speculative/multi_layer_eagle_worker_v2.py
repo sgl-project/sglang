@@ -43,7 +43,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+    EagleVerifyInput,
+)
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
@@ -414,16 +418,15 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             "draft_extend_for_prefill: next_token_ids before draft embed",
         )
 
-        # Construct spec_info
-        next_draft_input = EagleDraftInput(
+        # Draft-extend spec_info for the extend forward; carries only
+        # hidden_states + shape info.
+        extend_input = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
-            bonus_tokens=next_token_ids,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
-
-        batch.spec_info = next_draft_input
+        batch.spec_info = extend_input
 
         # Chain-style MTP needs FULL to get all-token hidden states;
         # non-chain only needs LAST (the target model's hidden states).
@@ -484,8 +487,16 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     forward_batch.extend_seq_lens,
                     topk_index,
                 )
-        next_draft_input.topk_p = torch.cat(topk_p_list, dim=1)
-        next_draft_input.topk_index = torch.cat(topk_index_list, dim=1)
+        next_draft_input = EagleDraftInput(
+            topk_p=torch.cat(topk_p_list, dim=1),
+            topk_index=torch.cat(topk_index_list, dim=1),
+            # Chain-style left the last step's hidden_states on the extend
+            # input; non-chain keeps the target hidden states.
+            hidden_states=extend_input.hidden_states,
+            bonus_tokens=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
 
         # Update req_to_hidden_states_pool for KV Cache reversion
         if forward_batch.extend_seq_lens is not None:
@@ -504,7 +515,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
-        draft_input = EagleDraftInput(
+        draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=1,
@@ -513,7 +524,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Prepare for draft extend in a separate stream
         # Notice that here we use batch_result.next_token_ids as the input ids
         with self.plan_stream_ctx:
-            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+            forward_batch = draft_extend_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
                 batch_result.next_token_ids,
                 self.speculative_num_draft_tokens,
