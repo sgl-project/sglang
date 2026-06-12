@@ -19,8 +19,12 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
-    from triton_kernels.matmul import PrecisionConfig
-    from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
+    from triton_kernels.matmul_ogs import (
+        GatherIndx,
+        PrecisionConfig,
+        RoutingData,
+        ScatterIndx,
+    )
 
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
@@ -38,11 +42,9 @@ class TritonKernelsRunnerInput(RunnerInput):
     """Input bundle passed to the triton-kernels runner core."""
 
     hidden_states: torch.Tensor
-    a_ragged_metadata: "RaggedTensorMetadata"
-    gather_indx: torch.Tensor
-    scatter_indx: torch.Tensor
-    gate_scal: torch.Tensor
-    n_expts_act: int
+    routing_data: RoutingData
+    gather_indx: GatherIndx
+    scatter_indx: ScatterIndx
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -100,11 +102,9 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
         hidden_states = runner_input.hidden_states
 
         common_kwargs = dict(
-            a_ragged_metadata=runner_input.a_ragged_metadata,
+            routing_data=runner_input.routing_data,
             gather_indx=runner_input.gather_indx,
             scatter_indx=None if self.config.no_combine else runner_input.scatter_indx,
-            gate_scal=runner_input.gate_scal,
-            n_expts_act=runner_input.n_expts_act,
             inplace=False,
             activation=self.config.activation,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
@@ -137,19 +137,12 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
                 **common_kwargs,
             )
 
-        tokens = runner_input.hidden_states.shape[0]
-        hidden = runner_input.hidden_states.shape[-1]
-        total_rows = output.shape[0]
-        top_k = runner_input.n_expts_act
-        assert total_rows == tokens * top_k, (
-            "Triton-kernels MoE output rows must match tokens * active experts, "
-            f"got {total_rows=} for {tokens=} and {top_k=}"
-        )
-
         if self.config.no_combine:
+            tokens = runner_input.hidden_states.shape[0]
+            hidden = runner_input.hidden_states.shape[-1]
+            total_rows = output.shape[0]
+            top_k = total_rows // tokens
             output = output.view(tokens, top_k, hidden)
-        else:
-            output = output.view(tokens, top_k, hidden).sum(dim=1)
 
         return TritonKernelsRunnerOutput(hidden_states=output)
 
@@ -165,7 +158,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
 
 @register_pre_permute("standard", "triton_kernel")
 def pre_permute_standard_to_triton_kernels(
-    dispatch_output: "StandardDispatchOutput",
+    dispatch_output: StandardDispatchOutput,
     quant_info: TritonKernelsQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
@@ -179,15 +172,13 @@ def pre_permute_standard_to_triton_kernels(
         topk_output
     ), "Triton-kernel runner expects TritonKernelTopKOutput"
 
-    a_ragged_metadata, gather_indx, scatter_indx, gate_scal, n_expts_act = topk_output
+    routing_data, gather_indx, scatter_indx = topk_output
 
     return TritonKernelsRunnerInput(
         hidden_states=hidden_states,
-        a_ragged_metadata=a_ragged_metadata,
+        routing_data=routing_data,
         gather_indx=gather_indx,
         scatter_indx=scatter_indx,
-        gate_scal=gate_scal,
-        n_expts_act=n_expts_act,
     )
 
 

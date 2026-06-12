@@ -133,7 +133,7 @@ class MiMoAudioPipeline:
             center=True,
         )
         self._mel_spectrogram = None
-        self._resamplers: "OrderedDict[int, torchaudio.transforms.Resample]" = (
+        self._resamplers: OrderedDict[int, torchaudio.transforms.Resample] = (
             OrderedDict()
         )
         self._resamplers_max = max_resamplers
