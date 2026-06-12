@@ -8,130 +8,21 @@ This section describes the best practice data for DeepSeek-R1 on the Ascend NPU.
 
 ### Low Latency
 
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "13%"}} />
-    <col style={{width: "13%"}} />
-    <col style={{width: "13%"}} />
-    <col style={{width: "13%"}} />
-    <col style={{width: "12%"}} />
-    <col style={{width: "12%"}} />
-    <col style={{width: "12%"}} />
-    <col style={{width: "12%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-R1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>18.9ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-18-9ms">Optimal Configuration</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-R1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1K</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>19.0ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms">Optimal Configuration</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-R1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.9K+1K</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>19.0ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms">Optimal Configuration</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-R1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>6K+1.6K</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20.5ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms">Optimal Configuration</a></td>
-    </tr>
-  </tbody>
-</table>
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5K+1.5K | 18.9ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-18-9ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5K+1K | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.9K+1K | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 6K+1.6K | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
+
 ### High Throughput
 
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "13%"}} />
-    <col style={{width: "13%"}} />
-    <col style={{width: "13%"}} />
-    <col style={{width: "13%"}} />
-    <col style={{width: "12%"}} />
-    <col style={{width: "12%"}} />
-    <col style={{width: "12%"}} />
-    <col style={{width: "12%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-R1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.6K+1.5K</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>41ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-41ms">Optimal Configuration</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-R1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50.36ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#deepseek-r1-w4a8-8p-in3k5-out1k5-50-36ms">Optimal Configuration</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DeepSeek-R1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.6K+1.5K</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms">Optimal Configuration</a></td>
-    </tr>
-  </tbody>
-</table>
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek-R1 | Atlas 800I A3 | 16 | PD Disaggregation | 3.6K+1.5K | 41ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-41ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50.36ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50-36ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.6K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms) |
+
 
 ## Optimal Configuration
 
@@ -154,13 +45,36 @@ This section describes the best practice data for DeepSeek-R1 on the Ascend NPU.
 #### Model Deployment
 
 ```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
+
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
+
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
+
 
 export ENABLE_MOE_NZ=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -169,12 +83,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('your prefill ip1')
-D_IP=('your decode ip1')
-
-MODEL_PATH=xxx
+P_IP=('<your prefill ip>')
+D_IP=('<your decode ip>')
+MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -186,15 +99,13 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-        export GLOO_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=3500
-        export HCCL_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port 8998 \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8998 --node-rank 0 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.62 \
@@ -214,7 +125,6 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
-        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -226,17 +136,15 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-
-        export GLOO_SOCKET_IFNAME=xxx
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=800
-        export HCCL_SOCKET_IFNAME=xxx
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=78
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --node-rank 0 \
         --nnodes 1 \
         --tp-size 16 \
         --dp-size 16 \
@@ -259,7 +167,6 @@ do
         --dtype bfloat16 \
         --tokenizer-worker-num 4 \
         --load-balance-method round_robin \
-        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -267,12 +174,17 @@ done
 ```
 
 ```shell Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+# ============================================================
+
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --prefill http://P_IP:8000 8999 \
-    --decode http://D_IP:8001 \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
 ```
@@ -314,20 +226,36 @@ python -m sglang.bench_serving \
 #### Model Deployment
 
 ```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
 
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=1200
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=56
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -338,7 +266,7 @@ export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-python -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
+python3 -m sglang.launch_server --model-path $MODEL_PATH --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
     --trust-remote-code \
     --attention-backend ascend \
@@ -400,13 +328,36 @@ python -m sglang.bench_serving \
 #### Model Deployment
 
 ```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
+
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
+
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
+
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_NPU_USE_MLAPO=1
@@ -414,12 +365,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
-D_IP=('your decode ip1' 'your decode ip2')
-
-MODEL_PATH=xxx
+P_IP=('<your prefill ip>' '<your prefill ip>')
+D_IP=('<your decode ip>' '<your decode ip>')
+MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -431,15 +381,13 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-        export GLOO_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=1536
-        export HCCL_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --node-rank 0 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -460,7 +408,6 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
-        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -472,18 +419,16 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-
-        export GLOO_SOCKET_IFNAME=xxx
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=650
-        export HCCL_SOCKET_IFNAME=xxx
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
         --dp-size 16 \
@@ -507,7 +452,6 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -515,13 +459,19 @@ done
 ```
 
 ```shell Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+# ============================================================
+
 export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --prefill http://P_IP:8000 8999 \
-    --decode http://D_IP:8001 \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --prefill http://<your prefill ip>:8000 8999 \
+    --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -564,13 +514,36 @@ python -m sglang.bench_serving \
 #### Model Deployment
 
 ```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
+
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
+
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
+
 
 export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -580,12 +553,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
-D_IP=('your decode ip1' 'your decode ip2')
-
-MODEL_PATH=xxx
+P_IP=('<your prefill ip>' '<your prefill ip>')
+D_IP=('<your decode ip>' '<your decode ip>')
+MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -597,18 +569,16 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-        export GLOO_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=800
-        export HCCL_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=131072
         export SGLANG_NPU_FUSED_MOE_MODE=2
         export SGLANG_USE_AG_AFTER_QLORA=1
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --node-rank 0 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.778 \
@@ -628,7 +598,6 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
-        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -640,10 +609,9 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-
-        export GLOO_SOCKET_IFNAME=xxx
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=600
-        export HCCL_SOCKET_IFNAME=xxx
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
@@ -651,8 +619,7 @@ do
         export SGLANG_NPU_FUSED_MOE_MODE=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
         --dp-size 32 \
@@ -675,7 +642,6 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -683,13 +649,19 @@ done
 ```
 
 ```shell Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+# ============================================================
+
 export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --prefill http://P_IP:8000 8999 \
-    --decode http://D_IP:8001 \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --prefill http://<your prefill ip>:8000 8999 \
+    --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -732,13 +704,36 @@ python -m sglang.bench_serving \
 #### Model Deployment
 
 ```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
+
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
+
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
+
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_NPU_USE_MLAPO=1
@@ -746,12 +741,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
-D_IP=('your decode ip1' 'your decode ip2')
-
-MODEL_PATH=xxx
+P_IP=('<your prefill ip>' '<your prefill ip>')
+D_IP=('<your decode ip>' '<your decode ip>')
+MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -763,15 +757,13 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-        export GLOO_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=1536
-        export HCCL_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --node-rank 0 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -792,7 +784,6 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
-        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -804,18 +795,16 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-
-        export GLOO_SOCKET_IFNAME=xxx
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=650
-        export HCCL_SOCKET_IFNAME=xxx
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
         --dp-size 16 \
@@ -839,7 +828,6 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -847,13 +835,19 @@ done
 ```
 
 ```shell Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+# ============================================================
+
 export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --prefill http://P_IP:8000 8999 \
-    --decode http://D_IP:8001 \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --prefill http://<your prefill ip>:8000 8999 \
+    --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -896,13 +890,36 @@ python -m sglang.bench_serving \
 #### Model Deployment
 
 ```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
+
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
+
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
+
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_NPU_USE_MLAPO=1
@@ -910,12 +927,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
-D_IP=('your decode ip1' 'your decode ip2')
-
-MODEL_PATH=xxx
+P_IP=('<your prefill ip>' '<your prefill ip>')
+D_IP=('<your decode ip>' '<your decode ip>')
+MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -927,15 +943,13 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-        export GLOO_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=1536
-        export HCCL_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --node-rank 0 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -956,7 +970,6 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
-        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -968,18 +981,16 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-
-        export GLOO_SOCKET_IFNAME=xxx
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=650
-        export HCCL_SOCKET_IFNAME=xxx
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
         --dp-size 16 \
@@ -1003,7 +1014,6 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -1011,13 +1021,19 @@ done
 ```
 
 ```shell Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+# ============================================================
+
 export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --prefill http://P_IP:8000 8999 \
-    --decode http://D_IP:8001 \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --prefill http://<your prefill ip>:8000 8999 \
+    --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -1060,13 +1076,36 @@ python -m sglang.bench_serving \
 #### Model Deployment
 
 ```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
+
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
+
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/cann-9.0.0/tools/bishengir/bin:$PATH
+
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_NPU_USE_MLAPO=1
@@ -1074,12 +1113,11 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
-export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 
-P_IP=('your prefill ip1' 'your prefill ip2')
-D_IP=('your decode ip1' 'your decode ip2')
-
-MODEL_PATH=xxx
+P_IP=('<your prefill ip>' '<your prefill ip>')
+D_IP=('<your decode ip>' '<your decode ip>')
+MODEL_PATH=/path/to/model-weights
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -1091,15 +1129,13 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-        export GLOO_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=1536
-        export HCCL_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} \
-        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --node-rank 0 \
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.81 \
@@ -1119,7 +1155,6 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
-        --node-rank 0 \
         NODE_RANK=$i
         break
     fi
@@ -1131,18 +1166,16 @@ do
     if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
     then
         echo "${D_IP[$i]}"
-
-        export GLOO_SOCKET_IFNAME=xxx
+        export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=650
-        export HCCL_SOCKET_IFNAME=xxx
+        export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --dist-init-addr ${D_IP[0]}:5000 \
+        python3 -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} --port 8001 --dist-init-addr ${D_IP[0]}:5000 --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
         --dp-size 8 \
@@ -1165,7 +1198,6 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
-        --node-rank $i \
         NODE_RANK=$i
         break
     fi
@@ -1173,13 +1205,19 @@ done
 ```
 
 ```shell Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+# ============================================================
+
 export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --prefill http://P_IP:8000 8999 \
-    --decode http://D_IP:8001 \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --prefill http://<your prefill ip>:8000 8999 \
+    --decode http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
