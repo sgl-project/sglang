@@ -492,7 +492,6 @@ def launch_weight_cache_daemons(
 
     and all 4 daemons will be started automatically.
     """
-    import shutil
     import socket as sock_mod
     import subprocess
     import sys
@@ -512,15 +511,25 @@ def launch_weight_cache_daemons(
     procs = []
     for i in range(tp_size):
         cmd = [
-            python_path, "-m", daemon_module,
-            "--model-path", model_path,
-            "--gpu-id", str(i),
-            "--tp-size", str(tp_size),
-            "--tp-rank", str(i),
-            "--dp-size", str(dp_size),
-            "--load-format", load_format,
-            "--dtype", dtype,
-            "--dist-init-method", dist_init_method,
+            python_path,
+            "-m",
+            daemon_module,
+            "--model-path",
+            model_path,
+            "--gpu-id",
+            str(i),
+            "--tp-size",
+            str(tp_size),
+            "--tp-rank",
+            str(i),
+            "--dp-size",
+            str(dp_size),
+            "--load-format",
+            load_format,
+            "--dtype",
+            dtype,
+            "--dist-init-method",
+            dist_init_method,
         ]
         if quantization:
             cmd += ["--quantization", quantization]
@@ -533,9 +542,7 @@ def launch_weight_cache_daemons(
 
         proc = subprocess.Popen(cmd)
         procs.append(proc)
-        logger.info(
-            f"Launched weight cache daemon gpu={i} rank={i} pid={proc.pid}"
-        )
+        logger.info(f"Launched weight cache daemon gpu={i} rank={i} pid={proc.pid}")
 
     # Wait for all daemons to become ready
     check_interval = 2

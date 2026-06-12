@@ -629,8 +629,6 @@ class Engine(EngineScoreMixin, EngineBase):
             daemon_procs.append(proc)
 
         # Wait for all daemons to be ready (ready file exists)
-        import time
-
         timeout = 1800  # 30 min timeout for large model loading
         check_interval = 2
         elapsed = 0
