@@ -1,7 +1,7 @@
 import subprocess
 from types import SimpleNamespace
 
-from sglang.test.ascend.test_npu_utils import write_results_to_github_step_summary
+from sglang.test.ascend.test_ascend_utils import write_results_to_github_step_summary
 from sglang.test.run_eval import run_eval
 
 

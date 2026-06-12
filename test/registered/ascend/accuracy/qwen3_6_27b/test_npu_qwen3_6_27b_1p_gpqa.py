@@ -4,7 +4,7 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    QWEN3_6_27B_W8A8_MODEL_PATH,
+    QWEN3_6_27B_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -81,10 +81,10 @@ QWEN3_6_27B_64K_PREFIX_OTHER_ARGS = [
 
 
 class TestNPUQwen3_6_27B_2P_In64k_Out1k_Prefix90_gpqa(TestNpuAccuracyTestCaseBase):
-    model = QWEN3_6_27B_W8A8_MODEL_PATH
+    model = QWEN3_6_27B_MODEL_PATH
     envs = QWEN3_6_27B_64K_PREFIX_ENVS
     other_args = QWEN3_6_27B_64K_PREFIX_OTHER_ARGS
-    accuracy = 0.855
+    accuracy = 0.878
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     eval_batch_size = 64

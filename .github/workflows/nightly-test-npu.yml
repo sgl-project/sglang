@@ -19,6 +19,11 @@ on:
         required: false
         type: string
         default: 'all'
+      image_a2:
+        description: 'The a2 running docker image of the test task.'
+        required: false
+        type: string
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-910b'
       image_a3:
         description: 'The a3 running docker image of the test task.'
         required: false
@@ -41,11 +46,16 @@ on:
         required: false
         type: string
         default: 'all'
+      image_a2:
+        description: 'The a2 running docker image of the test task.'
+        required: false
+        type: string
+        default: ''
       image_a3:
         description: 'The a3 running docker image of the test task.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11'
+        default: ''
       skip_install_flag:
         description: 'Indicates whether to skip the installation of sglang, defaulting to false.'
         required: false
@@ -60,6 +70,7 @@ jobs:
     outputs:
       ref: ${{ steps.set-vars.outputs.ref }}
       job_filter: ${{ steps.set-vars.outputs.job_filter }}
+      image_a2: ${{ steps.set-vars.outputs.image_a2 }}
       image_a3: ${{ steps.set-vars.outputs.image_a3 }}
       skip_install_flag: ${{ steps.set-vars.outputs.skip_install_flag }}
     steps:
@@ -77,6 +88,11 @@ jobs:
           else
             echo "job_filter=${{ inputs.job_filter }}" >> $GITHUB_OUTPUT
           fi
+          if [ -z "${{ inputs.image_a2 }}" ]; then
+            echo "image_a2=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-910b" >> $GITHUB_OUTPUT
+          else
+            echo "image_a2=${{ inputs.image_a2 }}" >> $GITHUB_OUTPUT
+          fi
           if [ -z "${{ inputs.image_a3 }}" ]; then
             echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3" >> $GITHUB_OUTPUT
           else
@@ -87,6 +103,29 @@ jobs:
           else
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
+  nightly-poc-single-node-a2-tests:
+    name: single-node-poc-a2
+    if: ${{ !cancelled() }}
+    needs: [ set-image-config ]
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        test_config:
+          - name: qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_a2
+            runner: linux-aarch64-a2b3-4
+            test_case: test/registered/ascend/performance/qwen3_32b/test_npu_qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_a2.py
+            test_type: 'perf'
+    uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
+    with:
+      runner: ${{ matrix.test_config.runner }}
+      test_type: ${{ matrix.test_config.test_type }}
+      test_config_name: ${{ matrix.test_config.name }}
+      test_case: ${{ matrix.test_config.test_case }}
+      image: ${{ needs.set-image-config.outputs.image_a2 }}
+      install_sglang_from_source: false
+      transformers_version: ''
+
   nightly-poc-single-node-tests:
     name: single-node-poc
     if: ${{ !cancelled() }}
@@ -149,17 +188,13 @@ jobs:
             runner: linux-aarch64-a3-2
             test_case: test/registered/ascend/performance/qwen3_6_27b/test_npu_qwen3_6_27b_1p_in1080p_30_out256_50ms.py
             test_type: 'perf'
-          - name: qwen3_6_27b_w8a8_2p_gpqa
-            runner: linux-aarch64-a3-4
-            test_case: test/registered/ascend/accuracy/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_2p_gpqa.py
+          - name: qwen3_6_27b_1p_gpqa
+            runner: linux-aarch64-a3-2
+            test_case: test/registered/ascend/accuracy/qwen3_6_27b/test_npu_qwen3_6_27b_1p_gpqa.py
           # qwen3_32b performance tests
           - name: qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_gpqa
             runner: linux-aarch64-a3-4
             test_case: test/registered/ascend/performance/qwen3_32b/test_npu_qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_gpqa.py
-            test_type: 'perf'
-          - name: qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_a2
-            runner: linux-aarch64-a3-4
-            test_case: test/registered/ascend/performance/qwen3_32b/test_npu_qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_a2.py
             test_type: 'perf'
           - name: qwen3_32b_bf16_8p_in18k_out4k_6ms
             runner: linux-aarch64-a3-16
@@ -285,6 +320,7 @@ jobs:
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
+      - nightly-poc-single-node-a2-tests
       - nightly-poc-single-node-tests
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
@@ -307,6 +343,7 @@ jobs:
             esac
           }
 
+          single_result_a2="${{ needs.nightly-poc-single-node-a2-tests.result }}"
           single_result="${{ needs.nightly-poc-single-node-tests.result }}"
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
@@ -325,6 +362,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| single-node-poc-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
           echo "| single-node-poc | $(group_icon ${single_result}) ${single_result} |" >> $GITHUB_STEP_SUMMARY
           echo "| multi-node-poc | $(group_icon ${multi_result}) ${multi_result} |" >> $GITHUB_STEP_SUMMARY
           echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
