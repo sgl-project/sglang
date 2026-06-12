@@ -50,6 +50,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
     Req,
+    ReqPhase,
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import (
@@ -853,6 +854,7 @@ class SchedulerDisaggregationPrefillMixin:
         # as a partially-extended req and crash process_prefill_chunk (req_pool_idx=None).
         # Remove it from active_reqs and clear the extend state defensively.
         req.extend_range = None
+        req.phase = ReqPhase.OTHERS
         self._deactivate_req(req)
 
     def handle_pending_bootstrap(
