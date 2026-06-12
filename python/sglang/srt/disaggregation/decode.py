@@ -59,7 +59,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqPhase, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1409,7 +1409,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # TODO: start can transiently disagree with len(prefix_indices) under HiCache
         # decode prefetch, but it is behavior-neutral — only .end is read before
         # get_new_prebuilt_batch resets extend_range ahead of the prebuilt forward.
-        req.phase = ReqPhase.EXTEND
         req.set_extend_range(total_prefix_len, req.kv_committed_len)
 
         # Return the transfer destination indices:
@@ -1876,7 +1875,6 @@ class SchedulerDisaggregationDecodeMixin:
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv_committed_len is not None:
-                    req.phase = ReqPhase.EXTEND
                     req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
             else:
                 waiting_queue.append(req)

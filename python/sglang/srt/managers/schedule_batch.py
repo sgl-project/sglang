@@ -995,17 +995,9 @@ class Req(ReqDllmMixin):
 
     @property
     def is_partially_extended(self) -> bool:
-        if self.is_dllm():
-            return False
-        if self.extend_range is None:
+        if self.is_dllm() or self.phase != ReqPhase.EXTEND:
             return False
         assert self.extend_range.end > 0, f"{self.rid=} {self.extend_range=}"
-        if self.kv_committed_len > self.extend_range.end:
-            # extend_range keeps the last prefill extent as a stale snapshot
-            # once the req enters decode (it is no longer cleared to None);
-            # committed KV moving past the extend frontier marks the prefill
-            # as complete.
-            return False
         return self.extend_range.end < self.get_full_untruncated_fill_len()
 
     @property
@@ -1098,6 +1090,11 @@ class Req(ReqDllmMixin):
 
     # TODO: inline this method into its callers — it has no side effects, it only sets extend_range.
     def set_extend_range(self, start: int, end: int) -> None:
+        # Setting an extend range is what admits the req into the extend
+        # phase (PrefillAdder admission, chunk resume, disagg prebuilt).
+        # mix_with_running is the one caller that only borrows the range for
+        # batch assembly; it restores DECODE right after.
+        self.phase = ReqPhase.EXTEND
         self.extend_range = Range(start, end)
 
     def get_fill_ids(self) -> array:
@@ -2055,7 +2052,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.extend_batch_idx += 1
 
             # update req-level memory management fields
-            req.phase = ReqPhase.EXTEND
             req.kv_committed_len = seq_len
             req.kv_allocated_len = seq_len
 
@@ -2377,6 +2373,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in running_batch.reqs:
             full_len = req.get_full_untruncated_fill_len()
             req.set_extend_range(full_len - 1, full_len)
+            # The running rows stay in decode; the range above only feeds the
+            # mixed batch assembly.
+            req.phase = ReqPhase.DECODE
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
