@@ -14,16 +14,18 @@ from sglang.srt.constants import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    BeginWeightUpdateReqOutput,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    EndWeightUpdateReqInput,
+    EndWeightUpdateReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
-    PostProcessWeightsReqInput,
-    PostProcessWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -95,6 +97,9 @@ class SchedulerUpdateWeightsMixin:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        assert (
+            self._weight_update_in_progress
+        ), "update_weights_from_distributed requires an open begin_weight_update session"
         self._quiesce_for_weight_update()
         if recv_req.disable_draft_model:
             worker = self.tp_worker
@@ -102,6 +107,7 @@ class SchedulerUpdateWeightsMixin:
             worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_distributed(recv_req)
         if success:
+            self._weight_update_loaded = True
             self.flush_cache_after_weight_update(recv_req)
         else:
             logger.error(message)
@@ -112,6 +118,9 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
+        assert (
+            self._weight_update_in_progress
+        ), "update_weights_from_tensor requires an open begin_weight_update session"
         self._quiesce_for_weight_update()
         if recv_req.disable_draft_model:
             worker = self.tp_worker
@@ -119,6 +128,7 @@ class SchedulerUpdateWeightsMixin:
             worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_tensor(recv_req)
         if success:
+            self._weight_update_loaded = True
             self.flush_cache_after_weight_update(recv_req)
         else:
             logger.error(message)
@@ -141,13 +151,29 @@ class SchedulerUpdateWeightsMixin:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromIPCReqOutput(success, message)
 
-    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
-        """Optional post-processing for updated weights (e.g., Marlin conversion)."""
+    def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
+        """Begin a new weight update session: restore packed weights to a loadable state."""
         self._quiesce_for_weight_update()
-        success, message = self.tp_worker.post_process_weights(recv_req)
+        success, message = self.tp_worker.begin_weight_update()
+        self._weight_update_in_progress = True
+        self._weight_update_loaded = False
         if self.tp_cpu_group is not None:
             torch.distributed.barrier(group=self.tp_cpu_group)
-        return PostProcessWeightsReqOutput(success, message)
+        return BeginWeightUpdateReqOutput(success, message)
+
+    def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
+        """End the weight update session: optionally post_load_weights, then quant finalize."""
+        assert (
+            self._weight_update_in_progress
+        ), "end_weight_update called without begin_weight_update"
+        self._quiesce_for_weight_update()
+        success, message = self.tp_worker.end_weight_update(
+            run_post_load=not self._weight_update_loaded
+        )
+        self._weight_update_in_progress = False
+        if self.tp_cpu_group is not None:
+            torch.distributed.barrier(group=self.tp_cpu_group)
+        return EndWeightUpdateReqOutput(success, message)
 
     def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)

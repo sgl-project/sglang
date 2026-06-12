@@ -3718,51 +3718,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         return output
 
-    def post_process_weights(self, recv_req):
-        """
-        Execute post-processing logic for model weights, such as Marlin quantization format conversion
-        and model-specific post_load_weights hooks (e.g., DeepSeek MLA kv_b_proj decomposition).
-        """
-        from sglang.srt.model_loader.loader import device_loading_context
-
-        target_device = torch.device("cuda", torch.cuda.current_device())
-
-        if recv_req.post_load_weights:
-            # Call model.post_load_weights() if available (e.g., for DeepSeek MLA
-            # models that need to decompose kv_b_proj.weight into w_kc/w_vc tensors
-            # after RDMA weight transfer)
-            if hasattr(self.model, "post_load_weights"):
-                self.model.post_load_weights()
-
-        # LoRA wrappers forward `quant_method` for forward-path dispatch but
-        # don't own the packed params; skip them here so the inner base layer
-        # (yielded separately by `named_modules`) handles post-processing.
-        from sglang.srt.lora.layers import BaseLayerWithLoRA
-
-        if recv_req.restore_weights_before_load:
-            for _, module in self.model.named_modules():
-                if isinstance(module, BaseLayerWithLoRA):
-                    continue
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None and hasattr(
-                    quant_method, "restore_weights_before_loading"
-                ):
-                    with device_loading_context(module, target_device):
-                        quant_method.restore_weights_before_loading(module)
-
-        if recv_req.post_process_quantization:
-            for _, module in self.model.named_modules():
-                if isinstance(module, BaseLayerWithLoRA):
-                    continue
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None and hasattr(
-                    quant_method, "process_weights_after_loading"
-                ):
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
-
-        return True, "Success"
-
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
