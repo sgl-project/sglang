@@ -71,6 +71,7 @@ def _eagle_prefill_tail_tokens(
                 break
     return tail_tokens
 
+
 def organize_draft_results(
     score_list: List[torch.Tensor],
     token_list: List[torch.Tensor],

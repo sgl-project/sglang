@@ -48,12 +48,13 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
     sanitize_nan_logits,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -513,7 +514,7 @@ class EagleVerifyInputV2Mixin:
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
-        if sampling_info.is_all_greedy or _is_npu or _is_hip:
+        if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(

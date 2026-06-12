@@ -13,6 +13,12 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
     EAGLEDraftNpuGraphRunner,
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.hardware_backend.xpu.eagle_draft_extend_xpu_graph_runner import (
+    EAGLEDraftExtendXpuGraphRunner,
+)
+from sglang.srt.hardware_backend.xpu.eagle_draft_xpu_graph_runner import (
+    EAGLEDraftXpuGraphRunner,
+)
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -90,6 +96,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
@@ -98,6 +105,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +345,7 @@ class EagleDraftWorker(BaseDraftWorker):
             return
 
         Device2DraftCudaGraphRunner = {
+            "xpu": EAGLEDraftXpuGraphRunner,
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
@@ -359,6 +368,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
         Device2ExtendCudaGraphRunner = {
+            "xpu": EAGLEDraftExtendXpuGraphRunner,
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
@@ -387,6 +397,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # TODO: support draft extend cuda graph for more attention backends
         if self.draft_extend_attn_backend and (
             _is_npu
+            or _is_xpu
             or supports_cuda_draft_extend_graph
             or supports_hip_aiter_draft_extend_graph
         ):
