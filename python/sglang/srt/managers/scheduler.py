@@ -3409,6 +3409,7 @@ class Scheduler(
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
+            and not self.partially_extended_reqs()
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
