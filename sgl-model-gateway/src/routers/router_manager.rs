@@ -31,7 +31,10 @@ use crate::{
         rerank::RerankRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{
+        anthropic_protocol::{AnthropicCountTokensRequest, AnthropicMessagesRequest},
+        RouterTrait,
+    },
     server::ServerConfig,
 };
 
@@ -724,6 +727,76 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 "No router available for rerank request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_anthropic_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &AnthropicMessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            let model = model_id.or(Some(&body.model));
+            match self.resolve_model_id(model) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+
+        let selected_model = effective_model_id
+            .as_deref()
+            .or(model_id)
+            .or(Some(&body.model));
+        let router = self.select_router_for_request(headers, selected_model);
+
+        if let Some(router) = router {
+            router
+                .route_anthropic_messages(headers, body, selected_model)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_anthropic_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &AnthropicCountTokensRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            let model = model_id.or(Some(&body.model));
+            match self.resolve_model_id(model) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+
+        let selected_model = effective_model_id
+            .as_deref()
+            .or(model_id)
+            .or(Some(&body.model));
+        let router = self.select_router_for_request(headers, selected_model);
+
+        if let Some(router) = router {
+            router
+                .route_anthropic_count_tokens(headers, body, selected_model)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
             )
                 .into_response()
         }

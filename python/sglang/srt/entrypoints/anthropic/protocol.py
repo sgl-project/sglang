@@ -120,6 +120,15 @@ class AnthropicMessagesRequest(BaseModel):
     top_k: Optional[int] = None
     top_p: Optional[float] = None
 
+    # SGLang internal PD-disaggregation fields. The gateway injects these
+    # before forwarding Anthropic requests to prefill/decode workers.
+    bootstrap_host: Optional[list[str] | str] = None
+    bootstrap_port: Optional[list[Optional[int]] | int] = None
+    bootstrap_room: Optional[list[int] | int] = None
+    routed_dp_rank: Optional[int] = None
+    disagg_prefill_dp_rank: Optional[int] = None
+    data_parallel_rank: Optional[int] = None
+
     @field_validator("model")
     @classmethod
     def validate_model(cls, v):
@@ -138,9 +147,13 @@ class AnthropicMessagesRequest(BaseModel):
 class AnthropicDelta(BaseModel):
     """Delta for streaming responses"""
 
-    type: Optional[Literal["text_delta", "input_json_delta"]] = None
+    type: Optional[
+        Literal["text_delta", "input_json_delta", "thinking_delta", "signature_delta"]
+    ] = None
     text: Optional[str] = None
     partial_json: Optional[str] = None
+    thinking: Optional[str] = None
+    signature: Optional[str] = None
 
     # Message delta fields
     stop_reason: Optional[

@@ -31,13 +31,14 @@ use crate::{
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         classify::ClassifyRequest,
-        common::{InputIds, StringOrArray},
+        common::{GenerationRequest, InputIds, StringOrArray},
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
     },
     routers::{
+        anthropic_protocol::{AnthropicCountTokensRequest, AnthropicMessagesRequest},
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
@@ -77,6 +78,71 @@ struct PDRequestContext<'a> {
 struct BreakerOutcomesRecorded;
 
 impl PDRouter {
+    async fn post_to_worker<T: Serialize>(
+        &self,
+        worker: Arc<dyn Worker>,
+        endpoint: &'static str,
+        headers: Option<&HeaderMap>,
+        body: &T,
+    ) -> Response {
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+
+        let json_request = match serde_json::to_value(body) {
+            Ok(v) => v,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+
+        let request = self.build_post_with_headers(
+            &self.client,
+            worker.url(),
+            endpoint,
+            &json_request,
+            Some(&headers_with_trace),
+            false,
+        );
+
+        match request.send().await {
+            Ok(res) => {
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let response_headers = header_utils::preserve_response_headers(res.headers());
+
+                match res.bytes().await {
+                    Ok(body) => {
+                        let mut response = Response::new(Body::from(body));
+                        *response.status_mut() = status;
+                        *response.headers_mut() = response_headers;
+                        response
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to read response body from worker url={}: {}",
+                            worker.url(),
+                            e
+                        );
+                        error::internal_error(
+                            "read_response_body_failed",
+                            format!("Failed to read response body: {}", e),
+                        )
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to proxy POST request to worker url={} endpoint={}: {}",
+                    worker.url(),
+                    endpoint,
+                    e
+                );
+                error::bad_gateway(
+                    "worker_request_failed",
+                    format!("Failed to proxy request to worker: {}", e),
+                )
+            }
+        }
+    }
+
     async fn proxy_to_first_prefill_worker(
         &self,
         endpoint: &str,
@@ -673,6 +739,7 @@ impl PDRouter {
                             prefill_result,
                             prefill.url(),
                             context.return_logprob,
+                            true,
                         )
                         .await
                     {
@@ -682,7 +749,12 @@ impl PDRouter {
                 } else {
                     // Even if we don't need logprobs, we should check prefill status
                     match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
+                        .process_prefill_response(
+                            prefill_result,
+                            prefill.url(),
+                            false,
+                            !context.is_stream,
+                        )
                         .await
                     {
                         Ok((_, body)) => body,
@@ -1086,6 +1158,7 @@ impl PDRouter {
         prefill_result: Result<reqwest::Response, reqwest::Error>,
         prefill_url: &str,
         return_logprob: bool,
+        consume_body: bool,
     ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
         // Check prefill result first - it's critical for disaggregated mode
         let prefill_response = match prefill_result {
@@ -1163,13 +1236,25 @@ impl PDRouter {
                     None
                 }
             }
-        } else {
+        } else if consume_body {
             // For non-logprob requests, just consume the response without storing
             debug!("Consuming prefill response body (non-logprob request)");
             match prefill_response.bytes().await {
                 Ok(_) => debug!("Prefill response consumed successfully"),
                 Err(e) => warn!("Error consuming prefill response: {}", e),
             }
+            None
+        } else {
+            let prefill_url = prefill_url.to_string();
+            tokio::spawn(async move {
+                match prefill_response.bytes().await {
+                    Ok(_) => debug!("Prefill streaming response consumed successfully"),
+                    Err(e) => warn!(
+                        "Error consuming prefill streaming response from {}: {}",
+                        prefill_url, e
+                    ),
+                }
+            });
             None
         };
 
@@ -1540,6 +1625,55 @@ impl RouterTrait for PDRouter {
             "pd_unsupported_classify",
             "PD mode does not support /v1/classify",
         )
+    }
+
+    async fn route_anthropic_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &AnthropicMessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let request_text = if self.policies_need_request_text() {
+            Some(body.extract_text_for_routing())
+        } else {
+            None
+        };
+
+        let context = PDRequestContext {
+            route: "/v1/messages",
+            batch_size: None,
+            is_stream: body.stream,
+            return_logprob: false,
+            request_text,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_anthropic_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &AnthropicCountTokensRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let request_text = if self.policies_need_request_text() {
+            Some(body.extract_text_for_routing())
+        } else {
+            None
+        };
+
+        let (prefill, _decode) = match self
+            .select_pd_pair(request_text.as_deref(), model_id, headers)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => return Self::handle_server_selection_error(e),
+        };
+
+        self.post_to_worker(prefill, "/v1/messages/count_tokens", headers, body)
+            .await
     }
 
     fn router_type(&self) -> &'static str {
