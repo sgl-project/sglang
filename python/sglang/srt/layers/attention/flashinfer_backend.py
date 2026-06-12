@@ -26,9 +26,8 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -178,7 +177,10 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
+        self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
+            model_runner
+        )
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
         self.enable_mis = model_runner.server_args.enable_mis
 
         # FIXME: remove dllm workarounds from flashinfer
@@ -351,6 +353,27 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+
+    @staticmethod
+    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
+        """Return the SWA KV pool to translate against, or None for non-SWA models.
+
+        EAGLE-like draft workers share the target allocator for token bookkeeping,
+        but own a separate draft KV pool. Do not use the target allocator's SWA
+        mapping for that draft pool. FROZEN_KV MTP is the exception: its draft
+        path reads target KV directly, so it still needs the allocator pool when
+        the active pool is not SWA.
+        """
+        active_pool = model_runner.token_to_kv_pool
+        if isinstance(active_pool, BaseSWAKVPool):
+            return active_pool
+
+        if model_runner.is_draft_worker:
+            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
+                return None
+
+        kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+        return kvcache if isinstance(kvcache, BaseSWAKVPool) else None
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -550,10 +573,11 @@ class FlashInferAttnBackend(AttentionBackend):
         # Refill the SWA write-target buffer from the live out_cache_loc before
         # replay (bound onto the metadata at capture below).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            assert self._swa_kv_pool is not None
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                self._swa_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
             )
@@ -565,7 +589,8 @@ class FlashInferAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            assert self._swa_kv_pool is not None
+            swa_out_cache_loc = self._swa_kv_pool.translate_loc_from_full_to_swa(
                 forward_batch.out_cache_loc
             )
 
@@ -998,7 +1023,7 @@ class FlashInferIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        self._swa_kv_pool = attn_backend._swa_kv_pool
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1084,8 +1109,8 @@ class FlashInferIndicesUpdaterDecode:
                 seq_lens_cpu_tmp = seq_lens_cpu
                 kv_start_idx_tmp = None
 
-            use_sliding_window_kv_pool = wrapper_id == 0 and isinstance(
-                self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            use_sliding_window_kv_pool = (
+                wrapper_id == 0 and self._swa_kv_pool is not None
             )
 
             self.call_begin_forward(
@@ -1182,9 +1207,10 @@ class FlashInferIndicesUpdaterDecode:
             bs = kv_indptr.shape[0] - 1
 
         if use_sliding_window_kv_pool:
+            assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
-                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                self._swa_kv_pool.translate_loc_from_full_to_swa(
                     kv_indices[:kv_last_index]
                 )
             )
@@ -1265,7 +1291,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
         # Dispatch the update function
@@ -1380,8 +1406,8 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens = seq_lens
                 paged_kernel_lens_sum = seq_lens_sum
                 kv_start_idx = seq_lens - paged_kernel_lens
-            use_sliding_window_kv_pool = wrapper_id == 0 and isinstance(
-                self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            use_sliding_window_kv_pool = (
+                wrapper_id == 0 and self._swa_kv_pool is not None
             )
 
             self.call_begin_forward(
@@ -1557,9 +1583,10 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         if use_sliding_window_kv_pool:
+            assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
-                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                self._swa_kv_pool.translate_loc_from_full_to_swa(
                     kv_indices[:kv_last_index]
                 )
             )
