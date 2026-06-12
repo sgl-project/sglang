@@ -1044,8 +1044,7 @@ void Runner::run(
         mGemm2.mTileTokensDim >= 128 ? QuantizationSFLayout::SWIZZLED_128x4 : QuantizationSFLayout::SWIZZLED_8x4;
 
     float globalScaleInv = 1.f / (448.f * 6.f);
-    if (tensorrt_llm::common::getEnvNVFP4Use4Over6() &&
-        tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
+    if (tensorrt_llm::common::getEnvNVFP4Use4Over6() && tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
       globalScaleInv = 1.f / (256.f * 6.f);
     }
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
