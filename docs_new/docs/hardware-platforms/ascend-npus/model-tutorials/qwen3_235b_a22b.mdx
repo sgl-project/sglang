@@ -13,7 +13,8 @@ logical reasoning, text comprehension, mathematics, science, coding, and tool us
 and thinking/reasoning-enhanced editions.
 
 This document demonstrates the deployment of Qwen3-235B-A22B on Ascend NPUs using SGLang, including single-node PD mixed
-mode, multi-node PD mixed mode, multi-node PD disaggregation mode, feature configuration, and performance optimization.
+mode, multi-node PD mixed mode, multi-node PD disaggregation mode, 256K long-sequence inference, Prefill Context Parallel,
+feature configuration, and performance optimization.
 
 This document is validated and written based on **SGLang v0.5.10**. The current model (Qwen3-235B-A22B) is fully supported in
 this version. To use the latest features (e.g., PD disaggregation, speculative decoding), it is recommended to use
@@ -34,6 +35,7 @@ v0.5.10 or a later version.
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
+| Prefill Context Parallel      | `--enable-prefill-context-parallel --attn-cp-size 2 --moe-dp-size 2`                         |
 
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
@@ -142,64 +144,30 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the **W8A8** quantized model.
+with limited hardware resources. The following command is based on the **BF16** model.
 
 ```bash Launch server
 #============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   DRAFT_MODEL_PATH: path to the speculative draft model weights directory
 #============================================================
 
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-
 export SGLANG_SET_CPU_AFFINITY=1
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-unset ASCEND_LAUNCH_BLOCKING
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export HCCL_BUFFSIZE=1536
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 
 MODEL_PATH=/path/to/model-weights
-DRAFT_MODEL_PATH=/path/to/draft-model-weights
 
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
-
-LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
-LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
-
-echo "${LOCAL_HOST1}"
-echo "${LOCAL_HOST2}"
-
-export HCCL_BUFFSIZE=570
-export HCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
-export HCCL_OP_EXPANSION_MODE="AIV"
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
-
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
-export SGLANG_NPU_FUSED_MOE_MODE=2
-
-python -m sglang.launch_server --model-path $MODEL_PATH \
-    --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu --quantization modelslim  \
-    --max-running-requests 432 --context-length 8192 --dtype bfloat16 \
-    --chunked-prefill-size 94208 --max-prefill-tokens 458880 --sampling-backend ascend \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path $DRAFT_MODEL_PATH \
-    --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --disable-radix-cache --moe-a2a-backend ascend_fuseep --speculative-draft-model-quantization unquant \
-    --tp-size 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.8 --cuda-graph-bs 1 2 4 8 16 20 24 26 27
+python -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --tp-size 16 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --watchdog-timeout 9000 \
+    --mem-fraction-static 0.8
 ```
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
@@ -423,6 +391,219 @@ python -m sglang_router.launch_router \
 ```
 
 The full sglang server will serve on `http://127.0.0.1:7439`.
+
+#### 256K long-sequence PD disaggregation on 2 x Atlas 800I A3 (without CP)
+
+This configuration uses PD disaggregation for **256K long-sequence inference** with context parallel disabled.
+The following command is based on the **W8A8** quantized model.
+
+1. Set the shared environment variables on both prefill and decode nodes:
+
+```bash Shared environment
+#============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   PREFILL_HOST_IP: prefill node IP address
+#   NETWORK_IFACE: network interface name (use ifconfig to find)
+#============================================================
+
+export ASCEND_USE_FIA=1
+export SGLANG_SET_CPU_AFFINITY=1
+export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:12345"
+export HCCL_SOCKET_IFNAME=<NETWORK_IFACE>
+export GLOO_SOCKET_IFNAME=<NETWORK_IFACE>
+
+MODEL_PATH=/path/to/model-weights
+```
+
+2. Run on the **prefill node**:
+
+```bash Prefill node
+#============================================================
+# Before running, update the following variable:
+#   PREFILL_HOST_IP: prefill node IP address
+#============================================================
+
+export ASCEND_LAUNCH_BLOCKING=1
+export HCCL_BUFFSIZE=1500
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=128
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+
+python3 -m sglang.launch_server \
+    --model-path ${MODEL_PATH} \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --disable-radix-cache \
+    --chunked-prefill-size -1 \
+    --skip-server-warmup \
+    --device npu \
+    --tp-size 16 \
+    --mem-fraction-static 0.45 \
+    --max-running-requests 1 \
+    --host <PREFILL_HOST_IP> \
+    --port 8000 \
+    --dist-init-addr <PREFILL_HOST_IP>:5000 \
+    --nnodes 1 \
+    --node-rank 0 \
+    --moe-a2a-backend deepep \
+    --deepep-mode normal
+```
+
+3. Run on the **decode node**:
+
+```bash Decode node
+#============================================================
+# Before running, update the following variable:
+#   DECODE_HOST_IP: decode node IP address
+#============================================================
+
+export HCCL_BUFFSIZE=4000
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
+
+python3 -m sglang.launch_server \
+    --model-path ${MODEL_PATH} \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --attention-backend ascend \
+    --mem-fraction-static 0.8 \
+    --disable-cuda-graph \
+    --device npu \
+    --disable-radix-cache \
+    --chunked-prefill-size 8192 \
+    --skip-server-warmup \
+    --tp-size 16 \
+    --max-running-requests 1 \
+    --host <DECODE_HOST_IP> \
+    --port 8232 \
+    --moe-a2a-backend deepep \
+    --deepep-mode low_latency \
+    --disable-overlap-schedule
+```
+
+4. Launch the SGLang Router (on any reachable node):
+
+```bash Router
+#============================================================
+# Before running, update the following variables:
+#   PREFILL_HOST_IP: prefill node IP address
+#   DECODE_HOST_IP: decode node IP address
+#   ROUTER_HOST_IP: router node IP address
+#============================================================
+
+python3 -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://<PREFILL_HOST_IP>:8000 8995 \
+    --decode http://<DECODE_HOST_IP>:8232 \
+    --host <ROUTER_HOST_IP> \
+    --port 6689 \
+    --prometheus-port 29010
+```
+
+#### Prefill Context Parallel (PCP) on 2 x Atlas 800I A3
+
+This configuration enables **Prefill Context Parallel** (`--enable-prefill-context-parallel`) to split the context
+across CP ranks during prefill, reducing per-device memory pressure and improving TTFT for long sequences.
+PD disaggregation is required. The following command is based on the **W8A8** quantized model.
+
+<Warning>
+**Constraints:**
+- Prefill side must set `--max-running-requests 1` (PCP only supports batch_size=1)
+- `--attn-cp-size` must evenly divide `--tp-size`; each CP rank occupies `tp_size / cp_size` NPUs
+</Warning>
+
+1. Run on the **prefill node**:
+
+```bash Prefill node
+#============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   PREFILL_HOST_IP: prefill node IP address
+#============================================================
+
+export SGLANG_SET_CPU_AFFINITY=1
+export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:23456"
+export ASCEND_USE_FIA=True
+
+python3 -m sglang.launch_server \
+    --model-path ${MODEL_PATH} \
+    --trust-remote-code \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --quantization modelslim \
+    --attention-backend ascend \
+    --skip-server-warmup \
+    --mem-fraction-static 0.7 \
+    --chunked-prefill-size 32768 \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 16 \
+    --enable-prefill-context-parallel \
+    --attn-cp-size 2 \
+    --moe-dp-size 2 \
+    --max-running-requests 1 \
+    --host <PREFILL_HOST_IP> \
+    --port 8000 \
+    --nnodes 1 \
+    --node-rank 0 \
+    --dist-init-addr <PREFILL_HOST_IP>:6688
+```
+
+Key parameters for PCP:
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `--enable-prefill-context-parallel` | flag | Enable PCP feature |
+| `--attn-cp-size` | 2 | Split context across 2 CP ranks (each rank handles half the sequence) |
+| `--moe-dp-size` | 2 | MoE DP size, should match `--attn-cp-size` |
+| `--max-running-requests` | 1 | Required by PCP (batch_size=1 constraint) |
+
+2. Run on the **decode node**:
+
+```bash Decode node
+#============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DECODE_HOST_IP: decode node IP address
+#   PREFILL_HOST_IP: prefill node IP address (for ASCEND_MF_STORE_URL)
+#============================================================
+
+export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:23456"
+export ASCEND_USE_FIA=True
+
+python3 -m sglang.launch_server \
+    --model-path ${MODEL_PATH} \
+    --trust-remote-code \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --quantization modelslim \
+    --attention-backend ascend \
+    --disable-radix-cache \
+    --disable-cuda-graph \
+    --mem-fraction-static 0.7 \
+    --chunked-prefill-size 32768 \
+    --skip-server-warmup \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 8 \
+    --max-running-requests 32 \
+    --host <DECODE_HOST_IP> \
+    --port 8001 \
+    --nnodes 1 \
+    --node-rank 0 \
+    --dist-init-addr <DECODE_HOST_IP>:6688
+```
+
+<Tip>
+`ASCEND_MF_STORE_URL` on both nodes must point to the same KV store (typically the prefill node IP).
+`ASCEND_USE_FIA=True` enables fast interconnect aggregation for KV transfer.
+PCP is a prefill-only feature; the decode side needs no CP-related flags.
+</Tip>
 
 ## Functional verification
 
