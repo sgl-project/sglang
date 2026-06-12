@@ -3,6 +3,7 @@ import unittest
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    inflight_middle_chunks_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
@@ -299,7 +300,7 @@ class TestInvariantsBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             yield
             req = r.req
-            cur = req.inflight_middle_chunks if req is not None else 0
+            cur = inflight_middle_chunks_of(req) if req is not None else 0
             running_max = max(running_max, cur)
             if r.finished:
                 running_max_post_finish = max(running_max_post_finish, cur)
@@ -480,7 +481,7 @@ class TestInvariantsBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             s = t.scheduler
             req = t.find_req_by_rid(r.rid)
-            cur_inflight = req.inflight_middle_chunks if req is not None else 0
+            cur_inflight = inflight_middle_chunks_of(req) if req is not None else 0
             cur_is_chunked_slot = (
                 chunked_req_of(s) is not None and chunked_req_of(s).rid == r.rid
             )

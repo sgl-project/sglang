@@ -40,6 +40,12 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
     yield from run_until(handle, lambda h: h.finished, max_steps=max_steps)
 
 
+def inflight_middle_chunks_of(req: Any) -> int:
+    from sglang.srt.managers.schedule_batch import ReqPhase
+
+    return int(req.phase is ReqPhase.EXTEND_NON_LAST)
+
+
 def chunked_req_of(scheduler: Any) -> Any:
     reqs = scheduler.partially_extended_reqs()
     assert len(reqs) <= 1, (

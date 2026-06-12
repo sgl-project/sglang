@@ -4,6 +4,7 @@ from typing import Optional
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    inflight_middle_chunks_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
@@ -290,7 +291,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, prompt_token=180
         )
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        assert r.req.inflight_middle_chunks > 0
+        assert inflight_middle_chunks_of(r.req) > 0
         assert r.is_chunking
 
         t.pause_generation(mode="retract")
@@ -304,9 +305,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             f"got status={r.status!r}"
         )
         req = t.find_req_by_rid(r.rid)
-        assert req is not None and req.inflight_middle_chunks == 0, (
+        assert req is not None and inflight_middle_chunks_of(req) == 0, (
             f"retract must reset inflight_middle_chunks; got "
-            f"{req.inflight_middle_chunks if req is not None else None}"
+            f"{inflight_middle_chunks_of(req) if req is not None else None}"
         )
 
         t.continue_generation()
@@ -438,10 +439,10 @@ class TestSpecialCaseBasic(ScriptedTestCase):
     def _script_stage_a_inflight_middle_chunks_sync_invariant(t: ScriptedContext):
         def assert_invariant() -> None:
             req = t.find_req_by_rid(r.rid)
-            if req is not None and req.inflight_middle_chunks > 0:
+            if req is not None and inflight_middle_chunks_of(req) > 0:
                 assert r.is_chunking, (
                     f"invariant violated: inflight_middle_chunks="
-                    f"{req.inflight_middle_chunks} but is_chunking={r.is_chunking}"
+                    f"{inflight_middle_chunks_of(req)} but is_chunking={r.is_chunking}"
                 )
 
         r = t.start_req(

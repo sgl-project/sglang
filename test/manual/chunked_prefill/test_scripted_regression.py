@@ -3,6 +3,7 @@ import unittest
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    inflight_middle_chunks_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
@@ -45,7 +46,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.req.req_pool_idx is None
         assert r.lock_refs == 0
         assert not r.is_chunking
-        assert r.req.inflight_middle_chunks == 0
+        assert inflight_middle_chunks_of(r.req) == 0
 
     def test_pause_covers_waiting_chunked(self):
         self.server.execute_script(self._script_pause_covers_waiting_chunked)
@@ -80,13 +81,13 @@ class TestRegressionBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             req = r.req
             if req is not None:
-                observed_max = max(observed_max, req.inflight_middle_chunks)
+                observed_max = max(observed_max, inflight_middle_chunks_of(req))
                 if r.chunks_done >= 1 and r.is_chunking:
                     saw_chunking_bump = saw_chunking_bump or (
-                        req.inflight_middle_chunks > 0
+                        inflight_middle_chunks_of(req) > 0
                     )
                 if not r.is_chunking and r.chunks_done >= 2:
-                    cleared_inflight = req.inflight_middle_chunks == 0
+                    cleared_inflight = inflight_middle_chunks_of(req) == 0
                     break
             if r.finished:
                 cleared_inflight = True
@@ -258,7 +259,7 @@ class TestRegressionBasic(ScriptedTestCase):
             r.lock_refs == 0
         ), f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
         assert not r.is_chunking
-        assert r.req.inflight_middle_chunks == 0
+        assert inflight_middle_chunks_of(r.req) == 0
         assert sum(t.get_all_node_lock_refs().values()) == baseline_refs
 
     def test_pause_retract_releases_waiting_chunked_resume(self):

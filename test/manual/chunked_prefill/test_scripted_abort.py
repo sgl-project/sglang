@@ -5,6 +5,7 @@ from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    inflight_middle_chunks_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
@@ -251,7 +252,7 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
-        assert r.req is None or r.req.inflight_middle_chunks == 0
+        assert r.req is None or inflight_middle_chunks_of(r.req) == 0
 
     def test_abort_penultimate_chunk(self):
         self.server.execute_script(self._script_abort_penultimate_chunk)
@@ -424,7 +425,7 @@ class TestAbortBasic(ScriptedTestCase):
             r,
             lambda h: h.is_chunking and h.chunks_done >= 1,
         )
-        assert r.req.inflight_middle_chunks > 0
+        assert inflight_middle_chunks_of(r.req) > 0
 
         t.abort(r)
         yield from _drain_until_released(t, r)
@@ -438,8 +439,8 @@ class TestAbortBasic(ScriptedTestCase):
 
         if r.req is not None:
             assert (
-                r.req.inflight_middle_chunks == 0
-            ), f"inflight_middle_chunks not cleared; got {r.req.inflight_middle_chunks}"
+                inflight_middle_chunks_of(r.req) == 0
+            ), f"inflight_middle_chunks not cleared; got {inflight_middle_chunks_of(r.req)}"
 
     def test_abort_when_chunked_only_then_idle(self):
         self.server.execute_script(self._script_abort_when_chunked_only_then_idle)
