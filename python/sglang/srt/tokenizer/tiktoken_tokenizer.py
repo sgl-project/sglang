@@ -29,7 +29,7 @@ PAT_STR_B = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^
 class TiktokenTokenizer:
     def __init__(self, tokenizer_path):
         import tiktoken
-        from jinja2 import Template
+        from jinja2.sandbox import ImmutableSandboxedEnvironment
 
         # Read the JSON
         with open(tokenizer_path, "rb") as fin:
@@ -104,7 +104,9 @@ class TiktokenTokenizer:
         self.eos_token_id = tokenizer._special_tokens[EOS]
         self.vocab_size = tokenizer.n_vocab
         self.chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}{{ 'Human: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'system' %}{{ 'System: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'assistant' %}{{ 'Assistant: '  + message['content'] + '<|separator|>\n\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
-        self.chat_template_jinja = Template(self.chat_template)
+        self.chat_template_jinja = ImmutableSandboxedEnvironment(
+            loader=None,
+        ).from_string(self.chat_template)
         self.additional_stop_token_ids = None
 
     def encode(self, x, add_special_tokens=False):
