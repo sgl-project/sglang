@@ -490,11 +490,14 @@ class LMCRadixCache(RadixCache):
             request_id=req.rid,
         )
         if self._mode is LMCacheMode.MP:
+            self.lmcache_connector.store_kv(store_md)
             # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
             self._mp_load_back_markers.pop(req.rid, None)
             self.dec_lock_ref(new_last_node)
             self.lmcache_connector.end_session(req.rid)
         elif self._mode is LMCacheMode.IP:
+            with _device_stream_context(self.store_stream):
+                self.lmcache_connector.store_kv(store_md)
             # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
             with self._node_lock:
                 self._in_flight_nodes.append(new_last_node)
