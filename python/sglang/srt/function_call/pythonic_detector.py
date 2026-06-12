@@ -31,12 +31,15 @@ class PythonicDetector(BaseFormatDetector):
     Reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct?chat_template=default
     """
 
+    # Maximum input length to process to prevent DoS attacks
+    MAX_INPUT_LENGTH = 100000
+
     def __init__(self):
         super().__init__()
-        self.tool_call_regex = re.compile(
-            r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
-            re.DOTALL,
-        )
+        # Simple pattern to detect the start of a pythonic tool call: [func_name(
+        # This avoids the ReDoS vulnerability from the previous complex regex.
+        # Full validation is done by AST parsing after bracket matching.
+        self._tool_call_start_pattern = re.compile(r"\[\s*[a-zA-Z_]\w*\s*\(")
 
     @staticmethod
     def _text_strip(text: str) -> str:
@@ -46,8 +49,87 @@ class PythonicDetector(BaseFormatDetector):
         text = text.replace("<|python_end|>", "")
         return text
 
+    def _find_tool_call_bounds(self, text: str) -> tuple[int, int] | None:
+        """
+        Find the bounds of a pythonic tool call using bracket matching.
+        Returns (start, end) indices or None if no valid tool call found.
+
+        This approach avoids ReDoS by using O(n) bracket counting instead of
+        complex regex with nested quantifiers.
+        """
+        if len(text) > self.MAX_INPUT_LENGTH:
+            logger.warning(
+                f"Input length {len(text)} exceeds maximum {self.MAX_INPUT_LENGTH}, skipping tool call detection"
+            )
+            return None
+
+        # Find potential start of tool call: [func_name(
+        match = self._tool_call_start_pattern.search(text)
+        if not match:
+            return None
+
+        start = match.start()
+
+        # Use bracket matching to find the end
+        bracket_count = 0
+        paren_count = 0
+        brace_count = 0
+        in_string = False
+        string_char = None
+
+        i = start
+        while i < len(text):
+            char = text[i]
+
+            # Handle string literals to avoid counting brackets inside strings
+            if char in ('"', "'") and (i == 0 or text[i - 1] != "\\"):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+                i += 1
+                continue
+
+            if in_string:
+                i += 1
+                continue
+
+            # Count brackets
+            if char == "[":
+                bracket_count += 1
+            elif char == "]":
+                bracket_count -= 1
+                if bracket_count == 0:
+                    # Found matching closing bracket
+                    # Validate that we have at least one complete function call
+                    candidate = text[start : i + 1]
+                    try:
+                        module = ast.parse(candidate)
+                        parsed = getattr(module.body[0], "value", None)
+                        if isinstance(parsed, ast.List) and all(
+                            isinstance(e, ast.Call) for e in parsed.elts
+                        ):
+                            return (start, i + 1)
+                    except (SyntaxError, ValueError, IndexError):
+                        pass
+                    return None
+            elif char == "(":
+                paren_count += 1
+            elif char == ")":
+                paren_count -= 1
+            elif char == "{":
+                brace_count += 1
+            elif char == "}":
+                brace_count -= 1
+
+            i += 1
+
+        return None
+
     def has_tool_call(self, text: str) -> bool:
-        return bool(self.tool_call_regex.search(self._text_strip(text.strip())))
+        return self._find_tool_call_bounds(self._text_strip(text.strip())) is not None
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         # Try parsing the text as a Python list of function calls
@@ -56,13 +138,11 @@ class PythonicDetector(BaseFormatDetector):
         # Remove unexpected <|python_start|> and <|python_end|> for llama4
         text = self._text_strip(text)
 
-        match = self.tool_call_regex.search(text)
-        if match is None:
+        bounds = self._find_tool_call_bounds(text)
+        if bounds is None:
             return StreamingParseResult(normal_text=text, calls=[])
 
-        # Extract the tool call part and any text before/after it
-        tool_call_start = match.start()
-        tool_call_end = match.end()
+        tool_call_start, tool_call_end = bounds
 
         normal_text_before = text[:tool_call_start] if tool_call_start > 0 else ""
         tool_call_text = text[tool_call_start:tool_call_end]
