@@ -34,12 +34,16 @@ def _fake_get(url, *args, **kwargs):
     raise requests.RequestException()
 
 
-class _GSM8KHost(GSM8KMixin, CustomTestCase):
-    __test__ = False  # host only; not collected as a test on its own
+def _make_host(mixin, method):
+    """Build a throwaway mixin host bound to ``method``.
 
-
-class _GPQAHost(GPQAMixin, CustomTestCase):
-    __test__ = False  # host only; not collected as a test on its own
+    Created dynamically (never bound at module scope) so it is collected by
+    neither runner: CI executes this file via ``python3 <file>`` ->
+    ``unittest.main()``, whose loader ignores pytest's ``__test__`` flag, and
+    pytest only collects module-level ``Test*`` classes. The host runs only when
+    a test below instantiates and drives it directly.
+    """
+    return type(f"_{mixin.__name__}Host", (mixin, CustomTestCase), {})(method)
 
 
 class TestEvalKitBackendDispatch(CustomTestCase):
@@ -52,7 +56,7 @@ class TestEvalKitBackendDispatch(CustomTestCase):
             captured["args"] = args
             return {"score": score}
 
-        host = _GSM8KHost("test_gsm8k")
+        host = _make_host(GSM8KMixin, "test_gsm8k")
         host.base_url = "http://127.0.0.1:0"
         host.model = "m"
         for k, v in attrs.items():
@@ -80,7 +84,7 @@ class TestEvalKitBackendDispatch(CustomTestCase):
     def test_sgl_eval_path_skips_when_not_installed(self):
         # GPQA/AIME25 and the sgl_eval backend must skip -- not error -- when
         # sgl-eval is not installed. None in sys.modules makes the import raise.
-        host = _GPQAHost("test_gpqa")
+        host = _make_host(GPQAMixin, "test_gpqa")
         host.base_url = "http://127.0.0.1:0"
         host.model = "m"
         host.gpqa_score_threshold = 0.5
