@@ -1,23 +1,13 @@
 import logging
-from copy import copy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    is_dp_attention_enabled,
-)
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -29,39 +19,23 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
 )
-from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
-    SIMULATE_ACC_LEN,
-    TREE_SPEC_KERNEL_AVAILABLE,
-    align_evict_mask_to_page_size,
     assign_req_to_token_pool_func,
     create_extend_after_decode_spec_info,
-    create_num_accept_tokens_filter,
-    filter_finished_cache_loc_kernel,
-    generate_simulated_accept_index,
-    get_src_tgt_cache_loc,
-    get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
-from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
-
-if is_cuda() or is_musa():
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-        tree_speculative_sampling_target_only,
-    )
+from sglang.srt.utils import next_power_of_2
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 logger = logging.getLogger(__name__)
 
 
 def _draft_runner_of(worker):
-    """Draft model_runner accessor that handles v1 / v2 worker naming.
+    """Draft model_runner accessor across worker shapes.
 
-    v1 (`EAGLEWorker` and subclasses) exposes the draft model_runner as
-    `model_runner` (the worker itself runs the draft model);
-    v2 (`EagleDraftWorker` and subclasses) exposes it as `draft_runner`.
+    v2 draft workers (`EagleDraftWorker` and subclasses) expose the draft
+    model_runner as `draft_runner`; fall back to `model_runner` for workers
+    that run the draft model directly.
     """
     return (
         worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
@@ -117,7 +91,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             spec_steps=spec_steps,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=0,
-            seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
@@ -238,464 +212,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
-
-    def verify(
-        self,
-        batch: ScheduleBatch,
-        logits_output: LogitsProcessorOutput,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        page_size: int,
-        vocab_mask: Optional[torch.Tensor] = None,  # For grammar
-    ) -> torch.Tensor:
-        """
-        Verify and find accepted tokens based on logits output and batch
-        (which contains spec decoding information).
-
-        WARNING: This API in-place modifies the states of logits_output
-
-        This API updates values inside logits_output based on the accepted
-        tokens. I.e., logits_output.next_token_logits only contains
-        accepted token logits.
-        """
-        if batch.forward_mode.is_idle():
-            # hidden_size=None: worker fixup in forward_draft_extend_after_decode
-            # rebuilds via EagleDraftExtendInput.hidden_size_for(worker)
-            # (single source incl. EAGLE-3 aux widening).
-            draft_extend_input = EagleDraftExtendInput.create_idle_input(
-                device=batch.device,
-                hidden_size=None,
-                dtype=None,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
-            )
-            return EagleVerifyOutput.create_idle(
-                draft_extend_input=draft_extend_input,
-                logits_output=logits_output,
-                device=batch.device,
-                spec_steps=self.spec_steps,
-            )
-
-        bs = self.retrieve_index.shape[0]
-        candidates = self.draft_token.reshape(bs, self.draft_token_num)
-        sampling_info = batch.sampling_info
-
-        predict_shape = list(logits_output.next_token_logits.shape)[:-1]
-        predict_shape[-1] += 1
-        predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
-        accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=batch.device
-        )
-        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=batch.device)
-
-        if bs != len(sampling_info):
-            sampling_info = copy.deepcopy(sampling_info)
-            # NOTE: retrieve_index are the indices of the requests that are kept.
-            sampling_info.filter_batch(
-                self.retrieve_index.tolist(), self.retrieve_index
-            )
-
-        # Apply the custom logit processors if registered in the sampling info.
-        if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(
-                logits_output.next_token_logits,
-                sampling_info,
-                num_tokens_in_batch=self.draft_token_num,
-            )
-
-        # Apply penalty
-        if (
-            sampling_info.penalizer_orchestrator.is_required
-            or sampling_info.logit_bias is not None
-        ):
-            # This is a relaxed version of penalties for speculative decoding.
-            sampling_info.penalizer_orchestrator.apply(
-                logits_output.next_token_logits, repeat=self.draft_token_num
-            )
-            if sampling_info.logit_bias is not None:
-                logits_output.next_token_logits.add_(
-                    torch.repeat_interleave(
-                        sampling_info.logit_bias, self.draft_token_num, dim=0
-                    )
-                )
-
-        # Apply grammar mask
-        if vocab_mask is not None:
-            assert self.grammar is not None
-            self.grammar.apply_vocab_mask(
-                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
-            )
-
-        # Sample tokens. Force greedy sampling on AMD
-        is_all_greedy = sampling_info.is_all_greedy
-        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
-            logger.warning(
-                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
-                "Falling back to greedy verification."
-            )
-
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
-            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=num_correct_drafts,  # mutable
-                candidates=candidates,
-                retrieve_index=self.retrieve_index,
-                retrieve_next_token=self.retrieve_next_token,
-                retrieve_next_sibling=self.retrieve_next_sibling,
-                target_predict=target_predict,
-                topk=self.topk,
-            )
-
-        else:
-            # apply temperature and get target probs
-            expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, self.draft_token_num, dim=0
-            )  # (bs * draft_token_num, 1)
-
-            target_probs = F.softmax(
-                logits_output.next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * draft_token_num, vocab_size)
-            maybe_detect_nan(target_probs, "verify: target_probs after softmax")
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
-                ),
-            )  # (bs * draft_token_num, vocab_size)
-            maybe_detect_nan(target_probs, "verify: target_probs after top_k_renorm")
-            if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, self.draft_token_num, dim=0
-                    ),
-                )
-                maybe_detect_nan(
-                    target_probs, "verify: target_probs after top_p_renorm"
-                )
-            target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-
-            draft_probs = torch.zeros(
-                target_probs.shape, dtype=torch.float32, device=batch.device
-            )
-
-            # coins for rejection sampling
-            coins = torch.rand_like(
-                candidates, dtype=torch.float32, device=batch.device
-            )
-            # coins for final sampling
-            coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device=batch.device
-            )
-            tree_speculative_sampling_target_only(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=num_correct_drafts,  # mutable
-                candidates=candidates,
-                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-                retrive_index=self.retrieve_index,
-                retrive_next_token=self.retrieve_next_token,
-                retrive_next_sibling=self.retrieve_next_sibling,
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=get_global_server_args().speculative_accept_threshold_single,
-                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
-                deterministic=True,
-            )
-
-            # Sync sampling results across TP ranks: different GPUs may
-            # produce slightly different target_probs due to floating-point
-            # non-determinism in softmax/top_k/top_p, causing different
-            # sampled tokens. Broadcast from rank 0 to ensure consistency.
-            tp_group = (
-                get_attention_tp_group()
-                if is_dp_attention_enabled()
-                else get_tp_group()
-            )
-            if tp_group.world_size > 1:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
-
-        if SIMULATE_ACC_LEN > 0.0:
-            # Do simulation
-            accept_index = generate_simulated_accept_index(
-                accept_index=accept_index,
-                predict=predict,  # mutable
-                num_correct_drafts=num_correct_drafts,  # mutable
-                bs=bs,
-                spec_steps=self.spec_steps,
-            )
-
-        # accept_index values index batch.out_cache_loc (size = bs * draft_token_num);
-        # -1 is the reject sentinel.
-        maybe_detect_oob(
-            accept_index,
-            -1,
-            bs * self.draft_token_num,
-            "eagle verify accept_index post-sampling",
-        )
-        maybe_detect_oob(
-            num_correct_drafts,
-            0,
-            self.draft_token_num + 1,
-            "eagle verify num_correct_drafts post-sampling",
-        )
-
-        unfinished_index = []
-        unfinished_accept_index = []
-        accept_index_cpu = accept_index.tolist()
-        predict_cpu = predict.tolist()
-        has_finished = False
-        think_end_id = batch.model_config.think_end_id
-
-        # Iterate every accepted token and check if req has finished after append the token
-        # should be checked BEFORE free kv cache slots
-        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            num_accept_tokens = 0
-            for j, idx in enumerate(accept_index_row):
-                if idx == -1:
-                    break
-                num_accept_tokens += 1
-                id = predict_cpu[idx]
-                req.output_ids.append(id)
-                if req.require_reasoning and think_end_id is not None:
-                    req.update_reasoning_tokens(id, think_end_id)
-                req.update_finish_state()
-                if not req.finished() and req.grammar is not None:
-                    try:
-                        req.grammar.accept_token(id)
-                    except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                        )
-                        raise e
-                    req.update_finish_state()
-                if req.finished():
-                    has_finished = True
-                    # set all tokens after finished token to -1 and break
-                    accept_index[i, j + 1 :] = -1
-                    break
-            # Update KV cache tracking for the accepted tokens
-            req.kv_committed_len += num_accept_tokens
-            req.kv_allocated_len = req.kv_committed_len
-            if not req.finished():
-                unfinished_index.append(i)
-                if idx == -1:
-                    unfinished_accept_index.append(accept_index[i, :j])
-                else:
-                    unfinished_accept_index.append(accept_index[i])
-            req.spec_verify_ct += 1
-            num_correct_drafts_this_req = (
-                sum(1 for idx in accept_index_row if idx != -1) - 1
-            )
-            req.spec_num_correct_drafts += num_correct_drafts_this_req
-            req.update_spec_correct_drafts_histogram(num_correct_drafts_this_req)
-
-        if has_finished:
-            num_correct_drafts = (accept_index != -1).sum(dim=1) - 1
-
-        # Free the KV cache for unaccepted tokens
-        # TODO: fuse them
-        accept_index = accept_index[accept_index != -1]
-        accept_tokens = predict[accept_index]
-        maybe_detect_oob(
-            accept_tokens,
-            0,
-            batch.model_config.vocab_size,
-            "eagle verify accept_tokens",
-        )
-        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-        evict_mask[accept_index] = False
-        num_correct_drafts_cpu = num_correct_drafts.cpu()
-        num_accept_tokens_cpu = num_correct_drafts_cpu + 1
-        # FIXME: this `tolist()` fixes the numerical calculation consistency
-        # try to unify the tensor representation and list representation
-        num_correct_drafts_list = num_correct_drafts_cpu.tolist()
-        num_accept_tokens_list = num_accept_tokens_cpu.tolist()
-
-        if page_size == 1:
-            # TODO: boolean array index leads to a device sync. Remove it.
-            token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-        else:
-            if self.topk == 1:
-                # Only evict full empty page. Do not evict partial empty page
-                align_evict_mask_to_page_size[len(batch.seq_lens),](
-                    batch.seq_lens,
-                    evict_mask,
-                    page_size,
-                    self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
-                )
-                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-            else:
-                # Shift the accepted tokens to the beginning.
-                # Only evict the last part
-                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    accept_index,
-                    num_correct_drafts,
-                    self.draft_token_num,
-                    page_size,
-                )
-                to_free_slots = torch.empty(
-                    (to_free_num_slots.sum().item(),),
-                    dtype=torch.int64,
-                    device=to_free_num_slots.device,
-                )
-
-                # out_cache_loc: [0  1  2,  3  4  5,  6  7  8]
-                # accept_index:  [0 -1  2,  3  4 -1,  6 -1 -1]
-                # tgt_cache_loc: [0  1   ,  3  4   ,  6      ]
-                # to_free_slots: [      2,        5,     7  8]
-                # to_free_slots also needs to be page-aligned without the first partial page
-                #
-                # split each row of out_cache_loc into two parts.
-                # 1. the first part goes to tgt_cache_loc. length = num_correct_drafts[i] + 1
-                # 2. the second part goes to to_free_slots.
-                get_target_cache_loc[(bs,)](
-                    tgt_cache_loc,
-                    to_free_slots,
-                    num_correct_drafts,
-                    to_free_num_slots,
-                    batch.out_cache_loc,
-                    self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
-                    next_power_of_2(bs),
-                )
-
-                # Free the kv cache
-                token_to_kv_pool_allocator.free(to_free_slots)
-
-                # Copy the kv cache
-                batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-                    tgt_cache_loc, src_cache_loc
-                )
-
-        # Construct EagleVerifyOutput
-        if not has_finished:
-            if page_size == 1 or self.topk == 1:
-                batch.out_cache_loc = batch.out_cache_loc[accept_index]
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    batch.req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.seq_lens + num_correct_drafts + 1,
-                    batch.out_cache_loc,
-                    bs,
-                )
-            else:
-                batch.out_cache_loc = tgt_cache_loc
-            batch.seq_lens.add_(num_correct_drafts + 1)
-            batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
-
-            draft_extend_input = EagleDraftExtendInput(
-                hidden_states=(
-                    batch.spec_info.hidden_states[accept_index]
-                    if batch.spec_info.hidden_states is not None
-                    else None
-                ),
-                num_correct_drafts=num_correct_drafts,
-                num_accept_tokens=num_correct_drafts + 1,
-                num_accept_tokens_cpu=num_accept_tokens_list,
-                input_ids=accept_tokens,
-                seq_lens=batch.seq_lens,
-                seq_lens_cpu=batch.seq_lens_cpu,
-                req_pool_indices=batch.req_pool_indices,
-            )
-
-            return EagleVerifyOutput(
-                draft_extend_input=draft_extend_input,
-                logits_output=logits_output,
-                accept_tokens=accept_tokens,
-                num_correct_drafts_per_req_cpu=num_correct_drafts_list,
-                accept_indices=accept_index,
-            )
-        else:
-            if page_size == 1 or self.topk == 1:
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    batch.req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.seq_lens + num_correct_drafts + 1,
-                    batch.out_cache_loc[accept_index],
-                    bs,
-                )
-                batch.seq_lens.add_(num_correct_drafts + 1)
-                batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
-
-            if len(unfinished_accept_index) > 0:
-                unfinished_accept_index = torch.cat(unfinished_accept_index)
-                unfinished_index_device = torch.tensor(
-                    unfinished_index, dtype=torch.int64, device=predict.device
-                )
-                draft_input_num_correct_drafts_cpu = [
-                    num_correct_drafts_list[i] for i in unfinished_index
-                ]
-                draft_input_num_accept_tokens_cpu = [
-                    num_accept_tokens_list[i] for i in unfinished_index
-                ]
-                if page_size == 1 or self.topk == 1:
-                    batch.out_cache_loc = batch.out_cache_loc[unfinished_accept_index]
-                else:
-                    batch.out_cache_loc = torch.empty(
-                        len(unfinished_index) + sum(draft_input_num_correct_drafts_cpu),
-                        dtype=torch.int64,
-                        device=predict.device,
-                    )
-                    num_accept_tokens_filter = create_num_accept_tokens_filter(
-                        num_correct_drafts,
-                        unfinished_index_device,
-                        batch.seq_lens,
-                    )
-                    batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
-                    filter_finished_cache_loc_kernel[(bs,)](
-                        batch.out_cache_loc,
-                        tgt_cache_loc,
-                        num_correct_drafts,
-                        num_accept_tokens_filter,
-                        next_power_of_2(bs),
-                        next_power_of_2(self.draft_token_num),
-                    )
-
-                unfinished_num_correct_drafts = num_correct_drafts[
-                    unfinished_index_device
-                ]
-                draft_extend_input = EagleDraftExtendInput(
-                    hidden_states=(
-                        batch.spec_info.hidden_states[unfinished_accept_index]
-                        if batch.spec_info.hidden_states is not None
-                        else None
-                    ),
-                    num_accept_tokens_cpu=draft_input_num_accept_tokens_cpu,
-                    num_correct_drafts=unfinished_num_correct_drafts,
-                    num_accept_tokens=unfinished_num_correct_drafts + 1,
-                    input_ids=predict[unfinished_accept_index],
-                    seq_lens=batch.seq_lens[unfinished_index_device],
-                    seq_lens_cpu=batch.seq_lens_cpu[unfinished_index],
-                    req_pool_indices=batch.req_pool_indices[unfinished_index_device],
-                )
-            else:
-                # hidden_size=None: worker fixup rebuilds via
-                # EagleDraftExtendInput.hidden_size_for(worker) (single source).
-                draft_extend_input = EagleDraftExtendInput.create_idle_input(
-                    device=batch.device,
-                    hidden_size=None,
-                    dtype=None,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
-                )
-
-            return EagleVerifyOutput(
-                draft_extend_input=draft_extend_input,
-                logits_output=logits_output,
-                accept_tokens=accept_tokens,
-                num_correct_drafts_per_req_cpu=num_correct_drafts_list,
-                accept_indices=accept_index,
-            )
 
 
 @dataclass
@@ -935,8 +451,8 @@ class EagleDraftExtendInput(SpecInput):
             num_accept_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             num_accept_tokens_cpu=[],
             input_ids=torch.empty((0,), device=device, dtype=torch.long),
-            seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
-            seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
+            seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
             req_pool_indices=torch.empty((0,), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
         )
@@ -1007,42 +523,3 @@ class EagleDraftExtendInput(SpecInput):
             req_to_token.size(1),
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
-
-
-@dataclass
-class EagleVerifyOutput:
-    # Next iter's draft-extend input, installed as `batch.spec_info` for the
-    # draft-extend forward.
-    draft_extend_input: EagleDraftExtendInput
-    # Logit outputs from target worker.
-    logits_output: LogitsProcessorOutput
-    # All accepted tokens flat across all reqs incl. those that finished this
-    # step. Includes the bonus token. Used for output processing.
-    accept_tokens: torch.Tensor
-    # Accepted token length per sequence in a batch in CPU (full set).
-    num_correct_drafts_per_req_cpu: List[int]
-    # Accepted indices from logits_output.next_token_logits
-    accept_indices: torch.Tensor
-    # Whether the target verify forward ran a captured cuda graph. Set by
-    # the worker after `EagleVerifyInput.sample` returns; default kept so
-    # idle / direct constructions don't have to pass it.
-    can_run_cuda_graph: bool = False
-
-    @classmethod
-    def create_idle(
-        cls,
-        *,
-        draft_extend_input: EagleDraftExtendInput,
-        logits_output: LogitsProcessorOutput,
-        device: torch.device,
-        spec_steps: int,
-    ) -> "EagleVerifyOutput":
-        return cls(
-            draft_extend_input=draft_extend_input,
-            logits_output=logits_output,
-            accept_tokens=torch.empty(0, dtype=torch.long, device=device),
-            num_correct_drafts_per_req_cpu=[],
-            accept_indices=torch.full(
-                (0, spec_steps + 1), -1, dtype=torch.int32, device=device
-            ),
-        )

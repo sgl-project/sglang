@@ -86,7 +86,10 @@ def _make_param_like(
     try:
         new_param = cls.__new__(cls, tensor, requires_grad=False)
     except TypeError:
-        new_param = cls.__new__(cls, tensor)
+        try:
+            new_param = cls.__new__(cls, tensor)
+        except TypeError:
+            new_param = nn.Parameter(tensor, requires_grad=False)
     new_param.__dict__.update(actual_param.__dict__)
     new_param.requires_grad = False
     return new_param
@@ -583,10 +586,15 @@ def load_model_from_full_model_state_dict(
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
 
-        requires_grad = False
-        sharded_sd[target_param_name] = nn.Parameter(
-            sharded_tensor, requires_grad=requires_grad
-        )
+        actual_param = param_dict.get(target_param_name)
+        if actual_param is not None:
+            sharded_sd[target_param_name] = _make_param_like(
+                actual_param, sharded_tensor
+            )
+        else:
+            sharded_sd[target_param_name] = nn.Parameter(
+                sharded_tensor, requires_grad=False
+            )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
 
