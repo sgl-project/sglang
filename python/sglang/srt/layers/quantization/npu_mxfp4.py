@@ -68,7 +68,7 @@ class NPUMxfp4Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict) -> "NPUMxfp4Config":
+    def from_config(cls, config: Dict) -> NPUMxfp4Config:
         ignored_layers = cls.get_from_keys_or(
             config, ["ignored_layers", "modules_to_not_convert"], None
         )
