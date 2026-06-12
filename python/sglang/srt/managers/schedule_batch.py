@@ -694,7 +694,10 @@ class Req(ReqDllmMixin):
             if origin_input_ids_unpadded
             else self.origin_input_ids
         )  # Before image padding
-        # Each decode stage's output ids
+        # Each decode stage's output ids. Append-only by contract:
+        # _refresh_fill_ids infers how many output tokens are already in
+        # full_untruncated_fill_ids from lengths alone, so in-place rewrites
+        # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
