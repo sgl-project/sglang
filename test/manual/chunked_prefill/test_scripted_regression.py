@@ -500,7 +500,7 @@ class TestRegressionGptOss(ScriptedTestCase):
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         model_path="openai/gpt-oss-20b",
         mem_fraction_static=0.70,
-        disable_piecewise_cuda_graph=True,
+        disable_prefill_cuda_graph=True,
     )
 
     def test_chunked_stash_bounded_by_kv_committed_len(self):
