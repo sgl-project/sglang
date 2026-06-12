@@ -159,6 +159,7 @@ class MoonViTEncoderLayer(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
+            max_seqlen=max_seqlen,
         )
 
         hidden_states = residual + hidden_states
@@ -478,7 +479,7 @@ class MoonViT3dEncoder(nn.Module):
             )
         )
 
-        max_seqlen = lengths.max()
+        max_seqlen = int(lengths.max().item())
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
         for block in self.blocks:
