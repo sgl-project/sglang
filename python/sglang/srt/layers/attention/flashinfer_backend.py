@@ -1362,7 +1362,8 @@ class FlashInferIndicesUpdaterPrefill:
                     device=seq_lens.device, dtype=seq_lens.dtype
                 )
             )
-        window_size = seq_lens.new_tensor(self.sliding_window_size)
+        sliding_window_size = self.sliding_window_size
+        assert sliding_window_size is not None
         for wrapper_id in range(2):
             swa_paged_custom_mask = None
             if wrapper_id == 0:
@@ -1370,7 +1371,9 @@ class FlashInferIndicesUpdaterPrefill:
                     # K for extend tokens is written after the paged wrapper runs, so
                     # the paged wrapper sees prefix-only. Trim to the last `window` tokens
                     # (required for SWATokenToKVPoolAllocator; also keeps mask O(window)).
-                    effective_start = torch.clamp(prefix_lens - window_size, min=0)
+                    effective_start = torch.clamp(
+                        prefix_lens - sliding_window_size, min=0
+                    )
                     paged_kernel_lens = prefix_lens - effective_start
                     paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = effective_start
@@ -1381,7 +1384,7 @@ class FlashInferIndicesUpdaterPrefill:
                     # window attention use paged only
                     paged_kernel_lens = torch.minimum(
                         seq_lens,
-                        window_size + seq_lens - prefix_lens,
+                        sliding_window_size + seq_lens - prefix_lens,
                     )
                     paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
