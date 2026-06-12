@@ -53,7 +53,7 @@ class PlanInput:
         *,
         bs_capacity: int,
         device: torch.device,
-    ) -> "PlanInput":
+    ) -> PlanInput:
         return cls(
             req_pool_indices=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
             prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
@@ -63,7 +63,7 @@ class PlanInput:
             ),
         )
 
-    def fill_from_forward_batch(self, *, forward_batch: "ForwardBatch") -> None:
+    def fill_from_forward_batch(self, *, forward_batch: ForwardBatch) -> None:
         req_pool_indices = forward_batch.req_pool_indices
         bs = int(req_pool_indices.shape[0])
         capacity = int(self.req_pool_indices.shape[0])
@@ -92,7 +92,7 @@ class PlanInput:
 
 def _extract_prefix_lens_and_extend_seq_lens(
     *,
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     out_prefix_lens: torch.Tensor,
     out_extend_seq_lens: torch.Tensor,
     bs: int,
