@@ -86,7 +86,7 @@ class RadixKey:
         else:
             yield from self.token_ids
 
-    def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
+    def __getitem__(self, idx: Union[int, slice]) -> RadixKey:
         # Normalize int -> 1-element slice so the rest handles one shape.
         if isinstance(idx, int):
             if idx < 0:
@@ -109,7 +109,7 @@ class RadixKey:
         preview = self.token_ids[:10]
         return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
 
-    def page_aligned(self, page_size: int) -> "RadixKey":
+    def page_aligned(self, page_size: int) -> RadixKey:
         if page_size == 1:
             return self
         aligned_len = len(self) // page_size * page_size
@@ -119,7 +119,7 @@ class RadixKey:
         self,
         is_eagle: bool,
         value: Optional[torch.Tensor] = None,
-    ) -> Tuple["RadixKey", Optional[torch.Tensor]]:
+    ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
         # O(1): flip the bigram flag instead of materializing a tuple list.
         # value is paired with raw tokens and gets truncated to the bigram count.
         if is_eagle and not self.is_bigram:
@@ -128,14 +128,14 @@ class RadixKey:
                 value = value[: len(self)]
         return self, value
 
-    def _check_compatible(self, other: "RadixKey") -> None:
+    def _check_compatible(self, other: RadixKey) -> None:
         if self.extra_key != other.extra_key:
             raise ValueError(
                 f"RadixKey operations require matching extra_key, but got "
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
-    def match(self, other: "RadixKey", page_size: int = 1) -> int:
+    def match(self, other: RadixKey, page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
@@ -257,7 +257,7 @@ class TreeNode:
 
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
-    def __lt__(self, other: "TreeNode"):
+    def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
 

@@ -18,7 +18,7 @@ class TokenOracleManager:
     def fill_expected_inputs(
         self,
         *,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         expected_inputs_out: ExpectedInputs,
     ) -> None:
         positions = forward_batch.positions
@@ -57,7 +57,7 @@ class TokenOracleManager:
 
 def _build_generalized_req_id_per_token(
     *,
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     num_tokens: int,
     generalized_req_ids_per_row: torch.Tensor,
 ) -> torch.Tensor:

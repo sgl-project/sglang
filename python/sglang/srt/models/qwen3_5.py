@@ -970,8 +970,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if _is_hip:
+                from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                    sigmoid_gate_mul,
+                )
+
+                attn_output = sigmoid_gate_mul(attn_output, gate)
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output

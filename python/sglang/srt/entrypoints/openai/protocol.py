@@ -615,7 +615,7 @@ class Tool(BaseModel):
     defer_loading: Optional[bool] = None
 
     @model_validator(mode="after")
-    def _propagate_defer_loading(self) -> "Tool":
+    def _propagate_defer_loading(self) -> Tool:
         if self.defer_loading is not None and self.function.defer_loading is None:
             self.function.defer_loading = self.defer_loading
         return self
@@ -1223,7 +1223,7 @@ class TokenizeRequest(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_tokenize_input(self) -> "TokenizeRequest":
+    def validate_tokenize_input(self) -> TokenizeRequest:
         if (self.prompt is None) == (self.messages is None):
             raise ValueError("Exactly one of 'prompt' or 'messages' must be provided.")
         return self
@@ -1471,7 +1471,7 @@ class ResponsesResponse(BaseModel):
         ],
         status: str,
         usage: Optional[UsageInfo],
-    ) -> "ResponsesResponse":
+    ) -> ResponsesResponse:
         """Create a response from a request."""
 
         # Determine if the output is plain text only to set text.format

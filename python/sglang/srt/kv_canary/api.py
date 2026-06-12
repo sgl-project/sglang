@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 
 def install_canary(
     *,
-    server_args: "ServerArgs",
-    model_runner: "ModelRunner",
-    token_oracle_manager: Optional["TokenOracleManager"] = None,
+    server_args: ServerArgs,
+    model_runner: ModelRunner,
+    token_oracle_manager: Optional[TokenOracleManager] = None,
 ) -> Optional[CanaryManager]:
     config = CanaryConfig.from_env(server_args)
     if config.mode is CanaryMode.NONE:
@@ -101,9 +101,7 @@ def install_canary(
     return manager
 
 
-def _patch_model_forward(
-    *, model_runner: "ModelRunner", manager: CanaryManager
-) -> None:
+def _patch_model_forward(*, model_runner: ModelRunner, manager: CanaryManager) -> None:
     def _with_canary_bracketing(original: Callable, *args: Any, **kwargs: Any) -> Any:
         forward_batch = _extract_forward_batch(args, kwargs)
         assert (

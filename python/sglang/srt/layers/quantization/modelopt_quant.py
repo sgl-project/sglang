@@ -325,7 +325,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         return []
 
     def apply_weight_name_mapper(
-        self, hf_to_sglang_mapper: "WeightsMapper"
+        self, hf_to_sglang_mapper: WeightsMapper
     ):  # noqa: B027
         # Map excluded module patterns from HF layout to sglang layout.
         # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
@@ -613,7 +613,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
         quantized_layers: Dict[str, Dict[str, Any]],
         fp8_config: ModelOptFp8Config,
-        nvfp4_config: "ModelOptFp4Config",
+        nvfp4_config: ModelOptFp4Config,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
@@ -641,7 +641,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         return ModelOptFp4Config.get_min_capability()
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "ModelOptMixedPrecisionConfig":
+    def from_config(cls, config: Dict[str, Any]) -> ModelOptMixedPrecisionConfig:
         kv_cache_quant_algo = None
         exclude_modules = None
         quantized_layers = {}
@@ -712,7 +712,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             nvfp4_config=nvfp4_config,
         )
 
-    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         super().apply_weight_name_mapper(hf_to_sglang_mapper)
         if self.quantized_layers:
             self.quantized_layers = hf_to_sglang_mapper.apply_dict(

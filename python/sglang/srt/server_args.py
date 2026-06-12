@@ -1777,14 +1777,6 @@ class ServerArgs:
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
-            if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
-                    # standalonedraft model and cuda graphs
-                    reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
-                    # eagle draft models and cuda graphs
-                    reserved_mem += 4 * 1024
-
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
                 if gpu_mem is not None
@@ -2542,7 +2534,7 @@ class ServerArgs:
                     self.attention_backend = default_attention_backend
 
             prefill_backend, decode_backend = self.get_attention_backends()
-            accepted_backends = ("trtllm_mha", "triton", "intel_xpu")
+            accepted_backends = ("trtllm_mha", "triton", "ascend", "intel_xpu")
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
@@ -2910,7 +2902,7 @@ class ServerArgs:
                     else:
                         raise ValueError(
                             f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
-                            "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
+                            "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer."
                         )
 
     def _handle_sampling_backend(self):
@@ -3660,22 +3652,6 @@ class ServerArgs:
             assert (
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
-
-        # TODO(yuwei): Fix piecewise cuda graph support for bypassed topk MoE backends.
-        # Exception: GptOssForCausalLM wraps the entire MoE block in its own
-        # custom op (moe_impl), so bypassed topk is handled inside the op body.
-        if (
-            (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked
-            and self.moe_runner_backend in ("flashinfer_trtllm", "flashinfer_mxfp4")
-            and self.get_model_config().hf_config.architectures[0]
-            != "GptOssForCausalLM"
-        ):
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            logger.info(
-                f"Piecewise cuda graph is disabled for MoE runner backend "
-                f"'{self.moe_runner_backend}' (bypassed topk is incompatible "
-                f"with torch.compile)."
-            )
 
     def cutedsl_moe_max_num_tokens(self) -> int:
         """Largest number of tokens a single forward routes through a CuteDSL

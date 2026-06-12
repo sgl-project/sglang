@@ -46,12 +46,14 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils.common import is_gfx95_supported
+
 # OPUS gfx950 paged-prefill kernel is preferred when importable; otherwise fall
 # back to the Triton implementation below.
 try:
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
 
-    _HAS_OPUS = True
+    _HAS_OPUS = is_gfx95_supported()
 except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False

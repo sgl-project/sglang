@@ -241,8 +241,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,
-                attr_name=self.attr_name[AttentionArch.MLA],
-                attr_type=self.attr_type[AttentionArch.MLA],
+                attr_name=self._get_update_attr_name(),
+                attr_type=self._get_update_attr_type(),
             )
         else:
             output = self.backend.replay(graph_key, forward_batch)

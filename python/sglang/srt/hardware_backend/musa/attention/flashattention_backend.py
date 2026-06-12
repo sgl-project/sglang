@@ -39,11 +39,11 @@ _MATE_NO_MLA_SCHEDULER_METADATA_DICT: dict = {}
 _MATE_NO_MLA_SCHEDULER_METADATA_LOCK = threading.Lock()
 
 # Global reference to the current backend instance (set during __init__)
-_CURRENT_BACKEND: Optional["MusaFlashAttentionBackend"] = None
+_CURRENT_BACKEND: Optional[MusaFlashAttentionBackend] = None
 
 
 def _compute_scheduler_metadata(
-    backend: "MusaFlashAttentionBackend",
+    backend: MusaFlashAttentionBackend,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k_new: Optional[torch.Tensor],
     cache_seqlens: torch.Tensor,

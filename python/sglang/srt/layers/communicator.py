@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
+    dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
     get_attention_cp_rank,
@@ -448,6 +449,7 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        force_layernorm_before_dp_gather: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -455,8 +457,12 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
 
         self._context = CommunicateContext.init_new()
+        self._context.force_layernorm_before_dp_gather = (
+            force_layernorm_before_dp_gather
+        )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
@@ -787,6 +793,7 @@ class CommunicateContext:
     tp_size: int
     cache = None
     tp_rank: int
+    force_layernorm_before_dp_gather: bool = False
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -1029,9 +1036,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
-            use_layer_norm_before_gather = context.attn_tp_size == 1
+            use_layer_norm_before_gather = (
+                context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
+            )
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
+                if context.attn_tp_size > 1:
+                    hidden_states = attention_tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
@@ -1044,7 +1056,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            if use_layer_norm_before_gather:
+                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            else:
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
 
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)

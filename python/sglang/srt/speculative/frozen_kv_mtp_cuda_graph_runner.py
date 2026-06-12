@@ -98,7 +98,7 @@ class FrozenKVMTPCudaGraphRunner:
             self.draft_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         seq_lens_cpu = torch.full(
-            (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int32
+            (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int64
         )
 
         if self.enable_torch_compile:
@@ -109,7 +109,7 @@ class FrozenKVMTPCudaGraphRunner:
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
             seq_lens = torch.full(
-                (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int64
             )
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
