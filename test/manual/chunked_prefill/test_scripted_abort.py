@@ -5,6 +5,7 @@ from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    chunked_req_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
@@ -449,18 +450,18 @@ class TestAbortBasic(ScriptedTestCase):
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=250
         )
         yield from run_until(r, lambda h: h.is_chunking)
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 1
+        assert (1 if chunked_req_of(t.scheduler) is not None else 0) == 1
 
         t.abort(r)
         yield from _drain_until_released(t, r)
 
         for _ in range(12):
-            if t.scheduler.chunked_req is None and t.is_idle:
+            if chunked_req_of(t.scheduler) is None and t.is_idle:
                 break
             yield
 
         assert r.kv_pages == 0
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 0
+        assert (1 if chunked_req_of(t.scheduler) is not None else 0) == 0
         assert t.is_idle, "engine must be idle after the only chunked req is aborted"
 
     def test_chunked_req_then_abort_then_new_short_in_one_yield(self):
@@ -475,10 +476,10 @@ class TestAbortBasic(ScriptedTestCase):
         )
         yield from run_until(r1, lambda h: h.is_chunking)
         assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
+            chunked_req_of(t.scheduler).rid if chunked_req_of(t.scheduler) is not None else None
         ) == r1.rid, (
             f"r1 should hold the chunked slot before abort; got "
-            f"{(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
+            f"{(chunked_req_of(t.scheduler).rid if chunked_req_of(t.scheduler) is not None else None)!r}"
         )
 
         t.abort(r1)
@@ -486,7 +487,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r1)
 
         cur = (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
+            chunked_req_of(t.scheduler).rid if chunked_req_of(t.scheduler) is not None else None
         )
         assert cur != r1.rid, f"chunked slot still points to aborted r1; got {cur!r}"
         assert r1.kv_pages == 0
@@ -533,7 +534,7 @@ class TestAbortBasic(ScriptedTestCase):
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=281
         )
         yield from run_until(r1, lambda h: h.is_chunking)
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 1
+        assert (1 if chunked_req_of(t.scheduler) is not None else 0) == 1
 
         t.abort(r1)
         yield from _drain_until_released(t, r1)

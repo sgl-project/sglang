@@ -4,6 +4,7 @@ from typing import Optional
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    chunked_req_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
@@ -20,7 +21,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 def _load_inquirer_pending_for_rid(t: ScriptedContext, rid: str) -> int:
     s = t.scheduler
-    chunked = s.chunked_req
+    chunked = chunked_req_of(s)
     if chunked is not None and chunked.rid == rid:
         return chunked.seqlen - len(chunked.prefix_indices)
     for req in s.waiting_queue:
@@ -98,13 +99,13 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
         t.abort(r)
         for _ in range(12):
-            if t.scheduler.chunked_req is None and r.kv_pages == 0 and r.lock_refs == 0:
+            if chunked_req_of(t.scheduler) is None and r.kv_pages == 0 and r.lock_refs == 0:
                 break
             yield
 
         assert (
-            t.scheduler.chunked_req is None
-        ), f"abort must clear the chunked slot; got {t.scheduler.chunked_req!r}"
+            chunked_req_of(t.scheduler) is None
+        ), f"abort must clear the chunked slot; got {chunked_req_of(t.scheduler)!r}"
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -121,8 +122,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
                 cur = (
-                    t.scheduler.chunked_req.rid
-                    if t.scheduler.chunked_req is not None
+                    chunked_req_of(t.scheduler).rid
+                    if chunked_req_of(t.scheduler) is not None
                     else None
                 )
                 assert cur in (None, r.rid), (
@@ -137,7 +138,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert r.finished
         assert saw_match, "getter must return r.rid at least once while r.is_chunking"
         assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
+            chunked_req_of(t.scheduler).rid if chunked_req_of(t.scheduler) is not None else None
         ) is None
 
     @unittest.skip(
@@ -258,8 +259,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield
 
         assert (
-            t.scheduler.chunked_req is None
-        ), f"pause(retract) must clear chunked_req; got {t.scheduler.chunked_req!r}"
+            chunked_req_of(t.scheduler) is None
+        ), f"pause(retract) must clear chunked_req; got {chunked_req_of(t.scheduler)!r}"
         assert not r.finished, "retract must re-queue r, not finish or abort it"
         assert r.status == "waiting", (
             f"retracted chunked req must return to the waiting queue; "
@@ -324,7 +325,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         saw_chunking = False
         saw_dedup = False
         for _ in range(DEFAULT_MAX_STEPS):
-            chunked = t.scheduler.chunked_req
+            chunked = chunked_req_of(t.scheduler)
             if r.is_chunking and chunked is not None and chunked.rid == r.rid:
                 saw_chunking = True
                 pending = _load_inquirer_pending_for_rid(t, r.rid)
@@ -366,7 +367,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
-            chunked = s.chunked_req
+            chunked = chunked_req_of(s)
             if r.is_chunking and chunked is not None and chunked.rid == r.rid:
                 assert len(s.waiting_queue) == 0, (
                     "test requires an empty waiting_queue so the chunked req is "
@@ -401,7 +402,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
-            chunked = s.chunked_req
+            chunked = chunked_req_of(s)
             if (
                 r.is_chunking
                 and chunked is not None
@@ -516,8 +517,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert r.finished
         assert saw_chunking, "req should have occupied the chunked_req slot mid-chunk"
         assert (
-            s.chunked_req is None
-        ), f"chunked_req slot must clear after last chunk; got {s.chunked_req!r}"
+            chunked_req_of(s) is None
+        ), f"chunked_req slot must clear after last chunk; got {chunked_req_of(s)!r}"
 
     def test_second_chunked_admit_blocked_when_chunked_req_set(self):
         self.server.execute_script(

@@ -3,6 +3,7 @@ import unittest
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    chunked_req_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
@@ -285,7 +286,7 @@ class TestRegressionBasic(ScriptedTestCase):
             f"f38e69f87d: pause(retract) must re-queue the retracted "
             f"chunked-resume req; got status={r.status!r}"
         )
-        assert t.scheduler.chunked_req is None
+        assert chunked_req_of(t.scheduler) is None
         assert t.scheduler.running_batch.is_empty()
 
         t.continue_generation()
@@ -311,7 +312,7 @@ class TestRegressionBasic(ScriptedTestCase):
             f"{len(t.scheduler.running_batch.reqs)}"
         )
         assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
+            chunked_req_of(t.scheduler).rid if chunked_req_of(t.scheduler) is not None else None
         ) is None
         for r in (r1, r2):
             assert r.status == "waiting"
