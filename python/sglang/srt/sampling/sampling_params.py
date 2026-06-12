@@ -68,17 +68,25 @@ class SamplingParams(msgspec.Struct, kw_only=True):
     stream_interval: Optional[int] = None
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
+    is_normalized: bool = False
 
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers
         # (e.g. /generate) can pass null without crashing verify().
-        self.stop_strs = self.stop or []
+
+        # Since the __post_init__ is called after msgpack deserialization,
+        # we try to avoid init again to reset the values.
+        if self.is_normalized:
+            return
+
+        self.stop_strs = self.stop
+        self.stop_regex_strs = self.stop_regex
+
         if self.stop_token_ids:
             filtered = {int(t) for t in self.stop_token_ids if t is not None}
             self.stop_token_ids = filtered or None
         else:
             self.stop_token_ids = None
-        self.stop_regex_strs = self.stop_regex or []
         self.temperature = self.temperature if self.temperature is not None else 1.0
         self.top_p = self.top_p if self.top_p is not None else 1.0
         self.top_k = self.top_k if self.top_k is not None else -1
@@ -209,6 +217,8 @@ class SamplingParams(msgspec.Struct, kw_only=True):
                 )
 
             self.stop_regex_max_len = stop_regex_max_len
+
+        self.is_normalized = True
 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need
