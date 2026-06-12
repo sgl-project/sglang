@@ -15,8 +15,8 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.models import VAEConfig
 from sglang.multimodal_gen.runtime.distributed import (
-    get_decode_parallel_rank,
-    get_decode_parallel_world_size,
+    get_sp_parallel_rank,
+    get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -118,7 +118,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         if (
             self.use_tiling
             and self.use_parallel_tiling
-            and get_decode_parallel_world_size() > 1
+            and get_sp_world_size() > 1
         ):
             return self.parallel_tiled_decode(z)[:, :, :num_sample_frames]
         if (
@@ -224,7 +224,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         """
         Parallel version of tiled_decode that distributes both temporal and spatial computation across GPUs
         """
-        world_size, rank = get_decode_parallel_world_size(), get_decode_parallel_rank()
+        world_size, rank = get_sp_world_size(), get_sp_parallel_rank()
         _, _, T, H, W = z.shape
 
         tile_latent_min_height = (
@@ -362,7 +362,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         return torch.cat(result_slices, dim=2)
 
     def parallel_patch_decode(self, z: torch.FloatTensor) -> torch.FloatTensor:
-        world_size, rank = get_decode_parallel_world_size(), get_decode_parallel_rank()
+        world_size, rank = get_sp_world_size(), get_sp_parallel_rank()
         if world_size <= 1:
             return self._decode(z)
 
