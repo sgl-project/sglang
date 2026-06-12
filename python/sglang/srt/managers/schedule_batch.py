@@ -710,7 +710,6 @@ class Req(ReqDllmMixin):
         # Each decode stage's output ids
         self.output_ids = array("q")
         self.phase: ReqPhase = ReqPhase.OTHERS
-        self.is_extend_intermediate: bool = False
         self.extend_range: Optional[Range] = None
         self.dllm_initialized: bool = False
 
@@ -1001,7 +1000,7 @@ class Req(ReqDllmMixin):
         if self.is_dllm() or self.phase != ReqPhase.EXTEND:
             return False
         assert self.extend_range.end > 0, f"{self.rid=} {self.extend_range=}"
-        return self.is_extend_intermediate
+        return self.extend_range.end < self.get_full_untruncated_fill_len()
 
     @property
     def is_prefill_only(self) -> bool:
@@ -1415,7 +1414,6 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.phase = ReqPhase.OTHERS
-        self.is_extend_intermediate = False
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -2031,9 +2029,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             req.extend_batch_idx += 1
             req.phase = ReqPhase.EXTEND
-            req.is_extend_intermediate = (
-                req.extend_range.end < req.get_full_untruncated_fill_len()
-            )
 
             # update req-level memory management fields
             req.kv_committed_len = seq_len

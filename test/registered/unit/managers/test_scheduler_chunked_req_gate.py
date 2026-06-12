@@ -37,7 +37,6 @@ def _make_req(
     req.req_pool_idx = req_pool_idx
     req.extend_range = Range(fill_len - extend_input_len, fill_len)
     req.phase = ReqPhase.EXTEND
-    req.is_extend_intermediate = True
     req.host_hit_length = 0
     req.cache_protected_len = 0
     req.skip_radix_cache_insert = False

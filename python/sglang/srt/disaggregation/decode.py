@@ -1413,10 +1413,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # This prebuilt path never goes through prepare_for_extend, so enter
         # the extend phase here; prepare_for_decode moves it to DECODE later.
         req.phase = ReqPhase.EXTEND
-        # Committed KV is always mid-stream here (output_ids run one token
-        # ahead of kv_committed_len), so keep counting as partially extended
-        # until prepare_for_decode flips the phase.
-        req.is_extend_intermediate = True
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1890,7 +1886,6 @@ class SchedulerDisaggregationDecodeMixin:
                     # so enter the extend phase here; prepare_for_decode moves
                     # it to DECODE later.
                     req.phase = ReqPhase.EXTEND
-                    req.is_extend_intermediate = True
             else:
                 waiting_queue.append(req)
 
