@@ -1118,6 +1118,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+                # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
+                spec_info.hidden_states = torch.zeros(
+                    (num_tokens, self.model_runner.model_config.hidden_size),
+                    dtype=self.model_runner.dtype,
+                    device=self.model_runner.device,
+                )
         elif self.model_runner.spec_algorithm.is_dflash():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
