@@ -276,7 +276,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
     if server_args.device == "cpu" and not server_args.disable_overlap_schedule:
         server_args.disable_overlap_schedule = True
         logger.warning(
-            "Overlap schedule is not implemented for speculative decoding on CPU."
+            "Overlap schedule is disabled for speculative decoding on CPU "
+            "(the overlap spec path is not supported on CPU yet)."
         )
 
     if server_args.disable_overlap_schedule:
