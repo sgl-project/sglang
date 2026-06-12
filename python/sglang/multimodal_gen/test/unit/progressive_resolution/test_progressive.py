@@ -26,6 +26,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     _flux2_pack,
     _flux2_unpack,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.ideogram import (
+    Ideogram4ProgressiveDenoisingStage,
+    _ideogram4_pack,
+    _ideogram4_unpack,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
     _qwen_image_pack,
     _qwen_image_unpack,
@@ -293,6 +298,7 @@ class TestProgressiveStageHelpers(unittest.TestCase):
     def test_model_specific_latent_scale_factors(self):
         flux2_stage = object.__new__(Flux2ProgressiveDenoisingStage)
         wan_stage = object.__new__(WanProgressiveDenoisingStage)
+        ideogram_stage = object.__new__(Ideogram4ProgressiveDenoisingStage)
 
         flux2_args = SimpleNamespace(
             pipeline_config=SimpleNamespace(
@@ -308,9 +314,13 @@ class TestProgressiveStageHelpers(unittest.TestCase):
                 )
             )
         )
+        ideogram_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(patch_size=2, ae_scale_factor=8)
+        )
 
         self.assertEqual(flux2_stage._latent_scale_factor(flux2_args), 16)
         self.assertEqual(wan_stage._latent_scale_factor(wan_args), 8)
+        self.assertEqual(ideogram_stage._latent_scale_factor(ideogram_args), 16)
 
 
 class TestLatentAdapters(unittest.TestCase):
@@ -352,6 +362,266 @@ class TestLatentAdapters(unittest.TestCase):
             stage._repack_latent(latent, 8, 8, SimpleNamespace(), SimpleNamespace()),
             latent,
         )
+
+
+class TestIdeogram4LatentAdapters(unittest.TestCase):
+    def test_row_major_roundtrip(self):
+        # [B, C, H, W] → pack → unpack → original
+        x = torch.arange(2 * 128 * 4 * 6, dtype=torch.float32).reshape(2, 128, 4, 6)
+
+        packed = _ideogram4_pack(x)
+
+        self.assertEqual(packed.shape, (2, 4 * 6, 128))
+        torch.testing.assert_close(_ideogram4_unpack(packed, 4, 6), x)
+
+    def test_pack_preserves_row_major_order(self):
+        # Each packed token at position [b, row*W + col] should equal x[b, :, row, col]
+        x = torch.arange(1 * 4 * 3 * 5, dtype=torch.float32).reshape(1, 4, 3, 5)
+        packed = _ideogram4_pack(x)
+
+        # token at spatial position (row=1, col=2) → flat index 1*5+2 = 7
+        torch.testing.assert_close(packed[0, 7], x[0, :, 1, 2])
+
+    def test_ideogram_matches_flux2_pack_unpack(self):
+        # Ideogram and FLUX.2 share the same row-major token layout
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux_2 import (
+            _flux2_pack,
+            _flux2_unpack,
+        )
+
+        x = torch.randn(2, 128, 5, 7)
+        torch.testing.assert_close(_ideogram4_pack(x), _flux2_pack(x))
+        packed = _ideogram4_pack(x)
+        torch.testing.assert_close(
+            _ideogram4_unpack(packed, 5, 7), _flux2_unpack(packed, 5, 7)
+        )
+
+
+class TestIdeogram4OnResolutionChange(unittest.TestCase):
+    """CPU-only test: _on_resolution_change rebuilds batch/ctx tensors correctly."""
+
+    _PATCH = 2
+    _AE = 8
+    _SCALE = 16  # patch * ae = 16
+    _IN_C = 128
+    _LLM_DIM = 64  # small stand-in for llm_features_dim
+
+    def _make_ideogram_extra(self, batch_size, grid_h, grid_w, max_text_tokens):
+        """Build a minimal batch.extra["ideogram4"] dict matching _prepare_denoising_loop."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ideogram import (
+            IMAGE_POSITION_OFFSET,
+            LLM_TOKEN_INDICATOR,
+            OUTPUT_IMAGE_INDICATOR,
+            SEQUENCE_PADDING_INDICATOR,
+        )
+
+        num_image_tokens = grid_h * grid_w
+        total_seq_len = max_text_tokens + num_image_tokens
+
+        h_idx = torch.arange(grid_h).view(-1, 1).expand(grid_h, grid_w).reshape(-1)
+        w_idx = torch.arange(grid_w).view(1, -1).expand(grid_h, grid_w).reshape(-1)
+        image_pos = (
+            torch.stack([torch.zeros_like(h_idx), h_idx, w_idx], dim=1)
+            + IMAGE_POSITION_OFFSET
+        )
+
+        position_ids = torch.zeros(batch_size, total_seq_len, 3, dtype=torch.long)
+        segment_ids = torch.full(
+            (batch_size, total_seq_len), SEQUENCE_PADDING_INDICATOR, dtype=torch.long
+        )
+        indicator = torch.zeros(batch_size, total_seq_len, dtype=torch.long)
+
+        for b in range(batch_size):
+            # simulate a single item with no text padding for simplicity
+            position_ids[b, :max_text_tokens] = (
+                torch.arange(max_text_tokens).unsqueeze(-1).expand(-1, 3)
+            )
+            position_ids[b, max_text_tokens:] = image_pos
+            segment_ids[b] = 1
+            indicator[b, :max_text_tokens] = LLM_TOKEN_INDICATOR
+            indicator[b, max_text_tokens:] = OUTPUT_IMAGE_INDICATOR
+
+        return {
+            "position_ids": position_ids,
+            "segment_ids": segment_ids,
+            "indicator": indicator,
+            "num_image_tokens": num_image_tokens,
+            "grid_h": grid_h,
+            "grid_w": grid_w,
+            "max_text_tokens": max_text_tokens,
+        }
+
+    def _make_ctx_extra(self, batch_size, num_image_tokens, max_text_tokens):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ideogram import (
+            OUTPUT_IMAGE_INDICATOR,
+        )
+
+        neg_llm_features = torch.zeros(batch_size, num_image_tokens, self._LLM_DIM)
+        attn_mask = torch.ones(
+            batch_size, max_text_tokens + num_image_tokens, dtype=torch.bool
+        )
+        neg_attn_mask = torch.ones(batch_size, num_image_tokens, dtype=torch.bool)
+        return {
+            "ideogram4_attn_mask": attn_mask,
+            "ideogram4_attn_mask_meta": None,
+            "ideogram4_neg_position_ids": torch.zeros(
+                batch_size, num_image_tokens, 3, dtype=torch.long
+            ),
+            "ideogram4_neg_segment_ids": torch.ones(
+                batch_size, num_image_tokens, dtype=torch.long
+            ),
+            "ideogram4_neg_indicator": torch.full(
+                (batch_size, num_image_tokens), OUTPUT_IMAGE_INDICATOR, dtype=torch.long
+            ),
+            "ideogram4_neg_attn_mask": neg_attn_mask,
+            "ideogram4_neg_attn_mask_meta": None,
+            "ideogram4_neg_llm_features": neg_llm_features,
+        }
+
+    def test_resolution_change_doubles_image_tokens(self):
+        B = 2
+        old_grid_h, old_grid_w = 4, 4
+        new_grid_h, new_grid_w = 8, 8
+        max_text_tokens = 10
+
+        stage = object.__new__(Ideogram4ProgressiveDenoisingStage)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                patch_size=self._PATCH, ae_scale_factor=self._AE
+            )
+        )
+
+        old_num_img = old_grid_h * old_grid_w  # 16
+        new_num_img = new_grid_h * new_grid_w  # 64
+        new_h_pixel = new_grid_h * self._SCALE
+        new_w_pixel = new_grid_w * self._SCALE
+
+        # Build fake ctx and batch
+        ctx = SimpleNamespace(
+            latents=torch.zeros(B, new_num_img, self._IN_C),
+            extra=self._make_ctx_extra(B, old_num_img, max_text_tokens),
+        )
+        batch = SimpleNamespace(
+            extra={
+                "ideogram4": self._make_ideogram_extra(
+                    B, old_grid_h, old_grid_w, max_text_tokens
+                )
+            }
+        )
+
+        stage._on_resolution_change(ctx, batch, server_args, new_h_pixel, new_w_pixel)
+
+        data = batch.extra["ideogram4"]
+        self.assertEqual(data["num_image_tokens"], new_num_img)
+        self.assertEqual(data["grid_h"], new_grid_h)
+        self.assertEqual(data["grid_w"], new_grid_w)
+        self.assertEqual(
+            data["position_ids"].shape, (B, max_text_tokens + new_num_img, 3)
+        )
+        self.assertEqual(data["segment_ids"].shape, (B, max_text_tokens + new_num_img))
+        self.assertEqual(data["indicator"].shape, (B, max_text_tokens + new_num_img))
+
+        # ctx.extra tensors updated to new sizes
+        self.assertEqual(
+            ctx.extra["ideogram4_attn_mask"].shape,
+            (B, max_text_tokens + new_num_img),
+        )
+        self.assertEqual(
+            ctx.extra["ideogram4_neg_position_ids"].shape, (B, new_num_img, 3)
+        )
+        self.assertEqual(
+            ctx.extra["ideogram4_neg_llm_features"].shape,
+            (B, new_num_img, self._LLM_DIM),
+        )
+
+    def test_text_portion_is_unchanged_after_resolution_change(self):
+        B = 1
+        old_grid_h, old_grid_w = 4, 4
+        new_grid_h, new_grid_w = 8, 8
+        max_text_tokens = 6
+
+        stage = object.__new__(Ideogram4ProgressiveDenoisingStage)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                patch_size=self._PATCH, ae_scale_factor=self._AE
+            )
+        )
+
+        old_data = self._make_ideogram_extra(B, old_grid_h, old_grid_w, max_text_tokens)
+        old_text_position_ids = old_data["position_ids"][:, :max_text_tokens].clone()
+        old_text_segment_ids = old_data["segment_ids"][:, :max_text_tokens].clone()
+        old_text_indicator = old_data["indicator"][:, :max_text_tokens].clone()
+
+        ctx = SimpleNamespace(
+            latents=torch.zeros(B, new_grid_h * new_grid_w, self._IN_C),
+            extra=self._make_ctx_extra(B, old_grid_h * old_grid_w, max_text_tokens),
+        )
+        batch = SimpleNamespace(extra={"ideogram4": old_data})
+
+        stage._on_resolution_change(
+            ctx,
+            batch,
+            server_args,
+            new_grid_h * self._SCALE,
+            new_grid_w * self._SCALE,
+        )
+
+        data = batch.extra["ideogram4"]
+        torch.testing.assert_close(
+            data["position_ids"][:, :max_text_tokens], old_text_position_ids
+        )
+        torch.testing.assert_close(
+            data["segment_ids"][:, :max_text_tokens], old_text_segment_ids
+        )
+        torch.testing.assert_close(
+            data["indicator"][:, :max_text_tokens], old_text_indicator
+        )
+
+    def test_image_position_ids_use_grid_coordinates(self):
+        B = 1
+        grid_h, grid_w = 4, 6
+        max_text_tokens = 4
+        scale = self._SCALE
+
+        stage = object.__new__(Ideogram4ProgressiveDenoisingStage)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                patch_size=self._PATCH, ae_scale_factor=self._AE
+            )
+        )
+
+        old_num_img = 2 * 3  # half the new grid
+        ctx = SimpleNamespace(
+            latents=torch.zeros(B, grid_h * grid_w, self._IN_C),
+            extra=self._make_ctx_extra(B, old_num_img, max_text_tokens),
+        )
+        batch = SimpleNamespace(
+            extra={
+                "ideogram4": self._make_ideogram_extra(
+                    B, grid_h // 2, grid_w // 2, max_text_tokens
+                )
+            }
+        )
+
+        stage._on_resolution_change(
+            ctx, batch, server_args, grid_h * scale, grid_w * scale
+        )
+
+        img_pos = batch.extra["ideogram4"]["position_ids"][0, max_text_tokens:]
+        self.assertEqual(img_pos.shape, (grid_h * grid_w, 3))
+        # All t-coordinates (dim 0) should be IMAGE_POSITION_OFFSET (the t=0 term)
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ideogram import (
+            IMAGE_POSITION_OFFSET,
+        )
+
+        # t dimension (index 0) should be IMAGE_POSITION_OFFSET + 0
+        self.assertTrue((img_pos[:, 0] == IMAGE_POSITION_OFFSET).all())
+        # h dimension at row-major index row*grid_w + col should be IMAGE_POSITION_OFFSET + row
+        for row in range(grid_h):
+            for col in range(grid_w):
+                idx = row * grid_w + col
+                self.assertEqual(img_pos[idx, 1].item(), IMAGE_POSITION_OFFSET + row)
+                self.assertEqual(img_pos[idx, 2].item(), IMAGE_POSITION_OFFSET + col)
 
 
 if __name__ == "__main__":
