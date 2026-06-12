@@ -11,12 +11,11 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.mamba2_attention import (
     DEFAULT_CONV_KERNEL,
     DEFAULT_HEAD_DIM,
@@ -43,7 +42,6 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -166,12 +164,6 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
     # Layout-robustness. See dense/test_triton.py for the rationale.
     # Reuse the case generator's first two cases to avoid duplicating
     # all the Mamba2-specific config fields.
-    @unittest.skipIf(
-        is_hip(),
-        "interleaved_pages layout drives the causal_conv1d_fn path in "
-        "mamba/mamba.py, which is a CUDA-only conditional import "
-        "(NameError on ROCm). The other Mamba2 cases pass on AMD.",
-    )
     def test_layout_robustness_cases(self):
         cases = [
             self.CASES[0],  # extend exact-page (zero-prefix, multi-token)
