@@ -10,19 +10,19 @@ This guide describes the best practice data for Qwen3-Next-80B-A3B-Instruct on t
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 20ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-qwen3-next-80b-w8a8-2p-in3k5-out1k5-20ms) |
-| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 6K+1.5K | 15.62ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-qwen3-next-80b-w8a8-2p-in6k-out1k5-bs16) |
+| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 20ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in3k5-out1k5-20ms) |
+| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 6K+1.5K | 15.62ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in6k-out1k5-bs16) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-qwen3-next-80b-w8a8-2p-in3k5-out1k5-50ms) |
+| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in3k5-out1k5-50ms) |
 
 
 ## Optimal Configuration
 
-### Qwen3-Next-80B-A3B-Instruct QWEN3 NEXT 80B W8A8 2P IN3K5 OUT1K5 20ms
+### Qwen3-Next-80B-A3B-Instruct W8A8 2P IN3K5 OUT1K5 20ms
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
 
@@ -133,7 +133,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### Qwen3-Next-80B-A3B-Instruct QWEN3 NEXT 80B W8A8 2P IN3K5 OUT1K5 50ms
+### Qwen3-Next-80B-A3B-Instruct W8A8 2P IN3K5 OUT1K5 50ms
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
 
@@ -247,7 +247,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### Qwen3-Next-80B-A3B-Instruct QWEN3 NEXT 80B W8A8 2P IN6K OUT1K5 BS16
+### Qwen3-Next-80B-A3B-Instruct W8A8 2P IN6K OUT1K5 BS16
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
 
