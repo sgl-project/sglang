@@ -20,7 +20,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.configs.model_config import (
+    get_mimo_v2_fused_qkv_expected_tp_size,
+    is_mimo_v2_fused_qkv_plain_layout,
+)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -94,7 +97,11 @@ logger = logging.getLogger(__name__)
 
 
 def load_mimo_v2_qkv_proj_weight(
-    name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
+    name,
+    param,
+    loaded_weight,
+    expected_fused_tp_size: Optional[int] = None,
+    plain_layout: bool = False,
 ):
     if loaded_weight.shape == param.shape:
         # The checkpoint already stores this rank's qkv_proj shard.
@@ -106,6 +113,22 @@ def load_mimo_v2_qkv_proj_weight(
             f"qkv_proj weight {name}: unexpected shape {tuple(loaded_weight.shape)}; "
             f"expected sharded {tuple(param.shape)}"
         )
+
+    if plain_layout:
+        # The checkpoint stores fused qkv rows in plain [Q;K;V] order
+        # (transformers/ModelOpt re-exports). Blind row-chunking would assign
+        # Q rows to K/V slots on every rank (issue #24321); delegate to the
+        # QKVParallelLinear weight loader, which splits the fused tensor by
+        # section and shards each section per rank. This also lifts the
+        # attention-TP restriction of the interleaved format.
+        weight_loader = getattr(param, "weight_loader", None)
+        if weight_loader is None or weight_loader is default_weight_loader:
+            raise ValueError(
+                f"qkv_proj weight {name} is in plain [Q;K;V] layout but the "
+                "parameter has no QKVParallelLinear weight loader to shard it."
+            )
+        weight_loader(param, loaded_weight)
+        return
 
     tp_size = get_attention_tp_size()
     tp_rank = get_attention_tp_rank()
@@ -1385,7 +1408,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         self.config
                     )
                     load_mimo_v2_qkv_proj_weight(
-                        name, param, loaded_weight, expected_fused_tp_size
+                        name,
+                        param,
+                        loaded_weight,
+                        expected_fused_tp_size,
+                        plain_layout=is_mimo_v2_fused_qkv_plain_layout(self.config),
                     )
                 continue
 

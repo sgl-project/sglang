@@ -71,6 +71,48 @@ def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     return num_key_value_heads
 
 
+def is_mimo_v2_fused_qkv_plain_layout(hf_config) -> bool:
+    """Whether a MiMoV2 fused qkv_proj checkpoint stores rows in plain
+    [Q;K;V] order rather than the TP-interleaved order of the original
+    Pro release.
+
+    Both layouts declare attention_projection_layout='fused_qkv' and have
+    identical tensor shapes, so the row order cannot be inferred from the
+    weights. Checkpoints re-exported through transformers + ModelOpt (the
+    community quantization path) load the original weights with HF modeling
+    code, which de-interleaves qkv_proj in memory, and then serialize it in
+    plain [Q;K;V] order. Sharding such a checkpoint by blind row-chunking
+    assigns Q rows to K/V slots and produces degenerate output (issue
+    sgl-project/sglang#24321).
+
+    An explicit `fused_qkv_weight_order` config field ('plain' or
+    'interleaved', settable via --json-model-override-args) takes precedence
+    over the ModelOpt-provenance heuristic.
+    """
+    order = getattr(hf_config, "fused_qkv_weight_order", None)
+    if order is None:
+        text_config = getattr(hf_config, "text_config", None)
+        if text_config is not None:
+            order = getattr(text_config, "fused_qkv_weight_order", None)
+    if order is not None:
+        if order not in ("plain", "interleaved"):
+            raise ValueError(
+                f"MiMoV2 hf_config has unsupported fused_qkv_weight_order="
+                f"{order!r}; expected 'plain', 'interleaved', or unset."
+            )
+        return order == "plain"
+
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if quantization_config is not None:
+        if isinstance(quantization_config, dict):
+            quant_method = quantization_config.get("quant_method")
+        else:
+            quant_method = getattr(quantization_config, "quant_method", None)
+        if quant_method == "modelopt":
+            return True
+    return False
+
+
 class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
