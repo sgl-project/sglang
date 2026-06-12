@@ -825,6 +825,7 @@ def get_decode_parallel_world_size() -> int:
 def get_decode_parallel_rank() -> int:
     return get_decode_parallel_group_coordinator().rank_in_group
 
+
 def init_dit_group(
     dit_parallel_size: int,
     backend: str,
