@@ -10,14 +10,14 @@ This section describes the best practice data for DeepSeek-V3.2 on the Ascend NP
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 131.1K+1K | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-26ms) |
-| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 131.1K+1K | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs8) |
+| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-26ms) |
+| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs8) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 131.1K+1K | 107ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs16) |
+| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 107ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs16) |
 
 
 ## Optimal Configuration
@@ -34,7 +34,7 @@ This section describes the best practice data for DeepSeek-V3.2 on the Ascend NP
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 131.1K+1K
+**Dataset**: 128K+1K
 
 **TPOT**: 26ms
 
@@ -228,7 +228,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 131.1K+1K
+**Dataset**: 128K+1K
 
 **TPOT**: 107ms
 
@@ -422,7 +422,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 131.1K+1K
+**Dataset**: 128K+1K
 
 **TPOT**: 26ms
 

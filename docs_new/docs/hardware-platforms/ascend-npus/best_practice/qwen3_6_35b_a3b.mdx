@@ -16,10 +16,10 @@ This section describes the best practice data for Qwen3.6-35B-A3B on the Ascend 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 30+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1024x1024-30-out1024-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 30+256 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1080p-30-out256-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024_30+1024 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1024x1024-30-out1024-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1080p-30-out256-50ms) |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-50ms) |
-| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-prefix90-50ms) |
+| Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 128K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-prefix90-50ms) |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in3k5-out1k5-50ms) |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 1 | PD Mixed | 64K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-50ms) |
 | Qwen3.6-35B-A3B | Atlas 800I A3 | 2 | PD Mixed | 984K+1K | 40.91ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-35b-a3b-2p-in984k-out1k) |
@@ -39,7 +39,7 @@ This section describes the best practice data for Qwen3.6-35B-A3B on the Ascend 
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 30+1K
+**Dataset**: 1024x1024_30+1024
 
 **TPOT**: 50ms
 
@@ -137,7 +137,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 30+256
+**Dataset**: 1080p_30+256
 
 **TPOT**: 50ms
 
@@ -334,7 +334,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 128K+1K
 
 **TPOT**: 50ms
 

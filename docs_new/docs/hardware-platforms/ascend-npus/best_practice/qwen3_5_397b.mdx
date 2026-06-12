@@ -10,21 +10,21 @@ This section describes the best practice data for Qwen3.5-397B on the Ascend NPU
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 131.1K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-20ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16.4K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-20ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-20ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-20ms) |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in3k5-out1k5-20ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 65.5K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-20ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 131.1K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 131.1K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-prefix90-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16.4K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 128K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in128k-out1k-prefix90-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 16K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in16k-out1k-50ms) |
 | Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in3k5-out1k5-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 65.5K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-50ms) |
-| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 65.5K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-50ms) |
+| Qwen3.5-397B | Atlas 800I A3 | 8 | PD Mixed | 64K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-w4a8-8p-in64k-out1k-prefix90-50ms) |
 
 
 ## Optimal Configuration
@@ -41,7 +41,7 @@ This section describes the best practice data for Qwen3.5-397B on the Ascend NPU
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 131.1K+1K
+**Dataset**: 128K+1K
 
 **TPOT**: 20ms
 
@@ -152,7 +152,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 131.1K+1K
+**Dataset**: 128K+1K
 
 **TPOT**: 50ms
 
@@ -263,7 +263,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 131.1K+1K
+**Dataset**: 128K+1K
 
 **TPOT**: 50ms
 
@@ -375,7 +375,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 16.4K+1K
+**Dataset**: 16K+1K
 
 **TPOT**: 20ms
 
@@ -490,7 +490,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 16.4K+1K
+**Dataset**: 16K+1K
 
 **TPOT**: 50ms
 
@@ -833,7 +833,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65.5K+1K
+**Dataset**: 64K+1K
 
 **TPOT**: 20ms
 
@@ -948,7 +948,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65.5K+1K
+**Dataset**: 64K+1K
 
 **TPOT**: 50ms
 
@@ -1063,7 +1063,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65.5K+1K
+**Dataset**: 64K+1K
 
 **TPOT**: 50ms
 
