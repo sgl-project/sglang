@@ -311,7 +311,7 @@ def _make_spec_verify_input(
     if spec_kind == "ngram":
         return NgramVerifyInput(
             draft_token=batch.input_ids,
-            tree_mask=custom_mask,
+            custom_mask=custom_mask,
             positions=batch.positions,
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
@@ -1196,19 +1196,18 @@ def run_mamba2_eagle_verify_case(
     atol: float = MAMBA2_ATOL,
     rtol: float = MAMBA2_RTOL,
 ):
-    """Mamba2 chain verify (eager). Mamba2's SSM kernel processes draft
-    tokens linearly regardless of the spec_info tree mask, so only
-    `topk == 1` is supported here. The EXTEND-style recurrence reference
-    (`_pure_torch_mamba2_reference`) doubles as the chain verify
-    reference across all chain spec kinds (eagle / frozen_kv_mtp /
-    dflash / ngram). Tree verify (topk > 1) is structurally blocked
-    (the kernel doesn't consume the parent-indices plumbing); see
-    `expected_mamba2_verify_output_from_inputs`."""
+    """Mamba2 chain verify (eager). This test's reference
+    (`_pure_torch_mamba2_reference`) is a chain recurrence, so it can only
+    validate `topk == 1`; it doubles as the chain verify reference across
+    all chain spec kinds (eagle / frozen_kv_mtp / dflash / ngram). Tree
+    verify (topk > 1) is skipped only for lack of a tree-aware reference --
+    the production SSM kernel does consume the parent-indices plumbing and
+    supports tree verify. See `expected_mamba2_verify_output_from_inputs`."""
     if topk != 1:
         testcase.skipTest(
-            "Mamba2 tree verify (topk>1) is structurally unsupported — "
-            "the SSM kernel ignores tree masks; only chain (topk=1) is "
-            "exercised. See `expected_mamba2_verify_output_from_inputs`."
+            "Mamba2 tree verify (topk>1) skipped: this test has no tree-aware "
+            "reference. The production kernel supports tree verify. See "
+            "`expected_mamba2_verify_output_from_inputs`."
         )
     fixture = build_mamba2_attention_fixture(
         testcase,

@@ -122,6 +122,10 @@ def get_world_group() -> GroupCoordinator:
     return _WORLD
 
 
+def world_group_is_initialized() -> bool:
+    return _WORLD is not None
+
+
 def init_world_group(
     ranks: list[int], local_rank: int, backend: str
 ) -> GroupCoordinator:

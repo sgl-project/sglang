@@ -33,17 +33,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    materialize_output_sample,
     post_process_sample,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
-from sglang.multimodal_gen.runtime.loader.weights_updater import (
-    WeightsUpdater,
-    get_updatable_modules,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
-    iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
@@ -53,6 +48,12 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
+    GPUWorkerPostTrainingMixin,
+)
+from sglang.multimodal_gen.runtime.realtime.session import (
+    RealtimeSessionCache,
+)
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -64,8 +65,15 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
-from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.multimodal_gen.runtime.utils.realtime_video import (
+    RAW_RGB_CONTENT_TYPE,
+    build_raw_rgb_frame_batches,
+)
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
+    DiffStage,
+    init_diffusion_tracing,
+    trace_slice,
+)
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -91,7 +99,7 @@ class _ExpandedOutputParts:
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
 
 
-class GPUWorker:
+class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
     """
@@ -118,6 +126,24 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+        self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
+
+    def release_realtime_session(self, session_id: str) -> OutputBatch:
+        """release the session of a realtime connection"""
+        if not session_id:
+            return OutputBatch(
+                output={
+                    "released": False,
+                    "session_id": session_id,
+                    "reason": "empty_session_id",
+                }
+            )
+
+        released = self._realtime_sessions.release(session_id)
+        if released:
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
+        return OutputBatch(output={"released": released, "session_id": session_id})
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -273,7 +299,7 @@ class GPUWorker:
             error_context=f"request {req.request_id}",
         )
 
-    def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch:
+    def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""
         # TODO: support early return or mix-stage execution for reqs in a group
         assert self.pipeline is not None
@@ -309,6 +335,7 @@ class GPUWorker:
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
+            self._realtime_sessions.attach(req)
 
             # capture memory baseline for each req in grouped forward on rank-0
             request_metrics = [
@@ -354,21 +381,13 @@ class GPUWorker:
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
-            # file-path-only responses avoid serializing generated tensors between
-            # scheduler_client and gpu_worker.
-            if req.save_output and req.return_file_paths_only:
-                save_output_paths(output_batch)
-                output_batch.output = None
-                output_batch.audio = None
-                output_batch.audio_sample_rate = None
+            self._materialize_output_transport(output_batch, req, save_output_paths)
 
-                if torch.cuda.is_initialized():
-                    torch.cuda.empty_cache()
-
-            # Keep return_frames payloads off the scheduler's tensor ZMQ path.
-            self._materialize_frame_outputs_for_return(output_batch, req)
-
-            if torch.cuda.is_initialized() and output_batch.output is None:
+            if (
+                torch.cuda.is_initialized()
+                and output_batch.output is None
+                and not req.return_raw_frames
+            ):
                 torch.cuda.empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
@@ -403,9 +422,54 @@ class GPUWorker:
                 torch.cuda.empty_cache()
         return output_batch
 
+    def _materialize_output_transport(
+        self,
+        output_batch: OutputBatch,
+        req: Req,
+        save_output_paths: Callable[[OutputBatch], None],
+    ) -> None:
+        if req.return_raw_frames:
+            self._materialize_raw_frame_transport(output_batch, req)
+        elif req.save_output and req.return_file_paths_only:
+            self._materialize_file_path_transport(output_batch, save_output_paths)
+        elif req.return_frames:
+            self._materialize_frame_outputs_for_return(output_batch, req)
+
+    def _materialize_raw_frame_transport(
+        self, output_batch: OutputBatch, req: Req
+    ) -> None:
+        if self.rank != 0:
+            return
+        if output_batch.output is not None:
+            output_batch.raw_frame_content_type = RAW_RGB_CONTENT_TYPE
+            (
+                output_batch.raw_frame_batches,
+                output_batch.raw_frame_metadata,
+            ) = build_raw_rgb_frame_batches(
+                output_batch.output,
+                req,
+                output_batch,
+                post_process_sample,
+            )
+            output_batch.output = None
+        output_batch.audio = None
+        output_batch.audio_sample_rate = None
+
+    def _materialize_file_path_transport(
+        self,
+        output_batch: OutputBatch,
+        save_output_paths: Callable[[OutputBatch], None],
+    ) -> None:
+        if self.rank == 0:
+            save_output_paths(output_batch)
+        output_batch.output = None
+        output_batch.audio = None
+        output_batch.audio_sample_rate = None
+
     def _materialize_frame_outputs_for_return(
         self, output_batch: OutputBatch, req: Req
     ) -> None:
+        """materialize the output from tensor to numpy frames for faster serialization"""
         if self.rank != 0 or output_batch.output is None or not req.return_frames:
             return
 
@@ -452,13 +516,10 @@ class GPUWorker:
         ):
             return output
 
-        frames = post_process_sample(
+        materialized = materialize_output_sample(
             output,
             req.data_type,
             req.fps,
-            save_output=False,
-            audio_sample_rate=output_batch.audio_sample_rate,
-            output_compression=req.output_compression,
             enable_frame_interpolation=req.enable_frame_interpolation,
             frame_interpolation_exp=req.frame_interpolation_exp,
             frame_interpolation_scale=req.frame_interpolation_scale,
@@ -467,7 +528,7 @@ class GPUWorker:
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
         )
-        return np.asarray(frames)
+        return np.asarray(materialized.frames)
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
         if self.rank != 0 or current_platform.is_cpu():
@@ -482,6 +543,7 @@ class GPUWorker:
         return self._merge_expanded_output_batches(output_batches)
 
     def _save_output_paths(self, req: Req, output_batch: OutputBatch) -> None:
+        """save outputs to files"""
         if self.rank != 0 or output_batch.output is None:
             return
 
@@ -500,10 +562,15 @@ class GPUWorker:
             dynamic_output_paths = None
 
         if dynamic_output_paths is not None:
-            build_output_path = lambda idx: dynamic_output_paths[idx]
+
+            def build_output_path(idx: int) -> str:
+                return dynamic_output_paths[idx]
+
         else:
             num_outputs = len(output_batch.output)
-            build_output_path = lambda idx: req.output_file_path(num_outputs, idx)
+
+            def build_output_path(idx: int) -> str:
+                return req.output_file_path(num_outputs, idx)
 
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
@@ -824,48 +891,6 @@ class GPUWorker:
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
 
-    def update_weights_from_disk(
-        self,
-        model_path: str,
-        flush_cache: bool = True,
-        target_modules: list[str] | None = None,
-    ) -> tuple[bool, str]:
-        """Update model weights from disk inplace without restarting the server."""
-        if not self.pipeline:
-            return False, "Pipeline is not initialized"
-
-        updater = WeightsUpdater(self.pipeline)
-        success, message = updater.update_weights_from_disk(
-            model_path,
-            flush_cache=flush_cache,
-            target_modules=target_modules,
-        )
-        if success:
-            self.server_args.model_path = model_path
-            self.pipeline.model_path = model_path
-        return success, message
-
-    def get_weights_checksum(
-        self, module_names: list[str] | None = None
-    ) -> dict[str, str]:
-        """Compute SHA-256 checksum of each module's weights."""
-        if not self.pipeline:
-            return {"error": "Pipeline is not initialized"}
-
-        all_modules = get_updatable_modules(self.pipeline)
-        names = module_names if module_names is not None else list(all_modules.keys())
-
-        checksums: dict[str, str] = {}
-        for name in names:
-            module = all_modules.get(name)
-            if module is None:
-                checksums[name] = "not_found"
-                continue
-            checksums[name] = compute_weights_checksum(
-                iter_materialized_weights(module)
-            )
-        return checksums
-
 
 OOM_MSG = """
 OOM detected. Possible solutions:
@@ -922,9 +947,7 @@ def run_scheduler_process(
     elif current_platform.is_musa():
         set_musa_arch()
 
-    if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
-        trace_set_thread_info(f"DiffWorker_rank{rank}")
+    init_diffusion_tracing(server_args, f"DiffWorker_rank{rank}")
 
     port_args = PortArgs.from_server_args(server_args)
 

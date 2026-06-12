@@ -34,8 +34,9 @@ class TestBasicSanity(
 ):
     served_model_name = DEFAULT_MODEL_NAME_FOR_TEST
     # 5090 + Llama-3.1-8B single-batch decode with overlap scheduler +
-    # cuda graph measured ~99 median in CI; keep ~2pp headroom.
-    fwd_occupancy_threshold = 97.0
+    # cuda graph measured ~99 median in CI; async-assert probes are off in
+    # base-a, so the threshold can sit right under the measured median.
+    fwd_occupancy_threshold = 99.0
 
     @classmethod
     def setUpClass(cls):

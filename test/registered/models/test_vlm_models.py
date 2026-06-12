@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import (
     MMMUMultiModelTestBase,
 )
-from sglang.test.test_utils import is_in_ci
+from sglang.test.test_utils import is_in_amd_ci, is_in_ci
 
 # VLM (Vision Language Model) tests
 
@@ -41,7 +41,14 @@ class TestVLMModels(MMMUMultiModelTestBase):
             with tempfile.TemporaryDirectory(
                 prefix=f"test_vlm_mmmu_{model.model.replace('/', '_')}_"
             ) as temp_dir:
-                self._run_vlm_mmmu_test(model, temp_dir)
+                # On AMD CI, the aiter greedy_sample kernel returns an out-of-range
+                # token id (== vocab_size) for degenerate (all-NaN / all -inf) logit
+                # rows, producing empty completions that crash the MMMU eval. Disable
+                # it there so greedy sampling falls back to torch.argmax.
+                custom_env = None
+                if is_in_amd_ci():
+                    custom_env = {"SGLANG_DISABLE_AITER_GREEDY_SAMPLE": "1"}
+                self._run_vlm_mmmu_test(model, temp_dir, custom_env=custom_env)
 
 
 if __name__ == "__main__":

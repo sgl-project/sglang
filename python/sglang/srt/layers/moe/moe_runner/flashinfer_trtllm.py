@@ -38,6 +38,8 @@ from sglang.srt.utils.common import (
     next_power_of_2,
 )
 
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
 logger = __import__("logging").getLogger(__name__)
 
 
@@ -810,6 +812,7 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     intermediate_size_per_partition: int
 
     routing_method_type: int
+    use_per_token_activation: bool = False
 
 
 def quantize_hidden_states_fp4(
@@ -873,12 +876,19 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     topk_output = dispatch_output.topk_output
 
     # Quantize hidden states to FP4
-    if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
+    if quant_info.use_per_token_activation:
         from flashinfer import SfLayout, nvfp4_quantize
+
+        e4m3_max = 448.0
+        if (
+            envs.FLASHINFER_NVFP4_4OVER6.get()
+            and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
+        ):
+            e4m3_max = 256.0
 
         hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
-            1.0 / (448.0 * 6.0),
+            1.0 / (e4m3_max * 6.0),
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
         )
@@ -1209,3 +1219,9 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm_routed: {type(quant_info)}"
     )
+
+
+# Register the experimental experimental_sgl_trtllm MoE fused-func (MoeRunner needs it at
+# build time even for LoRA); gated by the master switch so the upstream path is untouched.
+if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+    from sglang.srt.lora.trtllm_lora_temp import sgl_backend  # noqa: E402,F401

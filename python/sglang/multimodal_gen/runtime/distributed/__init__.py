@@ -1,7 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-from functools import lru_cache
 
-from sglang.multimodal_gen.configs.models.encoders import TextEncoderConfig
 from sglang.multimodal_gen.runtime.distributed.communication_op import *
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
     get_local_torch_device,
@@ -56,16 +54,3 @@ __all__ = [
     # Get torch device
     "get_local_torch_device",
 ]
-
-
-def _get_folding_tp_group(
-    config: TextEncoderConfig,
-) -> torch.distributed.ProcessGroup | None:
-    if config.parallel_folding:
-        if config.parallel_folding_mode == "sp":
-            return get_sp_group()
-        elif config.parallel_folding_mode == "ulysses":
-            return get_sp_group().ulysses_group
-        elif config.parallel_folding_mode == "ring":
-            return get_sp_group().ring_group
-    return get_tp_group()

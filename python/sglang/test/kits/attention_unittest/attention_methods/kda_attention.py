@@ -22,6 +22,11 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -211,6 +216,7 @@ class MockKDAModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
         speculative_num_draft_tokens = (
@@ -222,8 +228,18 @@ class MockKDAModelRunner(ModelRunner):
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,

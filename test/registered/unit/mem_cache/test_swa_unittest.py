@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -16,7 +17,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -244,6 +245,30 @@ class TestSWA(unittest.TestCase):
         alloc.free_swa(index)
         result = alloc.translate_loc_from_full_to_swa(index)
         print(result)
+
+    def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=16,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
+        )
+
+        full_indices = _swa_alloc(allocator, page_size)
+        self.assertEqual(allocator.swa_available_size(), 16 - page_size)
+
+        allocator.free_swa(full_indices[:1])
+        self.assertEqual(allocator.swa_available_size(), 16)
+        self.assertTrue(
+            torch.all(
+                allocator.full_to_swa_index_mapping[full_indices.to(torch.int64)] == 0
+            )
+        )
+
+        allocator.free_swa(full_indices[1:2])
+        self.assertEqual(allocator.swa_available_size(), 16)
 
     def test_swa_radix_cache_1(self):
         # args

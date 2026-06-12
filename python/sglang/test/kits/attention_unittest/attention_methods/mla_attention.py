@@ -11,6 +11,11 @@ from sglang.srt.layers import dp_attention as _dp_attention
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -222,6 +227,7 @@ class MockMLAModelRunner(ModelRunner):
         # does the BF16->FP8 cast on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
         self.gpu_id = 0
+        self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
         self.tp_size = 1
@@ -236,9 +242,19 @@ class MockMLAModelRunner(ModelRunner):
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             disable_chunked_prefix_cache=True,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
             disable_radix_cache=False,
             disaggregation_mode=None,
             dllm_algorithm=None,
