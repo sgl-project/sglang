@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -128,20 +129,29 @@ class SWAComponent(TreeComponent):
     ) -> MatchResult:
         ct = self.component_type
         n_swa = 0
+        swa_host_hit = 0
         node = result.best_match_node
         root = self.cache.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
-            if cd.value is None and cd.host_value is not None:
-                # TODO(ispobock): refactor host_hit_length usage
-                return result._replace(host_hit_length=max(result.host_hit_length, 1))
             if cd.value is not None:
                 n_swa += len(cd.value)
             elif cd.host_value is not None:
+                # TODO(hzh): load_back may currently restore a full host-tombstone
+                # segment whose length exceeds sliding_window_size. Once
+                # load_back is constrained to fetch only one sliding window
+                # worth of pages, cap swa_host_hit at sliding_window_size
+                # here so the scheduler budget matches the actual device-pool
+                # consumption.
+                swa_host_hit += len(cd.host_value)
                 n_swa += len(cd.host_value)
             else:
                 break
             node = node.parent
+        if swa_host_hit > 0:
+            return result._replace(
+                swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit)
+            )
         return result
 
     def update_component_on_insert_overlap(
@@ -515,6 +525,20 @@ class SWAComponent(TreeComponent):
             insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
         return None
 
+    def free_out_of_window_slots(
+        self, req: Req, pre_len: int, insert_params: InsertParams
+    ) -> None:
+        if self.sliding_window_size is not None:
+            free_swa_out_of_window_slots(
+                req,
+                pre_len,
+                sliding_window_size=self.sliding_window_size,
+                page_size=self.cache.page_size,
+                req_to_token_pool=self.cache.req_to_token_pool,
+                token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
+            )
+        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+
     # ---- HiCache Hooks ----
 
     def build_hicache_transfers(
@@ -672,7 +696,7 @@ class SWAComponent(TreeComponent):
             )
 
     def _attach_swa_host_value(
-        self, node: "UnifiedTreeNode", host_indices: torch.Tensor
+        self, node: UnifiedTreeNode, host_indices: torch.Tensor
     ) -> None:
         """Write host_indices into node's SWA host_value and refresh tree state."""
         ct = self.component_type

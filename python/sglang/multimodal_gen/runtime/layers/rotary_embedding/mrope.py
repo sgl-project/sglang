@@ -123,11 +123,7 @@ class Qwen3VLTextRotaryEmbedding(torch.nn.Module):
             freqs_t[..., idx] = freqs[dim, ..., idx]
         return freqs_t
 
-    @torch.no_grad()
-    def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return cos/sin for position IDs shaped [3, B, S], [B, S, 3], or [B, S]."""
+    def _normalize_position_ids(self, position_ids: torch.Tensor) -> torch.Tensor:
         if position_ids.ndim == 3 and position_ids.shape[-1] == 3:
             position_ids = position_ids.permute(2, 0, 1)
         elif position_ids.ndim == 2:
@@ -137,6 +133,10 @@ class Qwen3VLTextRotaryEmbedding(torch.nn.Module):
                 "Qwen3 mRoPE position_ids must have shape [3, B, S], [B, S, 3], "
                 f"or [B, S], got {tuple(position_ids.shape)}"
             )
+        return position_ids
+
+    def _compute_interleaved_freqs(self, position_ids: torch.Tensor) -> torch.Tensor:
+        position_ids = self._normalize_position_ids(position_ids)
 
         inv_freq_expanded = (
             self.inv_freq[None, None, :, None]
@@ -147,7 +147,31 @@ class Qwen3VLTextRotaryEmbedding(torch.nn.Module):
         position_ids_expanded = position_ids[:, :, None, :].float()
 
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
-        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+        return self.apply_interleaved_mrope(freqs, self.mrope_section)
+
+    @torch.no_grad()
+    def build_rope_cache_inputs(
+        self, position_ids: torch.Tensor, *, cache_dtype: torch.dtype | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        freqs = self._compute_interleaved_freqs(position_ids)
+        cos = freqs.cos() * self.attention_scaling
+        sin = freqs.sin() * self.attention_scaling
+        if cache_dtype is not None and cache_dtype != torch.float32:
+            cos = cos.to(cache_dtype).float()
+            sin = sin.to(cache_dtype).float()
+        cos_sin_cache = torch.cat((cos, sin), dim=-1).reshape(-1, self.head_dim)
+        cos_sin_cache = cos_sin_cache.contiguous()
+        cache_positions = torch.arange(
+            cos_sin_cache.shape[0], device=cos_sin_cache.device, dtype=torch.long
+        )
+        return cos_sin_cache, cache_positions
+
+    @torch.no_grad()
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cos/sin for position IDs shaped [3, B, S], [B, S, 3], or [B, S]."""
+        freqs = self._compute_interleaved_freqs(position_ids)
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos() * self.attention_scaling
         sin = emb.sin() * self.attention_scaling
