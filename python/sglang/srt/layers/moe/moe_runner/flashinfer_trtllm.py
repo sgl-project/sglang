@@ -1096,7 +1096,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
             # FIXME(kpham-sgl): flashinfer sizes this buffer from routing_logits
             # dtype (fp32 in DSv3 decode) but always writes bf16 weights into it.
-            # Reinterpret the live bf16 prefix. Fix upstream alloc to drop this.
+            # Reinterpret the live bf16 prefix. Fix upstream alloc to drop this,
+            # tracking in https://github.com/flashinfer-ai/flashinfer/issues/3595
             if expert_weights.dtype == torch.float32:
                 n, k = expert_weights.shape
                 expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
