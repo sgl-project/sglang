@@ -2,8 +2,6 @@ import logging
 from typing import Optional, Union
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
@@ -14,6 +12,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
 )
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
+    track_mamba_states_if_needed,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -24,108 +23,6 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
-
-
-# Kernel to track mamba states if needed based on track mask
-@triton.jit
-def track_mamba_state_if_needed_kernel(
-    conv_states_ptr,
-    ssm_states_ptr,
-    cache_indices_ptr,
-    mamba_track_mask_ptr,
-    mamba_track_indices_ptr,
-    conv_state_stride_0,  # stride for first dimension (batch/pool index)
-    ssm_state_stride_0,  # stride for first dimension (batch/pool index)
-    conv_state_numel_per_row: tl.constexpr,  # total elements per row
-    ssm_state_numel_per_row: tl.constexpr,  # total elements per row
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Track conv_states and ssm_states rows based on track mask.
-
-    This kernel replaces a Python loop that copies state tensors for mamba attention.
-    For each batch element, if the track mask is True, it copies the entire row from
-    the source index (cache_indices[i]) to the destination index (mamba_track_indices[i]).
-
-    Grid: (batch_size,)
-    Each block handles one batch element, using multiple threads to copy data in parallel.
-    """
-    batch_idx = tl.program_id(0)
-
-    # Load the copy mask for this batch element
-    track_mask = tl.load(mamba_track_mask_ptr + batch_idx)
-
-    # Early exit if we don't need to track
-    if not track_mask:
-        return
-
-    # Load source and destination indices
-    src_idx = tl.load(cache_indices_ptr + batch_idx)
-    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx)
-
-    # Copy conv_states
-    # Each thread handles BLOCK_SIZE elements
-    for offset in range(0, conv_state_numel_per_row, BLOCK_SIZE):
-        element_indices = offset + tl.arange(0, BLOCK_SIZE)
-        mask = element_indices < conv_state_numel_per_row
-
-        src_ptr = conv_states_ptr + src_idx * conv_state_stride_0 + element_indices
-        dst_ptr = conv_states_ptr + dst_idx * conv_state_stride_0 + element_indices
-
-        data = tl.load(src_ptr, mask=mask, other=0.0)
-        tl.store(dst_ptr, data, mask=mask)
-
-    # Copy ssm_states
-    for offset in range(0, ssm_state_numel_per_row, BLOCK_SIZE):
-        element_indices = offset + tl.arange(0, BLOCK_SIZE)
-        mask = element_indices < ssm_state_numel_per_row
-
-        src_ptr = ssm_states_ptr + src_idx * ssm_state_stride_0 + element_indices
-        dst_ptr = ssm_states_ptr + dst_idx * ssm_state_stride_0 + element_indices
-
-        data = tl.load(src_ptr, mask=mask, other=0.0)
-        tl.store(dst_ptr, data, mask=mask)
-
-
-def track_mamba_states_if_needed(
-    conv_states: torch.Tensor,
-    ssm_states: torch.Tensor,
-    cache_indices: torch.Tensor,
-    mamba_track_mask: torch.Tensor,
-    mamba_track_indices: torch.Tensor,
-    batch_size: int,
-):
-    """
-    Track mamba states using Triton kernel for better performance.
-
-    Args:
-        conv_states: Convolution states tensor [pool_size, ...]
-        ssm_states: SSM states tensor [pool_size, ...]
-        cache_indices: Source indices for each batch element [batch_size]
-        mamba_track_mask: Boolean mask indicating which elements to track [batch_size]
-        mamba_track_indices: Indices to track for each batch element [batch_size]
-        batch_size: Number of batch elements
-    """
-    conv_state_numel_per_row = conv_states[0].numel()
-    ssm_state_numel_per_row = ssm_states[0].numel()
-
-    # Choose BLOCK_SIZE based on the size of the data
-    BLOCK_SIZE = 1024
-
-    # Launch kernel with batch_size blocks
-    grid = (batch_size,)
-    track_mamba_state_if_needed_kernel[grid](
-        conv_states,
-        ssm_states,
-        cache_indices,
-        mamba_track_mask,
-        mamba_track_indices,
-        conv_states.stride(0),
-        ssm_states.stride(0),
-        conv_state_numel_per_row,
-        ssm_state_numel_per_row,
-        BLOCK_SIZE,
-    )
 
 
 class MambaAttnBackendBase(AttentionBackend):
