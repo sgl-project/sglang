@@ -6,6 +6,9 @@ import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.configs.models import ModelConfig
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
+    LingBotWorldI2VConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -88,6 +91,11 @@ def _should_use_channels_last_3d(
         isinstance(pipeline_config, (WanT2V480PConfig, LTX2PipelineConfig))
         and server_args.num_gpus == 1
     ):
+        return True
+    # LingBot-World realtime decode: the distributed (height-sharded, halo)
+    # WanDist* conv path is channels_last_3d-aware, so NHWC is safe and removes
+    # the per-block nchwToNhwc layout round-trips even at num_gpus > 1.
+    if isinstance(pipeline_config, LingBotWorldI2VConfig):
         return True
     return False
 

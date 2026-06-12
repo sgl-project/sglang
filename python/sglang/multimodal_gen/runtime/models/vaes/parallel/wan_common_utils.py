@@ -195,14 +195,24 @@ class WanRMS_norm(nn.Module):
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
+        self._eps = 1e-12
 
     def forward(self, x):
-        return (
-            F.normalize(x, dim=(1 if self.channel_first else -1))
-            * self.scale
-            * self.gamma
-            + self.bias
-        )
+        # Manual RMS normalization, mathematically equivalent to the original
+        #     F.normalize(x, dim) * sqrt(dim) * gamma + bias.
+        # rsqrt(mean(x^2)) already equals F.normalize(x) * sqrt(dim) (== scale),
+        # so the scale must NOT be reapplied here -- only gamma/bias.
+        #
+        # The rewrite uses broadcasting elementwise ops so the output KEEPS the
+        # input memory format (esp. channels_last_3d / NDHWC). F.normalize
+        # materializes a contiguous NCDHW result, which forces the following
+        # WanCausalConv3d to convert the activation back to channels_last every
+        # block (the nchwToNhwc kernels seen in the profile). Reducing over the
+        # contiguous-in-NHWC channel dim is also coalesced.
+        norm_dim = 1 if self.channel_first else -1
+        variance = x.pow(2).mean(dim=norm_dim, keepdim=True)
+        normed = x * torch.rsqrt(variance + self._eps)
+        return normed * self.gamma + self.bias
 
 
 class WanUpsample(nn.Upsample):
