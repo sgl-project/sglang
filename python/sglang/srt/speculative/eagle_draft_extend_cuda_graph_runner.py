@@ -23,6 +23,7 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
+    ShapeKey,
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
@@ -167,7 +168,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
             )
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
             )
             extend_seq_lens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
@@ -221,7 +222,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32, device="cpu"
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
         self.buffers = EagleDraftExtendInputBuffers(
@@ -259,7 +260,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        return bs
+        return ShapeKey(size=bs)
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:

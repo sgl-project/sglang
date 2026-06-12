@@ -342,7 +342,7 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     use_nvfp4_dispatch: bool = False
 
     # v1 only: SBO down-GEMM overlap args.
-    down_gemm_overlap_args: Optional["DownGemmOverlapArgs"] = None
+    down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
 
 @register_fused_func("none", "flashinfer_cutedsl")
