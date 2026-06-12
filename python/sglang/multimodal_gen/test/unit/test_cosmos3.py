@@ -2,11 +2,12 @@
 """Unit tests for Cosmos3 config, weight mapping, and sampling params."""
 
 import importlib.util
+import json
 import unittest
 from unittest import mock
 
+import torch
 from fastapi import HTTPException
-
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     _build_cosmos3_param_names_mapping,
 )
@@ -24,7 +25,17 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _reject_unsupported_cosmos3_modes,
 )
+from sglang.multimodal_gen.runtime.layers.domain_aware_linear import (
+    DomainAwareLinear,
+)
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    build_action_prompt,
+    canonical_aspect_ratio,
+    find_closest_target_size,
+    get_domain_id,
+    get_raw_action_dim,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
 )
@@ -54,13 +65,14 @@ class TestCosmos3ParamNamesMapping(unittest.TestCase):
         key, idx, total = _apply(self.fn, "norm.weight")
         self.assertEqual(key, "")
 
-    def test_audio_proj_in_dropped(self):
+    def test_audio_proj_in_loaded(self):
+        # Omni heads are loaded via identity passthrough.
         key, *_ = _apply(self.fn, "audio_proj_in.weight")
-        self.assertEqual(key, "")
+        self.assertEqual(key, "audio_proj_in.weight")
 
-    def test_action_proj_in_dropped(self):
-        key, *_ = _apply(self.fn, "action_proj_in.weight")
-        self.assertEqual(key, "")
+    def test_action_proj_in_loaded(self):
+        key, *_ = _apply(self.fn, "action_proj_in.fc.weight")
+        self.assertEqual(key, "action_proj_in.fc.weight")
 
     # --- top-level pass-through ---
 
@@ -294,6 +306,114 @@ class TestCosmos3Guardrails(unittest.TestCase):
     @mock.patch("importlib.util.find_spec", return_value=None)
     def test_missing_guardrail_package_reports_unavailable(self, _):
         self.assertFalse(is_cosmos_guardrail_available())
+
+
+class TestDomainAwareLinear(unittest.TestCase):
+    """Per-embodiment action projection (Cosmos3 action heads)."""
+
+    def test_weight_table_shapes(self):
+        layer = DomainAwareLinear(input_size=64, output_size=8, num_domains=32)
+        self.assertEqual(tuple(layer.fc.weight.shape), (32, 8 * 64))
+        self.assertEqual(tuple(layer.bias.weight.shape), (32, 8))
+
+    def test_forward_rank2(self):
+        layer = DomainAwareLinear(input_size=6, output_size=4, num_domains=3)
+        x = torch.randn(2, 6)
+        out = layer(x, torch.tensor([0, 2]))
+        self.assertEqual(tuple(out.shape), (2, 4))
+
+    def test_forward_rank3(self):
+        layer = DomainAwareLinear(input_size=6, output_size=4, num_domains=3)
+        x = torch.randn(2, 5, 6)
+        out = layer(x, torch.tensor([1, 0]))
+        self.assertEqual(tuple(out.shape), (2, 5, 4))
+
+    def test_per_domain_weights_differ(self):
+        layer = DomainAwareLinear(input_size=4, output_size=4, num_domains=2)
+        x = torch.randn(1, 4)
+        out0 = layer(x, torch.tensor([0]))
+        out1 = layer(x, torch.tensor([1]))
+        self.assertFalse(torch.allclose(out0, out1))
+
+    def test_rejects_out_of_range_domain(self):
+        layer = DomainAwareLinear(input_size=4, output_size=4, num_domains=2)
+        with self.assertRaises(ValueError):
+            layer(torch.randn(1, 4), torch.tensor([5]))
+
+    def test_rejects_batch_mismatch(self):
+        layer = DomainAwareLinear(input_size=4, output_size=4, num_domains=4)
+        with self.assertRaises(ValueError):
+            layer(torch.randn(2, 4), torch.tensor([0, 1, 2]))
+
+
+class TestCosmos3OmniSamplingParams(unittest.TestCase):
+    """Sound flag and the native T2I CFG-window default."""
+
+    def test_generate_sound_default_false(self):
+        self.assertFalse(Cosmos3SamplingParams().generate_sound)
+
+    def test_generate_sound_opt_in(self):
+        self.assertTrue(Cosmos3SamplingParams(generate_sound=True).generate_sound)
+
+    def test_t2i_cfg_window_default(self):
+        self.assertEqual(
+            Cosmos3SamplingParams(num_frames=1).guidance_interval, (400.0, 1000.0)
+        )
+
+    def test_video_leaves_cfg_window_unset(self):
+        self.assertIsNone(Cosmos3SamplingParams(num_frames=81).guidance_interval)
+
+
+class TestCosmos3FlowUniPCOverride(unittest.TestCase):
+    """Native FlowUniPC scheduler override (vs the shipped Karras config)."""
+
+    def test_scheduler_override(self):
+        self.assertEqual(
+            Cosmos3Config().scheduler_class_override, "FlowUniPCMultistepScheduler"
+        )
+
+
+class TestCosmos3ActionUtils(unittest.TestCase):
+    """Action resolution, aspect ratio, JSON prompt, and embodiment lookups."""
+
+    def test_find_closest_target_size(self):
+        self.assertEqual(find_closest_target_size(480, 640, "480"), (736, 544))
+        self.assertEqual(find_closest_target_size(512, 512, "480"), (640, 640))
+        with self.assertRaises(ValueError):
+            find_closest_target_size(480, 640, "999")
+
+    def test_canonical_aspect_ratio(self):
+        self.assertEqual(canonical_aspect_ratio(736, 544), "4,3")
+        self.assertEqual(canonical_aspect_ratio(100, 50), "2,1")  # gcd fallback
+
+    def test_build_action_prompt_matches_reference_json(self):
+        d = json.loads(build_action_prompt(
+            "Put the pot to the left of the purple item.", "ego_view",
+            num_frames=17, fps=5, height=544, width=736,
+        ))
+        self.assertEqual(
+            d["cinematography"]["framing"],
+            "This video is captured from a first-person perspective looking at the scene.",
+        )
+        self.assertEqual(d["actions"][0]["time"], "0:00-0:03")
+        self.assertNotIn("idle_frame", d["actions"][0])
+        self.assertEqual(d["duration"], "3s")
+        self.assertEqual(d["fps"], 5.0)
+        self.assertEqual(d["resolution"], {"H": 544, "W": 736})
+        self.assertEqual(d["aspect_ratio"], "4,3")
+
+    def test_build_action_prompt_adds_terminal_punctuation(self):
+        d = json.loads(build_action_prompt("pick up the cube", "wrist_view", 17, 5, 544, 736))
+        self.assertEqual(d["actions"][0]["description"], "pick up the cube.")
+
+    def test_bridge_embodiment_raw_dim(self):
+        self.assertEqual(get_raw_action_dim("bridge_orig_lerobot"), 10)
+        self.assertIsInstance(get_domain_id("bridge_orig_lerobot"), int)
+
+
+class TestCosmos3V2VParams(unittest.TestCase):
+    def test_condition_frame_indexes_default_none(self):
+        self.assertIsNone(Cosmos3SamplingParams().condition_frame_indexes_vision)
 
 
 if __name__ == "__main__":

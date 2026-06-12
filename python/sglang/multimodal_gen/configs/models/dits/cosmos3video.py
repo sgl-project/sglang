@@ -28,17 +28,17 @@ def _build_cosmos3_param_names_mapping() -> dict:
 
     GEN patterns (`*_moe_gen`, `add_*`, `to_add_out`, `norm_added_*`) must
     precede the UND catch-all so the catch-all can't claim GEN keys.
-    `norm.weight` and `lm_head.weight` are inherited from Qwen3-VL
-    pretraining and not used at inference; audio/action keys are reserved
-    for a future modality extension — all skipped via empty-string replacement.
+    `norm.weight` and `lm_head.weight` are inherited from Qwen3-VL pretraining
+    and consumed only by the reasoner, so they are skipped at diffusion
+    inference. The omni heads (`audio_proj_*`, `audio_modality_embed`,
+    `action_proj_*`, `action_modality_embed`) are unlisted, so they pass through
+    unchanged to the modules built on the transformer when the checkpoint
+    enables sound or action generation.
     """
     return {
         # Inherited from Qwen3-VL pretraining; unused at diffusion inference.
         r"^lm_head\.weight$": "",
         r"^norm\.weight$": "",
-        # Audio / action modalities — not yet wired; skip to avoid load warnings.
-        r"^audio_.*$": "",
-        r"^action_.*$": "",
         # Top-level norms / embeddings.
         r"^norm_moe_gen\.(.*)$": r"norm_moe_gen.\1",
         r"^embed_tokens\.(.*)$": r"language_model.embed_tokens.\1",
@@ -160,6 +160,15 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
 
     # RMSNorm epsilon
     rms_norm_eps: float = 1e-6
+
+    # Omni modality flags and dims from transformer/config.json.
+    sound_gen: bool = False
+    sound_dim: int = 64
+    sound_latent_fps: int = 25
+    temporal_compression_factor_sound: int = 1
+    action_gen: bool = False
+    action_dim: int = 64
+    num_embodiment_domains: int = 32
 
     # Weight mapping from checkpoint to model
     param_names_mapping: dict = field(
