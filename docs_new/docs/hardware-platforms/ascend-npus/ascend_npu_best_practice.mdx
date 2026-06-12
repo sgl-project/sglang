@@ -6853,7 +6853,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset with throughput focus (0.4 request rate).
 
 ```bash
-python3 -m sglang.bench_serving --backend sglang --host <ROUTER_IP> --port 9903  --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random --tokennize-prompt --random-input-len 16000 --random-output-len 1 --request-rate 0.4 --random-range-ratio 1 --num-prompts 128 --max-concurrency 64
+python3 -m sglang.bench_serving --backend sglang --host <ROUTER_IP> --port 9903  --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random --tokenize-prompt --random-input-len 16000 --random-output-len 1 --request-rate 0.4 --random-range-ratio 1 --num-prompts 128 --max-concurrency 64
 ```
 
 ### MiMo-V2-Flash 32K+1 2,147ms on A3 24 Cards Disaggregation Mode
@@ -6903,7 +6903,7 @@ Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-
 We tested it based on the `RANDOM` dataset with low latency focus (infinite request rate).
 
 ```bash
-python3 -m sglang.bench_serving --backend sglang --host <ROUTER_IP> --port 9903  --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random --tokennize-prompt --random-input-len 16000 --random-output-len 1000 --request-rate inf --random-range-ratio 1 --num-prompts 128 --max-concurrency 64
+python3 -m sglang.bench_serving --backend sglang --host <ROUTER_IP> --port 9903  --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random --tokenize-prompt --random-input-len 16000 --random-output-len 1000 --request-rate inf --random-range-ratio 1 --num-prompts 128 --max-concurrency 64
 ```
 
 ### MiMo-V2-Flash 32K+1K 12ms on A3 24 Cards Disaggregation Mode
