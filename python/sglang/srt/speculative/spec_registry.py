@@ -90,7 +90,13 @@ class CustomSpecAlgo:
         return True
 
     def create_worker(self, server_args: "ServerArgs") -> Type:
+        if not server_args.disable_overlap_schedule and not self.supports_overlap:
+            raise ValueError(
+                f"Speculative algorithm {self.name} does not support overlap scheduling."
+            )
         if not self.supports_overlap:
+            # Reached only when overlap is disabled, so the algorithm really
+            # does run synchronously on the V2 schema below.
             logger.warning(
                 "Speculative algorithm %s is registered with "
                 "supports_overlap=False, which is deprecated: the spec V1 "
@@ -98,10 +104,6 @@ class CustomSpecAlgo:
                 "the V2 scheduler schema with overlap disabled (synchronous). "
                 "Migrate the plugin worker to support overlap scheduling.",
                 self.name,
-            )
-        if not server_args.disable_overlap_schedule and not self.supports_overlap:
-            raise ValueError(
-                f"Speculative algorithm {self.name} does not support overlap scheduling."
             )
         return self.factory(server_args)
 
