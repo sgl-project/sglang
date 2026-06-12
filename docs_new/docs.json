@@ -1070,6 +1070,12 @@
                     ]
                   },
                   {
+                    "group": "JetBrains",
+                    "pages": [
+                      "cookbook/autoregressive/JetBrains/Mellum"
+                    ]
+                  },
+                  {
                     "group": "Mistral",
                     "pages": [
                       "cookbook/autoregressive/Mistral/Ministral-3",

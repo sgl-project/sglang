@@ -2624,6 +2624,7 @@ class ServerArgs:
 
             apply_nemotron_h_defaults(self, model_arch)
         elif model_arch in [
+            "MellumForCausalLM",
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3NextForCausalLM",
@@ -2792,6 +2793,7 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "MistralLarge3ForCausalLM",
+                "MellumForCausalLM",
                 "Qwen3MoeForCausalLM",
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",

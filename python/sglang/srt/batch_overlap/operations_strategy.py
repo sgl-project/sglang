@@ -45,7 +45,7 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
-        elif layer_name == "Qwen3MoeDecoderLayer":
+        elif layer_name in ("Qwen3MoeDecoderLayer", "MellumDecoderLayer"):
             return OperationsStrategy.concat(
                 [
                     _compute_moe_qwen3_layer_operations_strategy_tbo(
