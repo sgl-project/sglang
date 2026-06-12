@@ -83,13 +83,13 @@ import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deploym
 - **B200**: single node, TP=8 (verified). Uses `--attention-backend fa4` + `--moe-runner-backend flashinfer_trtllm` + `--mem-fraction-static 0.8`. Set `--swa-full-tokens-ratio 0.1` to keep KV-cache footprint within 192 GB HBM.
 - **GB300**: 2 nodes, TP=8 (verified). Same Blackwell stack as B200; multi-node interconnect requires `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1`. Default SWA ratio is fine.
 - **H100/H200**: 2 nodes × 8 GPUs (TP=16, not yet verified). Uses the Hopper stack (`fa3` + DeepEP + EAGLE multi-layer); fits with `--mem-fraction-static 0.7` and `--swa-full-tokens-ratio 0.3`. DeepEP dispatch tuning: `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256` avoids memory spikes during prefill.
-- EAGLE speculative decoding (3 steps, topk=1) typically yields a 2–3× decode speedup. Requires `SGLANG_ENABLE_SPEC_V2=1` and `--enable-multi-layer-eagle` (both Hopper and Blackwell). See §5.4 for acceptance-rate behavior on natural text vs random prompts.
+- EAGLE speculative decoding (3 steps, topk=1) typically yields a 2–3× decode speedup. Requires `--enable-multi-layer-eagle` (both Hopper and Blackwell). See §5.4 for acceptance-rate behavior on natural text vs random prompts.
 
 **MiMo-V2.5 (310B):**
 - The checkpoint has a TP=4-interleaved fused `qkv_proj`; attention-TP per DP group **must** be 4. Use `--dp = TP / 4`; for TP > 4 this also requires DP-attention. Total GPUs must be a multiple of 4. A bare `--tp 8` without `--dp 2` will fail to load with `MiMoV2 fused qkv_proj checkpoint is TP=4-interleaved; got attention tp_size=8`.
 - Single-node deployments: H100/H200 8× GPUs (`--tp 8 --dp 2`), B200 4× GPUs (`--tp 4`, dp=1, no DP-attn flag needed), GB300 4× GPUs (`--tp 4`, single NVL4 node). FP8 quantization.
 - `--enable-dp-lm-head` and `--mm-enable-dp-encoder` are required whenever `--enable-dp-attention` is on, to keep LM head and encoder sharding consistent.
-- EAGLE MTP uses the checkpoint's MTP weights. Enable with `SGLANG_ENABLE_SPEC_V2=1`, `--speculative-algorithm EAGLE`, and `--enable-multi-layer-eagle` (both Hopper and Blackwell).
+- EAGLE MTP uses the checkpoint's MTP weights. Enable with `--speculative-algorithm EAGLE` and `--enable-multi-layer-eagle` (both Hopper and Blackwell).
 - **Multimodal**: Supports image, video, and audio understanding; see Section 4.3 for invocation examples.
 
 **DeepEP (optional toggle, Hopper-only):**

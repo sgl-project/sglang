@@ -266,7 +266,7 @@ def split_spec_info(
 
 def compute_split_token_index(
     split_seq_index: int,
-    forward_mode: "ForwardMode",
+    forward_mode: ForwardMode,
     extend_seq_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> int:
@@ -679,6 +679,11 @@ class TboForwardBatchPreparer:
                 or key == "extend_logprob_start_lens_cpu"
             ):
                 output_dict[key] = None
+                continue
+            elif key == "rids" and len(old_value) != num_seqs:
+                output_dict[key] = old_value[
+                    start_seq_index : min(end_seq_index, len(old_value))
+                ]
                 continue
             assert (
                 len(old_value) == num_seqs
