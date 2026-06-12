@@ -225,6 +225,15 @@ class SchedulerInvariantChecker:
                     f"EXTEND req past its extend frontier: {req.rid=} "
                     f"{req.kv_committed_len=} {req.extend_range=}"
                 )
+            else:
+                # Every path that gives an active req an extend range also
+                # enters a tracked phase (prepare_for_extend, the disagg
+                # prebuilt paths, prepare_for_decode afterwards). An OTHERS
+                # req holding a range means a missed EXTEND transition.
+                raise AssertionError(
+                    f"req with an extend range stuck in {req.phase}: {req.rid=} "
+                    f"{req.kv_committed_len=} {req.extend_range=}"
+                )
 
     def self_check_during_busy(self):
         if self.get_last_batch() is None:
