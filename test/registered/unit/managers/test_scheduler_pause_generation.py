@@ -107,8 +107,8 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         """retract mode should retract all requests from running_batch."""
         scheduler = self._new_scheduler()
         scheduler.last_batch = None
-        req_a = MagicMock(rid="req-a", is_partially_extended=False)
-        req_b = MagicMock(rid="req-b", is_partially_extended=False)
+        req_a = MagicMock(rid="req-a", phase=None)
+        req_b = MagicMock(rid="req-b", phase=None)
         scheduler.running_batch.reqs = [req_a, req_b]
         scheduler.running_batch.__len__ = lambda self: len(self.reqs)
         scheduler.running_batch.is_empty.return_value = False
