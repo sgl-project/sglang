@@ -26,6 +26,7 @@ ARG GPU_ARCH=gfx950
 # ===============================
 # Base image 942 with rocm700 and args
 FROM $BASE_IMAGE_942 AS gfx942
+ENV GPU_ARCH_LIST=gfx942
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
@@ -36,6 +37,7 @@ ENV AITER_COMMIT_DEFAULT="7a8ff7dd4ae3063ff1a18622a46460125c84370e"
 # ===============================
 # Base image 942 with rocm720 and args
 FROM $BASE_IMAGE_942_ROCM720 AS gfx942-rocm720
+ENV GPU_ARCH_LIST=gfx942
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
@@ -46,6 +48,7 @@ ENV AITER_COMMIT_DEFAULT="7a8ff7dd4ae3063ff1a18622a46460125c84370e"
 # ===============================
 # Base image 950 and args
 FROM $BASE_IMAGE_950 AS gfx950
+ENV GPU_ARCH_LIST=gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
@@ -56,6 +59,7 @@ ENV AITER_COMMIT_DEFAULT="7a8ff7dd4ae3063ff1a18622a46460125c84370e"
 # ===============================
 # Base image 950 with rocm720 and args
 FROM $BASE_IMAGE_950_ROCM720 AS gfx950-rocm720
+ENV GPU_ARCH_LIST=gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
@@ -69,7 +73,8 @@ FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
-ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
+# GPU_ARCH_LIST is set in the selected base stage (gfx942/gfx950, with or without -rocm720).
+# BuildKit does not support bash ${VAR%-*} stripping in ENV.
 ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
