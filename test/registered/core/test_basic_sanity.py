@@ -36,9 +36,10 @@ class TestBasicSanity(
     # 5090 + Llama-3.1-8B single-batch decode with overlap scheduler +
     # cuda graph measured ~99 median in CI; async-assert probes are off in
     # base-a, so the threshold can sit right under the measured median.
-    # AMD MI325 sits ~1pp lower and historically passed by <0.1pp at 99.0, so
-    # any small per-step decode change re-breaks it; give AMD a comfortable
-    # margin while keeping CUDA's tight regression floor.
+    # 99.0 was raised from the original 97.0 (#27836) against the CUDA median;
+    # AMD MI325 sits ~1pp lower and only ever cleared 99.0 by <0.1pp, so any
+    # small per-step decode change re-breaks it. Restore the original 97.0
+    # floor on AMD while keeping CUDA's tight regression detector.
     fwd_occupancy_threshold = 97.0 if is_hip() else 99.0
 
     @classmethod
