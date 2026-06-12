@@ -403,6 +403,7 @@ def compress_norm_rope_store_bf16(
     kvcache: torch.Tensor,
     page_size: int,
     use_fp4: bool = False,
+    bf16_store: bool = False,
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_bf16_module(
