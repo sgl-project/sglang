@@ -163,19 +163,6 @@ class FlashinferDispatcher(BaseDispatcher):
             mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
 
-        self.dummy_topk_ids = torch.full(
-            (1, self.router_topk), self.num_experts, dtype=torch.int32, device="cuda"
-        )
-        self.dummy_topk_ids_current_rank = torch.full(
-            (1, self.router_topk),
-            self.ep_rank * self.num_local_experts,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        self.dummy_topk_weights = torch.zeros(
-            (1, self.router_topk), dtype=torch.float32, device="cuda"
-        )
-
     @debug_kernel_api
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -185,12 +172,6 @@ class FlashinferDispatcher(BaseDispatcher):
         x_sf = None
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
-
-        self.has_dummy_token = x.shape[0] == 0
-        if self.has_dummy_token:
-            x = hidden_states.new_zeros((1, self.hidden_size))
-            topk_ids = self.dummy_topk_ids
-            topk_weights = self.dummy_topk_weights
 
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
@@ -222,8 +203,6 @@ class FlashinferDispatcher(BaseDispatcher):
             # in SP mode, full batch otherwise).  Avoids the pre-scatter
             # scheduler count which can exceed the workspace cap.
             self.runtime_max_tokens_per_rank = x.shape[0]
-        if self.has_dummy_token:
-            self.runtime_max_tokens_per_rank = max(self.runtime_max_tokens_per_rank, 1)
 
         # Passing topk_ids + invalid_token_expert_id triggers the sanitize step
         # inside moe_a2a. The recv buffer has shape
@@ -232,7 +211,7 @@ class FlashinferDispatcher(BaseDispatcher):
         # and waste downstream MoE compute. Sanitizing the padding to a
         # sentinel id is structural, not optional.
         recv_tensors = self.moe_a2a.dispatch(
-            self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
+            topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
             invalid_token_expert_id=self.num_experts,
@@ -275,9 +254,5 @@ class FlashinferDispatcher(BaseDispatcher):
             payload_in_workspace=self.payload_in_workspace,
         )
 
-        if self.has_dummy_token:
-            hidden_states = hidden_states[1:, :]
-
         del self.runtime_max_tokens_per_rank
-        del self.has_dummy_token
         return hidden_states
