@@ -232,6 +232,10 @@ def torch_gdn_gating(A_log, a, b, dt_bias):
     ), b.sigmoid().unsqueeze(0)
 
 
+@unittest.skipUnless(
+    hasattr(torch.ops.sgl_kernel, "chunk_gated_delta_rule_cpu"),
+    "sgl-kernel CPU extension not available",
+)
 class TestMambaAttention(CustomTestCase):
     def test_chunk_gated_delta_rule(self):
         B, L, HK, HV, EK, EV, N = 1, 100, 3, 6, 64, 64, 4
