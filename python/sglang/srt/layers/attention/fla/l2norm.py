@@ -51,13 +51,13 @@ def l2norm_fwd_kernel1(
 #     ],
 #     key=["D", "NB"],
 # )
-@triton.jit
+@triton.jit(do_not_specialize=["T", "NB"])
 def l2norm_fwd_kernel(
     x,
     y,
     eps,
-    NB: tl.constexpr,
-    T: tl.constexpr,
+    NB,
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
@@ -91,7 +91,9 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
+        # NOTE: Use a coarser granularity (2048 * 32) instead of 2048 to avoid
+        # excessive recompilation when T varies. Synced from fla upstream.
+        NB = triton.cdiv(T, 2048 * 32)
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
