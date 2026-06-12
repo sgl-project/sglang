@@ -659,6 +659,12 @@ class PrefillAdder:
         )
 
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
+        # A dllm block may or may not reach the fill target; decide here.
+        req.phase = (
+            ReqPhase.EXTEND_NON_LAST
+            if prefix_len + trunc_len < req.get_full_untruncated_fill_len()
+            else ReqPhase.EXTEND_LAST
+        )
 
         self.can_run_list.append(req)
 
@@ -683,6 +689,7 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        req.phase = ReqPhase.EXTEND_NON_LAST if truncated else ReqPhase.EXTEND_LAST
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -730,6 +737,7 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        req.phase = ReqPhase.EXTEND_NON_LAST if truncated else ReqPhase.EXTEND_LAST
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -841,6 +849,7 @@ class PrefillAdder:
             req.set_extend_range(
                 len(req.prefix_indices), req.get_full_untruncated_fill_len()
             )
+            req.phase = ReqPhase.EXTEND_LAST
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
@@ -859,6 +868,7 @@ class PrefillAdder:
             req.set_extend_range(
                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
             )
+            req.phase = ReqPhase.EXTEND_NON_LAST
             self.can_run_list.append(req)
             self._update_prefill_budget(0, trunc_len, 0, req.retracted_stain)
 
@@ -986,6 +996,7 @@ class PrefillAdder:
                 req.set_extend_range(
                     len(req.prefix_indices), req.get_full_untruncated_fill_len()
                 )
+                req.phase = ReqPhase.EXTEND_LAST
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
@@ -1027,6 +1038,7 @@ class PrefillAdder:
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.prefix_indices) + trunc_len
                 )
+                req.phase = ReqPhase.EXTEND_NON_LAST
 
                 self.can_run_list.append(req)
 

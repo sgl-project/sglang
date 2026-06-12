@@ -1410,7 +1410,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # decode prefetch, but it is behavior-neutral — only .end is read before
         # get_new_prebuilt_batch resets extend_range ahead of the prebuilt forward.
         req.set_extend_range(total_prefix_len, req.kv_committed_len)
-        # This prebuilt path never goes through prepare_for_extend, so enter
+        # This prebuilt path never goes through the PrefillAdder, so enter
         # the extend phase here; prepare_for_decode moves it to DECODE later.
         # These reqs are not a real chunk sequence; NON_LAST keeps them visible
         # as holders of not-yet-batched extend resources (pool stats / invariant
@@ -1885,7 +1885,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv_committed_len is not None:
                     req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
-                    # This prebuilt path never goes through prepare_for_extend,
+                    # This prebuilt path never goes through the PrefillAdder,
                     # so enter the extend phase here; prepare_for_decode moves
                     # it to DECODE later.
                     req.phase = ReqPhase.EXTEND_NON_LAST

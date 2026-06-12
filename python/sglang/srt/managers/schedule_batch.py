@@ -642,9 +642,10 @@ class ReqLogprob:
 
 
 class ReqPhase(Enum):
-    """Lifecycle phase of a request, written at the same places that mutate
-    the request's memory-management fields (prepare_for_extend,
-    prepare_for_decode, reset_for_retract)."""
+    """Lifecycle phase of a request, written at scheduling decision points:
+    the PrefillAdder admit methods (EXTEND_*), prepare_for_decode (DECODE),
+    reset_for_retract (OTHERS), plus the disagg-decode prebuilt paths and the
+    disagg-prefill bootstrap-failure handler."""
 
     # Catch-all for every state this enum does not track yet (just created,
     # waiting in queue, retracted, transferring, finished, ...).
@@ -2031,11 +2032,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             assert seq_len - pre_len == req.extend_range.length
 
             req.extend_batch_idx += 1
-            req.phase = (
-                ReqPhase.EXTEND_NON_LAST
-                if req.extend_range.end < req.get_full_untruncated_fill_len()
-                else ReqPhase.EXTEND_LAST
-            )
 
             # update req-level memory management fields
             req.kv_committed_len = seq_len
