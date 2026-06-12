@@ -4,7 +4,6 @@ from typing import Optional
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
-    extend_input_len_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
@@ -15,6 +14,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     base_engine_kwargs,
     chunked_req_of,
     exhaust_row_pool,
+    extend_input_len_of,
     inflight_middle_chunks_of,
     run_until,
     run_until_finished,
@@ -485,9 +485,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 and extend_input_len_of(req) is not None
             ):
                 saw_mid_chunk = True
-                assert (
-                    len(req.fill_ids) == len(req.prefix_indices) + extend_input_len_of(req)
-                ), (
+                assert len(req.fill_ids) == len(
+                    req.prefix_indices
+                ) + extend_input_len_of(req), (
                     f"init_next_round_input must rebuild fill_ids to the committed "
                     f"prefix plus the in-flight chunk; "
                     f"fill_ids_len={len(req.fill_ids)}, "
