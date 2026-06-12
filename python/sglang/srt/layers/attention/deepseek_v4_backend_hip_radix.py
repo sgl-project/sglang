@@ -1148,6 +1148,10 @@ class DeepseekV4HipRadixBackend(
             is_dsa_prefill_cp_round_robin_split,
         )
 
+        # NOTE (AMD/HIP only): this whole DSA-CP prefill handling lives in the
+        # HIP backend (DeepseekV4HipRadixBackend, selected only when is_hip()).
+        # The NVIDIA path uses DeepseekV4AttnBackend and never reaches here, so
+        # these CP changes do not affect B200/H200 execution.
         _cp_size = get_attention_cp_size()
         _cp_active = (
             _cp_size > 1
