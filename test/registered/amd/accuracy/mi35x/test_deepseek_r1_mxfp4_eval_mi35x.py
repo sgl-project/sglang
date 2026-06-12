@@ -114,7 +114,7 @@ def get_answer_value(answer_str):
 
 def run_gsm8k_benchmark(
     base_url: str,
-    num_questions: int = 200,
+    num_questions: int = 1319,
     num_shots: int = 5,
     parallel: int = 64,
 ) -> Tuple[float, float, float]:
@@ -166,7 +166,7 @@ class TestDeepSeekR1MXFP4EvalMI35x(unittest.TestCase):
     def setUpClass(cls):
         cls.models = get_mxfp4_models()
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_deepseek_r1_mxfp4_accuracy(self):
         """Test DeepSeek-R1-MXFP4 models with GSM8K completion benchmark."""
