@@ -944,7 +944,7 @@ class Scheduler(
             return
         waiting_rids = {r.rid for r in self.waiting_queue}
         active_rids = set(self.active_reqs.keys())
-        running_rids = {r.rid for r in self.running_batch.reqs}
+        running_rids = {r.rid for r in self.running_batch.reqs if not r.finished()}
 
         assert not waiting_rids & active_rids, (
             f"waiting_queue and active_reqs must be disjoint (sync mode); "
