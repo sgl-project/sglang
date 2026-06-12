@@ -71,6 +71,14 @@ def resolve_decode_backend(
         return NPUCudaGraphBackend(
             cuda_graph_runner, enable_memory_saver=enable_memory_saver
         )
+    elif model_runner.device == "xpu":
+        from sglang.srt.hardware_backend.xpu.xpu_cudagraph_backend import (
+            XPUCudaGraphBackend,
+        )
+
+        return XPUCudaGraphBackend(
+            cuda_graph_runner, enable_memory_saver=enable_memory_saver
+        )
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(

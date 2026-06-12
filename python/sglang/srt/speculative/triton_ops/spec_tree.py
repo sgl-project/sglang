@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def sgl_build_tree_kernel_efficient_triton(
     parent_list_ptr,
