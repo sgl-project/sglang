@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.server_args import get_global_server_args
 
@@ -116,6 +117,14 @@ class ViTCudaGraphRunner:
         # x_3d: [S, B, H], B=1, S as graph_key
         return x_3d.shape[0]
 
+    def _warmup_eager(self, graph_key: int, **kw):
+        """Eager forward to trigger all lazy init (torch.compile, Triton JIT, cuDNN)
+        before CUDA graph capture."""
+        kw = {k: v for k, v in kw.items() if v is not None}
+        with envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.override(False):
+            y = self.block_input[graph_key]
+            self.vit.blocks[0](y, cu_seqlens=self.cu_full_len[graph_key], **kw)
+
     def _create_graph(
         self,
         graph_key: int,
@@ -125,6 +134,12 @@ class ViTCudaGraphRunner:
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
     ):
+        self._warmup_eager(
+            graph_key,
+            position_embeddings=position_embeddings,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+        )
 
         graph = torch.cuda.CUDAGraph()
         vit = self.vit
