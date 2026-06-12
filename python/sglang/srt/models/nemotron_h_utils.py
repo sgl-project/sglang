@@ -41,7 +41,7 @@ def pad_to_original_num_tokens(
 ) -> torch.Tensor:
     if output.shape[0] == original_num_tokens:
         return output
-    padded = output.new_zeros((original_num_tokens, *output.shape[1:]))
+    padded = output.new_empty((original_num_tokens, *output.shape[1:]))
     padded[: output.shape[0]] = output
     return padded
 
