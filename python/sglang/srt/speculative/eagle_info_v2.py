@@ -12,7 +12,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ReqPhase, ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -164,6 +164,9 @@ class EagleDraftInputV2Mixin:
             num_needed_tokens += nxt - cur
             r.kv_allocated_len = nxt
             r.decode_batch_idx += 1
+            # This path bypasses ScheduleBatch.prepare_for_decode, so transition
+            # the phase here before the bonus pre-claim crosses the extend frontier.
+            r.phase = ReqPhase.DECODE
             # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
             r.kv_committed_len += 1
 
