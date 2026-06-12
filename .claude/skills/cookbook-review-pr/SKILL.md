@@ -105,6 +105,13 @@ than restating.
   from the `sglang serve` deploy command.
 - `sglang_version` is a real build the author ran (a release, or `dev`/nightly) — not a
   guessed/placeholder value (no leftover `0.0.0`).
+- **Consistent accuracy harness across entries**: every value under one `accuracyLabels`
+  column must be produced by the SAME harness — flag a page that, say, measures one
+  platform's GSM8K with `few_shot_gsm8k --num-questions 200` and another's with
+  `run_eval --eval-name gsm8k --num-examples 1319` and shows both as one "GSM8K %"
+  (the scores aren't comparable). Either standardize on one harness (matching
+  `benchmarkCommands.accuracy`) or require an explicit per-entry note. Common when folding
+  a second contributor's measurements (e.g. an AMD/ROCm PR) into the page.
 
 ### 5. Doc ↔ config parity (the #1 finding)
 - Any `sglang serve` command shown in MDX prose (config tips, benchmark section) must
