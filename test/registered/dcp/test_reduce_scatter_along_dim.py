@@ -41,11 +41,14 @@ register_cuda_ci(
 # Test parameters
 # ---------------------------------------------------------------------------
 
-# (batch, seq, hidden) shapes – dim 0 is always divisible by world_size
+# (head_num, batch_size, head_dim) shapes
 TEST_SHAPES = [
     (8, 16, 32),
     (16, 64, 128),
     (4, 1024, 512),
+    (16, 3, 128),
+    (64, 5, 512),
+    (128, 7, 512),
 ]
 
 
@@ -151,7 +154,7 @@ def _reference_reduce_scatter_along_dim(
         dim += input_.dim()
 
     # Move target dim to position 0 and make contiguous
-    input_tensor = input_.movedim(0, dim).contiguous()
+    input_tensor = input_.movedim(dim, 0).contiguous()
 
     assert input_tensor.shape[0] % world_size == 0
     chunk_size = input_tensor.shape[0] // world_size
