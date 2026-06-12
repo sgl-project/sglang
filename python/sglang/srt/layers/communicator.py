@@ -448,6 +448,17 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        # Opt-in flags for the fused AR+RMSNorm+per-group-FP8-quant kernel.
+        # ``enable_fused_ar_quant=True`` asks the communicator to prefer the
+        # fully-fused path when the previous layer requests AR fusion (i.e.
+        # when ``_sglang_needs_allreduce_fusion`` is set on the incoming
+        # hidden states). ``fused_ar_quant_keep_bf16=True`` is required for
+        # GDN-style layers that consume both bf16 (for the small gating
+        # projection) and fp8+scale (for the main FP8 projection) from the
+        # same normed output. Falls back to the plain fused AR+RMSNorm path
+        # if the fused quant kernel returns ``None``.
+        enable_fused_ar_quant: bool = False,
+        fused_ar_quant_keep_bf16: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -455,6 +466,8 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.enable_fused_ar_quant = enable_fused_ar_quant
+        self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
 
         self._context = CommunicateContext.init_new()
         self._post_init_communicate()
@@ -537,11 +550,32 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                    hidden_states, residual = (
-                        self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=False
+                    quant_result = None
+                    if (
+                        self.enable_fused_ar_quant
+                        and _use_aiter
+                        and hasattr(
+                            self.input_layernorm,
+                            "forward_with_allreduce_fusion_quant_per_group",
                         )
-                    )
+                    ):
+                        # Try fused AR+RMSNorm+per-group-quant. Internally
+                        # falls back to AR+RMSNorm + separate quant when the
+                        # fully-fused kernel cannot service the shape.
+                        quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant_per_group(
+                            hidden_states,
+                            residual,
+                            use_attn_tp_group=False,
+                            keep_bf16=self.fused_ar_quant_keep_bf16,
+                        )
+                    if quant_result is not None:
+                        hidden_states, residual = quant_result
+                    else:
+                        hidden_states, residual = (
+                            self.input_layernorm.forward_with_allreduce_fusion(
+                                hidden_states, residual, use_attn_tp_group=False
+                            )
+                        )
                 else:
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
