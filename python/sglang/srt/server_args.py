@@ -834,6 +834,7 @@ class ServerArgs:
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
+    enable_tf32_matmul: bool = False
 
     # Context parallelism (unified API)
     enable_prefill_cp: bool = False
@@ -2717,6 +2718,10 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                     )
+            self.enable_tf32_matmul = True
+            logger.info(
+                "Enable TF32 matmul for Glm4MoeForCausalLM model to improve gate gemm performance."
+            )
 
         elif model_arch in [
             "FalconH1ForCausalLM",
@@ -2757,6 +2762,12 @@ class ServerArgs:
                 model_arch=model_arch,
                 support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=False,
+            )
+
+        elif model_arch in ["MiniMaxM2ForCausalLM"]:
+            self.enable_tf32_matmul = True
+            logger.info(
+                "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
             )
 
         if (
@@ -7303,6 +7314,11 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
+        )
+        parser.add_argument(
+            "--enable-tf32-matmul",
+            action="store_true",
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance.",
         )
 
         # Dynamic batch tokenizer
