@@ -565,6 +565,59 @@ def sglang_per_token_group_quant_fp8(
     return x_q, x_s
 
 
+def sglang_per_token_group_quant_fp8_row_padded(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    row_alignment: int = 4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token-group quant writing into row-padded buffers (col-major scales).
+
+    The cutlass fp8_blockwise_scaled_mm wrapper pads mat_a / scales_a to a
+    multiple of 4 rows on every call (a zeros fill + a cat for each of mat_a
+    and scales_a). Allocating the quant outputs with rows already aligned to
+    ``row_alignment`` makes the wrapper's pad_tensor() short-circuit (pad_rows
+    == 0), removing 2x fill + 2x cat kernels per GEMM. Rows in [m, m_pad) are
+    uninitialized garbage; the caller must slice the GEMM output back to m.
+    """
+    assert x.dim() == 2, "row-padded quant expects a 2D input"
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` must be divisible by `group_size`"
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    if not (enable_sgl_per_token_group_quant_8bit and group_size in (16, 32, 64, 128)):
+        # No v2 kernel available: keep the legacy unpadded path and let the
+        # GEMM wrapper do the padding.
+        return sglang_per_token_group_quant_fp8(
+            x, group_size, eps, column_major_scales=True
+        )
+
+    m, k = x.shape
+    m_pad = ceil_align(m, row_alignment)
+    # mat_a buffer: (m_pad, k) row-major fp8
+    x_q = torch.empty((m_pad, k), device=x.device, dtype=fp8_dtype)
+    # scales_a buffer: column-major (stride(0) == 1), shape (m_pad, k // group)
+    x_s = torch.empty(
+        (k // group_size, m_pad), device=x.device, dtype=torch.float32
+    ).transpose(0, 1)
+    if m > 0:
+        sgl_per_token_group_quant_8bit(
+            x,
+            x_q[:m],
+            x_s[:m],
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            False,  # scale_ue8m0
+            False,  # fuse_silu_and_mul
+            None,  # masked_m
+            enable_v2=True,
+        )
+    return x_q, x_s
+
+
 def sglang_per_token_group_quant_fp8_ue8m0(
     x: torch.Tensor,
     group_size: int,

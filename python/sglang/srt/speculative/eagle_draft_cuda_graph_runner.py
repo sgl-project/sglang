@@ -23,10 +23,11 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
+    ShapeKey,
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
-from sglang.srt.model_executor.runner_backend import FullCudaGraphBackend
+from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -170,7 +171,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 else None
             )
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
             )
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
@@ -204,7 +205,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_for_logprob_gpu = None
 
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32, device="cpu"
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
         )
 
         self.buffers = EagleDraftInputBuffers(
@@ -226,11 +227,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.buffers.share_buffers()
 
-        # Backend (Full CUDA graph capture)
-        self.backend = FullCudaGraphBackend(
-            self,
-            enable_memory_saver=model_runner.server_args.enable_memory_saver,
-        )
+        self.backend = resolve_decode_backend(self)
 
         # Capture
         try:
@@ -241,6 +238,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def _replay_graph(self, shape_key, forward_batch):
+        return self.backend.replay(shape_key, forward_batch)
+
     # -----------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------
@@ -248,8 +248,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        # EAGLE doesn't use stream_idx / lora variants; key is just bs.
-        return bs
+        # EAGLE doesn't use stream_idx / lora variants.
+        return ShapeKey(size=bs)
 
     # -----------------------------------------------------------------
     # can_run
@@ -533,7 +533,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             else contextlib.nullcontext()
         )
         with timer_ctx:
-            out = self.backend.replay(shape_key, forward_batch)
+            out = self._replay_graph(shape_key, forward_batch)
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)
