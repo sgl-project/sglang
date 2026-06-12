@@ -26,7 +26,7 @@ class TestPrefetchCheckpointsMultiGPU(CustomTestCase):
             enable_dp_attention=True,
             disable_radix_cache=True,
             weight_loader_prefetch_checkpoints=True,
-            cuda_graph_max_bs=1,
+            cuda_graph_max_bs_decode=1,
             max_total_tokens=256,
         )
 

@@ -65,9 +65,15 @@ from sglang.srt.layers.moe import (
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
 from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
     mla_use_prefill_cp,
+)
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -273,7 +279,7 @@ class AttnTpContext:
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
-            and get_global_server_args().disable_piecewise_cuda_graph
+            and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             and get_global_server_args().speculative_algorithm != "EAGLE3"
         )
         if get_global_server_args().enable_attn_tp_input_scattered:
@@ -572,6 +578,7 @@ class LayerCommunicator:
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
                             output_unquantized_inp1=_dsa_needs_bf16,
+                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
                         )
                         if _dsa_needs_bf16:
                             hidden_states = (
@@ -617,6 +624,7 @@ class LayerCommunicator:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=residual,
                                 output_unquantized_inp1=_dsa_needs_bf16,
+                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
                             )
                         )
                         if _dsa_needs_bf16:
@@ -943,6 +951,23 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 residual_input_mode=residual_input_mode,
             )
 
+        if (
+            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (
+                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+            )
+            and (hidden_states_output_mode == ScatterMode.TP_ATTN_FULL)
+            and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
+            and context.attn_tp_size > 1
+        ):
+            # Used when the dense MLP is tensor-parallelized along the
+            # attention TP group (``moe_dense_tp_size > 1``): hidden states
+            # need an all-reduce inside the attention TP group before the
+            # next layernorm, while staying in TP_ATTN_FULL on both sides.
+            return (
+                CommunicateWithAllReduceAndLayerNormFn._tp_attn_all_reduce_and_layernorm
+            )
+
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
         )
@@ -956,6 +981,25 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    @staticmethod
+    def _tp_attn_all_reduce_and_layernorm(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+    ):
+        """All-reduce hidden states inside the attention TP group, then layernorm.
+
+        Used when the dense MLP shares the attention TP group
+        (``moe_dense_tp_size > 1``): both hidden states and residual stay in
+        ``TP_ATTN_FULL`` across the boundary.
+        """
+        hidden_states = get_attention_tp_group().all_reduce(hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual

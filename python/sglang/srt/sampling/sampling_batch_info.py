@@ -42,6 +42,8 @@ class SamplingBatchInfo:
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
     grammars: Optional[List] = None
+    rids_int: Optional[torch.Tensor] = None
+    bootstrap_room_ids_int: Optional[torch.Tensor] = None
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
@@ -193,7 +195,7 @@ class SamplingBatchInfo:
         pass
 
     # placeholder for override
-    def adjusted_merge_batch(self, other: "SamplingBatchInfo"):
+    def adjusted_merge_batch(self, other: SamplingBatchInfo):
         pass
 
     # placeholder for override
@@ -350,7 +352,7 @@ class SamplingBatchInfo:
 
         return merged_dict
 
-    def merge_batch(self, other: "SamplingBatchInfo"):
+    def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         # Merge the custom logit processors and custom params lists
