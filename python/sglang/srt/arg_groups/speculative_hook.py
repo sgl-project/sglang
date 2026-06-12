@@ -120,14 +120,18 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
     if server_args.speculative_adaptive:
         _maybe_disable_adaptive(server_args)
         if server_args.speculative_adaptive:
-            from sglang.srt.speculative.adaptive_spec_params import (
-                validate_adaptive_initial_steps,
-            )
+            strategy = getattr(server_args, "speculative_adaptive_strategy", "ema")
+            if strategy == "throughput_aware":
+                _validate_throughput_aware_adaptive(server_args)
+            else:
+                from sglang.srt.speculative.adaptive_spec_params import (
+                    validate_adaptive_initial_steps,
+                )
 
-            validate_adaptive_initial_steps(
-                server_args.speculative_num_steps,
-                server_args.speculative_adaptive_config,
-            )
+                validate_adaptive_initial_steps(
+                    server_args.speculative_num_steps,
+                    server_args.speculative_adaptive_config,
+                )
 
 
 def _handle_dflash(server_args: "ServerArgs") -> None:
@@ -462,3 +466,39 @@ def _maybe_disable_adaptive(server_args: "ServerArgs") -> None:
             "Falling back to static speculative params."
         )
         server_args.speculative_adaptive = False
+
+
+def _validate_throughput_aware_adaptive(server_args: "ServerArgs") -> None:
+    """Validate throughput_aware strategy config at startup."""
+    if server_args.speculative_adaptive_config is None:
+        raise ValueError(
+            "--speculative-adaptive-strategy=throughput_aware requires "
+            "--speculative-adaptive-config to point to a JSON config file."
+        )
+
+    from sglang.srt.speculative.throughput_aware_controller import (
+        load_throughput_aware_config,
+        resolve_throughput_aware_candidate_steps,
+        _parse_bs_candidates,
+    )
+
+    cfg = load_throughput_aware_config(server_args.speculative_adaptive_config)
+    # This will raise ValueError if the config is malformed.
+    _, bs_candidates = _parse_bs_candidates(cfg)
+
+    all_candidate_steps = sorted(
+        {s for steps in bs_candidates.values() for s in steps}
+    )
+    initial_steps = server_args.speculative_num_steps
+    if initial_steps not in all_candidate_steps:
+        raise ValueError(
+            f"--speculative-num-steps={initial_steps} is not in the "
+            f"throughput_aware config candidate_steps {all_candidate_steps}. "
+            "Pass one of those values."
+        )
+
+    logger.info(
+        f"throughput_aware adaptive: config loaded, "
+        f"candidate_steps={all_candidate_steps}, "
+        f"initial_steps={initial_steps}"
+    )

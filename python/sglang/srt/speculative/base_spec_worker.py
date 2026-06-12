@@ -56,3 +56,7 @@ class BaseSpecWorker(ABC):
         the runtime state before each draft round.
         """
         pass
+
+    def run_startup_spec_profiling(self, tree_cache) -> None:
+        """Startup cost-table profiling hook. Default no-op."""
+        pass

@@ -632,6 +632,7 @@ class ServerArgs:
     # Adaptive speculative decoding
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
+    speculative_adaptive_strategy: str = "ema"  # "ema" | "throughput_aware"
 
     # Expert parallelism
     ep_size: int = 1
@@ -6011,6 +6012,18 @@ class ServerArgs:
             default=ServerArgs.speculative_adaptive_config,
         )
         parser.add_argument(
+            "--speculative-adaptive-strategy",
+            type=str,
+            choices=["ema", "throughput_aware"],
+            help=(
+                "Adaptive speculative decoding strategy. "
+                "'ema' (default): EMA-based hysteresis step selection. "
+                "'throughput_aware': per-position sliding-window acceptance rate "
+                "combined with a startup-profiled cost table to maximise tokens/ms."
+            ),
+            default=ServerArgs.speculative_adaptive_strategy,
+        )
+        parser.add_argument(
             "--speculative-skip-dp-mlp-sync",
             action="store_true",
             default=ServerArgs.speculative_skip_dp_mlp_sync,
@@ -7374,15 +7387,24 @@ class ServerArgs:
         if not self.speculative_adaptive:
             return self.speculative_num_draft_tokens
 
-        from sglang.srt.speculative.adaptive_spec_params import (
-            resolve_candidate_steps_from_config,
-        )
+        if self.speculative_adaptive_strategy == "throughput_aware":
+            from sglang.srt.speculative.throughput_aware_controller import (
+                resolve_throughput_aware_candidate_steps,
+            )
 
-        candidate_steps = resolve_candidate_steps_from_config(
-            cfg_path=self.speculative_adaptive_config,
-        )
-        # TODO: adaptive spec currently requires topk=1, so each runtime state
-        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
+            candidate_steps = resolve_throughput_aware_candidate_steps(
+                self.speculative_adaptive_config,
+            )
+        else:
+            from sglang.srt.speculative.adaptive_spec_params import (
+                resolve_candidate_steps_from_config,
+            )
+
+            candidate_steps = resolve_candidate_steps_from_config(
+                cfg_path=self.speculative_adaptive_config,
+            )
+        # adaptive spec currently requires topk=1, so each runtime state
+        # needs steps + 1 draft-token slots.
         return max(candidate_steps) + 1
 
     @property

@@ -813,6 +813,12 @@ class Scheduler(
         else:
             self.external_corpus_manager = None
 
+    def maybe_run_spec_startup_profiling(self) -> None:
+        """Startup spec cost-table profiling (no-op unless worker overrides)."""
+        dw = getattr(self, "draft_worker", None)
+        if dw is not None:
+            dw.run_startup_spec_profiling(self.tree_cache)
+
     def init_model_worker(self):
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
@@ -4056,6 +4062,8 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+
+        scheduler.maybe_run_spec_startup_profiling()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
