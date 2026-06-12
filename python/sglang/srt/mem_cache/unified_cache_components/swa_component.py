@@ -681,7 +681,7 @@ class SWAComponent(TreeComponent):
             )
 
     def _attach_swa_host_value(
-        self, node: "UnifiedTreeNode", host_indices: torch.Tensor
+        self, node: UnifiedTreeNode, host_indices: torch.Tensor
     ) -> None:
         """Write host_indices into node's SWA host_value and refresh tree state."""
         ct = self.component_type
