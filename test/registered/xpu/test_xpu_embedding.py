@@ -2,7 +2,7 @@
 XPU embedding server test: validates the OpenAI-compatible /v1/embeddings
 endpoint on Intel XPU using a small embedding model. Lives in its own file
 because embedding models load with --is-embedding and use a different model
-than the chat fixtures in test_xpu_multi_feature.py.
+than the chat fixtures in test_xpu_serving_features.py.
 
 Usage:
 python3 -m unittest test_xpu_embedding.TestXPUEmbedding

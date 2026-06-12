@@ -1,11 +1,11 @@
 """
-XPU multi-feature server test: covers OpenAI API, constrained decoding,
+XPU serving-features test: covers OpenAI API, constrained decoding,
 sampling penalties, radix cache, and reasoning parsing in a single
 server fixture so each feature gets one canonical assertion on Intel XPU
 without paying the cost of N separate model launches.
 
 Usage:
-python3 -m unittest test_xpu_multi_feature.TestXPUMultiFeature
+python3 -m unittest test_xpu_serving_features.TestXPUServingFeatures
 """
 
 import json
@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
 register_xpu_ci(est_time=300, suite="stage-b-test-1-gpu-xpu")
 
 
-class TestXPUMultiFeature(CustomTestCase):
+class TestXPUServingFeatures(CustomTestCase):
     """One server, many features. Boots Llama-3.2-1B-Instruct once and
     exercises five separate gaps the per-feature tests would each launch
     their own server for.
