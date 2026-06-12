@@ -562,7 +562,12 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             # pre-plan (see warning above). Mark the batch so the forward path
             # keeps skipping metadata init — preserves the pre-existing
             # behavior; the latent issue is tracked by the warning.
-            forward_batch.mark_forward_metadata_ready()
+            # On NPU with --disable-cuda-graph, leave each draft runner to init
+            # its own metadata in forward_extend (post-pad), otherwise
+            # per-runner attn_backend.forward_metadata is never initialized for
+            # draft_runner_list[1+].
+            if not _is_npu or can_cuda_graph:
+                forward_batch.mark_forward_metadata_ready()
 
         for step in range(self.speculative_num_steps):
             # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
@@ -821,7 +826,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # prepare_for_v2_verify only plans when cuda-graph replay_prepare ran.
         # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
         # worker has not adopted that fix, so preserve its behavior verbatim.
-        verify_forward_batch.mark_forward_metadata_ready()
+        # On NPU with --disable-cuda-graph, non-graph verify needs metadata init
+        # in forward_extend (post-pad); only mark ready for the cuda-graph path.
+        if not _is_npu or can_run_cuda_graph:
+            verify_forward_batch.mark_forward_metadata_ready()
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,

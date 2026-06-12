@@ -370,7 +370,11 @@ class EagleDraftExtendInputV2Mixin:
             # (the `_batch_size == batch_size` assertion, see #27091); the
             # marked pre-pad metadata is used as-is, matching the proven
             # skip_attn_backend_init=True behavior.
-            forward_batch.mark_forward_metadata_ready()
+            # On NPU with --disable-cuda-graph, block_table shape won't match
+            # after prepare_mlp_sync_batch padding; defer re-init to
+            # forward_extend (post-pad) instead.
+            if not _is_npu or can_cuda_graph:
+                forward_batch.mark_forward_metadata_ready()
         return forward_batch
 
 
