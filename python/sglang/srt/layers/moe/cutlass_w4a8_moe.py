@@ -329,7 +329,8 @@ def cutlass_w4a8_moe_deepep_normal(
         None,
         topk,
         a.shape[1],
-        BLOCK_SIZE=512,
+        BLOCK_SIZE=1024,
+        num_warps=8,
     )
     gateup_input = torch.empty(
         gateup_input_pre_reorder.shape, dtype=torch.float8_e4m3fn, device=device
