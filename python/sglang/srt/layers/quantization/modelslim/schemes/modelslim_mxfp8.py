@@ -4,21 +4,38 @@ Loads weights pre-quantized by msmodelslim (float8_e4m3fn weights,
 uint8 scales) and runs MXFP8 matmul at inference.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
-import torch_npu
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
+from sglang.srt.platforms import current_platform
+
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    import torch_npu
 
 MXFP8_BLOCK_SIZE = 32
-_FLOAT8_E8M0FNU_DTYPE = getattr(
-    torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)
+_FLOAT8_E8M0FNU_DTYPE = (
+    getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None))
+    if _is_npu
+    else getattr(torch, "float8_e8m0fnu", None)
 )
 
 
 class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
+
+    def __init__(
+        self,
+        quant_config: Optional[Dict[str, any]] = None,
+        prefix: Optional[str] = None,
+    ):
+        # quant_config / prefix are accepted to match the linear-scheme
+        # dispatch signature used by ModelSlimConfig.get_linear_scheme;
+        # MXFP8 needs no per-layer config beyond what create_weights derives.
+        del quant_config, prefix
 
     def create_weights(
         self,
@@ -69,6 +86,16 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
         layer.weight.data = layer.weight.data.transpose(0, 1)
         layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1)
+        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
+        if (
+            getattr(layer, "bias", None) is not None
+            and layer.bias.dtype != torch.float32
+        ):
+            layer.bias_fp32 = torch.nn.Parameter(
+                layer.bias.data.to(torch.float32), requires_grad=False
+            )
+        else:
+            layer.bias_fp32 = None
 
     def apply_weights(
         self,
@@ -90,7 +117,18 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
             x_2d, dst_type=torch_npu.float8_e4m3fn
         )
 
-        # MXFP8 matmul (weight & scale already transposed at load time)
+        # MXFP8 matmul (weight & scale already transposed at load time).
+        # Use the cached FP32 bias from process_weights_after_loading.
+        if bias is None:
+            quant_bias = None
+        elif (
+            bias is getattr(layer, "bias", None)
+            and getattr(layer, "bias_fp32", None) is not None
+        ):
+            quant_bias = layer.bias_fp32
+        else:
+            quant_bias = bias.to(torch.float32)
+
         output = torch_npu.npu_quant_matmul(
             qx,
             layer.weight,
@@ -98,7 +136,7 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
             scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
             pertoken_scale=input_scale,
             pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
-            bias=bias.to(torch.float32) if bias is not None else None,
+            bias=quant_bias,
             output_dtype=original_dtype,
             group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
         )

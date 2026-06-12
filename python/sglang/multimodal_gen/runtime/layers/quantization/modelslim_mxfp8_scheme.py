@@ -7,7 +7,13 @@ uint8 scales) and runs MXFP8 matmul at inference.
 from typing import List, Optional
 
 import torch
-import torch_npu
+
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    import torch_npu
 
 from sglang.multimodal_gen.runtime.models.parameter import (
     GroupQuantScaleParameter,

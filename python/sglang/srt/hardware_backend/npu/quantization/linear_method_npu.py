@@ -1,18 +1,28 @@
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch_npu
 from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.platforms import current_platform
+
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    import torch_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
+logger = logging.getLogger(__name__)
+
 MXFP8_BLOCK_SIZE = 32
-_FLOAT8_E8M0FNU_DTYPE = getattr(
-    torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)
+_FLOAT8_E8M0FNU_DTYPE = (
+    getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None))
+    if _is_npu
+    else getattr(torch, "float8_e8m0fnu", None)
 )
 
 
@@ -161,21 +171,41 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight_fp = layer.weight.data
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
+            logger.warning(
+                "NPUMXFP8LinearMethod: weight dtype %s is not float16/bfloat16; "
+                "casting to bfloat16 before MXFP8 quantisation.",
+                weight_fp.dtype,
+            )
             weight_fp = weight_fp.to(torch.bfloat16)
 
         # Move weight to NPU if needed (cpu offload may have moved it back to CPU)
         if not weight_fp.is_npu:
             weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
 
-        # Online MXFP8 quantisation of weights (block_size=32)
+        # Online MXFP8 quantisation of weights (block_size=32).
+        # qw: [out, in] float8_e4m3fn, w_scale: [out, in//64, 2] uint8.
         qw, w_scale = torch_npu.npu_dynamic_mx_quant(
             weight_fp, dst_type=torch_npu.float8_e4m3fn
         )
-        # Pre-transpose to [in, out] for npu_quant_matmul (avoid per-call transpose)
-        layer.weight = Parameter(qw.transpose(0, 1).contiguous(), requires_grad=False)
-        layer.weight_scale_inv = Parameter(
-            w_scale.transpose(0, 1).contiguous(), requires_grad=False
-        )
+        # Transpose to [in, out] / [in//64, out, 2] as a strided view — DO NOT
+        # call .contiguous(). The matmul reduction loop scans the in-dim per
+        # output column; the [out, in] row-major layout gives stride-1 access
+        # for that scan via the transpose view (matches msmodelslim's offline
+        # layout and vllm-ascend's AscendW8A8MXFP8DynamicLinearMethod). Calling
+        # .contiguous() physically reorders to [in, out] row-major, which makes
+        # the inner-loop stride = out and tanks HBM bandwidth.
+        layer.weight = Parameter(qw.transpose(0, 1), requires_grad=False)
+        layer.weight_scale_inv = Parameter(w_scale.transpose(0, 1), requires_grad=False)
+        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
+        if (
+            getattr(layer, "bias", None) is not None
+            and layer.bias.dtype != torch.float32
+        ):
+            layer.bias_fp32 = Parameter(
+                layer.bias.data.to(torch.float32), requires_grad=False
+            )
+        else:
+            layer.bias_fp32 = None
 
     def apply(
         self,
@@ -198,6 +228,18 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         )
 
         # MXFP8 matmul (weight & scale already transposed at load time)
+        # Use the cached FP32 bias from process_weights_after_loading; fall back
+        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
+        if bias is None:
+            quant_bias = None
+        elif (
+            bias is getattr(layer, "bias", None)
+            and getattr(layer, "bias_fp32", None) is not None
+        ):
+            quant_bias = layer.bias_fp32
+        else:
+            quant_bias = bias.to(torch.float32)
+
         output = torch_npu.npu_quant_matmul(
             qx,
             layer.weight,
@@ -205,7 +247,7 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
             scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
             pertoken_scale=input_scale,
             pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
-            bias=bias.to(torch.float32) if bias is not None else None,
+            bias=quant_bias,
             output_dtype=original_dtype,
             group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
         )
@@ -232,8 +274,10 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
     W4A8 mixed-precision kernel in the current torch_npu public API.
     """
 
-    _FLOAT4_E2M1FN_X2_DTYPE = getattr(
-        torch_npu, "float4_e2m1fn_x2", getattr(torch, "float4_e2m1fn_x2", None)
+    _FLOAT4_E2M1FN_X2_DTYPE = (
+        getattr(torch_npu, "float4_e2m1fn_x2", getattr(torch, "float4_e2m1fn_x2", None))
+        if _is_npu
+        else getattr(torch, "float4_e2m1fn_x2", None)
     )
 
     def create_weights(

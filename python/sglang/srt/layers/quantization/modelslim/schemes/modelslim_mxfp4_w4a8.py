@@ -12,19 +12,36 @@ Inference:
 from typing import List, Optional
 
 import torch
-import torch_npu
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
+from sglang.srt.platforms import current_platform
+
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    import torch_npu
 
 MXFP4_W4A8_BLOCK_SIZE = 32
 
-_FLOAT8_E8M0FNU_DTYPE = getattr(
-    torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)
+_FLOAT8_E8M0FNU_DTYPE = (
+    getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None))
+    if _is_npu
+    else getattr(torch, "float8_e8m0fnu", None)
 )
 
 
 class ModelSlimMXFP4W4A8Scheme(ModelSlimLinearScheme):
+
+    def __init__(
+        self,
+        quant_config: Optional[dict] = None,
+        prefix: Optional[str] = None,
+    ):
+        # quant_config / prefix are accepted to match the linear-scheme dispatch
+        # signature used by ModelSlimConfig.get_linear_scheme; W4A8_MXFP needs no
+        # per-layer config beyond what create_weights derives.
+        del quant_config, prefix
 
     def create_weights(
         self,

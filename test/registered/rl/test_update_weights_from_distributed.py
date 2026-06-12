@@ -43,8 +43,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import terminate_process
 
-register_cuda_ci(est_time=103, suite="stage-b-test-2-gpu-large")
-register_amd_ci(est_time=103, suite="stage-b-test-2-gpu-large-amd")
+register_cuda_ci(est_time=137, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")
 
 mp.set_start_method("spawn", force=True)
 
@@ -315,7 +315,7 @@ def init_process_sgl(
             model_path=model_name,
             base_gpu_id=base_gpu_id,
             tp_size=tp_size,
-            cuda_graph_max_bs=2,
+            cuda_graph_max_bs_decode=2,
         )
     else:
         if rank == 1:
