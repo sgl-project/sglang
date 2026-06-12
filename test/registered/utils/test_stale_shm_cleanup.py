@@ -34,6 +34,9 @@ class TestMakeShmName(unittest.TestCase):
         self.assertIsNone(_creator_pid("psm_deadbeef"))
         self.assertIsNone(_creator_pid("sgl_shm_garbage"))
         self.assertIsNone(_creator_pid("multi_tokenizer_args_notanint"))
+        # Non-positive pids would make os.kill probe process groups.
+        self.assertIsNone(_creator_pid("sgl_shm_mm_-1_abcd1234"))
+        self.assertIsNone(_creator_pid("sgl_shm_mm_0_abcd1234"))
 
 
 @unittest.skipUnless(os.path.isdir("/dev/shm"), "requires /dev/shm")
@@ -55,7 +58,9 @@ class TestCleanupStaleShm(unittest.TestCase):
         dead_pid = _spawn_dead_pid()
         stale = self._make_segment(f"sgl_shm_mm_{dead_pid}_aaaa0000")
         live = self._make_segment(f"sgl_shm_mm_{os.getpid()}_bbbb0000")
-        foreign = self._make_segment(f"test_foreign_{os.getpid()}")
+        # Anonymous segments from other processes get psm_* names; the sweep
+        # must never touch them even when their creator is dead.
+        foreign = self._make_segment("psm_testforeign")
 
         with patch("sglang.utils.is_in_ci", return_value=True):
             cleanup_stale_shm()
@@ -72,6 +77,20 @@ class TestCleanupStaleShm(unittest.TestCase):
             cleanup_stale_shm()
 
         self.assertTrue(os.path.exists(f"/dev/shm/{stale}"))
+
+    def test_shm_ring_buffer_uses_reclaimable_name(self):
+        """Bind the production call site: ShmRingBuffer must emit a
+        pid-stamped name, or the leak this module fixes silently returns."""
+        from sglang.srt.distributed.device_communicators.shm_broadcast import (
+            ShmRingBuffer,
+        )
+
+        buf = ShmRingBuffer(1, 64, 1)
+        try:
+            self.assertEqual(_creator_pid(buf.shared_memory.name), os.getpid())
+        finally:
+            buf.shared_memory.close()
+            buf.shared_memory.unlink()
 
     def test_multi_tokenizer_args_cleanup(self):
         dead_pid = _spawn_dead_pid()
