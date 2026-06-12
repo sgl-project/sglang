@@ -913,6 +913,12 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     self.send_kv_chunk(partially_extended_req)
                 self.running_batch.batch_is_full = False
+            else:
+                # Bootstrap not ready (deferred overlap poll) or failed: stop resuming
+                # this chunked prefill, mirroring the old `chunked_req = None`. The
+                # deferred optimistic_release_and_requeue (or the failure handler) owns
+                # the req from here; deactivating again there is an idempotent no-op.
+                self._deactivate_req(partially_extended_req)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             last_bs = self.last_batch.batch_size()
