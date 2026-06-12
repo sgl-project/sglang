@@ -38,8 +38,8 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import (
-    Req, 
-    ScheduleBatch, 
+    Req,
+    ScheduleBatch,
     compute_cache_hit_split,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
