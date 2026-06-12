@@ -1674,6 +1674,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 @dataclass
 class CheckWeightsReqInput(BaseReq):
     action: str
+    allow_quant_error: bool = False
 
 
 @dataclass

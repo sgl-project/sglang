@@ -52,14 +52,16 @@ class WeightChecker:
         self._model_runner = model_runner
         self._snapshot_tensors = None
 
-    def handle(self, action: str) -> Optional[Dict]:
-        logger.info(f"[WeightChecker] handle action={action}")
+    def handle(self, action: str, allow_quant_error: bool = False) -> Optional[Dict]:
+        logger.info(
+            f"[WeightChecker] handle action={action} allow_quant_error={allow_quant_error}"
+        )
         if action == "snapshot":
             return self._snapshot()
         elif action == "reset_tensors":
             return self._reset_tensors()
         elif action == "compare":
-            return self._compare()
+            return self._compare(allow_quant_error=allow_quant_error)
         elif action == "checksum":
             return self._compute_checksum()
         else:
@@ -80,7 +82,7 @@ class WeightChecker:
                 continue
             param.copy_(_random_like(param))
 
-    def _compare(self):
+    def _compare(self, allow_quant_error: bool = False):
         assert self._snapshot_tensors is not None
 
         skip_compare_names = {
@@ -95,6 +97,7 @@ class WeightChecker:
             actual_tensors=_postprocess_tensors(
                 dict(self._model_state()), skip_compare_names
             ),
+            allow_quant_error=allow_quant_error,
         )
 
     def _compute_checksum(self) -> Dict:
@@ -112,7 +115,7 @@ class WeightChecker:
         # produce the same bf16 must produce the same checksum.
         checksums = {
             name: _hash_tensor(tensor.data)
-            for name, should_compare, tensor in _postprocess_tensors(
+            for name, should_compare, _, tensor in _postprocess_tensors(
                 dict(self._model_state()), skip_compare_names
             )
             if should_compare
@@ -154,8 +157,9 @@ def _hash_tensor(t: torch.Tensor) -> str:
 
 
 def _check_tensors(
-    expect_tensors: Iterable[Tuple[str, bool, torch.Tensor]],
-    actual_tensors: Iterable[Tuple[str, bool, torch.Tensor]],
+    expect_tensors: Iterable[Tuple[str, bool, Optional[torch.Tensor], torch.Tensor]],
+    actual_tensors: Iterable[Tuple[str, bool, Optional[torch.Tensor], torch.Tensor]],
+    allow_quant_error: bool = False,
 ):
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
@@ -163,15 +167,17 @@ def _check_tensors(
     error_messages = []
     info_messages = []
 
-    for (expect_name, expect_should_compare, expect), (
+    for (expect_name, expect_should_compare, expect_quant_ulp, expect), (
         actual_name,
         actual_should_compare,
+        actual_quant_ulp,
         actual,
     ) in zip(expect_tensors, actual_tensors, strict=True):
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
         assert (
             expect_should_compare == actual_should_compare
         ), f"{expect_should_compare=} {actual_should_compare=}"
+        assert (expect_quant_ulp is None) == (actual_quant_ulp is None)
         name = expect_name
         should_compare = expect_should_compare
 
@@ -189,7 +195,22 @@ def _check_tensors(
                 f"{get_tensor_info(expect)=} "
                 f"{get_tensor_info(actual)=} "
             )
-            (error_messages if should_compare else info_messages).append(msg)
+            if not should_compare:
+                info_messages.append(msg)
+            elif allow_quant_error and expect_quant_ulp is not None:
+                # Each side is one quantization of the same weight, so they may
+                # disagree by up to 1 ULP of each quantized representation.
+                tolerance = expect_quant_ulp.cuda() + actual_quant_ulp.cuda()
+                # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
+                num_exceed = int((~(abs_diff <= tolerance)).sum())
+                if num_exceed == 0:
+                    info_messages.append(msg + "(within quantization ULP tolerance)")
+                else:
+                    error_messages.append(
+                        msg + f"num_exceed_quant_ulp_tolerance={num_exceed}"
+                    )
+            else:
+                error_messages.append(msg)
 
     logger.info(f"[check_tensors] equal tensors: {good_names}")
     if len(info_messages) > 0:
@@ -215,10 +236,27 @@ def _random_like(t: torch.Tensor):
     )
 
 
+def _quant_ulp(w_q: torch.Tensor) -> torch.Tensor:
+    """Per-element ULP (spacing to the next representable magnitude) of w_q in its own dtype."""
+    finfo = torch.finfo(w_q.dtype)
+    x = w_q.to(torch.float32).abs()
+    # frexp: x = m * 2^e with m in [0.5, 1), so 2^(e-1) is the binade base of x.
+    _, exponent = torch.frexp(x)
+    binade = torch.exp2((exponent - 1).to(torch.float32))
+    # Zeros and subnormals share the spacing of the smallest normal binade.
+    binade = binade.masked_fill(x < finfo.smallest_normal, finfo.smallest_normal)
+    return binade * finfo.eps
+
+
 def _postprocess_tensors(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
-) -> Iterable[Tuple[str, bool, torch.Tensor]]:
+) -> Iterable[Tuple[str, bool, Optional[torch.Tensor], torch.Tensor]]:
+    """Yields (name, should_compare, quant_ulp, tensor).
+
+    quant_ulp is only set for dequantized tensors: the per-element ULP of the
+    quantized representation, scaled into dequantized space by the block scale.
+    """
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
     skip_compare_names = set(skip_compare_names)
@@ -252,15 +290,25 @@ def _postprocess_tensors(
                 w_s_for_dequant = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
             else:
                 w_s_for_dequant = w_s
+            w_s_for_dequant = w_s_for_dequant.to(torch.float32)
 
+            block_size = [
+                -(-w_q.shape[-2] // w_s_for_dequant.shape[-2]),
+                -(-w_q.shape[-1] // w_s_for_dequant.shape[-1]),
+            ]
             w_dequant = block_quant_dequant(
                 w_q,
                 w_s_for_dequant,
-                # TODO do not hardcode
-                block_size=[128, 128],
+                block_size=block_size,
                 dtype=torch.bfloat16,
             )
-            yield name, True, w_dequant
+            quant_ulp = block_quant_dequant(
+                _quant_ulp(w_q),
+                w_s_for_dequant,
+                block_size=block_size,
+                dtype=torch.float32,
+            )
+            yield name, True, quant_ulp, w_dequant
         except Exception as e:
             e.add_note(
                 f"when handling {name=} {get_tensor_info(w_q)=} {get_tensor_info(w_s)=}"
@@ -269,4 +317,4 @@ def _postprocess_tensors(
 
     for name in raw:
         should_compare = name not in skip_compare_names
-        yield name, should_compare, raw[name]
+        yield name, should_compare, None, raw[name]

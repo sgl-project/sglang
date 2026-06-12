@@ -256,7 +256,10 @@ class SchedulerUpdateWeightsMixin:
 
     def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
         try:
-            payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
+            payload = self.tp_worker.model_runner.check_weights(
+                action=recv_req.action,
+                allow_quant_error=recv_req.allow_quant_error,
+            )
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
