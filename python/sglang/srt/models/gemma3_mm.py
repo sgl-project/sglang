@@ -243,19 +243,20 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
 
                 # Consider bidirectional attention between image tokens
                 mm_inputs = forward_batch.mm_inputs[i]
-                for mm_item in mm_inputs.mm_items:
-                    if mm_item.is_image():
-                        for im_begin, im_end in mm_item.offsets:
-                            if (
-                                im_begin >= forward_batch.extend_prefix_lens[i]
-                            ):  # compatible with radix cache
-                                bidirectional_attn_mask[
-                                    im_begin
-                                    - forward_batch.extend_prefix_lens[i] : im_end
-                                    + 1
-                                    - forward_batch.extend_prefix_lens[i],
-                                    im_begin : im_end + 1,
-                                ] = 1
+                if mm_inputs is not None:
+                    for mm_item in mm_inputs.mm_items:
+                        if mm_item.is_image():
+                            for im_begin, im_end in mm_item.offsets:
+                                if (
+                                    im_begin >= forward_batch.extend_prefix_lens[i]
+                                ):  # compatible with radix cache
+                                    bidirectional_attn_mask[
+                                        im_begin
+                                        - forward_batch.extend_prefix_lens[i] : im_end
+                                        + 1
+                                        - forward_batch.extend_prefix_lens[i],
+                                        im_begin : im_end + 1,
+                                    ] = 1
                 bidirectional_attn_masks_list.append(bidirectional_attn_mask.flatten())
                 bidirectional_attn_mask_indptr[i + 1] = (
                     bidirectional_attn_mask_indptr[i]
