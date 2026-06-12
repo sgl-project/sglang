@@ -328,10 +328,18 @@ class OpenAIServingChat(OpenAIServingBase):
             delta = content["text"][offset:]
             stream_offsets[index] = len(content["text"])
 
+        raw_delta = delta
+        content_logprobs = choice_logprobs
+
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
                 index, delta, reasoning_parser_dict, content, request
+            )
+            reasoning_logprobs, content_logprobs = (
+                self._split_streaming_logprobs_for_reasoning(
+                    choice_logprobs, raw_delta, reasoning_text, delta
+                )
             )
             if reasoning_text:
                 usage = None
@@ -348,6 +356,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
+                    logprobs=reasoning_logprobs,
                     usage=usage,
                 )
 
@@ -391,7 +400,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     content=delta,
-                    logprobs=choice_logprobs,
+                    logprobs=content_logprobs,
                     usage=usage,
                 )
 
@@ -1372,6 +1381,80 @@ class OpenAIServingChat(OpenAIServingBase):
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
         return ChoiceLogprobs(content=token_logprobs)
+
+    @staticmethod
+    def _split_streaming_logprobs_for_reasoning(
+        choice_logprobs: Optional[Dict],
+        raw_delta: str,
+        reasoning_text: str,
+        content_text: str,
+    ) -> tuple[Optional[Dict], Optional[Dict]]:
+        """Split one streaming logprob slice between reasoning and content deltas."""
+        if not choice_logprobs:
+            return None, None
+
+        logprob_content = choice_logprobs.get("content")
+        if not logprob_content:
+            return choice_logprobs if reasoning_text else None, (
+                choice_logprobs if content_text else None
+            )
+
+        if not reasoning_text and not content_text:
+            return None, None
+
+        emitted_spans = []
+        search_start = 0
+        if reasoning_text:
+            reasoning_start = raw_delta.find(reasoning_text, search_start)
+            if reasoning_start != -1:
+                reasoning_end = reasoning_start + len(reasoning_text)
+                emitted_spans.append(("reasoning", reasoning_start, reasoning_end))
+                search_start = reasoning_end
+        if content_text:
+            content_start = raw_delta.find(content_text, search_start)
+            if content_start == -1:
+                content_start = raw_delta.rfind(content_text)
+            if content_start != -1:
+                content_end = content_start + len(content_text)
+                emitted_spans.append(("content", content_start, content_end))
+
+        token_text = "".join(entry.get("token", "") for entry in logprob_content)
+        if not emitted_spans or token_text != raw_delta:
+            if reasoning_text and not content_text and reasoning_text == raw_delta:
+                return choice_logprobs, None
+            if content_text and not reasoning_text and content_text == raw_delta:
+                return None, choice_logprobs
+            logger.debug(
+                "Failed to align streaming reasoning logprobs with parsed deltas; "
+                "dropping mixed reasoning/content logprobs for this chunk."
+            )
+            return None, None
+
+        reasoning_tokens = []
+        content_tokens = []
+        offset = 0
+        for token_logprob in logprob_content:
+            token_text = token_logprob.get("token", "")
+            token_start = offset
+            offset += len(token_text)
+            token_end = offset
+            for target, span_start, span_end in emitted_spans:
+                if span_start <= token_start and token_end <= span_end:
+                    if target == "reasoning":
+                        reasoning_tokens.append(token_logprob)
+                    elif target == "content":
+                        content_tokens.append(token_logprob)
+                    break
+
+        reasoning_logprobs = (
+            {**choice_logprobs, "content": reasoning_tokens}
+            if reasoning_tokens
+            else None
+        )
+        content_logprobs = (
+            {**choice_logprobs, "content": content_tokens} if content_tokens else None
+        )
+        return reasoning_logprobs, content_logprobs
 
     def _process_tool_call_id(
         self,
