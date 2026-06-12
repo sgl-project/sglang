@@ -113,13 +113,21 @@ class WeightChecker:
         # Reuse the snapshot/compare postprocess pipeline so fp8 weights are
         # dequantized to bf16 before hashing — two (qweight, scale) pairs that
         # produce the same bf16 must produce the same checksum.
-        checksums = {
-            name: _hash_tensor(tensor.data)
-            for name, should_compare, _, tensor in _postprocess_tensors(
-                dict(self._model_state()), skip_compare_names
-            )
-            if should_compare
-        }
+        checksums = {}
+        for name, should_compare, entry in _postprocess_tensors(
+            dict(self._model_state()), skip_compare_names
+        ):
+            if not should_compare:
+                continue
+            if entry[0] == "quant":
+                _, w_q, w_s = entry
+                w_s = _normalize_scale(w_q, w_s)
+                tensor = block_quant_dequant(
+                    w_q, w_s, block_size=_block_size_of(w_q, w_s), dtype=torch.bfloat16
+                )
+            else:
+                tensor = entry[1]
+            checksums[name] = _hash_tensor(tensor.data)
 
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
@@ -157,8 +165,8 @@ def _hash_tensor(t: torch.Tensor) -> str:
 
 
 def _check_tensors(
-    expect_tensors: Iterable[Tuple[str, bool, Optional[torch.Tensor], torch.Tensor]],
-    actual_tensors: Iterable[Tuple[str, bool, Optional[torch.Tensor], torch.Tensor]],
+    expect_tensors: Iterable[Tuple[str, bool, Tuple]],
+    actual_tensors: Iterable[Tuple[str, bool, Tuple]],
     allow_quant_error: bool = False,
 ):
     from sglang.srt.debug_utils.dumper import get_tensor_info
@@ -167,22 +175,56 @@ def _check_tensors(
     error_messages = []
     info_messages = []
 
-    for (expect_name, expect_should_compare, expect_quant_ulp, expect), (
+    for (expect_name, expect_should_compare, expect_entry), (
         actual_name,
         actual_should_compare,
-        actual_quant_ulp,
-        actual,
+        actual_entry,
     ) in zip(expect_tensors, actual_tensors, strict=True):
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
         assert (
             expect_should_compare == actual_should_compare
         ), f"{expect_should_compare=} {actual_should_compare=}"
-        assert (expect_quant_ulp is None) == (actual_quant_ulp is None)
+        assert expect_entry[0] == actual_entry[0]
         name = expect_name
         should_compare = expect_should_compare
 
-        expect = expect.cuda()
-        actual = actual.cuda()
+        if expect_entry[0] == "quant":
+            _, expect_q, expect_s = expect_entry
+            _, actual_q, actual_s = actual_entry
+            try:
+                equal, max_abs_err, mean_abs_err, num_exceed = _compare_quant_pair(
+                    expect_q, expect_s, actual_q, actual_s
+                )
+            except Exception as e:
+                e.add_note(
+                    f"when handling {name=} "
+                    f"expect: shape={tuple(expect_q.shape)} dtype={expect_q.dtype} "
+                    f"actual: shape={tuple(actual_q.shape)} dtype={actual_q.dtype}"
+                )
+                raise
+            if equal:
+                good_names.append(name)
+                continue
+            msg = (
+                f"name={name} "
+                f"max_abs_err={max_abs_err} "
+                f"mean_abs_err={mean_abs_err} "
+                f"num_exceed_quant_ulp_tolerance={num_exceed} "
+                f"expect_quant: shape={tuple(expect_q.shape)} dtype={expect_q.dtype} "
+                f"actual_quant: shape={tuple(actual_q.shape)} dtype={actual_q.dtype} "
+            )
+            if not should_compare:
+                info_messages.append(msg)
+            elif allow_quant_error and num_exceed == 0:
+                # Each side is one quantization of the same weight, so they may
+                # disagree by up to 1 ULP of each quantized representation.
+                info_messages.append(msg + "(within quantization ULP tolerance)")
+            else:
+                error_messages.append(msg)
+            continue
+
+        expect = expect_entry[1].cuda()
+        actual = actual_entry[1].cuda()
 
         if torch.all(expect == actual):
             good_names.append(name)
@@ -195,22 +237,7 @@ def _check_tensors(
                 f"{get_tensor_info(expect)=} "
                 f"{get_tensor_info(actual)=} "
             )
-            if not should_compare:
-                info_messages.append(msg)
-            elif allow_quant_error and expect_quant_ulp is not None:
-                # Each side is one quantization of the same weight, so they may
-                # disagree by up to 1 ULP of each quantized representation.
-                tolerance = expect_quant_ulp.cuda() + actual_quant_ulp.cuda()
-                # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
-                num_exceed = int((~(abs_diff <= tolerance)).sum())
-                if num_exceed == 0:
-                    info_messages.append(msg + "(within quantization ULP tolerance)")
-                else:
-                    error_messages.append(
-                        msg + f"num_exceed_quant_ulp_tolerance={num_exceed}"
-                    )
-            else:
-                error_messages.append(msg)
+            (error_messages if should_compare else info_messages).append(msg)
 
     logger.info(f"[check_tensors] equal tensors: {good_names}")
     if len(info_messages) > 0:
@@ -248,17 +275,94 @@ def _quant_ulp(w_q: torch.Tensor) -> torch.Tensor:
     return binade * finfo.eps
 
 
+def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
+    if w_s.dtype == torch.int32:
+        # UE8M0 packed format (Blackwell DeepGEMM)
+        w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
+    return w_s.to(torch.float32)
+
+
+def _block_size_of(w_q: torch.Tensor, w_s: torch.Tensor) -> list:
+    return [
+        -(-w_q.shape[-2] // w_s.shape[-2]),
+        -(-w_q.shape[-1] // w_s.shape[-1]),
+    ]
+
+
+# Bounds GPU transients during chunked compare: full dequantized tensors of
+# large MoE models do not fit next to the KV-cache pool.
+_COMPARE_CHUNK_NUMEL = 64 * 1024 * 1024
+
+
+def _iter_quant_chunks(w_q: torch.Tensor, w_s: torch.Tensor, block_n: int):
+    """Yields block-row-aligned (q_slice, s_slice) pairs of bounded size."""
+    q3 = w_q.reshape(-1, *w_q.shape[-2:])
+    s3 = w_s.reshape(-1, *w_s.shape[-2:])
+    n, k = q3.shape[-2:]
+    rows = max(block_n, _COMPARE_CHUNK_NUMEL // k // block_n * block_n)
+    for b in range(q3.shape[0]):
+        for r0 in range(0, n, rows):
+            r1 = min(r0 + rows, n)
+            yield q3[b, r0:r1], s3[b, r0 // block_n : -(-r1 // block_n)]
+
+
+def _compare_quant_pair(
+    expect_q: torch.Tensor,
+    expect_s: torch.Tensor,
+    actual_q: torch.Tensor,
+    actual_s: torch.Tensor,
+) -> Tuple[bool, float, float, int]:
+    """Chunked compare of two block-quantized tensors in dequantized space.
+
+    Returns (equal, max_abs_err, mean_abs_err, num_exceed) where num_exceed
+    counts elements differing by more than 1 ULP of each side's quantized
+    representation (NaN counts as exceeding).
+    """
+    assert expect_q.shape == actual_q.shape, f"{expect_q.shape=} {actual_q.shape=}"
+    expect_s = _normalize_scale(expect_q, expect_s)
+    actual_s = _normalize_scale(actual_q, actual_s)
+    block_n = _block_size_of(actual_q, actual_s)[0]
+
+    equal = True
+    max_abs_err = torch.zeros((), dtype=torch.float32)
+    sum_abs_err = 0.0
+    num_exceed = 0
+    for (e_q, e_s), (a_q, a_s) in zip(
+        _iter_quant_chunks(expect_q, expect_s, block_n),
+        _iter_quant_chunks(actual_q, actual_s, block_n),
+        strict=True,
+    ):
+        e_q, e_s = e_q.cuda(), e_s.cuda()
+        a_q, a_s = a_q.cuda(), a_s.cuda()
+        if e_q.dtype == a_q.dtype and torch.equal(e_q, a_q) and torch.equal(e_s, a_s):
+            continue
+        block_size = _block_size_of(e_q, e_s)
+        e_dequant = block_quant_dequant(e_q, e_s, block_size, dtype=torch.bfloat16)
+        a_dequant = block_quant_dequant(a_q, a_s, block_size, dtype=torch.bfloat16)
+        abs_diff = (a_dequant.float() - e_dequant.float()).abs()
+        if torch.all(abs_diff == 0):
+            continue
+        equal = False
+        tolerance = block_quant_dequant(
+            _quant_ulp(e_q), e_s, block_size, dtype=torch.float32
+        ) + block_quant_dequant(_quant_ulp(a_q), a_s, block_size, dtype=torch.float32)
+        # torch.maximum propagates NaN, unlike builtin max().
+        max_abs_err = torch.maximum(max_abs_err, abs_diff.max().cpu())
+        sum_abs_err += abs_diff.sum().item()
+        # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
+        num_exceed += int((~(abs_diff <= tolerance)).sum())
+    return equal, max_abs_err.item(), sum_abs_err / expect_q.numel(), num_exceed
+
+
 def _postprocess_tensors(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
-) -> Iterable[Tuple[str, bool, Optional[torch.Tensor], torch.Tensor]]:
-    """Yields (name, should_compare, quant_ulp, tensor).
+) -> Iterable[Tuple[str, bool, Tuple]]:
+    """Yields (name, should_compare, entry).
 
-    quant_ulp is only set for dequantized tensors: the per-element ULP of the
-    quantized representation, scaled into dequantized space by the block scale.
+    entry is ("quant", w_q, w_s) for block-quantized pairs — compared/hashed in
+    dequantized space without materializing the full dequant — or ("raw", tensor).
     """
-    from sglang.srt.debug_utils.dumper import get_tensor_info
-
     skip_compare_names = set(skip_compare_names)
 
     # Skip non-persistent buffers (registered with persistent=False; recomputed
@@ -281,40 +385,12 @@ def _postprocess_tensors(
     skip_compare_names.update(quant_names)
     skip_compare_names.update(quant_scale_names)
     for name in quant_names:
-        w_q = raw[name]
-        w_s = raw[name.replace("weight", "weight_scale_inv")]
-
-        try:
-            if w_s.dtype == torch.int32:
-                # UE8M0 packed format (Blackwell DeepGEMM)
-                w_s_for_dequant = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
-            else:
-                w_s_for_dequant = w_s
-            w_s_for_dequant = w_s_for_dequant.to(torch.float32)
-
-            block_size = [
-                -(-w_q.shape[-2] // w_s_for_dequant.shape[-2]),
-                -(-w_q.shape[-1] // w_s_for_dequant.shape[-1]),
-            ]
-            w_dequant = block_quant_dequant(
-                w_q,
-                w_s_for_dequant,
-                block_size=block_size,
-                dtype=torch.bfloat16,
-            )
-            quant_ulp = block_quant_dequant(
-                _quant_ulp(w_q),
-                w_s_for_dequant,
-                block_size=block_size,
-                dtype=torch.float32,
-            )
-            yield name, True, quant_ulp, w_dequant
-        except Exception as e:
-            e.add_note(
-                f"when handling {name=} {get_tensor_info(w_q)=} {get_tensor_info(w_s)=}"
-            )
-            raise
+        yield name, True, (
+            "quant",
+            raw[name],
+            raw[name.replace("weight", "weight_scale_inv")],
+        )
 
     for name in raw:
         should_compare = name not in skip_compare_names
-        yield name, should_compare, None, raw[name]
+        yield name, should_compare, ("raw", raw[name])
