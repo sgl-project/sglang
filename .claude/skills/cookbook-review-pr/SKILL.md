@@ -53,7 +53,7 @@ than restating.
   (hw × variant × quant) combination: a single-recipe combination must park under its
   semantically honest tier (clear slant → that tier, e.g. a workstation card under
   `low-latency`; no slant → `balanced`, e.g. a CPU platform) — **flag a no-slant recipe
-  parked under low-latency/high-throughput as a toggle-mapping side effect**. Mixed unions
+  parked under low-latency/high-throughput**. Mixed unions
   like [low-latency, balanced, high-throughput] with per-selection greying are fine. Also
   flag model-specific ids (e.g. `mtp`), and flag an INVERTED speculative mapping — the
   deterministic default is MTP/spec-decoding ON → `low-latency`, OFF → `high-throughput`

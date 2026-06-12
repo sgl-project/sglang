@@ -98,11 +98,26 @@ always from the DeepSeek-V4 vocabulary, never model-specific ids like
 - **3 operating points** → the **full trio** (the ideal — e.g. GPU-budget
   tiers 2/4/8).
 
+**Signal-driven tiers (hard rule).** A cell goes under `low-latency` /
+`high-throughput` ONLY on a signal present in the legacy source: an explicit
+performance toggle (MTP/speculative, DP+EP, gpuCount, …), a named
+recipe/strategy checkbox, or prose stating the operating point. Reading such
+a signal is SGLang-level serving semantics (MTP favors latency on any
+vendor's silicon), so any migrator can tier any vendor's cells without
+hardware-specific judgment. **No signal → `balanced`** — legacy silence is
+itself information: the page offered that command as the hardware's
+general-purpose operating point, and `balanced` transcribes exactly that.
+Never derive a slant from your own hardware intuition ("this flag combo
+feels throughput-tuned"); re-tiering on measured evidence is the hardware
+owner's follow-up PR, not part of a migration. A toggle that maps to no
+dimension, or a suspected undocumented slant → stop and ask the maintainer.
+
 The tiers apply **per (hw × variant × quant) combination**, not just per page:
 a combination with fewer operating points than the page parks its cells in
-the semantically honest tier. A single recipe with a clear slant goes to that
-tier (DSv4's RTX PRO 6000 → `low-latency`: workstation card, low-batch Marlin
-recipe); a general-purpose recipe with no latency/throughput slant goes to
+the semantically honest tier. A single recipe with a signal-evidenced slant
+goes to that tier (DSv4's RTX PRO 6000 → `low-latency`: workstation card,
+low-batch Marlin recipe — the recipe's own SGLang-legible content is the
+evidence); a general-purpose recipe with no latency/throughput slant goes to
 `balanced` (Qwen3.5's Xeon → `balanced`). Never park a no-slant recipe under
 `low-latency`/`high-throughput` just because the page's toggle mapping lands
 there — that reads as a semantic lie ("CPU = high-throughput?"). The page's

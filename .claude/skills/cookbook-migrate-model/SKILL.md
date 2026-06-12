@@ -17,7 +17,10 @@ Reuses the `cookbook-add-model` skill's assets (read them on demand):
 
 Migration-specific references in this skill:
 - [references/dimension-mapping.md](references/dimension-mapping.md) — legacy-control → new-dimension mapping rules, command rewrite table, per-family strategy sets, and the Qwen3.5 pilot as a worked example (PR #27848).
-- [references/model-inventory.md](references/model-inventory.md) — per-model quirks for the remaining legacy pages (dimensions, hardware, env vars, measured-data inventory, batch order).
+
+The round's per-model inventory (scope, batch order, quirks, measured-data
+survey) is tracked by the migration maintainer outside the repo — expect it in
+your dispatch prompt, or ask for it.
 
 ## Hard rules (non-negotiable)
 
@@ -56,6 +59,13 @@ Migration-specific references in this skill:
 5. **`github.cookbookModel` must be set** (`<hf-org>/<page-slug>`, e.g.
    `qwen/qwen3.5`) and the block never pruned — without it Submit ↗ mislabels
    as deepseek-v4. The issue template itself needs NO edits (free-form input).
+6. **Strategy tiers are signal-driven.** A cell goes under `low-latency` /
+   `high-throughput` ONLY on a signal present in the legacy source (an
+   explicit performance toggle, a named recipe, or prose stating the
+   operating point); **no signal → `balanced`**. Never derive a slant from
+   your own hardware intuition — re-tiering on measured evidence is the
+   hardware owner's follow-up PR, not part of a migration
+   (dimension-mapping.md §4).
 
 ## Workflow (one model = one PR)
 
@@ -72,7 +82,7 @@ Migration-specific references in this skill:
 - Inbound-anchor sweep: `grep -rn "<PageName>" docs_new/ --include='*.mdx'` —
   find links/`#fragments` into this page (`mint broken-links` does NOT check
   fragments). Fix referrers or add `<a id="old-anchor" />` shims in the same PR.
-- Check `references/model-inventory.md` for this model's known quirks.
+- Check the maintainer-provided inventory notes for this model's known quirks.
 
 ### 2. Design the 5-dim mapping
 Apply [references/dimension-mapping.md](references/dimension-mapping.md). Key
@@ -89,8 +99,13 @@ multi-strategy page parks under its semantically honest tier (no
 latency/throughput slant → `balanced`; the page's list is the union). When the
 legacy toggle is MTP / speculative decoding, the direction is a deterministic
 default — apply without asking: **MTP on → `low-latency`, MTP off →
-`high-throughput`** (reversed only with maintainer confirmation). Never
-invent a recipe just to fill strategy chips (see dimension-mapping.md §4).
+`high-throughput`** (reversed only with maintainer confirmation). Tier
+placement is signal-driven (hard rule 6). Never invent a recipe just to fill
+strategy chips (see dimension-mapping.md §4). Record the outcome as a
+**strategy mapping table** for the PR body — one row per
+(hw × variant × quant) combination: legacy signal → tier, plus a one-line
+rationale; no-signal rows read `(none) → balanced`. The table is what
+hardware owners sign off on at review.
 
 ### 3. Generate the config (codegen, then audit)
 - For >~30 cells, port the legacy `generateCommand()` into a throwaway Node
@@ -161,8 +176,8 @@ changes**: docs.json path/title unchanged, vendor card + logo already exist.
 
 ### 8. PR + review
 One PR per model. PR body: migration framing, verified policy applied, the
-audit PASS count + script, any inherited-infeasible combos flagged for
-re-verification. Then run `/cookbook-review-pr <N>` and fix findings.
+strategy mapping table (step 2), the audit PASS count + script, any
+inherited-infeasible combos flagged for re-verification. Then run `/cookbook-review-pr <N>` and fix findings.
 FYI: docs previews only build for in-repo (`sgl-project/sglang`) branches —
 a fork-headed PR is perfectly fine but renders no preview; a maintainer can
 re-push the branch in-repo if a preview is wanted for review.
