@@ -4,6 +4,7 @@ from typing import Optional
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    extend_input_len_of,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
@@ -414,9 +415,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 r.is_chunking
                 and chunked is not None
                 and chunked.rid == r.rid
-                and chunked.extend_input_len > 0
+                and extend_input_len_of(chunked) > 0
             ):
-                deduct = chunked.extend_input_len
+                deduct = extend_input_len_of(chunked)
                 base = s.load_inquirer._get_num_pending_tokens()
                 deducted = s.load_inquirer._get_num_pending_tokens(chunk_deduct=deduct)
                 assert deducted == base - deduct, (
@@ -481,17 +482,17 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 r.is_chunking
                 and r.chunks_done >= 1
                 and req is not None
-                and req.extend_input_len is not None
+                and extend_input_len_of(req) is not None
             ):
                 saw_mid_chunk = True
                 assert (
-                    len(req.fill_ids) == len(req.prefix_indices) + req.extend_input_len
+                    len(req.fill_ids) == len(req.prefix_indices) + extend_input_len_of(req)
                 ), (
                     f"init_next_round_input must rebuild fill_ids to the committed "
                     f"prefix plus the in-flight chunk; "
                     f"fill_ids_len={len(req.fill_ids)}, "
                     f"prefix_indices_len={len(req.prefix_indices)}, "
-                    f"extend_input_len={req.extend_input_len}, "
+                    f"extend_input_len={extend_input_len_of(req)}, "
                     f"chunks_done={r.chunks_done}"
                 )
             if r.finished:
@@ -785,11 +786,11 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
         page_size = 16
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
-            if r.is_chunking and r.req.extend_input_len is not None:
+            if r.is_chunking and extend_input_len_of(r.req) is not None:
                 saw_chunking = True
-                assert r.req.extend_input_len % page_size == 0, (
+                assert extend_input_len_of(r.req) % page_size == 0, (
                     f"deterministic chunk boundary must be page-aligned; "
-                    f"got extend_input_len={r.req.extend_input_len}, page_size={page_size}"
+                    f"got extend_input_len={extend_input_len_of(r.req)}, page_size={page_size}"
                 )
             if r.finished:
                 break

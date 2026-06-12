@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 DEFAULT_CHUNK_SIZE: int = 256
 
@@ -44,6 +44,10 @@ def inflight_middle_chunks_of(req: Any) -> int:
     from sglang.srt.managers.schedule_batch import ReqPhase
 
     return int(req.phase is ReqPhase.EXTEND_NON_LAST)
+
+
+def extend_input_len_of(req: Any) -> Optional[int]:
+    return req.extend_range.length if req.extend_range is not None else None
 
 
 def chunked_req_of(scheduler: Any) -> Any:
