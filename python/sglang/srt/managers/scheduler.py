@@ -2586,7 +2586,7 @@ class Scheduler(
     def _should_delay_dflash_prefill_for_batching(self, running_bs: int) -> bool:
         if not self.spec_algorithm.is_dflash():
             return False
-        if running_bs <= 0 or self.chunked_req is not None:
+        if running_bs <= 0 or self.partially_extended_reqs():
             return False
 
         return should_delay_dflash_prefill_for_batching(
