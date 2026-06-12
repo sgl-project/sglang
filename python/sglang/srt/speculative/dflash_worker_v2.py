@@ -40,7 +40,7 @@ from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
 from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
     _prepare_dflash_draft_block_unchecked,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
 
@@ -102,17 +102,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
-        # Without draft windowing, the draft worker aliases the target request->token
-        # mapping and allocation state. With draft windowing enabled, the draft worker
-        # keeps a private compact req->token table over the same global KV index space,
-        # so radix-cache/prefix-hit KV remains reusable while draft attention sees only
-        # the recent window.
-        target_req_to_token_pool, target_token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-        shared_req_to_token_pool = (
-            None if self.use_compact_draft_cache else target_req_to_token_pool
-        )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
@@ -168,9 +157,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             dp_rank=dp_rank,
             nccl_port=nccl_port,
             is_draft_worker=True,
-            req_to_token_pool=shared_req_to_token_pool,
-            token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
-            memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
@@ -287,6 +273,38 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
         )
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        # Without draft windowing, the draft worker aliases the target
+        # request->token mapping and allocation state. With draft windowing
+        # enabled, the draft worker keeps a private compact req->token table
+        # over the same global KV index space, so radix-cache/prefix-hit KV
+        # remains reusable while draft attention sees only the recent window.
+        self._draft_worker.alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
+            req_to_token_pool=(
+                None if self.use_compact_draft_cache else req_to_token_pool
+            ),
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+
+    def init_backends(self):
+        disable_cuda_graph = False
+        if is_cuda() and not self.server_args.disable_cuda_graph:
+            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            disable_cuda_graph = available_mem < 1.0
+            if disable_cuda_graph:
+                logger.warning(
+                    "Disable DFLASH draft cuda graph because only %.2f GB GPU "
+                    "memory is available after target backend initialization.",
+                    available_mem,
+                )
+        self._draft_worker.init_backends(disable_cuda_graph=disable_cuda_graph)
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""

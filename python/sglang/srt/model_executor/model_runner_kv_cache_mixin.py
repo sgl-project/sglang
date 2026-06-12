@@ -64,12 +64,17 @@ _is_hip = is_hip()
 
 class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
-        post_model_load_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
+        # Use the snapshot taken at the end of this runner's weight-load phase,
+        # not the current free memory: draft-model weights loaded after that
+        # point are charged to the non-static slack, not the static budget.
+        post_model_load_memory = getattr(self, "post_model_load_memory", None)
+        if post_model_load_memory is None:
+            post_model_load_memory = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=get_world_group().world_size > 1,
+                cpu_group=get_world_group().cpu_group,
+            )
 
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static

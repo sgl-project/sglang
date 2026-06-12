@@ -286,8 +286,7 @@ class DeepseekV2MLP(nn.Module):
             and self.swiglu_limit is None
             and not isinstance(x, tuple)
         ):
-            from flashinfer import fp4_quantize
-
+            from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
             from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
                 nvfp4_gemm_swiglu_nvfp4_quant,
             )
