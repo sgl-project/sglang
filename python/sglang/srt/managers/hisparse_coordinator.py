@@ -6,13 +6,17 @@ from typing import List, NamedTuple, Union
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.hisparse_memory_pool import (
+from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    DeepSeekV4SingleKVPoolHost,
-    HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.hisparse_memory_pool import (
+    HiSparseDSATokenToKVPool,
+)
+from sglang.srt.mem_cache.memory_pool_host import (
+    DeepSeekV4PagedHostPool,
+    MLATokenToKVPoolHost,
+)
 from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
@@ -65,15 +69,23 @@ class HiSparseCoordinator:
         )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
-            host_size = self.token_to_kv_pool_allocator.size_full // self.compress_ratio
-            self.mem_pool_host = DeepSeekV4SingleKVPoolHost(
-                self.mem_pool_device,
-                host_size,
-                page_size=self.mem_pool_device.page_size,
+            page_size = self.mem_pool_device.page_size
+            num_host_pages = (
+                self.token_to_kv_pool_allocator.size_full // self.compress_ratio
+                + page_size
+                - 1
+            ) // page_size
+            self.mem_pool_host = DeepSeekV4PagedHostPool(
+                pool_name="dsv4_hisparse_c4",
+                device_buffers=self.mem_pool_device.kv_buffer,
+                item_bytes=self.mem_pool_device.bytes_per_page_padded,
+                num_host_pages=num_host_pages,
+                slot_page_size=page_size,
+                layout="layer_first",
             )
             self.item_size_bytes = (
-                self.mem_pool_host.kv_cache_total_dim
-                * self.mem_pool_host.dtype.itemsize
+                self.mem_pool_device.kv_cache_total_dim
+                * self.mem_pool_device.store_dtype.itemsize
             )
         else:
             assert isinstance(
@@ -197,7 +209,7 @@ class HiSparseCoordinator:
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, : req.fill_len
         ].to(dtype=torch.int64, copy=True)
         device_indices = (
             self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
@@ -246,15 +258,10 @@ class HiSparseCoordinator:
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
         """
-        if self.is_dsv4_hisparse:
-            # TODO(dsv4): wire PD direct-to-host. Needs (a) load_to_device_per_layer
-            raise NotImplementedError(
-                "PD direct-to-host admission is not supported for dsv4 hisparse yet."
-            )
-
         self.alloc_device_buffer(req)
 
-        if req.kv_allocated_len <= self.device_buffer_size:
+        host_len = self.host_token_len(req.kv_allocated_len)
+        if host_len <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
             # must preload all tokens from host pool into the device buffer
@@ -271,9 +278,14 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
+    def host_token_len(self, kv_allocated_len: int) -> int:
+        if self.is_dsv4_hisparse:
+            return kv_allocated_len // self.compress_ratio
+        return kv_allocated_len
+
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
-        n = req.kv_allocated_len
+        n = self.host_token_len(req.kv_allocated_len)
         host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
 
@@ -288,7 +300,7 @@ class HiSparseCoordinator:
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
-            allocated_len = len(req.fill_ids)
+            allocated_len = req.fill_len
             alloc_size = self.padded_buffer_size
         else:
             allocated_len = req.kv_allocated_len
@@ -697,7 +709,7 @@ class HiSparseCoordinator:
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
-        prefill_len = len(req.fill_ids)
+        prefill_len = req.fill_len
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len
         ]

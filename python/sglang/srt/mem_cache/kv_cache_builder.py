@@ -45,17 +45,18 @@ if TYPE_CHECKING:
 
 def get_draft_kv_pool(
     *,
-    draft_worker: "BaseTpWorker",
+    draft_worker: BaseTpWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
-    enable_overlap: bool,
 ):
     """Return (draft_token_to_kv_pool, draft_model_config) for the current
     draft worker, or (None, None) when no draft KV pool is available."""
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
 
-    if spec_algorithm.supports_spec_v2() and enable_overlap:
+    # V2 (EAGLE family) nests the runner under `.draft_worker`; DFLASH /
+    # FROZEN_KV_MTP expose `.model_runner` directly.
+    if spec_algorithm.supports_spec_v2():
         if server_args.enable_multi_layer_eagle:
             draft_runner = draft_worker.draft_worker.draft_runner_list[0]
         else:
@@ -70,12 +71,11 @@ def get_draft_kv_pool(
 
 def maybe_register_hicache_draft(
     *,
-    tree_cache: "BasePrefixCache",
-    draft_worker: "BaseTpWorker",
+    tree_cache: BasePrefixCache,
+    draft_worker: BaseTpWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
     enable_hierarchical_cache: bool,
-    enable_overlap: bool,
     page_size: int,
 ) -> None:
     """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
@@ -86,7 +86,6 @@ def maybe_register_hicache_draft(
         draft_worker=draft_worker,
         spec_algorithm=spec_algorithm,
         server_args=server_args,
-        enable_overlap=enable_overlap,
     )
     if draft_kv_pool is None:
         return
@@ -130,20 +129,21 @@ def maybe_register_hicache_draft(
 
 def build_kv_cache(
     *,
-    server_args: "ServerArgs",
-    model_config: "ModelConfig",
-    tp_worker: "BaseTpWorker",
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    tp_worker: BaseTpWorker,
     page_size: int,
-    spec_algorithm: "SpeculativeAlgorithm",
-    attn_tp_cpu_group: "ProcessGroup",
-    tp_cpu_group: "ProcessGroup",
-    attn_cp_cpu_group: "ProcessGroup",
+    spec_algorithm: SpeculativeAlgorithm,
+    attn_tp_cpu_group: ProcessGroup,
+    tp_cpu_group: ProcessGroup,
+    attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    ps: "ParallelState",
-    tp_group: "GroupCoordinator",
+    ps: ParallelState,
+    tp_group: GroupCoordinator,
+    pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
-) -> "KVCacheBuildResult":
+) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
@@ -214,10 +214,12 @@ def build_kv_cache(
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
+        pp_cache_group=pp_group.cpu_group,
         eviction_policy=server_args.radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
+        enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
