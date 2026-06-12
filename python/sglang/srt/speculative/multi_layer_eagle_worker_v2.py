@@ -657,6 +657,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        # Multi-layer EAGLE keeps one draft runner per step on the inner draft
+        # worker; weight-check fans out over every step.
+        return [
+            (f"draft_step_{i}", r)
+            for i, r in enumerate(self.draft_worker.draft_runner_list)
+        ]
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (
             model_worker_batch.forward_mode.is_extend()

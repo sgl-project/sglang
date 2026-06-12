@@ -361,6 +361,12 @@ class DFlashWorker:
         # to flush here.
         pass
 
+    def iter_draft_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        # DFlash aliases `model_runner` to the target but owns an independent draft
+        # model (`draft_model_runner`); that is the runner weight-check must reach.
+        # Defined explicitly so it does not fall through __getattr__ to the target.
+        return [("draft", self.draft_model_runner)]
+
     def _gather_req_to_token_masked(
         self,
         *,

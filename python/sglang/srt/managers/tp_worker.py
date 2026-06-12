@@ -413,6 +413,16 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> "ModelRunner":
         return self._model_runner
 
+    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        # Lists THIS worker's own independent draft ModelRunner(s) as (role, runner)
+        # for weight-check fan-out. Target (is_draft_worker=False) owns no draft → [];
+        # multi-layer EAGLE has one runner per step, single-layer one ("draft").
+        if not self.is_draft_worker:
+            return []
+        if self.model_runner_list:
+            return [(f"draft_step_{i}", r) for i, r in enumerate(self.model_runner_list)]
+        return [("draft", self.model_runner)]
+
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
 

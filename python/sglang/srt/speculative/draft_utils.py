@@ -1,11 +1,7 @@
 import logging
-from typing import TYPE_CHECKING, List, Tuple
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils.common import is_blackwell, is_musa
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -325,64 +321,3 @@ class DraftBackendFactory:
         )
 
         return DeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False)
-
-
-def iter_draft_model_runners(draft_worker) -> List[Tuple[str, "ModelRunner"]]:
-    """Enumerate the independent draft ``ModelRunner``s behind ``self.draft_worker``.
-
-    Returns ``(role, runner)`` pairs; ``role`` is ``"draft"`` for single-runner
-    workers and ``"draft_step_{i}"`` for the per-step runners of multi-layer
-    workers. Returns ``[]`` when there is no independent draft weight to check.
-
-    Two cases need explicit handling rather than a "runner is the target's" rule:
-    NGRAM has no draft model (its ``model_runner`` IS the target's) and is detected
-    by isinstance; DFlash aliases ``model_runner`` to the target yet still owns an
-    independent ``draft_model_runner``, so its inner ``draft_worker`` (a plain
-    ``TpModelWorker`` with no ``draft_runner``) falls through to the direct accessors.
-    """
-    if draft_worker is None:
-        return []
-
-    # NGRAM shares the target's runner; import lazily to avoid the scheduler
-    # import cycle that a module-level import would create.
-    from sglang.srt.speculative.ngram_worker import NGRAMWorker
-
-    if isinstance(draft_worker, NGRAMWorker):
-        return []
-
-    inner = getattr(draft_worker, "draft_worker", None)
-    if inner is not None:
-        draft_runner_list = getattr(inner, "draft_runner_list", None)
-        if draft_runner_list:
-            return [
-                (f"draft_step_{i}", r) for i, r in enumerate(draft_runner_list)
-            ]
-        elif getattr(inner, "draft_runner", None) is not None:
-            return [("draft", inner.draft_runner)]
-        # else: DFlash's inner TpModelWorker — fall through to direct accessors.
-
-    model_runner_list = getattr(draft_worker, "model_runner_list", None)
-    if model_runner_list:
-        return [(f"draft_step_{i}", r) for i, r in enumerate(model_runner_list)]
-
-    draft_runner_list = getattr(draft_worker, "draft_runner_list", None)
-    if draft_runner_list:
-        return [(f"draft_step_{i}", r) for i, r in enumerate(draft_runner_list)]
-
-    if getattr(draft_worker, "draft_model_runner", None) is not None:
-        return [("draft", draft_worker.draft_model_runner)]
-
-    if getattr(draft_worker, "draft_runner", None) is not None:
-        return [("draft", draft_worker.draft_runner)]
-
-    model_runner = getattr(draft_worker, "model_runner", None)
-    target_worker = getattr(draft_worker, "target_worker", None)
-    if (
-        model_runner is not None
-        and getattr(target_worker, "model_runner", None) is model_runner
-    ):
-        return []
-
-    raise ValueError(
-        f"Cannot discover draft model runners for {type(draft_worker).__name__}"
-    )

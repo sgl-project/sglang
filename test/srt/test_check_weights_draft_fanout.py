@@ -39,6 +39,12 @@ def _checksum_runner(checksums, tp_rank=0):
     return runner
 
 
+def _draft_worker(*pairs):
+    # Fake draft worker exposing iter_draft_runners() for the fan-out tests;
+    # discovery itself is covered by test_draft_runner_discovery.py.
+    return SimpleNamespace(iter_draft_runners=lambda: list(pairs))
+
+
 def _scheduler(tp_worker=None, draft_worker=None):
     scheduler = _TestScheduler()
     scheduler.tp_worker = tp_worker
@@ -90,7 +96,7 @@ def test_all_selector_merges_target_and_single_draft():
     draft_runner = _checksum_runner({"w": "b"})
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
-        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+        draft_worker=_draft_worker(("draft", draft_runner)),
     )
 
     out = _call(scheduler, action="checksum", selector="all")
@@ -108,7 +114,7 @@ def test_all_selector_multi_step_draft_prefixes_each_step():
     r1 = _checksum_runner({"w": "b1"})
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
-        draft_worker=SimpleNamespace(model_runner_list=[r0, r1]),
+        draft_worker=_draft_worker(("draft_step_0", r0), ("draft_step_1", r1)),
     )
 
     out = _call(scheduler, action="checksum", selector="all")
@@ -128,7 +134,7 @@ def test_all_selector_checksum_key_collision_fails():
     draft_runner = _checksum_runner({"w": "b"})
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
-        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+        draft_worker=_draft_worker(("draft", draft_runner)),
     )
 
     out = _call(scheduler, action="checksum", selector="all")
@@ -186,7 +192,7 @@ def test_invalid_selector_fails_before_touching_any_runner():
     draft_runner = _checksum_runner({"w": "b"})
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
-        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+        draft_worker=_draft_worker(("draft", draft_runner)),
     )
 
     out = _call(scheduler, action="reset_tensors", selector="bogus")
@@ -205,7 +211,7 @@ def test_empty_string_selector_is_rejected_not_coerced_to_target():
     draft_runner = _checksum_runner({"w": "b"})
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
-        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+        draft_worker=_draft_worker(("draft", draft_runner)),
     )
 
     out = _call(scheduler, action="reset_tensors", selector="")
@@ -226,7 +232,7 @@ def test_compare_error_message_carries_role_label():
     draft_runner.check_weights.side_effect = AssertionError("no snapshot")
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
-        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+        draft_worker=_draft_worker(("draft", draft_runner)),
     )
 
     out = _call(scheduler, action="compare", selector="all")
@@ -280,8 +286,8 @@ def test_draft_reset_covers_target_owned_shared_storage():
     draft_runner = _RealCheckerRunner([("embed", shared), ("d_priv", d_priv)])
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
-        # iter_draft_model_runners yields [("draft", draft_runner)].
-        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+        # the draft worker yields [("draft", draft_runner)] via iter_draft_runners.
+        draft_worker=_draft_worker(("draft", draft_runner)),
     )
 
     t_priv_before = t_priv.clone()
@@ -309,7 +315,7 @@ def test_all_selector_reset_shared_storage_independent_of_order():
     draft_runner = _RealCheckerRunner([("embed", shared), ("d_priv", d_priv)])
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
-        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+        draft_worker=_draft_worker(("draft", draft_runner)),
     )
 
     out = _call(scheduler, action="reset_tensors", selector="all")
@@ -362,7 +368,7 @@ def test_draft_compare_scope_excludes_target_and_labels_draft():
     draft_runner.check_weights.side_effect = AssertionError("draft-private stale")
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
-        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+        draft_worker=_draft_worker(("draft", draft_runner)),
     )
 
     out = _call(scheduler, action="compare", selector="draft")
@@ -391,7 +397,7 @@ def test_target_selector_checksum_returns_target_payload_only():
     )
     scheduler = _scheduler(
         tp_worker=SimpleNamespace(model_runner=target_runner),
-        draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+        draft_worker=_draft_worker(("draft", draft_runner)),
     )
 
     out = _call(scheduler, action="checksum", selector="target")
@@ -415,7 +421,7 @@ def test_target_selector_reset_and_compare_touch_target_only():
         )
         scheduler = _scheduler(
             tp_worker=SimpleNamespace(model_runner=target_runner),
-            draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+            draft_worker=_draft_worker(("draft", draft_runner)),
         )
 
         out = _call(scheduler, action=action, selector="target")

@@ -37,7 +37,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.speculative.draft_utils import iter_draft_model_runners
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -267,8 +266,8 @@ class SchedulerUpdateWeightsMixin:
             runners = []
             if selector == "all":
                 runners.append(("", self.tp_worker.model_runner))
-            if selector in ("draft", "all"):
-                runners += iter_draft_model_runners(self.draft_worker)
+            if selector in ("draft", "all") and self.draft_worker is not None:
+                runners += self.draft_worker.iter_draft_runners()
 
             if not runners:
                 payload = (

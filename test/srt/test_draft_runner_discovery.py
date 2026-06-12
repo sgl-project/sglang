@@ -1,105 +1,115 @@
-"""Unit tests for sglang/srt/speculative/draft_utils.py::iter_draft_model_runners.
+"""Unit tests for the per-worker ``iter_draft_runners()`` methods.
 
-The discovery helper enumerates the independent draft ``ModelRunner``s behind a
-worker via ``getattr``, so most workers can be faked with ``SimpleNamespace``.
-NGRAM is the one case that must be a real instance because the helper uses
-``isinstance``; we build it with ``object.__new__`` and set attributes by hand,
-matching the style in test_distributed_weight_update_spec_worker.py.
+These replace the old ``draft_utils.iter_draft_model_runners`` discovery helper:
+each spec worker now reports its own independent draft ``ModelRunner``(s) as
+``(role, runner)`` pairs, and the weight-check fan-out just calls the method.
 
-All cases run on CPU: the helper only inspects attributes and never touches GPU.
+Workers are built with ``object.__new__`` + manual attribute setting so no GPU /
+real ``ModelRunner`` is needed — the methods only read attributes. All CPU.
 """
 
 from types import SimpleNamespace
 
 import pytest
 
-from sglang.srt.speculative.draft_utils import iter_draft_model_runners
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.speculative.dflash_worker import DFlashWorker
+from sglang.srt.speculative.eagle_worker import EAGLEWorker
+from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from sglang.srt.speculative.multi_layer_eagle_worker_v2 import MultiLayerEagleWorkerV2
 from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
 
-def test_none_worker_returns_empty():
-    assert iter_draft_model_runners(None) == []
+def _new(cls, **attrs):
+    # Build a worker without running __init__, then set the attributes the method
+    # reads — mirrors the object.__new__ trick the old test used for NGRAM.
+    w = object.__new__(cls)
+    for k, v in attrs.items():
+        setattr(w, k, v)
+    return w
 
 
-def test_v1_eagle_style_draft_model_runner():
-    # v1 EAGLE / FrozenKVMTP / Standalone v1 all expose `draft_model_runner`.
+# --- TpModelWorker default (covers all four v1 workers by inheritance) ---
+
+
+def test_tp_worker_target_has_no_draft():
+    # The target worker (is_draft_worker=False) owns no independent draft.
+    w = _new(TpModelWorker, is_draft_worker=False)
+    assert w.iter_draft_runners() == []
+
+
+def test_tp_worker_single_layer_draft_is_own_model_runner():
+    # v1 EAGLE / Standalone / FrozenKVMTP: the draft model IS this worker's own
+    # model_runner; model_runner_list stays empty.
     runner = object()
-    worker = SimpleNamespace(draft_model_runner=runner)
-    assert iter_draft_model_runners(worker) == [("draft", runner)]
+    w = _new(
+        TpModelWorker, is_draft_worker=True, model_runner_list=[], _model_runner=runner
+    )
+    assert w.iter_draft_runners() == [("draft", runner)]
 
 
-def test_v2_eagle_style_inner_draft_runner():
-    # v2 EAGLE / Standalone v2 nest the runner under `draft_worker.draft_runner`.
-    runner = object()
-    worker = SimpleNamespace(draft_worker=SimpleNamespace(draft_runner=runner))
-    assert iter_draft_model_runners(worker) == [("draft", runner)]
-
-
-def test_multi_layer_v1_lists_every_step():
+def test_tp_worker_multi_layer_lists_every_step():
+    # v1 MultiLayerEagle: model_runner_list holds one runner per step (index 0 is
+    # model_runner itself).
     r0, r1, r2 = object(), object(), object()
-    worker = SimpleNamespace(model_runner_list=[r0, r1, r2])
-    assert iter_draft_model_runners(worker) == [
+    w = _new(
+        TpModelWorker, is_draft_worker=True, model_runner_list=[r0, r1, r2], _model_runner=r0
+    )
+    assert w.iter_draft_runners() == [
         ("draft_step_0", r0),
         ("draft_step_1", r1),
         ("draft_step_2", r2),
     ]
 
 
+def test_v1_subclass_inherits_default():
+    # EAGLEWorker is a TpModelWorker subclass and inherits the default unchanged
+    # (StandaloneWorker/FrozenKVMTPWorker/MultiLayerEagleWorker likewise).
+    runner = object()
+    w = _new(
+        EAGLEWorker, is_draft_worker=True, model_runner_list=[], _model_runner=runner
+    )
+    assert w.iter_draft_runners() == [("draft", runner)]
+
+
+# --- v2 family (override; the runner lives on the inner draft worker) ---
+
+
+def test_eagle_v2_uses_inner_draft_runner():
+    # EAGLEWorkerV2.draft_worker is a property -> inner EagleDraftWorker.draft_runner.
+    runner = object()
+    w = _new(EAGLEWorkerV2, _draft_worker=SimpleNamespace(draft_runner=runner))
+    assert w.iter_draft_runners() == [("draft", runner)]
+
+
 def test_multi_layer_v2_lists_every_step():
     r0, r1 = object(), object()
-    worker = SimpleNamespace(
-        draft_worker=SimpleNamespace(draft_runner_list=[r0, r1])
+    w = _new(
+        MultiLayerEagleWorkerV2,
+        _draft_worker=SimpleNamespace(draft_runner_list=[r0, r1]),
     )
-    assert iter_draft_model_runners(worker) == [
-        ("draft_step_0", r0),
-        ("draft_step_1", r1),
-    ]
+    assert w.iter_draft_runners() == [("draft_step_0", r0), ("draft_step_1", r1)]
 
 
-def test_dflash_inner_worker_falls_through_to_direct_accessor():
-    # DFlash aliases `model_runner` to the target yet still owns an independent
-    # `draft_model_runner`. Its inner `draft_worker` is a plain TpModelWorker with
-    # NEITHER `draft_runner` NOR `draft_runner_list`, so discovery must fall
-    # through the inner branch to the direct `draft_model_runner` accessor — not
-    # short-circuit to [] just because an inner draft_worker exists.
-    draft_runner = object()
-    target_runner = object()
-    worker = SimpleNamespace(
-        draft_worker=SimpleNamespace(),
-        draft_model_runner=draft_runner,
-        model_runner=target_runner,
-        target_worker=SimpleNamespace(model_runner=target_runner),
-    )
-    assert iter_draft_model_runners(worker) == [("draft", draft_runner)]
+# --- bare workers (no shared spec base) ---
+
+
+def test_dflash_returns_independent_draft():
+    # model_runner aliases the target, but draft_model_runner is independent.
+    runner = object()
+    w = _new(DFlashWorker, draft_model_runner=runner)
+    assert w.iter_draft_runners() == [("draft", runner)]
 
 
 def test_ngram_has_no_independent_draft():
-    # NGRAM's model_runner IS the target's; the isinstance branch returns [] and
-    # must NOT relabel the shared target runner as a draft.
-    target_runner = object()
-    worker = object.__new__(NGRAMWorker)
-    worker.model_runner = target_runner
-    worker.target_worker = SimpleNamespace(model_runner=target_runner)
-
-    result = iter_draft_model_runners(worker)
-
-    assert result == []
-    assert target_runner not in [r for _, r in result]
+    # NGRAM's model_runner IS the target's; no independent draft to check.
+    w = _new(NGRAMWorker)
+    assert w.iter_draft_runners() == []
 
 
-def test_aliased_target_runner_returns_empty():
-    # No draft accessor, but model_runner is the target's runner -> [].
-    target_runner = object()
-    worker = SimpleNamespace(
-        model_runner=target_runner,
-        target_worker=SimpleNamespace(model_runner=target_runner),
-    )
-    assert iter_draft_model_runners(worker) == []
-
-
-def test_unrecognized_worker_raises():
-    # Nothing recognizable as a draft and no aliased-target match -> hard error,
-    # rather than silently returning [].
-    worker = SimpleNamespace(foo=1)
-    with pytest.raises(ValueError):
-        iter_draft_model_runners(worker)
+def test_worker_without_method_fails_loudly():
+    # A worker that neither inherits the TpModelWorker default nor defines the
+    # method raises AttributeError at call time — the polymorphic analog of the
+    # old helper's ValueError on an unrecognized worker.
+    with pytest.raises(AttributeError):
+        SimpleNamespace().iter_draft_runners()

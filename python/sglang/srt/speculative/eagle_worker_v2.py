@@ -742,6 +742,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        # The draft model lives on the inner EagleDraftWorker (self.draft_worker);
+        # its `draft_runner` is this worker's single independent draft runner.
+        return [("draft", self.draft_worker.draft_runner)]
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (
             model_worker_batch.forward_mode.is_extend()
