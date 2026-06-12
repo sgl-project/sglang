@@ -857,7 +857,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 k_by_head = k.reshape(-1, self.head_dim)
                 k_by_head = self.k_norm(k_by_head)
             current_stream.wait_stream(self.alt_stream)
-        elif _is_hip:
+        elif _is_hip or _is_xpu:
             q_by_head, k_by_head = fused_qk_gemma_rmsnorm(
                 q,
                 k,
@@ -894,7 +894,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
-    def forward_prepare_hip(self, positions, hidden_states):
+    def forward_prepare_fused_gate(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -948,8 +948,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_hip and self.attn_output_gate:
-            q, k, v, gate = self.forward_prepare_hip(
+        if (_is_hip or _is_xpu) and self.attn_output_gate:
+            q, k, v, gate = self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
             )
