@@ -485,12 +485,12 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 and extend_input_len_of(req) is not None
             ):
                 saw_mid_chunk = True
-                assert len(req.fill_ids) == len(
+                assert len(req.get_fill_ids()) == len(
                     req.prefix_indices
                 ) + extend_input_len_of(req), (
                     f"init_next_round_input must rebuild fill_ids to the committed "
                     f"prefix plus the in-flight chunk; "
-                    f"fill_ids_len={len(req.fill_ids)}, "
+                    f"fill_ids_len={len(req.get_fill_ids())}, "
                     f"prefix_indices_len={len(req.prefix_indices)}, "
                     f"extend_input_len={extend_input_len_of(req)}, "
                     f"chunks_done={r.chunks_done}"
