@@ -121,9 +121,9 @@ def write_cache_indices(
     if support_triton(get_global_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
-            device=req_to_token_pool.device,
             dtype=torch.uint64,
-        )
+            pin_memory=True,
+        ).to(req_to_token_pool.device, non_blocking=True)
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
             req_to_token_pool.req_to_token,
