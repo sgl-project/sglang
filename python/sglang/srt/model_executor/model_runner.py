@@ -353,7 +353,7 @@ class ModelRunnerOutput:
 @dataclass
 class _EagerBufferRegistry:
     # Lazily-built eager input-buffer registry plus the capacity it was sized to.
-    registry: Optional["CudaGraphBufferRegistry"] = None
+    registry: Optional[CudaGraphBufferRegistry] = None
     max_bs: int = 0
     max_num_tokens: int = 0
 
@@ -1976,7 +1976,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
@@ -3107,8 +3107,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         cache: _EagerBufferRegistry,
         raw_bs: int,
         raw_num_tokens: int,
-        build: Callable[[int, int], "CudaGraphBufferRegistry"],
-    ) -> "CudaGraphBufferRegistry":
+        build: Callable[[int, int], CudaGraphBufferRegistry],
+    ) -> CudaGraphBufferRegistry:
         # Built on first use and grown (next power of two) when a batch exceeds
         # the current capacity.
         if (
@@ -3126,7 +3126,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _ensure_eager_decode_registry(
         self, raw_bs: int, raw_num_tokens: int
-    ) -> "CudaGraphBufferRegistry":
+    ) -> CudaGraphBufferRegistry:
         is_encoder_decoder = self.model_config.is_encoder_decoder
         return self._ensure_eager_registry(
             self._eager_decode_registry,
@@ -3162,7 +3162,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _ensure_eager_prefill_registry(
         self, raw_bs: int, raw_num_tokens: int
-    ) -> "CudaGraphBufferRegistry":
+    ) -> CudaGraphBufferRegistry:
         return self._ensure_eager_registry(
             self._eager_prefill_registry,
             raw_bs,
