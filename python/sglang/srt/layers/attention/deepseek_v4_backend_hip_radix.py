@@ -123,6 +123,9 @@ class DSV4AttnMetadata:
     c128_topk_lengths_raw: Optional[torch.Tensor] = None
 
     # unified_kv: per-forward prebuilt ragged decode index
+    # SWA ring write target (req_slot*ring + pos%ring), computed once per
+    # forward in _attach_unified_kv_decode_streams, read by every layer's store.
+    unified_swa_loc: Optional[torch.Tensor] = None
     unified_swa_indices: Optional[torch.Tensor] = None
     unified_swa_indptr: Optional[torch.Tensor] = None
     unified_hca_indices: Optional[torch.Tensor] = None
@@ -196,6 +199,7 @@ class DSV4AttnMetadata:
                 # Recomputed by the recorded init_forward_metadata_in_graph op
                 # each forward; not copied across replays.
                 "swa_out_cache_loc",
+                "unified_swa_loc",
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
@@ -1028,6 +1032,13 @@ class DeepseekV4HipRadixBackend(
             ring_stride=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,
         )
+        # SWA ring write target, same value for every layer this forward.
+        # Decode: N tokens == N reqs, positions already aligned (no repeat).
+        req_slot = req_pool_indices[:N].to(torch.int64)
+        core.unified_swa_loc = (
+            req_slot * pool.unified_swa_ring_size
+            + core.positions_casual.to(torch.int64) % pool.unified_swa_ring_size
+        ).to(torch.int32)
 
     def _attach_unified_kv_prefill_meta(
         self,
@@ -1205,6 +1216,32 @@ class DeepseekV4HipRadixBackend(
         return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
             torch.int32
         )
+
+    def get_unified_swa_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """SWA ring write target for unified_kv, shared by all layers.
+
+        Fast path: the per-forward value cached in _attach_unified_kv_decode_streams
+        (recorded inside cuda graphs, so replay re-reads live buffers). Fallback:
+        recompute at store time, matching the pre-cache per-layer behavior, for
+        paths that never ran the decode-stream init (eager prefill/extend, idle,
+        or a batch re-padded after init -> shape mismatch).
+        """
+        positions = forward_batch.positions
+        core = getattr(self.forward_metadata, "core_attn_metadata", None)
+        cached = core.unified_swa_loc if core is not None else None
+        if (
+            cached is not None
+            and not forward_batch.forward_mode.is_idle()
+            and cached.shape[0] == positions.shape[0]
+        ):
+            return cached
+        ring = self.token_to_kv_pool.unified_swa_ring_size
+        req_slot = forward_batch.req_pool_indices.to(torch.int64)
+        if req_slot.shape[0] != positions.shape[0]:
+            req_slot = req_slot.repeat_interleave(
+                positions.shape[0] // req_slot.shape[0]
+            )
+        return (req_slot * ring + positions.to(torch.int64) % ring).to(torch.int32)
 
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
