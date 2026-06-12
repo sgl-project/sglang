@@ -325,7 +325,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
     ) -> OutputBatch | Req:
-        """Run a pipeline forward and attach runtime metadata."""
+        """Run a pipeline forward and attach runtime metadata.
+
+        Args:
+            forward_fn: The forward function for the request group.
+        """
         output_batch = None
         pre_forward_reserved_mb = self._get_current_reserved_memory_mb()
         try:
@@ -353,7 +357,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     )
                 result = forward_fn()
 
-            # Disagg roles keep intermediate tensors on Req until transfer finishes.
+            # disagg roles return raw Req so callers can keep and transfer
+            # intermediate tensors before converting it to OutputBatch
             if return_req and isinstance(result, Req):
                 return result
 
@@ -538,15 +543,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     @staticmethod
     def _get_current_reserved_memory_mb() -> float:
         """Return current allocator-reserved memory in MiB."""
-        if current_platform.is_cpu():
-            return 0.0
-        try:
-            device_module = torch.get_device_module()
-            if hasattr(device_module, "memory_reserved"):
-                return float(device_module.memory_reserved()) / (1024**2)
-        except Exception:
-            return 0.0
-        return 0.0
+        return current_platform.get_process_reserved_memory_mb() or 0.0
 
     def _record_output_memory_stats(
         self, output_batch: OutputBatch, *, pre_forward_reserved_mb: float
@@ -554,16 +551,20 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """Attach allocator peak stats used by memory-aware admission."""
         if current_platform.is_cpu():
             return
+        should_reduce_peaks = (
+            output_batch.error is None
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+        if self.rank != 0 and not should_reduce_peaks:
+            return
+
         device_module = torch.get_device_module()
         peak_reserved_mb = float(device_module.max_memory_reserved()) / (1024**2)
         peak_allocated_mb = float(device_module.max_memory_allocated()) / (1024**2)
 
         # Avoid collectives on error paths; failed ranks may not reach this point.
-        if (
-            output_batch.error is None
-            and torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-        ):
+        if should_reduce_peaks:
             device_type = (
                 "cuda"
                 if current_platform.is_cuda() or current_platform.is_rocm()
@@ -611,6 +612,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             dynamic_output_paths = None
 
         if dynamic_output_paths is not None:
+
             def build_output_path(idx: int) -> str:
                 return dynamic_output_paths[idx]
 

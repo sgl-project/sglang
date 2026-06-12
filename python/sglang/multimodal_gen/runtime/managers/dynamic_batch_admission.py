@@ -13,9 +13,8 @@ import time
 from dataclasses import dataclass, field, fields, is_dataclass
 from difflib import get_close_matches
 from enum import Enum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
-
-import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -45,34 +44,6 @@ _BATCHING_RULE_KEYS = frozenset(
 
 _MEMORY_PROFILE_SCHEMA_VERSION = 1
 _CACHE_ENV = "SGLANG_DIFFUSION_BATCH_MEMORY_CACHE"
-
-# Request identity/output fields do not affect memory profile reuse.
-_SAMPLING_MEMORY_EXCLUDE = frozenset(
-    {
-        "prompt",
-        "negative_prompt",
-        "prompt_path",
-        "seed",
-        "request_id",
-        "output_path",
-        "output_file_name",
-        "output_quality",
-        "output_compression",
-        "fps",
-        "save_output",
-        "return_file_paths_only",
-        "generator_device",
-        "supported_resolutions",
-        "profile",
-        "num_profiled_timesteps",
-        "profile_all_stages",
-        "debug",
-        "suppress_logs",
-        "perf_dump_path",
-        "no_override_protected_fields",
-        "adjust_frames",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -228,7 +199,14 @@ class MemoryObservation:
 
 @dataclass
 class MemoryProfile:
-    """Memory observations for one runtime/request key."""
+    """Memory observations for one runtime/request key.
+
+    ``successes`` stores recent successful batch measurements. Predictions use
+    a monotone upper envelope over those points, indexed by relative batch cost.
+    ``ratio_residuals`` and ``absolute_residuals_mb`` keep recent extrapolation
+    misses as adaptive headroom. ``oom_cost`` is the lowest observed cost that
+    ran out of memory and is treated as a hard boundary until recovery succeeds.
+    """
 
     successes: list[MemoryObservation] = field(default_factory=list)
     ratio_residuals: list[float] = field(default_factory=list)
@@ -461,8 +439,11 @@ class BatchAdmissionController:
         self._model_path = server_args.model_path
         self._offload = bool(server_args.layerwise_offload_components)
         self._gpu_id = gpu_id
-        self._device_name = self._get_device_name(gpu_id)
-        self._device_memory_gb = self._get_device_memory_gb(gpu_id)
+        self._device_name = _get_device_name(gpu_id)
+        device_memory_mb = _get_device_total_memory_mb(gpu_id)
+        self._device_memory_gb = (
+            None if device_memory_mb is None else device_memory_mb / 1024.0
+        )
         self._memory_reserve_fraction = float(
             server_args.batching_memory_reserve_fraction
         )
@@ -475,6 +456,7 @@ class BatchAdmissionController:
         self._lora_revision = 0
         self._memory_profiles: dict[tuple[Any, ...], MemoryProfile] = {}
         self._memory_budget_mb: float | None = None
+        self._memory_profile_revision = 0
         self._memory_profiles_dirty = False
         self._last_profile_save_s = 0.0
         self._memory_profile_cache_path = self._get_memory_profile_cache_path(
@@ -569,18 +551,45 @@ class BatchAdmissionController:
         )
 
     def get_max_admissible_batch_size(self, req: Req) -> int:
+        """Return the largest homogeneous batch size currently admissible.
+
+        This is used for metrics/capacity reporting, so it mirrors candidate
+        admission instead of using a looser static cap. The binary search is
+        cached on primitive inputs plus memory budget/profile revision because
+        it can be called several times in one scheduler selection pass while the
+        profile and budget are unchanged.
+        """
         if not self.enabled:
             return 1
 
         limit = self.get_admission_limit(req)
-        high = limit.max_batch_size
         cost_per_req = self.get_request_cost(req)
-        memory_key = self._get_memory_key(req)
+        return self._compute_max_admissible_batch_size_cached(
+            limit.max_batch_size,
+            limit.max_cost,
+            cost_per_req,
+            self._get_memory_key(req),
+            self._memory_budget_mb,
+            self._memory_profile_revision,
+        )
+
+    @lru_cache(maxsize=1024)
+    def _compute_max_admissible_batch_size_cached(
+        self,
+        max_batch_size: int,
+        max_cost: float | None,
+        cost_per_req: float,
+        memory_key: tuple[Any, ...],
+        memory_budget_mb: float | None,
+        memory_profile_revision: int,
+    ) -> int:
+        del memory_budget_mb, memory_profile_revision
         low = 1
+        high = max_batch_size
         while low < high:
             mid = (low + high + 1) // 2
             batch_cost = cost_per_req * mid
-            if limit.reject_reason(batch_size=mid, batch_cost=batch_cost) is not None:
+            if max_cost is not None and batch_cost > max_cost:
                 high = mid - 1
             elif (
                 self._get_memory_reject_reason(
@@ -608,7 +617,7 @@ class BatchAdmissionController:
         )
         if output_batch.is_oom:
             profile.observe_oom(batch_cost)
-            self._memory_profiles_dirty = True
+            self._mark_memory_profiles_changed()
             self._save_memory_profile_cache_if_due()
             return
 
@@ -622,7 +631,7 @@ class BatchAdmissionController:
                 batch_size=len(reqs),
                 baseline_memory_mb=output_batch.pre_forward_reserved_memory_mb,
             )
-            self._memory_profiles_dirty = True
+            self._mark_memory_profiles_changed()
             self._save_memory_profile_cache_if_due()
 
     def update_lora_revision(self) -> None:
@@ -633,6 +642,10 @@ class BatchAdmissionController:
         if not self._memory_profiles_dirty:
             return
         self._save_memory_profile_cache()
+
+    def _mark_memory_profiles_changed(self) -> None:
+        self._memory_profiles_dirty = True
+        self._memory_profile_revision += 1
 
     def _save_memory_profile_cache_if_due(self) -> None:
         if not self._memory_profiles_dirty:
@@ -784,7 +797,6 @@ class BatchAdmissionController:
             ("condition_image", getattr(req, "condition_image", None) is not None),
             ("image_path", bool(getattr(req, "image_path", None))),
             ("return_frames", getattr(req, "return_frames", None)),
-            ("return_trajectory", getattr(req, "return_trajectory", None)),
             ("enable_upscaling", getattr(req, "enable_upscaling", None)),
             (
                 "enable_frame_interpolation",
@@ -803,64 +815,87 @@ class BatchAdmissionController:
 
     def _build_runtime_memory_key(self, server_args: "ServerArgs") -> tuple[Any, ...]:
         return (
-            ("model_path", server_args.model_path),
-            ("model_id", server_args.model_id),
-            ("pipeline_class_name", server_args.pipeline_class_name),
-            ("backend", _freeze_key_value(server_args.backend)),
-            ("device_name", self._device_name),
-            ("device_memory_gb", self._device_memory_gb),
-            ("attention_backend", server_args.attention_backend),
             (
-                "component_attention_backends",
-                _freeze_key_value(server_args.component_attention_backends),
-            ),
-            (
-                "dit_precision",
-                getattr(server_args.pipeline_config, "dit_precision", None),
-            ),
-            (
-                "vae_precision",
-                getattr(server_args.pipeline_config, "vae_precision", None),
-            ),
-            (
-                "text_encoder_precisions",
-                _freeze_key_value(
-                    getattr(
-                        server_args.pipeline_config, "text_encoder_precisions", None
-                    )
+                "model",
+                (
+                    ("model_path", server_args.model_path),
+                    ("model_id", server_args.model_id),
+                    ("pipeline_class_name", server_args.pipeline_class_name),
+                    ("pipeline_config", _freeze_key_value(server_args.pipeline_config)),
                 ),
             ),
             (
-                "image_encoder_precision",
-                getattr(server_args.pipeline_config, "image_encoder_precision", None),
+                "device",
+                (
+                    ("name", self._device_name),
+                    ("memory_gb", self._device_memory_gb),
+                ),
             ),
-            ("quantization", server_args.quantization),
-            ("transformer_weights_path", server_args.transformer_weights_path),
-            ("num_gpus", server_args.num_gpus),
-            ("tp_size", server_args.tp_size),
-            ("sp_degree", server_args.sp_degree),
-            ("ulysses_degree", server_args.ulysses_degree),
-            ("ring_degree", server_args.ring_degree),
-            ("dp_size", server_args.dp_size),
-            ("dp_degree", server_args.dp_degree),
-            ("enable_cfg_parallel", server_args.enable_cfg_parallel),
-            ("cfg_parallel_degree", server_args.cfg_parallel_degree),
-            ("dit_cpu_offload", server_args.dit_cpu_offload),
-            ("dit_layerwise_offload", server_args.dit_layerwise_offload),
             (
-                "layerwise_offload_components",
-                _freeze_key_value(server_args.layerwise_offload_components),
+                "runtime",
+                (
+                    ("backend", _freeze_key_value(server_args.backend)),
+                    ("attention_backend", server_args.attention_backend),
+                    (
+                        "component_attention_backends",
+                        _freeze_key_value(server_args.component_attention_backends),
+                    ),
+                    ("quantization", server_args.quantization),
+                    (
+                        "transformer_weights_path",
+                        server_args.transformer_weights_path,
+                    ),
+                    ("enable_torch_compile", server_args.enable_torch_compile),
+                ),
             ),
-            ("dit_offload_prefetch_size", server_args.dit_offload_prefetch_size),
-            ("text_encoder_cpu_offload", server_args.text_encoder_cpu_offload),
-            ("image_encoder_cpu_offload", server_args.image_encoder_cpu_offload),
-            ("vae_cpu_offload", server_args.vae_cpu_offload),
-            ("use_fsdp_inference", server_args.use_fsdp_inference),
-            ("enable_torch_compile", server_args.enable_torch_compile),
-            ("lora_path", server_args.lora_path),
-            ("lora_nickname", server_args.lora_nickname),
-            ("lora_scale", server_args.lora_scale),
-            ("lora_weight_name", server_args.lora_weight_name),
+            (
+                "parallelism",
+                (
+                    ("num_gpus", server_args.num_gpus),
+                    ("tp_size", server_args.tp_size),
+                    ("sp_degree", server_args.sp_degree),
+                    ("ulysses_degree", server_args.ulysses_degree),
+                    ("ring_degree", server_args.ring_degree),
+                    ("dp_size", server_args.dp_size),
+                    ("dp_degree", server_args.dp_degree),
+                    ("enable_cfg_parallel", server_args.enable_cfg_parallel),
+                    ("cfg_parallel_degree", server_args.cfg_parallel_degree),
+                ),
+            ),
+            (
+                "offload",
+                (
+                    ("dit_cpu_offload", server_args.dit_cpu_offload),
+                    ("dit_layerwise_offload", server_args.dit_layerwise_offload),
+                    (
+                        "layerwise_offload_components",
+                        _freeze_key_value(server_args.layerwise_offload_components),
+                    ),
+                    (
+                        "dit_offload_prefetch_size",
+                        server_args.dit_offload_prefetch_size,
+                    ),
+                    (
+                        "text_encoder_cpu_offload",
+                        server_args.text_encoder_cpu_offload,
+                    ),
+                    (
+                        "image_encoder_cpu_offload",
+                        server_args.image_encoder_cpu_offload,
+                    ),
+                    ("vae_cpu_offload", server_args.vae_cpu_offload),
+                    ("use_fsdp_inference", server_args.use_fsdp_inference),
+                ),
+            ),
+            (
+                "lora",
+                (
+                    ("path", server_args.lora_path),
+                    ("nickname", server_args.lora_nickname),
+                    ("scale", server_args.lora_scale),
+                    ("weight_name", server_args.lora_weight_name),
+                ),
+            ),
         )
 
     def _get_matching_rules(self, req: Req) -> list[BatchingRule]:
@@ -878,9 +913,9 @@ class BatchAdmissionController:
     def _compute_memory_budget_mb(self) -> float | None:
         if current_platform.is_cpu():
             return None
-        total_mb = self._get_device_memory_mb(self._gpu_id)
-        available_mb = self._get_available_memory_mb(self._gpu_id)
-        reserved_mb = self._get_process_reserved_memory_mb()
+        total_mb = _get_device_total_memory_mb(self._gpu_id)
+        available_mb = _get_available_device_memory_mb(self._gpu_id)
+        reserved_mb = current_platform.get_process_reserved_memory_mb()
         if total_mb is None:
             return None
 
@@ -893,47 +928,6 @@ class BatchAdmissionController:
             external_used_mb = max(0.0, total_mb - available_mb - reserved_mb)
             budget_mb = max(0.0, budget_mb - external_used_mb)
         return budget_mb
-
-    @staticmethod
-    def _get_device_memory_gb(gpu_id: int) -> float | None:
-        device_mb = BatchAdmissionController._get_device_memory_mb(gpu_id)
-        return None if device_mb is None else device_mb / 1024.0
-
-    @staticmethod
-    def _get_device_memory_mb(gpu_id: int) -> float | None:
-        try:
-            return current_platform.get_device_total_memory(gpu_id) / (1024**2)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _get_device_name(gpu_id: int) -> str | None:
-        try:
-            return current_platform.get_device_name(gpu_id)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _get_available_memory_mb(gpu_id: int) -> float | None:
-        try:
-            return (
-                current_platform.get_available_gpu_memory(gpu_id, empty_cache=False)
-                * 1024.0
-            )
-        except Exception:
-            return None
-
-    @staticmethod
-    def _get_process_reserved_memory_mb() -> float | None:
-        if current_platform.is_cpu():
-            return None
-        try:
-            device_module = torch.get_device_module()
-            if hasattr(device_module, "memory_reserved"):
-                return float(device_module.memory_reserved()) / (1024**2)
-        except Exception:
-            return None
-        return None
 
     def _get_memory_profile_cache_path(self, configured: str | None) -> str | None:
         path = configured or os.getenv(_CACHE_ENV)
@@ -1102,6 +1096,12 @@ def _validate_rule_keys(data: dict[str, Any], *, source: str) -> None:
 
 
 def _get_sampling_memory_key(req: Req) -> tuple[Any, ...] | None:
+    """Reuse the scheduler's SamplingParams compatibility boundary.
+
+    Dynamic batching only co-batches requests whose non-``batch_sig_exclude``
+    sampling fields match. Reusing the same metadata keeps memory profile reuse
+    conservative without maintaining a second include/exclude list here.
+    """
     sp = getattr(req, "sampling_params", None)
     if sp is None:
         return None
@@ -1109,10 +1109,34 @@ def _get_sampling_memory_key(req: Req) -> tuple[Any, ...] | None:
     items = []
     for field_info in fields(SamplingParams):
         name = field_info.name
-        if name in _SAMPLING_MEMORY_EXCLUDE or name.startswith("_"):
+        if name.startswith("_") or field_info.metadata.get("batch_sig_exclude", False):
             continue
         items.append((name, _freeze_key_value(getattr(sp, name, None))))
     return tuple(items)
+
+
+def _get_device_name(gpu_id: int) -> str | None:
+    try:
+        return current_platform.get_device_name(gpu_id)
+    except Exception:
+        return None
+
+
+def _get_device_total_memory_mb(gpu_id: int) -> float | None:
+    try:
+        return current_platform.get_device_total_memory(gpu_id) / (1024**2)
+    except Exception:
+        return None
+
+
+def _get_available_device_memory_mb(gpu_id: int) -> float | None:
+    try:
+        return (
+            current_platform.get_available_gpu_memory(gpu_id, empty_cache=False)
+            * 1024.0
+        )
+    except Exception:
+        return None
 
 
 def _freeze_key_value(value: Any) -> Any:
@@ -1136,6 +1160,12 @@ def _freeze_key_value(value: Any) -> Any:
         return tuple(sorted(_freeze_key_value(item) for item in value))
     if hasattr(value, "shape") and hasattr(value, "dtype"):
         return ("tensor", tuple(value.shape), str(value.dtype))
+    if callable(value):
+        return (
+            "callable",
+            getattr(value, "__module__", None),
+            getattr(value, "__qualname__", type(value).__qualname__),
+        )
     return repr(value)
 
 
