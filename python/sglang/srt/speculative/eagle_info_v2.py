@@ -219,7 +219,7 @@ class EagleDraftInputV2Mixin:
             bs,
         )
 
-    def prepare_for_v2_draft(
+    def prepare_for_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
         batch: ScheduleBatch,
@@ -321,7 +321,7 @@ class EagleVerifyInputV2Mixin:
         irregular tree (no fixed per-level branching)."""
         return self.topk
 
-    def prepare_for_v2_verify(
+    def prepare_for_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,
         batch: ScheduleBatch,

@@ -33,7 +33,7 @@ class EagleDraftWorkerBase(ABC):
         self.init_attention_backend()
         self.init_cuda_graphs()
 
-    def prepare_for_extend_to_fill_draft_kvcache(
+    def prepare_for_draft_extend(
         self,
         draft_extend_input: EagleDraftExtendInput,
         batch: ScheduleBatch,
@@ -61,7 +61,7 @@ class EagleDraftWorkerBase(ABC):
             batch.input_ids,
             0,
             batch.model_config.vocab_size,
-            "v2 prepare_for_extend_to_fill_draft_kvcache input_ids",
+            "v2 prepare_for_draft_extend input_ids",
         )
         # init_new requires both list or both Tensor;
         # gpu_only emits device tensors to skip H2D.
