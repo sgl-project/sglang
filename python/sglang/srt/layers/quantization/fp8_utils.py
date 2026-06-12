@@ -36,11 +36,13 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    get_hip_version,
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_musa,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -56,9 +58,12 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
+_is_musa = is_musa()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+# ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
+_use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -82,10 +87,12 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
 
 if _use_aiter:
     import aiter
-
-    # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
-    from aiter import gemm_a8w8_blockscale as gemm_a8w8_blockscale
-    from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
+    from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
+    from aiter import (
+        gemm_a8w8_blockscale_bpreshuffle,
+        gemm_a8w8_bpreshuffle,
+        get_hip_quant,
+    )
     from aiter.ops.triton.gemm_a8w8_blockscale import (
         gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     )
@@ -113,7 +120,6 @@ if _is_cuda:
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
-use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 
 # Input scaling factors are no longer optional in _scaled_mm starting
@@ -490,8 +496,11 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     input_2d = input.view(-1, input.shape[-1])
     backend = _get_flashinfer_groupwise_backend()
-    # TRTLLM backend requires K dimension >= 256.
-    if backend == "trtllm" and input_2d.shape[1] < 256:
+    # TRTLLM backend requires K >= 256 and weight scales in UE8M0/R128c4
+    # packed format. Fall back to triton when scales are plain float32.
+    if backend == "trtllm" and (
+        input_2d.shape[1] < 256 or not getattr(weight_scale, "format_ue8m0", False)
+    ):
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )
@@ -669,13 +678,19 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d,
-        block_size[1],
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
+    if not _is_musa:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            block_size[1],
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+    else:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            block_size[1],
+        )
 
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
@@ -758,25 +773,36 @@ def aiter_w8a8_block_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    # if input_scale not None, input is quanted
-    if input_scale is not None:
-        q_input = input_2d
-        x_scale = input_scale
-
-    else:
-        q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
-
     n, k = weight.shape
 
-    if _use_aiter_gfx95:
+    if _use_aiter_bpreshuffle_gfx95:
+        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+    elif _use_aiter_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     else:
         use_triton = True
 
+    # if input_scale not None, input is quanted
+    if input_scale is not None:
+        q_input = input_2d
+        x_scale = input_scale
+        # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
+        # Triton needs a row-major view, so adjust strides only. No copy.
+        if use_triton and _use_aiter_bpreshuffle_gfx95:
+            x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
+    else:
+        q_input, x_scale = aiter_per1x128_quant(
+            input_2d,
+            quant_dtype=aiter.dtypes.fp8,
+            transpose_scale=(_use_aiter_bpreshuffle_gfx95 and not use_triton),
+        )
+
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
+    elif _use_aiter_bpreshuffle_gfx95:
+        gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
     else:
-        gemm_a8w8_blockscale_op = gemm_a8w8_blockscale
+        gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
 
     output = gemm_a8w8_blockscale_op(
         q_input,
@@ -1269,6 +1295,19 @@ def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
 
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
     sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+
+    # In sgl-deep-gemm, the C++ deepgemm path returns through DLPack which collapses the stride
+    # of size-1 trailing dims to 1 (happens when packed_sf_k == 1, i.e.
+    # K <= block_k * 4). Restore the TMA-aligned stride so the deepgemm
+    # assertion sf.stride(-1) == get_tma_aligned_size(mn, element_size) holds.
+    if not use_torch_impl and sf.shape[-1] == 1:
+        from deep_gemm.utils import get_tma_aligned_size
+
+        aligned_mn = get_tma_aligned_size(sf.shape[-2], sf.element_size())
+        if sf.stride(-1) != aligned_mn:
+            new_stride = list(sf.stride())
+            new_stride[-1] = aligned_mn
+            sf = sf.as_strided(sf.shape, tuple(new_stride))
     return sf
 
 
@@ -1463,12 +1502,14 @@ def apply_fp8_linear(
         # eliminating a separate kernel launch per linear layer.
         # weight_scale shape does not matter here -- it is only used in the
         # GEMM epilogue, not in the activation quant fusion. Only activates when
-        # piecewise_cuda_graph_compiler=inductor; eager PCG and decode both
-        # use the faster custom kernel.
+        # cuda_graph_config[prefill].tc_compiler=inductor; eager PCG and
+        # decode both use the faster custom kernel.
+
         if (
             input_scale is not None
             and input_scale.numel() == 1
-            and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
+            and get_global_server_args().cuda_graph_config.prefill.tc_compiler
+            == "inductor"
         ):
             qinput = (
                 (input_2d * input_scale.reciprocal())

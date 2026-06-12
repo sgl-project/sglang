@@ -118,7 +118,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Note: In production, this should use a proper storage backend (Redis, database)
         # with TTL/expiration to prevent memory leaks
         self.msg_store: dict[
-            str, Union[list[ChatCompletionMessageParam], list["OpenAIMessage"]]
+            str, Union[list[ChatCompletionMessageParam], list[OpenAIMessage]]
         ] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
@@ -631,8 +631,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse],
-    ) -> list["OpenAIMessage"]:
-        messages: list["OpenAIMessage"] = []
+    ) -> list[OpenAIMessage]:
+        messages: list[OpenAIMessage] = []
         if prev_response is None:
             # New conversation.
             reasoning_effort = request.reasoning.effort if request.reasoning else None

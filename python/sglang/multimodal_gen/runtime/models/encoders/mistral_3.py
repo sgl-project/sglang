@@ -41,6 +41,10 @@ from transformers.models.mistral.modeling_mistral import (
 )
 
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -369,7 +373,7 @@ class Mistral3Model(nn.Module):
         )
 
 
-class Mistral3ForConditionalGeneration(nn.Module):
+class Mistral3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin):
     _checkpoint_conversion_mapping = {
         "^language_model.model": "model.language_model",
         "^multi_modal_projector": "model.multi_modal_projector",
@@ -377,6 +381,8 @@ class Mistral3ForConditionalGeneration(nn.Module):
     }
     _tied_weights_keys = ["lm_head.weight"]
     uses_sglang_forward_context = False
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["model.language_model.layers"]
 
     def __init__(self, config: LlavaConfig):
         super().__init__()
@@ -426,7 +432,9 @@ class Mistral3ForConditionalGeneration(nn.Module):
         execution_tensor = input_ids if input_ids is not None else inputs_embeds
         sdpa_context = (
             sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
-            if execution_tensor is not None and execution_tensor.device.type == "cuda"
+            if execution_tensor is not None
+            and execution_tensor.device.type == "cuda"
+            and current_platform.is_cuda()
             else nullcontext()
         )
         with sdpa_context:

@@ -17,9 +17,9 @@ if _is_cuda:
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
         shuffle_rows,
-        silu_and_mul,
     )
 
+    from sglang.jit_kernel.activation import silu_and_mul
     from sglang.jit_kernel.nvfp4 import (
         cutlass_fp4_group_mm,
         scaled_fp4_experts_quant,
@@ -359,6 +359,7 @@ def cutlass_moe_fp4(
     topk_ids: torch.Tensor,
     params: CutlassMoEParams,
     apply_router_weight_on_input: bool = False,
+    no_combine: bool = False,
 ):
     """
     MoE implementation for FP4 Inputs
@@ -467,7 +468,7 @@ def cutlass_moe_fp4(
     )
     del rep_a_fp4, rep_a_blockscale
 
-    # hidden size dimension is split to one halfpytho sized tensor.
+    # hidden size dimension is split to one half sized tensor.
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
@@ -490,8 +491,12 @@ def cutlass_moe_fp4(
         params.to_gemm2_args(),
     )
     del int_fp4, int_blockscale
-    c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
-    c2 = c2.view(m_a, num_topk, params.hidden_size)
-    if not apply_router_weight_on_input:
-        c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)
-    return c2.sum(dim=1).to(out_dtype)
+
+    if no_combine:
+        c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
+        c2 = c2.view(m_a, num_topk, params.hidden_size)
+        return c2.to(out_dtype)
+    output = torch.empty((m_a, k_a), device=device, dtype=out_dtype)
+    weights = topk_weights.to(out_dtype) if not apply_router_weight_on_input else None
+    apply_shuffle_mul_sum(c2, output, c_map, weights)
+    return output

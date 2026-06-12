@@ -1,0 +1,215 @@
+---
+title: "Sequence Parallelism"
+tag: "preserve"
+metatags:
+    description: "Configure sequence parallelism, Ulysses, and ring-based sequence splitting for SGLang Diffusion workloads."
+---
+
+Sequence parallelism splits long image or video latent sequences across GPUs. In SGLang Diffusion, the public controls are:
+
+- `--sp-degree`: total sequence parallel degree
+- `--ulysses-degree`: Ulysses parallel degree
+- `--ring-degree`: ring parallel degree
+
+The degrees must satisfy:
+
+```text
+sp_degree = ulysses_degree * ring_degree
+```
+
+Use SP when sequence length or video shape makes the DiT forward pass the bottleneck and the model supports sequence sharding. For latency-oriented multi-GPU Qwen/Wan deployments, also compare against CFG parallelism and FSDP; SP is not automatically the best multi-GPU setting for every model.
+
+## Recommended Commands
+
+### Two-GPU Sequence Parallelism
+
+This example uses two GPUs with `sp=2`, `ulysses=1`, and `ring=2`.
+
+```bash
+sglang serve \
+  --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --num-gpus 2 \
+  --sp-degree 2 \
+  --ulysses-degree 1 \
+  --ring-degree 2 \
+  --port 8898
+```
+
+### Single-GPU Baseline
+
+Use an explicit single-GPU baseline before attributing a gain to sequence parallelism.
+
+```bash
+sglang serve \
+  --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --num-gpus 1 \
+  --sp-degree 1 \
+  --ulysses-degree 1 \
+  --ring-degree 1 \
+  --port 8898
+```
+
+## Choosing The Degrees
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "28%"}} />
+    <col style={{width: "32%"}} />
+    <col style={{width: "40%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Setting</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Typical use</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>--sp-degree 1</code></td>
+      <td style={{padding: "9px 12px"}}>Single-GPU or no sequence splitting</td>
+      <td style={{padding: "9px 12px"}}>Use this as the baseline.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>--ulysses-degree N</code></td>
+      <td style={{padding: "9px 12px"}}>Ulysses-only sequence parallelism</td>
+      <td style={{padding: "9px 12px"}}>When ring parallelism is not needed, keep <code>--ring-degree 1</code>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>--ring-degree N</code></td>
+      <td style={{padding: "9px 12px"}}>Ring-based sequence splitting over long sequences</td>
+      <td style={{padding: "9px 12px"}}>Keep <code>--sp-degree</code> equal to <code>ulysses_degree * ring_degree</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+## Benchmarking Guidance
+
+When benchmarking SP, compare the same model, precision, resolution, frame count, step count, scheduler settings, prompt type, and output path. Report both stage latency and peak GPU memory; SP can reduce per-GPU memory while adding communication overhead.
+
+Useful metrics:
+
+- End-to-end latency
+- Denoising stage latency
+- Decoding stage latency
+- Peak GPU memory and peak allocated memory
+- Communication or runtime overhead when available
+
+## Reference Benchmark
+
+The following numbers are a reference measurement for one setup. They are not a general promise for all Wan2.2 deployments.
+
+- Model: `Wan-AI/Wan2.2-TI2V-5B-Diffusers`
+- Hardware: two 48 GB RTX 40-series GPUs for sequence parallelism, one 48 GB RTX 40-series GPU for baseline
+- Sequence parallel config: `sp=2, ulysses=1, ring=2` (`u1r2`)
+- Baseline config: `sp=1, ulysses=1, ring=1` (`u1r1`)
+
+### Stage Time Breakdown
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Stage / Metric</th>
+      <th><code>u1r2</code> (s)</th>
+      <th><code>u1r1</code> baseline (s)</th>
+      <th>Speedup</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>InputValidation</td>
+      <td>0.1060</td>
+      <td>0.1029</td>
+      <td>0.97x</td>
+    </tr>
+    <tr>
+      <td>TextEncoding</td>
+      <td>1.3965</td>
+      <td>2.2261</td>
+      <td>1.59x</td>
+    </tr>
+    <tr>
+      <td>LatentPreparation</td>
+      <td>0.0002</td>
+      <td>0.0002</td>
+      <td>1.00x</td>
+    </tr>
+    <tr>
+      <td>TimestepPreparation</td>
+      <td>0.0003</td>
+      <td>0.0004</td>
+      <td>1.33x</td>
+    </tr>
+    <tr>
+      <td>Denoising</td>
+      <td>52.6358</td>
+      <td>71.6785</td>
+      <td>1.36x</td>
+    </tr>
+    <tr>
+      <td>Decoding</td>
+      <td>7.6708</td>
+      <td>13.4314</td>
+      <td>1.75x</td>
+    </tr>
+    <tr>
+      <td><strong>Total</strong></td>
+      <td><strong>63.74</strong></td>
+      <td><strong>90.63</strong></td>
+      <td><strong>1.42x</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+### Memory Usage
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Memory Metric</th>
+      <th><code>u1r2</code> (GB)</th>
+      <th><code>u1r1</code> baseline (GB)</th>
+      <th>Delta</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Peak GPU Memory</td>
+      <td>20.07</td>
+      <td>27.40</td>
+      <td>-7.33</td>
+    </tr>
+    <tr>
+      <td>Peak Allocated</td>
+      <td>13.35</td>
+      <td>20.40</td>
+      <td>-7.05</td>
+    </tr>
+    <tr>
+      <td>Memory Overhead</td>
+      <td>6.72</td>
+      <td>7.00</td>
+      <td>-0.28</td>
+    </tr>
+    <tr>
+      <td>Overhead Ratio</td>
+      <td>33.5%</td>
+      <td>25.6%</td>
+      <td>+7.9pp</td>
+    </tr>
+  </tbody>
+</table>
+
+In this setup, end-to-end latency improved from `90.63s` to `63.74s` (`1.42x`) and peak GPU memory dropped by `7.33GB`. The overhead ratio increased, so future tuning should still check communication and runtime overhead on the target hardware.
