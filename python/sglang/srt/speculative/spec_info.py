@@ -332,6 +332,8 @@ def create_dummy_verify_input(
             draft_token=None,
             positions=None,
             draft_token_num=server_args.speculative_num_draft_tokens,
+            mamba_cache_steps=server_args.speculative_dflash_mamba_cache_steps,
+            mamba_replay=server_args.speculative_dflash_mamba_replay,
             custom_mask=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
