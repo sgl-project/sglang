@@ -72,6 +72,11 @@ class MoriEPNormalDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
+    # Host-side scheduling hint, see MoriEPLLDispatchOutput.expected_m. For
+    # normal dispatch the output is compact (no padding), so expected_m simply
+    # equals topk_ids.shape[0]; carrying the field on both flavors gives the
+    # downstream runner a single uniform attribute to read.
+    expected_m: int
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -89,6 +94,14 @@ class MoriEPLLDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
+    # Host-side scheduling hint: average #tokens per local expert under
+    # uniform routing. In LL dispatch topk_ids.shape[0] is the padded buffer
+    # size (num_local_experts * num_max_dispatch_tokens_per_rank) and tells
+    # nothing about the real workload, which pegs aiter's get_padded_M tier
+    # lookup at the worst tier. expected_m gives the runner the realistic M
+    # to feed into the tier lookup; the device-side masked_m mechanism still
+    # governs correctness, so a slightly-off hint only affects perf.
+    expected_m: int
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -460,6 +473,34 @@ class _MoriEPDispatcherImplBase:
             if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
                 self.combine_dtype = CombineDtype.fp8
 
+    def _compute_expected_m(self, topk_ids: torch.Tensor) -> int:
+        """Host-side scheduling hint (M) for AITER fused_moe tier lookup.
+
+        Reproduces, without any token truncation, the per-stage sizing the
+        removed SGLANG_MORI_MOE_MAX_INPUT_TOKENS env var used in CI:
+
+          * prefill (extend): MORI_MAX_DISPATCH_TOKENS_PREFILL * dp_ranks / 2,
+            i.e. num_max_dispatch_tokens_per_rank * world_size // 2 -- the exact
+            MORI_MOE_MAX_INPUT_TOKENS_PREFILL formula. Keeps prefill on the same
+            GEMM tier it used before (e.g. 8192 * 8 / 2 = 32768 at TP/EP=8).
+          * decode: reqs_per_rank * topk * 7 // 10. topk_ids.shape[0] already
+            folds in the MTP draft tokens, so this lands on the same small tier
+            the decode-side truncation produced (~356 at conc=128).
+
+        expected_m is only a scheduling hint -- it never drops rows, so this
+        cannot change prefill (or decode) numerics, only the tuned tier picked.
+        """
+        world_size = self.num_experts // self.num_local_experts
+        if get_is_extend_in_batch():
+            # prefill: match MORI_MOE_MAX_INPUT_TOKENS_PREFILL exactly.
+            return (self.num_max_dispatch_tokens_per_rank * world_size) // 2
+        # decode: match the legacy decode-side truncation sizing. No capture-time
+        # floor is needed -- the aiter fused_moe 2-stage path now derives its
+        # kernel tier from this same hint (sched_M), so a small tier picked while
+        # the CUDA-graph capture batch shrinks toward bs=1 is self-consistent and
+        # bounded by masked_m. expected_m stays a pure performance hint.
+        return (topk_ids.shape[0] * topk_ids.shape[1] * 7) // 10
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -622,6 +663,9 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
+            # Stage-aware expected_m (prefill keeps the legacy 32768-equiv
+            # tier; decode uses the reqs*topk*7/10 sizing). No token dropping.
+            expected_m=self._compute_expected_m(topk_ids),
         )
 
     def _dispatch_core(
@@ -894,6 +938,11 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             self.mori_op.local_expert_count
         )
 
+        # Stage-aware expected_m: prefill keeps the legacy
+        # MORI_MOE_MAX_INPUT_TOKENS_PREFILL-equivalent tier; decode uses the
+        # reqs*topk*7/10 sizing. Only a scheduling hint -- never drops rows.
+        expected_m = self._compute_expected_m(topk_ids)
+
         return MoriEPLLDispatchOutput(
             hidden_states=hidden_states,
             hidden_states_scale=recv_scales,
@@ -903,6 +952,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
+            expected_m=expected_m,
         )
 
     def _dispatch_core(
