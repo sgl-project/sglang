@@ -1,38 +1,21 @@
 """SM120 FlashMLA sparse *prefill* dispatch.
 
-DeepSeek's ``sgl_kernel.flash_mla.flash_mla_sparse_fwd`` is compiled only for
-SM90a (WGMMA) and SM100f (tcgen05); on SM120 (Blackwell workstation / RTX PRO
-6000) it raises ``RuntimeError: Sparse Attention Forward Kernel is only
-supported on SM90a and SM100f architectures``. That path is reached whenever a
-single prefill forward batches more than ``_LARGE_INDEXER_QUERY_THRESHOLD``
-(=11673) query tokens, which a high-concurrency / long-context sweep trips.
+Stock ``sgl_kernel.flash_mla.flash_mla_sparse_fwd`` is SM90a/SM100f-only and raises on
+SM120; that path is hit when a prefill batches > ``_LARGE_INDEXER_QUERY_THRESHOLD`` (=11673)
+query tokens. Mirrors ``flash_mla_sm120.py`` for the prefill op, selected by
+``SGLANG_SM120_SPARSE_PREFILL``:
 
-This module mirrors ``flash_mla_sm120.py`` (the sparse-*decode* selector) for
-the prefill op, selected by ``SGLANG_SM120_SPARSE_PREFILL``:
+- ``hmma``      -- custom SM120 sparse-prefill kernel (``deepseek_v4_kernel.ops.sparse_prefill_fwd``),
+                   a drop-in for ``flash_mla_sparse_fwd``.
+- ``sglkernel`` -- stock kernel (SM90a/SM100f; crashes on SM120).
+- ``torch``     -- chunked pure-PyTorch reference (correct, slow).
 
-- ``hmma``      -- out-of-tree deepseek_v4_kernel tensor-core .so (opt-in), a
-                   drop-in for ``flash_mla_sparse_fwd``.
-- ``sglkernel`` -- the stock ``sgl_kernel.flash_mla.flash_mla_sparse_fwd``
-                   (works on SM90a / SM100f; crashes on SM120).
-- ``torch``     -- a chunked pure-PyTorch reference (always correct, slow).
+Default is *safe*: SM120 → ``hmma`` if installed else ``torch`` (never ``sglkernel``); off
+SM120 → ``sglkernel``. An explicit ``sglkernel`` on SM120 is downgraded to ``torch`` so the
+server never crashes on the > 11673-token path.
 
-Default resolution is *safe*: on SM120 the default is ``hmma`` when the package
-is installed, else ``torch`` -- never ``sglkernel`` (which would crash). Off
-SM120 the default is ``sglkernel`` (the working stock kernel). An explicit
-``sglkernel`` on SM120 is downgraded to ``torch`` with a warning so the server
-never crashes on the >11673-token prefill path.
-
-All three branches honour the ``flash_mla_sparse_fwd`` contract::
-
-    flash_mla_sparse_fwd(q[s_q,h_q,d_qk] bf16,
-                         kv[s_kv,(h_kv=1,)d_qk] bf16,
-                         indices[s_q,(h_kv=1,)topk] int32,
-                         sm_scale, d_v=512,
-                         attn_sink[h_q]|None, topk_length[s_q]|None)
-        -> (out[s_q,h_q,d_v] bf16, max_logits[s_q,h_q] f32, lse[s_q,h_q] f32)
-
-Only ``out`` is consumed by the callers (``o, _, _ = ...``); ``max_logits`` and
-``lse`` are returned for parity.
+Contract: ``flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v=512, attn_sink, topk_length)
+-> (out, max_logits, lse)``. Callers use only ``out`` (``o, _, _ = ...``).
 """
 
 import logging
@@ -53,10 +36,8 @@ _is_sm120 = is_sm120_supported()
 def _resolve_sm120_sparse_prefill_backend() -> str:
     """Resolve ``SGLANG_SM120_SPARSE_PREFILL`` once at import.
 
-    Unset -> a safe per-arch default (``hmma``/``torch`` on SM120, never the
-    crashing stock kernel; ``sglkernel`` elsewhere). An explicit value is
-    validated and, when it cannot run on this device, downgraded (never to a
-    backend that would crash).
+    Unset -> safe per-arch default (``hmma``/``torch`` on SM120, ``sglkernel`` elsewhere).
+    An explicit value that can't run on this device is downgraded — never to one that crashes.
     """
     raw = os.environ.get("SGLANG_SM120_SPARSE_PREFILL")
     if raw is None:
@@ -65,10 +46,10 @@ def _resolve_sm120_sparse_prefill_backend() -> str:
         if is_deepseek_v4_kernel_available():
             return "hmma"
         logger.info(
-            "SM120 sparse-prefill: deepseek_v4_kernel is not installed and the "
-            "stock sgl_kernel sparse-prefill is SM90a/SM100f-only; using the "
-            "pure-PyTorch reference. Install deepseek_v4_kernel or set "
-            "SGLANG_SM120_SPARSE_PREFILL=hmma for the tensor-core kernel."
+            "SM120 sparse-prefill: deepseek_v4_kernel not installed and stock "
+            "sgl_kernel is SM90a/SM100f-only; using the pure-PyTorch reference. "
+            "Install deepseek_v4_kernel or set SGLANG_SM120_SPARSE_PREFILL=hmma "
+            "for the custom kernel."
         )
         return "torch"
 

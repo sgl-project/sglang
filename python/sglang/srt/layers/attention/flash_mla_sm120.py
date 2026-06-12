@@ -4,7 +4,7 @@ On SM120 (Blackwell Desktop / RTX PRO 6000) the flash_mla CUDA kernel
 is not available, so this module provides alternative implementations,
 selected by ``SGLANG_SM120_SPARSE_DECODE`` (default ``triton``):
 
-- ``hmma``   -- out-of-tree deepseek_v4_kernel tensor-core .so (opt-in)
+- ``hmma``   -- custom SM120 sparse-decode kernel (``deepseek_v4_kernel.ops.sparse_decode_fwd``)
 - ``triton`` -- in-tree Triton kernel (default)
 - ``torch``  -- pure-PyTorch fallback
 
@@ -195,12 +195,9 @@ def _sm120_sparse_decode_fwd(
     return out.to(torch.bfloat16), lse.permute(0, 2, 1)
 
 
-# SM120 FlashMLA sparse-decode backend: "hmma" | "triton" | "torch".
-# Controlled by SGLANG_SM120_SPARSE_DECODE (default "triton", the in-tree kernel).
-#   hmma   -> out-of-tree deepseek_v4_kernel tensor-core .so (opt-in); downgraded
-#            to "triton" if the package is not installed.
-#   triton -> in-tree Triton kernel.
-#   torch  -> pure-PyTorch fallback.
+# SM120 sparse-decode backend (SGLANG_SM120_SPARSE_DECODE, default "triton"):
+#   hmma   -> custom SM120 kernel; downgraded to "triton" if not installed.
+#   triton -> in-tree Triton kernel.  torch -> pure-PyTorch fallback.
 def _resolve_sm120_sparse_decode_backend() -> str:
     backend = os.environ.get("SGLANG_SM120_SPARSE_DECODE", "triton").lower()
     if backend not in ("hmma", "triton", "torch"):

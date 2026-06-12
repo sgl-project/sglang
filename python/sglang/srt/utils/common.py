@@ -345,11 +345,11 @@ def is_flashinfer_available():
 
 
 def is_deepseek_v4_kernel_available() -> bool:
-    """Check whether the out-of-tree deepseek_v4_kernel is installed.
+    """Whether the custom SM120 deepseek_v4_kernel is installed.
 
-    Provides the SM120 HMMA tensor-core sparse-decode kernel
-    (``deepseek_v4_kernel.ops.sparse_decode_fwd``), a drop-in for FlashMLA's
-    sparse decode. Optional; when absent the in-tree Triton kernel is used.
+    Provides the SM120 sparse decode + prefill kernels
+    (``deepseek_v4_kernel.ops.{sparse_decode_fwd, sparse_prefill_fwd}``), drop-ins
+    for FlashMLA. Optional; when absent the in-tree Triton/torch paths are used.
     """
     return importlib.util.find_spec("deepseek_v4_kernel") is not None
 
