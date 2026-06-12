@@ -10,6 +10,9 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (  # noqa:
 from sglang.srt.entrypoints.openai.transcription_adapters.mimo_v2_asr import (  # noqa: F401
     MiMoV2ASRAdapter,
 )
+from sglang.srt.entrypoints.openai.transcription_adapters.moss_transcribe_diarize import (  # noqa: F401
+    MossTranscribeDiarizeAdapter,
+)
 from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_asr import (  # noqa: F401
     Qwen3ASRAdapter,
 )
@@ -24,4 +27,5 @@ __all__ = [
     "WhisperAdapter",
     "Qwen3ASRAdapter",
     "MiMoV2ASRAdapter",
+    "MossTranscribeDiarizeAdapter",
 ]
