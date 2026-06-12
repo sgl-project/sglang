@@ -646,7 +646,9 @@ class ReqPhase(Enum):
     the request's memory-management fields (prepare_for_extend,
     prepare_for_decode, reset_for_retract)."""
 
-    QUEUED = auto()  # not scheduled yet, or retracted back to the queue
+    # Catch-all for every state this enum does not track yet (just created,
+    # waiting in queue, retracted, transferring, finished, ...).
+    OTHERS = auto()
     EXTEND = auto()  # admitted to a prefill/extend batch (incl. mid-chunk)
     DECODE = auto()  # entered decode
 
@@ -707,7 +709,7 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        self.phase: ReqPhase = ReqPhase.QUEUED
+        self.phase: ReqPhase = ReqPhase.OTHERS
         self.extend_range: Optional[Range] = None
         self.dllm_initialized: bool = False
 
@@ -1416,7 +1418,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
-        self.phase = ReqPhase.QUEUED
+        self.phase = ReqPhase.OTHERS
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
