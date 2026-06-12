@@ -1,7 +1,7 @@
 """Benchmark fused_gate_sigmoid_mul_add: Triton kernel vs PyTorch eager.
 
 Compares the fused Triton kernel against a plain PyTorch implementation
-over a sweep of (num_tokens, hidden_dim) shapes typical for Qwen2 MoE.
+over the Qwen3.5 MoE target hidden size.
 """
 
 import torch
@@ -9,7 +9,7 @@ import triton
 
 from sglang.srt.layers.elementwise import fused_gate_sigmoid_mul_add
 
-HIDDEN_DIMS = [2048, 3072, 4096, 6144]
+HIDDEN_DIMS = [4096]
 
 
 def _pytorch_reference(hidden_states, gate_weight, shared_output, final_hidden_states):
@@ -21,7 +21,7 @@ def make_bench(hidden_dim):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["num_tokens"],
-            x_vals=[1, 4, 16, 64, 512, 1024, 2048, 8192],
+            x_vals=[1, 2, 4, 8, 16, 1024, 2048, 4096, 8192],
             line_arg="impl",
             line_vals=["triton", "pytorch"],
             line_names=["Triton fused", "PyTorch eager"],
