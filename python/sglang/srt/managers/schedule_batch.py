@@ -2663,8 +2663,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def filter_batch(
         self,
         keep_indices: Optional[List[int]] = None,
-        # FIXME(lsyin): deprecate this API after spec v1 is deprecated
-        v1_spec_info_filtered: Optional[bool] = False,
         skip_extend_intermediate: bool = False,
     ):
         if keep_indices is None:

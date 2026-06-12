@@ -2856,7 +2856,7 @@ class Scheduler(
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
+            self.running_batch.filter_batch()
             is_extend_intermediate = self.running_batch.is_extend_intermediate or []
             assert not any(
                 is_extend_intermediate
@@ -3835,7 +3835,7 @@ class Scheduler(
         self.cur_batch = None
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
+            self.running_batch.filter_batch()
 
             retract_reqs = [*self.running_batch.reqs, *self.partially_extended_reqs()]
 
