@@ -1,0 +1,95 @@
+name: PR Test - Kernel Bench Regression
+
+# Runs the registered kernel benchmark subset on a PR and compares the fresh
+# numbers against the nightly ground truth in sgl-project/ci-data with a relative
+# tolerance (default 5%).
+#
+# CI GPUs are NOT isolated, so an occasional regression here may be noise --
+# this gate is safe to simply re-run. A persistent failure across re-runs is a
+# real kernel performance regression.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      # Tracked kernel sources
+      - "sgl-kernel/csrc/gemm/dsv3_**"
+      - "sgl-kernel/csrc/elementwise/dsv4_**"
+      - "sgl-kernel/csrc/attention/cutlass_mla**"
+      - "sgl-kernel/csrc/gemm/per_token_group_quant_8bit**"
+      - "sgl-kernel/csrc/moe/moe_fused_gate**"
+      # Benchmark files + the regression harness itself
+      - "sgl-kernel/benchmark/bench_dsv3_**"
+      - "sgl-kernel/benchmark/bench_dsv4_**"
+      - "sgl-kernel/benchmark/bench_cutlass_mla**"
+      - "sgl-kernel/benchmark/bench_moe_fused_gate**"
+      - "sgl-kernel/benchmark/bench_per_token_group_quant_8bit**"
+      - "sgl-kernel/benchmark/kernel_bench_regression/**"
+      - ".github/workflows/pr-test-kernel-bench.yml"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to checkout'
+        required: false
+        default: ''
+        type: string
+      gt_ref:
+        description: 'ci-data ref to pull ground truth from'
+        required: false
+        default: 'main'
+        type: string
+      tolerance:
+        description: 'Relative regression tolerance (e.g. 0.05 == 5%)'
+        required: false
+        default: '0.05'
+        type: string
+
+concurrency:
+  group: pr-test-kernel-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+
+jobs:
+  kernel-bench-compare:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-h100
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Compare against nightly ground truth (sm90)
+        timeout-minutes: 30
+        env:
+          GT_REF: ${{ inputs.gt_ref || 'main' }}
+          TOLERANCE: ${{ inputs.tolerance || '0.05' }}
+        run: |
+          cd sgl-kernel/benchmark
+          GT_URL="https://raw.githubusercontent.com/sgl-project/ci-data/${GT_REF}/kernel-bench/sm90.json"
+          python3 -m kernel_bench_regression compare \
+            --gt-url "$GT_URL" \
+            --tolerance "$TOLERANCE" \
+            --repeat 5 \
+            --measured-out "$GITHUB_WORKSPACE/kernel-bench-measured.json" \
+            --commit "$GITHUB_SHA"
+
+      - name: Upload measured results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-bench-measured
+          path: kernel-bench-measured.json
+          retention-days: 7

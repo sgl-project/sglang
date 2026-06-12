@@ -1,0 +1,90 @@
+name: Nightly Kernel Bench Ground Truth
+
+# Generates the performance ground truth for the kernel benchmark regression
+# suite and publishes it to sgl-project/ci-data. PR runs (pr-test-kernel-bench.yml)
+# pull this ground truth back and compare their fresh numbers against it with a
+# relative tolerance.
+#
+# One ground-truth file is produced per GPU SKU (sm90 = Hopper, sm100 = Blackwell)
+# so that the comparison only ever happens against numbers measured on the same
+# hardware class.
+
+on:
+  schedule:
+    # 09:30 UTC daily, after the nightly NVIDIA tests have settled.
+    - cron: '30 9 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to checkout'
+        required: false
+        default: ''
+        type: string
+      publish:
+        description: 'Publish the generated ground truth to sgl-project/ci-data'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: nightly-kernel-bench-gt-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+
+jobs:
+  generate-gt:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sku: sm90
+            runner: 1-gpu-h100
+          - sku: sm100
+            runner: 1-gpu-b200
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Generate ground truth
+        timeout-minutes: 45
+        run: |
+          mkdir -p kernel-bench-gt
+          cd sgl-kernel/benchmark
+          python3 -m kernel_bench_regression generate \
+            --out "$GITHUB_WORKSPACE/kernel-bench-gt/${{ matrix.sku }}.json" \
+            --repeat 5 \
+            --commit "$GITHUB_SHA"
+          echo "----- generated ${{ matrix.sku }}.json -----"
+          cat "$GITHUB_WORKSPACE/kernel-bench-gt/${{ matrix.sku }}.json"
+
+      - name: Upload ground-truth artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-bench-gt-${{ matrix.sku }}
+          path: kernel-bench-gt/${{ matrix.sku }}.json
+          retention-days: 14
+
+      - name: Publish ground truth to sgl-project/ci-data
+        if: ${{ inputs.publish != false }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python3 scripts/ci/utils/kernel/publish_kernel_bench_gt.py \
+            --source-dir kernel-bench-gt \
+            --target-dir kernel-bench
