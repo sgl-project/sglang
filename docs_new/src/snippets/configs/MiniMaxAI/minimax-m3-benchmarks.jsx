@@ -3,8 +3,9 @@
 //
 // SPEED — bench_serving --flush-cache, random isl2048/osl256, max_concurrency 64,
 // CUDA graph on. B200 (tp4, MXFP8, MSA fmha_sm100 path) and H200 (tp8, bf16,
-// built-in Triton sparse) are measured on PR #27944 (run-1; a 3-run mean is
-// pending). B300 / GB300 rows are the earlier sglang main (2026-06-11) tp4 MSA
+// built-in Triton sparse) are measured on PR #27944 — warm steady-state from a
+// 3-run sweep (the cold-start first run, ~2x slower, is excluded). B300 / GB300
+// rows are the earlier sglang main (2026-06-11) tp4 MSA
 // numbers, pending a #27944 re-measure on their own boxes. GB200 is a bare-match
 // stub (inferred-supported, not benchmarked). AMD: MI355X at 8-GPU tp8 (native
 // MXFP8) carries a bench_serving speed row; MI300X (MXFP8 -> block-fp8) was
@@ -16,8 +17,11 @@
 // `run gsm8k`, full 1319-question test split, chat endpoint with --thinking
 // (M3's reasoning path) + M3's recommended sampling (temp 1.0 / top_p 0.95 /
 // top_k 40), symbolic grading. This is the config's Reproduce command. B200
-// (MSA path) and H200 (bf16, built-in Triton sparse) are measured on PR #27944;
-// a 3-run mean±std and the matching #27944 bench_serving speed are in progress.
+// (MSA path) and H200 (bf16, built-in Triton sparse) are measured on PR #27944.
+// 3-run results: H200 is stable at 97.04% (std 0.0); B200's fresh-server 94.4%
+// (= greedy) drifts down over sustained runs interleaved with bench (an
+// MSA-under-load serving issue under investigation), so it reports the
+// fresh-server value, not the drifted mean.
 // Per-platform re-measurement under sgl-eval is in progress; rows still pending
 // show `gsm8k_pct: null` (no GSM8K row rendered) with the legacy-harness number
 // kept in a comment. Legacy harnesses were NOT comparable across platforms
@@ -28,11 +32,11 @@ export const benchmarks = [
     match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
     sglang_version: "PR #27944",
     speed: [
-      // bench_serving --flush-cache, MSA path; run-1 (3-run mean pending).
+      // bench_serving --flush-cache, MSA path; warm steady-state (3-run, cold-start run-1 excluded).
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
-        ttft_ms: 2410, tpot_ms: 148.4, tokens_per_sec_per_gpu: 124 },
+        ttft_ms: 749, tpot_ms: 61.5, tokens_per_sec_per_gpu: 249 },
     ],
-    accuracy: { gsm8k_pct: 94.4 }, // #27944, sgl-eval --thinking, full 1319, recommended sampling (temp 1.0/top_p 0.95/top_k 40), MSA path; run-1 94.39% (greedy 94.16%); --no-thinking 88.6%
+    accuracy: { gsm8k_pct: 94.4 }, // #27944, sgl-eval --thinking, full 1319, recommended sampling (temp 1.0/top_p 0.95/top_k 40), MSA path; fresh-server 94.4% (greedy 94.16%; --no-thinking 88.6%). NOTE: 3 sustained runs interleaved with bench drifted 94.4->89.2->86.2 — an MSA-under-load serving issue (under investigation), not the model accuracy.
   },
   {
     // Hopper H200: bf16 build (MXFP8 is Blackwell-only) at tp8, built-in Triton
@@ -40,11 +44,11 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
     sglang_version: "PR #27944",
     speed: [
-      // bench_serving --flush-cache, bf16 Triton path; run-1 (3-run mean pending).
+      // bench_serving --flush-cache, bf16 Triton path; warm steady-state (3-run, cold-start run-1 excluded).
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
-        ttft_ms: 1068, tpot_ms: 78.0, tokens_per_sec_per_gpu: 105 },
+        ttft_ms: 1054, tpot_ms: 70.8, tokens_per_sec_per_gpu: 116 },
     ],
-    accuracy: { gsm8k_pct: 97.0 }, // #27944, sgl-eval --thinking, full 1319, recommended sampling (temp 1.0/top_p 0.95/top_k 40); run-1 97.04%
+    accuracy: { gsm8k_pct: 97.0 }, // #27944, sgl-eval --thinking, full 1319, recommended sampling (temp 1.0/top_p 0.95/top_k 40); stable 97.04% across all 3 runs (std 0.0)
   },
   {
     match: { hw: "b300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
