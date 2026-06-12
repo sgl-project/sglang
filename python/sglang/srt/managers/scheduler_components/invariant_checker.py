@@ -13,6 +13,7 @@ from typing import (
 )
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import ReqPhase
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
@@ -206,10 +207,30 @@ class SchedulerInvariantChecker:
 
         return full_uncached, swa_uncached
 
+    def _check_phase_consistency(self):
+        # Cross-check Req.phase against the committed-KV inference it replaced:
+        # prepare_for_decode pre-claims the bonus slot, so committed KV moving
+        # past the extend frontier coincides with entering decode. A missed
+        # phase transition shows up here.
+        for req in self.get_active_reqs().values():
+            if req.is_dllm() or req.extend_range is None:
+                continue
+            if req.phase is ReqPhase.DECODE:
+                assert req.kv_committed_len >= req.extend_range.end, (
+                    f"DECODE req behind its extend frontier: {req.rid=} "
+                    f"{req.kv_committed_len=} {req.extend_range=}"
+                )
+            elif req.phase is ReqPhase.EXTEND:
+                assert req.kv_committed_len <= req.extend_range.end, (
+                    f"EXTEND req past its extend frontier: {req.rid=} "
+                    f"{req.kv_committed_len=} {req.extend_range=}"
+                )
+
     def self_check_during_busy(self):
         if self.get_last_batch() is None:
             return
 
+        self._check_phase_consistency()
         ps = self.pool_stats_observer.get_pool_stats()
         full_uncached, swa_uncached = self._get_total_uncached_sizes()
 
