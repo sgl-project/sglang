@@ -495,7 +495,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = kv_indices
             return
 
-        token_ids = req.get_fill_ids()
+        token_ids = req.get_cached_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]

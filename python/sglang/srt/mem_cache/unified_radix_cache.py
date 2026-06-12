@@ -730,7 +730,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             return
 
-        token_ids = req.get_fill_ids()
+        token_ids = req.get_cached_fill_ids()
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
