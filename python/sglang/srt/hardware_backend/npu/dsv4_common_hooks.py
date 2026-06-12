@@ -269,8 +269,7 @@ def maybe_evict_dsv4_state(batch: "ScheduleBatch", req: "Req", pre_len: int) -> 
     free anything) the pool exhausts before the first SWA frontier advance, so
     we drain it here on its own cadence.
 
-    Retention windows (kernel read window + decode lookahead margin) mirror
-    reference (iforgetmyname/sglang dsv4_release chunk_cache.py:140-144):
+    Retention windows (kernel read window + decode lookahead margin):
     c4 = 8 + 16, c128 = 128 + 64 raw positions — intentionally smaller than one
     SWA page so the first eviction fires before the small pool fills. Watermarks
     are page-aligned so freed slots are whole pages reclaimable by the paged

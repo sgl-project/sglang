@@ -335,6 +335,9 @@ class Compressor(MultiPlatformOp):
         assert not self.ape_converted
         self.ape_converted = True
 
+        if _is_npu:
+            return
+
         if self.overlap:
             ape = torch.chunk(self.ape.data, 2, dim=-1)
             ape = torch.cat([ape[0], ape[1]], dim=0)

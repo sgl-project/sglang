@@ -353,7 +353,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         Returns None when this model has no paged state pools (CUDA / non-V4 /
         zero budget) — callers pass that straight through as ``dsv4_state_lens``.
-        Reference: iforgetmyname/sglang dsv4_release schedule_batch.py L1742-1747.
         """
         if self.c4_state_attn_allocator is None:
             return None
