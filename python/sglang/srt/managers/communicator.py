@@ -35,8 +35,6 @@ class FanOutCommunicator(Generic[T]):
         assert mode in ["queueing", "watching"]
 
     async def queueing_call(self, obj: T):
-        from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
-
         ready_event = asyncio.Event()
         if self._result_event is not None or len(self._ready_queue) > 0:
             self._ready_queue.append(ready_event)
@@ -45,10 +43,11 @@ class FanOutCommunicator(Generic[T]):
             assert self._result_values is None
 
         if obj is not None:
-            if isinstance(self._sender, SenderWrapper):
-                self._sender.send_obj(obj)
-            else:
+            if isinstance(self._sender, zmq.Socket):
                 sock_send(self._sender, obj)
+            else:
+                # for no zmq.Socket, it will be SenderWrapper
+                self._sender.send_obj(obj)
 
         self._result_event = asyncio.Event()
         self._result_values = []
@@ -62,18 +61,17 @@ class FanOutCommunicator(Generic[T]):
         return result_values
 
     async def watching_call(self, obj):
-        from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
-
         if self._result_event is None:
             assert self._result_values is None
             self._result_values = []
             self._result_event = asyncio.Event()
 
             if obj is not None:
-                if isinstance(self._sender, SenderWrapper):
-                    self._sender.send_obj(obj)
-                else:
+                if isinstance(self._sender, zmq.Socket):
                     sock_send(self._sender, obj)
+                else:
+                    # for no zmq.Socket, it will be SenderWrapper
+                    self._sender.send_obj(obj)
 
         # Capture local refs before await -- after event fires, the first
         # awakened coroutine clears shared state; later awaiters use local refs.

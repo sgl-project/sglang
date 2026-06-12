@@ -41,11 +41,11 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.entrypoints.api_specs import ProfileReqInputSpec
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import (
     ProfileReq,
-    ProfileReqInput,
     ProfileReqType,
     async_sock_recv,
     sock_send,
@@ -3740,7 +3740,7 @@ async def health_generate():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+async def start_profile_async(obj: Optional[ProfileReqInputSpec] = None):
     if dp_dispatcher is not None:
         profile_req = None
         if obj is not None:

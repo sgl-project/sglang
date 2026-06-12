@@ -863,14 +863,15 @@ class Engine(EngineScoreMixin, EngineBase):
         for p in detoken_procs:
             scheduler_init_result.all_child_pids.append(p.pid)
 
-        if server_args.tokenizer_worker_num > 1 or server_args.enable_http2:
-            # Launch multi-tokenizer router
-            tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-            template_manager = None
-        else:
+        if server_args.tokenizer_worker_num == 1 and not server_args.enable_http2:
+            # Launch a single tokenizer manager without the router
             tokenizer_manager, template_manager = init_tokenizer_manager_func(
                 server_args, port_args
             )
+        else:
+            # Launch multi-tokenizer router
+            tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+            template_manager = None
 
         # Wait for the model to finish loading
         scheduler_init_result.wait_for_ready()

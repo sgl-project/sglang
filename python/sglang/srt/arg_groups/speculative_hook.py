@@ -372,7 +372,7 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
     # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
     # TODO: @rainj-me, Temp allow fa4 to support the two-pass
-    _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton", "fa4")
+    _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
     if (
         server_args.speculative_eagle_topk > 1
         and server_args.page_size > 1

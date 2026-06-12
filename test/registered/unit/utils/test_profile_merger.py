@@ -13,7 +13,8 @@ import shutil
 import tempfile
 import unittest
 
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
+from sglang.srt.entryponts.api_specs import ProfileReqInputSpec
+from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -208,11 +209,11 @@ class TestProfileMerger(unittest.TestCase):
 class TestProfileMergerIntegration(unittest.TestCase):
 
     def test_data_structures_merge_profiles(self):
-        # Test ProfileReqInput
-        req_input = ProfileReqInput()
+        # Test ProfileReqInputSpec
+        req_input = ProfileReqInputSpec()
         self.assertFalse(req_input.merge_profiles)
 
-        req_input = ProfileReqInput(merge_profiles=True)
+        req_input = ProfileReqInputSpec(merge_profiles=True)
         self.assertTrue(req_input.merge_profiles)
 
         # Test ProfileReq

@@ -105,28 +105,6 @@ class BaseBatchReqIpc(msgspec.Struct, tag=True, kw_only=True):
     http_worker_ipcs: Optional[List[Optional[str]]] = None
 
 
-class SpeculativeDecodingMetricsMixinReq(BaseBatchReqIpc, kw_only=True):
-    """
-    Mixin class containing speculative decoding metrics.
-
-    This class consolidates speculative decoding metrics that are shared across
-    batch output types that support speculative decoding to avoid code duplication.
-    """
-
-    # Verify count: number of verification forward passes
-    spec_verify_ct: Optional[List[int]]
-
-    # Accepted drafts: Number of accepted draft tokens during speculative decoding
-    # (strict drafts-only count, excludes the bonus token).
-    spec_num_correct_drafts: Optional[List[int]]
-
-    # Acceptance histogram: List of lists, where each inner list represents histogram counts.
-    # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
-    # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
-    # Empty list [] when speculative decoding is disabled.
-    spec_correct_drafts_histogram: Optional[List[List[int]]]
-
-
 # Parameters for a session
 @dataclass
 class SessionParams:
@@ -1122,7 +1100,7 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReqIpc, kw_only=True):
         return iter(self.batch)
 
 
-class BatchTokenIDOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
+class BatchTokenIDOutput(BaseBatchReqIpc, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[Dict[str, Any]]]  # List[BaseFinishReason]
     # For incremental decoding
@@ -1228,8 +1206,22 @@ class BatchTokenIDOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+    # From the SpeculativeDecodingMetricsMixinReq class
+    # Verify count: number of verification forward passes
+    spec_verify_ct: Optional[List[int]]
 
-class BatchStrOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
+    # Accepted drafts: Number of accepted draft tokens during speculative decoding
+    # (strict drafts-only count, excludes the bonus token).
+    spec_num_correct_drafts: Optional[List[int]]
+
+    # Acceptance histogram: List of lists, where each inner list represents histogram counts.
+    # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
+    # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
+    # Empty list [] when speculative decoding is disabled.
+    spec_correct_drafts_histogram: Optional[List[List[int]]]
+
+
+class BatchStrOutput(BaseBatchReqIpc, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[Dict[str, Any]]]  # List[dict]
     # The output decoded strings
@@ -1328,6 +1320,20 @@ class BatchStrOutput(SpeculativeDecodingMetricsMixinReq, kw_only=True):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
+    # From the SpeculativeDecodingMetricsMixinReq class
+    # Verify count: number of verification forward passes
+    spec_verify_ct: Optional[List[int]]
+
+    # Accepted drafts: Number of accepted draft tokens during speculative decoding
+    # (strict drafts-only count, excludes the bonus token).
+    spec_num_correct_drafts: Optional[List[int]]
+
+    # Acceptance histogram: List of lists, where each inner list represents histogram counts.
+    # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
+    # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
+    # Empty list [] when speculative decoding is disabled.
+    spec_correct_drafts_histogram: Optional[List[List[int]]]
 
 
 class BatchEmbeddingOutput(BaseBatchReqIpc, kw_only=True):
@@ -1663,14 +1669,6 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReqIpc, kw_only=True):
     message: str
 
 
-@dataclass
-class UpdateWeightVersionReqInput(BaseReq):
-    # The new weight version
-    new_version: str
-    # Whether to abort all running requests before updating
-    abort_all_requests: bool = True
-
-
 class GetWeightsByNameReqInput(BaseReqIpc, kw_only=True):
     name: str
     truncate_size: int = 100
@@ -1761,32 +1759,6 @@ class SetInternalStateReqOutput(BaseReqIpc, kw_only=True):
     server_args: Dict[str, object]
 
 
-@dataclass
-class ProfileReqInput(BaseReq):
-    # The output directory
-    output_dir: Optional[str] = None
-    # Specify the steps to start the profiling
-    start_step: Optional[int] = None
-    # If set, it profile as many as this number of steps.
-    # If it is set, profiling is automatically stopped after this step, and
-    # the caller doesn't need to run stop_profile.
-    num_steps: Optional[int] = None
-    # The activities to record. The choices are ["CPU", "GPU", "MEM", "RPD"]
-    activities: Optional[List[str]] = None
-    # Whether profile by stages (e.g., prefill and decode) separately
-    profile_by_stage: bool = False
-    # Whether to record source information (file and line number) for the ops.
-    with_stack: Optional[bool] = None
-    # Whether to save information about operator’s input shapes.
-    record_shapes: Optional[bool] = None
-    # Merge profiles from all ranks into a single trace
-    merge_profiles: bool = False
-    # The prefix of the profile filenames
-    profile_prefix: Optional[str] = None
-    # Only profile these stages and ignore others
-    profile_stages: Optional[List[str]] = None
-
-
 class ProfileReqType(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
@@ -1872,30 +1844,6 @@ class Function:
 class Tool:
     function: Function
     type: Optional[str] = "function"
-
-
-@dataclass
-class ParseFunctionCallReq(BaseReq):
-    text: str  # The text to parse.
-    tools: List[Tool] = field(
-        default_factory=list
-    )  # A list of available function tools (name, parameters, etc.).
-    tool_call_parser: Optional[str] = (
-        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
-    )
-
-
-@dataclass
-class SeparateReasoningReqInput(BaseReq):
-    text: str  # The text to parse.
-    reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
-    return_blocks: bool = False  # If True, also return segmented reasoning blocks.
-
-
-@dataclass
-class VertexGenerateReqInput(BaseReq):
-    instances: List[dict]
-    parameters: Optional[dict] = None
 
 
 class RpcReqInput(BaseReqIpc, kw_only=True):
@@ -2172,7 +2120,8 @@ def _check_all_req_types():
         is_base_req = (
             issubclass(class_type[1], BaseReq)
             or issubclass(class_type[1], BaseBatchReq)
-            or issubclass(class_type[1], msgspec.Struct)  # allow IPC objects
+            or issubclass(class_type[1], BaseReqIpc)
+            or issubclass(class_type[1], BaseBatchReqIpc)
         )
         if is_io_struct and not is_base_req:
             raise ValueError(f"{name} is not a subclass of BaseReq or BaseBatchReq.")
@@ -2194,7 +2143,7 @@ def enc_hook(obj: Any) -> Any:
     if isinstance(obj, torch.Tensor):
         # encode torch tensor as Tuple(shape, dtype, data)
         tensor_dtype = str(obj.dtype).split(".")[-1]  # e.g., "float32"
-        raw_data = obj.flatten().cpu().contiguous().view(torch.uint8).numpy().data
+        raw_data = obj.numpy().tobytes()
         return (obj.shape, tensor_dtype, raw_data)
     elif isinstance(obj, array):
         return (obj.typecode, obj.tobytes())
@@ -2243,7 +2192,6 @@ _struct_types = tuple(
     cls
     for cls in BaseReqIpc.__subclasses__()
     + BaseBatchReqIpc.__subclasses__()
-    + SpeculativeDecodingMetricsMixinReq.__subclasses__()
     + [PickleWrapperIpc]
 )
 # str primitive types should encode to bytes

@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.encode_server import (
     handle_scheduler_receive_url_request,
     launch_encoder,
 )
+from sglang.srt.managers.io_struct import async_sock_send
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import random_uuid
@@ -87,8 +88,6 @@ class SGLangEncoderServer(SGLangEncoderServicer):
     async def Encode(
         self, request: sglang_encoder_pb2.EncodeRequest, context
     ) -> sglang_encoder_pb2.EncodeResponse:
-        from sglang.srt.managers.io_struct import async_sock_send
-
         try:
             request_dict = {
                 "mm_items": list(request.mm_items),
