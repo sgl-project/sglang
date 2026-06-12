@@ -368,12 +368,7 @@ class GroupCoordinator:
         )
         from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
-        if envs.SGLANG_DCP_SYMM_ONLY.get():
-            self.is_symmetric_memory_enabled = (
-                lambda: group_name == "dcp" and is_symmetric_memory_enabled()
-            )
-        else:
-            self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
+        self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
         self.use_symmetric_memory = use_symmetric_memory
         self.is_allocation_symmetric = is_allocation_symmetric
         self.debug_check_symmetric_mempool = debug_check_symmetric_mempool
