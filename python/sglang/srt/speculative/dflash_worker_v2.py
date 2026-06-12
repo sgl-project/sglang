@@ -238,7 +238,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda()
+        self._use_fused_kv_materialize = is_cuda() or is_hip()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
