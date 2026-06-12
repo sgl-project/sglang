@@ -85,8 +85,7 @@ class NGRAMWorker:
         self.ngram_corpus.reset()
 
     def iter_draft_runners(self) -> list[tuple[str, "ModelRunner"]]:
-        # NGRAM has no draft weights of its own — its `model_runner` is the
-        # target's — so there is no independent draft runner to check.
+        # NGRAM shares the target's model_runner — no independent draft.
         return []
 
     def update_weights_from_tensor(self, recv_req):

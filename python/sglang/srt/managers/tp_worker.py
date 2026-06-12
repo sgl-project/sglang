@@ -414,9 +414,7 @@ class TpModelWorker(BaseTpWorker):
         return self._model_runner
 
     def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        # Lists THIS worker's own independent draft ModelRunner(s) as (role, runner)
-        # for weight-check fan-out. Target (is_draft_worker=False) owns no draft → [];
-        # multi-layer EAGLE has one runner per step, single-layer one ("draft").
+        # The target worker shares this class (is_draft_worker=False) and returns [].
         if not self.is_draft_worker:
             return []
         if self.model_runner_list:

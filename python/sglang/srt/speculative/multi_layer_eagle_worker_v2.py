@@ -658,8 +658,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         pass
 
     def iter_draft_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        # Multi-layer EAGLE keeps one draft runner per step on the inner draft
-        # worker; weight-check fans out over every step.
         return [
             (f"draft_step_{i}", r)
             for i, r in enumerate(self.draft_worker.draft_runner_list)
