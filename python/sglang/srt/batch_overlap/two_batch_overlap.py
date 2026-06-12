@@ -266,7 +266,7 @@ def split_spec_info(
 
 def compute_split_token_index(
     split_seq_index: int,
-    forward_mode: "ForwardMode",
+    forward_mode: ForwardMode,
     extend_seq_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> int:
@@ -380,6 +380,14 @@ class TboDPAttentionPreparer:
         enable_two_batch_overlap = is_tbo_enabled()
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
+
+        # Short-circuit when TBO is off: prepare_mlp_sync_batch_raw invokes
+        # this preparer unconditionally for the forward_mode all-gather, but
+        # compute_split_seq_index is TBO-only and undefined for some modes
+        # (e.g. MIXED from enable_mixed_chunk).
+        if not enable_two_batch_overlap:
+            self.local_tbo_split_seq_index = None
+            return False, self._compute_local_forward_mode(local_batch)
 
         if local_batch is not None:
             token_num_per_seq = get_token_num_per_seq(
@@ -672,6 +680,11 @@ class TboForwardBatchPreparer:
             ):
                 output_dict[key] = None
                 continue
+            elif key == "rids" and len(old_value) != num_seqs:
+                output_dict[key] = old_value[
+                    start_seq_index : min(end_seq_index, len(old_value))
+                ]
+                continue
             assert (
                 len(old_value) == num_seqs
             ), f"{key=} {old_value=} {num_seqs=} {batch=}"
@@ -692,6 +705,7 @@ class TboForwardBatchPreparer:
             "all_extend_in_batch",
             "return_logprob",
             "can_run_dp_cuda_graph",
+            "can_run_dp_breakable_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
@@ -701,6 +715,7 @@ class TboForwardBatchPreparer:
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
+            "reuse_mtp_topk_indices",  # forward-level flag, inherited by both child batches
         ]:
             output_dict[key] = getattr(batch, key)
 
@@ -761,6 +776,12 @@ class TboForwardBatchPreparer:
                 token_ids_logprobs=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
+                # TBO children start unplanned — planned by the TBO-aware init
+                # flow; a stale parent "ready" would wrongly skip that.
+                forward_metadata_ready=False,
+                forward_metadata_planned_bs=None,
+                forward_metadata_planned_num_tokens=None,
+                forward_metadata_replan_equivalent=False,
             )
         )
 

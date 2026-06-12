@@ -8,11 +8,12 @@ slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -50,8 +51,25 @@ def _make_worker(num_steps: int, num_draft_tokens: int):
     worker.device = DEVICE
     worker.speculative_num_steps = num_steps
     worker.speculative_num_draft_tokens = num_draft_tokens
-    worker.server_args = SimpleNamespace(cuda_graph_max_bs=8, max_running_requests=8)
+    worker.server_args = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(max_bs=8)),
+        max_running_requests=8,
+    )
     return worker
+
+
+def _make_backend_factory(decode_backend, draft_extend_backend):
+    class FakeDraftBackendFactory:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_decode_backend(self):
+            return decode_backend
+
+        def create_draft_extend_backend(self):
+            return draft_extend_backend
+
+    return FakeDraftBackendFactory
 
 
 class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
@@ -88,6 +106,69 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+
+class TestEagleWorkerV2BackendFallback(CustomTestCase):
+    def test_preserves_initialized_backend_when_draft_extend_backend_is_unset(self):
+        worker = object.__new__(EagleDraftWorker)
+        existing_backend = object()
+        decode_backend = object()
+        worker.server_args = SimpleNamespace()
+        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.topk = 1
+        worker.speculative_num_steps = 2
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
+            _make_backend_factory(decode_backend, None),
+        ):
+            worker.init_attention_backend()
+
+        self.assertIs(worker.draft_attn_backend, decode_backend)
+        self.assertIsNone(worker.draft_extend_attn_backend)
+        self.assertIs(worker.draft_runner.draft_attn_backend, decode_backend)
+        self.assertIs(worker.draft_runner.attn_backend, existing_backend)
+
+    def test_uses_draft_extend_backend_when_available(self):
+        worker = object.__new__(EagleDraftWorker)
+        existing_backend = object()
+        decode_backend = object()
+        draft_extend_backend = object()
+        worker.server_args = SimpleNamespace()
+        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.topk = 1
+        worker.speculative_num_steps = 2
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
+            _make_backend_factory(decode_backend, draft_extend_backend),
+        ):
+            worker.init_attention_backend()
+
+        self.assertIs(worker.draft_attn_backend, decode_backend)
+        self.assertIs(worker.draft_extend_attn_backend, draft_extend_backend)
+        self.assertIs(worker.draft_runner.draft_attn_backend, decode_backend)
+        self.assertIs(worker.draft_runner.attn_backend, draft_extend_backend)
+
+    def test_spec_v2_attn_backends_include_draft_extend_fallback(self):
+        target_backend = object()
+        decode_backend = object()
+        fallback_backend = object()
+
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=target_backend)
+        )
+        worker._draft_worker = SimpleNamespace(
+            draft_attn_backend=decode_backend,
+            draft_extend_attn_backend=None,
+            draft_runner=SimpleNamespace(attn_backend=fallback_backend),
+        )
+
+        self.assertEqual(
+            worker.spec_v2_attn_backends,
+            (target_backend, decode_backend, fallback_backend),
+        )
 
 
 if __name__ == "__main__":

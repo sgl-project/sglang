@@ -34,6 +34,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 from sglang.srt.distributed import (
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -207,7 +209,7 @@ class StorageOperation:
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
 
-    def __lt__(self, other: "StorageOperation"):
+    def __lt__(self, other: StorageOperation):
         return self.id < other.id
 
 
@@ -254,19 +256,19 @@ class HiCacheController:
         load_cache_event: threading.Event,
         attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
         attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
-        pp_rank: int = 0,
-        pp_size: int = 1,
         enable_storage_metrics: bool = False,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
+        self.pp_group = pp_group
         self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -282,8 +284,6 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
@@ -624,8 +624,19 @@ class HiCacheController:
             self.tp_size = get_tensor_model_parallel_world_size()
             self.dp_rank = 0
 
+        self.pp_rank = get_pipeline_model_parallel_rank()
+        self.pp_size = get_pipeline_model_parallel_world_size()
+
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
-        is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
+        # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
+        # data. storage only needs rank 0 to write it back.
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        is_mla_model = isinstance(self.mem_pool_device, MLATokenToKVPool)
+        is_compressed_mla_model = isinstance(
+            self.mem_pool_device, DeepSeekV4TokenToKVPool
+        )
+        is_rank_replicated = is_mla_model or is_compressed_mla_model
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
         should_split_heads = False
@@ -635,7 +646,7 @@ class HiCacheController:
                 tp_lcm_size % self.tp_size == 0
             ), "tp_lcm_size must be divisible by tp_size."
             should_split_heads = (
-                not is_mla_backend
+                not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
                 and tp_lcm_size > self.tp_size
             )
@@ -649,7 +660,8 @@ class HiCacheController:
             pp_size=self.pp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
-            is_mla_model=is_mla_backend,
+            # TODO(hzh): Rename is_mla_model to is_rank_replicated.
+            is_mla_model=is_rank_replicated,
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,

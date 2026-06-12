@@ -17,12 +17,14 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.hisparse_memory_pool import (
+from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -34,7 +36,8 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -61,12 +64,17 @@ _is_hip = is_hip()
 
 class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
-        post_model_load_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
+        # Use the snapshot taken at the end of this runner's weight-load phase,
+        # not the current free memory: draft-model weights loaded after that
+        # point are charged to the non-static slack, not the static budget.
+        post_model_load_memory = getattr(self, "post_model_load_memory", None)
+        if post_model_load_memory is None:
+            post_model_load_memory = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=get_world_group().world_size > 1,
+                cpu_group=get_world_group().cpu_group,
+            )
 
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
@@ -292,11 +300,8 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
-            # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
             max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
-            extra_max_context_len = 4
-            if max_spec_draft_tokens is not None:
-                extra_max_context_len += max_spec_draft_tokens
+            extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (
@@ -381,9 +386,6 @@ class ModelRunnerKVCacheMixin:
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
 
-        # Out-of-tree platform plugin system — used by elif below
-        from sglang.srt.platforms import current_platform
-
         self._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform
         )
@@ -411,6 +413,7 @@ class ModelRunnerKVCacheMixin:
                 c128_state_pool_size=self.c128_state_pool_size,
                 page_size=self.page_size,
                 swa_page_size=swa_page_size,
+                sliding_window=self.model_config.window_size,
                 dtype=self.kv_cache_dtype,
                 state_dtype=self.state_dtype,
                 qk_nope_head_dim=self.model_config.qk_nope_head_dim,
@@ -508,9 +511,6 @@ class ModelRunnerKVCacheMixin:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     token_to_kv_pool_class=NPUMHATokenToKVPool,
-                    enable_kv_cache_copy=(
-                        self.server_args.speculative_algorithm is not None
-                    ),
                     **kwargs,
                 )
             elif self.use_mla_backend:
@@ -667,6 +667,9 @@ class ModelRunnerKVCacheMixin:
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     **extra_args,

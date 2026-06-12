@@ -396,7 +396,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         scheduler.server_args = SimpleNamespace(
             enable_two_batch_overlap=False,
-            disable_piecewise_cuda_graph=True,
+            cuda_graph_config=None,
         )
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.req_to_token_pool = ReqToTokenPool(
@@ -1125,6 +1125,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         # (deferred input materialization) before launching the forward.
         # Without resolve_forward_inputs in _launch_fresh, input_ids stays
         # None and async_forward_batch_generation_mlx dereferences a None.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
         class _StopLoop(Exception):
             pass
 
@@ -1151,7 +1153,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             prefill_input_ids_cpu=torch.tensor([1, 2, 3], dtype=torch.int64),
             input_ids=None,
             mix_running_indices=None,
-            is_spec_v2=False,
+            enable_overlap=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
         )
         scheduler.get_next_batch_to_run = lambda: batch

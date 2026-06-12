@@ -13,7 +13,8 @@ export const MiniMaxM27Deployment = () => {
         { id: 'h100',   label: 'H100',   default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon',  label: 'XEON',  default: false }
       ]
     },
     gpuCount: {
@@ -23,11 +24,30 @@ export const MiniMaxM27Deployment = () => {
         const hw = values.hardware;
         const isAMD = hw === 'mi300x' || hw === 'mi325x' || hw === 'mi355x';
         const isGB300 = hw === 'gb300';
+        const isXeon = hw === 'xeon';
+        if (isXeon) {
+          return [
+            { id: 'tp6', label: 'TP=6', default: true, disabled: false }
+          ];
+        }
         const canUse2GPU = isAMD || isGB300;
         return [
           { id: '2gpu', label: '2', default: canUse2GPU,  disabled: !canUse2GPU },
           { id: '4gpu', label: '4', default: !canUse2GPU, disabled: false },
           { id: '8gpu', label: '8', default: false,       disabled: isGB300 }
+        ];
+      }
+    },
+    precision: {
+      name: 'precision',
+      title: 'Precision',
+      getDynamicItems: (values) => {
+        const hw = values.hardware;
+        const isBlackwell = hw === 'b200' || hw === 'gb300';
+        return [
+          { id: 'fp8', label: 'FP8', default: true,  disabled: false },
+          { id: 'fp4', label: 'FP4', default: false, disabled: !isBlackwell,
+            disabledReason: 'NVFP4 requires Blackwell (B200/GB300)' }
         ];
       }
     },
@@ -108,22 +128,40 @@ export const MiniMaxM27Deployment = () => {
 
   // Generate command mirrors sgl-cookbook src/components/autoregressive/MiniMaxM27ConfigGenerator/index.js
   const generateCommand = () => {
-    const { hardware, gpuCount, thinking, toolcall } = values;
+    const { hardware, gpuCount, precision, thinking, toolcall } = values;
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
     const isGB300 = hardware === 'gb300';
+    const isXeon = hardware === 'xeon';
     const canUse2GPU = isAMD || isGB300;
 
     if (gpuCount === '2gpu' && !canUse2GPU) {
       return '# Please select compatible hardware\n# 2-GPU requires AMD MI300X/MI325X/MI355X or GB300';
     }
 
-    const modelName = 'MiniMaxAI/MiniMax-M2.7';
+    const isBlackwell = hardware === 'b200' || hardware === 'gb300';
+    const isFp4 = precision === 'fp4';
 
-    let cmd = 'sglang serve \\\n';
+    if (isFp4 && !isBlackwell) {
+      return '# NVFP4 requires Blackwell hardware (B200 or GB300)';
+    }
+
+    const modelName = isFp4 ? 'nvidia/MiniMax-M2.7-NVFP4' : 'MiniMaxAI/MiniMax-M2.7';
+
+    const useAllreduceFusion = hardware === 'h200' || hardware === 'b200' || hardware === 'gb300';
+
+    let cmd = '';
+    if (useAllreduceFusion) {
+      cmd += 'SGLANG_USE_FUSED_PARALLEL_QKNORM=1 \\\n';
+    }
+    cmd += 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
 
-    if (gpuCount === '8gpu') {
+    if (isXeon) {
+      cmd += ' \\\n  --device cpu';
+      cmd += ' \\\n  --disable-overlap-schedule';
+      cmd += ' \\\n  --tp 6';
+    } else if (gpuCount === '8gpu') {
       cmd += ' \\\n  --tp 8';
       cmd += ' \\\n  --ep 8';
     } else if (gpuCount === '4gpu') {
@@ -138,11 +176,25 @@ export const MiniMaxM27Deployment = () => {
     if (thinking === 'enabled') cmd += ' \\\n  --reasoning-parser minimax-append-think';
 
     cmd += ' \\\n  --trust-remote-code';
-    cmd += ' \\\n  --mem-fraction-static 0.85';
+    if (!isXeon) {
+      cmd += ' \\\n  --mem-fraction-static 0.85';
+    }
 
-    if (isAMD) {
+    if (!isXeon && isAMD) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
       cmd += ' \\\n  --attention-backend triton';
+    }
+
+    if (isBlackwell) {
+      cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm_routed';
+      if (!isFp4) {
+        cmd += ' \\\n  --fp8-gemm-backend flashinfer_trtllm';
+        cmd += ' \\\n  --dtype bfloat16';
+      }
+    }
+
+    if (useAllreduceFusion) {
+      cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
     }
 
     return cmd;
