@@ -1,0 +1,58 @@
+name: Nightly Test (MLU)
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # 2:00 a.m. Beijing Time every day
+  pull_request:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/nightly-test-mlu.yml"
+      - "scripts/ci/mlu/**"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+      trigger_type:
+        description: "Task type sent to the Cambricon Runner"
+        required: false
+        type: string
+        default: "nightly"
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+      trigger_type:
+        description: "Task type sent to the Cambricon Runner"
+        required: false
+        type: string
+        default: "nightly"
+
+concurrency:
+  group: nightly-test-mlu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+jobs:
+  nightly-test-mlu:
+    runs-on: [cambricon]
+    timeout-minutes: 480
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          submodules: true
+
+      - name: Submit nightly MLU CI task to Cambricon Runner
+        env:
+          SGLANG_MLU_CI_REPO_NAME: sglang
+          SGLANG_MLU_CI_TRIGGER_TYPE: ${{ inputs.trigger_type || 'nightly' }}
+          SGLANG_MLU_CI_BRIDGE_URL: http://127.0.0.1:14547
+          SGLANG_MLU_CI_TIMEOUT_SECONDS: "28800"
+        run: |
+          bash scripts/ci/mlu/invoke_mlu_ci.sh

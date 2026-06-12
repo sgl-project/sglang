@@ -22,6 +22,7 @@ HW_MAPPING = {
     "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
+    "mlu": HWBackend.MLU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -86,6 +87,9 @@ PER_COMMIT_SUITES = {
         "stage-a-test-1-gpu-xpu",
         "stage-b-test-1-gpu-xpu",
     ],
+    HWBackend.MLU: [
+        "pr-test-mlu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -142,6 +146,9 @@ NIGHTLY_SUITES = {
         "full-16-npu-a3",
     ],
     HWBackend.XPU: [],
+    HWBackend.MLU: [
+        "nightly-test-mlu",
+    ],
 }
 
 
@@ -161,6 +168,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.CPU,
     HWBackend.MUSA,
     HWBackend.XPU,
+    HWBackend.MLU,
 }
 
 

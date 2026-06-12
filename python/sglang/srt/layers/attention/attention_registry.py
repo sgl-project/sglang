@@ -6,6 +6,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import get_device_capability, is_musa
 
 _is_musa = is_musa()
@@ -104,6 +105,27 @@ def create_ascend_backend(runner):
     )
 
     return AscendAttnBackend(runner)
+
+
+@register_attention_backend("mlu")
+def create_mlu_backend(runner):
+    if not current_platform.is_mlu():
+        raise RuntimeError(
+            "MLU attention backend can only be used when the active platform is MLU."
+        )
+    if runner.use_mla_backend:
+        raise ValueError(
+            "MLU attention backend currently supports MHA/GQA models only; "
+            "MLA models are not supported."
+        )
+    try:
+        from sglang.srt.hardware_backend.mlu.attention.mlu_backend import MLUAttnBackend
+    except ImportError as err:
+        raise ImportError(
+            "MLU attention backend requires torch_mlu_ops and MLU runtime dependencies."
+        ) from err
+
+    return MLUAttnBackend(runner)
 
 
 @register_attention_backend("dsa")
