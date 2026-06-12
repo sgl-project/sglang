@@ -996,12 +996,11 @@ class _Grafter:
         return _evaluate_filter(expr, tags)
 
     def _maybe_inject_from_file(self, *, value: Any, tags: dict) -> None:
-        """File-inject mode: scan grafter_file_inject_dir for a dumper-saved .pt file
-        whose filename contains the dump name, load it, apply transform, and copy_ into value.
+        """File-inject mode: load a dumper-saved .pt file matching the dump name,
+        apply transform, and copy_ into value.
 
-        Dumper saves files as: step=N___rank=R___dump_index=I___name=<name>___....pt
-        (_format_tags uses '___' triple-underscore as separator)
-        We match by looking for '___name=<name>___' in the filename or ending with '___name=<name>.pt'.
+        Uses dump_loader's parse_meta_from_filename for robust filename parsing
+        and ValueWithMeta.load for proper dict unwrapping and error handling.
         """
         if not isinstance(value, torch.Tensor):
             return
@@ -1011,6 +1010,12 @@ class _Grafter:
             return
 
         if name not in self._file_inject_cache:
+            from sglang.srt.debug_utils.dump_loader import (
+                LOAD_FAILED,
+                ValueWithMeta,
+                parse_meta_from_filename,
+            )
+
             inject_dir = cfg.grafter_file_inject_dir
             # Cache directory listing once to avoid repeated os.listdir calls
             if self._file_inject_filenames is None:
@@ -1019,12 +1024,11 @@ class _Grafter:
                 except OSError:
                     self._file_inject_filenames = []
 
-            # Match dumper filename pattern: contains ___name=<name>___ or ends with ___name=<name>.pt
-            name_tag = f"___name={name}___"
-            name_tag_end = f"___name={name}.pt"
+            # Use parse_meta_from_filename for robust name matching
             matched = None
             for fname in self._file_inject_filenames:
-                if name_tag in fname or fname.endswith(name_tag_end):
+                meta = parse_meta_from_filename(Path(fname))
+                if meta.get("name") == name:
                     matched = os.path.join(inject_dir, fname)
                     break
 
@@ -1032,11 +1036,13 @@ class _Grafter:
                 self._file_inject_cache[name] = None
                 return
 
-            raw = torch.load(matched, map_location="cpu", weights_only=True)
-            # Dumper saves files as {"value": tensor, "meta": {...}}
-            if isinstance(raw, dict) and "value" in raw:
-                raw = raw["value"]
-            self._file_inject_cache[name] = raw
+            item = ValueWithMeta.load(Path(matched))
+            if item.value is LOAD_FAILED:
+                self._file_inject_cache[name] = None
+                _log(f"[Grafter/file_inject] Failed to load '{name}' from {matched}")
+                return
+
+            self._file_inject_cache[name] = item.value
             _log(f"[Grafter/file_inject] Loaded '{name}' from {matched}")
 
         raw = self._file_inject_cache[name]
