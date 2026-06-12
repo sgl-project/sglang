@@ -68,4 +68,6 @@ def test_inplace_semantics():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
