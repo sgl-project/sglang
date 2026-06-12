@@ -971,14 +971,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if attn_output.shape[0] <= 512:
-                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
-            else:
-                num_tokens = attn_output.shape[0]
-                attn_output = (
-                    attn_output.view(num_tokens, self.num_heads, -1)
-                    * torch.sigmoid(gate)
-                ).view(num_tokens, -1)
+            attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
 
         output, _ = self.o_proj(attn_output)
         return output
