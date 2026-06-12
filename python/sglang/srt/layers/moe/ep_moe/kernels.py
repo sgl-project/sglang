@@ -495,7 +495,7 @@ def _silu_and_mul_post_quant_packed_kernel(
     """silu+mul+quant fused with the UE8M0 transpose/pack (deep_gemm's
     ``get_mn_major_tma_aligned_packed_ue8m0_tensor``).
 
-    One block == one ``(expert, token, hidden_block)`` work item. ``program_id(1)``
+    One block == one ``(expert, token, hidden_block)`` work item. ``program_id(0)``
     is a flat work index over the ``sum(masked_m)`` real (expert, token) pairs, mapped
     to ``(expert, token_in_expert)`` by an in-kernel inclusive prefix-sum over
     ``masked_m`` -- so the launch is ``topk`` blocks per real token (see wrapper),
@@ -503,8 +503,10 @@ def _silu_and_mul_post_quant_packed_kernel(
     exponents little-endian into one int32 and writes it straight into the MN-major
     ``[E, G//4, m_max]`` scale buffer, so no separate transpose/pack kernel is needed.
     """
-    work_id = tl.program_id(1)
-    hidden_dim_block_index = tl.program_id(0)
+    # work_id on axis 0 (x): num_real_tokens*topk can exceed the 65535 grid.y/z
+    # limit, so the large flat dim must ride the 2**31-1 x axis.
+    work_id = tl.program_id(0)
+    hidden_dim_block_index = tl.program_id(1)
 
     # Map flat work_id -> (expert_id, token_in_expert) via prefix sum over masked_m.
     e_off = tl.arange(0, E_PADDED)
@@ -592,9 +594,10 @@ def silu_and_mul_masked_post_quant_packed_fwd(
         down GEMM consumes -- byte-identical to the previous
         ``get_mn_major_tma_aligned_packed_ue8m0_tensor(fp32_scale)`` output.
 
-    The grid is ``(G//4, num_real_tokens * topk)`` -- ``topk`` work-blocks per real
+    The grid is ``(num_real_tokens * topk, G//4)`` -- ``topk`` work-blocks per real
     token, mapped to (expert, token) in-kernel -- instead of the
-    ``(G//4, BLOCK_NUM_PER_EXPERT, num_experts)`` grid of the fp32 path.
+    ``(G//4, BLOCK_NUM_PER_EXPERT, num_experts)`` grid of the fp32 path. The flat
+    work dim is axis 0 (x) because it can exceed the 65535 grid.y/z limit.
     """
     assert input.is_contiguous()
     assert output.dtype == torch.float8_e4m3fn
@@ -615,7 +618,7 @@ def silu_and_mul_masked_post_quant_packed_fwd(
     finfo = torch.finfo(torch.float8_e4m3fn)
     fp8_max = finfo.max
 
-    grid = (hidden_dim_split, num_real_tokens * topk)
+    grid = (num_real_tokens * topk, hidden_dim_split)
     _silu_and_mul_post_quant_packed_kernel[grid](
         input,
         *input.stride(),
