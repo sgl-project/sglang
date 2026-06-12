@@ -987,6 +987,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Validate custom logit processor
         if isinstance(obj, GenerateReqInput):
+            self._validate_token_ids_logprob(obj)
             if (
                 obj.return_hidden_states
                 and not self.server_args.enable_return_hidden_states
@@ -1046,6 +1047,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError(
                 f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
             )
+
+    def _validate_token_ids_logprob(self, obj: GenerateReqInput) -> None:
+        token_ids_logprob = obj.token_ids_logprob
+        if not token_ids_logprob:
+            return
+        vocab_size = self.model_config.vocab_size
+        for token_id in self._iter_token_ids_logprob(token_ids_logprob):
+            if token_id < 0 or token_id >= vocab_size:
+                raise ValueError(
+                    f"token_ids_logprob contains out-of-vocabulary token id "
+                    f"{token_id}; valid range is [0, {vocab_size})."
+                )
+
+    @staticmethod
+    def _iter_token_ids_logprob(token_ids_logprob):
+        if isinstance(token_ids_logprob[0], list):
+            for token_ids in token_ids_logprob:
+                yield from token_ids
+        else:
+            yield from token_ids_logprob
 
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int

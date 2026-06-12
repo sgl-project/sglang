@@ -1,6 +1,7 @@
 import unittest
 
 import openai
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -103,6 +104,22 @@ class TestRequestLengthValidation(CustomTestCase):
             "max_completion_tokens is too large",
             str(cm.exception),
         )
+
+    def test_token_ids_logprob_out_of_vocabulary(self):
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        for token_ids_logprob in ([-1], [2_000_000_000]):
+            response = requests.post(
+                f"{self.base_url}/generate",
+                headers=headers,
+                json={
+                    "text": "hi",
+                    "sampling_params": {"max_new_tokens": 1},
+                    "return_logprob": True,
+                    "token_ids_logprob": token_ids_logprob,
+                },
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("out-of-vocabulary", response.text)
 
 
 if __name__ == "__main__":
