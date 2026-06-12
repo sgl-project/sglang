@@ -1522,6 +1522,98 @@ class UnifiedRadixCacheSuite:
         self.assertLess(b_pos, a_pos, "A was below B in pre, must stay below")
         tree.sanity_check()
 
+    def test_swa_eager_eviction_on_unfinished_req(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest(
+                "requires SWA without Mamba (mamba alters effective_cache_len)"
+            )
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        pre_len = 20
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, pre_len)
+        req.origin_input_ids = tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        kv_indices = self._alloc(allocator, pre_len)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
+        req.kv_committed_len = pre_len
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.swa_evicted_seqlen = 0
+
+        swa_avail_before = allocator.swa_attn_allocator.available_size()
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            tree.cache_unfinished_req(req)
+
+        cushion = self.cfg.sliding_window_size + self.cfg.page_size
+        expected_evicted = (pre_len - 1) - cushion
+        self.assertEqual(
+            req.swa_evicted_seqlen,
+            expected_evicted,
+            f"swa_evicted_seqlen should advance to (pre_len-1) - cushion = "
+            f"{expected_evicted}, got {req.swa_evicted_seqlen}",
+        )
+
+        swa_avail_after = allocator.swa_attn_allocator.available_size()
+        self.assertGreaterEqual(
+            swa_avail_after - swa_avail_before,
+            expected_evicted,
+            f"SWA pool should have freed at least {expected_evicted} slots; "
+            f"before={swa_avail_before}, after={swa_avail_after}",
+        )
+
+        tree.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        tree.sanity_check()
+
+    def test_swa_eager_eviction_noop_when_within_window(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        cushion = self.cfg.sliding_window_size + self.cfg.page_size  # = 5
+        pre_len = cushion  # exactly at the boundary, nothing slid out
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, pre_len)
+        req.origin_input_ids = tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        kv_indices = self._alloc(allocator, pre_len)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
+        req.kv_committed_len = pre_len
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.swa_evicted_seqlen = 0
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            tree.cache_unfinished_req(req)
+
+        self.assertEqual(
+            req.swa_evicted_seqlen,
+            0,
+            "Nothing should be evicted when prefill fits inside the cushion",
+        )
+
+        tree.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        tree.sanity_check()
+
     def test_swa_sanity_check_passes_after_deep_match(self):
         if not self._swa_pinning_cfg_supported():
             self.skipTest("requires SWA-only config with node size >= cushion")
