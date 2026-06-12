@@ -294,7 +294,7 @@ export const Qwen3Deployment = () => {
 
     // Add tool call parser
     if (toolcall === 'enabled') {
-      cmd += ' \\\n  --tool-call-parser qwen25';
+      cmd += ' \\\n  --tool-call-parser qwen';
     }
 
     return cmd;
