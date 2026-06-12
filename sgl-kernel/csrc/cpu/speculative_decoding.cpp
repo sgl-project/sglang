@@ -27,10 +27,10 @@ void verify_tree_greedy_cpu(
       int64_t off = bx * num_draft_tokens;
       int64_t ai_off = bx * num_spec_step;
 
-      int64_t last_accepted = ri_ptr[off];  // retrive_index[bx, 0]
-      accept_idx_ptr[ai_off] = static_cast<int32_t>(last_accepted);
+      int64_t last_accept_index = ri_ptr[off];  // retrive_index[bx, 0]
+      accept_idx_ptr[ai_off] = static_cast<int32_t>(last_accept_index);
 
-      int32_t num_accepted = 0;
+      int32_t num_correct_drafts = 0;
       int64_t cur = 0;
 
       for (int64_t j = 1; j < num_spec_step; ++j) {
@@ -38,20 +38,20 @@ void verify_tree_greedy_cpu(
         while (cur != -1) {
           int64_t draft_idx = ri_ptr[off + cur];
           int64_t draft_tok = cand_ptr[off + cur];
-          int64_t target_tok = tp_ptr[last_accepted];
+          int64_t target_tok = tp_ptr[last_accept_index];
           if (draft_tok == target_tok) {
-            predicts_ptr[last_accepted] = static_cast<int32_t>(target_tok);
-            ++num_accepted;
-            accept_idx_ptr[ai_off + num_accepted] = static_cast<int32_t>(draft_idx);
-            last_accepted = draft_idx;
+            predicts_ptr[last_accept_index] = static_cast<int32_t>(target_tok);
+            ++num_correct_drafts;
+            accept_idx_ptr[ai_off + num_correct_drafts] = static_cast<int32_t>(draft_idx);
+            last_accept_index = draft_idx;
             break;
           }
           cur = rns_ptr[off + cur];  // try sibling
         }
         if (cur == -1) break;
       }
-      accept_num_ptr[bx] = num_accepted;
-      predicts_ptr[last_accepted] = static_cast<int32_t>(tp_ptr[last_accepted]);
+      accept_num_ptr[bx] = num_correct_drafts;
+      predicts_ptr[last_accept_index] = static_cast<int32_t>(tp_ptr[last_accept_index]);
     }
   });
 }

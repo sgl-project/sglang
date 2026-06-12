@@ -36,18 +36,12 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
 )
-from sglang.srt.utils.common import (
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_musa,
-    is_npu,
-)
 from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
     sanitize_nan_logits,
 )
+from sglang.srt.utils.common import is_cpu, is_cuda, is_hip, is_musa, is_npu
 
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()

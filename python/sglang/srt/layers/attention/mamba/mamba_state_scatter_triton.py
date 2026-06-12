@@ -220,9 +220,9 @@ def fused_mamba_state_scatter_with_mask(
         valid_mask = step_indices_raw >= 0
         if valid_mask.any():
             valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-            dst_idx = dst_indices_raw[valid_indices]
-            step_idx = step_indices_raw[valid_indices]
-            dst[:, dst_idx] = src[:, valid_indices, step_idx]
+            dst_indices = dst_indices_raw[valid_indices]
+            step_indices = step_indices_raw[valid_indices]
+            dst[:, dst_indices] = src[:, valid_indices, step_indices]
         return
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")

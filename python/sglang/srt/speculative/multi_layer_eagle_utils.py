@@ -20,15 +20,12 @@ _is_cpu = is_cpu()
 
 if _is_cpu:
     from sgl_kernel import rotate_input_ids_cpu
-else:
-    from sglang.srt.speculative.triton_ops.multi_layer_eagle import (
-        assign_hidden_states_pool_triton,
-        rotate_input_ids_triton,
-    )
 
 from sglang.srt.speculative.triton_ops.multi_layer_eagle import (
     assign_hidden_states_pool_torch,
+    assign_hidden_states_pool_triton,
     assign_new_state_triton,
+    rotate_input_ids_triton,
 )
 
 

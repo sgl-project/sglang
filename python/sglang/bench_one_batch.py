@@ -964,21 +964,23 @@ def latency_test_run_once(
                 )
                 profiler = None
 
-            new_tokens = 0
+            num_new_tokens = 0
             for i in range(batch_size):
                 if tokens_generated[i] >= output_len:
                     continue
-                accepted = min(accept_lens[i], output_len - tokens_generated[i])
-                tokens_generated[i] += accepted
-                new_tokens += accepted
+                num_accept_tokens = min(
+                    accept_lens[i], output_len - tokens_generated[i]
+                )
+                tokens_generated[i] += num_accept_tokens
+                num_new_tokens += num_accept_tokens
                 decode_steps_per_req[i] += 1
             tot_latency += latency
             decode_latencies.append(latency)
             if step < 5 or (log_decode_step > 0 and step % log_decode_step == 0):
                 rank_print(
-                    f"Decode(SD) {step}. new tokens: {new_tokens}, "
+                    f"Decode(SD) {step}. new tokens: {num_new_tokens}, "
                     f"latency: {latency:6.5f} s, "
-                    f"throughput: {new_tokens / latency:9.2f} token/s"
+                    f"throughput: {num_new_tokens / latency:9.2f} token/s"
                 )
             step += 1
 

@@ -14,17 +14,10 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     create_extend_after_decode_spec_info,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_musa, next_power_of_2
-from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils import is_cpu, next_power_of_2
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 _is_cpu = is_cpu()
-
-if is_cuda() or is_musa():
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-        tree_speculative_sampling_target_only,
-    )
 
 logger = logging.getLogger(__name__)
 

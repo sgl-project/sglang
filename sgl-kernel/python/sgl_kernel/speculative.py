@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 
@@ -285,7 +287,7 @@ def rotate_input_ids_cpu(
     extend_start_loc: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     topk_index: torch.Tensor,
-    select_index=None,
+    select_index: Optional[torch.Tensor] = None,
 ) -> None:
     torch.ops.sgl_kernel.rotate_input_ids_cpu(
         input_ids,
@@ -294,4 +296,3 @@ def rotate_input_ids_cpu(
         topk_index,
         select_index,
     )
-
