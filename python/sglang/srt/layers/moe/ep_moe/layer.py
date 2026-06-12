@@ -22,7 +22,14 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsFusedMoEMethod,
+)
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    NPUCompressedTensorsW4A16Int4DynamicMoE,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -156,6 +163,9 @@ class DeepEPMoE(FusedMoE):
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"
+            server_args = get_global_server_args()
+            if server_args.piecewise_cuda_graph_compiler == "inductor":
+                return self.forward_impl(hidden_states, topk_output)
             return moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
