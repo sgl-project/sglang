@@ -95,6 +95,35 @@ class TestFusedMoeSmemClamp(CustomTestCase):
             clamped = clamp_config_to_shared_mem(FP8_PREFILL_DEFAULT, "fp8_w8a8")
         self.assertLessEqual(_estimate_fused_moe_smem_bytes(clamped, "fp8_w8a8"), 24576)
 
+    def test_mixed_precision_w8a16_byte_sizes(self):
+        # int8_w8a16: 2-byte activations (A-tile), 1-byte weights (B-tile).
+        config = {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 32,
+            "num_warps": 8,
+            "num_stages": 4,
+        }
+        # (4-1) * 128 * (128*2 + 256*1) = 3 * 128 * 512 = 196608
+        self.assertEqual(_estimate_fused_moe_smem_bytes(config, "int8_w8a16"), 196608)
+        with patch(_LIMIT_PATH, return_value=SM12X_LIMIT):
+            clamped = clamp_config_to_shared_mem(config, "int8_w8a16")
+        self.assertLessEqual(
+            _estimate_fused_moe_smem_bytes(clamped, "int8_w8a16"), SM12X_LIMIT
+        )
+
+    def test_w4a16_half_byte_weights(self):
+        # int4_w4a16: 2-byte activations, 0.5-byte weights.
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "num_stages": 3,
+        }
+        # (3-1) * 128 * (64*2 + 128*0.5) = 2 * 128 * 192 = 49152
+        self.assertEqual(_estimate_fused_moe_smem_bytes(config, "int4_w4a16"), 49152)
+
 
 if __name__ == "__main__":
     unittest.main()

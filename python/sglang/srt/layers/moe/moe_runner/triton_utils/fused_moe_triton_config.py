@@ -145,15 +145,33 @@ def get_moe_configs(
 
 @functools.lru_cache(maxsize=1)
 def _get_max_shared_mem_bytes() -> Optional[int]:
-    """Per-block shared memory limit of the current device, or None if
-    it cannot be determined (non-CUDA platforms, mocked drivers, ...)."""
+    """Per-block (opt-in) shared memory limit of the current device, or None
+    if it cannot be determined (non-CUDA platforms, mocked drivers, ...)."""
     try:
         index = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(index)
+        # Stable public API first (cudaDeviceProp.sharedMemPerBlockOptin).
+        opt_in_bytes = getattr(props, "shared_memory_per_block_optin", None)
+        if opt_in_bytes:
+            return opt_in_bytes
+        # Fallback for torch builds without that field: Triton's internal
+        # driver API (subject to change across Triton versions, hence the
+        # broad except below).
         return triton.runtime.driver.active.utils.get_device_properties(index)[
             "max_shared_mem"
         ]
     except Exception:
         return None
+
+
+# Per-tile element sizes (activation A-tile, weight B-tile) by config dtype
+# string. Mixed-precision dtypes have differently-sized operands.
+_SMEM_ELEM_BYTES: Dict[Optional[str], Tuple[float, float]] = {
+    "fp8_w8a8": (1, 1),
+    "int8_w8a8": (1, 1),
+    "int8_w8a16": (2, 1),
+    "int4_w4a16": (2, 0.5),
+}
 
 
 def _estimate_fused_moe_smem_bytes(config: Dict[str, int], dtype: Optional[str]) -> int:
@@ -162,13 +180,12 @@ def _estimate_fused_moe_smem_bytes(config: Dict[str, int], dtype: Optional[str])
     (BLOCK_K x BLOCK_N) B-tiles. Matches the requirement Triton reports in
     OutOfResources (e.g. 147456 = (4-1) * (128 + 256) * 128 for fp8).
     """
-    elem_bytes = 1 if dtype in ("fp8_w8a8", "int8_w8a8", "int8_w8a16") else 2
+    a_bytes, b_bytes = _SMEM_ELEM_BYTES.get(dtype, (2, 2))
     num_stages = config.get("num_stages", 2)
-    return (
+    return int(
         max(num_stages - 1, 1)
         * config["BLOCK_SIZE_K"]
-        * (config["BLOCK_SIZE_M"] + config["BLOCK_SIZE_N"])
-        * elem_bytes
+        * (config["BLOCK_SIZE_M"] * a_bytes + config["BLOCK_SIZE_N"] * b_bytes)
     )
 
 
