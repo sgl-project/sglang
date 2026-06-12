@@ -516,6 +516,102 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
 
+    def _build_hybrid_swa_resumed_req(
+        self,
+        *,
+        page_size,
+        rem_swa,
+        rem_chunk=2048,
+        extend_input_len=500,
+        is_hybrid_swa=True,
+        full_available=100_000,
+    ):
+        self.mock_token_allocator.swa_available_size.return_value = rem_swa
+        self.mock_token_allocator.full_available_size.return_value = full_available
+        self.mock_token_allocator.available_size.return_value = full_available
+        self.mock_tree_cache.sliding_window_size = 128
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=page_size,
+            rem_chunk_tokens=rem_chunk,
+        )
+        adder.is_hybrid_swa = is_hybrid_swa
+
+        req = self.create_mock_req("resumed", priority=0, max_new_tokens=128)
+        req.is_partially_extended = True
+        req.prefix_indices = []
+        req.get_full_untruncated_fill_len.return_value = extend_input_len
+        # set_extend_range is the only writer of extend_range; the production
+        # path reads req.extend_range.length right after calling it, so the mock
+        # must actually set the attribute (a spec=Req mock has the method but
+        # not the instance attribute).
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return adder, req
+
+    def test_add_resumed_extend_req_hybrid_swa_reserves_page_for_alloc_extend(self):
+        """Hybrid-SWA resume caps the chunk at rem_swa_tokens minus one reserved page."""
+        # alloc_extend needs extend_num_tokens + page_size per request. If the
+        # scheduler hands out all of rem_swa_tokens, alloc_extend cannot get its
+        # extra page and OOMs. With the fix, extend_input_len must cap at
+        # rem_swa_tokens - page_size so the page is reserved.
+        PAGE_SIZE = 64
+        REM_SWA = 100
+        adder, req = self._build_hybrid_swa_resumed_req(
+            page_size=PAGE_SIZE, rem_swa=REM_SWA
+        )
+
+        result = adder.add_resumed_extend_req(req)
+
+        self.assertIsInstance(result, AddReqResult)
+        self.assertIn(req, adder.can_run_list)
+        req.set_extend_range.assert_called_once()
+        start, end = req.set_extend_range.call_args.args
+        new_len = end - start
+        self.assertLessEqual(new_len + PAGE_SIZE, REM_SWA)
+        self.assertEqual(new_len, REM_SWA - PAGE_SIZE)
+        # Truncated below the full prompt: chunked prefill continues.
+        self.assertLess(end, req.get_full_untruncated_fill_len())
+
+    def test_add_resumed_extend_req_hybrid_swa_defers_when_swa_below_page(self):
+        """Hybrid-SWA resume defers with NO_TOKEN when rem_swa_tokens <= page_size."""
+        # When rem_swa_tokens <= page_size there is no room to serve even the
+        # reservation, so the resumed req must be deferred instead of falling
+        # back to rem_chunk_tokens and bypassing the SWA budget.
+        PAGE_SIZE = 64
+        adder, req = self._build_hybrid_swa_resumed_req(
+            page_size=PAGE_SIZE, rem_swa=PAGE_SIZE
+        )
+
+        result = adder.add_resumed_extend_req(req)
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        req.set_extend_range.assert_not_called()
+        self.assertEqual(len(adder.can_run_list), 0)
+
+    def test_add_resumed_extend_req_non_hybrid_no_swa_reservation(self):
+        """Non-hybrid resume ignores the SWA-pool reservation and adds the full chunk."""
+        # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
+        # the fix would regress non-SWA models.
+        PAGE_SIZE = 16
+        adder, req = self._build_hybrid_swa_resumed_req(
+            page_size=PAGE_SIZE,
+            rem_swa=10,
+            rem_chunk=500,
+            extend_input_len=200,
+            is_hybrid_swa=False,
+            full_available=300,
+        )
+
+        result = adder.add_resumed_extend_req(req)
+
+        self.assertIsInstance(result, AddReqResult)
+        req.set_extend_range.assert_called_once_with(0, 200)
+        self.assertIn(req, adder.can_run_list)
+
     def test_swa_budget_for_req(self):
         cases = [
             # (extend, rem_chunk, window, page, expected, label)
