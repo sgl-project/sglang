@@ -22,7 +22,6 @@ ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=2026.6.0
 
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
-ARG DEVICE_TYPE
 
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
       echo "Using x86_64 dependencies"; \
@@ -39,6 +38,7 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 WORKDIR /workspace
 
 # Define environments
+ARG EULER_MIRROR=""
 RUN pip config set global.index-url $PIP_INDEX_URL
 RUN if [ -n "$EULER_MIRROR" ]; then \
       sed -i "s|http://repo.openeuler.org|${EULER_MIRROR}|g; s|https://repo.openeuler.org|${EULER_MIRROR}|g" /etc/yum.repos.d/openEuler.repo && \
@@ -63,14 +63,14 @@ RUN yum update -y && yum upgrade -y && yum install -y \
     pkg-config \
     ca-certificates \
     libglvnd-glx \
+    glibc-common \
+    glibc-locale-source \
     && rm -rf /var/cache/yum \
     && rm -rf /tmp/* \
-    && update-ca-trust
-
-RUN yum install -y glibc-common glibc-locale-source && \
-    rm -f /usr/lib/locale/locale-archive && \
-    localedef -i en_US -f UTF-8 en_US.UTF-8 && \
-    echo "LANG=en_US.UTF-8" > /etc/locale.conf
+    && update-ca-trust \
+    && rm -f /usr/lib/locale/locale-archive \
+    && localedef -i en_US -f UTF-8 en_US.UTF-8 \
+    && echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
