@@ -140,7 +140,7 @@ def _torch_sparse_prefill_fwd(
         )
         qf = q[start:end].float()
         P = (qf @ gathered.transpose(1, 2)) * sm_scale  # [n, h_q, topk]
-        P[invalid.unsqueeze(1).broadcast_to(P.shape)] = float("-inf")
+        P.masked_fill_(invalid.unsqueeze(1), float("-inf"))
 
         orig_lse = torch.logsumexp(P, dim=-1)  # [n, h_q]
         mx = P.max(dim=-1).values  # [n, h_q]
@@ -157,7 +157,6 @@ def _torch_sparse_prefill_fwd(
         o = s_for_o @ gathered[..., :d_v]  # [n, h_q, d_v]
 
         lonely = orig_lse == float("-inf")
-        orig_lse = orig_lse.clone()
         orig_lse[lonely] = float("+inf")
 
         out[start:end] = o.to(torch.bfloat16)
