@@ -17,6 +17,9 @@ LEGACY_DOCS_ALLOWLIST = {
     "docs/_static/css/custom_log.css",
     "docs/_static/js/deprecation_banner.js",
     "docs/conf.py",
+    # Has relative links into the source tree that the offline lychee check
+    # validates, so it must be updated when the linked source files move.
+    "docs/developer_guide/development_jit_kernel_guide.md",
 }
 
 

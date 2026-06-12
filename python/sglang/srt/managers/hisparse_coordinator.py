@@ -6,10 +6,12 @@ from typing import List, NamedTuple, Union
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.hisparse_memory_pool import (
+from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.hisparse_memory_pool import (
+    HiSparseDSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
