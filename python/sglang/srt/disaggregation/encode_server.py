@@ -8,6 +8,7 @@ import logging
 import multiprocessing as mp
 import os
 import pickle
+import threading
 import time
 import traceback
 from collections import defaultdict
@@ -16,6 +17,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
+import requests as http_requests
 import torch
 import uvicorn
 import zmq
@@ -899,8 +901,9 @@ class MMEncoder:
                 mm_feature, mm_inputs, missing_indices, modality, get_feature_fn
             )
 
-        # Step 3: Rank 0 prefetches cache-hit embeddings from global cache.
-        prefetch_status = torch.tensor([1], dtype=torch.int32)
+        # Step 3: Rank 0 prefetches cache-hit embeddings and builds fallback_mask.
+        fallback_mask = torch.zeros(num_items, dtype=torch.int32)
+        cached_slices = []
 
         if self.rank == 0:
             if hit_indices:
@@ -917,32 +920,46 @@ class MMEncoder:
                             await asyncio.sleep(0.005)
 
                     await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
+
+                    # Prefetch IO completed; check which items actually loaded.
+                    cached_slices = self.mm_global_cache.get_embeddings(hit_hashes)
+                    for i, idx in enumerate(hit_indices):
+                        if cached_slices[i] is None:
+                            fallback_mask[idx] = 1
+                    num_partial_fail = int(fallback_mask.sum().item())
+                    if num_partial_fail > 0:
+                        logger.warning(
+                            f"Req {req_id}: {num_partial_fail}/{len(hit_indices)} "
+                            f"cache-hit items failed to load (pool full), "
+                            f"falling back to ViT"
+                        )
                 except (asyncio.TimeoutError, Exception) as e:
                     logger.error(
                         f"Prefetch failed for req {req_id}: {e}. "
                         f"Falling back to ViT for {len(hit_indices)} hit items."
                     )
-                    prefetch_status[0] = 0
+                    for idx in hit_indices:
+                        fallback_mask[idx] = 1
 
-        # Step 4: Broadcast prefetch result to all ranks so they stay in sync.
+        # Step 4: Broadcast fallback_mask to all ranks so they stay in sync.
         if self.server_args.tp_size > 1:
             torch.distributed.broadcast(
-                prefetch_status,
+                fallback_mask,
                 src=0,
                 group=self.mm_global_cache.prefetch_tp_group,
             )
 
-        # Step 5: If prefetch failed, all ranks fallback to ViT for the hit mm items.
-        if prefetch_status.item() == 0 and hit_indices:
+        # Step 5: All ranks run ViT for items that need fallback recomputation.
+        fallback_indices = [i for i in range(num_items) if fallback_mask[i].item() == 1]
+        fallback_slices = None
+        if fallback_indices:
             logger.info(
-                f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
-                f"for {len(hit_indices)} mm items."
+                f"Req {req_id}: All ranks running ViT fallback "
+                f"for {len(fallback_indices)} items."
             )
             fallback_slices = self._encode_missing(
-                mm_feature, mm_inputs, hit_indices, modality, get_feature_fn
+                mm_feature, mm_inputs, fallback_indices, modality, get_feature_fn
             )
-        else:
-            fallback_slices = None
 
         # Step 6: Rank 0 assembles final embedding and prepares for sending.
         if self.rank == 0:
@@ -951,25 +968,37 @@ class MMEncoder:
             for i, idx in enumerate(missing_indices):
                 final_slices[idx] = new_slices[i]
 
-            # Fill in cache-hit embeddings (from prefetch or fallback)
-            if prefetch_status.item() == 1 and hit_indices:
-                cached_slices = self.mm_global_cache.get_embeddings(
-                    [str_mm_hashes[i] for i in hit_indices]
-                )
+            # Fill in successfully loaded cache-hit embeddings
+            if cached_slices:
                 for i, idx in enumerate(hit_indices):
-                    final_slices[idx] = cached_slices[i]
-            elif fallback_slices is not None:
-                for i, idx in enumerate(hit_indices):
+                    if cached_slices[i] is not None:
+                        final_slices[idx] = cached_slices[i]
+
+            # Fill in ViT fallback results for failed items
+            if fallback_slices is not None:
+                for i, idx in enumerate(fallback_indices):
                     final_slices[idx] = fallback_slices[i]
 
             mm_embedding = torch.cat(final_slices, dim=0)
+
+            # Release embedding cache references now that torch.cat has
+            # copied the data into a new tensor.  This allows the cache
+            # entries to be evicted under memory pressure.
+            if cached_slices:
+                loaded_hashes = [
+                    str_mm_hashes[idx]
+                    for idx in hit_indices
+                    if fallback_mask[idx].item() == 0
+                ]
+                if loaded_hashes:
+                    self.mm_global_cache.release_embeddings(loaded_hashes)
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
             all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
             all_new_slices = list(new_slices)
             if fallback_slices is not None:
-                all_new_hashes += [str_mm_hashes[i] for i in hit_indices]
+                all_new_hashes += [str_mm_hashes[i] for i in fallback_indices]
                 all_new_slices += list(fallback_slices)
 
             if all_new_hashes:
@@ -1637,7 +1666,7 @@ class MMEncoder:
                 else:
                     sock.send_multipart([serialized_data], copy=False)
             finally:
-                sock.close()
+                sock.close(linger=5000)
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
@@ -2185,7 +2214,7 @@ class EncoderScheduler:
         self.send_sockets = send_sockets
         self.max_batch_size = max(1, int(max_batch_size))
         self.request_timeout = max(1.0, float(request_timeout))
-        self.pending_queue: "asyncio.Queue[PendingRequest]" = asyncio.Queue()
+        self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
 
     def start(self) -> None:
@@ -3127,6 +3156,107 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
         traceback.print_exc()
 
 
+def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
+    """Asynchronously register this encoder with each bootstrap URL.
+
+    Spawns a daemon thread that retries each URL independently with bounded
+    backoff.  The encoder's own startup is not blocked: if some bootstrap
+    server is slow or unreachable, only the background worker waits.
+
+    Inspired by ``_ensure_prefill_info`` in disaggregation/decode.py: each
+    target keeps its own retry count and is retried at a fixed interval
+    instead of serialising sleeps in a single thread.
+    """
+
+    host = server_args.host
+    if not host or host in ("0.0.0.0", "::"):
+        host = get_local_ip_auto(server_args.host)
+    scheme = "https" if server_args.ssl_certfile else "http"
+    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
+    payload = {"url": encoder_url}
+    bootstrap_urls = list(server_args.encoder_register_urls)
+    if not bootstrap_urls:
+        return
+
+    max_retries = 30
+    retry_interval = 5.0
+    request_timeout = 5.0
+
+    def _try_register_once(bootstrap_url: str) -> bool:
+        try:
+            resp = http_requests.post(
+                f"{bootstrap_url}/register_encoder_url",
+                json=payload,
+                timeout=request_timeout,
+            )
+            if resp.status_code == 200:
+                logger.info(
+                    f"Registered encoder URL '{encoder_url}' with bootstrap "
+                    f"at {bootstrap_url}"
+                )
+                return True
+            logger.warning(
+                f"Bootstrap {bootstrap_url} returned {resp.status_code}: {resp.text}"
+            )
+        except Exception as e:
+            logger.debug(f"Register attempt to {bootstrap_url} failed: {e}")
+        return False
+
+    def _worker():
+        pending = list(bootstrap_urls)
+        retry_count = {url: 0 for url in pending}
+        while pending:
+            still_pending = []
+            for bootstrap_url in pending:
+                if _try_register_once(bootstrap_url):
+                    continue
+                retry_count[bootstrap_url] += 1
+                if retry_count[bootstrap_url] >= max_retries:
+                    logger.error(
+                        f"Giving up on bootstrap {bootstrap_url} after "
+                        f"{max_retries} attempts. Encoder discovery via this "
+                        f"bootstrap will be incomplete."
+                    )
+                    continue
+                still_pending.append(bootstrap_url)
+            pending = still_pending
+            if pending:
+                time.sleep(retry_interval)
+
+    threading.Thread(
+        target=_worker, daemon=True, name="encoder-bootstrap-register"
+    ).start()
+
+
+def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
+    host = server_args.host
+    if not host or host in ("0.0.0.0", "::"):
+        host = get_local_ip_auto(server_args.host)
+    scheme = "https" if server_args.ssl_certfile else "http"
+    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
+    payload = {"url": encoder_url}
+
+    for bootstrap_url in server_args.encoder_register_urls:
+        try:
+            resp = http_requests.delete(
+                f"{bootstrap_url}/unregister_encoder_url",
+                json=payload,
+                timeout=2.0,
+            )
+            if resp.status_code == 200:
+                logger.info(
+                    f"Unregistered encoder URL '{encoder_url}' from "
+                    f"bootstrap at {bootstrap_url}"
+                )
+            else:
+                logger.warning(
+                    f"Bootstrap {bootstrap_url} returned "
+                    f"{resp.status_code} on unregister: {resp.text}"
+                )
+        except Exception as e:
+            logger.debug(f"Unregister from {bootstrap_url} failed: {e}")
+
+
 def launch_server(server_args: ServerArgs):
     configure_logger(server_args, prefix=" encode_server")
     if server_args.dp_size > 1:
@@ -3156,6 +3286,14 @@ def launch_server(server_args: ServerArgs):
             daemon=True,
         ).start()
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
+
+    # Register this encoder's URL with prefill server(s) if configured.
+    if server_args.encoder_register_urls:
+        import atexit
+
+        _register_encoder_url_with_bootstrap(server_args)
+        atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
+
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
@@ -3227,6 +3365,13 @@ def _launch_server_dp(server_args: ServerArgs):
         result_socket,
         worker_processes,
     )
+
+    # Register this encoder's URL with prefill server(s) if configured.
+    if server_args.encoder_register_urls:
+        import atexit
+
+        _register_encoder_url_with_bootstrap(server_args)
+        atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
 
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 

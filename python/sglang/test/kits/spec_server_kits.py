@@ -249,6 +249,12 @@ class SpecLogprobKit:
     """Logprob correctness: start_len, prefill-rescore match, mixed sweep,
     spec-v2 decode-vs-prefill match, and ragged token_ids_logprob."""
 
+    # Max |decode-path - prefill-rescore| logprob gap. The two paths run
+    # different kernels / batch shapes, so the gap is accumulated rounding
+    # noise of the fixture dtype: ~0.25 observed for bf16 (up to 0.36 on
+    # some CI runners), ~8x smaller for fp16 (3 extra mantissa bits).
+    logprob_match_delta = 0.5
+
     def test_logprob_start_len(self):
         logprob_start_len = 4
         new_tokens = 4
@@ -346,7 +352,7 @@ class SpecLogprobKit:
 
             diff = np.abs(output_logprobs - output_logprobs_score)
             max_diff = np.max(diff)
-            self.assertLess(max_diff, 0.255)
+            self.assertLess(max_diff, self.logprob_match_delta)
 
     def test_logprob_mixed(self):
         args = []
@@ -442,7 +448,7 @@ class SpecLogprobKit:
                 score_vals = np.array([t[0] for t in score_logprobs])
                 max_diff = np.max(np.abs(decode_vals - score_vals))
                 print(f"[round {round_idx}] logprob max_diff={max_diff:.6f}")
-                self.assertLess(max_diff, 0.255)
+                self.assertLess(max_diff, self.logprob_match_delta)
 
                 for pos in range(len(decode_logprobs)):
                     dec_top = {t[1]: t[0] for t in decode_top_logprobs[pos]}
@@ -450,7 +456,9 @@ class SpecLogprobKit:
                     common_ids = set(dec_top.keys()) & set(scr_top.keys())
                     self.assertGreater(len(common_ids), 0)
                     for tid in common_ids:
-                        self.assertAlmostEqual(dec_top[tid], scr_top[tid], delta=0.255)
+                        self.assertAlmostEqual(
+                            dec_top[tid], scr_top[tid], delta=self.logprob_match_delta
+                        )
 
                 self.assertEqual(len(decode_tid_logprobs), len(score_tid_logprobs))
                 for pos in range(len(decode_tid_logprobs)):
@@ -458,7 +466,9 @@ class SpecLogprobKit:
                     scr_tid = {t[1]: t[0] for t in score_tid_logprobs[pos]}
                     self.assertEqual(set(dec_tid.keys()), set(scr_tid.keys()))
                     for tid in dec_tid:
-                        self.assertAlmostEqual(dec_tid[tid], scr_tid[tid], delta=0.255)
+                        self.assertAlmostEqual(
+                            dec_tid[tid], scr_tid[tid], delta=self.logprob_match_delta
+                        )
 
     def test_token_ids_logprob_ragged(self):
         """Regression: ragged token_ids_logprob lists in one batch must not crash."""

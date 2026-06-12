@@ -15,7 +15,11 @@ import triton.language as tl
 from einops import rearrange
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -190,12 +194,8 @@ def _get_sm_count(device: torch.device) -> int:
 def calc_rows_per_block(M: int, device: torch.device) -> int:
     # When piecewise cuda graph is enabled, use a constant value to avoid
     # torch.compile creating guards on the dynamic batch dimension.
-    try:
-        if not get_global_server_args().disable_piecewise_cuda_graph:
-            return MAX_ROWS_PER_BLOCK
-    except ValueError:
-        # Global server args not initialized (e.g., in unit tests)
-        pass
+    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+        return MAX_ROWS_PER_BLOCK
     sm_count = _get_sm_count(device)
     rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
     rows_per_block = min(rows_per_block, MAX_ROWS_PER_BLOCK)
