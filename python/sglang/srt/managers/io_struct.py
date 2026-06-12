@@ -1562,6 +1562,18 @@ class UpdateWeightsFromIPCReqOutput(BaseReq):
     message: str
 
 
+# Request types that must be executed on all PP ranks simultaneously,
+CROSS_PP_COLLECTIVE_REQ_TYPES: tuple[type, ...] = (
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromIPCReqInput,
+)
+
+
+def is_cross_pp_collective_req(req) -> bool:
+    return isinstance(req, CROSS_PP_COLLECTIVE_REQ_TYPES)
+
+
 @dataclass
 class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
     success: bool

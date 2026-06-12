@@ -1065,7 +1065,7 @@ class Engine(EngineScoreMixin, EngineBase):
         else:
             serialized_named_tensors = [
                 MultiprocessingSerializer.serialize(named_tensors)
-                for _ in range(self.server_args.tp_size)
+                for _ in range(self.server_args.tp_size * self.server_args.pp_size)
             ]
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=serialized_named_tensors,

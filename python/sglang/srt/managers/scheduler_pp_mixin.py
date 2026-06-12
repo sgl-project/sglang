@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.io_struct import is_cross_pp_collective_req
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -40,6 +41,7 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -98,8 +100,18 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
-                    self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
+                forwarded_early = any(
+                    is_cross_pp_collective_req(r) for r in recv_reqs or ()
+                )
+                if forwarded_early and not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+                    with torch.profiler.record_function("send_reqs_to_next_stage"):
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs,
+                            async_send=True,
+                        )
+                self.process_input_requests(recv_reqs)
+                if not forwarded_early and not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -232,9 +244,17 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.request_receiver.recv_requests()
+                forwarded_early = any(
+                    is_cross_pp_collective_req(r) for r in recv_reqs or ()
+                )
+                if forwarded_early and not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        recv_reqs, async_send=True
+                    )
                 self.process_input_requests(recv_reqs)
 
-                if not self.pp_group.is_last_rank:
+                if not forwarded_early and not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
@@ -315,9 +335,10 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
+                    if not forwarded_early:
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs, async_send=True
+                        )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
                     )
@@ -378,9 +399,17 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.request_receiver.recv_requests()
+                forwarded_early = any(
+                    is_cross_pp_collective_req(r) for r in recv_reqs or ()
+                )
+                if forwarded_early and not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        recv_reqs, async_send=True
+                    )
                 self.process_input_requests(recv_reqs)
 
-                if not self.pp_group.is_last_rank:
+                if not forwarded_early and not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
                 # reaching consensus through PP ranks
@@ -495,9 +524,10 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
+                    if not forwarded_early:
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs, async_send=True
+                        )
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
                         retract_rids, async_send=True
                     )
