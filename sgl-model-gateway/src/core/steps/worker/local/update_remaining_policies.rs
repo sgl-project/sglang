@@ -5,6 +5,7 @@ use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::core::steps::workflow_data::WorkerRemovalWorkflowData;
+use crate::{config::RoutingMode, core::WorkerType};
 
 /// Step to update cache-aware policies for remaining workers.
 ///
@@ -34,17 +35,44 @@ impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
         for model_id in affected_models.iter() {
             let remaining_workers = app_context.worker_registry.get_by_model(model_id);
 
-            if let Some(policy) = app_context.policy_registry.get_policy(model_id) {
-                if policy.name() == "cache_aware" && !remaining_workers.is_empty() {
-                    app_context
-                        .policy_registry
-                        .init_cache_aware_policy(model_id, &remaining_workers);
+            let is_pd_mode = matches!(
+                app_context.router_config.mode,
+                RoutingMode::PrefillDecode { .. }
+            );
+            if is_pd_mode {
+                let prefill_workers: Vec<_> = remaining_workers.iter()
+                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
+                .cloned()
+                .collect();
 
-                    debug!(
-                        "Updated cache-aware policy for model {} ({} remaining workers)",
-                        model_id,
-                        remaining_workers.len()
-                    );
+                let decode_workers: Vec<_> = remaining_workers.iter()
+                .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
+                .cloned()
+                .collect();
+
+                app_context.policy_registry.init_pd_cache_aware_policies(
+                    &prefill_workers,
+                    &decode_workers,
+                );
+                debug!(
+                    "Updated PD cache-aware policies for model {} (prefill: {}, decode: {})",
+                    model_id,
+                    prefill_workers.len(),
+                    decode_workers.len()
+                );
+            } else {
+                if let Some(policy) = app_context.policy_registry.get_policy(model_id) {
+                    if policy.name() == "cache_aware" && !remaining_workers.is_empty() {
+                        app_context
+                            .policy_registry
+                            .init_cache_aware_policy(model_id, &remaining_workers);
+
+                        debug!(
+                            "Updated cache-aware policy for model {} ({} remaining workers)",
+                            model_id,
+                            remaining_workers.len()
+                        );
+                    }
                 }
             }
         }
