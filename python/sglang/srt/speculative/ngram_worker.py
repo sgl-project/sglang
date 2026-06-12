@@ -16,8 +16,10 @@ from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWor
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
+    commit_mamba_states_after_verify,
     generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
+    prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
@@ -32,6 +34,14 @@ USE_FULL_MASK = True
 
 
 class NGRAMWorker(BaseSpecWorker):
+    def alloc_memory_pool(self, **kwargs):
+        # The target memory pool does not exist yet when __init__ runs.
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            self._target_worker.get_memory_pool()
+        )
+        self.max_batch_size = self.model_runner.max_running_requests
+        self._init_preallocated_tensors()
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -55,14 +65,9 @@ class NGRAMWorker(BaseSpecWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
-        self.max_batch_size = target_worker.max_running_requests
+        # req_to_token_pool / token_to_kv_pool_allocator are set in
+        # alloc_memory_pool(), after the target pools are allocated.
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
-
-        self._init_preallocated_tensors()
 
         self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for
@@ -324,6 +329,9 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=self.draft_token_num,
             device=self.device,
         )
+
+        prepare_mamba_track_for_verify(batch)
+
         batch.spec_info = NgramVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -426,6 +434,13 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
             ) = verify_input.sample(batch, logits_output, vocab_mask)
             new_seq_lens = batch.seq_lens + accept_lens
+            commit_mamba_states_after_verify(
+                self.target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                self.draft_token_num,
+            )
             accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens
 
