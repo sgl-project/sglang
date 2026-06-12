@@ -131,6 +131,29 @@ def _extract_field_by_index(
     return [field[index]]
 
 
+def _attach_http_worker_info(obj: Any, ipc_name: str) -> None:
+    if isinstance(obj, BaseReq):
+        obj.http_worker_ipc = ipc_name
+        return
+
+    if isinstance(obj, BaseBatchReq):
+        # Some single-item batch objects are routed through single-request paths.
+        obj.http_worker_ipc = ipc_name
+
+        batch = getattr(obj, "batch", None)
+        if batch is not None:
+            if obj.rids is None:
+                obj.rids = [item.rid for item in batch]
+            for item in batch:
+                item.http_worker_ipc = ipc_name
+
+        batch_size = len(obj.rids) if obj.rids is not None else len(obj)
+        obj.http_worker_ipcs = [ipc_name] * batch_size
+        return
+
+    raise ValueError(f"Unknown request type: {type(obj)}")
+
+
 def _handle_output_by_index(output, i):
     """NOTE: A maintainable method is better here."""
     if isinstance(output, BatchTokenIDOutput):
@@ -535,7 +558,7 @@ class MultiDetokenizerRouter:
                     one = _handle_output_by_index(recv_obj, i)
                     if one is recv_obj:
                         raise TypeError(f"Cannot split {type(recv_obj)}")
-                    one.http_worker_ipcs = [ipc_key]
+                    _attach_http_worker_info(one, ipc_key)
                     self._send(self._pick(ipc_key), one)
                 continue
 
@@ -743,6 +766,6 @@ class SenderWrapper:
         self.send_to_scheduler = send_to_scheduler
 
     def send_pyobj(self, obj):
-        if isinstance(obj, BaseReq):
-            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
+        if isinstance(obj, (BaseReq, BaseBatchReq)):
+            _attach_http_worker_info(obj, self.port_args.tokenizer_ipc_name)
         self.send_to_scheduler.send_pyobj(obj)
