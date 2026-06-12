@@ -212,6 +212,16 @@ class SchedulerBatchResultProcessor:
 
             hidden_state_offset = 0
 
+            # Settle the decode ledger for decode reqs mixed into this
+            # prefill batch: their decode step's result is processed here,
+            # not in process_batch_result_decode. Must precede the loop --
+            # release_kv_cache below reads kv_committed_len.
+            if batch.decoding_reqs:
+                for req in batch.decoding_reqs:
+                    if req.is_retracted or req.finished():
+                        continue
+                    req.kv_committed_len += 1
+
             # Check finish conditions
             logprob_pt = 0
 

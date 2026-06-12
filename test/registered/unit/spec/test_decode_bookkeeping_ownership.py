@@ -69,6 +69,13 @@ _OWNER_SITES = {
         "SchedulerBatchResultProcessor.process_batch_result_decode",
         "spec_verify_ct",
     ): 1,
+    # Mixed chunked prefill: decode steps ride in the prefill batch and
+    # settle in the prefill result path.
+    (
+        "managers/scheduler_components/batch_result_processor.py",
+        "SchedulerBatchResultProcessor.process_batch_result_prefill",
+        "kv_committed_len",
+    ): 1,
     (
         "speculative/dflash_info_v2.py",
         "DFlashDraftInputV2.prepare_for_decode",
