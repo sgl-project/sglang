@@ -11,6 +11,11 @@ on:
         required: false
         type: string
         default: 'main'
+      custom_image_suffix:
+        description: 'Append this suffix to AMD CI daily image tags, e.g. -test-pr-21839 (optional)'
+        required: false
+        type: string
+        default: ''
       job_filter:
         description: 'Comma-separated workflows to run: nightly-amd, nightly-amd-rocm720, pr-test-amd, pr-test-amd-rocm720. Default: all'
         required: false
@@ -90,6 +95,7 @@ jobs:
     with:
       ref: ${{ github.sha }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      custom_image_suffix: ${{ inputs.custom_image_suffix || '' }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
@@ -101,6 +107,7 @@ jobs:
     with:
       ref: ${{ github.sha }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      custom_image_suffix: ${{ inputs.custom_image_suffix || '' }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
@@ -112,6 +119,7 @@ jobs:
     with:
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      custom_image_suffix: ${{ inputs.custom_image_suffix || '' }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-pr-test-amd-rocm720:
@@ -122,6 +130,7 @@ jobs:
     with:
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      custom_image_suffix: ${{ inputs.custom_image_suffix || '' }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   check-all-jobs:
@@ -140,6 +149,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER SHA:** \`${{ needs.resolve-aiter.outputs.aiter_sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${{ needs.resolve-aiter.outputs.aiter_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Custom image suffix:** \`${{ inputs.custom_image_suffix || 'default SGLang AMD CI image' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Workflow | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
