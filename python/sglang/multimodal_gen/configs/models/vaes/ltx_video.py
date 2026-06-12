@@ -62,3 +62,5 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
 @dataclass
 class LTXVideoVAEConfig(VAEConfig):
     arch_config: LTXVideoVAEArchConfig = field(default_factory=LTXVideoVAEArchConfig)
+    use_parallel_decode: bool = True
+    parallel_decode_mode: str = "spatial_shard"

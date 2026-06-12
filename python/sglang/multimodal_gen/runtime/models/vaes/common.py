@@ -14,9 +14,14 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 
 from sglang.multimodal_gen.configs.models import VAEConfig
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    is_spatial_shard_parallel_decode_mode,
+)
 from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_world_size,
     get_sp_parallel_rank,
     get_sp_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -114,6 +119,14 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             self.tile_sample_min_num_frames // self.temporal_compression_ratio
         )
         num_sample_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
+
+        if (
+            self.use_parallel_decode
+            and is_spatial_shard_parallel_decode_mode(self.parallel_decode_mode)
+            and model_parallel_is_initialized()
+            and get_decode_parallel_world_size() > 1
+        ):
+            return self._decode(z)[:, :, :num_sample_frames]
 
         if (
             self.use_tiling

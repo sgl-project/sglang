@@ -64,6 +64,8 @@ class StableDiffusion3VAEConfig(VAEConfig):
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = True
     use_temporal_scaling_frames: bool = False
+    use_parallel_decode: bool = True
+    parallel_decode_mode: str = "spatial_shard"
 
     def __post_init__(self) -> None:
         """Post initialization for SD3 VAE specific setup."""

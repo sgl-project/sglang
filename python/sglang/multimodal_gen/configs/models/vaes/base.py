@@ -12,6 +12,13 @@ from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
 from sglang.multimodal_gen.utils import StoreBoolean
 
 
+SPATIAL_SHARD_PARALLEL_DECODE_MODES = ("spatial_shard", "spatial", "auto")
+
+
+def is_spatial_shard_parallel_decode_mode(mode: str) -> bool:
+    return mode in SPATIAL_SHARD_PARALLEL_DECODE_MODES
+
+
 @dataclass
 class VAEArchConfig(ArchConfig):
     scaling_factor: float | torch.Tensor = 0
@@ -59,98 +66,98 @@ class VAEConfig(ModelConfig):
             f"--{prefix}.load-encoder",
             action=StoreBoolean,
             dest=f"{prefix.replace('-', '_')}.load_encoder",
-            default=VAEConfig.load_encoder,
+            default=None,
             help="Whether to load the VAE encoder",
         )
         parser.add_argument(
             f"--{prefix}.load-decoder",
             action=StoreBoolean,
             dest=f"{prefix.replace('-', '_')}.load_decoder",
-            default=VAEConfig.load_decoder,
+            default=None,
             help="Whether to load the VAE decoder",
         )
         parser.add_argument(
             f"--{prefix}.tile-sample-min-height",
             type=int,
             dest=f"{prefix.replace('-', '_')}.tile_sample_min_height",
-            default=VAEConfig.tile_sample_min_height,
+            default=None,
             help="Minimum height for VAE tile sampling",
         )
         parser.add_argument(
             f"--{prefix}.tile-sample-min-width",
             type=int,
             dest=f"{prefix.replace('-', '_')}.tile_sample_min_width",
-            default=VAEConfig.tile_sample_min_width,
+            default=None,
             help="Minimum width for VAE tile sampling",
         )
         parser.add_argument(
             f"--{prefix}.tile-sample-min-num-frames",
             type=int,
             dest=f"{prefix.replace('-', '_')}.tile_sample_min_num_frames",
-            default=VAEConfig.tile_sample_min_num_frames,
+            default=None,
             help="Minimum number of frames for VAE tile sampling",
         )
         parser.add_argument(
             f"--{prefix}.tile-sample-stride-height",
             type=int,
             dest=f"{prefix.replace('-', '_')}.tile_sample_stride_height",
-            default=VAEConfig.tile_sample_stride_height,
+            default=None,
             help="Stride height for VAE tile sampling",
         )
         parser.add_argument(
             f"--{prefix}.tile-sample-stride-width",
             type=int,
             dest=f"{prefix.replace('-', '_')}.tile_sample_stride_width",
-            default=VAEConfig.tile_sample_stride_width,
+            default=None,
             help="Stride width for VAE tile sampling",
         )
         parser.add_argument(
             f"--{prefix}.tile-sample-stride-num-frames",
             type=int,
             dest=f"{prefix.replace('-', '_')}.tile_sample_stride_num_frames",
-            default=VAEConfig.tile_sample_stride_num_frames,
+            default=None,
             help="Stride number of frames for VAE tile sampling",
         )
         parser.add_argument(
             f"--{prefix}.blend-num-frames",
             type=int,
             dest=f"{prefix.replace('-', '_')}.blend_num_frames",
-            default=VAEConfig.blend_num_frames,
+            default=None,
             help="Number of frames to blend for VAE tile sampling",
         )
         parser.add_argument(
             f"--{prefix}.use-tiling",
             action=StoreBoolean,
             dest=f"{prefix.replace('-', '_')}.use_tiling",
-            default=VAEConfig.use_tiling,
+            default=None,
             help="Whether to use tiling for VAE",
         )
         parser.add_argument(
             f"--{prefix}.use-temporal-tiling",
             action=StoreBoolean,
             dest=f"{prefix.replace('-', '_')}.use_temporal_tiling",
-            default=VAEConfig.use_temporal_tiling,
+            default=None,
             help="Whether to use temporal tiling for VAE",
         )
         parser.add_argument(
             f"--{prefix}.use-parallel-tiling",
             action=StoreBoolean,
             dest=f"{prefix.replace('-', '_')}.use_parallel_tiling",
-            default=VAEConfig.use_parallel_tiling,
+            default=None,
             help="Whether to use parallel tiling for VAE",
         )
         parser.add_argument(
             f"--{prefix}.use-parallel-decode",
             action=StoreBoolean,
             dest=f"{prefix.replace('-', '_')}.use_parallel_decode",
-            default=VAEConfig.use_parallel_decode,
+            default=None,
             help="Whether to use parallel decode for VAE",
         )
         parser.add_argument(
             f"--{prefix}.parallel-decode-mode",
-            choices=("tiled", "patch", "auto"),
+            choices=("tiled", "patch", "spatial_shard", "spatial", "auto"),
             dest=f"{prefix.replace('-', '_')}.parallel_decode_mode",
-            default=VAEConfig.parallel_decode_mode,
+            default=None,
             help="Parallel decode mode for VAE",
         )
 

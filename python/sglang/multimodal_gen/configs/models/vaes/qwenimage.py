@@ -38,7 +38,8 @@ class QwenImageVAEConfig(VAEConfig):
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False
 
-    use_parallel_decode: bool = False
+    use_parallel_decode: bool = True
+    parallel_decode_mode: str = "spatial_shard"
 
     def get_vae_scale_factor(self):
         return 2 ** len(self.arch_config.temperal_downsample)

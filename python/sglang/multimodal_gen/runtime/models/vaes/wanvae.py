@@ -25,6 +25,9 @@ import torch.nn as nn
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    is_spatial_shard_parallel_decode_mode,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
@@ -861,7 +864,10 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 dropout=config.dropout,
                 out_channels=config.out_channels,
                 is_residual=config.is_residual,
-                use_parallel_decode=self.use_parallel_decode,
+                use_parallel_decode=self.use_parallel_decode
+                and is_spatial_shard_parallel_decode_mode(
+                    self.parallel_decode_mode
+                ),
             )
 
         self.use_feature_cache = config.use_feature_cache
