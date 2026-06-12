@@ -140,8 +140,10 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        force_native_attention_path: bool = False,
     ) -> None:
         super().__init__()
+        self.force_native_attention_path = force_native_attention_path
         self.hidden_size = hidden_size
         self.start_layer = start_layer
         tp_size = get_tensor_model_parallel_world_size()
@@ -236,6 +238,7 @@ class LlamaAttention(nn.Module):
             not _is_npu
             or not hasattr(self.rotary_emb, "get_cos_sin_with_position")
             or forward_batch.forward_mode.is_extend()
+            or self.force_native_attention_path
         ):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
