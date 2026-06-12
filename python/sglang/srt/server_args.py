@@ -4841,6 +4841,7 @@ class ServerArgs:
             '* "sglang" will use the SGLang model implementation.\n'
             '* "transformers" will use the Transformers model '
             '* "mindspore" will use the MindSpore model '
+            '* "atom" will use the Atom model '
             "implementation.\n",
         )
         parser.add_argument(
@@ -7909,6 +7910,9 @@ class ServerArgs:
 
         if self.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
+
+        if self.model_impl == "atom":
+            assert is_hip(), "Atom model impl is only supported on ROCm."
 
         # Check metrics labels
         if (
