@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ReqPhase, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -175,9 +175,6 @@ class DFlashDraftInputV2(SpecInput):
         uniform_top_k_value = None
         uniform_top_k = True
         for i, req in enumerate(batch.reqs):
-            # This path bypasses ScheduleBatch.prepare_for_decode, so transition
-            # the phase here before resolve moves committed KV past the frontier.
-            req.phase = ReqPhase.DECODE
             committed_len = int(req.kv_committed_len)
             if cur_allocated_seq_lens_cpu is not None and i < len(
                 cur_allocated_seq_lens_cpu
