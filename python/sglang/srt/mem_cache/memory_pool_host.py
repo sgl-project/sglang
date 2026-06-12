@@ -971,7 +971,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def _v_layout_dim(self) -> int:
         return self._v_token_stride_size() * self.layer_num
 
-    def _flat_page_unsupported(self) -> "NotImplementedError":
+    def _flat_page_unsupported(self) -> NotImplementedError:
         return NotImplementedError(
             "Models with head_dim != v_head_dim do not support the flat-page "
             "interface used by HiCache L3 storage backends {hf3fs, eic, nixl}. "
@@ -1141,7 +1141,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         )
 
 
-def get_mha_host_pool_cls(device_pool: "MHATokenToKVPool") -> type:
+def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     """Pick the right MHA host-pool class based on the device pool's K/V dims.
 
     Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
