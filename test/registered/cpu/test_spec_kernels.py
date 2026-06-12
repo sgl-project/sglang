@@ -1354,5 +1354,86 @@ class TestMultiLayerEagleStateKernels(CustomTestCase):
             )
 
 
+class TestBuildDraftDecodeMetadata(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(1234)
+
+    def _ref_build_metadata(
+        self, req_to_token, req_pool_indices, seq_lens, topk, num_steps
+    ):
+        """Pure-python reference. Draft row b*topk+tk holds the committed prefix
+        followed by candidate tk's draft slots, which live contiguously in the
+        source row at sl + tk*num_steps + s (assign_draft_cache_locs_contiguous
+        layout); only the first sl + num_steps entries per row are defined.
+        """
+        rows = []
+        for b in range(seq_lens.numel()):
+            src_row = req_to_token[int(req_pool_indices[b])]
+            sl = int(seq_lens[b])
+            for tk in range(topk):
+                draft_start = sl + tk * num_steps
+                rows.append(
+                    torch.cat(
+                        [src_row[:sl], src_row[draft_start : draft_start + num_steps]]
+                    )
+                )
+        return rows
+
+    def _run_and_check(self, seq_lens, topk, num_steps, pool_len, num_reqs):
+        num_seqs = seq_lens.numel()
+        # distinct slot values so any misplaced copy is caught exactly
+        req_to_token = (
+            torch.randperm(num_reqs * pool_len).to(torch.int32).view(num_reqs, pool_len)
+        )
+        req_pool_indices = torch.randperm(num_reqs, dtype=torch.int64)[:num_seqs]
+        req_to_token_draft = torch.ops.sgl_kernel.build_draft_decode_metadata_cpu(
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            topk,
+            num_steps,
+            pool_len,
+        )
+        self.assertEqual(
+            req_to_token_draft.shape, torch.Size([num_seqs * topk, pool_len])
+        )
+        self.assertEqual(req_to_token_draft.dtype, req_to_token.dtype)
+        ref_rows = self._ref_build_metadata(
+            req_to_token, req_pool_indices, seq_lens, topk, num_steps
+        )
+        for b in range(num_seqs):
+            sl = int(seq_lens[b])
+            for tk in range(topk):
+                flat = b * topk + tk
+                # Only the first sl + num_steps entries are the kernel's
+                # contract: the output is allocated uninitialized and the
+                # draft-decode consumer reads at most seq_len + num_steps
+                # slots per candidate, so the row tail stays unasserted.
+                torch.testing.assert_close(
+                    req_to_token_draft[flat, : sl + num_steps],
+                    ref_rows[flat],
+                    atol=0,
+                    rtol=0,
+                )
+
+    def test_build_metadata_topk1_chain(self):
+        # MTP config: topk=1 -> the single candidate's drafts sit right after
+        # the prefix, so each draft row is the source row's first
+        # sl + num_steps slots verbatim.
+        seq_lens = torch.tensor([5, 0, 17], dtype=torch.int64)
+        for num_steps in [1, 2, 3]:
+            with self.subTest(num_steps=num_steps):
+                self._run_and_check(seq_lens, 1, num_steps, pool_len=32, num_reqs=5)
+
+    def test_build_metadata_topk4(self):
+        # EAGLE config: topk=4 -> candidate tk's drafts come from the strided
+        # source range [sl + tk*num_steps, sl + (tk+1)*num_steps) but always
+        # land right after the prefix in the expanded row.
+        seq_lens = torch.tensor([9, 0, 3, 21], dtype=torch.int64)
+        for num_steps in [1, 2, 3]:
+            with self.subTest(num_steps=num_steps):
+                self._run_and_check(seq_lens, 4, num_steps, pool_len=64, num_reqs=6)
+
+
 if __name__ == "__main__":
     unittest.main()
