@@ -322,6 +322,8 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
+        if self.draft_extend_attn_backend is not None:
+            self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
     def init_cuda_graphs(self):
@@ -1115,6 +1117,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.draft_runner.draft_attn_backend = state.draft_attn_backend
         dw.cuda_graph_runner = state.cuda_graph_runner
         dw.draft_extend_attn_backend = state.draft_extend_attn_backend
+        # Keep the runner's attn_backend in step with the active draft-extend
+        # backend (the draft-extend forward reads draft_runner.attn_backend);
+        # mirrors init_attention_backend. When None, the runner keeps its
+        # initialized backend (consistent across step configs).
+        if state.draft_extend_attn_backend is not None:
+            dw.draft_runner.attn_backend = state.draft_extend_attn_backend
         dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
         dw._rebuild_topk1_chain_buffers()
 
@@ -1148,6 +1156,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.draft_attn_backend,
             dw.draft_extend_attn_backend,
             dw.draft_runner.draft_attn_backend,
+            dw.draft_runner.attn_backend,
             dw.cuda_graph_runner,
             dw.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
@@ -1183,6 +1192,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.draft_attn_backend,
                 dw.draft_extend_attn_backend,
                 dw.draft_runner.draft_attn_backend,
+                dw.draft_runner.attn_backend,
                 dw.cuda_graph_runner,
                 dw.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
