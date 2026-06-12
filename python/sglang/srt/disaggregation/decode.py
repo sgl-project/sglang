@@ -1412,7 +1412,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.set_extend_range(total_prefix_len, req.kv_committed_len)
         # This prebuilt path never goes through prepare_for_extend, so enter
         # the extend phase here; prepare_for_decode moves it to DECODE later.
-        req.phase = ReqPhase.EXTEND
+        # These reqs are not a real chunk sequence; NON_LAST keeps them visible
+        # as holders of not-yet-batched extend resources (pool stats / invariant
+        # checker) until prepare_for_decode flips them to DECODE.
+        req.phase = ReqPhase.EXTEND_NON_LAST
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1885,7 +1888,7 @@ class SchedulerDisaggregationDecodeMixin:
                     # This prebuilt path never goes through prepare_for_extend,
                     # so enter the extend phase here; prepare_for_decode moves
                     # it to DECODE later.
-                    req.phase = ReqPhase.EXTEND
+                    req.phase = ReqPhase.EXTEND_NON_LAST
             else:
                 waiting_queue.append(req)
 

@@ -220,9 +220,9 @@ class SchedulerInvariantChecker:
                     f"DECODE req behind its extend frontier: {req.rid=} "
                     f"{req.kv_committed_len=} {req.extend_range=}"
                 )
-            elif req.phase is ReqPhase.EXTEND:
+            elif req.phase.is_extend():
                 assert req.kv_committed_len <= req.extend_range.end, (
-                    f"EXTEND req past its extend frontier: {req.rid=} "
+                    f"extend req past its extend frontier: {req.rid=} "
                     f"{req.kv_committed_len=} {req.extend_range=}"
                 )
             else:

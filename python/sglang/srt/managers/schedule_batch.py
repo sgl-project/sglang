@@ -649,8 +649,21 @@ class ReqPhase(Enum):
     # Catch-all for every state this enum does not track yet (just created,
     # waiting in queue, retracted, transferring, finished, ...).
     OTHERS = auto()
-    EXTEND = auto()  # admitted to a prefill/extend batch (incl. mid-chunk)
+    # Both EXTEND_* members mean "admitted to a prefill/extend batch". The
+    # NON_LAST / LAST distinction is frozen AT ADMISSION TIME (it reflects the
+    # scheduler's decision state), deliberately independent of when the forward
+    # finishes or its result is processed — under the overlap scheduler
+    # "completion" has no single well-defined instant.
+    # The admitted extend range did NOT cover the fill target known at
+    # admission (a middle chunk).
+    EXTEND_NON_LAST = auto()
+    # The admitted extend range covered the fill target known at admission
+    # (the final chunk, including ordinary single-chunk prefills).
+    EXTEND_LAST = auto()
     DECODE = auto()  # entered decode
+
+    def is_extend(self) -> bool:
+        return self in (ReqPhase.EXTEND_NON_LAST, ReqPhase.EXTEND_LAST)
 
 
 class Req(ReqDllmMixin):
@@ -997,10 +1010,10 @@ class Req(ReqDllmMixin):
 
     @property
     def is_partially_extended(self) -> bool:
-        if self.is_dllm() or self.phase != ReqPhase.EXTEND:
+        if self.is_dllm() or self.phase != ReqPhase.EXTEND_NON_LAST:
             return False
         assert self.extend_range.end > 0, f"{self.rid=} {self.extend_range=}"
-        return self.extend_range.end < self.get_full_untruncated_fill_len()
+        return True
 
     @property
     def is_prefill_only(self) -> bool:
@@ -2028,7 +2041,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             assert seq_len - pre_len == req.extend_range.length
 
             req.extend_batch_idx += 1
-            req.phase = ReqPhase.EXTEND
+            req.phase = (
+                ReqPhase.EXTEND_NON_LAST
+                if req.extend_range.end < req.get_full_untruncated_fill_len()
+                else ReqPhase.EXTEND_LAST
+            )
 
             # update req-level memory management fields
             req.kv_committed_len = seq_len
