@@ -1799,12 +1799,11 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 
 
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
-async def v1_responses_request(request: dict, raw_request: Request):
+async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
-    request_obj = ResponsesRequest(**request)
     result = await raw_request.app.state.openai_serving_responses.create_responses(
-        request_obj, raw_request
+        request, raw_request
     )
 
     # Handle streaming responses
