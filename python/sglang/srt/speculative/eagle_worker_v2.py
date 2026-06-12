@@ -659,9 +659,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
                 pt += extend_len
 
-        # Install draft-extend spec_info for the extend forward (it only
-        # carries hidden_states + shape info); the next-iter draft input is
-        # assembled fresh from the extend output below.
+        # Draft-extend spec_info for the extend forward; carries only
+        # hidden_states + shape info.
         batch.spec_info = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
             # draft mode is same with decode mode, only 1 token per req
@@ -707,7 +706,6 @@ class EagleDraftWorker(BaseDraftWorker):
             topk_index=topk_index,
             hidden_states=logits_output.hidden_states,
             bonus_tokens=next_token_ids,
-            # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
@@ -718,8 +716,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            # `batch_result.accept_lens` already includes the bonus token, so use it
-            # directly for `num_accept_tokens` and subtract 1 for `num_correct_drafts`.
+            # accept_lens includes the bonus token; correct drafts exclude it.
             num_correct_drafts=batch_result.accept_lens - 1,
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,

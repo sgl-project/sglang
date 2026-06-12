@@ -418,9 +418,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             "draft_extend_for_prefill: next_token_ids before draft embed",
         )
 
-        # Install draft-extend spec_info for the extend forward (it only
-        # carries hidden_states + shape info); the next-iter draft input is
-        # assembled fresh from the extend outputs below.
+        # Draft-extend spec_info for the extend forward; carries only
+        # hidden_states + shape info.
         extend_input = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
             # draft mode is same with decode mode, only 1 token per req
@@ -488,15 +487,13 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     forward_batch.extend_seq_lens,
                     topk_index,
                 )
-        # Assemble the next-iter draft spec_info from the extend outputs.
-        # Chain-style left the last step's hidden_states on the extend input;
-        # non-chain keeps the target hidden states.
         next_draft_input = EagleDraftInput(
             topk_p=torch.cat(topk_p_list, dim=1),
             topk_index=torch.cat(topk_index_list, dim=1),
+            # Chain-style left the last step's hidden_states on the extend
+            # input; non-chain keeps the target hidden states.
             hidden_states=extend_input.hidden_states,
             bonus_tokens=next_token_ids,
-            # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
