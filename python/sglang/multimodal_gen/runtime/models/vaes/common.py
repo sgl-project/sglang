@@ -115,11 +115,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         )
         num_sample_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
 
-        if (
-            self.use_tiling
-            and self.use_parallel_tiling
-            and get_sp_world_size() > 1
-        ):
+        if self.use_tiling and self.use_parallel_tiling and get_sp_world_size() > 1:
             return self.parallel_tiled_decode(z)[:, :, :num_sample_frames]
         if (
             self.use_tiling
