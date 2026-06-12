@@ -266,13 +266,18 @@ class Session:
         carry_fill = None
         if last_req is not None:
             self._strip_bos_token(req, tokenizer)
-            share = (
+            # In-place sharing is only safe for the plain streaming append:
+            # streaming sessions allow a single inflight request, last_req has
+            # finished, and the committed_* lengths recorded by finish_req let
+            # _share_token_arrays trim away tokens appended by an aborted turn.
+            # offset / drop_previous_output rewrite history and must copy.
+            can_share_token_arrays = (
                 self.streaming
                 and self.committed_origin_len is not None
                 and not session_params.drop_previous_output
                 and not (session_params.offset and session_params.offset != 0)
             )
-            if share:
+            if can_share_token_arrays:
                 input_ids, input_ids_unpadded, carry_fill = self._share_token_arrays(
                     last_req, req.input_ids
                 )

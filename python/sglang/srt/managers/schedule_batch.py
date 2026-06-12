@@ -1073,8 +1073,16 @@ class Req(ReqDllmMixin):
 
     def _refresh_fill_ids(self) -> None:
         """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
-        appending only the new output tokens; full rebuild when the invariant
-        can't hold (fresh req, aliasing, or lengths disagree)."""
+        appending only the new output tokens.
+
+        Falls back to a full rebuild when the in-place append is invalid:
+        - aliasing: scheduler_pp_mixin assigns full_untruncated_fill_ids =
+          origin_input_ids directly, so extending in place would write output
+          tokens into the origin;
+        - lengths disagree: fresh req (array still empty), retraction
+          (output_ids reset to empty), or set_finish_with_abort (origin
+          replaced by a 1-token stub).
+        """
         n_have_output = len(self.full_untruncated_fill_ids) - len(self.origin_input_ids)
         if (
             self.full_untruncated_fill_ids is not self.origin_input_ids
