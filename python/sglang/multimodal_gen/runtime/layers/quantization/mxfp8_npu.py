@@ -56,7 +56,7 @@ class MXFP8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "MXFP8Config":
+    def from_config(cls, config: Dict[str, Any]) -> MXFP8Config:
         return cls()
 
     def get_quant_method(
