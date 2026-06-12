@@ -32,7 +32,7 @@ class HfStoreConfig:
     revision: str = "main"
 
     @classmethod
-    def from_env(cls) -> "HfStoreConfig":
+    def from_env(cls) -> HfStoreConfig:
         repo = os.environ.get("SGLANG_PRECISION_HF_REPO")
         if not repo:
             raise RuntimeError(
