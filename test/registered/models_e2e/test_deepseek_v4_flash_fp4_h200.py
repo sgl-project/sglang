@@ -13,7 +13,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.spec_decoding_kit import MTPAcceptanceLengthMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -42,7 +42,7 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 
 
 class TestDSV4FlashFP4H200(
-    MTPAcceptanceLengthMixin,
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -50,8 +50,8 @@ class TestDSV4FlashFP4H200(
     """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
 
     gsm8k_accuracy_thres = 0.93
-    mtp_accept_length_thres = 2.8
-    mtp_summary_name = "deepseek-v4-flash-fp4-h200"
+    accept_length_thres = 2.8
+    bs_1_speed_thres = 240
 
     @classmethod
     def setUpClass(cls):
@@ -91,7 +91,7 @@ class TestDSV4FlashFP4H200(
     "FlashInfer build lacks SM90 mixed-input MXFP4 helpers (PR #3084, >= 0.6.11)",
 )
 class TestDSV4FlashFP4H200FlashInferCutlass(
-    MTPAcceptanceLengthMixin,
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -104,8 +104,8 @@ class TestDSV4FlashFP4H200FlashInferCutlass(
     """
 
     gsm8k_accuracy_thres = 0.93
-    mtp_accept_length_thres = 2.8
-    mtp_summary_name = "deepseek-v4-flash-fp4-h200-flashinfer-cutlass"
+    accept_length_thres = 2.8
+    bs_1_speed_thres = 230
 
     @classmethod
     def setUpClass(cls):

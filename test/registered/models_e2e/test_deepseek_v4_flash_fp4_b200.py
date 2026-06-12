@@ -13,7 +13,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.spec_decoding_kit import MTPAcceptanceLengthMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -33,7 +33,7 @@ _DEEPEP_ENV = {
 
 
 class TestDSV4FlashFP4B200(
-    MTPAcceptanceLengthMixin,
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -41,8 +41,8 @@ class TestDSV4FlashFP4B200(
     """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
 
     gsm8k_accuracy_thres = 0.93
-    mtp_accept_length_thres = 2.8
-    mtp_summary_name = "deepseek-v4-flash-fp4-b200"
+    accept_length_thres = 2.65
+    bs_1_speed_thres = 220
 
     @classmethod
     def setUpClass(cls):
@@ -79,7 +79,7 @@ class TestDSV4FlashFP4B200(
 
 
 class TestDSV4FlashFP4B200Balanced(
-    MTPAcceptanceLengthMixin,
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -87,8 +87,8 @@ class TestDSV4FlashFP4B200Balanced(
     """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
 
     gsm8k_accuracy_thres = 0.93
-    mtp_accept_length_thres = 1.6
-    mtp_summary_name = "deepseek-v4-flash-fp4-b200-balanced"
+    accept_length_thres = 1.6
+    bs_1_speed_thres = 100
 
     @classmethod
     def setUpClass(cls):

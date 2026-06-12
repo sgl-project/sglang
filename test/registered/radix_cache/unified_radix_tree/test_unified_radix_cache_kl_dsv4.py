@@ -9,7 +9,7 @@ from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.spec_decoding_kit import MTPAcceptanceLengthMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.test_utils import (
@@ -167,7 +167,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
 
 
 class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(
-    MTPAcceptanceLengthMixin, AccuracyTwoPassMixin, CustomTestCase
+    SpecDecodingMixin, AccuracyTwoPassMixin, CustomTestCase
 ):
     """DeepSeek V4 Flash EAGLE + HiCache L3 should load from storage."""
 
@@ -177,8 +177,8 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(
     num_gsm8k_questions = 100
     gsm8k_parallel = 4
     mmlu_num_threads = 4
-    mtp_accept_length_thres = 2.8
-    mtp_summary_name = "deepseek-v4-flash-fp8-hicache-l3-eagle"
+    accept_length_thres = 2.8
+    bs_1_speed_thres = 100
 
     @classmethod
     def setUpClass(cls):
