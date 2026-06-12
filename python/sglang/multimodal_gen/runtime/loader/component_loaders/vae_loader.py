@@ -85,9 +85,6 @@ def _should_use_channels_last_3d(
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, QwenImagePipelineConfig):
         return True
-    # Cosmos3 reuses the Wan VAE (AutoencoderKLWan), so the same Conv3d
-    # channels_last_3d transform applies. Gated on single-GPU like Wan/LTX
-    # since the parallel-decode path is not yet validated with channels_last.
     if (
         isinstance(
             pipeline_config,
