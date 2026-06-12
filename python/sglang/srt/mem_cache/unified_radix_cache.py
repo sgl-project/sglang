@@ -722,8 +722,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
-    def cache_unfinished_req(self, req: Req, is_partially_extended: bool = False, **kwargs) -> None:
-        if self.session.try_cache_unfinished_req(req, is_partially_extended=is_partially_extended, **kwargs):
+    def cache_unfinished_req(
+        self, req: Req, is_partially_extended: bool = False, **kwargs
+    ) -> None:
+        if self.session.try_cache_unfinished_req(
+            req, is_partially_extended=is_partially_extended, **kwargs
+        ):
             return
 
         token_ids = req.get_fill_ids()
@@ -1729,7 +1733,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return transfers
 
-    def _inc_hit_count(self, node: UnifiedTreeNode, is_partially_extended: bool = False) -> None:
+    def _inc_hit_count(
+        self, node: UnifiedTreeNode, is_partially_extended: bool = False
+    ) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""
         if node.evicted or is_partially_extended:
             return

@@ -509,7 +509,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
-            self.root_node, key, value, mamba_value, params.is_partially_extended, prev_prefix_len
+            self.root_node,
+            key,
+            value,
+            mamba_value,
+            params.is_partially_extended,
+            prev_prefix_len,
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 

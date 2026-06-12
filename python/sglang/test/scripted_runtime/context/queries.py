@@ -10,11 +10,11 @@ if TYPE_CHECKING:
 # TODO: scripted runtime still uses chunk-era vocabulary (`_chunked_req`,
 # `is_chunking`, `chunked_rid`). The scheduler concept was renamed to
 # "partially extended"; do a larger scripted-runtime rename pass later to align.
-def _chunked_req(s) -> Optional["Req"]:
+def _chunked_req(s) -> Optional[Req]:
     return next(iter(s.partially_extended_reqs()), None)
 
 
-def _get_all_reqs(ctx: "ScriptedContext") -> Iterator["Req"]:
+def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
     s = ctx.scheduler
     yield from s.partially_extended_reqs()
     yield from s.waiting_queue
