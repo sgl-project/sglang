@@ -171,27 +171,187 @@ void launch_sm100_fp8_blockwise_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status))
 }
 
+template <
+    typename OutType,
+    typename MmaTileShape,
+    typename PerSmTileShape,
+    typename EpilogueTileShape,
+    typename ScalesPerTile,
+    int TileSizeM_ = 128,
+    class ClusterShape = Shape<_1, _1, _1>>
+void launch_sm100_fp8_blockwise_scaled_mm_with_bias(
+    torch::Tensor& out,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& bias) {
+  static constexpr int ScaleMsPerTile = size<0>(ScalesPerTile{});
+  static constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;
+  static constexpr int ScaleGranularityN = size<1>(MmaTileShape{}) / size<1>(ScalesPerTile{});
+  static constexpr int ScaleGranularityK = size<2>(MmaTileShape{}) / size<2>(ScalesPerTile{});
+
+  using ElementAB = cutlass::float_e4m3_t;
+  using ElementA = ElementAB;
+  using ElementB = ElementAB;
+  using ElementD = OutType;
+  using ElementC = ElementD;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutD = cutlass::layout::RowMajor;
+  using LayoutC = LayoutD;
+  // This means both SFA and SFB are column-major.
+  using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
+      ScaleGranularityM,
+      ScaleGranularityN,
+      ScaleGranularityK,
+      cute::UMMA::Major::MN,
+      cute::UMMA::Major::K>;
+  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+
+  static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+  static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+  static constexpr int AlignmentC = AlignmentD;
+
+  using ElementAccumulator = float;
+  using ElementBlockScale = float;
+  using ElementCompute = float;
+  using ArchTag = cutlass::arch::Sm100;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      cutlass::arch::OpClassTensorOp,
+      PerSmTileShape,
+      ClusterShape,
+      EpilogueTileShape,
+      ElementAccumulator,
+      ElementCompute,
+      ElementC,
+      LayoutC,
+      AlignmentC,
+      ElementD,
+      LayoutD,
+      AlignmentD,
+      cutlass::epilogue::TmaWarpSpecialized1Sm>::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      cute::tuple<LayoutA, LayoutSFA>,
+      AlignmentA,
+      ElementB,
+      cute::tuple<LayoutB, LayoutSFB>,
+      AlignmentB,
+      ElementAccumulator,
+      MmaTileShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::KernelTmaWarpSpecializedBlockwise1SmSm100>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      cutlass::gemm::PersistentScheduler>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  Gemm gemm_op;
+
+  int m = a.size(0);
+  int k = a.size(1);
+  int n = b.size(1);
+
+  auto a_ptr = static_cast<ElementAB*>(a.data_ptr());
+  auto b_ptr = static_cast<ElementAB*>(b.data_ptr());
+  auto scales_a_ptr = static_cast<float*>(scales_a.data_ptr());
+  auto scales_b_ptr = static_cast<float*>(scales_b.data_ptr());
+  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
+  auto bias_ptr = static_cast<ElementD*>(bias.data_ptr());
+
+  using StrideA = typename GemmKernel::StrideA;
+  using StrideB = typename GemmKernel::StrideB;
+  using StrideD = typename GemmKernel::StrideD;
+  using StrideC = typename GemmKernel::StrideC;
+
+  StrideA a_stride = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  StrideB b_stride = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  StrideD d_stride = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, 1));
+  // Broadcast bias along M dimension: stride(M)=0 means same bias for each row,
+  // stride(N)=1 reads consecutive elements, stride(L)=0 for batch
+  StrideC bias_stride = cute::make_stride(int64_t(0), cute::C<1>{}, int64_t(0));
+  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+
+  typename GemmKernel::MainloopArguments mainloop_args{
+      a_ptr, a_stride, b_ptr, b_stride, scales_a_ptr, layout_SFA, scales_b_ptr, layout_SFB};
+
+  typename GemmKernel::EpilogueArguments epilogue_args{{}, bias_ptr, bias_stride, c_ptr, d_stride};
+  epilogue_args.thread.alpha = 1.0f;
+  epilogue_args.thread.beta = 1.0f;
+
+  typename GemmKernel::Arguments args = {
+      cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1}, mainloop_args, epilogue_args};
+
+  auto can_implement = gemm_op.can_implement(args);
+  TORCH_CHECK(can_implement == cutlass::Status::kSuccess, cutlassGetStatusString(can_implement))
+
+  size_t workspace_size = gemm_op.get_workspace_size(args);
+  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+
+  auto init_status = gemm_op.initialize(args, workspace.get());
+  TORCH_CHECK(init_status == cutlass::Status::kSuccess, cutlassGetStatusString(init_status));
+
+  auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+
+  auto status = gemm_op.run(stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status))
+}
+
 template <typename OutType>
 void sm100_fp8_blockwise_dispatch_shape(
     torch::Tensor& out,
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b) {
+    const torch::Tensor& scales_b,
+    const c10::optional<torch::Tensor>& bias) {
   if (a.size(0) <= 128) {
     using MmaTileShape = Shape<_64, _128, _128>;
     using PerSmTileShape = Shape<_64, _128, _128>;
     using EpilogueTileShape = Shape<_64, _64>;
     using ScalesPerTile = Shape<_64, _1, _1>;
-    launch_sm100_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
-        out, a, b, scales_a, scales_b);
+    if (bias.has_value()) {
+      launch_sm100_fp8_blockwise_scaled_mm_with_bias<
+          OutType,
+          MmaTileShape,
+          PerSmTileShape,
+          EpilogueTileShape,
+          ScalesPerTile>(out, a, b, scales_a, scales_b, *bias);
+    } else {
+      launch_sm100_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
+          out, a, b, scales_a, scales_b);
+    }
   } else {
     using MmaTileShape = Shape<_128, _128, _128>;
     using PerSmTileShape = Shape<_128, _128, _128>;
     using EpilogueTileShape = Shape<_128, _64>;
     using ScalesPerTile = Shape<_128, _1, _1>;
-    launch_sm100_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
-        out, a, b, scales_a, scales_b);
+    if (bias.has_value()) {
+      launch_sm100_fp8_blockwise_scaled_mm_with_bias<
+          OutType,
+          MmaTileShape,
+          PerSmTileShape,
+          EpilogueTileShape,
+          ScalesPerTile>(out, a, b, scales_a, scales_b, *bias);
+    } else {
+      launch_sm100_fp8_blockwise_scaled_mm<OutType, MmaTileShape, PerSmTileShape, EpilogueTileShape, ScalesPerTile>(
+          out, a, b, scales_a, scales_b);
+    }
   }
 }
 
@@ -427,7 +587,8 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& mat_b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const torch::Dtype& out_dtype) {
+    const torch::Dtype& out_dtype,
+    const c10::optional<torch::Tensor>& bias) {
   TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
   TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
@@ -472,6 +633,7 @@ torch::Tensor fp8_blockwise_scaled_mm(
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
 #if defined CUDA_VERSION && CUDA_VERSION >= 12000
   if (sm_version == 90) {
+    TORCH_CHECK(!bias.has_value(), "fp8_blockwise_scaled_mm with bias is only supported on SM100, got SM", sm_version);
     torch::Tensor scales_b_contiguous = scales_b.contiguous();
     if (out_dtype == torch::kBFloat16) {
       cutlass_gemm_blockwise_sm90_fp8_dispatch<cutlass::bfloat16_t>(
@@ -492,11 +654,19 @@ torch::Tensor fp8_blockwise_scaled_mm(
       || sm_version == 103
 #endif
   ) {
+    if (bias.has_value()) {
+      TORCH_CHECK(bias->is_cuda(), "bias must be a CUDA tensor");
+      TORCH_CHECK(bias->dim() == 1, "bias must be a 1D tensor");
+      TORCH_CHECK(bias->size(0) == mat_b.size(1), "bias size must match N dimension (mat_b columns)");
+      TORCH_CHECK(bias->scalar_type() == out_dtype, "bias dtype must match out_dtype");
+      TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous");
+    }
     if (out_dtype == torch::kBFloat16) {
       sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
-          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
+          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b, bias);
     } else {
-      sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
+      sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(
+          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b, bias);
     }
     return out_padded.slice(0, 0, original_rows);
   }
@@ -506,6 +676,7 @@ torch::Tensor fp8_blockwise_scaled_mm(
 #if defined(CUTLASS_ARCH_MMA_SM120A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 12080
   if (sm_version >= 120) {
+    TORCH_CHECK(!bias.has_value(), "fp8_blockwise_scaled_mm with bias is only supported on SM100, got SM", sm_version);
     if (out_dtype == torch::kBFloat16) {
       sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
           out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
