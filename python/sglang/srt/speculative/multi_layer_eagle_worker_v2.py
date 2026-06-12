@@ -135,18 +135,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
-        # Do not capture cuda graph in `TpModelWorker` init,
-        # will capture later with init_cuda_graphs()
-        backup_decode_mode = server_args.cuda_graph_config.decode.backend
-        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
-
-        # Share the allocator with a target worker.
-        # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
+        # Load draft model weights only.
         with empty_context(), speculative_moe_backend_context():
-            # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -158,9 +148,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=target_worker.model_runner.memory_pool_config,
                 is_multi_layer_eagle=True,
             )
 
@@ -174,7 +161,26 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # next step.  Non-chain: each step uses the target model's hidden states.
         draft_arch = self.draft_worker.model_config.hf_config.architectures[0]
         self.chain_mtp_hidden_states = draft_arch in ["Step3p5MTP"]
+        self.draft_tp_context = (
+            draft_tp_context if server_args.enable_dp_attention else empty_context
+        )
+        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        """Allocate draft KV cache pools (called by scheduler)."""
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.draft_worker.alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
         self.init_lm_head()
 
         # KV cache reversion buffer; sized to mirror req_to_token (indexed by
@@ -189,24 +195,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             device=self.device,
         )
 
-        # Init attention backend and cuda graphs
-        for i in range(self.speculative_num_steps):
-            self.draft_runner_list[i].server_args.cuda_graph_config.decode.backend = (
-                backup_decode_mode
-            )
-        self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
-        )
-        with (
-            self.draft_tp_context(self.draft_runner_list[0].tp_group),
-            speculative_moe_backend_context(),
-        ):
-            self.init_attention_backend()
-            self.init_cuda_graphs()
-
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
-
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+    def init_backends(self):
+        with self.draft_tp_context(
+            self.draft_runner_list[0].tp_group
+        ), speculative_moe_backend_context():
+            super().init_backends()
 
     def mtp_model_runner(self, step: int):
         return self.draft_runner_list[step]
@@ -230,9 +223,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.draft_extend_attn_backend_list.append(
                 draft_backend_factory.create_draft_extend_backend()
             )
-            self.draft_runner_list[step].attn_backend = (
-                self.draft_extend_attn_backend_list[-1]
-            )
+            if self.draft_extend_attn_backend_list[-1] is not None:
+                self.draft_runner_list[step].attn_backend = (
+                    self.draft_extend_attn_backend_list[-1]
+                )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -685,10 +679,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             server_args.speculative_algorithm
         )
 
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
@@ -712,6 +702,21 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        self._draft_worker.alloc_memory_pool(
+            memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
+        )
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+    def init_backends(self):
+        self._draft_worker.init_backends()
+
     @property
     def target_worker(self):
         return self._target_worker
@@ -724,7 +729,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def spec_v2_attn_backends(self) -> tuple:
         return (
             self._target_worker.model_runner.attn_backend,
-            *self._draft_worker.draft_extend_attn_backend_list,
+            *(
+                backend or runner.attn_backend
+                for backend, runner in zip(
+                    self._draft_worker.draft_extend_attn_backend_list,
+                    self._draft_worker.draft_runner_list,
+                )
+            ),
         )
 
     def clear_cache_pool(self):
