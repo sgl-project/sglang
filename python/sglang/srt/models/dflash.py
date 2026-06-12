@@ -12,7 +12,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -109,9 +112,27 @@ class DFlashAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
+            partial_rotary_factor=float(getattr(config, "partial_rotary_factor", 1.0)),
         )
 
         self.scaling = head_dim**-0.5
+
+        # MiMo DFlash draft extras from dflash_config: a sliding window over the
+        # draft block, a per-head attention sink bias, and a value scale. Defaults
+        # preserve the generic (sink-less, non-windowed, unscaled) draft behavior.
+        draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
+        swa_window = None
+        if draft_cfg.use_swa:
+            swa_window = draft_cfg.swa_window_size
+            if swa_window is None:
+                swa_window = getattr(config, "sliding_window", None)
+        self.v_scale: Optional[float] = draft_cfg.attention_value_scale
+        self.attention_sink_bias = (
+            nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
+            if draft_cfg.attention_sink_bias
+            else None
+        )
+
         # DFlash uses non-causal attention over the draft block.
         self.attn = RadixAttention(
             num_heads=self.num_heads,
@@ -120,6 +141,7 @@ class DFlashAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             attn_type=AttentionType.ENCODER_ONLY,
+            sliding_window_size=int(swa_window) if swa_window else -1,
         )
 
     def forward_prepare_npu(self, positions, hidden_states):
@@ -155,7 +177,16 @@ class DFlashAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        if self.v_scale is not None:
+            v = v * self.v_scale
+        # Forward the attention sink bias only when this draft has one; backends
+        # without sink support (e.g. FlashInfer) reject the `sinks=` kwarg.
+        if self.attention_sink_bias is not None:
+            attn_output = self.attn(
+                q, k, v, forward_batch, sinks=self.attention_sink_bias
+            )
+        else:
+            attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -419,6 +450,12 @@ class DFlashDraftModel(nn.Module):
                         f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
                         f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
                     )
+                if resolved_name.endswith("attention_sink_bias"):
+                    # The checkpoint stores the sink bias for all heads; copy the
+                    # slice owned by this TP rank (matching self.num_heads).
+                    start = get_tensor_model_parallel_rank() * param.numel()
+                    param.data.copy_(loaded_weight[start : start + param.numel()])
+                    continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
