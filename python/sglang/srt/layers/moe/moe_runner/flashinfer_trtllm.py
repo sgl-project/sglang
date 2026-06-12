@@ -637,7 +637,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
         else:
             a_q, a_sf = per_token_group_quant_fp8(
-                hidden_states, quant_info.weight_block_k
+                hidden_states,
+                quant_info.weight_block_k,
+                column_major_scales=True,
             )
             a_sf_t = a_sf.t().contiguous()
 

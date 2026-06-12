@@ -429,7 +429,7 @@ class MoEGate(nn.Module):
             correction_bias_dtype = torch.float32
             if quant_config is not None:
                 if (
-                    quant_config.get_name() == "modelopt_fp4"
+                    quant_config.get_name() in ("fp8", "modelopt_fp4")
                     and get_moe_runner_backend().is_flashinfer_trtllm()
                 ):
                     correction_bias_dtype = torch.bfloat16
