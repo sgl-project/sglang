@@ -58,14 +58,17 @@ _OWNER_SITES = {
     (*_MIXIN, "decode_batch_idx"): 1,
     (*_MIXIN, "evict"): 1,
     (*_MIXIN, "kv_allocated_len"): 1,
-    # Settle-at-result accounting: one full-settle mutation per resolve.
-    (*_RESOLVE, "kv_committed_len"): 1,
-    (*_RESOLVE, "spec_verify_ct"): 1,
-    # Non-spec decode settles its ledger in the result processor too.
+    # Settle-at-result accounting: one unified settle site for spec and
+    # non-spec decode.
     (
         "managers/scheduler_components/batch_result_processor.py",
         "SchedulerBatchResultProcessor.process_batch_result_decode",
         "kv_committed_len",
+    ): 1,
+    (
+        "managers/scheduler_components/batch_result_processor.py",
+        "SchedulerBatchResultProcessor.process_batch_result_decode",
+        "spec_verify_ct",
     ): 1,
     (
         "speculative/dflash_info_v2.py",

@@ -29,6 +29,9 @@ class GenerationBatchResult:
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
+    # CPU copy of accept_lens, stashed by _resolve_spec_v2_tokens for the
+    # ledger settle in process_batch_result_decode. None for non-spec.
+    accept_lens_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and

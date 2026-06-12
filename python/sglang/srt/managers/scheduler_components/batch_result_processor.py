@@ -535,6 +535,7 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
+        result.accept_lens_cpu = accept_lens
         result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
@@ -545,36 +546,15 @@ class SchedulerBatchResultProcessor:
             result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
         )
 
-        predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
-        for i, req in enumerate(batch.reqs):
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
-
-            if req.is_retracted:
-                # reset_for_retract() already zeroes committed/allocated KV.
-                continue
-
-            if req.finished():
-                # Over-decoded result of an already-finished req; the step
-                # never settles.
-                continue
-
-            # Settle at result: the verify forward that wrote this step's
-            # KV is done.
-            req.kv_committed_len += accept_lens[i]
-            req.spec_verify_ct += 1
-
-            num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-            req.spec_num_correct_drafts += num_correct_drafts
-            req.update_spec_correct_drafts_histogram(num_correct_drafts)
-
-        return predict_tokens
+        return [
+            next_token_ids[i * stride : i * stride + accept_lens[i]]
+            for i in range(len(batch.reqs))
+        ]
 
     def process_batch_result_idle(
         self,
@@ -615,16 +595,21 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
-        if batch.spec_algorithm.is_none():
-            # Settle the decode ledger: the forward that wrote this step's KV
-            # is done (spec settles in _resolve_spec_v2_tokens instead). Must
-            # run before the per-req loop -- the mamba track-boundary check
-            # reads kv_committed_len with this step included. Reqs finished or
-            # retracted in an earlier iteration never settle their step.
-            for req in batch.reqs:
-                if req.is_retracted or req.finished():
-                    continue
-                req.kv_committed_len += 1
+        # Settle the decode ledger: the forward that wrote this step's KV is
+        # done. Must run before the per-req loop -- the mamba track-boundary
+        # check reads kv_committed_len with this step included. Reqs finished
+        # or retracted in an earlier iteration never settle their step
+        # (retract already zeroed its ledger).
+        accept_lens = result.accept_lens_cpu  # None for non-spec: 1 token/req
+        for i, req in enumerate(batch.reqs):
+            if req.is_retracted or req.finished():
+                continue
+            req.kv_committed_len += 1 if accept_lens is None else accept_lens[i]
+            if accept_lens is not None:
+                req.spec_verify_ct += 1
+                num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
+                req.spec_num_correct_drafts += num_correct_drafts
+                req.update_spec_correct_drafts_histogram(num_correct_drafts)
 
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
