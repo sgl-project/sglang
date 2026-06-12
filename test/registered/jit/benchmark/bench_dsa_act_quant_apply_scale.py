@@ -24,7 +24,9 @@ from sglang.srt.layers.attention.dsa.triton_kernel import (
     act_quant,
     act_quant_apply_scale,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
 
+register_cuda_ci(est_time=5, suite="base-b-kernel-benchmark-1-gpu-large")
 
 INDEX_N_HEADS = 32
 INDEX_HEAD_DIM = 128

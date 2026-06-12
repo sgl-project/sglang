@@ -7,6 +7,28 @@ import triton.language as tl
 
 # Triton implementation
 @triton.jit
+def _quantize_group_to_fp8(x, round_scale: tl.constexpr):
+    fp8_min = -448.0
+    fp8_max = 448.0
+    fp8_max_inv = 1.0 / fp8_max
+
+    x_abs = tl.abs(x)
+    amax = tl.max(x_abs, axis=1)
+    amax = tl.maximum(amax, 1e-4)
+
+    if round_scale:
+        log_val = tl.log2(amax * fp8_max_inv)
+        log_ceil = tl.ceil(log_val)
+        scale = tl.exp2(log_ceil)
+    else:
+        scale = amax * fp8_max_inv
+
+    y = x / scale[:, None]
+    y = tl.minimum(tl.maximum(y, fp8_min), fp8_max)
+    return y, scale
+
+
+@triton.jit
 def _act_quant_kernel(
     X_ptr,
     Y_ptr,
@@ -27,11 +49,6 @@ def _act_quant_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    # FP8 constants
-    fp8_min = -448.0
-    fp8_max = 448.0
-    fp8_max_inv = 1.0 / fp8_max
-
     # Calculate row and column offsets
     row_start = pid_m * BLOCK_M
     col_start = pid_n * group_size
@@ -48,29 +65,7 @@ def _act_quant_kernel(
     # Load input data
     x_ptrs = X_ptr + rows[:, None] * N + cols[None, :]
     x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-
-    # Compute absolute max along columns (group_size dimension) for each row
-    x_abs = tl.abs(x)
-    amax = tl.max(x_abs, axis=1)  # Shape: (BLOCK_M,)
-
-    # Clamp amax to avoid division by zero
-    amax = tl.maximum(amax, 1e-4)
-
-    # Compute scale
-    if round_scale:
-        # Fast round scale using bit manipulation approximation
-        # This is a simplified version - the exact bit manipulation is harder in Triton
-        # Using log2 + ceil + pow2 as approximation
-        log_val = tl.log2(amax * fp8_max_inv)
-        log_ceil = tl.ceil(log_val)
-        scale = tl.exp2(log_ceil)
-    else:
-        scale = amax * fp8_max_inv
-
-    # Quantize: y = clamp(x / scale, fp8_min, fp8_max)
-    scale_broadcast = scale[:, None]
-    y = x / scale_broadcast
-    y = tl.minimum(tl.maximum(y, fp8_min), fp8_max)
+    y, scale = _quantize_group_to_fp8(x, round_scale)
 
     # Store quantized output
     y_ptrs = Y_ptr + rows[:, None] * N + cols[None, :]
@@ -159,10 +154,6 @@ def _act_quant_apply_scale_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    fp8_min = -448.0
-    fp8_max = 448.0
-    fp8_max_inv = 1.0 / fp8_max
-
     row_start = pid_m * BLOCK_M
     col_start = pid_n * group_size
 
@@ -175,20 +166,7 @@ def _act_quant_apply_scale_kernel(
 
     x_ptrs = X_ptr + rows[:, None] * N + cols[None, :]
     x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-
-    x_abs = tl.abs(x)
-    amax = tl.max(x_abs, axis=1)
-    amax = tl.maximum(amax, 1e-4)
-
-    if round_scale:
-        log_val = tl.log2(amax * fp8_max_inv)
-        log_ceil = tl.ceil(log_val)
-        scale = tl.exp2(log_ceil)
-    else:
-        scale = amax * fp8_max_inv
-
-    y = x / scale[:, None]
-    y = tl.minimum(tl.maximum(y, fp8_min), fp8_max)
+    y, scale = _quantize_group_to_fp8(x, round_scale)
 
     y_ptrs = Y_ptr + rows[:, None] * N + cols[None, :]
     tl.store(y_ptrs, y, mask=mask)
