@@ -139,7 +139,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(_compute_next_extend_prompt_token(req), 600)
 
         req.extend_range = Range(0, 805)
-        # prepare_for_extend re-derives the phase at each chunk's admission.
+        # The PrefillAdder re-derives the phase at each chunk's admission.
         req.phase = ReqPhase.EXTEND_LAST
 
         self.assertFalse(
