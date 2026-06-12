@@ -641,6 +641,16 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+class ReqPhase(Enum):
+    """Lifecycle phase of a request, written at the same places that mutate
+    the request's memory-management fields (prepare_for_extend,
+    prepare_for_decode, reset_for_retract)."""
+
+    QUEUED = auto()  # not scheduled yet, or retracted back to the queue
+    EXTEND = auto()  # admitted to a prefill/extend batch (incl. mid-chunk)
+    DECODE = auto()  # entered decode
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -697,6 +707,7 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
+        self.phase: ReqPhase = ReqPhase.QUEUED
         self.extend_range: Optional[Range] = None
         self.dllm_initialized: bool = False
 
@@ -1408,6 +1419,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        self.phase = ReqPhase.QUEUED
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -2043,6 +2055,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.extend_batch_idx += 1
 
             # update req-level memory management fields
+            req.phase = ReqPhase.EXTEND
             req.kv_committed_len = seq_len
             req.kv_allocated_len = seq_len
 
@@ -2600,6 +2613,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update req-level memory management fields
         for req in self.reqs:
+            req.phase = ReqPhase.DECODE
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1

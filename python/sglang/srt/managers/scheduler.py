@@ -160,6 +160,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
     Req,
+    ReqPhase,
     ScheduleBatch,
     release_req,
 )
@@ -2422,6 +2423,10 @@ class Scheduler(
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
+
+        # This path bypasses prepare_for_decode, so transition the phase here.
+        for r in reqs:
+            r.phase = ReqPhase.DECODE
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,
