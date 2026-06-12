@@ -135,13 +135,26 @@ if _is_npu:
     )
 
 _aiter_fused_qkv_split_qk_norm_rope_cache = None
-if _is_hip and get_bool_env_var("SGLANG_USE_AITER_FUSED_QK_NORM_ROPE_CACHE", "false"):
+if _is_hip:
     try:
         from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
             fused_qkv_split_qk_norm_rope_cache as _aiter_fused_qkv_split_qk_norm_rope_cache,
         )
     except ImportError:
         _aiter_fused_qkv_split_qk_norm_rope_cache = None
+
+
+_enable_aiter_qknorm_fusion: Optional[bool] = None
+
+
+def _use_aiter_qknorm_fusion() -> bool:
+    global _enable_aiter_qknorm_fusion
+    if _enable_aiter_qknorm_fusion is None:
+        _enable_aiter_qknorm_fusion = (
+            _aiter_fused_qkv_split_qk_norm_rope_cache is not None
+            and get_global_server_args().enable_aiter_qknorm_fusion
+        )
+    return _enable_aiter_qknorm_fusion
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -981,7 +994,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # every other platform, so skip the gating (and its mm/position probing)
         # entirely there and fall through to the native/NPU path unchanged.
         use_aiter_fused = False
-        if _aiter_fused_qkv_split_qk_norm_rope_cache is not None:
+        if _use_aiter_qknorm_fusion():
             # mRoPE uses 3-row positions [3, T] but the fused kernel does 1-D RoPE
             # only; fuse on row 0 only when there are no mm inputs (rows then identical).
             if positions.dim() == 2 and positions.shape[0] == 3:

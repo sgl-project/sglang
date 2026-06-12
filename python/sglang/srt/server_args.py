@@ -659,6 +659,7 @@ class ServerArgs:
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
+    enable_aiter_qknorm_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
@@ -6235,6 +6236,12 @@ class ServerArgs:
             "--enable-aiter-allreduce-fusion",
             action="store_true",
             help="Enable Aiter AllReduce Fusion.",
+        )
+        parser.add_argument(
+            "--enable-aiter-qknorm-fusion",
+            action="store_true",
+            help="Enable the fused aiter qk-norm kernel (qk-norm + RoPE + quant + "
+            "KV-cache-write) in the Qwen3.5 attention prologue (ROCm/aiter only).",
         )
         parser.add_argument(
             "--deepep-mode",
