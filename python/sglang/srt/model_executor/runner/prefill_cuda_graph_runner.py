@@ -471,9 +471,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     # -----------------------------------------------------------------
     # capture_prepare
     # -----------------------------------------------------------------
-    def capture_prepare(
-        self, num_tokens: int
-    ) -> tuple[ForwardBatch, "AttentionBackend"]:
+    def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
         Default tensor inputs are fresh literals; under a Breakable
