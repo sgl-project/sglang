@@ -530,7 +530,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
-    ) -> "ForwardMetadata":
+    ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
@@ -847,7 +847,7 @@ class AscendAttnBackend(AttentionBackend):
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        layer: "RadixAttention",
+        layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """CP-aware attention for standard (non-MLA) models using FIA on Ascend NPU.

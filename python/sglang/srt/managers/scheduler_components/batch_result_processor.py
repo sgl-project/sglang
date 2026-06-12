@@ -61,22 +61,22 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
-    disaggregation_mode: "DisaggregationMode"
+    disaggregation_mode: DisaggregationMode
     enable_overlap: bool
     enable_overlap_mlx: bool
-    server_args: "ServerArgs"
-    model_config: "ModelConfig"
-    token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator"
-    tree_cache: "BasePrefixCache"
-    hisparse_coordinator: Optional["HiSparseCoordinator"]
-    req_to_token_pool: "ReqToTokenPool"
-    decode_offload_manager: Optional["DecodeKVCacheOffloadManager"]
-    metrics_collector: "SchedulerMetricsCollector"
-    metrics_reporter: "SchedulerMetricsReporter"
-    draft_worker: "BaseTpWorker"
-    model_worker: "BaseTpWorker"
-    logprob_result_processor: "SchedulerLogprobResultProcessor"
-    output_streamer: "SchedulerOutputStreamer"
+    server_args: ServerArgs
+    model_config: ModelConfig
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    tree_cache: BasePrefixCache
+    hisparse_coordinator: Optional[HiSparseCoordinator]
+    req_to_token_pool: ReqToTokenPool
+    decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
+    metrics_collector: SchedulerMetricsCollector
+    metrics_reporter: SchedulerMetricsReporter
+    draft_worker: BaseTpWorker
+    model_worker: BaseTpWorker
+    logprob_result_processor: SchedulerLogprobResultProcessor
+    output_streamer: SchedulerOutputStreamer
     abort_request: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
