@@ -179,7 +179,7 @@ class SchedulerInvariantChecker:
         partially_extended_in_active = [
             req
             for req in self.get_active_reqs().values()
-            if req.is_partially_extended
+            if req.phase is ReqPhase.EXTEND_NON_LAST
             and req.req_pool_idx is not None
             and id(req) not in seen_ids
         ]
@@ -220,7 +220,11 @@ class SchedulerInvariantChecker:
                     f"DECODE req behind its extend frontier: {req.rid=} "
                     f"{req.kv_committed_len=} {req.extend_range=}"
                 )
-            elif req.phase.is_extend():
+            elif req.phase in (ReqPhase.EXTEND_NON_LAST, ReqPhase.EXTEND_LAST):
+                assert req.extend_range.end > 0, (
+                    f"extend req with an empty admitted range: {req.rid=} "
+                    f"{req.extend_range=}"
+                )
                 assert req.kv_committed_len <= req.extend_range.end, (
                     f"extend req past its extend frontier: {req.rid=} "
                     f"{req.kv_committed_len=} {req.extend_range=}"

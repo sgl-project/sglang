@@ -134,7 +134,6 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             extend_input_len=fill_len - self.INITIAL_PREFIX_LEN,
             fill_len=fill_len,
         )
-        self.assertTrue(req.is_partially_extended)
         s = _scheduler_for_get_next_batch(tree_cache=cache, partially_extended_req=req)
         return s, req, initial_prefix, pool
 

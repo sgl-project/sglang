@@ -956,7 +956,11 @@ class Scheduler(
         ), f"running not subset of active: {running_rids - active_rids}"
 
     def partially_extended_reqs(self) -> List[Req]:
-        return [r for r in self.active_reqs.values() if r.is_partially_extended]
+        return [
+            r
+            for r in self.active_reqs.values()
+            if r.phase is ReqPhase.EXTEND_NON_LAST
+        ]
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -2822,7 +2826,7 @@ class Scheduler(
         new_batch.prepare_for_extend()
 
         partially_extended_in_batch = [
-            r for r in can_run_list if r.is_partially_extended
+            r for r in can_run_list if r.phase is ReqPhase.EXTEND_NON_LAST
         ]
         assert (
             len(partially_extended_in_batch) <= 1

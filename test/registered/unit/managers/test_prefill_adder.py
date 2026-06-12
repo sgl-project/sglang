@@ -90,7 +90,7 @@ class TestPrefillAdder(CustomTestCase):
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.finished.return_value = False
-        req.is_partially_extended = False
+        req.phase = ReqPhase.OTHERS
         req.is_dllm.return_value = False
         req.host_hit_length = 0
         req.needs_host_load_back.return_value = False
@@ -132,7 +132,6 @@ class TestPrefillAdder(CustomTestCase):
             extend_end=600,
         )
 
-        self.assertTrue(req.is_partially_extended)
         self.assertEqual(req.get_full_untruncated_fill_len(), 805)
         self.assertTrue(
             _compute_is_extend_intermediate(req, dllm_config=None, forward_mode=None)
@@ -143,7 +142,6 @@ class TestPrefillAdder(CustomTestCase):
         # prepare_for_extend re-derives the phase at each chunk's admission.
         req.phase = ReqPhase.EXTEND_LAST
 
-        self.assertFalse(req.is_partially_extended)
         self.assertFalse(
             _compute_is_extend_intermediate(req, dllm_config=None, forward_mode=None)
         )
@@ -163,7 +161,6 @@ class TestPrefillAdder(CustomTestCase):
         # None and it never counts as having a pending chunk, regardless of how
         # many output_ids have accumulated past the prompt length.
         req.extend_range = None
-        self.assertFalse(req.is_partially_extended)
 
         # A fresh single-chunk prefill whose extend_range already covers the full
         # prompt (no output yet) is the last chunk: not pending, no next token.
@@ -177,7 +174,6 @@ class TestPrefillAdder(CustomTestCase):
         last_chunk_req.retracted_stain = False
 
         self.assertEqual(last_chunk_req.get_full_untruncated_fill_len(), 128)
-        self.assertFalse(last_chunk_req.is_partially_extended)
         self.assertFalse(
             _compute_is_extend_intermediate(
                 last_chunk_req, dllm_config=None, forward_mode=None
@@ -546,7 +542,7 @@ class TestPrefillAdder(CustomTestCase):
         adder.is_hybrid_swa = is_hybrid_swa
 
         req = self.create_mock_req("resumed", priority=0, max_new_tokens=128)
-        req.is_partially_extended = True
+        req.phase = ReqPhase.EXTEND_NON_LAST
         req.prefix_indices = []
         req.get_full_untruncated_fill_len.return_value = extend_input_len
         # set_extend_range is the only writer of extend_range; the production

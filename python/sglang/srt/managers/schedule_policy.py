@@ -37,7 +37,7 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ReqPhase, ScheduleBatch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -704,7 +704,7 @@ class PrefillAdder:
 
     def add_resumed_extend_req(self, req: Req) -> AddReqResult:
         assert (
-            req.is_partially_extended and not req.is_dllm()
+            req.phase is ReqPhase.EXTEND_NON_LAST and not req.is_dllm()
         ), f"non-resume req {req.rid}"
 
         if self.dllm_config is not None:
@@ -867,7 +867,7 @@ class PrefillAdder:
     def add_unstarted_extend_req(
         self, req: Req, truncation_align_size: Optional[int]
     ) -> AddReqResult:
-        assert not req.is_partially_extended or req.is_dllm(), (
+        assert req.phase is not ReqPhase.EXTEND_NON_LAST or req.is_dllm(), (
             f"add_unstarted_extend_req called on partially-extended req {req.rid}; "
             f"scheduler-side dispatch broken"
         )

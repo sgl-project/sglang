@@ -662,9 +662,6 @@ class ReqPhase(Enum):
     EXTEND_LAST = auto()
     DECODE = auto()  # entered decode
 
-    def is_extend(self) -> bool:
-        return self in (ReqPhase.EXTEND_NON_LAST, ReqPhase.EXTEND_LAST)
-
 
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
@@ -1007,13 +1004,6 @@ class Req(ReqDllmMixin):
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
-
-    @property
-    def is_partially_extended(self) -> bool:
-        if self.is_dllm() or self.phase != ReqPhase.EXTEND_NON_LAST:
-            return False
-        assert self.extend_range.end > 0, f"{self.rid=} {self.extend_range=}"
-        return True
 
     @property
     def is_prefill_only(self) -> bool:

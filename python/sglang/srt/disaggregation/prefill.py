@@ -562,7 +562,7 @@ class SchedulerDisaggregationPrefillMixin:
         optimistic_reqs = [
             (i, req)
             for i, req in enumerate(batch.reqs)
-            if req.pending_bootstrap and not req.is_partially_extended
+            if req.pending_bootstrap and req.phase is not ReqPhase.EXTEND_NON_LAST
         ]
         if optimistic_reqs:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -848,8 +848,8 @@ class SchedulerDisaggregationPrefillMixin:
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
         # The stateless scheduler derives the current partially-extended req from
-        # partially_extended_reqs() = active_reqs entries whose is_partially_extended is True,
-        # and is_partially_extended ignores req.finished(). An aborted req still
+        # partially_extended_reqs() = active_reqs entries in the EXTEND_NON_LAST
+        # phase, which ignores req.finished(). An aborted req still
         # sitting in active_reqs with a non-None extend_range would be re-derived
         # as a partially-extended req and crash process_prefill_chunk (req_pool_idx=None).
         # Remove it from active_reqs and clear the extend state defensively.

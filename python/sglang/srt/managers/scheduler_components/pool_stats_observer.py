@@ -11,6 +11,8 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.managers.schedule_batch import ReqPhase
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -176,7 +178,7 @@ class SchedulerPoolStatsObserver:
                 if req.req_pool_idx is not None:
                     idxs.add(req.req_pool_idx)
         for req in self.get_active_reqs().values():
-            if req.is_partially_extended and req.req_pool_idx is not None:
+            if req.phase is ReqPhase.EXTEND_NON_LAST and req.req_pool_idx is not None:
                 idxs.add(req.req_pool_idx)
         return idxs
 
