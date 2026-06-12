@@ -14,6 +14,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cdiv,
@@ -177,9 +178,13 @@ def _get_sm_count(device: torch.device) -> int:
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
-    # When piecewise cuda graph is enabled, use a constant value to avoid
-    # torch.compile creating guards on the dynamic batch dimension.
+    # Use a constant value when the row count must not affect kernel numerics.
+    if is_batch_invariant_mode_enabled():
+        return MAX_ROWS_PER_BLOCK
+
     try:
+        # When piecewise cuda graph is enabled, use a constant value to avoid
+        # torch.compile creating guards on the dynamic batch dimension.
         if not get_global_server_args().disable_piecewise_cuda_graph:
             return MAX_ROWS_PER_BLOCK
     except ValueError:
