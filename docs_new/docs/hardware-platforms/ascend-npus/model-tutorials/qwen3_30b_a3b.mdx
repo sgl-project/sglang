@@ -26,7 +26,7 @@ v0.5.10 or a later version.
 | Tensor Parallelism            | `--tp-size 2`                                                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 35000`                                        |
-| NPU Graph                     | `--cuda-graph-bs-decode 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162`                    |
+| NPU Graph                     | `--cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162`                    |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | Disable Radix Cache           | `--disable-radix-cache`                                                                       |
@@ -138,7 +138,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the W8A8 quantized model with 2 NPUs on a single Atlas 800I A3 node.
+with limited hardware resources. The following command is based on the **W8A8** quantized model with 2 NPUs on a single Atlas 800I A3 node.
 
 ```bash Launch server
 #============================================================
@@ -188,7 +188,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 35000 \
-    --tp-size 2 --mem-fraction-static 0.87 --cuda-graph-bs-decode 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
+    --tp-size 2 --mem-fraction-static 0.87 --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
     --dtype bfloat16
 ```
 

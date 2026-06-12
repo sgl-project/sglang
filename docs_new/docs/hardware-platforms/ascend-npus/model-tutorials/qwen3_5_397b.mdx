@@ -29,7 +29,7 @@ use v0.5.10 or a later version.
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 35000`                                        |
-| NPU Graph                     | `--cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20` |
+| NPU Graph                     | `--cuda-graph-bs 2 4 6 8 10 12 14 16 18 20` |
 | Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
@@ -141,7 +141,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the W8A8 quantized model.
+with limited hardware resources. The following command is based on the **W8A8** quantized model.
 
 ```bash Launch server
 #============================================================
@@ -200,7 +200,7 @@ python3 -m sglang.launch_server \
 --host 127.0.0.1 --max-running-requests 160 \
 --mem-fraction-static 0.8 \
 --port 6699 \
---cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 \
+--cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 \
 --quantization modelslim \
 --enable-multimodal --moe-a2a-backend deepep --deepep-mode auto \
 --mm-attention-backend ascend_attn \

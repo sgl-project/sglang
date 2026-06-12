@@ -28,7 +28,7 @@ v0.5.10 or a later version.
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                     |
 | Quantization                  | `--quantization modelslim`                                                        |
 | Chunked Prefill               | `--chunked-prefill-size 16384 --max-prefill-tokens 280000`                        |
-| NPU Graph                     | `--cuda-graph-bs-decode 16`                                                       |
+| NPU Graph                     | `--cuda-graph-bs 16`                                                       |
 | Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`              |
 | Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                            |
@@ -139,7 +139,7 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the W4A8 quantized model.
+with limited hardware resources. The following command is based on the **W4A8** quantized model.
 
 ```bash Launch server
 #============================================================
@@ -184,7 +184,7 @@ python3 -m sglang.launch_server \
         --mem-fraction-static 0.7 \
         --port 8000 \
         --served-model-name glm-5.1 \
-        --cuda-graph-bs-decode 16 \
+        --cuda-graph-bs 16 \
         --moe-a2a-backend deepep --deepep-mode auto
 ```
 
@@ -194,7 +194,7 @@ For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms
 
 Multi-node deployment distributes the model across multiple Atlas 800I A3 nodes using tensor parallelism while keeping
 prefill and decode on the same nodes (PD mixed mode), suitable for scenarios that need more device memory than a single
-node can provide. The following command is based on the W4A8 quantized model.
+node can provide. The following command is based on the **W4A8** quantized model.
 
 #### 2 x Atlas 800I A3 (W4A8)
 
@@ -268,7 +268,7 @@ do
         --mem-fraction-static 0.65 \
         --port 8000 \
         --served-model-name glm-5.1 \
-        --cuda-graph-max-bs-decode 8 \
+        --cuda-graph-max-bs 8 \
         --max-running-requests 128 \
         --quantization modelslim \
         --speculative-draft-model-quantization unquant \
@@ -284,7 +284,7 @@ done
 ### Multi-node PD disaggregation deployment
 
 PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
-throughput for high-concurrency scenarios. The following command is based on the W4A8 quantized model.
+throughput for high-concurrency scenarios. The following command is based on the **W4A8** quantized model.
 
 #### 4 x Atlas 800I A3 (W4A8)
 
@@ -396,7 +396,7 @@ do
         --port 8003 --trust-remote-code --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --ep-size 32 \
         --mem-fraction-static 0.87 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
         --served-model-name glm-5.1 --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency \
-        --cuda-graph-bs-decode 1 2 3 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
+        --cuda-graph-bs 1 2 3 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
         --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
