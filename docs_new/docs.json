@@ -982,6 +982,12 @@
                     ]
                   },
                   {
+                    "group": "LiquidAI",
+                    "pages": [
+                      "cookbook/autoregressive/LiquidAI/LFM2.5"
+                    ]
+                  },
+                  {
                     "group": "OpenAI",
                     "pages": [
                       "cookbook/autoregressive/OpenAI/GPT-OSS"
