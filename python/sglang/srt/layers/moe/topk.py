@@ -314,7 +314,7 @@ class BypassedTopKOutput(NamedTuple):
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
 
-    def to_standard(self, layer_id: Optional[int] = None) -> "StandardTopKOutput":
+    def to_standard(self, layer_id: Optional[int] = None) -> StandardTopKOutput:
         """Materialize routing tensors. Used by MoE kernels that need explicit
         topk_ids / topk_weights rather than doing routing internally."""
         return select_experts(
@@ -1506,6 +1506,9 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_hip:
+        topk_ids = _biased_grouped_topk_postprocess(
+            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        )
         # On AMD HIP, the aiter MoE kernels do not handle topk_ids=-1 safely
         # (negative indices cause illegal memory access). Instead, zero the
         # routing weights for padded tokens so their MoE output contributes

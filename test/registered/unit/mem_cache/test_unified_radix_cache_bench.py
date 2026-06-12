@@ -38,9 +38,10 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import Compone
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
 # Constants

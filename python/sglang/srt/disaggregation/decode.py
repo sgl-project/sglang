@@ -146,7 +146,7 @@ class DecodeReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
+    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
@@ -170,7 +170,7 @@ class DecodeReqToTokenPool:
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
-    def free(self, req: "Req"):
+    def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
@@ -186,7 +186,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        cache_params: "Mamba2CacheParams",
+        cache_params: Mamba2CacheParams,
         mamba_layer_ids: List[int],
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
@@ -564,6 +564,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Add a request to the pending queue."""
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
+
+    def release_memory_occupation(self):
+        self.queue.clear()
+        self.retracted_queue.clear()
+        if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
+            self.kv_manager.deregister_buffer_to_engine()
+
+    def resume_memory_occupation(self):
+        if hasattr(self.kv_manager, "register_buffer_to_engine"):
+            self.kv_manager.register_buffer_to_engine()
 
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
@@ -1696,6 +1706,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ]
 
         return transferred_reqs
+
+    def release_memory_occupation(self):
+        """Clean up in-flight transfers before releasing GPU memory."""
+        self.queue.clear()
+
+    def resume_memory_occupation(self):
+        """Queues are already cleared on release; new transfers can be accepted."""
+        pass
 
 
 class SchedulerDisaggregationDecodeMixin:
