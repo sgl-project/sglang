@@ -34,10 +34,7 @@ if TYPE_CHECKING:
 
 if is_flashinfer_available():
     from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import (
-        convert_to_block_layout,
-        trtllm_mxint4_block_scale_moe,
-    )
+    from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
@@ -168,92 +165,83 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         """Prepare quantized weights for kernel (done offline with weights)."""
 
         epilogue_tile_m = 128
-        gemm1_weights_mxint4_shuffled = []
-        gemm1_scales_shuffled = []
-        gemm2_weights_mxint4_shuffled = []
-        gemm2_scales_shuffled = []
 
-        def repack(w):
-            assert w.dim() == 2 and w.dtype == torch.int32
+        def repack_batched(w):
+            assert w.dim() == 3 and w.dtype == torch.int32
             shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=w.device)
-            w = (w.unsqueeze(2) >> shifts) & 0x0F
-            w = (w - 8).to(torch.int8).reshape(w.shape[0], -1, 2)
+            w = (w.unsqueeze(-1) >> shifts) & 0x0F
+            w = (w - 8).to(torch.int8).reshape(w.shape[0], w.shape[1], -1, 2)
             w = (w[..., 0] & 0x0F) | ((w[..., 1] & 0x0F) << 4)
             w = w.to(torch.uint8)
             return w
 
-        for i in range(num_experts):
-            # NOTE(HandH1998):
-            # the huggingface weight format follows (w/s + 8) to pack,
-            # however, trtllm requires (w/s) to pack
-            # we need to convert the weight to trtllm's format first
-            cur_expert_gemm1_weight = repack(gemm1_weights[i])
-            cur_expert_gemm2_weight = repack(gemm2_weights[i])
-
-            # Calculate the permute indices for the following:
-            # 1. Reorder rows of W1 and scales for fused gated activation
-            # 2. Shuffle weights and scaling factors for transposed mma output
-            # for both w3_w1 and w2 weights and scale factors
-            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
-                self._cache_permute_indices,
-                cur_expert_gemm1_weight,
-                epilogue_tile_m,
+        def convert_to_block_layout_batched(input_tensor, block_k):
+            num_experts, m, k = input_tensor.shape
+            assert k % block_k == 0, "K must be divisible by blockK"
+            return (
+                input_tensor.view(num_experts, m, k // block_k, block_k)
+                .permute(0, 2, 1, 3)
+                .contiguous()
             )
-            gemm1_weights_shuffled = cur_expert_gemm1_weight[
-                permute_indices.to(gemm1_weights.device)
+
+        # NOTE(HandH1998):
+        # the huggingface weight format follows (w/s + 8) to pack,
+        # however, trtllm requires (w/s) to pack
+        # we need to convert the weight to trtllm's format first
+        gemm1_weights_repacked = repack_batched(gemm1_weights)
+        gemm2_weights_repacked = repack_batched(gemm2_weights)
+
+        # Calculate the permute indices for the following:
+        # 1. Reorder rows of W1 and scales for fused gated activation
+        # 2. Shuffle weights and scaling factors for transposed mma output
+        # for both w3_w1 and w2 weights and scale factors
+        gemm1_weight_permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            self._cache_permute_indices,
+            gemm1_weights_repacked[0],
+            epilogue_tile_m,
+        ).to(gemm1_weights.device)
+        gemm1_scale_permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            self._cache_permute_indices,
+            gemm1_scales[0].to(torch.bfloat16),
+            epilogue_tile_m,
+            num_elts_per_sf=32,
+        ).to(gemm1_scales.device)
+        gemm2_weight_permute_indices = get_w2_permute_indices_with_cache(
+            self._cache_permute_indices,
+            gemm2_weights_repacked[0],
+            epilogue_tile_m,
+        ).to(gemm2_weights.device)
+        gemm2_scale_permute_indices = get_w2_permute_indices_with_cache(
+            self._cache_permute_indices,
+            gemm2_scales[0].to(torch.bfloat16),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        ).to(gemm2_scales.device)
+
+        gemm1_weights_shuffled = gemm1_weights_repacked[
+            :, gemm1_weight_permute_indices, :
+        ].contiguous()
+        gemm2_weights_shuffled = gemm2_weights_repacked[
+            :, gemm2_weight_permute_indices, :
+        ].contiguous()
+        gemm1_scales_shuffled = block_scale_interleave(
+            gemm1_scales.to(torch.bfloat16)[
+                :, gemm1_scale_permute_indices, :
             ].contiguous()
-            permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
-                self._cache_permute_indices,
-                gemm1_scales[i].to(torch.bfloat16),
-                epilogue_tile_m,
-                num_elts_per_sf=32,
-            )
-            gemm1_scales_shuffled.append(
-                block_scale_interleave(
-                    gemm1_scales[i]
-                    .to(torch.bfloat16)[permute_sf_indices.to(gemm1_scales.device)]
-                    .contiguous()
-                )
-            )
-
-            permute_indices = get_w2_permute_indices_with_cache(
-                self._cache_permute_indices,
-                cur_expert_gemm2_weight,
-                epilogue_tile_m,
-            )
-            gemm2_weights_shuffled = cur_expert_gemm2_weight[
-                permute_indices.to(gemm2_weights.device)
+        ).reshape(num_experts, -1)
+        gemm2_scales_shuffled = block_scale_interleave(
+            gemm2_scales.to(torch.bfloat16)[
+                :, gemm2_scale_permute_indices, :
             ].contiguous()
+        ).reshape(num_experts, -1)
 
-            permute_sf_indices = get_w2_permute_indices_with_cache(
-                self._cache_permute_indices,
-                gemm2_scales[i].to(torch.bfloat16),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            gemm2_scales_shuffled.append(
-                block_scale_interleave(
-                    gemm2_scales[i]
-                    .to(torch.bfloat16)[permute_sf_indices.to(gemm2_scales.device)]
-                    .contiguous()
-                )
-            )
-
-            block_k = 128
-            gemm1_weights_shuffled = convert_to_block_layout(
-                gemm1_weights_shuffled.view(torch.uint8), block_k
-            )
-            gemm2_weights_shuffled = convert_to_block_layout(
-                gemm2_weights_shuffled.view(torch.uint8), block_k
-            )
-
-            gemm1_weights_mxint4_shuffled.append(gemm1_weights_shuffled)
-            gemm2_weights_mxint4_shuffled.append(gemm2_weights_shuffled)
-
-        gemm1_weights_mxint4_shuffled = torch.stack(gemm1_weights_mxint4_shuffled)
-        gemm2_weights_mxint4_shuffled = torch.stack(gemm2_weights_mxint4_shuffled)
-        gemm1_scales_shuffled = torch.stack(gemm1_scales_shuffled).view(torch.bfloat16)
-        gemm2_scales_shuffled = torch.stack(gemm2_scales_shuffled).view(torch.bfloat16)
+        block_k = 128
+        gemm1_weights_mxint4_shuffled = convert_to_block_layout_batched(
+            gemm1_weights_shuffled.view(torch.uint8), block_k
+        )
+        gemm2_weights_mxint4_shuffled = convert_to_block_layout_batched(
+            gemm2_weights_shuffled.view(torch.uint8), block_k
+        )
 
         return (
             gemm1_weights_mxint4_shuffled,
