@@ -1210,9 +1210,11 @@ class MMEncoder:
                         # Move cached CPU slices to GPU and match model dtype
                         device = torch.device(f"cuda:{self.gpu_id}")
                         final_slices = [
-                            s.to(device=device, dtype=self._embedding_dtype)
-                            if s.device.type == "cpu"
-                            else s
+                            (
+                                s.to(device=device, dtype=self._embedding_dtype)
+                                if s.device.type == "cpu"
+                                else s
+                            )
                             for s in final_slices
                         ]
                         mm_embedding = torch.cat(final_slices, dim=0)
@@ -1237,7 +1239,9 @@ class MMEncoder:
                         all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
                         all_new_slices = list(new_slices)
                         if fallback_slices is not None:
-                            all_new_hashes += [str_mm_hashes[i] for i in fallback_indices]
+                            all_new_hashes += [
+                                str_mm_hashes[i] for i in fallback_indices
+                            ]
                             all_new_slices += list(fallback_slices)
                         if all_new_hashes:
 
