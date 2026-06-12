@@ -561,17 +561,13 @@ class SchedulerBatchResultProcessor:
                 continue
 
             if req.finished():
-                if not batch.spec_algorithm.is_dflash():
-                    # EAGLE prepare_for_decode pre-claimed the bonus slot.
-                    req.kv_committed_len -= 1
+                # Stale result of an over-decoded step (the req finished in an
+                # earlier iteration); the step never settles.
                 continue
 
-            if batch.spec_algorithm.is_dflash():
-                # DFLASH materialized accepted draft tokens plus the bonus token.
-                req.kv_committed_len += accept_lens[i]
-            else:
-                # EAGLE prepare_for_decode pre-claimed the bonus slot.
-                req.kv_committed_len += accept_lens[i] - 1
+            # Settle this step's commit now that the verify forward has
+            # completed and its KV is written.
+            req.kv_committed_len += accept_lens[i]
             req.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -704,6 +700,16 @@ class SchedulerBatchResultProcessor:
             pass  # MLX path: already a list[int], skip torch round-trip
         else:
             next_token_ids = next_token_ids.tolist()
+
+        if batch.spec_algorithm.is_none():
+            # Settle the decode ledger now that the forward that wrote this
+            # step's KV has completed (mirror of _resolve_spec_v2_tokens).
+            # Skip stale results of reqs that finished or retracted in an
+            # earlier iteration: their step never settles.
+            for req in batch.reqs:
+                if req.is_retracted or req.finished():
+                    continue
+                req.kv_committed_len += 1
 
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
@@ -883,11 +889,11 @@ class SchedulerBatchResultProcessor:
 
         Returns (at_boundary, track_seqlen).  The boundary condition
         matches what the forward's tracking mask used:
-        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
-        ``kv_committed_len`` by 1, then checks
-        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
-        here reproduces that check exactly, and the value is always a
-        multiple of ``interval`` (hence page-aligned).
+        ``prepare_for_decode`` increments ``seq_lens_cpu`` by 1 and checks
+        ``seq_lens_cpu % interval == 0``; ``kv_committed_len`` settles to the
+        same value earlier in result processing, so using it here reproduces
+        that check exactly, and the value is always a multiple of
+        ``interval`` (hence page-aligned).
 
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
