@@ -17,11 +17,13 @@
 # limitations under the License.
 
 import contextvars
+import logging
 from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
@@ -63,6 +65,8 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils import (
     split_for_parallel_decode,
     split_for_parallel_encode,
 )
+
+logger = logging.getLogger(__name__)
 
 CACHE_T = 2
 
@@ -802,6 +806,59 @@ def unpatchify(x, patch_size):
     return x
 
 
+class FusedWanRMSNormSiLU(nn.Module):
+    """WanRMS_norm + SiLU fused into a single torch.compile kernel.
+
+    Reuses the wrapped norm's params and keeps the parent attribute name, so
+    state_dict keys are unchanged.
+    """
+
+    def __init__(self, norm: WanRMS_norm) -> None:
+        super().__init__()
+        self.channel_first = norm.channel_first
+        self.scale = norm.scale
+        self.gamma = norm.gamma
+        self.bias = norm.bias  # Parameter, or float 0.0 when bias=False
+        self._compiled = torch.compile(self._norm_silu, dynamic=None)
+
+    def _norm_silu(self, x: torch.Tensor) -> torch.Tensor:
+        normed = (
+            F.normalize(x, dim=(1 if self.channel_first else -1))
+            * self.scale
+            * self.gamma
+            + self.bias
+        )
+        return F.silu(normed).to(dtype=x.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Mark spatial dims dynamic so we don't recompile per resolution/tile.
+        spatial = (3, 4) if x.dim() == 5 else (2, 3) if x.dim() == 4 else ()
+        for d in spatial:
+            torch._dynamo.mark_dynamic(x, d)
+        return self._compiled(x)
+
+
+def _fuse_wan_vae_rmsnorm_silu(root: nn.Module) -> int:
+    """Replace WanRMS_norm + SiLU pairs in-place; return the number fused."""
+    count = 0
+    for m in root.modules():
+        nl = getattr(m, "nonlinearity", None)
+        if not isinstance(nl, nn.SiLU):
+            continue
+        norm1, norm2 = getattr(m, "norm1", None), getattr(m, "norm2", None)
+        norm_out = getattr(m, "norm_out", None)
+        if isinstance(norm1, WanRMS_norm) and isinstance(norm2, WanRMS_norm):
+            m.norm1 = FusedWanRMSNormSiLU(norm1)
+            m.norm2 = FusedWanRMSNormSiLU(norm2)
+            m.nonlinearity = nn.Identity()
+            count += 2
+        elif isinstance(norm_out, WanRMS_norm):
+            m.norm_out = FusedWanRMSNormSiLU(norm_out)
+            m.nonlinearity = nn.Identity()
+            count += 1
+    return count
+
+
 class AutoencoderKLWan(ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding videos into latents and decoding latent representations into videos.
@@ -864,6 +921,15 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
         self.use_feature_cache = config.use_feature_cache
         self._causal_decode_initialized = False
+
+    def apply_compile_fusions(self) -> None:
+        """Fuse WanRMS_norm + SiLU into torch.compile-generated kernels.
+
+        Invoked by the VAE loader when `--enable-torch-compile` is set (the
+        same flag that compiles the DiT).
+        """
+        n = _fuse_wan_vae_rmsnorm_silu(self)
+        logger.info("Wan VAE: fused %d RMSNorm+SiLU sites (torch.compile)", n)
 
     def clear_cache(self) -> None:
 

@@ -65,6 +65,16 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
     return num_converted
 
 
+def _maybe_apply_vae_compile_fusions(vae: nn.Module) -> None:
+    """Apply a VAE's torch.compile fusions if it defines them, else no-op.
+
+    Tied to `--enable-torch-compile` (the same flag that compiles the DiT).
+    """
+    apply_fusions = getattr(vae, "apply_compile_fusions", None)
+    if callable(apply_fusions):
+        apply_fusions()
+
+
 def _should_use_channels_last_3d(
     server_args: ServerArgs | None, component_name: str
 ) -> bool:
@@ -159,6 +169,8 @@ class VAELoader(ComponentLoader):
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
+            if server_args.enable_torch_compile:
+                _maybe_apply_vae_compile_fusions(vae)
             vae = current_platform.optimize_vae(vae)
             return vae
 
@@ -200,6 +212,9 @@ class VAELoader(ComponentLoader):
             n = _convert_conv3d_weights_to_channels_last_3d(vae)
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
+
+        if server_args.enable_torch_compile:
+            _maybe_apply_vae_compile_fusions(vae)
 
         vae = current_platform.optimize_vae(vae)
         return vae
