@@ -184,7 +184,6 @@ class DSV4AttnMetadata:
                 "c4_sparse_topk_lengths_raw",
                 "c4_sparse_page_indices",
                 "c4_sparse_raw_indices",
-                "unified_swa_loc",
                 "unified_swa_indices",
                 "unified_swa_indptr",
                 "unified_hca_indices",
@@ -200,6 +199,7 @@ class DSV4AttnMetadata:
                 # Recomputed by the recorded init_forward_metadata_in_graph op
                 # each forward; not copied across replays.
                 "swa_out_cache_loc",
+                "unified_swa_loc",
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
