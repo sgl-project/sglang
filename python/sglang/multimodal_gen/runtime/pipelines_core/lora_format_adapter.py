@@ -105,6 +105,46 @@ def _looks_like_qwen_image(state_dict: Mapping[str, torch.Tensor]) -> bool:
     )
 
 
+def _looks_like_zimage_diffusers(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """Detect diffusers-PEFT Z-Image LoRA.
+
+    `ZImagePipeline.save_lora_weights(transformer_lora_layers=...)` prefixes every
+    key with `transformer.`, giving patterns like:
+        transformer.layers.{N}.attention.to_q.lora_{A,B}.weight
+        transformer.{noise,context}_refiner.{N}.feed_forward.w{1,2,3}.lora_{A,B}.weight
+
+    We require Z-Image specific fingerprints on top of the prefix + lora_A/B
+    check to avoid false-positives on other diffusers LoRAs that also carry a
+    `transformer.` prefix (Qwen-Image, ErnieImage, etc). Two fingerprints
+    cover the realistic target_modules combinations:
+      - `noise_refiner` or `context_refiner` branch — unique to Z-Image.
+      - `feed_forward.w1/w2/w3` — Z-Image's Gated-MLP naming (Ernie uses `mlp`,
+        Qwen uses `transformer_blocks.*.ff`, etc).
+    Either signal is sufficient. Pure attention-only LoRAs without any FFN or
+    refiner coverage remain undetectable by keys alone — left as an explicit
+    gap rather than widening to `transformer.layers.*` which would misfire on
+    ErnieImage attention-only LoRAs (same key shape after PEFT export).
+    """
+    keys = list(state_dict.keys())
+    if not keys:
+        return False
+    has_prefix = _has_prefix_key(keys, "transformer.")
+    has_lora_ab = _has_substring_key(keys, ".lora_A") or _has_substring_key(
+        keys, ".lora_B"
+    )
+    if not (has_prefix and has_lora_ab):
+        return False
+    has_refiner = _has_prefix_key(
+        keys, "transformer.noise_refiner."
+    ) or _has_prefix_key(keys, "transformer.context_refiner.")
+    has_gated_ffn = (
+        _has_substring_key(keys, ".feed_forward.w1.")
+        or _has_substring_key(keys, ".feed_forward.w2.")
+        or _has_substring_key(keys, ".feed_forward.w3.")
+    )
+    return has_refiner or has_gated_ffn
+
+
 def _looks_like_ai_toolkit_flux_lora(state_dict: Mapping[str, torch.Tensor]) -> bool:
     """Detect ai-toolkit/ComfyUI trained Flux LoRA with double_blocks/single_blocks naming.
 
@@ -185,6 +225,22 @@ def _convert_qwen_image_standard(
 
         out[new_name] = tensor
 
+    return out
+
+
+def _convert_zimage_diffusers_standard(
+    state_dict: Mapping[str, torch.Tensor],
+    log: logging.Logger,
+) -> Dict[str, torch.Tensor]:
+    """Strip leading `transformer.` prefix from Z-Image diffusers PEFT LoRA keys
+    so they match `ZImageTransformer2DModel.named_modules()` (which has no
+    prefix). Mirrors the Qwen-Image case.
+    """
+    out: Dict[str, torch.Tensor] = {}
+    prefix = "transformer."
+    for name, tensor in state_dict.items():
+        new_name = name[len(prefix) :] if name.startswith(prefix) else name
+        out[new_name] = tensor
     return out
 
 
@@ -520,6 +576,9 @@ def convert_lora_state_dict_by_format(
 
         if _looks_like_qwen_image(maybe):
             return _convert_qwen_image_standard(maybe, log)
+
+        if _looks_like_zimage_diffusers(maybe):
+            return _convert_zimage_diffusers_standard(maybe, log)
 
         return maybe
 
