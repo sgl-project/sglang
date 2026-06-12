@@ -65,6 +65,109 @@ metric_b_total{source="w1"} 10
 }
 
 #[test]
+fn test_aggregate_mismatched_label_schemas() {
+    // Prefill worker: no dp_rank label
+    let pack_prefill = MetricPack {
+        labels: vec![("engine_type".to_string(), "prefill".to_string())],
+        metrics_text: r#"
+# HELP sglang_num_running_reqs The number of running requests
+# TYPE sglang_num_running_reqs gauge
+sglang_num_running_reqs{model_name="llama"} 10
+"#
+        .to_string(),
+    };
+    // Decode worker: has extra dp_rank label
+    let pack_decode = MetricPack {
+        labels: vec![("engine_type".to_string(), "decode".to_string())],
+        metrics_text: r#"
+# HELP sglang_num_running_reqs The number of running requests
+# TYPE sglang_num_running_reqs gauge
+sglang_num_running_reqs{model_name="llama",dp_rank="0"} 20
+"#
+        .to_string(),
+    };
+
+    let result = aggregate_metrics(vec![pack_prefill, pack_decode]);
+    assert!(result.is_ok(), "Should not fail when label schemas differ");
+
+    let text = result.unwrap();
+    // Prefill sample should have dp_rank="" padded
+    assert!(
+        text.contains("engine_type=\"prefill\""),
+        "Should contain prefill worker metrics"
+    );
+    assert!(
+        text.contains("engine_type=\"decode\""),
+        "Should contain decode worker metrics"
+    );
+    // Both samples should be present (values 10 and 20)
+    assert!(text.contains("10"), "Should contain prefill value 10");
+    assert!(text.contains("20"), "Should contain decode value 20");
+}
+
+#[test]
+fn test_aggregate_multiple_mismatched_labels() {
+    let pack1 = MetricPack {
+        labels: vec![("worker".to_string(), "w1".to_string())],
+        metrics_text: r#"
+# TYPE my_metric gauge
+my_metric{label_a="1"} 100
+"#
+        .to_string(),
+    };
+    let pack2 = MetricPack {
+        labels: vec![("worker".to_string(), "w2".to_string())],
+        metrics_text: r#"
+# TYPE my_metric gauge
+my_metric{label_b="2"} 200
+"#
+        .to_string(),
+    };
+
+    let result = aggregate_metrics(vec![pack1, pack2]);
+    assert!(
+        result.is_ok(),
+        "Should handle multiple mismatched labels gracefully"
+    );
+
+    let text = result.unwrap();
+    assert!(text.contains("100"), "Should contain first metric value");
+    assert!(text.contains("200"), "Should contain second metric value");
+}
+
+#[test]
+fn test_aggregate_label_order_independent() {
+    let pack1 = MetricPack {
+        labels: vec![("worker".to_string(), "w1".to_string())],
+        metrics_text: r#"
+# TYPE my_metric gauge
+my_metric{a="1",b="2"} 100
+"#
+        .to_string(),
+    };
+
+    let pack2 = MetricPack {
+        labels: vec![("worker".to_string(), "w2".to_string())],
+        metrics_text: r#"
+# TYPE my_metric gauge
+my_metric{b="2",a="1"} 200
+"#
+        .to_string(),
+    };
+
+    let result = aggregate_metrics(vec![pack1, pack2]);
+    assert!(
+        result.is_ok(),
+        "Should handle same labels in different order"
+    );
+
+    let text = result.unwrap();
+
+    assert!(text.contains("100"), "Should contain first metric value");
+    assert!(text.contains("200"), "Should contain second metric value");
+}
+
+#[test]
 fn test_empty_input() {
     let result = aggregate_metrics(vec![]).unwrap();
     assert_eq!(result, "");
