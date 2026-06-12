@@ -1,5 +1,3 @@
-import json
-import random
 from argparse import Namespace
 from dataclasses import dataclass
 from typing import List, Optional
@@ -9,16 +7,11 @@ from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets.common import (
     ASSISTANT_SUFFIX,
-    SHAREGPT_FILENAME,
-    SHAREGPT_REPO_ID,
     BaseDataset,
     DatasetRow,
+    load_sharegpt_conversations,
 )
-from sglang.benchmark.utils import (
-    download_and_cache_hf_file,
-    is_file_valid_json,
-    remove_suffix,
-)
+from sglang.benchmark.utils import remove_suffix
 
 
 @dataclass
@@ -68,36 +61,9 @@ def sample_sharegpt_requests(
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
 
-    # Download sharegpt if necessary
-    if not is_file_valid_json(dataset_path) and dataset_path == "":
-        dataset_path = download_and_cache_hf_file(
-            repo_id=SHAREGPT_REPO_ID,
-            filename=SHAREGPT_FILENAME,
-        )
+    # Load and filter ShareGPT conversations
+    dataset = load_sharegpt_conversations(dataset_path)
 
-    # Load the dataset.
-    with open(dataset_path) as f:
-        dataset = json.load(f)
-
-    # Filter out the conversations with less than 2 turns.
-    dataset = [
-        data
-        for data in dataset
-        if len(data.get("conversations", data.get("conversation", []))) >= 2
-    ]
-    # Only keep the first two turns of each conversation.
-    dataset = [
-        (
-            data.get("conversations", data.get("conversation", []))[0]["value"],
-            data.get("conversations", data.get("conversation", []))[1]["value"],
-        )
-        for data in dataset
-    ]
-
-    # Shuffle the dataset.
-    random.shuffle(dataset)
-
-    # Filter out sequences that are too long or too short
     filtered_dataset: List[DatasetRow] = []
     for i in range(len(dataset)):
         if len(filtered_dataset) == num_requests:
