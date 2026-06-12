@@ -2799,18 +2799,6 @@ class Scheduler(
                 self._deactivate_req(req)
                 self._add_request_to_queue(req)
 
-        partially_extended_in_batch = [
-            r for r in can_run_list if r.is_partially_extended
-        ]
-        assert (
-            len(partially_extended_in_batch) <= 1
-        ), "single-flight invariant: at most one partially-extended req per batch"
-        chunk_deduct = (
-            partially_extended_in_batch[0].extend_range.length
-            if partially_extended_in_batch
-            else 0
-        )
-
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
@@ -2824,10 +2812,6 @@ class Scheduler(
             self.spec_algorithm,
         )
 
-        new_batch.contains_last_prefill_chunk = (
-            not partially_extended_in_batch or len(can_run_list) != 1
-        )
-
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -2836,6 +2820,26 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+
+        # Queried after prepare_for_extend so the partially-extended check sees
+        # this round's freshly chunked req. prepare_for_extend only reads the
+        # inputs of is_partially_extended, so the values are unaffected;
+        # all consumers below run after prepare anyway.
+        partially_extended_in_batch = [
+            r for r in can_run_list if r.is_partially_extended
+        ]
+        assert (
+            len(partially_extended_in_batch) <= 1
+        ), "single-flight invariant: at most one partially-extended req per batch"
+        chunk_deduct = (
+            partially_extended_in_batch[0].extend_range.length
+            if partially_extended_in_batch
+            else 0
+        )
+
+        new_batch.contains_last_prefill_chunk = (
+            not partially_extended_in_batch or len(can_run_list) != 1
+        )
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
