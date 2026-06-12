@@ -474,6 +474,11 @@ class AnthropicServing:
                         output_tokens=(
                             usage_info.get("output_tokens", 0) if usage_info else 0
                         ),
+                        cache_read_input_tokens=(
+                            usage_info.get("cache_read_input_tokens", 0)
+                            if usage_info
+                            else 0
+                        ),
                     ),
                 )
                 yield _wrap_sse_event(
@@ -519,6 +524,11 @@ class AnthropicServing:
                             input_tokens=(
                                 chunk.usage.prompt_tokens if chunk.usage else 0
                             ),
+                            cache_read_input_tokens=(
+                                chunk.usage.prompt_tokens_details.cached_tokens
+                                if chunk.usage and chunk.usage.prompt_tokens_details
+                                else 0
+                            ),
                             output_tokens=0,
                         ),
                     ),
@@ -533,9 +543,15 @@ class AnthropicServing:
 
             # Usage-only chunk (empty choices with usage info)
             if not chunk.choices and chunk.usage:
+                cached = (
+                    chunk.usage.prompt_tokens_details.cached_tokens
+                    if chunk.usage.prompt_tokens_details
+                    else 0
+                )
                 usage_info = {
                     "input_tokens": chunk.usage.prompt_tokens,
                     "output_tokens": chunk.usage.completion_tokens or 0,
+                    "cache_read_input_tokens": cached,
                 }
                 continue
 
@@ -663,6 +679,15 @@ class AnthropicServing:
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
 
+        # Add thinking content block from reasoning_content
+        reasoning = getattr(choice.message, "reasoning_content", None)
+        if reasoning:
+            content.append(
+                AnthropicContentBlock(
+                    type="thinking", thinking=reasoning, signature="dummy-signature"
+                )
+            )
+
         # Add text content
         if choice.message.content:
             content.append(
@@ -697,6 +722,11 @@ class AnthropicServing:
             usage=AnthropicUsage(
                 input_tokens=response.usage.prompt_tokens if response.usage else 0,
                 output_tokens=response.usage.completion_tokens if response.usage else 0,
+                cache_read_input_tokens=(
+                    response.usage.prompt_tokens_details.cached_tokens
+                    if response.usage and response.usage.prompt_tokens_details
+                    else 0
+                ),
             ),
         )
 
