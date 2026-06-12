@@ -115,7 +115,9 @@ struct ActivationKernel {
   static constexpr auto kBlockSize = 256u;
 
   using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
+#ifdef USE_ROCM
   using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
+#endif
 
   template <ActivationKind kAct, bool kFilterExpert>
   static constexpr kernel_fn_t activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>;
@@ -207,11 +209,16 @@ struct ActivationKernel {
   template <ActivationKind kAct>
   static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL>;
 
-  // Explicit non-const function-pointer return type (mirrors select_kernel's
-  // kernel_fn_t). Using decltype() of the `static constexpr auto unary_kernel`
-  // var yields a const-qualified pointer type, which clang-HIP (gfx942)
-  // refuses to initialize from an lvalue / nullptr (nvcc tolerates it).
+#ifdef USE_ROCM
+  // ROCm-only: deduce decltype() of the `static constexpr auto unary_kernel`
+  // var yields a const-qualified function-pointer type, which clang-HIP
+  // (gfx942) refuses to initialize from an lvalue / nullptr. Use the explicit
+  // non-const fn-pointer type instead (mirrors select_kernel's kernel_fn_t).
   static unary_kernel_fn_t select_unary_kernel(const std::string& type) {
+#else
+  static auto select_unary_kernel(const std::string& type)
+      -> decltype(ActivationKernel::template unary_kernel<ActivationKind::kReLU2>) {
+#endif
     using namespace host;
     if (type == "relu2") {
       return ActivationKernel::template unary_kernel<ActivationKind::kReLU2>;
