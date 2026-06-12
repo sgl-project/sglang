@@ -207,7 +207,7 @@ class RadixCacheCpp(BasePrefixCache):
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
+    def cache_unfinished_req(self, req: Req, is_partially_extended=False):
         """Cache request when it is unfinished."""
         assert req.req_pool_idx is not None
         token_ids = req.get_fill_ids()

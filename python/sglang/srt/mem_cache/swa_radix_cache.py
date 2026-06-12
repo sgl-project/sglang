@@ -484,7 +484,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         req.swa_prefix_lock_released = False
 
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+    def cache_unfinished_req(self, req: Req, is_partially_extended=False) -> None:
         """Cache request when it is unfinished."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[

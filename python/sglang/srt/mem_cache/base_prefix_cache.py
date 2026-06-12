@@ -65,7 +65,7 @@ class InsertParams:
     swa_evicted_seqlen: int = 0
 
     # General
-    chunked: bool = False
+    is_partially_extended: bool = False
     priority: int = 0
 
 

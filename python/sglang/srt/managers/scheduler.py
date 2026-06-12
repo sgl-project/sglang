@@ -2417,7 +2417,7 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_partially_extended_req(self, req: Req):
-        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+        maybe_cache_unfinished_req(req, self.tree_cache, is_partially_extended=True)
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""

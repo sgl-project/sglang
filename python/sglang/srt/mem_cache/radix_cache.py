@@ -401,7 +401,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         key = params.key
         value = params.value
         priority = params.priority
-        chunked = params.chunked
+        is_partially_extended = params.is_partially_extended
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
@@ -411,7 +411,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
+        prefix_len = self._insert_helper(self.root_node, key, value, priority, is_partially_extended)
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -461,7 +461,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
+    def cache_unfinished_req(self, req: Req, is_partially_extended=False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
@@ -481,7 +481,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             InsertParams(
                 key=radix_key,
                 value=values,
-                chunked=chunked,
+                is_partially_extended=is_partially_extended,
                 priority=getattr(req, "priority", 0) or 0,
             )
         )
@@ -667,11 +667,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         return new_node
 
-    def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
-        # Skip the hit count update for chunked requests to avoid self-referencing
-        # inflation where a chunked request increments hit_count on nodes it created
-        # in previous chunks.
-        if chunked:
+    def _inc_hit_count(self, node: TreeNode, is_partially_extended: bool = False):
+        # Skip the hit count update for partially-extended requests to avoid
+        # self-referencing inflation where a request increments hit_count on nodes
+        # its own earlier prefill chunks created.
+        if is_partially_extended:
             return
         node.hit_count += 1
 
@@ -681,7 +681,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         key: RadixKey,
         value,
         priority: int = 0,
-        chunked: bool = False,
+        is_partially_extended: bool = False,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -707,11 +707,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
-                self._inc_hit_count(new_node, chunked)
+                self._inc_hit_count(new_node, is_partially_extended)
                 node = new_node
             else:
                 node.priority = max(node.priority, priority)
-                self._inc_hit_count(node, chunked)
+                self._inc_hit_count(node, is_partially_extended)
             if len(key):
                 child_key = key.child_key(self.page_size)
 
@@ -720,7 +720,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            self._inc_hit_count(new_node, chunked)
+            self._inc_hit_count(new_node, is_partially_extended)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)

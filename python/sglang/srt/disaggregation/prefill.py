@@ -899,7 +899,7 @@ class SchedulerDisaggregationPrefillMixin:
         partially_extended_req = next(iter(self.partially_extended_reqs()), None)
         if partially_extended_req is not None:
             maybe_cache_unfinished_req(
-                partially_extended_req, self.tree_cache, chunked=True
+                partially_extended_req, self.tree_cache, is_partially_extended=True
             )
             if self.check_bootstrap(partially_extended_req):
                 if self.enable_overlap:
