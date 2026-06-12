@@ -302,7 +302,7 @@ class Fp8Config(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         if self.ignored_layers:
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
@@ -2094,7 +2094,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         no_combine: bool = False,
-    ) -> Optional["AiterMoeQuantInfo"]:
+    ) -> Optional[AiterMoeQuantInfo]:
         if not (_use_aiter or _use_hip_int4):
             return None
         assert not no_combine, f"{no_combine=} is not supported."
