@@ -281,8 +281,8 @@ class TestSamplingParamsNormalize(CustomTestCase):
         """Create a mock tokenizer that returns predetermined token lists."""
         tokenizer = MagicMock()
         if encode_map:
-            tokenizer.encode.side_effect = lambda s, add_special_tokens=False: encode_map.get(
-                s, [1]
+            tokenizer.encode.side_effect = (
+                lambda s, add_special_tokens=False: encode_map.get(s, [1])
             )
         else:
             tokenizer.encode.return_value = [1]  # Default: 1 token
