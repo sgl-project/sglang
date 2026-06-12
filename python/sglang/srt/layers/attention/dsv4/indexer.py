@@ -510,9 +510,26 @@ class C4IndexerBackendMixin:
                 # SM120: the dsa/ kernel allocs k_smem as 1-D ((B*D,) uint8 +
                 # view), which CUDA-graph capture rejects. Use the dsv4/ kernel
                 # that allocs 2-D shared K directly.
-                from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
-                    tilelang_fp8_paged_mqa_logits as fn,
-                )
+                if envs.SGLANG_SM120_INDEXER_SPLIT.get() and (
+                    weights.shape[0] <= envs.SGLANG_SM120_INDEXER_SPLIT_MAX_BS.get()
+                ):
+                    # Split-KV: shard each row's scan across (batch, num_splits)
+                    # CTAs (bit-exact, big win at long ctx); MAX_BS caps it at
+                    # the graph ceiling. See the kernel for why it always wins.
+                    import functools
+
+                    from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
+                        tilelang_fp8_paged_mqa_logits_split,
+                    )
+
+                    fn = functools.partial(
+                        tilelang_fp8_paged_mqa_logits_split,
+                        num_splits=envs.SGLANG_SM120_INDEXER_SPLIT_COUNT.get(),
+                    )
+                else:
+                    from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
+                        tilelang_fp8_paged_mqa_logits as fn,
+                    )
             else:
                 from sglang.srt.layers.attention.dsa.tilelang_kernel import (
                     tilelang_fp8_paged_mqa_logits as fn,
