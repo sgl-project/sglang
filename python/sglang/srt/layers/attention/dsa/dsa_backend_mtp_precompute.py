@@ -71,8 +71,8 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        forward_mode: "ForwardMode",
-        spec_info: Optional["SpecInput"],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
     ) -> PrecomputedMetadata:
         """Precompute all shared metadata for multi-step backends.
 
@@ -252,7 +252,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        spec_info: "SpecInput",
+        spec_info: SpecInput,
     ) -> PrecomputedMetadata:
         """Precompute metadata for draft extend mode."""
         max_seqlen_k = int(seq_lens_cpu.max().item())
