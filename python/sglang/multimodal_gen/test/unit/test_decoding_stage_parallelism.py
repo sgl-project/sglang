@@ -9,7 +9,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import Decodin
 
 
 class TestDecodingStageParallelism(unittest.TestCase):
-    def test_cfg_parallel_uses_replicated_decode_when_decode_group_uses_cfg(self):
+    def test_cfg_parallel_uses_replicated_decode_when_decode_group_has_multiple_ranks(
+        self,
+    ):
         stage = object.__new__(DecodingStage)
         stage.vae = SimpleNamespace(use_parallel_decode=True)
 
@@ -20,10 +22,6 @@ class TestDecodingStageParallelism(unittest.TestCase):
             ),
             patch(
                 "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.model_parallel_is_initialized",
-                return_value=True,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.decode_parallel_group_uses_cfg_ranks",
                 return_value=True,
             ),
             patch(
@@ -50,10 +48,6 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.decode_parallel_group_uses_cfg_ranks",
-                return_value=True,
-            ),
-            patch(
                 "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.get_decode_parallel_world_size",
                 return_value=2,
             ),
@@ -63,7 +57,9 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 StageParallelismType.MAIN_RANK_ONLY,
             )
 
-    def test_cfg_parallel_keeps_main_rank_decode_when_decode_group_is_not_cfg(self):
+    def test_cfg_parallel_keeps_main_rank_decode_when_decode_group_is_single_rank(
+        self,
+    ):
         stage = object.__new__(DecodingStage)
         stage.vae = SimpleNamespace(use_parallel_decode=True)
 
@@ -75,10 +71,6 @@ class TestDecodingStageParallelism(unittest.TestCase):
             patch(
                 "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.model_parallel_is_initialized",
                 return_value=True,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.decode_parallel_group_uses_cfg_ranks",
-                return_value=False,
             ),
             patch(
                 "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.get_decode_parallel_world_size",

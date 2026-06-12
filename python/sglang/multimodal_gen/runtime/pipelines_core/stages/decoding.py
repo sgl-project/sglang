@@ -10,7 +10,6 @@ import weakref
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import (
-    decode_parallel_group_uses_cfg_ranks,
     get_decode_parallel_world_size,
     get_local_torch_device,
     model_parallel_is_initialized,
@@ -129,7 +128,6 @@ class DecodingStage(PipelineStage):
     def _can_use_parallel_decode(self) -> bool:
         return (
             model_parallel_is_initialized()
-            and decode_parallel_group_uses_cfg_ranks()
             and get_decode_parallel_world_size() > 1
             and self.vae.use_parallel_decode
         )
