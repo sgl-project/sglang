@@ -31,6 +31,19 @@ class _SuffixLike(CustomSpecAlgo):
     def is_suffix(self) -> bool:
         return True
 
+    def has_draft_kv(self) -> bool:
+        # SUFFIX dispatches like NGRAM: the draft tree lives only in the verify
+        # mask, no draft KV chains are written. Mirrors the builtin enum's
+        # ``not is_ngram()``; the CustomSpecAlgo base conservatively defaults True.
+        return False
+
+    def carries_draft_hidden_states(self) -> bool:
+        # Model-free: the disagg prefill->decode transfer ships nothing beyond
+        # the bonus token (no draft hidden states), so the metadata buffer uses
+        # the minimal RDMA pad. The CustomSpecAlgo base omits this method
+        # entirely, but Scheduler.init_disaggregation (decode mode) calls it.
+        return False
+
     def create_future_map(
         self,
         device,
@@ -42,6 +55,25 @@ class _SuffixLike(CustomSpecAlgo):
         from sglang.srt.managers.overlap_utils import FutureMap
 
         return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
+
+    def build_disagg_draft_input(
+        self,
+        batch,
+        server_args,
+        last_tokens_tensor,
+        future_map,
+    ):
+        # PD disaggregation: reconstruct the first decode batch's draft input
+        # on the decode instance (see suffix_disaggregation.py). SUFFIX is
+        # model-free, so unlike EAGLE nothing beyond the bonus token has to be
+        # shipped from the prefill instance.
+        from sglang.srt.speculative.suffix_disaggregation import (
+            build_suffix_disagg_draft_input,
+        )
+
+        return build_suffix_disagg_draft_input(
+            batch, server_args, last_tokens_tensor, future_map
+        )
 
 
 def _suffix_factory(server_args: ServerArgs) -> Type:
