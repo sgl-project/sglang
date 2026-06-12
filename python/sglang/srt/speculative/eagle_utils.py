@@ -59,7 +59,7 @@ def _eagle_prefill_tail_tokens(
 
     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
     for i, (req, is_extend_intermediate) in enumerate(
-        zip(batch.reqs, batch.is_extend_intermediate)
+        zip(batch.reqs, batch.is_extend_intermediate, strict=True)
     ):
         if not (is_extend_intermediate and not req.is_dllm()):
             continue
