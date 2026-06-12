@@ -125,12 +125,8 @@ class SpeculativeAlgorithm(Enum):
         return not self.is_ngram()
 
     def carries_draft_hidden_states(self) -> bool:
-        """Whether the prefill->decode disaggregation transfer carries target
-        hidden states for the draft. Only EAGLE-family drafts read transferred
-        hidden states; STANDALONE runs a vanilla LLM draft that ignores them
-        (build_disagg_draft_input returns None and prefill never collects them),
-        so its metadata buffer needs only minimal RDMA padding. Sizes the disagg
-        MetadataBuffers hidden-states buffer."""
+        """Whether the disagg prefill->decode transfer carries draft hidden
+        states (EAGLE-family only; STANDALONE's vanilla draft ignores them)."""
         return self.is_eagle()
 
     def create_future_map(
@@ -284,9 +280,7 @@ def create_capture_spec_info(
     num_tokens_per_bs: int,
     is_draft_worker: bool,
 ) -> Optional[SpecInput]:
-    """Build the shape-only dummy verify ``SpecInput`` used during CUDA-graph
-    capture. Centralizes the per-algorithm dispatch so the model runner stays
-    algorithm-agnostic (mirrors ``SpeculativeAlgorithm.create_worker``)."""
+    """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch)."""
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
     spec_info = None
