@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -17,6 +18,7 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -42,6 +44,7 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
+        DispatchOutput,
         StandardDispatchOutput,
     )
 
@@ -64,6 +67,20 @@ try:
     from flashinfer.fused_moe.core import ActivationType
 except ImportError:
     flashinfer_cutlass_fused_moe = None
+
+
+def swiglustep_and_mul(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
+    """Out-variant of swiglustep activation.
+
+    Writes into `out`:
+      silu(x[:d]).clamp(max=limit) * x[d:].clamp(-limit, limit)
+    """
+    gate, up = x.chunk(2, dim=-1)
+    gate = F.silu(gate)
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    out = gate * up
+    return out
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -163,13 +180,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
 
     def __init__(
-        self, use_triton_kernels: bool = False, use_flashinfer_trtllm_moe: bool = False
+        self,
+        use_triton_kernels: bool = False,
+        use_flashinfer_trtllm_moe: bool = False,
+        use_deep_gemm: bool = False,
     ):
         super().__init__()
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
+        self.use_deep_gemm = use_deep_gemm
         self._cache_permute_indices = dict({})
 
     def create_weights(
@@ -247,6 +268,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            if hasattr(layer, "w13_weight_bias"):
+                layer.w13_weight_bias = Parameter(
+                    layer.w13_weight_bias.float(), requires_grad=False
+                )
+            if hasattr(layer, "w2_weight_bias"):
+                layer.w2_weight_bias = Parameter(
+                    layer.w2_weight_bias.float(), requires_grad=False
+                )
+
+        if (
+            self.use_deep_gemm
+            and layer.w13_weight.dtype == torch.bfloat16
+            and get_moe_a2a_backend().is_deepep()
+            and get_deepep_mode().enable_low_latency()
+            and not _is_npu
+            and not _is_hip
+            and hasattr(layer, "dispatcher")
+        ):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
@@ -268,6 +308,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     self._cache_permute_indices,
                     layer.w13_weight.data[i].view(torch.uint8),
                     epilogue_tile_m,
+                    is_gated_act_gemm=layer.moe_runner_config.is_gated,
                 )
                 tmp_weights1 = (
                     layer.w13_weight.data[i]
@@ -375,6 +416,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
                 else MoeRunnerBackend.FLASHINFER_TRTLLM
             )
+        elif self.use_deep_gemm:
+            backend = MoeRunnerBackend.DEEP_GEMM
         elif self.use_triton_kernels:
             backend = MoeRunnerBackend.TRITON_KERNELS
         else:
@@ -389,7 +432,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()
             )
-            and get_moe_a2a_backend().is_none()
+            and get_moe_a2a_backend().supports_aiter()
         ):
             self._aiter_runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
 
@@ -416,7 +459,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
 
@@ -433,7 +475,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w2_bias=getattr(layer, "w2_weight_bias", None),
             )
             return self.runner.run(dispatch_output, quant_info)
+        elif self.runner.runner_backend.is_deep_gemm():
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+            # Only use_fp8=False when SGLANG_DEEPEP_BF16_DISPATCH is true,
+            # otherwise use_fp8=True for FP8 dispatch path
+            use_fp8 = not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                use_fp8=use_fp8,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
+            topk_output = dispatch_output.topk_output
             output = flashinfer_cutlass_fused_moe(
                 input=x,
                 token_selected_experts=topk_output.topk_ids,
@@ -453,6 +510,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     else ActivationType.Swiglu
                 ),
             )[0]
+
+            if (
+                not layer.should_fuse_routed_scaling_factor_in_topk
+                and moe_runner_config.routed_scaling_factor is not None
+            ):
+                output.mul_(moe_runner_config.routed_scaling_factor)
+
             return StandardCombineInput(hidden_states=output)
         elif self.use_flashinfer_trtllm_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -468,7 +532,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             return self.runner.run(dispatch_output, quant_info)
         else:
             if self._aiter_runner is not None:
-                from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
+                from sglang.srt.layers.moe.moe_runner.aiter import (
+                    AiterMoeQuantInfo,
+                )
 
                 try:
                     quant_info = AiterMoeQuantInfo(
@@ -529,6 +595,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 None,  # w1_zp
                 None,  # w2_zp
                 None,  # block_size
+                getattr(layer, "w13_weight_bias", None),
+                getattr(layer, "w2_weight_bias", None),
+                layer.moe_runner_config.gemm1_alpha,
+                layer.moe_runner_config.gemm1_clamp_limit,
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
@@ -565,6 +635,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         assert moe_runner_config.activation in [
             "silu",
             "gelu",
+            "relu2",  # Nemotron-H (NemotronHForCausalLM) uses squared-ReLU.
         ], f"activation = {moe_runner_config.activation} is not supported."
 
         backend = self.runner.runner_backend
@@ -602,10 +673,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def forward_npu(
         self,
         layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
+
+        if DispatchOutputChecker.format_is_deepep(dispatch_output):
+            return self._forward_npu_deepep(layer, dispatch_output)
 
         # x.shape = [B*S, H]
         x = dispatch_output.hidden_states
@@ -653,7 +728,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
             hidden_states = swiglu_oai(layer, hidden_states)
         elif self.moe_runner_config.activation == "silu":
-            hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+            if self.moe_runner_config.gemm1_clamp_limit is not None:
+                hidden_states = swiglustep_and_mul(
+                    hidden_states, self.moe_runner_config.gemm1_clamp_limit
+                )
+            else:
+                hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
         else:
             from sglang.srt.layers.activation import GeluAndMul
 
@@ -683,6 +763,46 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
 
         return StandardCombineInput(hidden_states=final_hidden_states)
+
+    def _forward_npu_deepep(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: DispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+            npu_fused_moe_without_routing_weights_bf16,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import (
+            DeepEPLLCombineInput,
+            DeepEPNormalCombineInput,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
+
+        # NOTE: Ascend's Dispatch & Combine does not support FP16
+        output_dtype = torch.bfloat16
+        group_list_type = 1
+
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            hidden_states, _, _, _, num_recv_tokens_per_expert = dispatch_output
+            group_list = torch.tensor(
+                num_recv_tokens_per_expert,
+                dtype=torch.int64,
+                device=hidden_states.device,
+            )
+            combine_cls = DeepEPNormalCombineInput
+        else:
+            hidden_states, _, _, _, group_list, _ = dispatch_output
+            group_list = group_list.to(torch.int64)
+            combine_cls = DeepEPLLCombineInput
+
+        hidden_states = npu_fused_moe_without_routing_weights_bf16(
+            layer, hidden_states, group_list_type, group_list, output_dtype
+        )
+        return combine_cls(
+            hidden_states=hidden_states,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")

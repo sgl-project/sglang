@@ -8,12 +8,14 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
+_is_hip = is_hip()
+_is_npu = is_npu()
 
 def _lcm(a: int, b: int) -> int:
     return a // gcd(a, b) * b
-
 
 @dataclasses.dataclass
 class KVAndScore:
@@ -27,15 +29,54 @@ class KVAndScore:
     def score(self) -> torch.Tensor:
         return self.kv_score[..., self._item_size :]
 
+    @property
+    def shape(self):
+        return self.kv_score.shape
+
     def __post_init__(self):
         self._item_size = self.kv_score.shape[-1] // 2
+
+    @staticmethod
+    def from_kv_score(*, kv: torch.Tensor, score: torch.Tensor) -> KVAndScore:
+        assert kv.shape == score.shape
+        return KVAndScore(torch.cat([kv, score], dim=-1))
+
+    def new_empty(self, new_shape) -> KVAndScore:
+        assert new_shape[-1] == self._item_size
+        new_shape = list(new_shape)
+        new_shape[-1] = 2 * self._item_size
+        return KVAndScore(self.kv_score.new_empty(new_shape, requires_grad=False))
 
     def __getitem__(self, index) -> KVAndScore:
         return KVAndScore(self.kv_score[index])
 
+    def __setitem__(self, index, value: KVAndScore):
+        self.kv_score[index] = value.kv_score
+
     def clear(self):
         self.kv.zero_()
         self.score.fill_(float("-inf"))
+
+    def view(self, *args):
+        args = list(args)
+        if isinstance(args[-1], int) and args[-1] != -1:
+            args[-1] = 2 * self._item_size
+        return KVAndScore(self.kv_score.view(*args))
+
+    def clone(self) -> KVAndScore:
+        return KVAndScore(self.kv_score.clone())
+
+    @staticmethod
+    def cat(tensors: list[KVAndScore], dim: int) -> KVAndScore:
+        assert dim != -1, "Concatenation along last dim is not supported."
+        assert len(tensors) > 0, "At least one tensor is required for concatenation."
+        item_size = tensors[0]._item_size
+        for v in tensors:
+            assert (
+                v._item_size == item_size
+            ), "All tensors must have the same item size."
+
+        return KVAndScore(torch.cat([v.kv_score for v in tensors], dim=dim))
 
 
 class CompressStatePool:
@@ -50,11 +91,11 @@ class CompressStatePool:
         enable_memory_saver: bool,
         ratio: int,
         online: bool = False,
-        page_size: int = 1,
+        swa_page_size: int = 0,
     ):
         self.ring_size = ring_size
-        self.online = online
-        self.page_size = page_size
+        self.swa_page_size = swa_page_size
+        self.enable_memory_saver = enable_memory_saver
 
         if online:
             assert ring_size == 1, "online compress requires ring_size=1"
@@ -67,7 +108,7 @@ class CompressStatePool:
             # op (torch.ops.custom.compressor wants its state_cache in that
             # 3D layout). page_size=1 (default) falls back to the original
             # ratio-only padding.
-            pad_to = _lcm(ratio, page_size) if page_size > 1 else ratio
+            pad_to = _lcm(ratio, swa_page_size) if (swa_page_size > 1 and _is_npu) else ratio
             self._size = (self._size + pad_to - 1) // pad_to * pad_to
             last_dim = 2 * (1 + overlap) * head_dim
 
@@ -91,25 +132,30 @@ class CompressStatePool:
         allocation boilerplate. Requires ``self._size`` and ``self.last_dim``
         to be set already.
         """
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-        )
-        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
-            maybe_init_custom_mem_pool(device=device)
-        )
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.custom_mem_pool
-                else nullcontext()
-            ):
-                self.kv_score_buffer = KVAndScore(
-                    torch.empty(
-                        (self._size, self.last_dim),
-                        dtype=dtype,
-                        device=device,
+        if _is_hip:
+            self.kv_score_buffer = KVAndScore(
+                torch.empty((self._size, self.last_dim), dtype=dtype, device=device)
+            )
+        else:
+            self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+                enable=enable_memory_saver
+            )
+            self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+                maybe_init_custom_mem_pool(device=device)
+            )
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.custom_mem_pool
+                    else nullcontext()
+                ):
+                    self.kv_score_buffer = KVAndScore(
+                        torch.empty(
+                            (self._size, self.last_dim),
+                            dtype=dtype,
+                            device=device,
+                        )
                     )
-                )
 
     @property
     def state_cache_3d(self) -> torch.Tensor:

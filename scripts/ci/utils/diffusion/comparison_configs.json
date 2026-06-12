@@ -13,7 +13,7 @@
             "num_gpus": 1,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup --dit-layerwise-offload false",
+                    "serve_args": "--warmup --dit-layerwise-offload false",
                     "extra_env": {}
                 }
             }
@@ -29,7 +29,7 @@
             "num_gpus": 1,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup --dit-layerwise-offload false",
+                    "serve_args": "--warmup --dit-layerwise-offload false",
                     "extra_env": {}
                 }
             }
@@ -45,7 +45,7 @@
             "num_gpus": 1,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup",
+                    "serve_args": "--warmup",
                     "extra_env": {}
                 }
             }
@@ -62,7 +62,7 @@
             "num_gpus": 1,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup",
+                    "serve_args": "--warmup",
                     "extra_env": {}
                 }
             }
@@ -78,7 +78,7 @@
             "num_gpus": 1,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup",
+                    "serve_args": "--warmup",
                     "extra_env": {}
                 }
             }
@@ -95,7 +95,7 @@
             "num_gpus": 4,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
+                    "serve_args": "--warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
                 }
             }
@@ -113,7 +113,7 @@
             "num_gpus": 1,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup",
+                    "serve_args": "--warmup",
                     "extra_env": {}
                 }
             }
@@ -130,7 +130,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup --enable-cfg-parallel --pipeline-class-name LTX2TwoStagePipeline",
+                    "serve_args": "--warmup --enable-cfg-parallel --pipeline-class-name LTX2TwoStagePipeline",
                     "extra_env": {}
                 }
             }
@@ -148,7 +148,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup --pipeline-class-name LTX2TwoStagePipeline",
+                    "serve_args": "--warmup --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2",
                     "extra_env": {}
                 }
             }
@@ -166,7 +166,7 @@
             "num_gpus": 4,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
+                    "serve_args": "--warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
                 }
             }

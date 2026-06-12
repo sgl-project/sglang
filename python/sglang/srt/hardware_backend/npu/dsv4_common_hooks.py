@@ -299,7 +299,7 @@ def maybe_evict_dsv4_state(batch: "ScheduleBatch", req: "Req", pre_len: int) -> 
 
 
 def maybe_evict_dsv4_state_on_swa(
-    batch: "ScheduleBatch", req: "Req", new_swa_evicted_seqlen: int
+    allocator, pool, req: "Req", new_swa_evicted_seqlen: int
 ) -> None:
     """Free compress-state slots that ride along with SWA eviction.
 
@@ -316,8 +316,6 @@ def maybe_evict_dsv4_state_on_swa(
     For typical large-window models (DS-V4 with window >> 192), the
     watermark eviction always runs first, making this path a no-op.
   """
-    allocator = batch.token_to_kv_pool_allocator
-    pool = batch.req_to_token_pool
     if not hasattr(allocator, "c4_state_attn_allocator"):
         return
     _free_state_range(

@@ -14,6 +14,7 @@
 
 """Inference-only Qwen3Next MTP Speculative Decoding."""
 
+import copy
 import logging
 from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
@@ -46,6 +47,8 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        # Deep-copy so MTP mutations below don't leak into the target's config.
+        config = copy.deepcopy(config)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         if (
@@ -56,7 +59,6 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
         self.pp_group = get_pp_group()
-        # self.determine_num_fused_shared_experts("Qwen3NextForCausalLMMTP")
 
         # currently based on the provided ckpt, we:
         # (1) do not use_dedicated_mtp_embeddings provided in ckpt since not provided and directly use the target model embeddings
@@ -83,6 +85,19 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        # Mirror Qwen3NextForCausalLM.__init__'s shared-expert fusion setup so
+        # the inherited load_weights() can find the attribute on the MTP path.
+        # We compute it from the actual MTP MoE layer (1 layer with is_nextn=True),
+        # not hardcode it — when the layer's MoE pre-fuses the shared expert,
+        # load_weights must remap mlp.shared_expert.* into the fused slot.
+        self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        if self.num_fused_shared_experts > 1:
+            raise ValueError(
+                "Qwen3-Next MTP shared expert fusion currently supports exactly one "
+                "shared expert because checkpoint weight remapping maps it into "
+                "a single fused MoE expert slot."
+            )
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
     @torch.no_grad()
     def forward(
@@ -105,25 +120,26 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
                 envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
             )
 
-        if input_embeds is None:
-            input_embeds = self.model.embed_tokens(input_ids)
+        try:
+            if input_embeds is None:
+                input_embeds = self.model.embed_tokens(input_ids)
 
-        hidden_states = forward_batch.spec_info.hidden_states
-        # Some idle batch has 0 batch size. GemmaRMSNorm.forward would fail due to bs=0.
-        if not forward_batch.forward_mode.is_idle():
-            input_embeds = self.pre_fc_norm_embedding(input_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-        hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
+            hidden_states = forward_batch.spec_info.hidden_states
+            # Some idle batch has 0 batch size. GemmaRMSNorm.forward would fail due to bs=0.
+            if not forward_batch.forward_mode.is_idle():
+                input_embeds = self.pre_fc_norm_embedding(input_embeds)
+                hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
 
-        with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states = self.model(
-                input_ids,
-                positions,
-                forward_batch,
-                hidden_states,
-            )
-
-        exit_stack.close()
+            with get_global_expert_distribution_recorder().disable_this_region():
+                hidden_states = self.model(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    hidden_states,
+                )
+        finally:
+            exit_stack.close()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

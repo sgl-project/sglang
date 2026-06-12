@@ -22,6 +22,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -38,11 +39,11 @@ _MATE_NO_MLA_SCHEDULER_METADATA_DICT: dict = {}
 _MATE_NO_MLA_SCHEDULER_METADATA_LOCK = threading.Lock()
 
 # Global reference to the current backend instance (set during __init__)
-_CURRENT_BACKEND: Optional["MusaFlashAttentionBackend"] = None
+_CURRENT_BACKEND: Optional[MusaFlashAttentionBackend] = None
 
 
 def _compute_scheduler_metadata(
-    backend: "MusaFlashAttentionBackend",
+    backend: MusaFlashAttentionBackend,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k_new: Optional[torch.Tensor],
     cache_seqlens: torch.Tensor,
@@ -264,11 +265,16 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -276,7 +282,16 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     )
             if is_cp_mode:
                 cp_allgather_and_save_kv_cache(
-                    forward_batch, layer, k, v, self.attn_cp_size
+                    forward_batch,
+                    layer,
+                    k,
+                    v,
+                    self.attn_cp_size,
+                    swa_loc=(
+                        self.forward_metadata.swa_out_cache_loc
+                        if self.use_sliding_window_kv_pool
+                        else None
+                    ),
                 )
 
         metadata = self.forward_metadata
@@ -357,9 +372,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             can_run_tbo=forward_batch.can_run_tbo,
         )
         if not self.use_mla:
-            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -555,9 +568,9 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     return output, lse
                 return output
             else:
-                kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-                    layer.layer_id
-                ).to(q.dtype)
+                kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+                    q.dtype
+                )
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
                 k_rope_cache = k_rope.view(
@@ -657,11 +670,16 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -710,9 +728,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             can_run_tbo=forward_batch.can_run_tbo,
         )
         if not self.use_mla:
-            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -831,9 +847,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 else:
                     o = result
         else:
-            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
-            )
+            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
             k_rope = kv_cache[:, :, layer.v_head_dim :]
             c_kv = kv_cache[:, :, : layer.v_head_dim]
             k_rope_cache = k_rope.view(
