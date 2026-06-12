@@ -844,7 +844,7 @@ Other layers (e.g. projections in the attention layers) have their weights quant
 
 ### `quark_mxfp4` online quantization method
 
-SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 models weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and eventually MXFP4 GEMMs instead of BF16 GEMMs.
+SGLang running on AMD GPUs with hardware FP4 support (CDNA4 architecture, e.g. MI355x) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 model weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and MXFP4 GEMMs instead of BF16 GEMMs.
 
 Example (BF16 to MXFP4 requantization):
 
