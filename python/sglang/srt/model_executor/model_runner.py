@@ -38,6 +38,7 @@ from sglang.jit_kernel.ngram_embedding import update_token_table_decode
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.configs import (
     BailingHybridConfig,
+    BambaConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
     InternS2PreviewConfig,
@@ -2182,7 +2183,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 return None
         if isinstance(
             config,
-            FalconH1Config
+            BambaConfig
+            | FalconH1Config
             | NemotronHConfig
             | Lfm2Config
             | Lfm2MoeConfig
