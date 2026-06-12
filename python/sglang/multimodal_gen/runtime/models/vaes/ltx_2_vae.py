@@ -21,7 +21,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
-from sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel import (
+from sglang.multimodal_gen.runtime.layers.spatial_parallel import (
     SpatialParallelConv3d,
     gather_and_trim_height,
     split_height_for_parallel_decode,

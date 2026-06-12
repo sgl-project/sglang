@@ -5,7 +5,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel import (
+from sglang.multimodal_gen.runtime.layers.spatial_parallel import (
     SpatialParallelConv2d,
     chunk_height_by_sizes,
     gather_and_trim_height,

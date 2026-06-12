@@ -33,8 +33,6 @@ class SanaVAEConfig(VAEConfig):
     use_tiling: bool = False
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False
-    use_parallel_decode: bool = True
-    parallel_decode_mode: str = "spatial_shard"
 
     def post_init(self):
         # Called by VAELoader AFTER update_model_arch() merges the HF config.json

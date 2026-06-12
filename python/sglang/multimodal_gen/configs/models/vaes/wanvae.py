@@ -83,8 +83,6 @@ class WanVAEConfig(VAEConfig):
     use_parallel_tiling: bool = False
 
     use_parallel_encode: bool = True
-    use_parallel_decode: bool = True
-    parallel_decode_mode: str = "spatial_shard"
 
     def __post_init__(self):
         self.blend_num_frames = (

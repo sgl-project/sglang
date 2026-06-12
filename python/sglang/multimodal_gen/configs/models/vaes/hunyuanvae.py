@@ -39,5 +39,3 @@ class HunyuanVAEArchConfig(VAEArchConfig):
 @dataclass
 class HunyuanVAEConfig(VAEConfig):
     arch_config: VAEArchConfig = field(default_factory=HunyuanVAEArchConfig)
-    use_parallel_decode: bool = True
-    parallel_decode_mode: str = "spatial_shard"

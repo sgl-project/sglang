@@ -37,8 +37,6 @@ class ErnieImageVAEConfig(VAEConfig):
     use_tiling: bool = False
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False
-    use_parallel_decode: bool = True
-    parallel_decode_mode: str = "spatial_shard"
 
     def get_vae_scale_factor(self):
         # 8 spatial compression (VAE) * 2 patch = 16 total, consistent with pipeline config

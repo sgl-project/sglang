@@ -8,7 +8,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel import (
+from sglang.multimodal_gen.runtime.layers.spatial_parallel import (
     SpatialParallelCausalConv3d,
     SpatialParallelConv2d,
     SpatialParallelZeroPad2d,

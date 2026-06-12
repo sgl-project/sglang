@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import (
     enable_diffusers_decoder_spatial_parallel,
 )
-from sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel import (
+from sglang.multimodal_gen.runtime.layers.spatial_parallel import (
     gather_and_trim_height,
     split_height_for_parallel_decode,
 )

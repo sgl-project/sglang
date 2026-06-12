@@ -11,7 +11,9 @@ from sglang.multimodal_gen.configs.models.vaes.base import (
 from sglang.multimodal_gen.configs.models.vaes.ernie_image import ErnieImageVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.glmimage import GlmImageVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.hunyuan3d import Hunyuan3DVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.hunyuanvae import HunyuanVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.ltx_audio import LTXAudioVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
@@ -37,7 +39,7 @@ from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
     LTX2VideoDecoder3d,
     _enable_ltx_decoder_spatial_parallel,
 )
-from sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel import (
+from sglang.multimodal_gen.runtime.layers.spatial_parallel import (
     SpatialParallelCausalConv3d,
     SpatialParallelConv2d,
     SpatialParallelConv3d,
@@ -74,6 +76,12 @@ class _DispatchProbeVAE(ParallelTiledVAE):
 
 
 class TestVAESpatialParallelDecode(unittest.TestCase):
+    def test_base_vae_config_defaults_to_spatial_parallel_decode(self):
+        config = VAEConfig()
+
+        self.assertTrue(config.use_parallel_decode)
+        self.assertEqual(config.parallel_decode_mode, "spatial_shard")
+
     def test_image_video_vae_configs_default_to_spatial_parallel_decode(self):
         configs = (
             ErnieImageVAEConfig(),
@@ -92,6 +100,14 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
             with self.subTest(config=type(config).__name__):
                 self.assertTrue(config.use_parallel_decode)
                 self.assertEqual(config.parallel_decode_mode, "spatial_shard")
+
+    def test_unsupported_vae_configs_opt_out_of_spatial_parallel_decode(self):
+        configs = (Hunyuan3DVAEConfig(), LTXAudioVAEConfig())
+
+        for config in configs:
+            with self.subTest(config=type(config).__name__):
+                self.assertFalse(config.use_parallel_decode)
+                self.assertEqual(config.parallel_decode_mode, "tiled")
 
     def test_vae_nested_cli_defaults_do_not_override_model_defaults(self):
         parser = FlexibleArgumentParser()
@@ -199,12 +215,12 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         x = torch.arange(10).view(1, 1, 10, 1)
 
         with patch(
-            "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_rank",
+            "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_rank",
             return_value=0,
         ):
             rank0 = chunk_height_by_sizes(x, [6, 4])
         with patch(
-            "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_rank",
+            "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_rank",
             return_value=1,
         ):
             rank1 = chunk_height_by_sizes(x, [6, 4])
@@ -228,11 +244,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 return_value=0,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_world_size",
+                "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_world_size",
                 return_value=2,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_rank",
+                "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_rank",
                 return_value=0,
             ),
         ):
@@ -276,11 +292,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 return_value=2,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_world_size",
+                "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_world_size",
                 return_value=2,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_rank",
+                "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_rank",
                 return_value=0,
             ),
         ):
@@ -330,11 +346,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 return_value=2,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_world_size",
+                "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_world_size",
                 return_value=2,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_rank",
+                "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_rank",
                 return_value=0,
             ),
         ):
@@ -348,11 +364,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
     def test_ltx_decoder_uses_spatial_parallel_conv3d(self):
         with (
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_world_size",
+                "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_world_size",
                 return_value=2,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_rank",
+                "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_rank",
                 return_value=0,
             ),
         ):
@@ -380,11 +396,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
     def test_hunyuan_decoder_uses_spatial_parallel_components(self):
         with (
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_world_size",
+                "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_world_size",
                 return_value=2,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.parallel.spatial_parallel.get_decode_parallel_rank",
+                "sglang.multimodal_gen.runtime.layers.spatial_parallel.get_decode_parallel_rank",
                 return_value=0,
             ),
         ):
