@@ -3835,7 +3835,7 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch = None
 
-        if recv_req.mode == "retract" and not self.running_batch.is_empty():
+        if recv_req.mode == "retract":
             self.running_batch.filter_batch()
 
             retract_reqs = [*self.running_batch.reqs, *self.partially_extended_reqs()]

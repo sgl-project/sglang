@@ -22,7 +22,6 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.enable_overlap = False
         scheduler.last_batch = None
         scheduler.cur_batch = None
-        scheduler.chunked_req = None
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
@@ -56,11 +55,9 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler = self._new_scheduler()
         scheduler.last_batch = MagicMock()
         scheduler.cur_batch = MagicMock()
-        scheduler.chunked_req = MagicMock()
 
         original_last_batch = scheduler.last_batch
         original_cur_batch = scheduler.cur_batch
-        original_chunked_req = scheduler.chunked_req
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
@@ -68,7 +65,6 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         # All state must be preserved — no mutation
         self.assertIs(scheduler.last_batch, original_last_batch)
         self.assertIs(scheduler.cur_batch, original_cur_batch)
-        self.assertIs(scheduler.chunked_req, original_chunked_req)
 
     def test_inplace_does_not_drain_overlap_queue(self):
         """in_place should not process the overlap result_queue."""
@@ -130,7 +126,6 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertEqual(mock_release_req.call_count, 2)
         self.assertEqual(scheduler._add_request_to_queue.call_count, 2)
         self.assertEqual(scheduler.active_reqs, {})
-        self.assertIsNone(scheduler.chunked_req)
 
     def test_abort_drains_overlap_queue(self):
         """abort with overlap enabled should drain the result_queue."""
