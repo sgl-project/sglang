@@ -179,6 +179,21 @@ class PromptTokensDetails(BaseModel):
     cached_tokens: int = 0
 
 
+class CompletionTokensDetails(BaseModel):
+    """Details about completion tokens. Follows OpenAI's
+    ``usage.completion_tokens_details`` schema.
+
+    ``accepted_prediction_tokens`` / ``rejected_prediction_tokens`` mirror
+    OpenAI's Predicted Outputs feature and are populated from speculative
+    decoding when ``--enable-spec-decode-usage`` is set: accepted = drafts the
+    target model verified (no bonus); rejected = drafts proposed but not
+    verified.
+    """
+
+    accepted_prediction_tokens: Optional[int] = None
+    rejected_prediction_tokens: Optional[int] = None
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -186,6 +201,9 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+    # Used to return speculative-decoding counters when --enable-spec-decode-usage
+    # is set. None for non-spec requests and for spec requests when the flag is off.
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
 class StreamOptions(BaseModel):
