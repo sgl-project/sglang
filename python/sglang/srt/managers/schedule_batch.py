@@ -708,11 +708,9 @@ class Req(ReqDllmMixin):
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
 
-        # For req-level memory management. kv_committed_len = prefix covered
-        # by fully settled decode steps (updated at result time, never at
-        # prepare); a lower bound of the valid-KV prefix. [committed,
-        # allocated) is reserved (drafts, headroom, in-flight) and reclaimed
-        # by release_kv_cache().
+        # For req-level memory management. kv_committed_len = prefix covered by
+        # decode steps settled at result time; a lower bound of the valid-KV
+        # prefix. [committed, allocated) is reserved, reclaimed on release.
         self.kv_committed_len = 0
         self.kv_allocated_len = 0
         self.kv_committed_freed = False

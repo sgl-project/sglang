@@ -595,11 +595,9 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
-        # Settle the decode ledger: the forward that wrote this step's KV is
-        # done. Must run before the per-req loop -- the mamba track-boundary
-        # check reads kv_committed_len with this step included. Reqs finished
-        # or retracted in an earlier iteration never settle their step
-        # (retract already zeroed its ledger).
+        # Settle the decode ledger. Must precede the per-req loop: the mamba
+        # track-boundary check reads kv_committed_len with this step included.
+        # Reqs finished/retracted in an earlier iteration never settle.
         accept_lens = result.accept_lens_cpu  # None for non-spec: 1 token/req
         for i, req in enumerate(batch.reqs):
             if req.is_retracted or req.finished():

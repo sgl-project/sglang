@@ -556,9 +556,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
-        # The overlap loop keeps exactly one batch in flight, so a finished
-        # req can have at most one skipped (never-settled) over-decoded slot
-        # -- that pipeline depth is what bounds the gap at 1. A deeper
+        # The overlap loop keeps one batch in flight, so at most one skipped
+        # (never-settled) over-decoded slot exists per finished req; a deeper
         # pipeline must raise this bound.
         assert (
             0 <= end_p - start_p <= 1

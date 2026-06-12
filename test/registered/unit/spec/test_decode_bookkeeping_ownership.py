@@ -58,8 +58,7 @@ _OWNER_SITES = {
     (*_MIXIN, "decode_batch_idx"): 1,
     (*_MIXIN, "evict"): 1,
     (*_MIXIN, "kv_allocated_len"): 1,
-    # Settle-at-result accounting: one unified settle site for spec and
-    # non-spec decode.
+    # Settle-at-result: one unified settle site for spec and non-spec decode.
     (
         "managers/scheduler_components/batch_result_processor.py",
         "SchedulerBatchResultProcessor.process_batch_result_decode",
