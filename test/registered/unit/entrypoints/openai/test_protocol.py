@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     Function,
     ModelCard,
     ModelList,
+    ResponsesRequest,
     Tool,
     UsageInfo,
 )
@@ -339,6 +340,32 @@ class TestChatCompletionRequest(unittest.TestCase):
         strict = json_format.strict
         self.assertEqual(name, "VoiceNote")
         self.assertEqual(strict, True)
+
+
+class TestResponsesRequest(unittest.TestCase):
+    """Test ResponsesRequest protocol model"""
+
+    def test_max_output_tokens_maps_to_max_new_tokens(self):
+        request = ResponsesRequest(
+            model="test-model",
+            input="Hello",
+            max_output_tokens=1,
+        )
+        params = request.to_sampling_params(default_max_tokens=16)
+        self.assertEqual(params["max_new_tokens"], 1)
+
+    def test_default_max_tokens_maps_to_max_new_tokens(self):
+        request = ResponsesRequest(model="test-model", input="Hello")
+        params = request.to_sampling_params(default_max_tokens=16)
+        self.assertEqual(params["max_new_tokens"], 16)
+
+    def test_negative_max_output_tokens_rejected(self):
+        with self.assertRaises(ValidationError):
+            ResponsesRequest(
+                model="test-model",
+                input="Hello",
+                max_output_tokens=-1,
+            )
 
 
 class TestModelSerialization(unittest.TestCase):

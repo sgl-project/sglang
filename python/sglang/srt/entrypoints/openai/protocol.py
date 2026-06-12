@@ -1360,6 +1360,13 @@ class ResponsesRequest(BaseModel):
     min_p: float = 0.0
     repetition_penalty: float = 1.0
 
+    @field_validator("max_output_tokens")
+    @classmethod
+    def validate_max_output_tokens_positive(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("max_output_tokens must be positive")
+        return v
+
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 0.7,
@@ -1381,9 +1388,6 @@ class ResponsesRequest(BaseModel):
             max_tokens = min(self.max_output_tokens, default_max_tokens)
         else:
             max_tokens = default_max_tokens
-
-        # Avoid exceed the context length by minus 2 token
-        max_tokens -= 2
 
         # Get parameters with defaults
         temperature = self.temperature
