@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.utils import get_device
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4
@@ -860,7 +861,7 @@ class TestRadixCache(unittest.TestCase):
         base_prefix_len = 10000
         suffix_len = 100
 
-        torch_allocated_before = torch.cuda.memory_allocated()
+        torch_allocated_before = torch.get_device_module().memory_allocated()
 
         # build dataset with common prefix
         common_prefix = [
@@ -870,7 +871,7 @@ class TestRadixCache(unittest.TestCase):
             suffix = [random.randint(1, vocab_size - 1) for _ in range(suffix_len)]
             seq = common_prefix + suffix
             keys.append(seq)
-            values.append(torch.zeros(len(seq), device="cuda", dtype=torch.int32))
+            values.append(torch.zeros(len(seq), device=get_device(), dtype=torch.int32))
 
         cache: RadixCache = RadixCache.create_simulated()
 
@@ -879,7 +880,9 @@ class TestRadixCache(unittest.TestCase):
 
         del values
 
-        torch_allocated = torch.cuda.memory_allocated() - torch_allocated_before
+        torch_allocated = (
+            torch.get_device_module().memory_allocated() - torch_allocated_before
+        )
         cache_size_bytes = cache.total_size() * 4
         print(f"\nCache size (MB): {cache_size_bytes / (1024 * 1024)}")
         print(f"Torch allocated (MB): {torch_allocated / (1024 * 1024)}")
