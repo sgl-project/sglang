@@ -238,6 +238,7 @@ class DSV4AttnMetadata:
             self.c4_topk_lengths_clamp1,
             self.c128_out_loc,
             _,
+            _,
             self.c128_topk_lengths_clamp1,
             self.c128_page_indices,
         ) = _init_compression_metadata_triton(
@@ -1533,6 +1534,8 @@ class DeepseekV4AttnBackend(
         is_prefill: bool = False,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
+
+        seq_lens_casual = seq_lens_casual.to(torch.int32)
 
         swa_page_indices = self.get_swa_page_indices(
             seq_lens_casual=seq_lens_casual,

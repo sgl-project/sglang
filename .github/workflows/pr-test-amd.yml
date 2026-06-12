@@ -283,17 +283,7 @@ jobs:
         env:
           CONTINUE_ON_ERROR: ${{ needs.check-changes.outputs.continue_on_error }}
         run: |
-          failures=0
-          run_pytest() {
-            if [[ "$CONTINUE_ON_ERROR" == "true" ]]; then
-              "$@" || failures=$((failures + 1))
-            else
-              "$@"
-            fi
-          }
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_deterministic_custom_allreduce.py
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_nccl_allreduce_determinism.py
-          exit $failures
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite sgl-kernel-unit-test-2-gpu-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== primary ====================================================
 

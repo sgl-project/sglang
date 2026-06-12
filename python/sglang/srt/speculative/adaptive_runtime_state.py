@@ -6,7 +6,7 @@ from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParam
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
-    from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+    from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
@@ -36,7 +36,7 @@ class SpecRuntimeState:
 
     # -- Verify stage: target model one-pass tree verification --
     target_attn_backend: "AttentionBackend"
-    target_graph_runner: "CudaGraphRunner | CPUGraphRunner | None"
+    target_graph_runner: "DecodeCudaGraphRunner | CPUGraphRunner | None"
 
     # -- Extend stage: draft model KV cache catch-up after verify --
     draft_extend_attn_backend: "AttentionBackend | None"

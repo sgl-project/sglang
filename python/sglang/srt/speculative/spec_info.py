@@ -118,6 +118,12 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
+    def has_draft_kv(self) -> bool:
+        """Whether the draft phase writes KV chains. NGRAM does not (its tree
+        lives only in the verify mask), so per-decode KV sizing needs no
+        per-topk page rounding; see get_alloc_len_per_decode."""
+        return not self.is_ngram()
+
     def create_future_map(
         self,
         device: torch.device,
@@ -145,7 +151,7 @@ class SpeculativeAlgorithm(Enum):
             )
         return None
 
-    def supports_spec_v2(self) -> bool:
+    def need_topk(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
     def get_num_tokens_per_bs_for_target_verify(
@@ -165,16 +171,12 @@ class SpeculativeAlgorithm(Enum):
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
 
-        enable_overlap = not server_args.disable_overlap_schedule
-
         if self.is_dflash():
-            if enable_overlap:
-                raise ValueError(
-                    "DFLASH does not support overlap scheduling (spec v2)."
-                )
-            from sglang.srt.speculative.dflash_worker import DFlashWorker
+            # V2 worker drives both overlap and non-overlap (scheduler runs it
+            # synchronously when overlap is disabled), same as EAGLE.
+            from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
-            return DFlashWorker
+            return DFlashWorkerV2
 
         if self.is_frozen_kv_mtp():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -205,11 +207,6 @@ class SpeculativeAlgorithm(Enum):
 
             return StandaloneWorkerV2
         elif self.is_ngram():
-            if enable_overlap:
-                raise ValueError(
-                    f"Speculative algorithm {self.name} does not support overlap worker creation."
-                )
-
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker

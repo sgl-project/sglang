@@ -62,10 +62,11 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,7 @@ class CacheConfig:
     head_dim: int = 64
     dtype: torch.dtype = torch.bfloat16
     eviction_policy: str = "lru"
+    is_eagle: bool = False
 
     @property
     def has_mamba(self) -> bool:
@@ -125,6 +127,8 @@ class CacheConfig:
             or self.num_layers != defaults["num_layers"].default
         ):
             parts.append(f"h{self.head_num}l{self.num_layers}")
+        if self.is_eagle:
+            parts.append("eagle")
         return "_".join(parts)
 
 
@@ -324,11 +328,97 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
         eviction_policy=cfg.eviction_policy,
+        is_eagle=cfg.is_eagle,
     )
     tree = UnifiedRadixCache(params=cache_init_params)
     tree.cache_init_params = cache_init_params
 
     return tree, allocator, req_to_token_pool
+
+
+class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL,),
+        is_eagle=True,
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def test_l3_prefetch_uses_bigram_radix_key(self):
+        from sglang.srt.mem_cache.utils import get_hash_str
+
+        tree, allocator, _ = build_fixture(self.cfg)
+        tree.enable_storage = True
+        tree.prefetch_threshold = 1
+        tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+        value = allocator.alloc(len(tokens) - 1)
+        self.assertIsNotNone(value)
+        tree.insert(InsertParams(key=RadixKey(tokens), value=value))
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        leaf = match.last_device_node
+        self.assertTrue(leaf.key.is_bigram)
+        self.assertEqual(len(leaf.hash_value), 2)
+
+        class FakeHostPool:
+            def alloc(self, num_tokens):
+                return torch.arange(num_tokens, dtype=torch.int64)
+
+        class FakeCacheController:
+            def __init__(self):
+                self.mem_pool_host = FakeHostPool()
+                self.prefetch_tokens_occupied = 0
+                self.prefetch_args = None
+
+            def prefetch_rate_limited(self):
+                return False
+
+            def prefetch(
+                self,
+                request_id,
+                host_indices,
+                new_input_tokens,
+                last_hash=None,
+                prefix_keys=None,
+                extra_pools=None,
+            ):
+                self.prefetch_args = (
+                    request_id,
+                    host_indices,
+                    new_input_tokens,
+                    last_hash,
+                    prefix_keys,
+                    extra_pools,
+                )
+                return mock.Mock()
+
+        controller = FakeCacheController()
+        tree.cache_controller = controller
+        tree.prefetch_from_storage("req", tree.root_node, tokens)
+
+        _, _, storage_key, _, _, _ = controller.prefetch_args
+        self.assertIsInstance(storage_key, RadixKey)
+        self.assertTrue(storage_key.is_bigram)
+        self.assertEqual(len(storage_key), len(tokens) - 1)
+
+        queried_hashes = []
+        running_hash = None
+        for start in range(0, len(storage_key), tree.page_size):
+            running_hash = get_hash_str(
+                storage_key[start : start + tree.page_size], running_hash
+            )
+            queried_hashes.append(running_hash)
+        self.assertEqual(queried_hashes, leaf.hash_value)
+
+        canonical_hashes = []
+        running_hash = None
+        for start in range(0, len(tokens) - 1, tree.page_size):
+            running_hash = get_hash_str(
+                tokens[start : start + tree.page_size], running_hash
+            )
+            canonical_hashes.append(running_hash)
+        self.assertNotEqual(canonical_hashes, leaf.hash_value)
 
 
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
@@ -1432,6 +1522,98 @@ class UnifiedRadixCacheSuite:
         self.assertLess(b_pos, a_pos, "A was below B in pre, must stay below")
         tree.sanity_check()
 
+    def test_swa_eager_eviction_on_unfinished_req(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest(
+                "requires SWA without Mamba (mamba alters effective_cache_len)"
+            )
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        pre_len = 20
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, pre_len)
+        req.origin_input_ids = tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        kv_indices = self._alloc(allocator, pre_len)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
+        req.kv_committed_len = pre_len
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.swa_evicted_seqlen = 0
+
+        swa_avail_before = allocator.swa_attn_allocator.available_size()
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            tree.cache_unfinished_req(req)
+
+        cushion = self.cfg.sliding_window_size + self.cfg.page_size
+        expected_evicted = (pre_len - 1) - cushion
+        self.assertEqual(
+            req.swa_evicted_seqlen,
+            expected_evicted,
+            f"swa_evicted_seqlen should advance to (pre_len-1) - cushion = "
+            f"{expected_evicted}, got {req.swa_evicted_seqlen}",
+        )
+
+        swa_avail_after = allocator.swa_attn_allocator.available_size()
+        self.assertGreaterEqual(
+            swa_avail_after - swa_avail_before,
+            expected_evicted,
+            f"SWA pool should have freed at least {expected_evicted} slots; "
+            f"before={swa_avail_before}, after={swa_avail_after}",
+        )
+
+        tree.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        tree.sanity_check()
+
+    def test_swa_eager_eviction_noop_when_within_window(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        cushion = self.cfg.sliding_window_size + self.cfg.page_size  # = 5
+        pre_len = cushion  # exactly at the boundary, nothing slid out
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, pre_len)
+        req.origin_input_ids = tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        kv_indices = self._alloc(allocator, pre_len)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
+        req.kv_committed_len = pre_len
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.swa_evicted_seqlen = 0
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            tree.cache_unfinished_req(req)
+
+        self.assertEqual(
+            req.swa_evicted_seqlen,
+            0,
+            "Nothing should be evicted when prefill fits inside the cushion",
+        )
+
+        tree.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        tree.sanity_check()
+
     def test_swa_sanity_check_passes_after_deep_match(self):
         if not self._swa_pinning_cfg_supported():
             self.skipTest("requires SWA-only config with node size >= cushion")
@@ -2361,6 +2543,36 @@ class UnifiedRadixCacheSuite:
             mamba_cache.temporal[:, mamba_indices].float().cpu().clone(),
             [conv[:, mamba_indices].float().cpu().clone() for conv in mamba_cache.conv],
         )
+
+    def test_hicache_evict_device_leaf_aborts_demote_when_backup_fails(self):
+        """when write_backup cannot allocate host pool,
+        _evict_device_leaf should not evict it to host."""
+        if self._skip_unsupported_hicache_test():
+            return
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+        ct = ComponentType.FULL
+
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        self.assertIsNot(node, tree.root_node)
+        self.assertFalse(node.backuped)
+        self.assertFalse(node.evicted)
+
+        tracker = {c: 0 for c in tree.tree_components}
+        with mock.patch.object(tree, "write_backup", return_value=0):
+            tree._evict_device_leaf(node, tracker)
+
+        self.assertFalse(node.evicted)
+        self.assertIsNotNone(node.component_data[ct].value)
+        self.assertIsNone(node.component_data[ct].host_value)
+
+        with self.assertRaises(AssertionError):
+            tree._evict_to_host(node, {c: 0 for c in tree.tree_components})
+
+        tree.sanity_check()
 
     def test_hicache_node_states(self):
         """Verify device-only to device+host transition after real backup."""

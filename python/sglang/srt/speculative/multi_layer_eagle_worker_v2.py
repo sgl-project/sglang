@@ -31,6 +31,11 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -38,7 +43,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+    EagleVerifyInput,
+)
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
@@ -128,8 +137,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        backup_decode_mode = server_args.cuda_graph_config.decode.backend
+        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
@@ -182,8 +191,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Init attention backend and cuda graphs
         for i in range(self.speculative_num_steps):
-            self.draft_runner_list[i].server_args.disable_cuda_graph = (
-                backup_disable_cuda_graph
+            self.draft_runner_list[i].server_args.cuda_graph_config.decode.backend = (
+                backup_decode_mode
             )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
@@ -230,7 +239,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
         if not _is_npu:
@@ -409,16 +418,15 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             "draft_extend_for_prefill: next_token_ids before draft embed",
         )
 
-        # Construct spec_info
-        next_draft_input = EagleDraftInput(
+        # Draft-extend spec_info for the extend forward; carries only
+        # hidden_states + shape info.
+        extend_input = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
-            bonus_tokens=next_token_ids,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
-
-        batch.spec_info = next_draft_input
+        batch.spec_info = extend_input
 
         # Chain-style MTP needs FULL to get all-token hidden states;
         # non-chain only needs LAST (the target model's hidden states).
@@ -479,8 +487,16 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     forward_batch.extend_seq_lens,
                     topk_index,
                 )
-        next_draft_input.topk_p = torch.cat(topk_p_list, dim=1)
-        next_draft_input.topk_index = torch.cat(topk_index_list, dim=1)
+        next_draft_input = EagleDraftInput(
+            topk_p=torch.cat(topk_p_list, dim=1),
+            topk_index=torch.cat(topk_index_list, dim=1),
+            # Chain-style left the last step's hidden_states on the extend
+            # input; non-chain keeps the target hidden states.
+            hidden_states=extend_input.hidden_states,
+            bonus_tokens=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
 
         # Update req_to_hidden_states_pool for KV Cache reversion
         if forward_batch.extend_seq_lens is not None:
@@ -499,7 +515,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
-        draft_input = EagleDraftInput(
+        draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=1,
@@ -508,7 +524,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Prepare for draft extend in a separate stream
         # Notice that here we use batch_result.next_token_ids as the input ids
         with self.plan_stream_ctx:
-            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+            forward_batch = draft_extend_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
                 batch_result.next_token_ids,
                 self.speculative_num_draft_tokens,
@@ -534,7 +550,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.reset_cuda_graph_buffers(forward_batch, batch_result)
         else:
             logger.warning_once(
-                f"can't use cuda graph for draft extend! may have correctness issue!"
+                "can't use cuda graph for draft extend! may have correctness issue!"
             )
             select_index = (
                 torch.arange(len(batch.seq_lens), device=self.device)
@@ -546,7 +562,12 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             # pre-plan (see warning above). Mark the batch so the forward path
             # keeps skipping metadata init — preserves the pre-existing
             # behavior; the latent issue is tracked by the warning.
-            forward_batch.mark_forward_metadata_ready()
+            # On NPU with --disable-cuda-graph, leave each draft runner to init
+            # its own metadata in forward_extend (post-pad), otherwise
+            # per-runner attn_backend.forward_metadata is never initialized for
+            # draft_runner_list[1+].
+            if not _is_npu or can_cuda_graph:
+                forward_batch.mark_forward_metadata_ready()
 
         for step in range(self.speculative_num_steps):
             # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
@@ -796,7 +817,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 verify_input,
                 (
-                    self.target_worker.model_runner.graph_runner.bs
+                    self.target_worker.model_runner.decode_cuda_graph_runner.bs
                     if can_run_cuda_graph
                     else None
                 ),
@@ -805,7 +826,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # prepare_for_v2_verify only plans when cuda-graph replay_prepare ran.
         # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
         # worker has not adopted that fix, so preserve its behavior verbatim.
-        verify_forward_batch.mark_forward_metadata_ready()
+        # On NPU with --disable-cuda-graph, non-graph verify needs metadata init
+        # in forward_extend (post-pad); only mark ready for the cuda-graph path.
+        if not _is_npu or can_run_cuda_graph:
+            verify_forward_batch.mark_forward_metadata_ready()
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
