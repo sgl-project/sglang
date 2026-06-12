@@ -1,6 +1,6 @@
+import ast
 import json
 import os
-import pickle
 import random
 from typing import List, Optional, Tuple, Union
 
@@ -32,6 +32,60 @@ MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
 # is a list of conversations sharing the same prefix (synthetic,
 # doc, video)
 SampleOutput = List[List[Tuple[MsgContent, int, int]]]
+
+
+def _parse_loogle_qa_pairs(raw_qa_pairs: Union[str, List[dict]]) -> List[dict]:
+    """Safely parse Loogle QA pairs without using eval()."""
+    if isinstance(raw_qa_pairs, list):
+        qa_pairs = raw_qa_pairs
+    elif isinstance(raw_qa_pairs, str):
+        try:
+            qa_pairs = json.loads(raw_qa_pairs)
+        except json.JSONDecodeError:
+            try:
+                qa_pairs = ast.literal_eval(raw_qa_pairs)
+            except (ValueError, SyntaxError) as err:
+                raise ValueError("Invalid qa_pairs format in Loogle dataset") from err
+    else:
+        raise ValueError(
+            "qa_pairs should be either a list or a JSON/Python string list"
+        )
+
+    if not isinstance(qa_pairs, list):
+        raise ValueError("qa_pairs should decode to a list")
+
+    for item in qa_pairs:
+        if not isinstance(item, dict) or "Q" not in item or "A" not in item:
+            raise ValueError("Each qa_pairs item must be a dict containing 'Q' and 'A'")
+
+    return qa_pairs
+
+
+def _load_generated_prefix_cache(cache_path) -> SampleOutput:
+    """Load JSON cache with schema validation."""
+    with open(cache_path, encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if not isinstance(payload, list):
+        raise ValueError("Cache payload must be a list")
+
+    normalized: SampleOutput = []
+    for group in payload:
+        if not isinstance(group, list):
+            raise ValueError("Cache group must be a list")
+        normalized_group = []
+        for row in group:
+            if not isinstance(row, list) or len(row) != 3:
+                raise ValueError(
+                    "Each cache row must be [prompt, prompt_len, output_len]"
+                )
+            prompt, prompt_len, output_len = row
+            if not isinstance(prompt, str):
+                raise ValueError("Prompt in cache row must be a string")
+            normalized_group.append((prompt, int(prompt_len), int(output_len)))
+        normalized.append(normalized_group)
+
+    return normalized
 
 
 def common_filter_chat(
@@ -241,7 +295,7 @@ def sample_loogle_requests(
             )
             new_dataset.append(chat)
         else:
-            qa_pairs = eval(data["qa_pairs"])
+            qa_pairs = _parse_loogle_qa_pairs(data["qa_pairs"])
             for i, qa in enumerate(qa_pairs):
                 if i == 0 or enable_shared_prefix:
                     # Combine input with the first Q
@@ -450,13 +504,12 @@ def sample_generated_shared_prefix_requests(
         question_len,
         output_len,
         tokenizer,
-    )
+    ).with_suffix(".json")
 
     # Try to load from cache first
     if cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
+        return _load_generated_prefix_cache(cache_path)
 
     print("\nGenerating new input data...")
 
@@ -511,8 +564,8 @@ def sample_generated_shared_prefix_requests(
     # Save to cache
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Caching generated input data to {cache_path}")
-    with open(cache_path, "wb") as f:
-        pickle.dump(input_requests, f)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(input_requests, f)
 
     return input_requests
 
