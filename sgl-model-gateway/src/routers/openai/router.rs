@@ -399,6 +399,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
     }
 
+    fn use_router_health_generate(&self) -> bool {
+        true
+    }
+
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         let stats = self.worker_registry.stats();
         let external_workers = self.external_workers();
