@@ -2,14 +2,18 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+    CompressedTensorsLinearMethod,
+)
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-b-test-cpu")
 
 
-class TestQuantLogString(CustomTestCase):
+class TestQuantLogString(unittest.TestCase):
     def test_qwen_fp8_config(self):
         # Example from Qwen/Qwen3-4B-Thinking-2507-FP8
         quant_config = {
@@ -71,6 +75,23 @@ class TestQuantLogString(CustomTestCase):
         result = model_config.get_quantization_config_log_str()
         print(f"\n[Test No Quant] Result: {result}")
         self.assertIsNone(result)
+
+    def test_compressed_tensors_parallel_lm_head_dispatch(self):
+        cfg = CompressedTensorsConfig(
+            target_scheme_map={"lm_head": {"weights": None, "input_activations": None}},
+            ignore=[],
+            quant_format="pack-quantized",
+            sparsity_scheme_map={},
+            sparsity_ignore_list=[],
+        )
+        sentinel = object()
+        cfg.get_linear_scheme = lambda **_: sentinel
+        layer = ParallelLMHead.__new__(ParallelLMHead)
+
+        method = cfg.get_quant_method(layer, prefix="lm_head")
+
+        self.assertIsInstance(method, CompressedTensorsLinearMethod)
+        self.assertIs(layer.scheme, sentinel)
 
 
 if __name__ == "__main__":
