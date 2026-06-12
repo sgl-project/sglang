@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import BufferSpec, get_context
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
@@ -40,9 +41,6 @@ if TYPE_CHECKING:
 # Default workspace size in MB for TRTLLM MHA
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
-
-# Reuse this workspace buffer across all TRTLLM MHA wrappers
-global_zero_init_workspace_buffer = None
 
 
 @dataclass
@@ -104,15 +102,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
-        # Allocate buffers
-        global global_zero_init_workspace_buffer
-        if global_zero_init_workspace_buffer is None:
-            global_zero_init_workspace_buffer = torch.zeros(
-                self.workspace_size,
+        # Lazily allocate the workspace; the buffer cache shares one tensor across
+        # backend instances.
+        ctx = get_context()
+        ctx.buffers.register(
+            BufferSpec(
+                name="trtllm.mha_workspace",
+                shape=self.workspace_size,  # 1-D uint8 workspace (size in bytes)
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
-        self.workspace_buffer = global_zero_init_workspace_buffer
+        )
+        self.workspace_buffer = ctx.buffers.get_persistent_buffer(
+            "trtllm.mha_workspace"
+        )
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}

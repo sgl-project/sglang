@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -963,7 +964,11 @@ class ModelRunnerKVCacheMixin:
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
 
-    def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
+    def init_memory_pool(self: ModelRunner):
+        # The pre-model-load memory measurement lives on the context (stashed by
+        # init_context); read it here at the point of use instead of threading it
+        # through initialize() / init_memory_pool() signatures.
+        pre_model_load_memory = get_context().metrics.pre_model_load_memory
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
                 self.memory_pool_config is not None

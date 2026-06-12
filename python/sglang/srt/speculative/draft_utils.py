@@ -1,6 +1,7 @@
 import logging
 
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.runtime_context import get_flags
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import is_blackwell, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
@@ -117,7 +118,7 @@ class DraftBackendFactory:
         return DeepseekSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_flashinfer_decode_backend(self):
-        if not get_global_server_args().use_mla_backend:
+        if not get_flags().attn.use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferMultiStepDraftBackend,
             )
@@ -192,7 +193,7 @@ class DraftBackendFactory:
         )
 
     def _create_trtllm_mla_decode_backend(self, backend: str = "trtllm-gen"):
-        if not get_global_server_args().use_mla_backend:
+        if not get_flags().attn.use_mla_backend:
             raise ValueError(
                 "trtllm_mla backend requires MLA model (use_mla_backend=True)."
             )
@@ -212,7 +213,7 @@ class DraftBackendFactory:
         return self._create_trtllm_mla_decode_backend(backend="cute-dsl")
 
     def _create_tokenspeed_mla_decode_backend(self):
-        if not get_global_server_args().use_mla_backend:
+        if not get_flags().attn.use_mla_backend:
             raise ValueError(
                 "tokenspeed_mla backend requires MLA model (use_mla_backend=True)."
             )
@@ -249,7 +250,7 @@ class DraftBackendFactory:
         )
 
     def _create_flashinfer_prefill_backend(self):
-        if not get_global_server_args().use_mla_backend:
+        if not get_flags().attn.use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferAttnBackend,
             )
@@ -297,7 +298,7 @@ class DraftBackendFactory:
         return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_trtllm_mla_prefill_backend(self):
-        if not get_global_server_args().use_mla_backend:
+        if not get_flags().attn.use_mla_backend:
             raise ValueError(
                 "trtllm_mla backend requires MLA model (use_mla_backend=True)."
             )
@@ -307,7 +308,7 @@ class DraftBackendFactory:
         return TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_tokenspeed_mla_prefill_backend(self):
-        if not get_global_server_args().use_mla_backend:
+        if not get_flags().attn.use_mla_backend:
             raise ValueError(
                 "tokenspeed_mla backend requires MLA model (use_mla_backend=True)."
             )

@@ -56,6 +56,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.model_executor.triton_ops.position import compute_position_triton
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_cuda,
@@ -1126,6 +1127,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
+        # mirror into the context flag while the legacy global is still read
+        get_flags().is_extend_in_batch = self.is_extend_in_batch
 
         bs = self.batch_size
 
