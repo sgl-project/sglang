@@ -868,8 +868,9 @@ class _Grafter:
     def __init__(self, *, config: DumperConfig):
         self._config = config
         self._pg = None
-        self._file_inject_cache: dict = {}  # module_name -> tensor (CPU)
+        self._file_inject_cache: dict = {}  # module_name -> tensor (CPU) or None
         self._file_inject_logged_mismatches: set = set()
+        self._file_inject_filenames: Optional[list] = None
 
     @property
     def enabled(self) -> bool:
@@ -1011,25 +1012,35 @@ class _Grafter:
 
         if name not in self._file_inject_cache:
             inject_dir = cfg.grafter_file_inject_dir
+            # Cache directory listing once to avoid repeated os.listdir calls
+            if self._file_inject_filenames is None:
+                try:
+                    self._file_inject_filenames = os.listdir(inject_dir)
+                except OSError:
+                    self._file_inject_filenames = []
+
             # Match dumper filename pattern: contains ___name=<name>___ or ends with ___name=<name>.pt
             name_tag = f"___name={name}___"
             name_tag_end = f"___name={name}.pt"
             matched = None
-            try:
-                for fname in os.listdir(inject_dir):
-                    if name_tag in fname or fname.endswith(name_tag_end):
-                        matched = os.path.join(inject_dir, fname)
-                        break
-            except OSError:
-                return
+            for fname in self._file_inject_filenames:
+                if name_tag in fname or fname.endswith(name_tag_end):
+                    matched = os.path.join(inject_dir, fname)
+                    break
+
             if matched is None:
+                self._file_inject_cache[name] = None
                 return
+
             raw = torch.load(matched, map_location="cpu", weights_only=True)
+            # Dumper saves files as {"value": tensor, "meta": {...}}
+            if isinstance(raw, dict) and "value" in raw:
+                raw = raw["value"]
             self._file_inject_cache[name] = raw
             _log(f"[Grafter/file_inject] Loaded '{name}' from {matched}")
 
         raw = self._file_inject_cache[name]
-        if not isinstance(raw, torch.Tensor):
+        if raw is None or not isinstance(raw, torch.Tensor):
             return
 
         # Warn on dtype mismatch (will be cast by .to(), but may hide bugs).
