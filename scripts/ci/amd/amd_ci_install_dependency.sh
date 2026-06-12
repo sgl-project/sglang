@@ -194,9 +194,9 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   # Check if ROCm version >= 7.14.0
   if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.14.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
     echo "[MORI] ROCm version ${ROCM_VERSION} >= 7.14.0 detected"
-    ROCM_PATH=${ROCM_HOME}
-    PATH=${ROCM_HOME}/bin:${PATH}
-    CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/rocm_sysdeps/lib/cmake:${ROCM_HOME}/lib/cmake:${ROCM_HOME}
+    # The reason behind naming the condition LEGACY_EDITABLE_INSTALL
+    #   1. We tend to call `setup.py` directly so far anyway.
+    #   2. The real ROCM_VERSION condition (as above) is too complicated.
     LEGACY_EDITABLE_INSTALL=0
   else
     echo "[MORI] ROCm version ${ROCM_VERSION} < 7.14.0 or unknown"
@@ -221,6 +221,9 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     if [[ '${LEGACY_EDITABLE_INSTALL}' == 1 ]]; then
       python3 setup.py develop
     else
+      ROCM_PATH=\${ROCM_HOME} \
+      PATH=\${ROCM_HOME}/bin:\${PATH} \
+      CMAKE_PREFIX_PATH=\${ROCM_HOME}/lib/rocm_sysdeps/lib/cmake:\${ROCM_HOME}/lib/cmake:\${ROCM_HOME} \
       python3 -m pip install -e . --no-build-isolation
     fi
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
