@@ -1,0 +1,170 @@
+
+# SGLang Benchmark on Ascend Atlas 800I A2 (Single NPU)
+
+This document presents a baseline performance evaluation of SGLang on Ascend Atlas 800I A2 using the Qwen3-0.6B model. The goal is to verify service availability, streaming latency, and concurrency scalability on Ascend backend.
+
+---
+
+## 1. Environment
+
+| Item | Value |
+|------|------|
+| Model | Qwen/Qwen3-0.6B |
+| Backend | Ascend NPU |
+| Device | Atlas 800I A2 (single card) |
+| SGLang Version | 7603b226c |
+| Python | 3.11.6 |
+| OS | Linux 5.15 |
+| Context Length | 40960 |
+
+---
+
+## 2. Service Setup
+
+### Launch Parameters
+
+```bash
+--device npu
+--attention-backend ascend
+--host 127.0.0.1
+--port 8188
+--mem-fraction-static 0.4
+--chunked-prefill-size 4096
+--disable-cuda-graph
+````
+
+> Note: `--disable-cuda-graph` is required. See Section 6.
+
+---
+
+## 3. Functionality Verification
+
+The following endpoints were validated:
+
+* `/health`
+* `/v1/models`
+* `/model_info`
+* `/generate`
+* `/v1/chat/completions`
+
+All endpoints responded correctly.
+
+---
+
+## 4. Benchmark Method
+
+Benchmark script:
+
+```bash
+python3 benchmark_sglang.py \
+  --base-url http://127.0.0.1:8188 \
+  --model Qwen/Qwen3-0.6B \
+  --concurrency 1,4,8
+```
+
+### Metrics
+
+* TTFT (Time To First Token)
+* End-to-End Latency
+* Request Throughput
+* Token Throughput
+
+---
+
+## 5. Results
+
+### 5.1 Streaming Performance
+
+| Metric              | Value     |
+| ------------------- | --------- |
+| TTFT                | 79.93 ms  |
+| Total Response Time | 344.18 ms |
+
+This indicates good interactive latency for a 0.6B model.
+
+---
+
+### 5.2 Concurrency Scaling
+
+| Concurrency | Req/s | Tok/s  | Avg Latency |
+| ----------- | ----- | ------ | ----------- |
+| 1           | 2.93  | 93.89  | 340.73 ms   |
+| 4           | 3.28  | 104.80 | 1220.75 ms  |
+| 8           | 6.43  | 205.89 | 1233.78 ms  |
+
+### Observation
+
+* Throughput increases with concurrency
+* Latency increases significantly
+
+This suggests scheduling overhead under higher load.
+
+---
+
+## 6. Known Issue: CUDA Graph on Ascend
+
+When enabling CUDA graph (default behavior), the service fails with:
+
+```
+0 active drivers ([])
+```
+
+### Workaround
+
+```bash
+--disable-cuda-graph
+```
+
+### Analysis
+
+Possible reasons:
+
+1. CUDA graph is not supported on Ascend backend
+2. Graph runner cannot find valid backend driver
+3. Triton-Ascend lacks graph execution support
+
+### Recommendation
+
+* Add automatic fallback when graph init fails
+* Improve logging for backend compatibility
+
+---
+
+## 7. Additional Observations
+
+### Cold Start
+
+* First request latency: ~9s
+* Likely due to model initialization and memory allocation
+
+### Multi-turn Stability
+
+* 5-turn latency: 341–389 ms
+* Stable across turns
+
+### Long Context
+
+* ~7k tokens prompt processed in ~513 ms
+* No obvious degradation observed
+
+---
+
+## 8. Conclusion
+
+* SGLang runs successfully on Ascend Atlas 800I A2
+* Streaming latency is low (TTFT ~80 ms)
+* Throughput scales with concurrency
+* CUDA graph must be disabled
+
+This report provides a baseline for future optimization.
+
+---
+
+## 9. Future Work
+
+* Enable CUDA graph or equivalent optimization on Ascend
+* Improve scheduling under high concurrency
+* Optimize KV cache management
+
+```
+
