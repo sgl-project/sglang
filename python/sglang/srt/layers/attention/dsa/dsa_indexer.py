@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 global _use_multi_stream
 _is_cuda = is_cuda()
+_use_dsa_indexer_fusion = _is_cuda and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -168,6 +169,32 @@ if _is_cuda:
     ) -> torch.Tensor:
         weights = weights_raw * n_heads_inv_sqrt
         return weights.unsqueeze(-1) * q_scale * softmax_scale
+
+    def _logits_head_gate_pcg_fake_impl(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+        q_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (x.shape[0], weight.shape[0], q_scale.shape[-1]),
+            dtype=torch.float32,
+            device=x.device,
+        )
+
+    @register_custom_op(fake_impl=_logits_head_gate_pcg_fake_impl)
+    def logits_head_gate_pcg(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+        q_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+        weights = out * n_heads_inv_sqrt
+        weights = weights.unsqueeze(-1) * q_scale * softmax_scale
+        return weights
 
     @register_custom_op(mutates_args=["topk_indices"])
     @register_split_op()
@@ -352,7 +379,7 @@ class Indexer(MultiPlatformOp):
             prefix=add_prefix("wq_b", prefix),
         )
 
-        if _is_cuda:
+        if _use_dsa_indexer_fusion:
             self.wk_weights_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim + self.n_heads,
@@ -393,7 +420,7 @@ class Indexer(MultiPlatformOp):
 
         # freqs_cis is built from the fp32 cos/sin cache before any forward casts it to bf16.
         self._indexer_freqs_cis: Optional[torch.Tensor] = None
-        if _is_cuda:
+        if _use_dsa_indexer_fusion:
             c = self.rotary_emb.cos_sin_cache.to(torch.float32)
             half = c.shape[-1] // 2
             self._indexer_freqs_cis = torch.complex(
@@ -489,7 +516,7 @@ class Indexer(MultiPlatformOp):
                 )
             with torch.cuda.stream(self.alt_stream):
                 # TODO we should also put DeepGEMM half SM here?
-                if _is_cuda:
+                if _use_dsa_indexer_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
                     key, _ = self.wk(x)
@@ -508,7 +535,7 @@ class Indexer(MultiPlatformOp):
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
-            if _is_cuda:
+            if _use_dsa_indexer_fusion:
                 key, weights_raw = self._fused_k_weights(x)
             else:
                 key, _ = self.wk(x)
@@ -570,7 +597,7 @@ class Indexer(MultiPlatformOp):
         enable_dual_stream: bool,
     ):
         # Compute only key, skip query
-        if _is_cuda:
+        if _use_dsa_indexer_fusion:
             key, _ = self._fused_k_weights(x)
         else:
             key, _ = self.wk(x)
@@ -1522,7 +1549,7 @@ class Indexer(MultiPlatformOp):
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if (
-            _is_cuda
+            _use_dsa_indexer_fusion
             and not is_in_tc_piecewise_cuda_graph()
             and forward_batch.attn_cp_metadata is None
         ):
@@ -1532,7 +1559,7 @@ class Indexer(MultiPlatformOp):
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            if not _is_cuda:
+            if not _use_dsa_indexer_fusion:
                 weights = self._project_and_scale_head_gates(x)
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
@@ -1546,7 +1573,7 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            if _is_cuda:
+            if _use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             else:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
@@ -1623,13 +1650,22 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = x
 
             if is_in_tc_piecewise_cuda_graph():
-                weights = scale_head_gate_pcg(
-                    weights_raw,
-                    self.n_heads**-0.5,
-                    self.softmax_scale,
-                    q_scale,
-                )
-            elif _is_cuda:
+                if _use_dsa_indexer_fusion:
+                    weights = scale_head_gate_pcg(
+                        weights_raw,
+                        self.n_heads**-0.5,
+                        self.softmax_scale,
+                        q_scale,
+                    )
+                else:
+                    weights = logits_head_gate_pcg(
+                        x_for_gate,
+                        self.weights_proj.weight,
+                        self.n_heads**-0.5,
+                        self.softmax_scale,
+                        q_scale,
+                    )
+            elif _use_dsa_indexer_fusion:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
