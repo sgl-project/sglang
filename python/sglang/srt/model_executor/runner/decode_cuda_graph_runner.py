@@ -38,9 +38,6 @@ from torch.profiler import ProfilerActivity, profile
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 from sglang.srt.distributed.parallel_state import (
     graph_capture,
     set_pdmux_status,
@@ -57,7 +54,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
-from sglang.srt.layers.utils.dcp_utils import dcp_enabled, get_attention_dcp_group
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
@@ -752,18 +748,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return forward_batch, attn_backend, pp_proxy_tensors
 
-    def _prealloc_symmetric_memory_pool(self):
-        if not dcp_enabled():
-            return
-        with torch.get_device_module(self.device).stream(self.stream):
-            logger.info(f"Pre-allocating symmetric memory pool for dcp")
-            with use_symmetric_memory(get_attention_dcp_group()):
-                [
-                    torch.empty(size, dtype=torch.uint8, device=self.device)
-                    for j in range(8)
-                    for size in [3 * 512 * 1024, 20 * 1024 * 1024]
-                ]
-
     # -----------------------------------------------------------------
     # capture
     # -----------------------------------------------------------------
@@ -776,11 +760,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if not self.enable_pdmux:
                 with graph_capture() as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
-                    if (
-                        getattr(self, "_prealloc_symmetric_memory_pool", None)
-                        is not None
-                    ):
-                        self._prealloc_symmetric_memory_pool()
                     with self.backend.capture_session(self.stream):
                         self._capture_one_stream()
             else:
