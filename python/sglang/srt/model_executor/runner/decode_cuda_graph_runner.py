@@ -26,9 +26,9 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
-import os
 import inspect
 import logging
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
