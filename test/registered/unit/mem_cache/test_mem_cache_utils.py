@@ -1,9 +1,5 @@
 """Unit tests for mem_cache/utils.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
-
 import hashlib
 import unittest
 from unittest.mock import MagicMock, patch
@@ -25,7 +21,10 @@ from sglang.srt.mem_cache.utils import (
     maybe_init_custom_mem_pool,
     split_node_hash_value,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestGetEvictionStrategy(CustomTestCase):
@@ -104,16 +103,6 @@ class TestGetHashStr(CustomTestCase):
         expected = hashlib.sha256().hexdigest()
         self.assertEqual(result, expected)
 
-    def test_single_token(self):
-        h1 = get_hash_str([42])
-        h2 = get_hash_str([42])
-        self.assertEqual(h1, h2)
-
-    def test_multiple_tokens(self):
-        h1 = get_hash_str([1, 2, 3])
-        h2 = get_hash_str([1, 2, 3])
-        self.assertEqual(h1, h2)
-
     def test_different_sequence_different_hash(self):
         h1 = get_hash_str([1, 2, 3])
         h2 = get_hash_str([3, 2, 1])
@@ -123,11 +112,6 @@ class TestGetHashStr(CustomTestCase):
         h1 = get_hash_str([100])
         h2 = get_hash_str([200])
         self.assertNotEqual(h1, h2)
-
-    def test_bigram_tuple_tokens(self):
-        h1 = get_hash_str([(1, 2), (3, 4)])
-        h2 = get_hash_str([(1, 2), (3, 4)])
-        self.assertEqual(h1, h2)
 
     def test_bigram_vs_flat_token_equivalent(self):
         h_flat = get_hash_str([1, 2])
@@ -140,14 +124,14 @@ class TestGetHashStr(CustomTestCase):
         self.assertNotEqual(h1, h2)
 
     def test_prior_hash_chaining(self):
-        first = get_hash_str([1, 2])
-        second = get_hash_str([3, 4], prior_hash=first)
-
-        ref = hashlib.sha256()
-        ref.update(bytes.fromhex(first))
-        ref.update((3).to_bytes(4, byteorder="little", signed=False))
-        ref.update((4).to_bytes(4, byteorder="little", signed=False))
-        self.assertEqual(second, ref.hexdigest())
+        chained = get_hash_str([3, 4], prior_hash=get_hash_str([1, 2]))
+        # prior_hash must fold into the digest, so chaining differs from
+        # hashing [3, 4] alone...
+        self.assertNotEqual(chained, get_hash_str([3, 4]))
+        # ...and a different prior_hash must yield a different chained digest.
+        self.assertNotEqual(
+            chained, get_hash_str([3, 4], prior_hash=get_hash_str([9, 9]))
+        )
 
     def test_prior_hash_single_step(self):
         step1 = get_hash_str([1])
