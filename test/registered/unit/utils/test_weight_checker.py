@@ -28,6 +28,7 @@ from sglang.srt.utils.weight_checker import (
     ChecksumInfo,
     ParallelismInfo,
     WeightChecker,
+    _block_size_of,
     _check_tensors,
     _compare_quant_pair,
     _hash_tensor,
@@ -426,6 +427,38 @@ class TestCompareQuantPair(CustomTestCase):
         with patch("sglang.srt.utils.weight_checker._CHUNK_NUMEL", 128 * 128):
             chunked = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
         self.assertEqual(chunked, reference)
+
+    @staticmethod
+    def _quantize_partial(weight: torch.Tensor, scale_margin: float):
+        """128x128 block quant where the last block per dim may be partial."""
+        n, k = weight.shape
+        s_n, s_k = -(-n // 128), -(-k // 128)
+        q = torch.empty(n, k, dtype=torch.float8_e4m3fn, device=weight.device)
+        scale = torch.empty(s_n, s_k, device=weight.device)
+        for i in range(s_n):
+            for j in range(s_k):
+                blk = weight[i * 128 : (i + 1) * 128, j * 128 : (j + 1) * 128].float()
+                s = blk.abs().amax() / 448.0 * scale_margin
+                s = s if s > 0 else weight.new_ones(())
+                scale[i, j] = s
+                q[i * 128 : (i + 1) * 128, j * 128 : (j + 1) * 128] = (blk / s).to(
+                    torch.float8_e4m3fn
+                )
+        return q, scale
+
+    def test_partial_last_block_infers_true_block_size(self):
+        # fused_qkv_a_proj_with_mqa out-dim is not a multiple of 128 (e.g. 2112 =
+        # 16*128 + 64), so the last row-block is partial. ceil(dim/num_blocks)
+        # would infer 125, misaligning scales; the true block size is 128.
+        n, k = 3 * 128 + 64, 256  # 448 rows = partial last block, 256 cols
+        weight = torch.randn(n, k, device="cuda") * 0.02
+        e_q, e_s = self._quantize_partial(weight, 1.0)
+        a_q, a_s = self._quantize_partial(weight, 1.001)
+        self.assertEqual(list(e_s.shape), [4, 2])  # ceil(448/128)=4, 256/128=2
+        self.assertEqual(_block_size_of(e_q, e_s), [128, 128])
+        equal, _, _, num_exceed = _compare_quant_pair(e_q, e_s, a_q, a_s)
+        self.assertFalse(equal)
+        self.assertEqual(num_exceed, 0)
 
     def test_3d_expert_tensor(self):
         q3 = self.e_q.reshape(2, 128, 256).contiguous()

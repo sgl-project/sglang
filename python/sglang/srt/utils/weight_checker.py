@@ -300,10 +300,17 @@ def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
 
 
 def _block_size_of(w_q: torch.Tensor, w_s: torch.Tensor) -> list:
-    return [
-        -(-w_q.shape[-2] // w_s.shape[-2]),
-        -(-w_q.shape[-1] // w_s.shape[-1]),
-    ]
+    # fp8 block quant uses square blocks. The output (row) dim can have a partial
+    # last block (e.g. fused_qkv_a_proj_with_mqa out-dim 2112 = 16*128 + 64), and
+    # then neither ceil(n/s_n) nor n//s_n recovers the true block size (2112/17
+    # rounds to 125/124, not 128). The contraction (column) dim is 128-aligned,
+    # so column // num_col_blocks gives the true block size exactly; reuse it for
+    # rows (square blocks). block_quant_dequant handles the partial row block via
+    # its repeat_interleave + slice.
+    k, s_k = w_q.shape[-1], w_s.shape[-1]
+    assert k % s_k == 0, f"cannot infer block size from {w_q.shape=} {w_s.shape=}"
+    block = k // s_k
+    return [block, block]
 
 
 def _iter_quant_chunks(w_q: torch.Tensor, w_s: torch.Tensor, block_n: int):
