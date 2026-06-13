@@ -326,11 +326,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
-        # During capture the runner sets seq_lens_sum = seq_lens.sum() and a
-        # consistent seq_lens_cpu (see decode_cuda_graph_runner), so reading the
-        # forward_batch fields matches the old in-capture local recompute.
+        # During capture the runner sets seq_lens_sum = seq_lens.sum() (see
+        # decode_cuda_graph_runner), so reading forward_batch.seq_lens_sum here
+        # matches the old in-capture local recompute used by the pre-roll.
         seq_lens_sum = forward_batch.seq_lens_sum
-        seq_lens_cpu = forward_batch.seq_lens_cpu
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
@@ -373,98 +372,22 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             else:
                 raise ValueError(f"Invalid mode: {forward_mode=}")
 
-        # Converged eager == replay == capture metadata body. `use_bound`
-        # selects the pre-bound cuda-graph wrapper (capture / replay / eager-at-
-        # captured-bs) vs the persistent eager wrapper. (Kept identical to the
-        # eager init_forward_metadata body, modulo the in_capture pre-roll
-        # above and the `in_capture or` below; the two are merged in a
-        # follow-up commit.)
+        # Single eager == replay == capture metadata path; `use_bound` selects
+        # the pre-bound cuda-graph wrapper vs the persistent eager wrapper.
         use_bound = in_capture or self._use_cuda_graph_buffers(bs, forward_mode)
-        if forward_mode.is_decode_or_idle():
-            if use_bound:
-                decode_wrapper = self.decode_cuda_graph_metadata[bs]
-                # Replay plans through the fast decode path: precompute the cpu
-                # indptr arrays the captured plan consumes.
-                assert seq_lens_cpu is not None
-                kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32)
-                self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
-                    kv_len_arr_cpu, dim=0
-                )
-                self.fast_decode_kwargs.update(
-                    {
-                        "qo_indptr_cpu": self.cuda_graph_qo_indptr_cpu[: bs + 1],
-                        "kv_indptr_cpu": self.cuda_graph_kv_indptr_cpu[: bs + 1],
-                        "kv_len_arr_cpu": kv_len_arr_cpu,
-                    }
-                )
-                self.indices_updater_decode.update(
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    seq_lens_sum,
-                    decode_wrapper=decode_wrapper,
-                    init_metadata_replay=True,
-                    spec_info=spec_info,
-                    **self.fast_decode_kwargs,
-                )
-            else:
-                decode_wrapper = self.decode_wrapper
-                self.indices_updater_decode.update(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_sum,
-                    decode_wrapper=decode_wrapper,
-                    init_metadata_replay=False,
-                )
-            self.forward_metadata = DecodeMetadata(decode_wrapper)
-        elif forward_mode.is_target_verify():
-            if use_bound:
-                prefill_wrapper = self.prefill_cuda_graph_metadata[bs]
-                self.indices_updater_prefill.update(
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    prefill_wrapper_paged=prefill_wrapper,
-                    use_ragged=False,
-                    spec_info=spec_info,
-                )
-            else:
-                prefill_wrapper = self.prefill_wrapper_verify
-                self.indices_updater_prefill.update(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    prefill_wrapper_paged=prefill_wrapper,
-                    use_ragged=False,
-                    spec_info=spec_info,
-                )
-            self.forward_metadata = PrefillMetadata(prefill_wrapper, False)
-        else:
-            # Plain EXTEND -- eager only (the decode graph never captures it, so
-            # use_bound is always False here).
-            prefix_lens = forward_batch.extend_prefix_lens
-            extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-            use_ragged = (
-                not get_global_server_args().flashinfer_mla_disable_ragged
-                and extend_no_prefix
-                # Piecewise cuda graph should use paged prefill to be compatible
-                # with prefix cache
-                and not is_in_tc_piecewise_cuda_graph()
-            )
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                prefix_lens,
-                prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=use_ragged,
-            )
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrapper_paged, use_ragged
-            )
+        self._compute_forward_metadata(forward_batch, use_bound=use_bound)
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def _compute_forward_metadata(
+        self, forward_batch: ForwardBatch, *, use_bound: bool
+    ):
+        """Single source of truth for FlashInfer-MLA forward metadata, shared by
+        eager, capture, and replay.
+
+        ``use_bound`` selects the wrapper the metadata is planned into: the
+        per-bs pre-bound cuda-graph wrapper (capture / replay / eager-at-
+        captured-bs) vs the persistent eager wrapper. Plain EXTEND only ever
+        runs with use_bound=False (the decode graph never captures it).
+        """
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -473,11 +396,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens_sum = forward_batch.seq_lens_sum
         seq_lens_cpu = forward_batch.seq_lens_cpu
 
-        # Converged eager == replay == capture metadata body -- identical to the
-        # post-pre-roll body of init_forward_metadata_out_graph, modulo the
-        # `in_capture or` below (eager never captures). The two are merged into
-        # a shared helper in a follow-up commit.
-        use_bound = self._use_cuda_graph_buffers(bs, forward_mode)
         if forward_mode.is_decode_or_idle():
             if use_bound:
                 decode_wrapper = self.decode_cuda_graph_metadata[bs]
