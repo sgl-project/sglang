@@ -91,7 +91,8 @@ than restating.
 - NO `--reasoning-parser` / `--tool-call-parser` in any cell — parsers are a
   Playground-only feature added on top of the base command (DSv4 convention);
   flag any cell that bakes them in.
-- Flag order: `--model-path` first, then parallelism, then MoE, then tuning, `--host`/`--port`
+- Flag order: `--model-path` first (an optional `--trust-remote-code` may precede it —
+  the DSv4 cells do), then parallelism, then MoE, then tuning, `--host`/`--port`
   last (the playground's insert anchors assume this).
 - TP/memory sanity: `model_weight_GB / (tp × gpu_mem)` fits with ~20–30% headroom
   (BF16 ≈ params×2 GB, FP8 ≈ ×1, FP4 ≈ ×0.5; MoE uses **total** weight, not active params).

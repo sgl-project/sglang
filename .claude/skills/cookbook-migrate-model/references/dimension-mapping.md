@@ -12,8 +12,8 @@ this file is about the *mapping decisions*.
 | hardware radio | `match.hw` | Catalog ids as-is. Off-catalog hardware → `config.hardware` entry — e.g. A100 `{id:"a100", label:"A100", vram:"80GB", vendor:"nvidia"}` (merges into the NVIDIA row), Xeon `{id:"xeon", label:"Xeon", vram:"host RAM", vendor:"intel"}` (engine renders a new INTEL row; any vendor key works). A merged chip like GLM-5's "MI300X/MI325X" splits into two ids with duplicated cells (cells are denormalized by design). |
 | model-size / model-name radio | `variants` | One variant per deployable checkpoint family; single `{id:"default"}` when there's no variant axis (then `modelNames` keys drop the variant half). |
 | quantization radio | `quantizations` | Real precision ids (`bf16`/`fp8`/`fp4`/`int4`/…). One `fp4` id even when checkpoints differ per vendor — route via `hw\|variant\|quant` triple keys in `modelNames` (NVFP4 on Blackwell vs AMD MXFP4 is the precedent); per-hw greying falls out of which cells exist. |
-| toggle that **couples** with other parts of the command (changes TP/mem/EP) | `strategies` | The Playground applies pure flag diffs — it cannot do coupled changes. Example: Qwen3.5's MTP toggle bumps TP on three H100 combos → strategies `low-latency` (MTP on) / `high-throughput` (MTP off). GPU-count radios (GLM-4.7, MiniMax-M2.5/2.7) → budget-tier strategies with the legacy SUPPORT matrix preserved by which cells exist. Strategy count follows the page's operating points: 1 → `balanced`, 2 → `low-latency`+`high-throughput`, 3 → the full trio (§4). |
-| toggle that only adds/removes its own flags | Playground axis (+ bake, EXCEPT parsers) | **Parsers (`--reasoning-parser` / `--tool-call-parser`) are NEVER baked into cells** — Deployment commands ship without them regardless of the legacy default or the measured command; the `parsers` axis adds them on top (DSv4 convention; cells mirror the legacy generator's parsers-OFF output). Other flag-only toggles: legacy default ON → bake into cells AND declare the axis so users can strip (red strikethrough); default OFF → keep cells clean, axis preset only. MTP/EAGLE presets → `speculative` axis; dp-attention → `attention.dpAttn` or a strategy (DSv4 semantics) depending on coupling. |
+| toggle that **couples** with other parts of the command (changes TP/mem/EP), OR one the legacy page labels with **operating-point words** | `strategies` | The Playground applies pure flag diffs — it cannot do coupled changes. Example: Qwen3.5's MTP toggle bumps TP on three H100 combos → strategies `low-latency` (MTP on) / `high-throughput` (MTP off). **Naming counts like coupling**: GLM-5.1's / Kimi-K2.6's `dpattention` adds only `--dp N --enable-dp-attention` (uncoupled), but its options are subtitled "Low Latency" / "High Throughput" — the page's own named operating-point split → strategies; a flag-only spec toggle riding alongside it stays a Playground axis and bakes per its legacy default. GPU-count radios (GLM-4.7, MiniMax-M2.5/2.7) → budget-tier strategies with the legacy SUPPORT matrix preserved by which cells exist. Strategy count follows the page's operating points: 1 → `balanced`, 2 → `low-latency`+`high-throughput`, 3 → the full trio (§4). |
+| toggle that only adds/removes its own flags | Playground axis (+ bake, EXCEPT parsers) | **Parsers (`--reasoning-parser` / `--tool-call-parser`) are NEVER baked into cells** — Deployment commands ship without them regardless of the legacy default or the measured command; the `parsers` axis adds them on top (DSv4 convention; cells mirror the legacy generator's parsers-OFF output). Other flag-only toggles: legacy default ON → bake into cells AND declare the axis so users can strip (red strikethrough); default OFF → keep cells clean, axis preset only. MTP/EAGLE presets → `speculative` axis; dp-attention → a strategy when the legacy page labels it as the operating-point split or when coupled (see the row above), else `attention.dpAttn`. |
 | per-combo hidden option (e.g. spec hidden on Xeon) | absent cells | Don't create cells for combos the legacy widget couldn't produce; the engine greys them automatically. `# Error:` pseudo-commands → no cell + explanation in §2 tips and/or a chip `disable`/`disableReason`. |
 | coupled secondary knob with no axis (e.g. mamba cache V1/V2) | cells + prose | No new engine axis for a migration. Bake the correct value per cell following the legacy coupling (Qwen3.5: MTP ⇒ `--mamba-scheduler-strategy extra_buffer` on NVIDIA; AMD/Xeon ⇒ V1/no flag), document the knob in §2 tips. |
 
@@ -77,7 +77,14 @@ green addition, never a strikethrough.
   a variant — under the strict policy prefer per-entry `accuracy` on the
   measured cell only.
 
-## 4. Per-family strategy sets (pre-designed; adjust at inventory time)
+## 4. Per-family strategy sets (survey sketches — re-derive from the live page)
+
+The family table below was sketched from the 2026-06-10 survey at PAGE level.
+At migration time **re-derive it from the live generator**: pages drift
+(precedent: Kimi-K2.6's live page has a speculative toggle the survey notes
+lack), and the per-combination rule means gated/hidden toggles — typically on
+Xeon, AMD, or a single-recipe quant like NVFP4 — produce `balanced` combos the
+page-level sketch doesn't show.
 
 **Strategy-set rule — the count follows the page's operating points** (ids
 always from the DeepSeek-V4 vocabulary, never model-specific ids like
@@ -92,16 +99,24 @@ always from the DeepSeek-V4 vocabulary, never model-specific ids like
   speculative decoding cuts per-token latency at low concurrency, but at
   saturation the draft+verify overhead costs more than it saves — DSv4's
   high-throughput recipes disable MTP for the same reason.) Other toggles
-  map by the same serving semantics (e.g. DP+EP on → `high-throughput`).
-  Only if a legacy page documents the OPPOSITE slant (e.g. "enable MTP for
-  high throughput") stop and confirm with the maintainer.
+  map by the same serving semantics — the two recurring **high-throughput
+  markers** are **dp-attention ON** (MLA-attention models) and **EP / DP+EP
+  ON** (MoE models): both shard work across ranks for saturated throughput
+  at some per-request latency cost. These directions apply to the toggle
+  CHOSEN as the strategy dimension (§1); a flag-only spec toggle riding
+  alongside a named operating-point toggle stays a Playground axis and bakes
+  per its legacy default — GLM-5.1's spec defaults ON, so its flags bake
+  into BOTH tiers there. Only if a legacy page documents the OPPOSITE slant
+  (e.g. "enable MTP for high throughput") stop and confirm with the
+  maintainer.
 - **3 operating points** → the **full trio** (the ideal — e.g. GPU-budget
   tiers 2/4/8).
 
 **Signal-driven tiers (hard rule).** A cell goes under `low-latency` /
 `high-throughput` ONLY on a signal present in the legacy source: an explicit
-performance toggle (MTP/speculative, DP+EP, gpuCount, …), a named
-recipe/strategy checkbox, or prose stating the operating point. Reading such
+performance toggle (MTP/speculative, dp-attention, EP, gpuCount, …), a named
+recipe/strategy checkbox, option subtitles ("Low Latency" / "High
+Throughput"), or prose stating the operating point. Reading such
 a signal is SGLang-level serving semantics (MTP favors latency on any
 vendor's silicon), so any migrator can tier any vendor's cells without
 hardware-specific judgment. **No signal → `balanced`** — legacy silence is
@@ -136,12 +151,12 @@ model-specific note — never toggle-/migration-centric explanations.
 | GLM-4.5, GLM-4.6 | `low-latency` (TP, + MTP from the legacy checkbox) / `high-throughput` (TP+DP+EP) | |
 | GLM-4.7 | `low-latency`(2 GPUs) / `balanced`(4) / `high-throughput`(8) — gpus 2/4/8 + SUPPORT matrix; confirm naming, tiers are GPU budgets | measured-best B200 TP=2 NVFP4 → the verified cell |
 | GLM-4.7-Flash | `low-latency` (tp1 + MTP from the legacy checkbox) / `high-throughput` (DP) | derive from the legacy dp/mtp checkboxes |
-| GLM-5, GLM-5.1 | `low-latency` (spec on per legacy condition) / `high-throughput` (dp-attention) | NVFP4 has a single recipe (legacy UI hid all toggles) |
+| GLM-5, GLM-5.1 | `low-latency` (dpattention off) / `high-throughput` (dpattention on) — the dpattention radio carries the page's own "Low Latency"/"High Throughput" subtitles (naming rule, §1) | spec is flag-only, default ON, hidden on AMD → bakes into both tiers on NVIDIA + `speculative` axis; NVFP4 hides all toggles → single no-signal recipe → `balanced` (page ships the trio union) |
 | Kimi-K2 | `low-latency` (tp8) / `high-throughput` (dp4+ep4) | variants = instruct/thinking; reasoning chip `hide` on instruct |
-| Kimi-K2.5, K2.6 | `low-latency` / `high-throughput` | K2.5 spec preset carries `--speculative-draft-model-path …eagle3-mla`, chip-gated to h200/b300 |
-| Qwen3.6, Qwen3-Next, Qwen3-Coder-Next | `low-latency` (MTP on, the legacy speculative toggle) / `high-throughput` (MTP off) | same pattern as the Qwen3.5 pilot |
-| Kimi-Linear, MiniMax-M2, Qwen3, Qwen3-Coder | single `balanced` — one recipe, no performance toggle (rule above: 1 operating point → `balanced`) | renders as one chip |
-| MiniMax-M2.5, M2.7 | `low-latency`(2) / `balanced`(4) / `high-throughput`(8=tp8+ep8) — confirm naming, tiers are GPU budgets | Xeon (M2.7) cells under one tier only |
+| Kimi-K2.5, K2.6 | `low-latency` (dpattention off) / `high-throughput` (dpattention on) — same named-subtitle pattern as GLM-5.1 | K2.5 spec preset carries `--speculative-draft-model-path …eagle3-mla`, chip-gated to h200/b300; K2.6's live page has a NVIDIA-only spec toggle, default OFF → `speculative` axis only, no bake (missed by the survey) |
+| Qwen3.6, Qwen3-Next | `low-latency` (MTP on, the legacy speculative toggle) / `high-throughput` (MTP off); Xeon hides the toggle → its single recipe → `balanced` (page ships the trio) | same pattern as the Qwen3.5 pilot |
+| Kimi-Linear, MiniMax-M2, Qwen3, Qwen3-Coder, Qwen3-Coder-Next | single `balanced` — one recipe, no performance toggle (rule above: 1 operating point → `balanced`) | renders as one chip; Qwen3-Coder-Next has NO speculative dim on the live page (quant × toolcall × mambaCache only — an earlier sketch wrongly lumped it with Qwen3.6) |
+| MiniMax-M2.5, M2.7 | `low-latency`(2) / `balanced`(4) / `high-throughput`(8=tp8+ep8) — confirm naming, tiers are GPU budgets | Xeon (M2.7) is a single no-slant recipe (fixed TP=6) → `balanced` (per-combination rule, Qwen3.5 Xeon precedent) |
 | Qwen3.5 (DONE — pilot) | `low-latency` (MTP on) / `high-throughput` (MTP off); Xeon's single no-slant recipe → `balanced` (the page ships the full trio) | see §5 |
 
 Qwen3 variant fan-out: variants = deployable checkpoints size-ordered

@@ -82,14 +82,23 @@ your dispatch prompt, or ask for it.
 - Inbound-anchor sweep: `grep -rn "<PageName>" docs_new/ --include='*.mdx'` —
   find links/`#fragments` into this page (`mint broken-links` does NOT check
   fragments). Fix referrers or add `<a id="old-anchor" />` shims in the same PR.
-- Check the maintainer-provided inventory notes for this model's known quirks.
+- Check the maintainer-provided inventory notes for this model's known quirks —
+  but treat them (and the §4 family table) as a **survey snapshot**: re-verify
+  every dimension against the live legacy files before mapping. Pages keep
+  receiving updates (precedent: Kimi-K2.6's live generator has a speculative
+  toggle the 2026-06-10 survey notes lack).
 
 ### 2. Design the 5-dim mapping
 Apply [references/dimension-mapping.md](references/dimension-mapping.md). Key
-decision: a legacy toggle that **changes other parts of the command** (TP, mem)
-becomes a `strategies` entry (the Playground can't do coupled changes); a
-toggle that only adds/removes its own flags becomes a Playground axis with the
-flags baked into cells when the legacy default was ON — EXCEPT parsers:
+decision — which legacy toggle becomes the `strategies` dimension: a toggle
+that **changes other parts of the command** (TP, mem) must (the Playground
+can't do coupled changes), and so does a toggle the legacy page itself labels
+with operating-point words — e.g. a `dpattention` radio whose options are
+subtitled "Low Latency" / "High Throughput" (GLM-5.1 / Kimi-K2.6 pattern) —
+even when its flags are uncoupled (`--dp N --enable-dp-attention` is a pure
+flag add). Any other toggle that only adds/removes its own flags becomes a
+Playground axis with the flags baked into cells when the legacy default was
+ON — EXCEPT parsers:
 `--reasoning-parser`/`--tool-call-parser` are NEVER baked into cells, they are
 Playground-only (DSv4 convention). The strategy count follows the page's
 operating points: **one recipe → a single `balanced`; two → `low-latency` +
@@ -102,9 +111,10 @@ default — apply without asking: **MTP on → `low-latency`, MTP off →
 `high-throughput`** (reversed only with maintainer confirmation). Tier
 placement is signal-driven (hard rule 6). Never invent a recipe just to fill
 strategy chips (see dimension-mapping.md §4). Record the outcome as a
-**strategy mapping table** for the PR body — one row per
-(hw × variant × quant) combination: legacy signal → tier, plus a one-line
-rationale; no-signal rows read `(none) → balanced`. The table is what
+**strategy mapping table** for the PR body — one row per group of
+combinations sharing the same legacy signal (e.g. "all GPU combos: MTP
+toggle → low-latency / high-throughput"; "xeon: (none) → balanced"), with a
+one-line rationale each; don't enumerate 60 identical rows. The table is what
 hardware owners sign off on at review.
 
 ### 3. Generate the config (codegen, then audit)
@@ -114,10 +124,13 @@ hardware owners sign off on at review.
   verified-cell override in the script. See the pilot scripts embedded in the
   worked example of dimension-mapping.md §5.
 - **Independent equivalence audit (required):** extract the ORIGINAL generator
-  from git (`git show HEAD:<path>`), stub React hooks, run it for every combo,
-  and diff token-by-token against the new cells. Expected deltas only: the
-  appended `--host {{HOST_IP}}`/`--port {{PORT}}`, the engine-injected
-  multi-node trio, the four alias rewrites, and the intentional verified-cell
+  from git (`git show main:<path>` — NOT `HEAD:`, the migration branch deletes
+  the file, see dimension-mapping.md §5 item 7), stub React hooks, run it for
+  every combo, and diff token-by-token against the new cells. Expected deltas
+  only: the appended `--host {{HOST_IP}}`/`--port {{PORT}}`, the
+  engine-injected multi-node trio, the §2 alias rewrites (the entrypoint
+  rewrite doesn't appear in cell tokens — cells hold flags only; the audit
+  script normalizes it on the legacy side), and the intentional verified-cell
   override. Paste the PASS count + the audit script in the PR body
   (collapsed `<details>`).
 - Hand-author the non-cells fields per authoring-reference.md. Structural
