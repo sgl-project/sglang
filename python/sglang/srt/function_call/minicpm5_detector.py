@@ -105,6 +105,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                 arguments = {}
                 parsed_ok = False
                 param_invalid = False
+                parse_error = None
 
                 # Primary path: XML parsing (lxml preferred, stdlib fallback)
                 try:
@@ -168,7 +169,8 @@ class MiniCPM5Detector(BaseFormatDetector):
                             arguments.clear()
                             param_invalid = True
                     parsed_ok = bool(func_name)
-                except Exception:
+                except Exception as e:
+                    parse_error = e
                     parsed_ok = False
 
                 if not parsed_ok:
@@ -211,10 +213,18 @@ class MiniCPM5Detector(BaseFormatDetector):
                             arguments.clear()
                             param_invalid = True
                         parsed_ok = bool(func_name)
-                    except Exception:
+                        if parsed_ok:
+                            parse_error = None
+                    except Exception as e:
+                        parse_error = e
                         parsed_ok = False
 
-                if not func_name or func_name not in tool_names or param_invalid:
+                if func_name and func_name not in tool_names:
+                    if self._skip_unknown_tool(func_name):
+                        parsed_ok = False
+                    else:
+                        parsed_ok = not param_invalid
+                elif not func_name or param_invalid:
                     parsed_ok = False
                 else:
                     req_props = name_to_required.get(func_name, set())
@@ -225,6 +235,8 @@ class MiniCPM5Detector(BaseFormatDetector):
                     tool_call_obj = {"name": func_name, "parameters": arguments}
                     calls.extend(self.parse_base_json(tool_call_obj, tools))
                 else:
+                    if parse_error is not None:
+                        self._note_malformed_tool_call(parse_error, detail=block[:80])
                     normal_parts.append(block)
 
                 last_end = m.end()
@@ -235,6 +247,7 @@ class MiniCPM5Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
+            self._note_malformed_tool_call(e)
             return StreamingParseResult(normal_text=text)
 
     def _append_tool_call(self, call, all_calls: List) -> None:

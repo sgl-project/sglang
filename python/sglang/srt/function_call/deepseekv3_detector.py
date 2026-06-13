@@ -5,6 +5,7 @@ from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -69,21 +70,29 @@ class DeepSeekV3Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=[])
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
-        try:
-            for match_result in match_result_list:
-                # Get function name
-                func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
-                func_name = func_detail.group(2)
-                func_args = func_detail.group(3)
-                func_args = json.loads(func_args)
-                # construct match_result for parse_base_json
-                match_result = {"name": func_name, "parameters": func_args}
-                calls.extend(self.parse_base_json(match_result, tools))
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
-        except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
-            # return the normal text if parsing fails
-            return StreamingParseResult(normal_text=text)
+
+        for match_result in match_result_list:
+            # Get function name
+            func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
+            if func_detail is None:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=match_result[:80],
+                )
+                continue
+            func_name = func_detail.group(2)
+            with self.compatibility.absorb(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                json.JSONDecodeError,
+                detail=f"{func_name}: {func_detail.group(3)[:80]}",
+            ) as absorbed:
+                func_args = json.loads(func_detail.group(3))
+            if absorbed.fired:
+                continue
+            # construct match_result for parse_base_json
+            match_result = {"name": func_name, "parameters": func_args}
+            calls.extend(self.parse_base_json(match_result, tools))
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -100,106 +109,117 @@ class DeepSeekV3Detector(BaseFormatDetector):
         )
 
         if not has_tool_call:
-            self._buffer = ""
+            normal_text, self._buffer = self._hold_back_partial_tokens(
+                current_text,
+                (
+                    self.bot_token,
+                    self.eot_token,
+                    "<｜tool▁call▁begin｜>",
+                    "<｜tool▁call▁end｜>",
+                ),
+            )
             for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+                if e_token in normal_text:
+                    normal_text = normal_text.replace(e_token, "")
+            return StreamingParseResult(normal_text=normal_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
         calls: list[ToolCallItem] = []
-        try:
-            partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
-                string=current_text,
-                flags=re.DOTALL,
-            )
-            if partial_match:
-                func_name = partial_match.group(2).strip()
-                func_args_raw = partial_match.group(3).strip()
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
+        # Parse only the first complete call currently in the buffer. A chunk
+        # can contain multiple complete calls, so the groups below must be
+        # non-greedy (`.*?`). With greedy `.*`, the match could start at the
+        # first call but bind to the last <｜tool▁sep｜>/JSON block; then the
+        # buffer-removal code would discard the first call while emitting a
+        # later one that remains in the buffer and can be emitted again.
+        partial_match = re.search(
+            pattern=r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```",
+            string=current_text,
+            flags=re.DOTALL,
+        )
+        if partial_match:
+            func_name = partial_match.group(2).strip()
+            func_args_raw = partial_match.group(3).strip()
 
-                # Ensure we have enough entries in our tracking arrays
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
+            # Initialize state if this is the first tool call
+            if self.current_tool_id == -1:
+                self.current_tool_id = 0
+                self.prev_tool_call_arr = []
+                self.streamed_args_for_tool = [""]
 
-                if not self.current_tool_name_sent:
+            # Ensure we have enough entries in our tracking arrays
+            while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
+
+            if not self.current_tool_name_sent:
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=func_name,
+                        parameters="",
+                    )
+                )
+                self.current_tool_name_sent = True
+                # Store the tool call info for serving layer completions endpoint
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": func_name,
+                    "arguments": {},
+                }
+            else:
+                argument_diff = (
+                    func_args_raw[len(self._last_arguments) :]
+                    if func_args_raw.startswith(self._last_arguments)
+                    else func_args_raw
+                )
+
+                if argument_diff:
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
+                            name=None,
+                            parameters=argument_diff,
                         )
                     )
-                    self.current_tool_name_sent = True
-                    # Store the tool call info for serving layer completions endpoint
-                    self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": func_name,
-                        "arguments": {},
-                    }
-                else:
-                    argument_diff = (
-                        func_args_raw[len(self._last_arguments) :]
-                        if func_args_raw.startswith(self._last_arguments)
-                        else func_args_raw
+                    self._last_arguments += argument_diff
+                    self.streamed_args_for_tool[
+                        self.current_tool_id
+                    ] += argument_diff
+
+                if _is_complete_json(func_args_raw):
+                    # Update the stored arguments
+                    try:
+                        parsed_args = json.loads(func_args_raw)
+                        self.prev_tool_call_arr[self.current_tool_id][
+                            "arguments"
+                        ] = parsed_args
+                    except json.JSONDecodeError:
+                        pass
+
+                    # Find the end of the current tool call and remove only that part from buffer
+                    tool_call_end_pattern = (
+                        r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
                     )
+                    match = re.search(
+                        tool_call_end_pattern, current_text, re.DOTALL
+                    )
+                    if match:
+                        # Remove the completed tool call from buffer, keep any remaining content
+                        self._buffer = current_text[match.end() :]
+                    else:
+                        self._buffer = ""
 
-                    if argument_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=argument_diff,
-                            )
-                        )
-                        self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                    result = StreamingParseResult(normal_text="", calls=calls)
+                    self.current_tool_id += 1
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                    return result
 
-                    if _is_complete_json(func_args_raw):
-                        # Update the stored arguments
-                        try:
-                            parsed_args = json.loads(func_args_raw)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
+        return StreamingParseResult(normal_text="", calls=calls)
 
-                        # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-                        )
-                        match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
-                        if match:
-                            # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[match.end() :]
-                        else:
-                            self._buffer = ""
-
-                        result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        return result
-
-            return StreamingParseResult(normal_text="", calls=calls)
-
-        except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

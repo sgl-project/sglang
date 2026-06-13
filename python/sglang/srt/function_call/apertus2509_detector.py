@@ -1,9 +1,7 @@
 import json
-import logging
 from typing import Any, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -11,9 +9,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-
-logger = logging.getLogger(__name__)
-
 
 class Apertus2509Detector(BaseFormatDetector):
     """
@@ -147,13 +142,7 @@ class Apertus2509Detector(BaseFormatDetector):
                 if args is None:
                     args = {}
 
-                if (
-                    name not in self._tool_indices
-                    and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
-                ):
-                    logger.warning(
-                        f"Model attempted to call undefined function: {name}"
-                    )
+                if name not in self._tool_indices and self._skip_unknown_tool(name):
                     continue
 
                 tool_id = self.current_tool_id
@@ -232,11 +221,7 @@ class Apertus2509Detector(BaseFormatDetector):
             if args is None:
                 args = {}
 
-            if (
-                name not in self._tool_indices
-                and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
-            ):
-                logger.warning(f"Model attempted to call undefined function: {name}")
+            if name not in self._tool_indices and self._skip_unknown_tool(name):
                 continue
 
             calls.append(

@@ -13,6 +13,7 @@ from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
+from sglang.srt.function_call.compatibility import recover_nonstream, recover_stream
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
@@ -32,6 +33,7 @@ from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
+from sglang.srt.function_call.minimax_m3_nom import MinimaxM3NomDetector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -81,6 +83,7 @@ class FunctionCallParser:
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
         "minimax-m2": MinimaxM2Detector,
+        "minimax-m3-nom": MinimaxM3NomDetector,
         "trinity": TrinityDetector,
         "interns1": InternlmDetector,
         "hermes": HermesDetector,
@@ -89,16 +92,51 @@ class FunctionCallParser:
         "gemma4": Gemma4Detector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
+    def __init__(
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        enable_compatibility_mode: bool = False,
+    ):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
-        if detector_class:
-            detector = detector_class()
-        else:
+        if not detector_class:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+        self._attach(detector_class(), tools, enable_compatibility_mode)
 
+    @classmethod
+    def with_detector(
+        cls,
+        detector: BaseFormatDetector,
+        tools: List[Tool],
+        enable_compatibility_mode: bool = False,
+    ) -> "FunctionCallParser":
+        """Boundary around an explicitly constructed detector.
+
+        For detectors that are not operator-selectable (the keys of
+        ``ToolCallParserEnum`` double as the ``--tool-call-parser`` CLI
+        choices), e.g. the constrained-output ``JsonArrayParser``. Every
+        detector must sit behind this boundary — it owns scope-4 fail-open
+        and the streaming latch.
+        """
+        parser = cls.__new__(cls)
+        parser._attach(detector, tools, enable_compatibility_mode)
+        return parser
+
+    def _attach(
+        self,
+        detector: BaseFormatDetector,
+        tools: List[Tool],
+        enable_compatibility_mode: bool,
+    ) -> None:
         self.detector = detector
+        detector.compatibility.strict = not enable_compatibility_mode
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+        # Fail-open latch: set when the detector raised during streaming, so
+        # the rest of the stream is passed through as normal text instead of
+        # repeatedly calling into a broken detector (or killing the SSE
+        # stream with an uncaught exception).
+        self._detector_failed = False
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -129,7 +167,13 @@ class FunctionCallParser:
         """
         if not self.tools:
             return full_text, []
-        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        try:
+            parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        except Exception as e:
+            # Fail-open (scope 4): recovery is owned by the compatibility
+            # module; calls it salvaged are returned, otherwise the full
+            # text falls through below.
+            parsed_result = recover_nonstream(self.detector, e, full_text, self.tools)
         tool_call_list = parsed_result.calls
         if tool_call_list:
             return parsed_result.normal_text, tool_call_list
@@ -148,12 +192,21 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        if not self.tools:
+        if (not self.tools) or self._detector_failed:
             return chunk_text, []
         final_normal_text = ""
         final_calls = []
 
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
+        try:
+            sp_result = self.detector.parse_streaming_increment(
+                chunk_text, self.tools
+            )
+        except Exception as e:
+            # Fail-open (scope 4): recovery is owned by the compatibility
+            # module; latch so the rest of the stream passes through as text.
+            self._detector_failed = True
+            sp_result = recover_stream(self.detector, e, chunk_text, self.tools)
+            return sp_result.normal_text, list(sp_result.calls)
         if sp_result.normal_text:
             final_normal_text = sp_result.normal_text
         if sp_result.calls:

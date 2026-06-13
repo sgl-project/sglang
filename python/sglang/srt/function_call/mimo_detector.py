@@ -20,9 +20,12 @@ import re
 from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
+from sglang.srt.function_call.core_types import (
+    StreamingParseResult,
+    ToolCallItem,
+    _GetInfoFunc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,14 +182,22 @@ class MiMoDetector(BaseFormatDetector):
             if parsed:
                 func_name = parsed.get("name")
                 if func_name not in tool_indices:
-                    # Unknown function
-                    logger.warning(f"Unknown function: {func_name}")
-                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                    if self._skip_unknown_tool(func_name):
                         # Return tool call block as normal text
                         normal_text += text[last_end : match.end()]
                         last_end = match.end()
                         continue
-                calls.extend(self.parse_base_json(parsed, tools))
+
+                calls.append(
+                    ToolCallItem(
+                        tool_index=tool_indices.get(func_name, -1),
+                        name=func_name,
+                        parameters=json.dumps(
+                            parsed.get("parameters") or parsed.get("arguments", {}),
+                            ensure_ascii=False,
+                        ),
+                    )
+                )
 
             last_end = match.end()
 

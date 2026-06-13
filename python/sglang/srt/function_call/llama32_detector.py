@@ -6,6 +6,7 @@ from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityViolation
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -40,7 +41,7 @@ class Llama32Detector(BaseFormatDetector):
             parsed = ast.literal_eval(text.strip())
             if isinstance(parsed, dict):
                 return json.dumps(parsed, ensure_ascii=False)
-        except:
+        except (ValueError, SyntaxError, TypeError):
             pass
         return text
 
@@ -71,7 +72,8 @@ class Llama32Detector(BaseFormatDetector):
                 all_actions.append(obj)
                 idx += end + len(self.tool_call_separator)
                 safe_idx = idx
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                parse_error = e
                 # Try Python dict conversion as fallback
                 try:
                     dict_end = idx
@@ -94,12 +96,21 @@ class Llama32Detector(BaseFormatDetector):
                             idx = dict_end + len(self.tool_call_separator)
                             safe_idx = idx
                             continue
-                except:
+                except (ValueError, SyntaxError, TypeError, json.JSONDecodeError) as e:
+                    parse_error = e
                     pass
 
                 next_obj_start = action_text.find('{"name":', idx + 1)
                 if next_obj_start == -1:
+                    if not all_actions and action_text[idx:].strip():
+                        self._note_malformed_tool_call(
+                            parse_error, detail=action_text[idx : idx + 80]
+                        )
                     break
+                if not all_actions:
+                    self._note_malformed_tool_call(
+                        parse_error, detail=action_text[idx:next_obj_start][:80]
+                    )
                 idx = next_obj_start
 
         # Only process if we found valid JSON objects
@@ -131,7 +142,9 @@ class Llama32Detector(BaseFormatDetector):
         try:
             result = super().parse_streaming_increment("", tools)
             return result
-        except:
+        except CompatibilityViolation:
+            raise
+        except (AssertionError, ValueError, TypeError, IndexError, KeyError):
             # Fall back to original buffer
             self._buffer = original_buffer
             return super().parse_streaming_increment(new_text, tools)

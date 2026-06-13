@@ -215,6 +215,7 @@ class Glm4MoeDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
+            self._note_malformed_tool_call(e)
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
@@ -579,6 +580,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                             logger.debug(
                                 f"Failed to parse arguments: {e}", exc_info=True
                             )
+                            self._note_malformed_tool_call(
+                                e, detail=func_args_raw[:80]
+                            )
 
                         # Remove the completed tool call from buffer
                         self._buffer = current_text[partial_match.end(3) :]
@@ -595,6 +599,7 @@ class Glm4MoeDetector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
+            self._note_malformed_tool_call(e)
             return StreamingParseResult(normal_text=current_text)
 
     def _parse_argument_pairs(

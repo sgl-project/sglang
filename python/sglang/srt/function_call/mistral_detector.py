@@ -4,6 +4,7 @@ from typing import Any, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -67,15 +68,15 @@ class MistralDetector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
             calls: list = []
-            try:
+            with self.compatibility.absorb(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                json.JSONDecodeError,
+                detail=json_array_str[:80],
+            ):
                 function_call_arr = json.loads(json_array_str)
                 if not isinstance(function_call_arr, list):
                     function_call_arr = [function_call_arr]
                 calls = self.parse_base_json(function_call_arr, tools)
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    f"Failed to parse JSON part: {json_array_str}, JSON parse error: {str(e)}"
-                )
             json_pos = tool_part.find(json_array_str) if json_array_str else -1
             trailing_text = (
                 tool_part[json_pos + len(json_array_str) :].strip()

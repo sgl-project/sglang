@@ -546,6 +546,7 @@ class ServerArgs:
     strip_thinking_cache: bool = False
     enable_strict_thinking: bool = False
     tool_call_parser: Optional[str] = None
+    enable_tool_call_compatibility_mode: bool = False
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
     asr_max_buffer_seconds: int = 60
@@ -5713,6 +5714,19 @@ class ServerArgs:
             help=f"Specify the parser for handling tool-call interactions. "
             f"Use 'auto' to detect from chat template. "
             f"Options include: {tool_call_parser_choices}.",
+        )
+        parser.add_argument(
+            "--enable-tool-call-compatibility-mode",
+            action="store_true",
+            default=ServerArgs.enable_tool_call_compatibility_mode,
+            help="Enable tolerant tool-call parsing for model output that "
+            "deviates from the expected wire format (see "
+            "python/sglang/srt/function_call/compatibility/). By default, "
+            "tool-call parsing is strict: deviations make the parse fail open "
+            "and return the output as normal text. When this flag is set, "
+            "known safe recoveries are applied and audited. Parsing never "
+            "crashes a request in either mode. Unrelated to "
+            "SGLANG_TOOL_STRICT_LEVEL, which constrains generation.",
         )
         parser.add_argument(
             "--tool-server",

@@ -5,8 +5,8 @@ import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -71,44 +71,57 @@ class PythonicDetector(BaseFormatDetector):
         # Combine normal text
         normal_text = normal_text_before + normal_text_after
 
-        try:
+        # Expected deviations are absorbed per block / per call below and
+        # recorded on self.compatibility; unexpected failures bubble to
+        # FunctionCallParser, which fails open to text (see the ``compatibility`` package).
+        with self.compatibility.absorb(
+            CompatibilityEvent.MALFORMED_JSON_DROPPED, SyntaxError, detail=tool_call_text[:80]
+        ) as absorbed:
             module = ast.parse(tool_call_text)
-            parsed = getattr(module.body[0], "value", None)
-            if not (
-                isinstance(parsed, ast.List)
-                and all(isinstance(e, ast.Call) for e in parsed.elts)
-            ):
-                return StreamingParseResult(normal_text=normal_text, calls=[])
-
-            calls = []
-            tool_indices = self._get_tool_indices(tools)
-            for call_index, call in enumerate(parsed.elts):
-                if not isinstance(call.func, ast.Name):
-                    continue
-                function_name = call.func.id
-                # Validate that the function exists in the tools
-                if function_name not in tool_indices:
-                    logger.warning(
-                        f"Model attempted to call undefined function: {function_name}"
-                    )
-                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                        continue  # Skip unknown tools (default legacy behavior)
-
-                arguments = {}
-                for keyword in call.keywords:
-                    arguments[keyword.arg] = self._get_parameter_value(keyword.value)
-                calls.append(
-                    ToolCallItem(
-                        tool_index=call_index,  # Use the call index in the response, not tool position
-                        name=function_name,
-                        parameters=json.dumps(arguments, ensure_ascii=False),
-                    )
-                )
-
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
-        except Exception:
-            logger.exception("Error in pythonic tool call parsing.")
+        if absorbed.fired:
+            # Looked like a pythonic call list but does not parse: surface
+            # the block as normal text rather than dropping it.
+            return StreamingParseResult(normal_text=text, calls=[])
+        parsed = getattr(module.body[0], "value", None)
+        if not (
+            isinstance(parsed, ast.List)
+            and all(isinstance(e, ast.Call) for e in parsed.elts)
+        ):
             return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        calls = []
+        tool_indices = self._get_tool_indices(tools)
+        for call_index, call in enumerate(parsed.elts):
+            if not isinstance(call.func, ast.Name):
+                continue
+            function_name = call.func.id
+            # Validate that the function exists in the tools
+            if function_name not in tool_indices and self._skip_unknown_tool(
+                function_name
+            ):
+                continue
+
+            # Non-literal arguments: drop this call, keep the others.
+            with self.compatibility.absorb(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                ValueError,
+                detail=f"{function_name}: non-literal arguments",
+            ) as absorbed:
+                arguments = {
+                    keyword.arg: self._get_parameter_value(keyword.value)
+                    for keyword in call.keywords
+                }
+            if absorbed.fired:
+                continue
+            calls.append(
+                ToolCallItem(
+                    tool_index=call_index,  # Use the call index in the response, not tool position
+                    name=function_name,
+                    parameters=json.dumps(arguments, ensure_ascii=False),
+                )
+            )
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def _find_matching_bracket(self, buffer: str, start: int) -> int:
         """

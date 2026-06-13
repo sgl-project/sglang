@@ -4,8 +4,8 @@ import re
 from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -219,16 +219,19 @@ class GptOssDetector(BaseFormatDetector):
         )
 
         # Check if tool exists
-        if function_name not in tool_indices:
-            logger.debug(f"Function {function_name} not in available tools")
-            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                return None  # Skip unknown tools (default legacy behavior)
+        if function_name not in tool_indices and self._skip_unknown_tool(
+            function_name
+        ):
+            return None
 
         # Parse JSON arguments
-        try:
+        with self.compatibility.absorb(
+            CompatibilityEvent.MALFORMED_JSON_DROPPED,
+            json.JSONDecodeError,
+            detail=f"{function_name}: {json_content[:80]}",
+        ) as absorbed:
             arguments = json.loads(json_content) if json_content.strip() else {}
-        except json.JSONDecodeError as e:
-            logger.debug(f"Failed to parse JSON arguments: {e}")
+        if absorbed.fired:
             return None
 
         return ToolCallItem(

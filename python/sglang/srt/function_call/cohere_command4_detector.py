@@ -78,6 +78,7 @@ class CohereCommand4Detector(BaseFormatDetector):
                     f"Cohere tool-call body did not parse as JSON: {e}; "
                     "returning surrounding text as normal output."
                 )
+                self._note_malformed_tool_call(e, detail=body[:80])
                 return StreamingParseResult(normal_text=normal_text)
 
         normalized = self._normalize_calls(arr)

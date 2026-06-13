@@ -76,6 +76,7 @@ class GigaChat3Detector(BaseFormatDetector):
                     function_call = None
             except json.JSONDecodeError as e:
                 logger.warning(f"[GigaChat3] JSON decode error: {e}")
+                self._note_malformed_tool_call(e, detail=m_func.group(1)[:80])
                 return StreamingParseResult(
                     normal_text=model_output,
                     calls=[],

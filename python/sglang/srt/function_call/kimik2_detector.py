@@ -9,6 +9,7 @@ from sglang.srt.function_call.base_format_detector import (
     StructuralTag,
     get_model_structural_tag,
 )
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -171,36 +172,42 @@ class KimiK2Detector(BaseFormatDetector):
         """
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
-        try:
-            function_call_tuples = self.tool_call_regex.findall(text)
+        function_call_tuples = self.tool_call_regex.findall(text)
 
-            logger.debug("function_call_tuples: %s", function_call_tuples)
+        logger.debug("function_call_tuples: %s", function_call_tuples)
 
-            tool_calls = []
-            for match in function_call_tuples:
-                function_id, function_args = match
-                function_name, function_idx = self._parse_tool_call_id(
-                    function_id, tools, function_args
+        tool_calls = []
+        for match in function_call_tuples:
+            function_id, function_args = match
+            # With a missing <|tool_call_end|> the args capture can span into
+            # the next call; never emit a call whose parameters are not JSON.
+            with self.compatibility.absorb(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                json.JSONDecodeError,
+                detail=f"{function_id}: {function_args[:80]}",
+            ) as absorbed:
+                json.loads(function_args)
+            if absorbed.fired:
+                continue
+            function_name, function_idx = self._parse_tool_call_id(
+                function_id, tools, function_args
+            )
+            if function_name is None:
+                continue
+
+            logger.debug(f"function_name {function_name}")
+
+            tool_calls.append(
+                ToolCallItem(
+                    tool_index=function_idx,
+                    name=function_name,
+                    parameters=function_args,
                 )
-                if function_name is None:
-                    continue
+            )
 
-                logger.debug(f"function_name {function_name}")
+        content = text[: text.find(self.bot_token)]
+        return StreamingParseResult(normal_text=content, calls=tool_calls)
 
-                tool_calls.append(
-                    ToolCallItem(
-                        tool_index=function_idx,
-                        name=function_name,
-                        parameters=function_args,
-                    )
-                )
-
-            content = text[: text.find(self.bot_token)]
-            return StreamingParseResult(normal_text=content, calls=tool_calls)
-
-        except Exception as e:
-            logger.error("Error in detect_and_parse: %s", e, exc_info=True)
-            return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -217,115 +224,119 @@ class KimiK2Detector(BaseFormatDetector):
         )
 
         if not has_tool_call:
-            self._buffer = ""
-            normal_text = _strip_special_tokens(new_text)
+            normal_text, self._buffer = self._hold_back_partial_tokens(
+                current_text, _KIMI_K2_SPECIAL_TOKENS
+            )
+            normal_text = _strip_special_tokens(normal_text)
             return StreamingParseResult(normal_text=normal_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
         calls: list[ToolCallItem] = []
-        try:
-            match = self.stream_tool_call_portion_regex.search(current_text)
-            if match:
-                function_id = match.group("tool_call_id")
-                function_args = match.group("function_arguments")
+        match = self.stream_tool_call_portion_regex.search(current_text)
+        if match:
+            function_id = match.group("tool_call_id")
+            function_args = match.group("function_arguments")
 
-                # Reuse cached name for current tool call to avoid repeated
-                # json.loads on partial JSON in _infer_tool_name.
-                if self._current_stream_function_name is not None:
-                    function_name = self._current_stream_function_name
-                else:
-                    function_name, _ = self._parse_tool_call_id(
-                        function_id, tools, function_args
+            # Reuse cached name for current tool call to avoid repeated
+            # json.loads on partial JSON in _infer_tool_name.
+            if self._current_stream_function_name is not None:
+                function_name = self._current_stream_function_name
+            else:
+                function_name, _ = self._parse_tool_call_id(
+                    function_id, tools, function_args
+                )
+            if function_name is None:
+                return StreamingParseResult(normal_text="", calls=calls)
+
+            # Initialize state if this is the first tool call
+            if self.current_tool_id == -1:
+                self.current_tool_id = 0
+                self.prev_tool_call_arr = []
+                self.streamed_args_for_tool = [""]
+
+            # Ensure we have enough entries in our tracking arrays
+            while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
+
+            if not self.current_tool_name_sent:
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=function_name,
+                        parameters="",
                     )
-                if function_name is None:
-                    return StreamingParseResult(normal_text="", calls=calls)
+                )
+                self.current_tool_name_sent = True
+                self._current_stream_function_name = function_name
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": function_name,
+                    "arguments": {},
+                }
+            else:
+                argument_diff = (
+                    function_args[len(self._last_arguments) :]
+                    if function_args.startswith(self._last_arguments)
+                    else function_args
+                )
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
+                parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[
+                    0
+                ]
+                # Hold back a possible partial <|tool_call_end|> at the chunk
+                # boundary: marker text must never leak into streamed
+                # arguments. The next chunk disambiguates and re-emits.
+                parsed_args_diff, _ = self._hold_back_partial_tokens(
+                    parsed_args_diff, (self.tool_call_end_token,)
+                )
 
-                # Ensure we have enough entries in our tracking arrays
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
-
-                if not self.current_tool_name_sent:
+                if parsed_args_diff:
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
-                            name=function_name,
-                            parameters="",
+                            name=None,
+                            parameters=parsed_args_diff,
                         )
                     )
-                    self.current_tool_name_sent = True
-                    self._current_stream_function_name = function_name
-                    self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": function_name,
-                        "arguments": {},
-                    }
-                else:
-                    argument_diff = (
-                        function_args[len(self._last_arguments) :]
-                        if function_args.startswith(self._last_arguments)
-                        else function_args
+                    self._last_arguments += parsed_args_diff
+                    self.streamed_args_for_tool[
+                        self.current_tool_id
+                    ] += parsed_args_diff
+
+                parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
+                if _is_complete_json(parsed_args):
+                    try:
+                        parsed_args = json.loads(parsed_args)
+                        self.prev_tool_call_arr[self.current_tool_id][
+                            "arguments"
+                        ] = parsed_args
+                    except json.JSONDecodeError:
+                        pass
+
+                    # Find the end of the current tool call and remove only that part from buffer
+                    tool_call_end_pattern = (
+                        r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
                     )
+                    end_match = re.search(
+                        tool_call_end_pattern, current_text, re.DOTALL
+                    )
+                    if end_match:
+                        self._buffer = current_text[end_match.end() :]
+                    else:
+                        self._buffer = ""
 
-                    parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[
-                        0
-                    ]
+                    result = StreamingParseResult(normal_text="", calls=calls)
+                    self.current_tool_id += 1
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                    self._current_stream_function_name = None
+                    return result
 
-                    if parsed_args_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=parsed_args_diff,
-                            )
-                        )
-                        self._last_arguments += parsed_args_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += parsed_args_diff
+        return StreamingParseResult(normal_text="", calls=calls)
 
-                    parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
-                    if _is_complete_json(parsed_args):
-                        try:
-                            parsed_args = json.loads(parsed_args)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
-
-                        # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
-                        )
-                        end_match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
-                        if end_match:
-                            self._buffer = current_text[end_match.end() :]
-                        else:
-                            self._buffer = ""
-
-                        result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        self._current_stream_function_name = None
-                        return result
-
-            return StreamingParseResult(normal_text="", calls=calls)
-
-        except Exception as e:
-            logger.error("Error in parse_streaming_increment: %s", e, exc_info=True)
-            return StreamingParseResult(normal_text=_strip_special_tokens(current_text))
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""

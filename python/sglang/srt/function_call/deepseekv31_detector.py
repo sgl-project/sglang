@@ -84,6 +84,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
+            self._note_malformed_tool_call(e)
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
@@ -196,6 +197,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
+            self._note_malformed_tool_call(e)
             return StreamingParseResult(normal_text=current_text)
 
     def structure_info(self) -> _GetInfoFunc:
