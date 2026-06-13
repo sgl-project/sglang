@@ -1204,7 +1204,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         return f"{convert_time_to_realtime(perf_counter_time):.3f}"
 
 
-@dataclass
 class EncoderReqTimeStats(ReqTimeStatsBase):
     mm_encode_start_time: float = 0.0
     mm_encode_end_time: float = 0.0
