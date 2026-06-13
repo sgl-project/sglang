@@ -905,7 +905,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)
                 base_post_warmup_hook = getattr(
-                    attn_backend,
+                    self.model_runner.attn_backend,
                     "on_after_cuda_graph_warmup",
                     None,
                 )
