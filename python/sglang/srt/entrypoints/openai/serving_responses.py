@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import OrderedDict
 from contextlib import AsyncExitStack
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
@@ -80,6 +81,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _BoundedResponseStore(OrderedDict):
+    """LRU-bounded ``dict`` for the in-process /v1/responses stores.
+
+    Both the response objects and the input-message history are retained only
+    to serve ``store=true`` retrieval and ``previous_response_id`` continuation.
+    Without a bound these grow without limit under default-configured traffic
+    (``store`` defaults to ``True``). Reads and writes refresh recency so that
+    actively-referenced multi-turn conversations survive while idle ones are
+    evicted first. ``max_size <= 0`` disables eviction (legacy behavior).
+    """
+
+    def __init__(self, max_size: int):
+        super().__init__()
+        self._max_size = max_size
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        return default
+
+    def __setitem__(self, key, value):
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        if self._max_size > 0:
+            while len(self) > self._max_size:
+                self.popitem(last=False)
+
+
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
@@ -122,18 +157,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                 get_stop_tokens_for_assistant_actions()
             )
 
-        # Response storage for background and retrieval operations
-        # Note: In production, this should use a proper storage backend (Redis, database)
-        # with TTL/expiration to prevent memory leaks
-        self.response_store: dict[str, ResponsesResponse] = {}
+        # Response/message storage for background, retrieval, and
+        # ``previous_response_id`` continuation. These are LRU-bounded
+        # (--responses-store-max-size) to cap memory under default
+        # ``store=true`` traffic; in production a shared backend (Redis,
+        # database) with TTL would be preferable, and high-QPS deployments
+        # should send ``store: false`` to avoid retaining inputs/outputs.
+        store_max_size = self.tokenizer_manager.server_args.responses_store_max_size
+        self.response_store: dict[str, ResponsesResponse] = _BoundedResponseStore(
+            store_max_size
+        )
         self.response_store_lock = asyncio.Lock()
 
-        # Message storage for conversation continuity
-        # Note: In production, this should use a proper storage backend (Redis, database)
-        # with TTL/expiration to prevent memory leaks
         self.msg_store: dict[
             str, Union[list[ChatCompletionMessageParam], list[OpenAIMessage]]
-        ] = {}
+        ] = _BoundedResponseStore(store_max_size)
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
@@ -270,11 +308,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                     assert len(tool_list) == 0
                     tool_sessions = {}
                 for i, engine_prompt in enumerate(engine_prompts):
-                    # Calculate default max tokens from context length minus prompt length
+                    # Derive prompt length for default_max_tokens. Prefer the
+                    # already-tokenized ids: the multimodal path sets
+                    # ``engine_prompt`` to ``tokenizer.decode(prompt_ids)``, so
+                    # re-encoding the string here would be a redundant second
+                    # tokenization run synchronously on the event loop, blocking
+                    # all concurrent requests. Fall back to an off-loop encode
+                    # only when token ids are unavailable.
                     if isinstance(engine_prompt, list):
                         prompt_length = len(engine_prompt)
+                    elif processed_messages is not None and isinstance(
+                        processed_messages.prompt_ids, list
+                    ):
+                        prompt_length = len(processed_messages.prompt_ids)
                     elif isinstance(engine_prompt, str):
-                        prompt_length = len(tokenizer.encode(engine_prompt))
+                        prompt_length = len(
+                            await asyncio.to_thread(tokenizer.encode, engine_prompt)
+                        )
                     else:
                         prompt_length = 0
 
@@ -725,6 +775,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if isinstance(tool_call_data, dict):
                     tool_call_data = [tool_call_data]
                 if isinstance(tool_call_data, list):
+                    appended_any = False
                     for tool in tool_call_data:
                         if not isinstance(tool, dict) or "name" not in tool:
                             continue
@@ -741,7 +792,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 status="completed",
                             )
                         )
-                    content = ""
+                        appended_any = True
+                    # Only consume ``content`` once it has actually been parsed
+                    # into tool calls. If every entry lacked "name" (or the JSON
+                    # was a list of non-dicts), keep the model text so it is
+                    # still surfaced as an output message below instead of being
+                    # silently dropped.
+                    if appended_any:
+                        content = ""
             except Exception as e:
                 logger.error("Required tool JSON parse error: %s", e)
 
@@ -1034,15 +1092,35 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # Prepend the conversation history
         if prev_response is not None:
-            # Add the previous messages
-            prev_msg = self.msg_store[prev_response.id]
+            # Add the previous messages (best-effort: the bounded store may have
+            # evicted an idle conversation, in which case the response output
+            # replayed below is still available).
+            prev_msg = self.msg_store.get(prev_response.id, [])
             messages.extend(prev_msg)
 
             for output_item in prev_response.output:
+                # Replay assistant text from ``message`` items.
                 assistant_text = self._output_message_text(output_item)
-                if assistant_text is None:
+                if assistant_text is not None:
+                    messages.append({"role": "assistant", "content": assistant_text})
                     continue
-                messages.append({"role": "assistant", "content": assistant_text})
+                # Replay ``function_call`` items as a proper assistant
+                # ``tool_calls`` message. Dropping them (the previous behavior)
+                # orphaned any client-supplied ``function_call_output`` in the
+                # next turn, breaking multi-turn tool use. The subsequent
+                # ``_merge_consecutive_assistant_messages`` folds this into the
+                # preceding assistant text block. Reasoning items remain
+                # skipped (``_normalize_response_message_for_chat`` returns None
+                # for them here).
+                item_type = (
+                    output_item.get("type")
+                    if isinstance(output_item, dict)
+                    else getattr(output_item, "type", None)
+                )
+                if item_type == "function_call":
+                    normalized = self._normalize_response_message_for_chat(output_item)
+                    if normalized is not None:
+                        messages.append(normalized)
 
         # Append the new input
         # Responses API supports simple text inputs without chat format
@@ -1119,7 +1197,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Continue the previous conversation.
             # FIXME: Currently, request params like reasoning and
             # instructions are ignored.
-            prev_msgs = self.msg_store[prev_response.id]
+            # ``.get`` (not ``[]``) since the bounded store may have evicted an
+            # idle conversation.
+            prev_msgs = self.msg_store.get(prev_response.id, [])
             # Remove the previous chain-of-thoughts if there is a new "final"
             # message.
             if (
@@ -1781,6 +1861,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False
+            probe: Optional[FunctionCallParser] = None
             if self.tool_call_parser:
                 probe = FunctionCallParser(chat_tools, self.tool_call_parser)
                 native_supports_structural_tag = (
@@ -1789,7 +1870,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             if is_required and not native_supports_structural_tag:
                 tool_parser = JsonArrayParser()
             elif self.tool_call_parser:
-                tool_parser = FunctionCallParser(chat_tools, self.tool_call_parser)
+                # Reuse the probe instead of constructing a second identical
+                # parser for the native path.
+                tool_parser = probe
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(

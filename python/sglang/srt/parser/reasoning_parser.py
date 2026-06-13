@@ -244,6 +244,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        tool_start_token: Optional[str] = "<tool_call>",
     ):
         think_excluded_tokens = [
             "<tool_call>",
@@ -251,15 +252,23 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             "<|im_end|>",
             "<|endoftext|>",
         ]
+        # ``tool_start_token`` makes the base detector treat ``<tool_call>`` as
+        # an implicit reasoning close when the model opens a tool call before
+        # emitting ``</think>`` — the Qwen3.5 behavior. The non-streaming path
+        # only does this when ``</think>`` is absent, so a literal ``<tool_call>``
+        # inside reasoning that later closes ``</think>`` is still parsed
+        # normally; the streaming path closes eagerly on the first ``<tool_call>``
+        # seen while reasoning. Subclasses that only reuse Qwen3 *tokens*
+        # (DeepSeek-V3/V4, MIMO, Poolside) pass ``None`` so the heuristic does
+        # not leak to families where the unclosed-``</think>`` quirk was never
+        # observed.
         super().__init__(
             "<think>",
             "</think>",
             think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
-            # Qwen3.5 sometimes opens ``<tool_call>`` without closing
-            # ``</think>``; treat it as an implicit reasoning close.
-            tool_start_token="<tool_call>",
+            tool_start_token=tool_start_token,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             thinks_internally=True,
@@ -579,6 +588,9 @@ class _DeepSeekV3Detector(Qwen3Detector):
     """DeepSeek-V3 reuses Qwen3 tokens but requires explicit thinking=True to enable."""
 
     def __init__(self, **kwargs):
+        # Only reuses Qwen3 *tokens*; the Qwen3.5 unclosed-``</think>`` quirk
+        # was never observed here, so keep ``<tool_call>`` inert in reasoning.
+        kwargs.setdefault("tool_start_token", None)
         super().__init__(**kwargs)
         self.reasoning_default = "explicit_thinking"
 
@@ -587,6 +599,7 @@ class _MimoDetector(Qwen3Detector):
     """MIMO reuses Qwen3 tokens but requires explicit enable_thinking=True to enable."""
 
     def __init__(self, **kwargs):
+        kwargs.setdefault("tool_start_token", None)
         super().__init__(**kwargs)
         self.reasoning_default = "explicit_enable_thinking"
 
@@ -596,6 +609,7 @@ class _PoolsideV1Detector(Qwen3Detector):
     defaults `enable_thinking=False`; reasoning is opt-in via `enable_thinking=True`."""
 
     def __init__(self, **kwargs):
+        kwargs.setdefault("tool_start_token", None)
         super().__init__(**kwargs)
         self.reasoning_default = "explicit_enable_thinking"
 

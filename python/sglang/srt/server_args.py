@@ -550,6 +550,7 @@ class ServerArgs:
     sampling_defaults: str = "model"
     asr_max_buffer_seconds: int = 60
     asr_max_concurrent_sessions: int = 32
+    responses_store_max_size: int = 10000
 
     # Data parallelism
     dp_size: int = 1
@@ -5663,6 +5664,17 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--responses-store-max-size",
+            type=int,
+            default=ServerArgs.responses_store_max_size,
+            help="Maximum number of conversations retained in the in-process "
+            "/v1/responses stores that back store=true retrieval and "
+            "previous_response_id continuation. The least-recently-used entries "
+            "are evicted past this size; set <= 0 to disable eviction (unbounded). "
+            "For high-QPS serving prefer store=false per request to avoid "
+            "retaining inputs/outputs at all.",
         )
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
