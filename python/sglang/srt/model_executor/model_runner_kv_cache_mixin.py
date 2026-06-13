@@ -885,8 +885,10 @@ class ModelRunnerKVCacheMixin:
 
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
-            max_num_reqs = min(max_num_reqs // self.dp_size, estimated)
+            requested_per_worker = max_num_reqs // self.dp_size
+            max_num_reqs = min(requested_per_worker, token_capacity // 2)
         else:
+            requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
         if self.mambaish_config is not None:
@@ -904,6 +906,13 @@ class ModelRunnerKVCacheMixin:
                     f"(2) increase --mem-fraction-static, or "
                     f"(3) use GPUs with more memory."
                 )
+        if requested_per_worker is not None and max_num_reqs < requested_per_worker:
+            logger.warning(
+                "max_running_requests was reduced from the requested %d to %d "
+                "(per dp worker) due to the available KV cache capacity.",
+                requested_per_worker,
+                max_num_reqs,
+            )
         logger.info(
             f"Max concurrent requests (per dp worker) from the finalized token capacity: "
             f"max_num_reqs={max_num_reqs}."
