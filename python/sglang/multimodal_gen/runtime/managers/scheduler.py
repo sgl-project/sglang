@@ -167,7 +167,7 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
         self._warmup_progress_bar: Any | None = None
         self._logged_server_ready_after_warmup = False
 
-        self.prepare_server_warmup_reqs()
+        self.prepare_internal_warmup_reqs()
 
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
@@ -964,10 +964,11 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
         )
         return batch_items
 
-    def prepare_server_warmup_reqs(self):
+    def prepare_internal_warmup_reqs(self):
         if (
             not self.server_args.warmup
             or self.warmed_up
+            or self.server_args.server_warmup
             or self.server_args.warmup_resolutions is None
         ):
             return

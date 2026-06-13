@@ -6,8 +6,11 @@ first real request, without copying user traffic. It starts from the model's
 sampling defaults, then keeps startup bounded by choosing common low-cost
 resolution/frame buckets and trimming the denoising step count.
 
-Explicit request-based warmup remains a scheduler-level legacy path and is not
-constructed here.
+Image models may run a tiny second step because first/last step paths often
+initialize different kernels or scheduler state. Video models cap frames and
+steps to keep startup bounded. Explicit warmup resolutions share this builder;
+online serving sends them through the scheduler client after HTTP is ready,
+while non-server entrypoints can still enqueue them internally.
 """
 
 from copy import copy
@@ -62,9 +65,8 @@ def _resolve_default_warmup_resolution(
     sampling_defaults: SamplingParams,
     *,
     server_based_warmup: bool,
-    use_model_sampling_defaults: bool,
 ) -> tuple[int, int]:
-    if server_based_warmup and use_model_sampling_defaults:
+    if server_based_warmup:
         return _resolve_representative_warmup_resolution(
             server_args, sampling_defaults
         )
@@ -168,13 +170,12 @@ def _resolve_warmup_num_frames(
     sampling_defaults: SamplingParams,
     *,
     server_based_warmup: bool,
-    use_model_sampling_defaults: bool,
 ) -> int:
     num_frames = sampling_defaults.num_frames
     if (
         not server_based_warmup
-        or not use_model_sampling_defaults
         or not _is_video_warmup_task(server_args)
+        or num_frames is None
     ):
         return num_frames
 
@@ -192,10 +193,9 @@ def _resolve_warmup_steps(
     sampling_defaults: SamplingParams,
     *,
     server_based_warmup: bool,
-    use_model_sampling_defaults: bool,
 ) -> int:
     warmup_steps = server_args.warmup_steps
-    if not server_based_warmup or not use_model_sampling_defaults:
+    if not server_based_warmup:
         return warmup_steps
 
     default_steps = sampling_defaults.num_inference_steps
@@ -231,42 +231,31 @@ def build_warmup_reqs(
     warmup_input_path: str | None = None,
     return_warmup_result: bool = False,
     server_based_warmup: bool = False,
-    use_model_sampling_defaults: bool = False,
 ) -> list[Req]:
     task_type = server_args.pipeline_config.task_type
-    if warmup_resolutions is None or use_model_sampling_defaults:
-        sampling_defaults = get_model_sampling_defaults(server_args)
-    else:
-        sampling_defaults = SamplingParams()
+    sampling_defaults = get_model_sampling_defaults(server_args)
 
     if warmup_resolutions is None:
         width, height = _resolve_default_warmup_resolution(
             server_args,
             sampling_defaults,
             server_based_warmup=server_based_warmup,
-            use_model_sampling_defaults=use_model_sampling_defaults,
         )
         resolutions: list[tuple[int, int]] = [(width, height)]
     else:
         resolutions = [_parse_size(resolution) for resolution in warmup_resolutions]
 
-    negative_prompt: Any = (
-        sampling_defaults.negative_prompt if use_model_sampling_defaults else None
-    )
-    cfg_scale = (
-        _effective_cfg_scale(sampling_defaults) if use_model_sampling_defaults else None
-    )
+    negative_prompt: Any = sampling_defaults.negative_prompt
+    cfg_scale = _effective_cfg_scale(sampling_defaults)
     warmup_steps = _resolve_warmup_steps(
         server_args,
         sampling_defaults,
         server_based_warmup=server_based_warmup,
-        use_model_sampling_defaults=use_model_sampling_defaults,
     )
     warmup_num_frames = _resolve_warmup_num_frames(
         server_args,
         sampling_defaults,
         server_based_warmup=server_based_warmup,
-        use_model_sampling_defaults=use_model_sampling_defaults,
     )
 
     warmup_reqs = []
@@ -278,24 +267,21 @@ def build_warmup_reqs(
             height=height,
             prompt=DEFAULT_PLACEHOLDER_PROMPT,
         )
-        if use_model_sampling_defaults:
-            req_kwargs["sampling_params"] = copy(sampling_defaults)
-            req_kwargs.update(
-                negative_prompt=negative_prompt,
-                guidance_scale=sampling_defaults.guidance_scale,
-                guidance_scale_2=sampling_defaults.guidance_scale_2,
-                true_cfg_scale=sampling_defaults.true_cfg_scale,
-                num_inference_steps=sampling_defaults.num_inference_steps,
-                num_frames=warmup_num_frames,
-            )
+        req_kwargs["sampling_params"] = copy(sampling_defaults)
+        req_kwargs.update(
+            negative_prompt=negative_prompt,
+            guidance_scale=sampling_defaults.guidance_scale,
+            guidance_scale_2=sampling_defaults.guidance_scale_2,
+            true_cfg_scale=sampling_defaults.true_cfg_scale,
+            num_inference_steps=sampling_defaults.num_inference_steps,
+            num_frames=warmup_num_frames,
+        )
         if include_warmup_image:
             if warmup_input_path is None:
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"
                 )
             req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-            if not use_model_sampling_defaults:
-                req_kwargs["negative_prompt"] = ""
             req_kwargs["image_path"] = [warmup_input_path]
         if (
             server_args.enable_cfg_parallel
@@ -303,12 +289,7 @@ def build_warmup_reqs(
         ):
             req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
             req_kwargs["do_classifier_free_guidance"] = True
-        elif (
-            use_model_sampling_defaults
-            and negative_prompt is not None
-            and cfg_scale is not None
-            and cfg_scale > 1.0
-        ):
+        elif negative_prompt is not None and cfg_scale is not None and cfg_scale > 1.0:
             req_kwargs["do_classifier_free_guidance"] = True
 
         req = Req(**req_kwargs)

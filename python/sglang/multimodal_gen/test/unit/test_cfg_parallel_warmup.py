@@ -1,7 +1,7 @@
 """Unit tests for the --enable-cfg-parallel warmup fix and guard.
 
 Covers warmup and cfg-parallel guard paths introduced alongside this file:
-- Scheduler.prepare_server_warmup_reqs synthesizes warmup Reqs that
+- Scheduler.prepare_internal_warmup_reqs synthesizes fallback warmup Reqs that
   actually enable classifier-free guidance when cfg-parallel is on.
 - InputValidationStage.forward rejects non-CFG requests when the server
   has cfg-parallel on.
@@ -44,7 +44,7 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     """
     Build a minimal Scheduler without calling __init__ (which requires
     distributed init, ZMQ sockets, pipeline load, etc.). Populates only
-    the attributes prepare_server_warmup_reqs reads/writes for a
+    the attributes prepare_internal_warmup_reqs reads/writes for a
     text-only task so _prepare_shared_warmup_image_path is skipped.
     """
     scheduler = object.__new__(Scheduler)
@@ -54,6 +54,7 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     server_args.warmup_steps = 1
     server_args.warmup_resolutions = ["512x512"]
     server_args.enable_cfg_parallel = enable_cfg_parallel
+    server_args.server_warmup = False
 
     # Text-only task — accepts_image_input() False skips the image-path
     # branch entirely, so we don't need to mock
@@ -92,11 +93,11 @@ def _make_validation_server_args(enable_cfg_parallel: bool) -> MagicMock:
 
 
 class TestWarmupReqCfgParallel(unittest.TestCase):
-    """Commit 1 regression: prepare_server_warmup_reqs."""
+    """Commit 1 regression: prepare_internal_warmup_reqs."""
 
     def test_warmup_req_cfg_parallel_sets_do_cfg(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=True)
-        scheduler.prepare_server_warmup_reqs()
+        scheduler.prepare_internal_warmup_reqs()
 
         self.assertEqual(len(scheduler.waiting_queue), 1)
         _, req, _ = scheduler.waiting_queue[0]
@@ -110,12 +111,21 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         # "warmup" placeholder for negative_prompt (which would indicate
         # the fix's kwargs leaked into this branch).
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
-        scheduler.prepare_server_warmup_reqs()
+        scheduler.prepare_internal_warmup_reqs()
 
         self.assertEqual(len(scheduler.waiting_queue), 1)
         _, req, _ = scheduler.waiting_queue[0]
         self.assertIs(req.do_classifier_free_guidance, False)
         self.assertNotEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
+
+    def test_server_warmup_skips_internal_warmup_queue(self):
+        scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
+        scheduler.server_args.server_warmup = True
+
+        scheduler.prepare_internal_warmup_reqs()
+
+        self.assertEqual(len(scheduler.waiting_queue), 0)
+        self.assertFalse(scheduler.warmed_up)
 
     def test_req_based_warmup_remains_explicit_legacy_entry(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
@@ -171,7 +181,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 return_warmup_result=True,
                 server_based_warmup=True,
             )
@@ -208,13 +217,49 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
         req = reqs[0]
         self.assertEqual(req.width, 640)
         self.assertEqual(req.height, 640)
+
+    def test_server_based_warmup_resolutions_keep_sampling_defaults_and_caps(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+
+        task_type = MagicMock()
+        task_type.requires_image_input.return_value = False
+        task_type.accepts_image_input.return_value = False
+        task_type.is_image_gen.return_value = False
+        task_type.data_type.return_value = ModelTaskType.T2V.data_type()
+        server_args.pipeline_config.task_type = task_type
+
+        sampling_defaults = SamplingParams(
+            negative_prompt="model default negative",
+            guidance_scale=3.5,
+            num_frames=81,
+            num_inference_steps=50,
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["832x480"],
+                return_warmup_result=True,
+                server_based_warmup=True,
+            )
+
+        req = reqs[0]
+        self.assertEqual((req.width, req.height), (832, 480))
+        self.assertEqual(req.num_frames, 17)
+        self.assertEqual(req.num_inference_steps, 1)
+        self.assertEqual(req.extra["cache_dit_num_inference_steps"], 50)
+        self.assertEqual(req.negative_prompt, "model default negative")
+        self.assertIs(req.do_classifier_free_guidance, True)
 
     def test_server_based_warmup_uses_supported_resolution_within_budget(self):
         server_args = MagicMock()
@@ -240,7 +285,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
@@ -267,7 +311,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
@@ -294,7 +337,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
@@ -325,7 +367,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
@@ -364,7 +405,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
@@ -391,7 +431,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
@@ -441,7 +480,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_args,
                 warmup_resolutions=None,
                 warmup_input_path="/tmp/warmup.png",
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
@@ -461,7 +499,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_args,
                 warmup_resolutions=None,
                 warmup_input_path="/tmp/warmup.png",
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
@@ -481,7 +518,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_args,
                 warmup_resolutions=None,
                 warmup_input_path="/tmp/warmup.png",
-                use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 

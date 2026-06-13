@@ -691,7 +691,6 @@ class ServerArgs(DisaggServerArgsMixin):
     def _adjust_warmup(self):
         if self.warmup_resolutions is not None:
             self.warmup = True
-            self.server_warmup = False
 
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
@@ -1258,12 +1257,12 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.warmup,
             help=(
                 "Perform warmup before normal traffic. `sglang serve` runs a "
-                "lightweight server warmup after HTTP is ready; other entrypoints "
-                "use request-based warmup unless `--warmup-resolutions` is "
-                "specified. Recommended to enable when benchmarking to ensure fair "
-                "comparison and best performance. When enabled with "
-                "`--warmup-resolutions` unspecified, look for the line ending with "
-                "`(with warmup excluded)` for actual processing time."
+                "server warmup through the scheduler client after HTTP is ready. "
+                "Other entrypoints use request-based warmup unless "
+                "`--warmup-resolutions` is specified. Recommended to enable when "
+                "benchmarking to ensure fair comparison and best performance. "
+                "When enabled, look for the line ending with `(with warmup "
+                "excluded)` for actual processing time."
             ),
         )
         parser.add_argument(
