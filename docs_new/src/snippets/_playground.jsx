@@ -968,12 +968,6 @@ export const Playground = ({ config }) => {
       },
 
       apply: ({ flags, env, value, fc, sel, h, derived }) => {
-        // Evaluate disable/hide against the SAME base render uses
-        // (constraintBase = 5 dims + cross-axis facts). `sel` carries only the
-        // 5 dims, so reconstruct dpAttnOn / pdMode from the post-earlier-axes
-        // flags (attention + pdDisagg run before this) — same trick the
-        // speculative axis uses — else an option gated on a cross-axis fact
-        // would be hidden in the UI yet still emitted here.
         const evalBase = {
           ...(sel || {}),
           dpAttnOn: h.hasFlag(flags, "--enable-dp-attention"),
