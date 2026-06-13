@@ -962,11 +962,11 @@ class Evo2ForCausalLM(nn.Module):
             forward_batch=forward_batch,
             inputs_embeds=inputs_embeds,
         )
-        # Evo2 uses tied embeddings (BERT-style). Since the model was trained
-        # for masked prediction rather than causal LM, logits can have unbounded
-        # dynamic range in bf16, causing softmax overflow during stochastic
-        # sampling. Clamp to a safe range for float32 exponentials.
-        hidden_states = hidden_states.clamp(-30.0, 30.0)
+        # Evo2 uses tied embeddings; during autoregressive decode the IIR
+        # filter can accumulate bf16 numerical error that produces NaN in
+        # the logits.  nan_to_num here keeps the sampler from crashing
+        # while preserving the model's output distribution.
+        hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=65504.0, neginf=-65504.0)
         output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
