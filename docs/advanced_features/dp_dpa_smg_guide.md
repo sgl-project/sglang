@@ -14,7 +14,7 @@ This guide explains the difference between Data Parallelism (DP) and Data Parall
 
 ## Data Parallelism Attention (DPA)
 
-**Data Parallelism Attention (DPA)**, also known as DP Attention, is an advanced parallelism strategy. While DPA provides the most significant benefits for **Multi-Head Latent Attention (MLA)** models (such as DeepSeek, MiniMax, Kimi-K2), it also supports **standard attention models** like Qwen.
+**Data Parallelism Attention (DPA)**, also known as DP Attention, is an advanced parallelism strategy. While DPA provides the most significant benefits for **Multi-Head Latent Attention (MLA)** models (such as DeepSeek, GLM-5, Kimi-K2), it also supports **standard attention models** like Qwen.
 
 ### The Problem with Tensor Parallelism for MLA Models
 
@@ -88,7 +88,7 @@ DPA supports the following model architectures:
 
 - **MLA (Multi-Head Latent Attention) models** - where DPA provides the most significant benefits:
   - DeepSeek family (DeepSeek-V2, DeepSeek-V3, DeepSeek-R1)
-  - MiniMax models
+  - GLM-5
   - Kimi-K2
   - Other models using MLA architecture
 
