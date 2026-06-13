@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.layers.spatial_parallel import (
     SpatialParallelConv2d,
     SpatialParallelZeroPad2d,
     chunk_height_for_parallel_decode,
+    disable_spatial_parallel_decode,
     gather_and_trim_height,
     gather_height_for_global_op,
     split_for_parallel_decode,
@@ -902,6 +903,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.temperal_upsample = temperal_downsample[::-1]
         self.input_channels = config.arch_config.input_channels
         self.latents_mean = config.arch_config.latents_mean
+        self.vae_config = config
         self.config = config.arch_config
         self.use_parallel_decode = config.use_parallel_decode
         self._spatial_parallel_decode_enabled = (
@@ -1080,14 +1082,27 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
 
         return posterior
 
+    def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
+        return (
+            self._spatial_parallel_decode_enabled
+            and should_use_spatial_shard_parallel_decode(
+                self.vae_config,
+                z,
+                get_decode_parallel_world_size(),
+            )
+        )
+
     def _decode_with_parallel_dispatch(self, z: torch.Tensor) -> DecoderOutput:
         if self.use_parallel_decode and get_decode_parallel_world_size() > 1:
             num_frame = z.shape[2]
             num_sample_frames = (num_frame - 1) * self.temporal_compression_ratio + 1
             mode = self.parallel_decode_mode
 
-            if self._spatial_parallel_decode_enabled:
+            if self._should_use_spatial_parallel_decode(z):
                 decoded = self._decode(z)[:, :, :num_sample_frames]
+            elif self._spatial_parallel_decode_enabled:
+                with disable_spatial_parallel_decode():
+                    decoded = self._decode(z)[:, :, :num_sample_frames]
             elif mode == "patch":
                 decoded = super().parallel_patch_decode(z)[:, :, :num_sample_frames]
             elif mode == "tiled":

@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.layers.spatial_parallel import (
     SpatialParallelConv3d,
     chunk_height_by_sizes,
+    disable_spatial_parallel_decode,
     gather_and_trim_height,
     gather_variable_height,
     split_height_for_parallel_decode,
@@ -925,6 +926,14 @@ class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
             and get_decode_parallel_world_size() > 1
         )
 
+    def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
+        if not self._spatial_parallel_decode_enabled or not dist.is_initialized():
+            return False
+        world_size = get_decode_parallel_world_size()
+        if world_size <= 1:
+            return False
+        return should_use_spatial_shard_parallel_decode(self.config, z, world_size)
+
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         x = self.encoder(x)
         enc = self.quant_conv(x)
@@ -932,7 +941,7 @@ class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
 
     def _decode(self, z: torch.Tensor) -> torch.Tensor:
         z = self.post_quant_conv(z)
-        if self._spatial_parallel_decode_enabled:
+        if self._should_use_spatial_parallel_decode(z):
             expected_height = (
                 z.shape[-2] * self.config.arch_config.spatial_compression_ratio
             )
@@ -943,6 +952,9 @@ class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
                 rank=get_decode_parallel_rank(),
             )
             dec = gather_and_trim_height(self.decoder(z), expected_height)
+        elif self._spatial_parallel_decode_enabled:
+            with disable_spatial_parallel_decode():
+                dec = self.decoder(z)
         else:
             dec = self.decoder(z)
         return dec

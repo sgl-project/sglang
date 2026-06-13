@@ -1,4 +1,6 @@
+import contextvars
 import math
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -11,6 +13,24 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+
+
+_SPATIAL_PARALLEL_DECODE_DISABLED = contextvars.ContextVar(
+    "spatial_parallel_decode_disabled", default=False
+)
+
+
+@contextmanager
+def disable_spatial_parallel_decode():
+    token = _SPATIAL_PARALLEL_DECODE_DISABLED.set(True)
+    try:
+        yield
+    finally:
+        _SPATIAL_PARALLEL_DECODE_DISABLED.reset(token)
+
+
+def spatial_parallel_decode_disabled() -> bool:
+    return _SPATIAL_PARALLEL_DECODE_DISABLED.get()
 
 
 def _tensor_pad(x: torch.Tensor, len_to_pad: int, dim: int = -2):
@@ -34,7 +54,9 @@ def _tensor_chunk(x: torch.Tensor, dim: int = -2, world_size: int = 1, rank: int
         return x
     if world_size <= 1:
         return x
-    return torch.tensor_split(x, world_size, dim=dim)[rank]
+    return torch.tensor_split(x, world_size, dim=dim)[rank].contiguous(
+        memory_format=_halo_memory_format(x)
+    )
 
 
 def split_for_parallel_decode(
@@ -51,6 +73,8 @@ def split_for_parallel_decode(
 def split_height_for_parallel_decode(
     x: torch.Tensor, expected_height: int, world_size: int, rank: int
 ):
+    if spatial_parallel_decode_disabled():
+        return x, None
     x = _tensor_chunk(x, dim=-2, world_size=world_size, rank=rank)
     return x, expected_height
 
@@ -73,6 +97,8 @@ def _maybe_contiguous_for_sp_gather(x: torch.Tensor) -> torch.Tensor:
 
 
 def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
+    if spatial_parallel_decode_disabled():
+        return x
     if expected_height is None:
         return x
     x, _ = gather_variable_height(x)
@@ -82,10 +108,14 @@ def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
 
 
 def gather_height_for_global_op(x: torch.Tensor) -> torch.Tensor:
+    if spatial_parallel_decode_disabled():
+        return x
     return gather_variable_height(x)[0]
 
 
 def chunk_height_for_parallel_decode(x: torch.Tensor) -> torch.Tensor:
+    if spatial_parallel_decode_disabled():
+        return x
     return _tensor_chunk(
         x,
         dim=-2,
@@ -95,12 +125,18 @@ def chunk_height_for_parallel_decode(x: torch.Tensor) -> torch.Tensor:
 
 
 def chunk_height_by_sizes(x: torch.Tensor, heights: list[int]) -> torch.Tensor:
+    if spatial_parallel_decode_disabled():
+        return x
     rank = get_decode_parallel_rank()
     start = sum(heights[:rank])
-    return x[..., start : start + heights[rank], :]
+    return x[..., start : start + heights[rank], :].contiguous(
+        memory_format=_halo_memory_format(x)
+    )
 
 
 def gather_height_sizes(x: torch.Tensor) -> list[int]:
+    if spatial_parallel_decode_disabled():
+        return [x.shape[-2]]
     world_size = get_decode_parallel_world_size()
     if world_size <= 1:
         return [x.shape[-2]]
@@ -115,6 +151,8 @@ def gather_height_sizes(x: torch.Tensor) -> list[int]:
 
 
 def gather_variable_height(x: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
+    if spatial_parallel_decode_disabled():
+        return x, [x.shape[-2]]
     world_size = get_decode_parallel_world_size()
     if world_size <= 1:
         return x, [x.shape[-2]]
@@ -172,6 +210,8 @@ def halo_exchange(
     recv_bottom_buf: torch.Tensor | None = None,
     height_pad_mode: str = "zeros",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if spatial_parallel_decode_disabled():
+        return x, recv_top_buf, recv_bottom_buf
     if height_halo_size == 0:
         return x, recv_top_buf, recv_bottom_buf
 
@@ -344,6 +384,9 @@ class SpatialParallelConv2d(nn.Conv2d):
         self.world_size = get_decode_parallel_world_size()
 
     def forward(self, x):
+        if spatial_parallel_decode_disabled():
+            return self._direct_forward(x)
+
         if any(self._padding):
             x = _pad_with_mode(x, self._padding, self.padding_mode)
 
@@ -380,6 +423,26 @@ class SpatialParallelConv2d(nn.Conv2d):
             kernel_height=self.kernel_size[-2],
             dilation_height=self.dilation[-2],
             stride_height=stride,
+        )
+
+    def _direct_forward(self, x):
+        width_pad = self.padding[-1]
+        padding = (
+            width_pad,
+            width_pad,
+            self.height_pad_top,
+            self.height_pad_bottom,
+        )
+        if any(padding):
+            x = _pad_with_mode(x, padding, self.padding_mode)
+        return F.conv2d(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            (0, 0),
+            self.dilation,
+            self.groups,
         )
 
 
@@ -431,6 +494,9 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
+        if spatial_parallel_decode_disabled():
+            padding[2] = self.height_pad_top
+            padding[3] = self.height_pad_bottom
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
@@ -438,6 +504,18 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
 
         x = F.pad(x, padding)
         x = x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
+
+        if spatial_parallel_decode_disabled():
+            x = _match_conv3d_input_format(x, self.weight)
+            return F.conv3d(
+                x,
+                self.weight,
+                self.bias,
+                self.stride,
+                (0, 0, 0),
+                self.dilation,
+                self.groups,
+            )
 
         x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
             x,
@@ -529,6 +607,9 @@ class SpatialParallelConv3d(nn.Conv3d):
         self.world_size = get_decode_parallel_world_size()
 
     def forward(self, x):
+        if spatial_parallel_decode_disabled():
+            return self._direct_forward(x)
+
         if any(self._padding):
             x = _pad_with_mode(x, self._padding, self.padding_mode)
 
@@ -568,6 +649,30 @@ class SpatialParallelConv3d(nn.Conv3d):
             stride_height=stride,
         )
 
+    def _direct_forward(self, x):
+        time_pad = self.padding[0]
+        width_pad = self.padding[-1]
+        padding = (
+            width_pad,
+            width_pad,
+            self.height_pad_top,
+            self.height_pad_bottom,
+            time_pad,
+            time_pad,
+        )
+        if any(padding):
+            x = _pad_with_mode(x, padding, self.padding_mode)
+        x = _match_conv3d_input_format(x, self.weight)
+        return F.conv3d(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            (0, 0, 0),
+            self.dilation,
+            self.groups,
+        )
+
 
 class SpatialParallelZeroPad2d(nn.Module):
     def __init__(self, padding: tuple[int, int, int, int]) -> None:
@@ -577,6 +682,8 @@ class SpatialParallelZeroPad2d(nn.Module):
         self.world_size = get_decode_parallel_world_size()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if spatial_parallel_decode_disabled():
+            return F.pad(x, self.padding)
         left, right, top, bottom = self.padding
         top = top if self.rank == 0 else 0
         bottom = bottom if self.rank == self.world_size - 1 else 0

@@ -24,17 +24,25 @@ def is_auto_parallel_decode_mode(mode: str) -> bool:
     return mode == AUTO_PARALLEL_DECODE_MODE
 
 
-def should_use_spatial_shard_parallel_decode(config: Any) -> bool:
+def should_use_spatial_shard_parallel_decode(
+    config: Any, z: torch.Tensor | None = None, world_size: int = 1
+) -> bool:
     if not config.use_parallel_decode:
         return False
 
     if is_spatial_shard_parallel_decode_mode(config.parallel_decode_mode):
         return True
 
-    return (
-        is_auto_parallel_decode_mode(config.parallel_decode_mode)
-        and config.auto_parallel_decode_prefers_spatial_shard()
-    )
+    if not is_auto_parallel_decode_mode(config.parallel_decode_mode):
+        return False
+
+    if not config.auto_parallel_decode_prefers_spatial_shard():
+        return False
+
+    if z is None:
+        return True
+
+    return config.should_use_auto_spatial_shard_parallel_decode(z, world_size)
 
 
 @dataclass
@@ -68,6 +76,7 @@ class VAEConfig(ModelConfig):
     use_temporal_scaling_frames: bool = True
     use_parallel_decode: bool = True
     parallel_decode_mode: str = AUTO_PARALLEL_DECODE_MODE
+    auto_parallel_decode_min_latent_elements_per_rank: int = 4096
 
     def __post_init__(self):
         self.blend_num_frames = (
@@ -79,6 +88,19 @@ class VAEConfig(ModelConfig):
 
     def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
         return False
+
+    def should_use_auto_spatial_shard_parallel_decode(
+        self, z: torch.Tensor, world_size: int
+    ) -> bool:
+        if world_size <= 1 or z.shape[-2] < world_size:
+            return False
+        latent_elements_per_rank = (
+            z.shape[0] * z.shape[-3] * z.shape[-2] * z.shape[-1]
+        ) // world_size
+        return (
+            latent_elements_per_rank
+            >= self.auto_parallel_decode_min_latent_elements_per_rank
+        )
 
     @staticmethod
     def add_cli_args(parser: Any, prefix: str = "vae-config") -> Any:

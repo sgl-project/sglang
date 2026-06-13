@@ -17,7 +17,7 @@
 # limitations under the License.
 
 import contextvars
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.distributed as dist
@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
+from sglang.multimodal_gen.runtime.layers.spatial_parallel import (
+    disable_spatial_parallel_decode,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
     ParallelTiledVAE,
@@ -870,6 +873,14 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self.use_feature_cache = config.use_feature_cache
         self._causal_decode_initialized = False
 
+    def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
+        if not dist.is_initialized():
+            return False
+        world_size = get_decode_parallel_world_size()
+        if world_size <= 1:
+            return False
+        return should_use_spatial_shard_parallel_decode(self.config, z, world_size)
+
     def clear_cache(self) -> None:
 
         def _count_conv3d(model) -> int:
@@ -907,13 +918,19 @@ class AutoencoderKLWan(ParallelTiledVAE):
         iter_ = z.shape[2]
         x = self.post_quant_conv(z)
         outs = []
-        with forward_context(
-            feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
-        ):
-            for i in range(iter_):
-                feat_idx.set(0)
-                first_chunk.set(is_first_chunk and i == 0)
-                outs.append(self.decoder(x[:, :, i : i + 1, :, :]))
+        spatial_context = (
+            nullcontext()
+            if self._should_use_spatial_parallel_decode(z)
+            else disable_spatial_parallel_decode()
+        )
+        with spatial_context:
+            with forward_context(
+                feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
+            ):
+                for i in range(iter_):
+                    feat_idx.set(0)
+                    first_chunk.set(is_first_chunk and i == 0)
+                    outs.append(self.decoder(x[:, :, i : i + 1, :, :]))
         out = torch.cat(outs, 2)
 
         if self.config.patch_size is not None:
@@ -987,16 +1004,25 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
             iter_ = z.shape[2]
             x = self.post_quant_conv(z)
-            outs = []
-            with forward_context(
-                feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
-            ):
-                out_chunks = []
-                for i in range(iter_):
-                    feat_idx.set(0)
-                    first_chunk.set(i == 0)
-                    out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
-                out = torch.cat(out_chunks, 2) if len(out_chunks) > 1 else out_chunks[0]
+            spatial_context = (
+                nullcontext()
+                if self._should_use_spatial_parallel_decode(z)
+                else disable_spatial_parallel_decode()
+            )
+            with spatial_context:
+                with forward_context(
+                    feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
+                ):
+                    out_chunks = []
+                    for i in range(iter_):
+                        feat_idx.set(0)
+                        first_chunk.set(i == 0)
+                        out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                    out = (
+                        torch.cat(out_chunks, 2)
+                        if len(out_chunks) > 1
+                        else out_chunks[0]
+                    )
 
             if self.config.patch_size is not None:
                 out = unpatchify(out, patch_size=self.config.patch_size)
@@ -1011,8 +1037,14 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
     def _decode(self, z: torch.Tensor, first_frame=False) -> torch.Tensor:
         x = self.post_quant_conv(z)
-        with forward_context(first_frame_arg=first_frame):
-            out = self.decoder(x)
+        spatial_context = (
+            nullcontext()
+            if self._should_use_spatial_parallel_decode(z)
+            else disable_spatial_parallel_decode()
+        )
+        with spatial_context:
+            with forward_context(first_frame_arg=first_frame):
+                out = self.decoder(x)
 
         out = torch.clamp(out, min=-1.0, max=1.0)
 

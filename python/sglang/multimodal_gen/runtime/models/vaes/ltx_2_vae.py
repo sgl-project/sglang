@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.layers.spatial_parallel import (
     SpatialParallelConv3d,
+    disable_spatial_parallel_decode,
     gather_and_trim_height,
     split_height_for_parallel_decode,
 )
@@ -1761,6 +1762,14 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             and get_decode_parallel_world_size() > 1
         )
 
+    def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
+        if not self._spatial_parallel_decode_enabled or not dist.is_initialized():
+            return False
+        world_size = get_decode_parallel_world_size()
+        if world_size <= 1:
+            return False
+        return should_use_spatial_shard_parallel_decode(self.config, z, world_size)
+
     def enable_tiling(
         self,
         tile_sample_min_height: Optional[int] = None,
@@ -1876,7 +1885,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         ):
             return self.tiled_decode(z, temb, causal=causal, return_dict=return_dict)
 
-        if self._spatial_parallel_decode_enabled:
+        if self._should_use_spatial_parallel_decode(z):
             expected_height = (
                 z.shape[-2] * self.config.arch_config.spatial_compression_ratio
             )
@@ -1889,6 +1898,9 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             dec = gather_and_trim_height(
                 self.decoder(z, temb, causal=causal), expected_height
             )
+        elif self._spatial_parallel_decode_enabled:
+            with disable_spatial_parallel_decode():
+                dec = self.decoder(z, temb, causal=causal)
         else:
             dec = self.decoder(z, temb, causal=causal)
 
