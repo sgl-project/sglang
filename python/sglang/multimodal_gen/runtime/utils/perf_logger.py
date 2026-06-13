@@ -212,19 +212,6 @@ class StageProfiler:
     def _should_record_as_step(self) -> bool:
         return self.record_as_step or self.stage_name.startswith("denoising_step_")
 
-    def _should_sync_step_timing(self) -> bool:
-        if (
-            not self._should_record_as_step()
-            or not torch.get_device_module().is_available()
-        ):
-            return False
-
-        sync_env = os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING")
-        if sync_env is not None:
-            return sync_env == "1"
-
-        return self.log_timing and self.metrics is not None
-
     def __enter__(self):
         if self.log_stage_start_end:
             msg = f"[{self.stage_name}] started..."
@@ -239,7 +226,11 @@ class StageProfiler:
             self.logger.info(msg)
 
         if (self.log_timing and self.metrics) or self.log_stage_start_end:
-            if self._should_sync_step_timing():
+            if (
+                os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+                and self._should_record_as_step()
+                and torch.get_device_module().is_available()
+            ):
                 torch.get_device_module().synchronize()
             self.start_time = time.perf_counter()
 
@@ -249,7 +240,11 @@ class StageProfiler:
         if not ((self.log_timing and self.metrics) or self.log_stage_start_end):
             return False
 
-        if self._should_sync_step_timing():
+        if (
+            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+            and self._should_record_as_step()
+            and torch.get_device_module().is_available()
+        ):
             torch.get_device_module().synchronize()
         execution_time_s = time.perf_counter() - self.start_time
 
