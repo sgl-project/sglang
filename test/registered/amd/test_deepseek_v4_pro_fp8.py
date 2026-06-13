@@ -46,7 +46,7 @@ COMMON_ENV_VARS = {
     "SGLANG_USE_ROCM700A": "1",
     "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
     "SGLANG_OPT_USE_FUSED_COMPRESS_TRITON": "true",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "triton",
+    "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
     "SGLANG_OPT_FP8_WO_A_GEMM": "false",
     "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
     "SGLANG_OPT_USE_TOPK_V2": "false",
@@ -133,6 +133,10 @@ class TestDeepseekV4ProFp8(CustomTestCase):
             )
             self.assertGreater(metrics["accuracy"], 0.91)
 
+    @unittest.skipIf(
+        os.environ.get("SGLANG_DSV4_ACCURACY_ONLY") == "1",
+        "SGLANG_DSV4_ACCURACY_ONLY=1: accuracy-only run (skipping perf)",
+    )
     def test_b_perf_8k_1k(self):
         json_output = "/tmp/deepseek_v4_pro_fp8_perf.json"
         if os.path.exists(json_output):

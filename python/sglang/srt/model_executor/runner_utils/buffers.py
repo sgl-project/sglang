@@ -68,7 +68,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: torch.Tensor
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
-    ngram_embedding_info: Optional["NgramEmbeddingInfo"]
+    ngram_embedding_info: Optional[NgramEmbeddingInfo]
     rids_int: Optional[torch.Tensor]
     bootstrap_room_ids_int: Optional[torch.Tensor]
 
@@ -94,7 +94,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
         hc_hidden_size: Optional[int] = None,
-    ) -> "DecodeInputBuffers":
+    ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
@@ -350,7 +350,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
-    ) -> "PrefillInputBuffers":
+    ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_tokens,), dtype=cache_loc_dtype)

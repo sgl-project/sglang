@@ -117,7 +117,7 @@ class _StageExecutor:
         debug_name: str,
         stages: List[Stage],
         inputs: dict,
-        child_ctx: Optional["ForwardContext"] = None,
+        child_ctx: Optional[ForwardContext] = None,
     ):
         self._debug_name = debug_name
         self._stages = stages

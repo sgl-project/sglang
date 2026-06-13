@@ -1,8 +1,7 @@
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
-
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -62,6 +61,15 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
 
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
+
+    # Removal notice for the retired env var; raw os.getenv on purpose -- the
+    # Envs descriptor is gone. Drop this check after one release.
+    if os.getenv("SGLANG_ENABLE_SPEC_V2") is not None:
+        logger.warning(
+            "SGLANG_ENABLE_SPEC_V2 has been removed: speculative decoding "
+            "always runs the V2 worker. Use --disable-overlap-schedule to "
+            "select the non-overlap (synchronous) path."
+        )
 
     kwargs = {}
 
@@ -230,14 +238,6 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    # SGLANG_ENABLE_SPEC_V2=False selects the non-overlap (synchronous) spec v2
-    # path instead of the overlap-scheduled one; both run the V2 worker.
-    if (
-        not envs.SGLANG_ENABLE_SPEC_V2.get()
-        and not server_args.disable_overlap_schedule
-    ):
-        server_args.disable_overlap_schedule = True
-
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
         logger.warning(
@@ -251,14 +251,6 @@ def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
-
-    # SGLANG_ENABLE_SPEC_V2=False selects the non-overlap (synchronous) spec v2
-    # path instead of the overlap-scheduled one; both run the V2 worker.
-    if (
-        not envs.SGLANG_ENABLE_SPEC_V2.get()
-        and not server_args.disable_overlap_schedule
-    ):
-        server_args.disable_overlap_schedule = True
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -283,14 +275,6 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
-
-    # SGLANG_ENABLE_SPEC_V2=False selects the non-overlap (synchronous) spec v2
-    # path instead of the overlap-scheduled one; both run the V2 worker.
-    if (
-        not envs.SGLANG_ENABLE_SPEC_V2.get()
-        and not server_args.disable_overlap_schedule
-    ):
-        server_args.disable_overlap_schedule = True
 
     if server_args.disable_overlap_schedule:
         logger.warning(
