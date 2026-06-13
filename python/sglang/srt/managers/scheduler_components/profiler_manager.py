@@ -20,8 +20,9 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileR
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import is_mps
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.tensor_bridge import use_mlx
+from sglang.srt.utils.tensor_bridge import is_mlx_available
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
@@ -160,7 +161,7 @@ class SchedulerProfilerManager:
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
         )
 
-        if use_mlx():
+        if is_mps() and is_mlx_available():
             import mlx.core as mx
 
             self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
@@ -317,7 +318,7 @@ class SchedulerProfilerManager:
 
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
 
-        if use_mlx():
+        if is_mps() and is_mlx_available():
             import mlx.core as mx
 
             mx.metal.stop_capture()
