@@ -2794,13 +2794,13 @@ class ServerArgs:
         return False
 
     def _validate_mamba_no_buffer(self, model_arch: str):
-        if self.page_size is not None:
-            assert (
-                self.page_size == 1 or self.page_size is None
-            ), "no_buffer only supports page_size=1."
+        assert self.page_size in (1, None), "no_buffer only supports page_size=1."
         assert (
             self.disable_overlap_schedule
         ), "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
+        assert (
+            self.attention_backend != "trtllm_mha"
+        ), "no_buffer do not support trtllm_mha attention backend."
 
     def _validate_mamba_extra_buffer(self, model_arch: str):
         assert self._support_mamba_cache_extra_buffer(
