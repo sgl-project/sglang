@@ -137,6 +137,7 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         self.sampler_name = sampler_name
         self._ltx2_bcg_runners = {}
+        self._ltx2_bcg_disabled_for_forward = False
 
     @staticmethod
     def _randn_like_with_batch_generators(
@@ -204,6 +205,8 @@ class LTX2DenoisingStage(DenoisingStage):
 
     def _maybe_get_ltx2_bcg_runner(self, current_model, phase: str | None):
         if not self.server_args.enable_breakable_cuda_graph:
+            return None
+        if self._ltx2_bcg_disabled_for_forward:
             return None
         if not isinstance(current_model, torch.nn.Module):
             return None
@@ -1533,13 +1536,20 @@ class LTX2DenoisingStage(DenoisingStage):
         ctx: LTX2DenoisingContext,
         step: DenoisingStepState,
     ):
-        with self._temporary_ltx23_hq_timestep_semantics(
-            step.current_model, ctx.use_ltx23_hq_timestep_semantics
-        ):
-            with set_forward_context(
-                current_timestep=step.step_index, attn_metadata=step.attn_metadata
+        previous_disabled = self._ltx2_bcg_disabled_for_forward
+        self._ltx2_bcg_disabled_for_forward = previous_disabled or (
+            ctx.is_warmup and ctx.is_ltx23_variant
+        )
+        try:
+            with self._temporary_ltx23_hq_timestep_semantics(
+                step.current_model, ctx.use_ltx23_hq_timestep_semantics
             ):
-                yield
+                with set_forward_context(
+                    current_timestep=step.step_index, attn_metadata=step.attn_metadata
+                ):
+                    yield
+        finally:
+            self._ltx2_bcg_disabled_for_forward = previous_disabled
 
     def _prepare_denoising_loop(
         self,
