@@ -4,11 +4,12 @@ import logging
 import re
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import (
     BaseFormatDetector,
+    StructuralTag,
     get_model_structural_tag,
 )
 from sglang.srt.function_call.core_types import (
@@ -23,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def _glm47_native_structural_tag_available() -> bool:
+    # "glm_4_7" is only registered in newer xgrammar, so the import can succeed
+    # while the model name stays unknown. Probe once and fall back if absent.
     if get_model_structural_tag is None:
         return False
     try:
@@ -800,10 +803,17 @@ class Glm47MoeDetector(BaseFormatDetector):
     def supports_structural_tag(self) -> bool:
         return _glm47_native_structural_tag_available()
 
-    def get_structural_tag(self, *args: Any, **kwargs: Any) -> Optional[Any]:
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+    ) -> Optional[StructuralTag]:
         if not self.supports_structural_tag():
             return None
-        return super().get_structural_tag(*args, **kwargs)
+        return super().get_structural_tag(
+            tools=tools, tool_choice=tool_choice, thinking_mode=thinking_mode
+        )
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
