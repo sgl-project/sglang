@@ -571,7 +571,7 @@ class Scheduler(
             from sglang.srt.hardware_backend.npu.utils import init_zbal
 
             if self.ps.pp_size > 1:
-                logger.error(f"only zbal mix mode support pp_size > 1!")
+                logger.error("only zbal mix mode support pp_size > 1!")
             init_zbal(
                 self.ps.tp_size, self.ps.gpu_id, self.ps.tp_rank
             )  # only switch allocator if is mix mode
@@ -1911,12 +1911,24 @@ class Scheduler(
         if radix_native_session:
             sp = recv_req.session_params
             if sp.rid or sp.offset or sp.replace or sp.drop_previous_output:
-                logger.warning(
-                    "Radix-native session %s ignores session_params "
-                    "rid/offset/replace/drop_previous_output; send full context "
-                    "each turn.",
-                    session_id,
+                error_msg = (
+                    "Invalid request: radix-native sessions do not support "
+                    "session_params rid/offset/replace/drop_previous_output; "
+                    "send full context each turn."
                 )
+                req = Req(
+                    recv_req.rid,
+                    recv_req.input_text,
+                    recv_req.input_ids,
+                    recv_req.sampling_params,
+                    vocab_size=self.model_config.vocab_size,
+                    http_worker_ipc=recv_req.http_worker_ipc,
+                )
+                req.tokenizer = self.tokenizer
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
 
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
@@ -3825,8 +3837,9 @@ class Scheduler(
 
     def open_session(self, recv_req: OpenSessionReqInput):
         if self.server_args.enable_session_radix_cache:
-            # Radix-native: open is implicit (per-req tag); accept + no-op.
+            # Radix-native: open is implicit; explicit open only permits id reuse.
             session_id = recv_req.session_id
+            self.tree_cache.register_session(session_id)
             output = OpenSessionReqOutput(session_id, session_id is not None)
         else:
             output = self.session_controller.open(recv_req)

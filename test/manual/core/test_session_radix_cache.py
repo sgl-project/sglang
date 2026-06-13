@@ -66,6 +66,26 @@ class TestSessionRadixCache(unittest.TestCase):
             MatchPrefixParams(key=RadixKey(array("q", toks)))
         ).last_device_node
 
+    def test_tag_with_known_node_skips_match_prefix(self):
+        self._insert([1, 2, 3, 4])
+        leaf = self._leaf([1, 2, 3, 4])
+        orig_match_prefix = self.cache.match_prefix
+
+        def fail_match_prefix(_params):
+            raise AssertionError("match_prefix should not run when node is supplied")
+
+        self.cache.match_prefix = fail_match_prefix
+        try:
+            self.cache._tag_session_leaf(
+                SimpleNamespace(session_id="S"),
+                RadixKey(array("q", [1, 2, 3, 4])),
+                node=leaf,
+            )
+        finally:
+            self.cache.match_prefix = orig_match_prefix
+        self.assertEqual(leaf.session_ids, {"S"})
+        self.assertIn(leaf, self.cache._session_leaves["S"])
+
     def test_shared_prefix_frees_only_unique_tail(self):
         # A/B share prefix [1,2]; close(A) frees only A's tail, B + shared stay.
         self._insert([1, 2, 3, 4])
@@ -98,7 +118,21 @@ class TestSessionRadixCache(unittest.TestCase):
         self.assertIn(leaf, self.cache.evictable_leaves)
         self.cache.evict(EvictParams(num_tokens=4))  # LRU reclaims it while open
         self.assertEqual(self._cached([1, 2, 3, 4]), 0)
+        self.assertNotIn("S", self.cache._session_leaves)
         self.assertEqual(self.cache.release_session("S"), 0)  # late close is a no-op
+
+    def test_close_tombstone_blocks_late_finish_until_reopen(self):
+        self._insert([1, 2, 3, 4])
+        self._tag([1, 2, 3, 4], "S")
+        self.assertEqual(self.cache.release_session("S"), 1)
+
+        self._insert([5, 6, 7, 8])
+        self._tag([5, 6, 7, 8], "S")  # simulates a finish racing after close
+        self.assertIsNone(self._leaf([5, 6, 7, 8]).session_ids)
+
+        self.cache.register_session("S")
+        self._tag([5, 6, 7, 8], "S")
+        self.assertEqual(self._leaf([5, 6, 7, 8]).session_ids, {"S"})
 
 
 if __name__ == "__main__":
