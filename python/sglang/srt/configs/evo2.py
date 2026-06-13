@@ -322,10 +322,11 @@ def patch_evo2_config_json(model: str) -> None:
 
     original configs can be found here:
     https://github.com/ArcInstitute/evo2/tree/main/evo2/configs
-    
+
     """
     import json
     import os
+
     import yaml
 
     cfg_path = os.path.join(model, "config.json")
