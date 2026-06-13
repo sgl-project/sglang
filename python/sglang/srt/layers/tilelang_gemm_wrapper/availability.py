@@ -13,7 +13,7 @@ from packaging.version import Version
 
 from sglang.srt.utils import get_device_sm, is_cuda
 
-TILELANG_MIN_VERSION = "0.1.9"
+TILELANG_MIN_VERSION = "0.1.11"
 SUPPORTED_SMS = (89, 90)
 
 
@@ -32,8 +32,9 @@ def get_availability_error() -> Optional[str]:
         tilelang = importlib.import_module("tilelang")
     except Exception as err:
         return (
-            "TileLang FP8 GEMM requires tilelang>=0.1.9. "
-            "Install it with `pip install 'tilelang>=0.1.9'` or `pip install sglang[tilelang]`. "
+            f"TileLang FP8 GEMM requires tilelang>={TILELANG_MIN_VERSION}. "
+            f"Install it with `pip install 'tilelang>={TILELANG_MIN_VERSION}'` "
+            "or `pip install sglang[tilelang]`. "
             "If TileLang cannot create its cache under your home directory, set "
             "`TILELANG_CACHE_DIR` to a writable path."
             f" Original error: {err}"
@@ -41,11 +42,14 @@ def get_availability_error() -> Optional[str]:
 
     version = getattr(tilelang, "__version__", None)
     if version is None:
-        return "TileLang FP8 GEMM requires tilelang>=0.1.9, but the installed version is unknown."
+        return (
+            f"TileLang FP8 GEMM requires tilelang>={TILELANG_MIN_VERSION}, "
+            "but the installed version is unknown."
+        )
 
     if Version(version) < Version(TILELANG_MIN_VERSION):
         return (
-            "TileLang FP8 GEMM requires tilelang>=0.1.9; "
+            f"TileLang FP8 GEMM requires tilelang>={TILELANG_MIN_VERSION}; "
             f"detected tilelang=={version}."
         )
 

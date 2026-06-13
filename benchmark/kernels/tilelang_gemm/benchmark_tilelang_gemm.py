@@ -38,6 +38,10 @@ def _tflops(M: int, N: int, K: int, latency_ms: float) -> float:
 def _do_bench(fn, rep: int, backend: str) -> float:
     quantiles = [0.5, 0.2, 0.8]
     if backend == "cudagraph":
+        # Triton's CUDA graph benchmark captures/replays on a side stream.
+        # Make sure any input preparation or warmup launch on the current stream
+        # has completed before the side stream starts reading/writing tensors.
+        torch.cuda.synchronize()
         result = triton.testing.do_bench_cudagraph(fn, rep=rep, quantiles=quantiles)
     elif backend == "event":
         result = triton.testing.do_bench(fn, rep=rep, quantiles=quantiles)
@@ -176,6 +180,7 @@ def _benchmark_one(
         "deepgemm_allclose": "",
         "deepgemm_max_diff": float("nan"),
     }
+    C_deepgemm: torch.Tensor | None = None
 
     if compare_deepgemm:
         from sglang.srt.layers import deep_gemm_wrapper
@@ -192,16 +197,11 @@ def _benchmark_one(
             )
 
         deepgemm_ms = _do_bench(deepgemm_run, rep=rep, backend=bench_backend)
-        deepgemm_max_diff = (C_tl - C_deepgemm).abs().max().item()
         result.update(
             {
                 "deepgemm_ms": deepgemm_ms,
                 "deepgemm_tflops": _tflops(M, N, K, deepgemm_ms),
                 "tilelang_deepgemm_speedup": deepgemm_ms / tl_ms,
-                "deepgemm_allclose": torch.allclose(
-                    C_tl, C_deepgemm, rtol=1e-2, atol=1e-2
-                ),
-                "deepgemm_max_diff": deepgemm_max_diff,
             }
         )
 
@@ -221,6 +221,11 @@ def _benchmark_one(
 
     baseline_ms = _do_bench(triton_run, rep=rep, backend=bench_backend)
     max_diff = (C_tl - C_ref).abs().max().item()
+    deepgemm_max_diff = (
+        (C_deepgemm - C_ref).abs().max().item()
+        if C_deepgemm is not None
+        else float("nan")
+    )
     result.update(
         {
             "baseline_ms": baseline_ms,
@@ -228,6 +233,12 @@ def _benchmark_one(
             "speedup": baseline_ms / tl_ms,
             "allclose": torch.allclose(C_tl, C_ref, rtol=1e-2, atol=1e-2),
             "max_diff": max_diff,
+            "deepgemm_allclose": (
+                torch.allclose(C_deepgemm, C_ref, rtol=1e-2, atol=1e-2)
+                if C_deepgemm is not None
+                else ""
+            ),
+            "deepgemm_max_diff": deepgemm_max_diff,
         }
     )
     return result
@@ -464,7 +475,8 @@ def main() -> None:
         action="store_true",
         help=(
             "Also benchmark DeepGEMM on each shape and compare its output with "
-            "TileLang. This requires the deep_gemm package and a supported GPU."
+            "the Triton baseline. This requires the deep_gemm package and a "
+            "supported GPU."
         ),
     )
     parser.add_argument(
