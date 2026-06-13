@@ -47,7 +47,9 @@ class TorchNativeAttnBackend(AttentionBackend):
         k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
         return (k_pos <= q_pos) & (k_pos >= q_pos - sliding_window_size)
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
         """Init the metadata for a forward pass."""
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             self.swa_out_cache_loc = (
