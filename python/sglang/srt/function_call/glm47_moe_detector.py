@@ -3,10 +3,14 @@ import json
 import logging
 import re
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.base_format_detector import (
+    BaseFormatDetector,
+    get_model_structural_tag,
+)
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -15,6 +19,19 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import infer_type_from_json_schema
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _glm47_native_structural_tag_available() -> bool:
+    if get_model_structural_tag is None:
+        return False
+    try:
+        get_model_structural_tag(
+            model="glm_4_7", tools=[], tool_choice="auto", reasoning=False
+        )
+        return True
+    except Exception:
+        return False
 
 
 class StreamState(str, Enum):
@@ -781,7 +798,12 @@ class Glm47MoeDetector(BaseFormatDetector):
         return arguments
 
     def supports_structural_tag(self) -> bool:
-        return True
+        return _glm47_native_structural_tag_available()
+
+    def get_structural_tag(self, *args: Any, **kwargs: Any) -> Optional[Any]:
+        if not self.supports_structural_tag():
+            return None
+        return super().get_structural_tag(*args, **kwargs)
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError

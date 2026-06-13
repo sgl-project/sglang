@@ -3400,6 +3400,29 @@ class TestGlm47MoeDetector(unittest.TestCase):
             xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
         )
 
+    def test_required_tool_choice_falls_back_when_native_tag_is_unavailable(self):
+        from unittest.mock import patch
+
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.function_call.glm47_moe_detector import (
+            _glm47_native_structural_tag_available,
+        )
+
+        with patch(
+            "sglang.srt.function_call.glm47_moe_detector.get_model_structural_tag",
+            None,
+        ):
+            _glm47_native_structural_tag_available.cache_clear()
+            self.assertFalse(self.detector.supports_structural_tag())
+            self.assertIsNone(self.detector.get_structural_tag(self.tools))
+
+            parser = FunctionCallParser(self.tools, "glm47_moe")
+            constraint = parser.get_structure_constraint("required")
+
+            self.assertIsNotNone(constraint)
+            self.assertEqual("json_schema", constraint[0])
+            _glm47_native_structural_tag_available.cache_clear()
+
 
 class TestJsonArrayParser(unittest.TestCase):
     def setUp(self):
