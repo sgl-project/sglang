@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextvars
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Generator, cast
 
 import torch
 from torch.nn import Module
@@ -41,6 +43,46 @@ from sglang.srt.utils.common import (
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = __import__("logging").getLogger(__name__)
+
+_deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "flashinfer_trtllm_deferred_finalize_enabled", default=False
+)
+
+
+@dataclass
+class FlashInferTrtllmDeferredFinalizeOutput:
+    gemm2_out: torch.Tensor
+    expert_weights: torch.Tensor
+    expanded_idx_to_permuted_idx: torch.Tensor
+    top_k: int
+
+
+@contextmanager
+def flashinfer_trtllm_deferred_finalize_context(
+    enabled: bool = True,
+) -> Generator[None, None, None]:
+    token = _deferred_finalize_enabled.set(enabled)
+    try:
+        yield
+    finally:
+        _deferred_finalize_enabled.reset(token)
+
+
+def finalize_flashinfer_trtllm_deferred_output(
+    deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
+    shared_output: torch.Tensor,
+) -> torch.Tensor:
+    from sglang.jit_kernel.moe_finalize_fuse_shared import moe_finalize_fuse_shared
+    from sglang.jit_kernel.utils import is_arch_support_pdl
+
+    return moe_finalize_fuse_shared(
+        deferred_output.gemm2_out,
+        deferred_output.expanded_idx_to_permuted_idx,
+        deferred_output.expert_weights,
+        shared_output,
+        deferred_output.top_k,
+        enable_pdl=is_arch_support_pdl(),
+    )
 
 
 def round_up_to_multiple(x: int, m: int) -> int:
@@ -922,33 +964,44 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     else:
         gemm1_clamp_limit = None
 
-    num_tokens = hs_fp4.shape[0]
-    hidden_size = (
-        hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
-    )
-    _provided = _moe_output_buf.get()
-    _symm_required = is_allocation_symmetric()
-    if (
-        _provided is not None
-        and _provided.shape == (num_tokens, hidden_size)
-        and _provided.dtype == hidden_states.dtype
-        and _provided.device == hs_fp4.device
-        and (
-            not _symm_required
-            or not is_symmetric_memory_enabled()
-            or is_tensor_in_symmetric_mempool(_provided)
-        )
-    ):
-        symm_output = _provided
-    else:
-        with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
-            symm_output = torch.empty(
-                num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
-            )
-
     # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
     if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
         use_routed_topk = True
+
+    defer_finalize = (
+        _deferred_finalize_enabled.get()
+        and not use_routed_topk
+        and TopKOutputChecker.format_is_bypassed(topk_output)
+    )
+
+    symm_output = None
+    if not defer_finalize:
+        num_tokens = hs_fp4.shape[0]
+        hidden_size = (
+            hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
+        )
+        _provided = _moe_output_buf.get()
+        _symm_required = is_allocation_symmetric()
+        if (
+            _provided is not None
+            and _provided.shape == (num_tokens, hidden_size)
+            and _provided.dtype == hidden_states.dtype
+            and _provided.device == hs_fp4.device
+            and (
+                not _symm_required
+                or not is_symmetric_memory_enabled()
+                or is_tensor_in_symmetric_mempool(_provided)
+            )
+        ):
+            symm_output = _provided
+        else:
+            with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
+                symm_output = torch.empty(
+                    hs_fp4.shape[0],
+                    hidden_size,
+                    dtype=hidden_states.dtype,
+                    device=hs_fp4.device,
+                )
 
     if use_routed_topk:
         assert TopKOutputChecker.format_is_standard(topk_output)
@@ -1000,7 +1053,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             if topk_config.correction_bias is None
             else topk_config.correction_bias.to(hidden_states.dtype)
         )
-        result = trtllm_fp4_block_scale_moe(
+        moe_kwargs = dict(
             routing_logits=router_logits,
             routing_bias=correction_bias,
             hidden_states=hs_fp4,
@@ -1031,11 +1084,31 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 if routing_method_type is not None
                 else RoutingMethodType.Default
             ),
-            do_finalize=True,
+            do_finalize=not defer_finalize,
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
-            output=symm_output,
-        )[0]
+        )
+        if not defer_finalize:
+            moe_kwargs["output"] = symm_output
+
+        result = trtllm_fp4_block_scale_moe(**moe_kwargs)
+        if defer_finalize:
+            gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
+            # FIXME(kpham-sgl): flashinfer sizes this buffer from routing_logits
+            # dtype (fp32 in DSv3 decode) but always writes bf16 weights into it.
+            # Reinterpret the live bf16 prefix. Fix upstream alloc to drop this,
+            # tracking in https://github.com/flashinfer-ai/flashinfer/issues/3595
+            if expert_weights.dtype == torch.float32:
+                n, k = expert_weights.shape
+                expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
+            result = FlashInferTrtllmDeferredFinalizeOutput(
+                gemm2_out=gemm2_out,
+                expert_weights=expert_weights,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                top_k=topk_config.top_k,
+            )
+        else:
+            result = result[0]
 
     return StandardCombineInput(hidden_states=result)
 
