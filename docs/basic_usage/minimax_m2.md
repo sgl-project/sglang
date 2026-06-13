@@ -83,3 +83,53 @@ curl http://localhost:8000/v1/chat/completions \
         ]
     }'
 ```
+
+## Using MiniMax API with SGLang Frontend
+
+In addition to self-hosted deployment, you can use MiniMax models through the [MiniMax API](https://platform.minimax.io/) with SGLang's frontend language via the built-in `MiniMax` backend.
+
+### Setup
+
+Set the `MINIMAX_API_KEY` environment variable:
+
+```bash
+export MINIMAX_API_KEY="your-api-key"
+```
+
+### Usage
+
+```python
+import sglang as sgl
+
+backend = sgl.MiniMax("MiniMax-M3")
+sgl.set_default_backend(backend)
+
+@sgl.function
+def chat(s, question):
+    s += sgl.user(question)
+    s += sgl.assistant(sgl.gen("answer"))
+
+state = chat.run(question="What is MiniMax?")
+print(state["answer"])
+```
+
+### Available Models
+
+| Model | Description |
+|-------|-------------|
+| `MiniMax-M3` | Default. Latest generation, 512K context window, up to 128K max output, image input support. |
+| `MiniMax-M2.7` | Previous generation, strong agentic and coding performance. |
+| `MiniMax-M2.7-highspeed` | Same as M2.7, faster and lower latency. |
+
+### Configuration
+
+```python
+# Custom base URL (e.g., for users in mainland China)
+backend = sgl.MiniMax(
+    "MiniMax-M3",
+    api_key="your-api-key",
+    base_url="https://api.minimaxi.com/v1",
+)
+```
+
+For more details on the MiniMax API, see the [MiniMax Platform Documentation](https://platform.minimax.io/docs/api-reference/text-openai-api).

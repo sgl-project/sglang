@@ -71,6 +71,7 @@ from sglang.version import __version__
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
 Crusoe = LazyImport("sglang.lang.backend.crusoe", "Crusoe")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
+MiniMax = LazyImport("sglang.lang.backend.minimax", "MiniMax")
 OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
 VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
 
@@ -109,6 +110,7 @@ __all__ = [
     "Anthropic",
     "Crusoe",
     "LiteLLM",
+    "MiniMax",
     "OpenAI",
     "VertexAI",
     "global_config",
