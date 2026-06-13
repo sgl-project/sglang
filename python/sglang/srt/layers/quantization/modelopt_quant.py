@@ -2412,13 +2412,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         device=x.device,
                     )
 
-            # Forward parameterized-SwiGLU values (GPT-OSS-style clamped swiglu,
-            # e.g. alpha=1.702, limit=7.0) to the kernel; otherwise it computes
-            # vanilla SwiGLU and such models generate garbage. swiglu_beta=1.0
-            # (the +1 shift on the linear branch) follows the mxfp4 path.
+            # Forward parameterized-SwiGLU values to the kernel; otherwise it
+            # computes vanilla SwiGLU and such models generate garbage. Two
+            # families need this:
+            #   - GPT-OSS-style clamped swiglu (gemm1_alpha + gemm1_clamp_limit,
+            #     e.g. alpha=1.702, limit=7.0): the linear branch is shifted by
+            #     +1, so swiglu_beta=1.0 (matches the mxfp4 path).
+            #   - clamp-limit-only swiglu (gemm1_clamp_limit, no gemm1_alpha,
+            #     e.g. step3p5): plain SiLU gate with a clamp, no +1 shift, so
+            #     swiglu_beta=0.0.
             swiglu_kwargs = {}
             _gemm1_alpha = moe_runner_config.gemm1_alpha
             _gemm1_limit = moe_runner_config.gemm1_clamp_limit
+            if _gemm1_alpha is not None and _gemm1_limit is None:
+                raise ValueError("gemm1_alpha requires gemm1_clamp_limit")
             if _gemm1_alpha is not None or _gemm1_limit is not None:
                 _num_local_experts = layer.w13_weight.shape[0]
                 swiglu_kwargs["swiglu_alpha"] = torch.full(
@@ -2429,7 +2436,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 swiglu_kwargs["swiglu_beta"] = torch.full(
                     (_num_local_experts,),
-                    1.0,
+                    1.0 if _gemm1_alpha is not None else 0.0,
                     dtype=torch.float32,
                     device=x.device,
                 )
