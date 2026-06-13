@@ -12,6 +12,10 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
         triton.Config({"BLOCK_HEADS": 4, "BLOCK_HS_HALF": 32}, num_warps=4),
         triton.Config({"BLOCK_HEADS": 4, "BLOCK_HS_HALF": 64}, num_warps=4),
         triton.Config({"BLOCK_HEADS": 8, "BLOCK_HS_HALF": 64}, num_warps=8),
+        # more heads per block -> more cos/sin reuse within a program
+        triton.Config({"BLOCK_HEADS": 8, "BLOCK_HS_HALF": 32}, num_warps=4),
+        triton.Config({"BLOCK_HEADS": 16, "BLOCK_HS_HALF": 64}, num_warps=8),
+        triton.Config({"BLOCK_HEADS": 16, "BLOCK_HS_HALF": 32}, num_warps=8),
     ],
     key=["num_heads", "head_size"],
 )
@@ -51,16 +55,32 @@ def _rotary_embedding_kernel(
     for block_start in range(0, head_size_half, BLOCK_HS_HALF):
         offsets_half = block_start + tl.arange(0, BLOCK_HS_HALF)
         half_mask = offsets_half < head_size_half
-        mask = head_mask[:, None] & half_mask[None, :]
 
-        cos_vals = tl.load(cos_row_ptr + offsets_half, mask=half_mask, other=0.0)
-        sin_vals = tl.load(sin_row_ptr + offsets_half, mask=half_mask, other=0.0)
+        # cos/sin depend only on the token, so they are reused by every
+        # head-block of this token: keep them hot in L2 (evict_last).
+        cos_vals = tl.load(
+            cos_row_ptr + offsets_half, mask=half_mask, other=0.0,
+            eviction_policy="evict_last",
+        )
+        sin_vals = tl.load(
+            sin_row_ptr + offsets_half, mask=half_mask, other=0.0,
+            eviction_policy="evict_last",
+        )
 
-        offsets_x1 = 2 * offsets_half
-        offsets_x2 = 2 * offsets_half + 1
-
-        x1_vals = tl.load(x_row_ptrs + offsets_x1[None, :], mask=mask, other=0.0)
-        x2_vals = tl.load(x_row_ptrs + offsets_x2[None, :], mask=mask, other=0.0)
+        # Load the interleaved (x1,x2) pairs as ONE contiguous run per head and
+        # deinterleave in registers, instead of two stride-2 gathers (which only
+        # use half of each cache line). pair col c maps to half index c // 2.
+        pair = tl.arange(0, 2 * BLOCK_HS_HALF)
+        pair_half = block_start + pair // 2
+        pair_mask = head_mask[:, None] & (pair_half < head_size_half)[None, :]
+        x_pairs = tl.load(
+            x_row_ptrs + (2 * block_start + pair)[None, :],
+            mask=pair_mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+        x_pairs = x_pairs.reshape(BLOCK_HEADS, BLOCK_HS_HALF, 2)
+        x1_vals, x2_vals = tl.split(x_pairs)  # even, odd -> [BLOCK_HEADS, BLOCK_HS_HALF]
 
         x1_fp32 = x1_vals.to(tl.float32)
         x2_fp32 = x2_vals.to(tl.float32)
@@ -69,15 +89,13 @@ def _rotary_embedding_kernel(
         o1_vals = tl.fma(-x2_fp32, sin_fp32, x1_fp32 * cos_fp32)
         o2_vals = tl.fma(x1_fp32, sin_fp32, x2_fp32 * cos_fp32)
 
+        # Re-interleave and store as one contiguous run per head.
+        o = tl.interleave(o1_vals.to(x_pairs.dtype), o2_vals.to(x_pairs.dtype))
         tl.store(
-            output_row_ptrs + offsets_x1[None, :],
-            o1_vals.to(x1_vals.dtype),
-            mask=mask,
-        )
-        tl.store(
-            output_row_ptrs + offsets_x2[None, :],
-            o2_vals.to(x2_vals.dtype),
-            mask=mask,
+            output_row_ptrs + (2 * block_start + pair)[None, :],
+            o,
+            mask=pair_mask,
+            eviction_policy="evict_first",
         )
 
 
