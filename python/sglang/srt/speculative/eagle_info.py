@@ -9,7 +9,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info_v2 import (
-    EagleDraftExtendInputV2Mixin,
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
 )
@@ -273,7 +272,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
 
 @dataclass
-class EagleDraftExtendInput(SpecInput, EagleDraftExtendInputV2Mixin):
+class EagleDraftExtendInput(SpecInput):
     """Inputs to the draft-extend forward (the fill-draft-kvcache pass after
     target prefill / verify).
 
