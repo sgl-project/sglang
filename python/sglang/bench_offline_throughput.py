@@ -29,6 +29,7 @@ from sglang.benchmark.utils import get_tokenizer, set_ulimit
 from sglang.lang.backend.runtime_endpoint import Runtime
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 
 @dataclasses.dataclass
@@ -237,11 +238,20 @@ def throughput_test_once(
     ]
 
     if profile:
-        assert (
-            "SGLANG_TORCH_PROFILER_DIR" in os.environ
-        ), "Please set SGLANG_TORCH_PROFILER_DIR."
-        os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
-        backend.start_profile()
+        if use_mlx():
+            import mlx.core as mx
+
+            profiler_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+            os.makedirs(profiler_dir, exist_ok=True)
+            mlx_trace_filename = os.path.join(profiler_dir, "bench_offline.gputrace")
+            mx.metal.start_capture(mlx_trace_filename)
+            print(f"MLX Metal capture started, saving to {mlx_trace_filename}")
+        else:
+            assert (
+                "SGLANG_TORCH_PROFILER_DIR" in os.environ
+            ), "Please set SGLANG_TORCH_PROFILER_DIR."
+            os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
+            backend.start_profile()
 
     st = time.perf_counter()
     gen_out = backend.generate(
@@ -253,10 +263,16 @@ def throughput_test_once(
     latency = time.perf_counter() - st
 
     if profile:
-        dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
-        known_files = set(os.listdir(dir))
-        backend.stop_profile()
-        monitor_trace_file(known_files, dir)
+        if use_mlx():
+            import mlx.core as mx
+
+            mx.metal.stop_capture()
+            print(f"MLX Metal gputrace saved to {mlx_trace_filename}")
+        else:
+            dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+            known_files = set(os.listdir(dir))
+            backend.stop_profile()
+            monitor_trace_file(known_files, dir)
 
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)

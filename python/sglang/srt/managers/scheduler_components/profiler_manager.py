@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
+from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
@@ -242,6 +243,17 @@ class SchedulerProfilerManager:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
+        if use_mlx():
+            import mlx.core as mx
+
+            self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
+            mlx_trace_filename = str(
+                self.torch_profiler_output_dir / f"{self.profile_id}.gputrace"
+            )
+            mx.metal.start_capture(mlx_trace_filename)
+            logger.info(f"MLX Metal capture started, saving to {mlx_trace_filename}")
+            self.profile_in_progress = True
+
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _merge_profile_traces(self) -> str:
@@ -350,6 +362,15 @@ class SchedulerProfilerManager:
         if "CUDA_PROFILER" in self.profiler_activities:
             if self.ps.gpu_id == get_global_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
+
+        if use_mlx():
+            import mlx.core as mx
+
+            mx.metal.stop_capture()
+            logger.info(
+                "MLX Metal capture stopped. Trace saved to: %s",
+                self.torch_profiler_output_dir,
+            )
 
         merge_message = self._merge_profile_traces()
 
