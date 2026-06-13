@@ -7,7 +7,6 @@ import unittest
 from unittest import mock
 
 import torch
-from fastapi import HTTPException
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     _build_cosmos3_param_names_mapping,
@@ -24,7 +23,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
-    _reject_unsupported_cosmos3_modes,
+    _cosmos3_sampling_param_kwargs,
+    _resolve_sound_duration,
+    _resolve_video_path,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
@@ -261,9 +262,9 @@ class TestCosmos3ModelResolution(unittest.TestCase):
 
 
 class TestCosmos3OpenAIProtocol(unittest.TestCase):
-    """Verify Cosmos3-only knobs stay out of the stable request schema."""
+    """Verify Cosmos3 modality knobs are exposed by the video HTTP schema."""
 
-    def test_cosmos3_private_fields_are_extra_fields(self):
+    def test_cosmos3_template_fields_remain_extra_fields(self):
         for request_cls in (ImageGenerationsRequest, VideoGenerationsRequest):
             with self.subTest(request_cls=request_cls.__name__):
                 self.assertIn("max_sequence_length", request_cls.model_fields)
@@ -273,22 +274,62 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
                 self.assertNotIn("use_system_prompt", request_cls.model_fields)
                 self.assertNotIn("use_guardrails", request_cls.model_fields)
 
-        self.assertNotIn("generate_sound", VideoGenerationsRequest.model_fields)
-        self.assertNotIn("sound_duration", VideoGenerationsRequest.model_fields)
+    def test_cosmos3_modal_fields_are_video_request_fields(self):
+        for field_name in (
+            "video_path",
+            "video_url",
+            "generate_sound",
+            "sound_duration",
+            "condition_frame_indexes",
+            "condition_frame_indexes_vision",
+            "condition_video_keep",
+            "action_mode",
+            "domain_id",
+            "domain_name",
+            "raw_action_dim",
+            "action_fps",
+            "action",
+            "action_view_point",
+            "action_stats_path",
+            "action_normalization",
+        ):
+            with self.subTest(field_name=field_name):
+                self.assertIn(field_name, VideoGenerationsRequest.model_fields)
 
-    def test_unsupported_cosmos3_modes_allow_falsy_extra_fields(self):
+    def test_cosmos3_http_aliases_map_to_sampling_params(self):
         req = VideoGenerationsRequest(
             prompt="test",
-            generate_sound=False,
-            action_mode="",
-            condition_frame_indexes_vision=[],
-            condition_video_keep={},
+            video_url="https://example.com/input.mp4",
+            generate_sound=True,
+            condition_frame_indexes_vision=[0, 2],
+            condition_video_keep="last",
+            action_mode="policy",
+            domain_name="umi",
+            raw_action_dim=9,
+            action_fps=30.0,
+            action_view_point="ego_view",
         )
-        _reject_unsupported_cosmos3_modes(req, "nvidia/Cosmos3-Nano")
 
-        req = VideoGenerationsRequest(prompt="test", generate_sound=True)
-        with self.assertRaises(HTTPException):
-            _reject_unsupported_cosmos3_modes(req, "nvidia/Cosmos3-Nano")
+        self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
+
+        kwargs = _cosmos3_sampling_param_kwargs(req, num_frames=48, fps=24)
+        self.assertEqual(kwargs["sound_duration"], 2.0)
+        self.assertEqual(kwargs["condition_frame_indexes"], [0, 2])
+        self.assertEqual(kwargs["condition_video_keep"], "last")
+        self.assertEqual(kwargs["action_mode"], "policy")
+        self.assertEqual(kwargs["domain_name"], "umi")
+        self.assertEqual(kwargs["raw_action_dim"], 9)
+        self.assertEqual(kwargs["action_fps"], 30.0)
+        self.assertEqual(kwargs["action_view_point"], "ego_view")
+
+    def test_generate_sound_false_disables_sound_duration(self):
+        req = VideoGenerationsRequest(
+            prompt="test", generate_sound=False, sound_duration=3.0
+        )
+        self.assertEqual(
+            _resolve_sound_duration(req, num_frames=48, fps=24),
+            0.0,
+        )
 
 
 class TestCosmos3Guardrails(unittest.TestCase):
