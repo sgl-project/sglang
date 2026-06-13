@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage import (
 from sglang.multimodal_gen.runtime.models.vaes.hunyuanvae import (
     HunyuanVideoDecoder3D,
     HunyuanVideoMidBlock3D,
+    HunyuanVideoResnetBlockCausal3D,
     _enable_hunyuan_decoder_spatial_parallel,
 )
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
@@ -105,14 +106,26 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
     def test_auto_parallel_decode_policy_is_conservative(self):
         self.assertFalse(is_spatial_shard_parallel_decode_mode("auto"))
         self.assertFalse(should_use_spatial_shard_parallel_decode(VAEConfig()))
-        self.assertFalse(
-            should_use_spatial_shard_parallel_decode(QwenImageVAEConfig())
-        )
+        self.assertTrue(should_use_spatial_shard_parallel_decode(QwenImageVAEConfig()))
+        self.assertTrue(should_use_spatial_shard_parallel_decode(LTXVideoVAEConfig()))
         self.assertTrue(should_use_spatial_shard_parallel_decode(WanVAEConfig()))
 
         config = QwenImageVAEConfig()
         config.parallel_decode_mode = "spatial_shard"
         self.assertTrue(should_use_spatial_shard_parallel_decode(config))
+
+        hunyuan_config = HunyuanVAEConfig()
+        self.assertTrue(should_use_spatial_shard_parallel_decode(hunyuan_config))
+        self.assertFalse(
+            should_use_spatial_shard_parallel_decode(
+                hunyuan_config, torch.empty(1, 16, 9, 16, 16), 2
+            )
+        )
+        self.assertTrue(
+            should_use_spatial_shard_parallel_decode(
+                hunyuan_config, torch.empty(1, 16, 9, 96, 96), 2
+            )
+        )
 
     def test_unsupported_vae_configs_opt_out_of_spatial_parallel_decode(self):
         configs = (Hunyuan3DVAEConfig(), LTXAudioVAEConfig())
@@ -201,17 +214,17 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertTrue(is_spatial_shard_parallel_decode_mode("spatial"))
 
     def test_decode_parallel_group_uses_dedicated_group(self):
-        old_decode = parallel_state._DECODE
+        old_decode = parallel_state._VAE_DECODE
         decode_group = SimpleNamespace(world_size=4, rank_in_group=2)
         try:
-            parallel_state._DECODE = decode_group
+            parallel_state._VAE_DECODE = decode_group
             self.assertIs(
                 parallel_state.get_decode_parallel_group_coordinator(), decode_group
             )
             self.assertEqual(parallel_state.get_decode_parallel_world_size(), 4)
             self.assertEqual(parallel_state.get_decode_parallel_rank(), 2)
         finally:
-            parallel_state._DECODE = old_decode
+            parallel_state._VAE_DECODE = old_decode
 
     def test_decode_rank_groups_cover_non_dp_parallel_axes(self):
         rank_generator = RankGenerator(
@@ -440,7 +453,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 in_channels=4,
                 out_channels=3,
                 up_block_types=("HunyuanVideoUpBlock3D", "HunyuanVideoUpBlock3D"),
-                block_out_channels=(4, 4),
+                block_out_channels=(4, 8),
                 layers_per_block=1,
                 norm_num_groups=1,
                 mid_block_add_attention=True,
@@ -458,6 +471,16 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         )
         self.assertTrue(
             any(isinstance(m, SpatialParallelConv3d) for m in decoder.modules())
+        )
+        shortcut_convs = [
+            m.conv_shortcut.conv
+            for m in decoder.modules()
+            if isinstance(m, HunyuanVideoResnetBlockCausal3D)
+            and m.conv_shortcut is not None
+        ]
+        self.assertTrue(shortcut_convs)
+        self.assertTrue(
+            all(not isinstance(conv, SpatialParallelConv3d) for conv in shortcut_convs)
         )
 
 

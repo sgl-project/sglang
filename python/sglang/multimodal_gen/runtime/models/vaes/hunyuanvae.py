@@ -214,6 +214,9 @@ class HunyuanVideoCausalConv3d(nn.Module):
         if isinstance(self.conv, SpatialParallelConv3d):
             self.spatial_parallel = True
             return
+        if self.conv.kernel_size == (1, 1, 1):
+            self.spatial_parallel = True
+            return
         self.conv = _make_spatial_parallel_conv3d(
             self.conv,
             height_pad=self.time_causal_padding[2],

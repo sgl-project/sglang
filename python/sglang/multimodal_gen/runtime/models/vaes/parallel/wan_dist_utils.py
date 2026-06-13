@@ -188,7 +188,7 @@ class WanDistResidualBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.conv2 = WanDistCausalConv3d(out_dim, out_dim, 3, padding=1)
         self.conv_shortcut = (
-            WanDistCausalConv3d(in_dim, out_dim, 1)
+            WanCausalConv3d(in_dim, out_dim, 1)
             if in_dim != out_dim
             else nn.Identity()
         )

@@ -306,8 +306,13 @@ class QwenImageResidualBlock(nn.Module):
         self.norm2 = QwenImageRMS_norm(out_dim, images=False)
         self.dropout = nn.Dropout(dropout)
         self.conv2 = causal_conv3d_cls(out_dim, out_dim, 3, padding=1)
+        shortcut_conv3d_cls = (
+            QwenImageCausalConv3d
+            if causal_conv3d_cls is SpatialParallelCausalConv3d
+            else causal_conv3d_cls
+        )
         self.conv_shortcut = (
-            causal_conv3d_cls(in_dim, out_dim, 1)
+            shortcut_conv3d_cls(in_dim, out_dim, 1)
             if in_dim != out_dim
             else nn.Identity()
         )
