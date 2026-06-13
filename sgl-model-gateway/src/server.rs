@@ -184,8 +184,14 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(mut body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
+    // Restore max_tokens if it was set in the original request but cleared by normalize()
+    // This maintains backward compatibility with clients using the deprecated field
+    #[allow(deprecated)]
+    if body.max_tokens.is_none() && body.max_completion_tokens.is_some() {
+        body.max_tokens = body.max_completion_tokens;
+    }
     state
         .router
         .route_chat(Some(&headers), &body, Some(&body.model))
