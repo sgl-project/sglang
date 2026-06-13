@@ -193,11 +193,11 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && case "$CUDA_VERSION" in \
-        12.9.1) CUINDEX=129 ;; \
+        12.9.2) CUINDEX=129 ;; \
         13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
+    && if [ "$CUDA_VERSION" = "12.9.2" ]; then \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.3" ]; then \
@@ -222,7 +222,7 @@ COPY proto                 /tmp/sglang_deps/proto
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/registry \
     case "$CUDA_VERSION" in \
-        12.9.1) CUINDEX=129 ;; \
+        12.9.2) CUINDEX=129 ;; \
         13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
@@ -302,7 +302,7 @@ RUN set -eux; \
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /build/DeepEP && \
     case "$CUDA_VERSION" in \
-        12.9.1) \
+        12.9.2) \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
             ;; \
         13.0.3) \
@@ -330,7 +330,7 @@ ARG FLASHINFER_VERSION
 # Stage jit-cache artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
-        12.9.1) CUINDEX=129 ;; \
+        12.9.2) CUINDEX=129 ;; \
         13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
