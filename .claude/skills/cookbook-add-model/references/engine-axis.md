@@ -7,6 +7,10 @@ cookbook is data-only and never needs this. The current 7 built-in axes
 (MegaMoE is not its own axis — it lives inside `moe` as a backend option +
 a `megamoeQuant` sub-select.) Only add a new axis if a real cookbook needs it
 and the feature does not fit any existing axis. Touches `_playground.jsx` only.
+One routine trigger: the `cookbook-migrate-model` skill requires every legacy
+control to survive as a dimension or a Playground axis — a legacy feature no
+built-in axis covers (e.g. Nemotron3's "KV Cache DType" radio) lands here
+first, as its own engine PR ahead of the migration PR.
 
 For the per-model config/cells/MDX reference see [authoring-reference.md](authoring-reference.md).
 
