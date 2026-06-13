@@ -533,6 +533,20 @@ def _force_import_submodules(prefix: str) -> None:
     ):
         if mod_name in sys.modules:
             continue
+        # Skip test / benchmark / autotune modules.  These are not kernel
+        # entry points and several of them (e.g. aiter.ops.flydsl.test_*)
+        # call ``torch.set_default_device("cuda")`` at import time, which
+        # leaks a CUDA default-device mode into the importing process and
+        # corrupts CPU tensor creation downstream (e.g. seq_lens_cpu).
+        leaf = mod_name.rsplit(".", 1)[-1]
+        if (
+            "test" in leaf
+            or leaf.startswith("test_")
+            or leaf.startswith("bench_")
+            or leaf.endswith("_test")
+            or leaf.endswith("_tune")
+        ):
+            continue
         try:
             importlib.import_module(mod_name)
         except Exception:
