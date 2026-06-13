@@ -638,7 +638,8 @@ def sglang_per_token_group_quant_fp8_row_padded(
     and scales_a). Allocating the quant outputs with rows already aligned to
     ``row_alignment`` makes the wrapper's pad_tensor() short-circuit (pad_rows
     == 0), removing 2x fill + 2x cat kernels per GEMM. Rows in [m, m_pad) are
-    uninitialized garbage; the caller must slice the GEMM output back to m.
+    zero-filled to match the legacy pad_tensor contract so the padded GEMM is
+    bit-exact; the caller still slices the GEMM output back to m.
     """
     assert x.dim() == 2, "row-padded quant expects a 2D input"
     assert (
@@ -675,6 +676,12 @@ def sglang_per_token_group_quant_fp8_row_padded(
             None,  # masked_m
             enable_v2=True,
         )
+    if m_pad != m:
+        # Tail rows [m, m_pad) feed the cutlass GEMM's padded region; the legacy
+        # pad_tensor path zero-fills them, so zero here to stay bit-identical
+        # (torch.empty would otherwise leave garbage that perturbs the output).
+        x_q[m:].zero_()
+        x_s[m:].zero_()
     return x_q, x_s
 
 
