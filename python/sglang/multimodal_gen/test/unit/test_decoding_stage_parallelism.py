@@ -5,10 +5,10 @@ from unittest.mock import patch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
     LTX2RefinementStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 
 
 class TestDecodingStageParallelism(unittest.TestCase):
