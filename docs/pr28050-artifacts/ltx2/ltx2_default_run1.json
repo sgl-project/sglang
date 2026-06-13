@@ -1,0 +1,271 @@
+{
+  "timestamp": "2026-06-13T03:43:47.244234+00:00",
+  "request_id": "6b35542e-1b0e-4207-9b8c-fa61ed586483",
+  "commit_hash": "696b8b240b871aa98b4ce9c44a2f3bbe557a5055",
+  "tag": "cli_generate",
+  "total_duration_ms": 125253.16334189847,
+  "steps": [
+    {
+      "name": "InputValidationStage",
+      "duration_ms": 0.04982622340321541
+    },
+    {
+      "name": "TextEncodingStage",
+      "duration_ms": 396.95807732641697
+    },
+    {
+      "name": "LTX2TextConnectorStage",
+      "duration_ms": 9.431820828467607
+    },
+    {
+      "name": "LTX2HalveResolutionStage",
+      "duration_ms": 0.0932491384446621
+    },
+    {
+      "name": "LTX2LoRASwitchStage",
+      "duration_ms": 4.687095992267132
+    },
+    {
+      "name": "LTX2SigmaPreparationStage",
+      "duration_ms": 0.31099794432520866
+    },
+    {
+      "name": "TimestepPreparationStage",
+      "duration_ms": 0.6246869452297688
+    },
+    {
+      "name": "LTX2AVLatentPreparationStage",
+      "duration_ms": 1.6144928522408009
+    },
+    {
+      "name": "LTX2ImageEncodingStage",
+      "duration_ms": 0.01864926889538765
+    },
+    {
+      "name": "LTX2AVDenoisingStage",
+      "duration_ms": 123148.86593958363
+    },
+    {
+      "name": "LTX2UpsampleStage",
+      "duration_ms": 5.029688123613596
+    },
+    {
+      "name": "ltx2_lora_switch_stage2",
+      "duration_ms": 6.386148743331432
+    },
+    {
+      "name": "ltx2_image_encoding_stage2",
+      "duration_ms": 0.02191402018070221
+    },
+    {
+      "name": "LTX2RefinementStage",
+      "duration_ms": 739.5411147736013
+    },
+    {
+      "name": "LTX2AVDecodingStage",
+      "duration_ms": 778.1404140405357
+    },
+    {
+      "name": "Scheduler.return_result.spill_arrays",
+      "duration_ms": 0.09087333455681801
+    },
+    {
+      "name": "SchedulerClient.materialize_file_refs",
+      "duration_ms": 0.012860167771577835
+    }
+  ],
+  "denoise_steps_ms": [
+    {
+      "step": 0,
+      "duration_ms": 119157.6805273071
+    },
+    {
+      "step": 1,
+      "duration_ms": 102.17548813670874
+    },
+    {
+      "step": 2,
+      "duration_ms": 147.06072630360723
+    },
+    {
+      "step": 3,
+      "duration_ms": 106.40498902648687
+    },
+    {
+      "step": 4,
+      "duration_ms": 104.9564192071557
+    },
+    {
+      "step": 5,
+      "duration_ms": 102.01331973075867
+    },
+    {
+      "step": 6,
+      "duration_ms": 103.08870812878013
+    },
+    {
+      "step": 7,
+      "duration_ms": 100.01104511320591
+    },
+    {
+      "step": 8,
+      "duration_ms": 100.29667289927602
+    },
+    {
+      "step": 9,
+      "duration_ms": 101.3546627946198
+    },
+    {
+      "step": 10,
+      "duration_ms": 102.14996617287397
+    },
+    {
+      "step": 11,
+      "duration_ms": 100.16104625537992
+    },
+    {
+      "step": 12,
+      "duration_ms": 102.15140413492918
+    },
+    {
+      "step": 13,
+      "duration_ms": 99.03701487928629
+    },
+    {
+      "step": 14,
+      "duration_ms": 100.38361977785826
+    },
+    {
+      "step": 15,
+      "duration_ms": 101.66856832802296
+    },
+    {
+      "step": 16,
+      "duration_ms": 99.35016790404916
+    },
+    {
+      "step": 17,
+      "duration_ms": 102.04464290291071
+    },
+    {
+      "step": 18,
+      "duration_ms": 99.09227583557367
+    },
+    {
+      "step": 19,
+      "duration_ms": 101.64596699178219
+    },
+    {
+      "step": 20,
+      "duration_ms": 99.06584769487381
+    },
+    {
+      "step": 21,
+      "duration_ms": 100.76142707839608
+    },
+    {
+      "step": 22,
+      "duration_ms": 100.20083421841264
+    },
+    {
+      "step": 23,
+      "duration_ms": 100.8830489590764
+    },
+    {
+      "step": 24,
+      "duration_ms": 99.13933230563998
+    },
+    {
+      "step": 25,
+      "duration_ms": 98.5623518936336
+    },
+    {
+      "step": 26,
+      "duration_ms": 101.2389287352562
+    },
+    {
+      "step": 27,
+      "duration_ms": 101.04946373030543
+    },
+    {
+      "step": 28,
+      "duration_ms": 100.35747103393078
+    },
+    {
+      "step": 29,
+      "duration_ms": 103.03181502968073
+    },
+    {
+      "step": 30,
+      "duration_ms": 100.5685729905963
+    },
+    {
+      "step": 31,
+      "duration_ms": 99.74951297044754
+    },
+    {
+      "step": 32,
+      "duration_ms": 100.72119301185012
+    },
+    {
+      "step": 33,
+      "duration_ms": 100.75951693579555
+    },
+    {
+      "step": 34,
+      "duration_ms": 100.16293777152896
+    },
+    {
+      "step": 35,
+      "duration_ms": 99.48199708014727
+    },
+    {
+      "step": 36,
+      "duration_ms": 100.7578270509839
+    },
+    {
+      "step": 37,
+      "duration_ms": 100.56933807209134
+    },
+    {
+      "step": 38,
+      "duration_ms": 99.5475728996098
+    },
+    {
+      "step": 39,
+      "duration_ms": 102.21581626683474
+    },
+    {
+      "step": 40,
+      "duration_ms": 226.65643924847245
+    },
+    {
+      "step": 41,
+      "duration_ms": 253.16900806501508
+    },
+    {
+      "step": 42,
+      "duration_ms": 250.1948270946741
+    }
+  ],
+  "memory_checkpoints": {
+    "before_forward": {
+      "allocated_mb": 53458.84,
+      "reserved_mb": 63330.0,
+      "peak_allocated_mb": 53458.84,
+      "peak_reserved_mb": 63330.0
+    },
+    "after_forward": {
+      "allocated_mb": 53491.92,
+      "reserved_mb": 63758.0,
+      "peak_allocated_mb": 59019.36,
+      "peak_reserved_mb": 63758.0
+    }
+  },
+  "meta": {
+    "prompt": [
+      "A cat and a dog baking a cake together in a kitchen."
+    ],
+    "model": "Lightricks/LTX-2"
+  }
+}

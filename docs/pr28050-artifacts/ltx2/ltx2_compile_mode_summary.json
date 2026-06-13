@@ -1,0 +1,88 @@
+{
+  "commit": "696b8b240b871aa98b4ce9c44a2f3bbe557a5055",
+  "default": {
+    "denoise_mean_s": 120.40982477739453,
+    "denoise_median_s": 120.52607663394883,
+    "e2e_mean_s": 121.78125747324277,
+    "e2e_median_s": 121.89377400511876,
+    "peak_mean_gb": 62.206380208333336
+  },
+  "gpu": "2x NVIDIA B200",
+  "max-autotune-no-cudagraphs": {
+    "denoise_mean_s": 131.9171906663105,
+    "denoise_median_s": 131.97086000582203,
+    "e2e_mean_s": 133.3878130276377,
+    "e2e_median_s": 133.6046805009246,
+    "peak_mean_gb": 62.250651041666664
+  },
+  "model": "Lightricks/LTX-2",
+  "preset": "ltx2",
+  "runs": [
+    {
+      "denoise_s": 123.88840705435723,
+      "e2e_s": 125.25316334189847,
+      "file": "ltx2_default_run1.json",
+      "mode": "default",
+      "peak_gb": 62.263671875,
+      "pixel_total_s": 807.86,
+      "step0_s": 119.1576805273071,
+      "warmup_s": 679.56
+    },
+    {
+      "denoise_s": 120.52607663394883,
+      "e2e_s": 121.89377400511876,
+      "file": "ltx2_default_run2.json",
+      "mode": "default",
+      "peak_gb": 62.177734375,
+      "pixel_total_s": 480.44,
+      "step0_s": 115.93008958315477,
+      "warmup_s": 355.43
+    },
+    {
+      "denoise_s": 116.81499064387754,
+      "e2e_s": 118.19683507271111,
+      "file": "ltx2_default_run3.json",
+      "mode": "default",
+      "peak_gb": 62.177734375,
+      "pixel_total_s": 476.21,
+      "step0_s": 112.28663673903793,
+      "warmup_s": 354.99
+    },
+    {
+      "denoise_s": 146.53484561899677,
+      "e2e_s": 147.96245608199388,
+      "file": "ltx2_max_run1.json",
+      "mode": "max-autotune-no-cudagraphs",
+      "peak_gb": 62.248046875,
+      "pixel_total_s": 1327.38,
+      "step0_s": 141.73296606494114,
+      "warmup_s": 1176.08
+    },
+    {
+      "denoise_s": 117.24586637411267,
+      "e2e_s": 118.59630249999464,
+      "file": "ltx2_max_run2.json",
+      "mode": "max-autotune-no-cudagraphs",
+      "peak_gb": 62.240234375,
+      "pixel_total_s": 507.25,
+      "step0_s": 112.6813411260955,
+      "warmup_s": 385.64
+    },
+    {
+      "denoise_s": 131.97086000582203,
+      "e2e_s": 133.6046805009246,
+      "file": "ltx2_max_run3.json",
+      "mode": "max-autotune-no-cudagraphs",
+      "peak_gb": 62.263671875,
+      "pixel_total_s": 558.39,
+      "step0_s": 126.84140547225252,
+      "warmup_s": 420.98
+    }
+  ],
+  "speedup": {
+    "mean_denoise_pct": 8.723173856866216,
+    "mean_e2e_pct": 8.701361309514882,
+    "median_denoise_pct": 8.672204887782273,
+    "median_e2e_pct": 8.765341492452269
+  }
+}
