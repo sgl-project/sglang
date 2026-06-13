@@ -585,7 +585,11 @@ def _norm_infer_kernel(
     if HAS_BIAS:
         B += 0
     cols = tl.arange(0, BLOCK_N)
-    x = tl.load(X + cols, mask=cols < N, other=0.0).to(tl.float32)
+    # x is streamed once: evict_first so it does not pollute L2 (where the tiny
+    # W/B vectors, reused by every row, want to stay resident).
+    x = tl.load(X + cols, mask=cols < N, other=0.0, eviction_policy="evict_first").to(
+        tl.float32
+    )
     if not IS_RMS_NORM:
         mean = tl.sum(x, axis=0) / N
         xbar = tl.where(cols < N, x - mean, 0.0)
@@ -593,17 +597,84 @@ def _norm_infer_kernel(
     else:
         xbar = tl.where(cols < N, x, 0.0)
         var = tl.sum(xbar * xbar, axis=0) / N
-    rstd = 1 / tl.sqrt(var + eps)
+    rstd = tl.rsqrt(var + eps)
     x_hat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
     if HAS_WEIGHT:
-        w = tl.load(W + cols, mask=cols < N, other=1.0).to(tl.float32)
+        w = tl.load(
+            W + cols, mask=cols < N, other=1.0, eviction_policy="evict_last"
+        ).to(tl.float32)
         y = x_hat * w
     else:
         y = x_hat
     if HAS_BIAS:
-        b = tl.load(B + cols, mask=cols < N, other=0.0).to(tl.float32)
+        b = tl.load(
+            B + cols, mask=cols < N, other=0.0, eviction_policy="evict_last"
+        ).to(tl.float32)
         y += b
-    tl.store(Y + cols, y, mask=cols < N)
+    tl.store(Y + cols, y, mask=cols < N, eviction_policy="evict_first")
+
+
+@triton.jit
+def _norm_infer_multirow_kernel(
+    X,
+    Y,
+    W,
+    B,
+    stride_x_row,
+    stride_y_row,
+    M,
+    N,
+    eps,
+    IS_RMS_NORM: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # Small-N path: one program normalizes BLOCK_M contiguous rows. This turns
+    # the tiny per-row ~256B loads into wide BLOCK_M*N coalesced loads and gives
+    # BLOCK_M independent reductions to hide memory latency (the per-row kernel
+    # is long-scoreboard / latency bound at small N).
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_N)
+    row_mask = rows < M
+    col_mask = cols < N
+    mask = row_mask[:, None] & col_mask[None, :]
+
+    x_off = rows[:, None] * stride_x_row + cols[None, :]
+    x = tl.load(X + x_off, mask=mask, other=0.0, eviction_policy="evict_first").to(
+        tl.float32
+    )
+    if not IS_RMS_NORM:
+        mean = tl.sum(x, axis=1) / N
+        xbar = tl.where(mask, x - mean[:, None], 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N
+        rstd = tl.rsqrt(var + eps)
+        x_hat = (x - mean[:, None]) * rstd[:, None]
+    else:
+        var = tl.sum(tl.where(mask, x * x, 0.0), axis=1) / N
+        rstd = tl.rsqrt(var + eps)
+        x_hat = x * rstd[:, None]
+
+    if HAS_WEIGHT:
+        w = tl.load(
+            W + cols, mask=col_mask, other=1.0, eviction_policy="evict_last"
+        ).to(tl.float32)
+        y = x_hat * w[None, :]
+    else:
+        y = x_hat
+    if HAS_BIAS:
+        b = tl.load(
+            B + cols, mask=col_mask, other=0.0, eviction_policy="evict_last"
+        ).to(tl.float32)
+        y += b[None, :]
+    tl.store(
+        Y + rows[:, None] * stride_y_row + cols[None, :],
+        y,
+        mask=mask,
+        eviction_policy="evict_first",
+    )
 
 
 def norm_infer(
@@ -628,6 +699,39 @@ def norm_infer(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
     if N > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+
+    # Small-N rows make the per-row kernel memory-latency bound (tiny ~256B
+    # loads, no ILP). Pack several contiguous rows per program instead so the
+    # loads widen and the per-row reductions overlap. Only worth it when M is
+    # large enough that M/BLOCK_M still gives many waves (else the smaller grid
+    # underfills the SMs); small-M rows are launch-bound and stay on the per-row
+    # path. Threshold N<=512 keeps wide-N rows (LayerNorm N=5120, ~70% BW) too.
+    if N <= 512 and M >= 131072:
+        block_m = max(1, 4096 // BLOCK_N)
+        block_m = min(block_m, 32)
+        threads = block_m * BLOCK_N
+        num_warps = min(max(threads // 256, 1), 8)
+        grid = (triton.cdiv(M, block_m),)
+        _norm_infer_multirow_kernel[grid](
+            x,
+            out,
+            weight if weight is not None else x,
+            bias if bias is not None else x,
+            x.stride(0),
+            out.stride(0),
+            M,
+            N,
+            eps,
+            IS_RMS_NORM=is_rms_norm,
+            HAS_WEIGHT=weight is not None,
+            HAS_BIAS=bias is not None,
+            BLOCK_M=block_m,
+            BLOCK_N=BLOCK_N,
+            num_warps=num_warps,
+            num_stages=2,
+        )
+        return out
+
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     _norm_infer_kernel[(M,)](
         x,
