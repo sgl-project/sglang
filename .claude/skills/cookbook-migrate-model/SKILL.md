@@ -64,7 +64,9 @@ your dispatch prompt, or ask for it.
    them in the PR body for the re-verification track.
 4. **Engines are read-only.** `_deployment.jsx` / `_playground.jsx` must not
    change in a migration PR. If the model needs an engine capability (a new
-   axis, accuracy labels, …), that is a separate prior PR.
+   axis, accuracy labels, …), that is a separate prior PR. The every-feature
+   rule (step 2) triggers this routinely: a legacy control no built-in axis
+   covers means an engine-axis PR lands first.
 5. **`github.cookbookModel` must be set** (`<hf-org>/<page-slug>`, e.g.
    `qwen/qwen3.5`) and the block never pruned — without it Submit ↗ mislabels
    as deepseek-v4. The issue template itself needs NO edits (free-form input).
@@ -109,7 +111,12 @@ flag add). Any other toggle that only adds/removes its own flags becomes a
 Playground axis with the flags baked into cells when the legacy default was
 ON — EXCEPT parsers:
 `--reasoning-parser`/`--tool-call-parser` are NEVER baked into cells, they are
-Playground-only (DSv4 convention). The strategy count follows the page's
+Playground-only (DSv4 convention). **Every legacy control survives as an
+interactive control** — a dimension or a Playground axis, never a tips-only
+mention. A feature none of the built-in axes covers (Nemotron3's "KV Cache
+DType" radio is the precedent) still lands in the Playground: add the axis
+via a separate PRIOR engine PR (engine-axis.md), keeping the migration PR
+itself data-only (hard rule 4). The strategy count follows the page's
 operating points: **one recipe → a single `balanced`; two → `low-latency` +
 `high-throughput`; three → the full trio (the ideal)**. The tiers apply per
 (hw × variant × quant) combination — a single-recipe combination on a
