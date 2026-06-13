@@ -141,7 +141,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
 def _create_unified_radix_cache(
     ctx: TreeCacheBuildContext,
-    server_args: "ServerArgs",
+    server_args: ServerArgs,
     params: CacheInitParams,
 ) -> BasePrefixCache:
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
