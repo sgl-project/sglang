@@ -105,10 +105,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             return self._precompute_target_verify_mode(
                 bs, req_pool_indices, seq_lens, seq_lens_cpu
             )
-        elif forward_mode.is_draft_extend():
-            return self._precompute_draft_extend_mode(
-                bs, req_pool_indices, seq_lens, seq_lens_cpu, spec_info
-            )
         else:
             raise ValueError(f"Unsupported forward mode: {forward_mode}")
 

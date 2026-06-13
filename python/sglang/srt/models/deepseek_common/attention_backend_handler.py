@@ -43,7 +43,6 @@ def handle_attention_ascend(attn, forward_batch):
     if (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()
-        and not forward_batch.forward_mode.is_draft_extend()
         and not forward_batch.forward_mode.is_draft_extend_v2()
     ):
         if hasattr(attn, "indexer"):
