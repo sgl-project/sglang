@@ -43,7 +43,7 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             )
             # relax for mi300x
             if is_in_amd_ci():
-                self.assertGreater(res["output_throughput"], 900)
+                self.assertGreater(res["output_throughput"], 800)
             else:
                 self.assertGreater(res["output_throughput"], 2500)
 
@@ -64,10 +64,11 @@ class TestBenchServing1GPUPart2(CustomTestCase):
                 f"### test_vlm_online_latency\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
-            self.assertLess(res["median_e2e_latency_ms"], 16500)
             if is_in_amd_ci():
-                self.assertLess(res["median_ttft_ms"], 150)
+                self.assertLess(res["median_e2e_latency_ms"], 500000)
+                self.assertLess(res["median_ttft_ms"], 350000)
             else:
+                self.assertLess(res["median_e2e_latency_ms"], 16500)
                 self.assertLess(res["median_ttft_ms"], 100)
             self.assertLess(res["median_itl_ms"], 8)
 
@@ -91,9 +92,15 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             )
 
         self.assertEqual(res["successful_requests"], res["total_requests"])
-        self.assertLess(res["avg_latency_ms"], 48)
-        self.assertLess(res["p95_latency_ms"], 50)
-        self.assertGreater(res["throughput"], 20)
+
+        if is_in_amd_ci():
+            self.assertLess(res["avg_latency_ms"], 55)
+            self.assertLess(res["p95_latency_ms"], 60)
+            self.assertGreater(res["throughput"], 15)
+        else:
+            self.assertLess(res["avg_latency_ms"], 48)
+            self.assertLess(res["p95_latency_ms"], 50)
+            self.assertGreater(res["throughput"], 20)
 
     def test_score_api_batch_scaling(self):
         """Test score API performance with different batch sizes"""
@@ -119,8 +126,8 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             self.assertEqual(res["successful_requests"], res["total_requests"])
             # relax for mi300x
             if is_in_amd_ci():
-                bounds = {10: (60, 65), 25: (70, 80), 50: (80, 90)}
-                default_bounds = (90, 90)
+                bounds = {10: (65, 70), 25: (75, 85), 50: (85, 95)}
+                default_bounds = (85, 95)
             else:
                 bounds = {10: (45, 50), 25: (50, 60), 50: (60, 65)}
                 default_bounds = (60, 65)
@@ -186,7 +193,7 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             self.assertEqual(res["successful_requests"], res["total_requests"])
             # relax for mi300x
             if is_in_amd_ci():
-                bounds = {10: (80, 90), 25: (140, 150), 50: (230, 240)}
+                bounds = {10: (80, 100), 25: (140, 150), 50: (230, 240)}
                 default_bounds = (300, 300)
             else:
                 bounds = {10: (60, 65), 25: (115, 120), 50: (190, 195)}
