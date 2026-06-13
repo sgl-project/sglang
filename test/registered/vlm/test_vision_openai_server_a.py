@@ -146,6 +146,7 @@ class TestKimiVLServer(ImageOpenAITestMixin):
     extra_args = [
         "--context-length=8192",
         "--dtype=bfloat16",
+        "--mem-fraction-static=0.40",
     ]
 
     def test_video_images_chat_completion(self):

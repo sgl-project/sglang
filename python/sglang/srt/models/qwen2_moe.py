@@ -128,13 +128,25 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
+def get_num_shared_experts(config: PretrainedConfig) -> int:
+    n_shared_experts = getattr(config, "n_shared_experts", None)
+    if n_shared_experts is not None:
+        return n_shared_experts
+    if (
+        hasattr(config, "shared_expert_intermediate_size")
+        and config.shared_expert_intermediate_size > 0
+    ):
+        return 1
+    return 0
+
+
 def can_fuse_shared_expert(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
+    """Whether the shared expert may be fused as an extra MoE expert.
 
-    Caller must still gate on support_shared_expert_fusion and _use_aiter.
+    Caller must still gate on the model/backend support flag.
     """
     if (
         get_global_server_args().disable_shared_experts_fusion is True
@@ -148,7 +160,9 @@ def can_fuse_shared_expert(
     # checkpoint), fusing it into the quantized MoE weight tensor requires online
     # quantization which is not supported. Disable fusion in this case.
     if quant_config is not None:
-        exclude_layers = getattr(quant_config, "exclude_layers", [])
+        exclude_layers = getattr(quant_config, "exclude_layers", None)
+        if exclude_layers is None:
+            exclude_layers = getattr(quant_config, "ignored_layers", [])
         if any(
             "shared_expert" in layer
             and "shared_expert_gate" not in layer
@@ -222,6 +236,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
         is_nextn: bool = False,
         support_shared_expert_fusion: bool = False,
+        enable_cuda_shared_expert_fusion: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -233,23 +248,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
         self.num_experts = config.num_experts
-        self.num_shared_experts = 0
+        self.num_shared_experts = get_num_shared_experts(config)
         self.num_fused_shared_experts = 0
-        if hasattr(config, "n_shared_experts"):
-            # config defines the number of shared experts
-            self.num_shared_experts = config.n_shared_experts
-        elif (
-            hasattr(config, "shared_expert_intermediate_size")
-            and config.shared_expert_intermediate_size > 0
-        ):
-            # n_shared_experts is not defined, but shared_expert_intermediate_size is defined, so we use 1 as the number of shared experts
-            self.num_shared_experts = 1
 
         self.enable_shared_expert_fusion = False  # default to False
-        if _use_aiter:
-            # enable shared expert fusion when use aiter
+        if support_shared_expert_fusion and (
+            _use_aiter or (_is_cuda and enable_cuda_shared_expert_fusion)
+        ):
             self.enable_shared_expert_fusion = (
-                support_shared_expert_fusion
+                self.num_shared_experts > 0
                 and can_fuse_shared_expert(config, quant_config)
             )
         if self.enable_shared_expert_fusion:
@@ -345,7 +352,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         ]
 
-    def _get_shared_expert_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _get_shared_expert_weights(
+        self, hidden_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
         """Return sigmoid(shared_expert_gate) for fused shared expert weights."""
         if not self.enable_shared_expert_fusion or self.shared_expert_gate is None:
             return None
@@ -473,7 +482,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(hidden_states.clone())
+        shared_output = (
+            self._forward_shared_experts(hidden_states.clone())
+            if self.shared_expert is not None
+            else None
+        )
 
         # ===== TO BE REFACTORED ====
         # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA

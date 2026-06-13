@@ -295,7 +295,9 @@ class Gemma4Attention(nn.Module):
 
         layer_type = config.layer_types[layer_id]
         self.sliding_window = (
-            config.sliding_window if layer_type == "sliding_attention" else None
+            get_attention_sliding_window_size(config)
+            if layer_type == "sliding_attention"
+            else -1
         )
 
         self.total_num_heads = config.num_attention_heads
