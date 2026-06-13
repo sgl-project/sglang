@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -105,6 +106,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
+        self._bcg_runner = None
 
     @property
     def role_affinity(self) -> RoleType:
@@ -127,6 +129,28 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                 memory_intensive=True,
             )
         ]
+
+    def _run_transformer(
+        self,
+        server_args: ServerArgs | None,
+        kwargs: dict,
+        *,
+        enable_bcg: bool = True,
+    ):
+        if (
+            not enable_bcg
+            or not getattr(server_args, "enable_breakable_cuda_graph", False)
+        ):
+            return self.transformer(**kwargs)
+        if self._bcg_runner is None:
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
+                DiffusionBreakableCudaGraphRunner,
+            )
+
+            self._bcg_runner = DiffusionBreakableCudaGraphRunner(
+                self.transformer, get_local_torch_device()
+            )
+        return self._bcg_runner(**kwargs)
 
     def _denoise_one_chunk(
         self,
@@ -173,29 +197,33 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     forward_batch=batch,
                     attn_metadata=None,
                 ):
-                    noise_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds,
-                        indices_hidden_states=indices_hidden_states,
-                        indices_latents_history_short=indices_latents_history_short,
-                        indices_latents_history_mid=indices_latents_history_mid,
-                        indices_latents_history_long=indices_latents_history_long,
-                        latents_history_short=(
-                            latents_history_short.to(target_dtype)
-                            if latents_history_short is not None
-                            else None
-                        ),
-                        latents_history_mid=(
-                            latents_history_mid.to(target_dtype)
-                            if latents_history_mid is not None
-                            else None
-                        ),
-                        latents_history_long=(
-                            latents_history_long.to(target_dtype)
-                            if latents_history_long is not None
-                            else None
-                        ),
+                    noise_pred = self._run_transformer(
+                        server_args,
+                        {
+                            "hidden_states": latent_model_input,
+                            "timestep": timestep,
+                            "encoder_hidden_states": prompt_embeds,
+                            "indices_hidden_states": indices_hidden_states,
+                            "indices_latents_history_short": indices_latents_history_short,
+                            "indices_latents_history_mid": indices_latents_history_mid,
+                            "indices_latents_history_long": indices_latents_history_long,
+                            "latents_history_short": (
+                                latents_history_short.to(target_dtype)
+                                if latents_history_short is not None
+                                else None
+                            ),
+                            "latents_history_mid": (
+                                latents_history_mid.to(target_dtype)
+                                if latents_history_mid is not None
+                                else None
+                            ),
+                            "latents_history_long": (
+                                latents_history_long.to(target_dtype)
+                                if latents_history_long is not None
+                                else None
+                            ),
+                        },
+                        enable_bcg=not getattr(batch, "is_warmup", False),
                     )
 
                 if do_cfg:
@@ -204,29 +232,33 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         forward_batch=batch,
                         attn_metadata=None,
                     ):
-                        noise_uncond = self.transformer(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=negative_prompt_embeds,
-                            indices_hidden_states=indices_hidden_states,
-                            indices_latents_history_short=indices_latents_history_short,
-                            indices_latents_history_mid=indices_latents_history_mid,
-                            indices_latents_history_long=indices_latents_history_long,
-                            latents_history_short=(
-                                latents_history_short.to(target_dtype)
-                                if latents_history_short is not None
-                                else None
-                            ),
-                            latents_history_mid=(
-                                latents_history_mid.to(target_dtype)
-                                if latents_history_mid is not None
-                                else None
-                            ),
-                            latents_history_long=(
-                                latents_history_long.to(target_dtype)
-                                if latents_history_long is not None
-                                else None
-                            ),
+                        noise_uncond = self._run_transformer(
+                            server_args,
+                            {
+                                "hidden_states": latent_model_input,
+                                "timestep": timestep,
+                                "encoder_hidden_states": negative_prompt_embeds,
+                                "indices_hidden_states": indices_hidden_states,
+                                "indices_latents_history_short": indices_latents_history_short,
+                                "indices_latents_history_mid": indices_latents_history_mid,
+                                "indices_latents_history_long": indices_latents_history_long,
+                                "latents_history_short": (
+                                    latents_history_short.to(target_dtype)
+                                    if latents_history_short is not None
+                                    else None
+                                ),
+                                "latents_history_mid": (
+                                    latents_history_mid.to(target_dtype)
+                                    if latents_history_mid is not None
+                                    else None
+                                ),
+                                "latents_history_long": (
+                                    latents_history_long.to(target_dtype)
+                                    if latents_history_long is not None
+                                    else None
+                                ),
+                            },
+                            enable_bcg=not getattr(batch, "is_warmup", False),
                         )
 
                     if is_cfg_zero_star:
@@ -371,29 +403,33 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         forward_batch=batch,
                         attn_metadata=None,
                     ):
-                        noise_pred = self.transformer(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=prompt_embeds,
-                            indices_hidden_states=indices_hidden_states,
-                            indices_latents_history_short=indices_latents_history_short,
-                            indices_latents_history_mid=indices_latents_history_mid,
-                            indices_latents_history_long=indices_latents_history_long,
-                            latents_history_short=(
-                                latents_history_short.to(target_dtype)
-                                if latents_history_short is not None
-                                else None
-                            ),
-                            latents_history_mid=(
-                                latents_history_mid.to(target_dtype)
-                                if latents_history_mid is not None
-                                else None
-                            ),
-                            latents_history_long=(
-                                latents_history_long.to(target_dtype)
-                                if latents_history_long is not None
-                                else None
-                            ),
+                        noise_pred = self._run_transformer(
+                            server_args,
+                            {
+                                "hidden_states": latent_model_input,
+                                "timestep": timestep,
+                                "encoder_hidden_states": prompt_embeds,
+                                "indices_hidden_states": indices_hidden_states,
+                                "indices_latents_history_short": indices_latents_history_short,
+                                "indices_latents_history_mid": indices_latents_history_mid,
+                                "indices_latents_history_long": indices_latents_history_long,
+                                "latents_history_short": (
+                                    latents_history_short.to(target_dtype)
+                                    if latents_history_short is not None
+                                    else None
+                                ),
+                                "latents_history_mid": (
+                                    latents_history_mid.to(target_dtype)
+                                    if latents_history_mid is not None
+                                    else None
+                                ),
+                                "latents_history_long": (
+                                    latents_history_long.to(target_dtype)
+                                    if latents_history_long is not None
+                                    else None
+                                ),
+                            },
+                            enable_bcg=not getattr(batch, "is_warmup", False),
                         )
 
                     if do_cfg:
@@ -402,29 +438,33 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                             forward_batch=batch,
                             attn_metadata=None,
                         ):
-                            noise_uncond = self.transformer(
-                                hidden_states=latent_model_input,
-                                timestep=timestep,
-                                encoder_hidden_states=negative_prompt_embeds,
-                                indices_hidden_states=indices_hidden_states,
-                                indices_latents_history_short=indices_latents_history_short,
-                                indices_latents_history_mid=indices_latents_history_mid,
-                                indices_latents_history_long=indices_latents_history_long,
-                                latents_history_short=(
-                                    latents_history_short.to(target_dtype)
-                                    if latents_history_short is not None
-                                    else None
-                                ),
-                                latents_history_mid=(
-                                    latents_history_mid.to(target_dtype)
-                                    if latents_history_mid is not None
-                                    else None
-                                ),
-                                latents_history_long=(
-                                    latents_history_long.to(target_dtype)
-                                    if latents_history_long is not None
-                                    else None
-                                ),
+                            noise_uncond = self._run_transformer(
+                                server_args,
+                                {
+                                    "hidden_states": latent_model_input,
+                                    "timestep": timestep,
+                                    "encoder_hidden_states": negative_prompt_embeds,
+                                    "indices_hidden_states": indices_hidden_states,
+                                    "indices_latents_history_short": indices_latents_history_short,
+                                    "indices_latents_history_mid": indices_latents_history_mid,
+                                    "indices_latents_history_long": indices_latents_history_long,
+                                    "latents_history_short": (
+                                        latents_history_short.to(target_dtype)
+                                        if latents_history_short is not None
+                                        else None
+                                    ),
+                                    "latents_history_mid": (
+                                        latents_history_mid.to(target_dtype)
+                                        if latents_history_mid is not None
+                                        else None
+                                    ),
+                                    "latents_history_long": (
+                                        latents_history_long.to(target_dtype)
+                                        if latents_history_long is not None
+                                        else None
+                                    ),
+                                },
+                                enable_bcg=not getattr(batch, "is_warmup", False),
                             )
 
                         if is_cfg_zero_star:
