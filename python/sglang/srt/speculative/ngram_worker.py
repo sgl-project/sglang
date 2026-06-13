@@ -12,7 +12,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
@@ -110,7 +110,7 @@ class NGRAMWorker(BaseSpecWorker):
         return self._target_worker
 
     @property
-    def draft_worker(self) -> Optional[BaseDraftWorker]:
+    def draft_worker(self) -> Optional[EagleDraftWorkerBase]:
         # NGRAM has no draft model; drafts come from the CPU-side corpus.
         return None
 
