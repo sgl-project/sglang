@@ -38,7 +38,7 @@ class TestDSV4FlashFP8H200(
     """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
 
     gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 1.6
+    accept_length_thres = 1.8
     bs_1_speed_thres = 140
 
     @classmethod
