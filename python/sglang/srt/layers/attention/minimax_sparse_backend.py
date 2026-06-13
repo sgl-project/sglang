@@ -116,9 +116,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # otherwise route the decode step through the cuda-graph-safe Triton sparse path.
         # MSA still serves prefill (run eager — prefill cuda graph is disabled), where
         # its long-context speedup matters.
+        #
+        # Decide from the resolved cuda_graph_config — the same source
+        # init_decode_cuda_graph uses to decide capture — not the legacy disable_*
+        # server_args flags: the two can disagree under config-native flags, and a
+        # mismatch could capture the unsafe MSA decode kernel into a graph.
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            Phase,
+            check_cuda_graph_backend,
+        )
+
         _sa = getattr(runner, "server_args", None)
-        _decode_cuda_graph = _sa is not None and not (
-            _sa.disable_cuda_graph or _sa.disable_decode_cuda_graph
+        _decode_cuda_graph = not check_cuda_graph_backend(
+            Phase.DECODE, Backend.DISABLED
         )
         self._use_msa_decode = self.use_msa and not _decode_cuda_graph
         # MSA owns the main decode step unless dense-sparse-decode does; the dense
