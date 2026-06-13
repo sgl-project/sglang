@@ -600,6 +600,7 @@ def run_gdn_eagle_verify_case(
     max_context_len: int = GDN_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = GDN_DEFAULT_DTYPE,
     device: str = GDN_DEFAULT_DEVICE,
+    enable_linear_compact_spec_cache: bool = False,
 ):
     fixture = build_gdn_attention_fixture(
         testcase,
@@ -609,6 +610,7 @@ def run_gdn_eagle_verify_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+        enable_linear_compact_spec_cache=enable_linear_compact_spec_cache,
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
     fixture.forward_batch.spec_info = _make_spec_verify_input(
