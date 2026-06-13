@@ -27,7 +27,9 @@ class TorchFlexAttnBackend(AttentionBackend):
         torch._dynamo.config.cache_size_limit = 1024
         torch._dynamo.config.accumulated_cache_size_limit = 1024
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
         """Init the metadata for a forward pass."""
         # TODO: find a more elegant way to save memory
         # Currently maintain the same memory as torch_native_backend
