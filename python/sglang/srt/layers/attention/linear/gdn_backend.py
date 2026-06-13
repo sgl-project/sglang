@@ -65,6 +65,8 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
 
+        flashinfer_kernel = None
+
         cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
@@ -116,24 +118,20 @@ class GDNKernelDispatcher:
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
             # Reuse the FlashInfer kernel if already created for decode
-            if decode_backend.is_flashinfer():
-                self.extend_kernel = flashinfer_kernel
-            else:
+            if flashinfer_kernel is None:
                 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
                     FlashInferGDNKernel,
                 )
 
                 flashinfer_kernel = FlashInferGDNKernel()
-                self.extend_kernel = flashinfer_kernel
+
+            self.extend_kernel = flashinfer_kernel
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer when the selected FlashInfer kernel
-        # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
-        # bf16-state adapter in FlashInferGDNKernel.
-        if (
-            decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
-        ) and flashinfer_kernel.supports_target_verify:
+        # Verify kernel: use FlashInfer only if it supports target_verify,
+        # otherwise fall back to Triton (e.g. SM100 decode-only FlashInfer).
+        if flashinfer_kernel is not None and flashinfer_kernel.supports_target_verify:
             self.verify_kernel = flashinfer_kernel
         else:
             self.verify_kernel = triton_kernel
