@@ -518,6 +518,7 @@ class SWAComponent(TreeComponent):
         self,
         node: UnifiedTreeNode,
         swa_uuid_for_lock: Optional[int] = None,
+        release_lower_priority_locks: bool = False,
     ) -> None:
         """Early-release the SWA lock along [node, swa_uuid_for_lock] while
         leaving Full and Mamba locks intact.
@@ -577,6 +578,17 @@ class SWAComponent(TreeComponent):
             if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
                 break
             cur = cur.parent
+
+        if release_lower_priority_locks:
+            # An internal node stays SWA-evictable after release, so also drop
+            # the strictly-lower-priority locks (e.g. Mamba) co-located on it to
+            # keep full_lock_ref >= swa_lock_ref >= mamba_lock_ref; otherwise SWA
+            # eviction's cascade would hit a still-locked component and assert.
+            swa_priority = self.eviction_priority(is_leaf=False)
+            dec_params = DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
+            for comp in self.cache._components_tuple:
+                if comp.eviction_priority(is_leaf=False) < swa_priority:
+                    comp.release_component_lock(node, dec_params)
 
     def prepare_for_caching_req(
         self,

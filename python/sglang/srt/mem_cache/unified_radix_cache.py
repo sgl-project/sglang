@@ -612,7 +612,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return result
 
     def dec_lock_ref(
-        self, node: Any, params: Optional[DecLockRefParams] = None
+        self,
+        node: Any,
+        params: Optional[DecLockRefParams] = None,
+        skip_swa: bool = False,
     ) -> DecLockRefResult:
         result = self.session.try_dec_lock_ref(node, params)
         if result is not None:
@@ -620,6 +623,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return DecLockRefResult()
         for component in self._components_tuple:
+            if skip_swa and component.component_type == ComponentType.SWA:
+                continue
             component.release_component_lock(node=node, params=params)
 
         self._update_evictable_leaf_sets(node)
@@ -644,7 +649,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         swa_component = self.components.get(ComponentType.SWA)
         if swa_component is None:
             return
-        swa_component.release_window_lock(node, swa_uuid_for_lock)
+        swa_component.release_window_lock(
+            node, swa_uuid_for_lock, release_lower_priority_locks=True
+        )
 
     def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
         if self.disable:
@@ -735,6 +742,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
         # cleanup
@@ -1242,6 +1250,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node, target):
                     cd = node.component_data[comp.component_type]
+                    # comp is only in this loop because leaf-collapse made its
+                    # priority look <= trigger. With SWA early-release on, a comp
+                    # whose TRUE internal priority is >= the trigger's outranks
+                    # the trigger; a lingering lock on it is a live decode still
+                    # pinning the node (its SWA window moved past) — skip it. A
+                    # locked lower-than-trigger tier is a genuine strand and must
+                    # still trip the assert below. (Unlocked higher tiers fall
+                    # through and are cascaded as part of the leaf teardown.)
+                    if (
+                        envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
+                        and comp.eviction_priority(is_leaf=False)
+                        >= trigger.eviction_priority(is_leaf=False)
+                    ):
+                        if EvictLayer.DEVICE in target and cd.lock_ref != 0:
+                            continue
+                        if EvictLayer.HOST in target and cd.host_lock_ref != 0:
+                            continue
                     if EvictLayer.DEVICE in target:
                         assert cd.lock_ref == 0
                     if EvictLayer.HOST in target:
