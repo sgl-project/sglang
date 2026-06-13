@@ -51,13 +51,13 @@ def l2norm_fwd_kernel1(
 #     ],
 #     key=["D", "NB"],
 # )
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def l2norm_fwd_kernel(
     x,
     y,
     eps,
     NB: tl.constexpr,
-    T: tl.constexpr,
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
