@@ -281,11 +281,9 @@ def build_warmup_reqs(
                 )
             req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
             req_kwargs["image_path"] = [warmup_input_path]
-        if (
-            server_args.enable_cfg_parallel
-            and req_kwargs.get("negative_prompt") is None
-        ):
-            req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
+        if server_args.enable_cfg_parallel:
+            if not req_kwargs.get("negative_prompt"):
+                req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
             req_kwargs["do_classifier_free_guidance"] = True
         elif negative_prompt is not None and cfg_scale is not None and cfg_scale > 1.0:
             req_kwargs["do_classifier_free_guidance"] = True

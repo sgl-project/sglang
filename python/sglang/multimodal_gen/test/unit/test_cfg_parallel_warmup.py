@@ -98,9 +98,24 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
     def test_warmup_req_cfg_parallel_sets_do_cfg(self):
         server_args = _make_bare_scheduler(enable_cfg_parallel=True).server_args
+        sampling_defaults = SamplingParams()
         with patch(
             "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
-            return_value=SamplingParams(),
+            return_value=sampling_defaults,
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+        self.assertIs(req.do_classifier_free_guidance, True)
+        self.assertEqual(req.negative_prompt, sampling_defaults.negative_prompt)
+
+    def test_warmup_req_cfg_parallel_fills_missing_negative_prompt(self):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=True).server_args
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(negative_prompt=None),
         ):
             req = build_warmup_reqs(
                 server_args,
