@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.jit_kernel.softmax import can_use_softmax_sampling, softmax_sampling
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -177,11 +178,17 @@ class Sampler(nn.Module):
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
-
-                # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
+                if is_cuda() and can_use_softmax_sampling(logits):
+                    softmax_sampling(
+                        logits,
+                        sampling_info.temperatures.view(-1),
+                        out=logits,
+                    )
+                else:
+                    logits.div_(sampling_info.temperatures)
+                    logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
+                del logits
 
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case

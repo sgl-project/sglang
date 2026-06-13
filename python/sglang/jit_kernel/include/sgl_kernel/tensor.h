@@ -602,4 +602,9 @@ struct TensorMatcher {
   bool m_has_device = false;
 };
 
+template <typename T>
+inline constexpr auto get_dtype() -> DLDataType {
+  return details::_dtype_trait<T>::value;
+}
+
 }  // namespace host
