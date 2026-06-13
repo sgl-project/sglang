@@ -1,22 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build synthetic diffusion warmup requests.
 
-Default server warmup should cover the model's normal serving path before the
-first real request, without copying user traffic. It therefore starts from the
-model's sampling defaults, keeps default resolution/frame semantics, and trims
-only the denoising step count.
+Default server warmup should cover a representative serving path before the
+first real request, without copying user traffic. It starts from the model's
+sampling defaults, then keeps startup bounded by choosing common low-cost
+resolution/frame buckets and trimming the denoising step count.
 
-Image models may run a tiny second step because first/last step paths often
-initialize different kernels or scheduler state. Video models stay at
-`warmup_steps` to keep startup bounded. Explicit request-based warmup remains a
-scheduler-level legacy path and is not constructed here.
+Explicit request-based warmup remains a scheduler-level legacy path and is not
+constructed here.
 """
 
 from copy import copy
 from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import _parse_size
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -27,7 +28,18 @@ logger = init_logger(__name__)
 
 DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION = (64, 64)
+DEFAULT_REPRESENTATIVE_PROMPT = (
+    "A detailed cinematic scene with a clear subject, natural lighting, "
+    "and rich background details"
+)
+SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION = (512, 512)
+SERVER_WARMUP_VIDEO_FALLBACK_RESOLUTION = (832, 480)
+SERVER_WARMUP_IMAGE_MAX_AREA = 768 * 768
+SERVER_WARMUP_DIFFUSERS_IMAGE_MAX_AREA = 512 * 512
+SERVER_WARMUP_VIDEO_MAX_AREA = 832 * 480
+SERVER_WARMUP_MAX_VIDEO_FRAMES = 17
 SERVER_WARMUP_IMAGE_STEPS = 2
+SERVER_WARMUP_VIDEO_STEPS = 2
 
 
 def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
@@ -52,7 +64,15 @@ def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
 def _resolve_default_warmup_resolution(
     server_args: ServerArgs,
     sampling_defaults: SamplingParams,
+    *,
+    server_based_warmup: bool,
+    use_model_sampling_defaults: bool,
 ) -> tuple[int, int]:
+    if server_based_warmup and use_model_sampling_defaults:
+        return _resolve_representative_warmup_resolution(
+            server_args, sampling_defaults
+        )
+
     width = sampling_defaults.width
     height = sampling_defaults.height
     if width is not None and height is not None:
@@ -69,6 +89,110 @@ def _resolve_default_warmup_resolution(
         width or DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION[0],
         height or DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION[1],
     )
+
+
+def _resolve_representative_warmup_resolution(
+    server_args: ServerArgs,
+    sampling_defaults: SamplingParams,
+) -> tuple[int, int]:
+    target_area = _target_warmup_area(server_args)
+
+    supported_resolution = _select_supported_warmup_resolution(
+        sampling_defaults.supported_resolutions, target_area
+    )
+    if supported_resolution is not None:
+        return supported_resolution
+
+    width = sampling_defaults.width
+    height = sampling_defaults.height
+    if width is not None and height is not None:
+        return _fit_resolution_to_area(width, height, target_area)
+
+    return _fallback_warmup_resolution(server_args)
+
+
+def _target_warmup_area(server_args: ServerArgs) -> int:
+    if server_args.pipeline_config.task_type.is_image_gen():
+        if getattr(server_args, "backend", None) == "diffusers":
+            return SERVER_WARMUP_DIFFUSERS_IMAGE_MAX_AREA
+        return SERVER_WARMUP_IMAGE_MAX_AREA
+    if _is_video_warmup_task(server_args):
+        return SERVER_WARMUP_VIDEO_MAX_AREA
+    return (
+        DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION[0]
+        * DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION[1]
+    )
+
+
+def _fallback_warmup_resolution(server_args: ServerArgs) -> tuple[int, int]:
+    if server_args.pipeline_config.task_type.is_image_gen():
+        return SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION
+    if _is_video_warmup_task(server_args):
+        return SERVER_WARMUP_VIDEO_FALLBACK_RESOLUTION
+    return DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION
+
+
+def _is_video_warmup_task(server_args: ServerArgs) -> bool:
+    return server_args.pipeline_config.task_type.data_type() == DataType.VIDEO
+
+
+def _select_supported_warmup_resolution(
+    supported_resolutions: list[tuple[int, int]] | None,
+    target_area: int,
+) -> tuple[int, int] | None:
+    if not supported_resolutions:
+        return None
+
+    candidates = [
+        resolution
+        for resolution in supported_resolutions
+        if resolution[0] * resolution[1] <= target_area
+    ]
+    if candidates:
+        return max(candidates, key=lambda size: size[0] * size[1])
+    return min(supported_resolutions, key=lambda size: size[0] * size[1])
+
+
+def _fit_resolution_to_area(
+    width: int, height: int, target_area: int
+) -> tuple[int, int]:
+    area = width * height
+    if area <= target_area:
+        return width, height
+
+    scale = (target_area / area) ** 0.5
+    return (
+        max(16, int(width * scale) // 16 * 16),
+        max(16, int(height * scale) // 16 * 16),
+    )
+
+
+def _resolve_warmup_prompt(
+    *,
+    server_based_warmup: bool,
+    use_model_sampling_defaults: bool,
+) -> str:
+    if server_based_warmup and use_model_sampling_defaults:
+        return DEFAULT_REPRESENTATIVE_PROMPT
+    return DEFAULT_PLACEHOLDER_PROMPT
+
+
+def _resolve_warmup_num_frames(
+    server_args: ServerArgs,
+    sampling_defaults: SamplingParams,
+    *,
+    server_based_warmup: bool,
+    use_model_sampling_defaults: bool,
+) -> int:
+    num_frames = sampling_defaults.num_frames
+    if (
+        not server_based_warmup
+        or not use_model_sampling_defaults
+        or not _is_video_warmup_task(server_args)
+    ):
+        return num_frames
+
+    return min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
 
 
 def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
@@ -92,10 +216,13 @@ def _resolve_warmup_steps(
     if default_steps is None or default_steps <= warmup_steps:
         return warmup_steps
 
-    if not server_args.pipeline_config.task_type.is_image_gen():
-        return warmup_steps
+    if _is_video_warmup_task(server_args):
+        return min(default_steps, max(warmup_steps, SERVER_WARMUP_VIDEO_STEPS))
 
-    return min(default_steps, max(warmup_steps, SERVER_WARMUP_IMAGE_STEPS))
+    if server_args.pipeline_config.task_type.is_image_gen():
+        return min(default_steps, max(warmup_steps, SERVER_WARMUP_IMAGE_STEPS))
+
+    return warmup_steps
 
 
 def should_include_warmup_image(
@@ -128,7 +255,10 @@ def build_warmup_reqs(
 
     if warmup_resolutions is None:
         width, height = _resolve_default_warmup_resolution(
-            server_args, sampling_defaults
+            server_args,
+            sampling_defaults,
+            server_based_warmup=server_based_warmup,
+            use_model_sampling_defaults=use_model_sampling_defaults,
         )
         resolutions: list[tuple[int, int]] = [(width, height)]
     else:
@@ -146,6 +276,16 @@ def build_warmup_reqs(
         server_based_warmup=server_based_warmup,
         use_model_sampling_defaults=use_model_sampling_defaults,
     )
+    warmup_num_frames = _resolve_warmup_num_frames(
+        server_args,
+        sampling_defaults,
+        server_based_warmup=server_based_warmup,
+        use_model_sampling_defaults=use_model_sampling_defaults,
+    )
+    warmup_prompt = _resolve_warmup_prompt(
+        server_based_warmup=server_based_warmup,
+        use_model_sampling_defaults=use_model_sampling_defaults,
+    )
 
     warmup_reqs = []
     include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
@@ -154,7 +294,7 @@ def build_warmup_reqs(
             data_type=task_type.data_type(),
             width=width,
             height=height,
-            prompt=DEFAULT_PLACEHOLDER_PROMPT,
+            prompt=warmup_prompt,
         )
         if use_model_sampling_defaults:
             req_kwargs["sampling_params"] = copy(sampling_defaults)
@@ -164,14 +304,14 @@ def build_warmup_reqs(
                 guidance_scale_2=sampling_defaults.guidance_scale_2,
                 true_cfg_scale=sampling_defaults.true_cfg_scale,
                 num_inference_steps=sampling_defaults.num_inference_steps,
-                num_frames=sampling_defaults.num_frames,
+                num_frames=warmup_num_frames,
             )
         if include_warmup_image:
             if warmup_input_path is None:
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"
                 )
-            req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
+            req_kwargs["prompt"] = warmup_prompt
             if not use_model_sampling_defaults:
                 req_kwargs["negative_prompt"] = ""
             req_kwargs["image_path"] = [warmup_input_path]
