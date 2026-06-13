@@ -512,6 +512,21 @@ python -m sglang.launch_server \
     --enable-multimodal
 ```
 
+### Integration checklist for MLLM + DLLM external adapters
+
+When adapting multimodal and diffusion models through `SGLANG_EXTERNAL_*` plugins, keep the
+adapter `forward()` logic minimal and aligned with built-in multimodal models:
+
+- Avoid preprocessing `input_ids` in adapter `forward()` unless required by the model
+  architecture and validated end-to-end.
+- Do not manually override `forward_batch.mm_inputs`; let SGLang's multimodal embed
+  routine manage multimodal state ownership and lifecycle.
+- Validate CUDA graph compatibility for your model path. If needed during bring-up,
+  use `--disable-cuda-graph` first, then re-enable after correctness validation.
+
+This helps preserve expected multimodal alignment and scheduler behavior across
+prefill/chunked prefill/DLLM iterations.
+
 ## Documentation
 
 Add to table of supported models in [generative_models.md](./generative_models) or [multimodal_language_models.md](./multimodal_language_models)
