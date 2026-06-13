@@ -60,6 +60,19 @@ def test_tilelang_gemm_selected_config_skips_incompatible_m_family():
     assert "tuned_M" not in selected
 
 
+def test_tilelang_gemm_exact_compatible_rejects_incompatible_m_family():
+    decode_config = generate_candidate_configs(
+        1, 4096, 1024, search_policy="fast_sm90"
+    )[0]
+    incompatible_exact = {**decode_config, "M": 64}
+
+    store = SelectedConfigStore()
+    store.add(incompatible_exact)
+
+    assert store.get_exact(64, 4096, 1024)["kernel_type"] == "swapAB"
+    assert store.get_exact_compatible(64, 4096, 1024) is None
+
+
 def test_tilelang_gemm_selected_config_uses_nearest_compatible_m_family():
     decode_config = generate_candidate_configs(
         1, 4096, 1024, search_policy="fast_sm90"

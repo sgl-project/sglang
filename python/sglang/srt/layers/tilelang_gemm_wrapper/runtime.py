@@ -440,7 +440,7 @@ def autotune_shapes(
 
     selected = []
     for M, N, K in shapes:
-        existing_config = _CONFIG_STORE.get_exact(M, N, K)
+        existing_config = _CONFIG_STORE.get_exact_compatible(M, N, K)
         if existing_config is not None:
             logger.info(
                 "Skipping TileLang FP8 GEMM autotune for M=%s, N=%s, K=%s; "
@@ -587,10 +587,10 @@ def get_candidate_configs(
 
 
 def has_selected_config(M: int, N: int, K: int) -> bool:
-    """Return whether an exact selected config is loaded for this shape."""
+    """Return whether a compatible exact selected config is loaded."""
 
     _ensure_selected_configs_loaded()
-    return _CONFIG_STORE.get_exact(M, N, K) is not None
+    return _CONFIG_STORE.get_exact_compatible(M, N, K) is not None
 
 
 def get_kernel_info(M: int, N: int, K: int) -> dict:

@@ -312,6 +312,14 @@ class SelectedConfigStore:
             return None
         return dict(configs[M])
 
+    def get_exact_compatible(self, M: int, N: int, K: int) -> Optional[dict]:
+        config = self.get_exact(M, N, K)
+        if config is None:
+            return None
+        if not is_config_compatible_with_shape(config, M, N, K):
+            return None
+        return config
+
     def select(self, M: int, N: int, K: int) -> dict:
         configs = self.configs_by_nk.get((N, K))
         if not configs:

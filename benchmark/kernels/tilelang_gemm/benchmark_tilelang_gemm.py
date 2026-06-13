@@ -250,7 +250,7 @@ def _parallel_autotune(
     pending = [
         shape
         for shape in shapes
-        if store.get_exact(shape[0], shape[1], shape[2]) is None
+        if store.get_exact_compatible(shape[0], shape[1], shape[2]) is None
     ]
     if store.as_list():
         write_selected_config_file(checkpoint_path, store.as_list(), metadata=metadata)
