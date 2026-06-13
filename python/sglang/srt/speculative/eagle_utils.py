@@ -278,7 +278,7 @@ def get_draft_hidden_dim(model_runner: ModelRunner) -> int:
     return model_runner.model_config.spec_hidden_size
 
 
-def prepare_for_verify(
+def eagle_prepare_for_verify(
     verify_input: EagleVerifyInput,
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
@@ -354,7 +354,7 @@ def prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
-def sample(
+def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,

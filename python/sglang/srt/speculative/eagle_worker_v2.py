@@ -65,10 +65,10 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
+    eagle_prepare_for_verify,
+    eagle_sample,
     organize_draft_results,
     per_step_draft_out_cache_loc,
-    prepare_for_verify,
-    sample,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -1217,7 +1217,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = prepare_for_verify(
+            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                 verify_input,
                 self.req_to_token_pool,
                 batch,
@@ -1267,7 +1267,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Run target verify batch in the main compute stream (GPU compute).
         # Metadata init is skipped iff cuda-graph already ran replay_prepare —
-        # prepare_for_verify marked the batch in exactly that case; the
+        # eagle_prepare_for_verify marked the batch in exactly that case; the
         # non-cuda-graph path stays unmarked and gets forward_extend's init
         # (post-pad).
         forward_batch_output = self.target_worker.forward_batch_generation(
@@ -1304,7 +1304,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             predict,
             accept_lens,
             accept_index,
-        ) = sample(verify_input, batch, logits_output, vocab_mask)
+        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification
