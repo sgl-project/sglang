@@ -658,9 +658,8 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             ),
             rope_theta=10000,
             start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
+            device=hidden_states.device,
         )
-        freqs_cos = freqs_cos.to(hidden_states.device)
-        freqs_sin = freqs_sin.to(hidden_states.device)
         freqs_cis = (
             (freqs_cos.float(), freqs_sin.float()) if freqs_cos is not None else None
         )
