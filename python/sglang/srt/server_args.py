@@ -2418,14 +2418,29 @@ class ServerArgs:
                 )
 
             if self.enable_hierarchical_cache:
-                self.swa_full_tokens_ratio = 1.0
-                logger.warning(
-                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2 model with hierarchical cache"
-                )
-                self.disable_hybrid_swa_memory = True
-                logger.warning(
-                    "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
-                )
+                if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+                    raise ValueError(
+                        "Hierarchical cache for MiMoV2 requires the unified "
+                        "radix tree. Set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 "
+                        "to enable --enable-hierarchical-cache for this model."
+                    )
+
+                # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
+                # asymmetric K/V allocation. Only the kernel/page_first transfer
+                # path has a safe split K/V implementation.
+                if self.hicache_io_backend != "kernel":
+                    logger.warning(
+                        f"Force hicache_io_backend to 'kernel' for MiMoV2 model "
+                        f"(was {self.hicache_io_backend!r})."
+                    )
+                    self.hicache_io_backend = "kernel"
+                if self.hicache_mem_layout != "page_first":
+                    logger.warning(
+                        f"Force hicache_mem_layout to 'page_first' for "
+                        f"MiMoV2 model (was {self.hicache_mem_layout!r}); "
+                        f"asymmetric K/V HiCache requires kernel/page_first."
+                    )
+                    self.hicache_mem_layout = "page_first"
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
