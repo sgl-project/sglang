@@ -927,12 +927,13 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         pad_token: torch.Tensor,
     ) -> torch.Tensor:
         """Replace padded token rows after each valid sequence length."""
-        positions = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
-        lengths = torch.tensor(valid_lens, device=tensor.device).unsqueeze(1)
-        pad_mask = positions >= lengths
-        if pad_mask.any():
+        seq_len = tensor.shape[1]
+        if any(valid_len < seq_len for valid_len in valid_lens):
             tensor = tensor.clone()
-            tensor[pad_mask] = pad_token.to(device=tensor.device, dtype=tensor.dtype)
+            pad_value = pad_token.to(device=tensor.device, dtype=tensor.dtype)
+            for row, valid_len in enumerate(valid_lens):
+                if valid_len < seq_len:
+                    tensor[row, valid_len:] = pad_value
         return tensor
 
     def forward(
