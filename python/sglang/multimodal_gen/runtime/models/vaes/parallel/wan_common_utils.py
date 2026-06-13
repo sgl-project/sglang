@@ -7,6 +7,18 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
+def causal_t_pad(x: torch.Tensor, t_pad: int) -> torch.Tensor:
+    """Zero-pad ``t_pad`` frames at the front of the temporal dim (dim 2).
+
+    The symmetric H/W padding is folded into the conv's own ``padding`` argument
+    (see WanCausalConv3d / WanDistCausalConv3d); only this asymmetric causal
+    front-pad on T is applied separately.
+    """
+    if t_pad <= 0:
+        return x
+    return F.pad(x, (0, 0, 0, 0, t_pad, 0))
+
+
 def _channels_last_3d_supported_by_platform() -> bool:
     return hasattr(torch, "channels_last_3d") and (
         current_platform.is_cuda() or current_platform.is_rocm()
@@ -150,24 +162,22 @@ class WanCausalConv3d(nn.Conv3d):
             padding=padding,
         )
         self.padding: tuple[int, int, int]
-        # Set up causal padding
-        self._padding: tuple[int, ...] = (
-            self.padding[2],
-            self.padding[2],
-            self.padding[1],
-            self.padding[1],
-            2 * self.padding[0],
-            0,
-        )
-        self.padding = (0, 0, 0)
+        # Fold the symmetric H/W padding into the conv itself (cuDNN applies it
+        # internally with no tensor materialization and preserves channels_last);
+        # only the causal temporal front-padding is done manually. This removes
+        # the per-conv F.pad that otherwise breaks channels_last and forces a
+        # match_conv3d_input_format .contiguous() copy.
+        pt, ph, pw = self.padding
+        self._t_pad = 2 * pt  # causal: pad 2*pt frames at the front of T
+        self.padding = (0, ph, pw)
 
     def forward(self, x, cache_x=None):
-        padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
+        t_pad = self._t_pad
+        if cache_x is not None and self._t_pad > 0:
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
+            t_pad -= cache_x.shape[2]
+        x = causal_t_pad(x, t_pad)
         x = (
             x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
         )  # casting needed if amp isn't supported

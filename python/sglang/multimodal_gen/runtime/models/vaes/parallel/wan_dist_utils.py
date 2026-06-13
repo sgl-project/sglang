@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import 
     WanRMS_norm,
     WanUpsample,
     attention_block_forward,
+    causal_t_pad,
     match_conv3d_input_format,
     mid_block_forward,
     resample_forward,
@@ -302,39 +303,27 @@ class WanDistCausalConv3d(nn.Conv3d):
         self.height_halo_size = (self.kernel_size[-2] - 1) // 2
 
         self.padding: tuple[int, int, int]
-        # Set up causal padding, let the halo to control height padding
-        if self.height_halo_size > 0:
-            self._padding: tuple[int, ...] = (
-                self.padding[2],
-                self.padding[2],
-                0,
-                0,
-                2 * self.padding[0],
-                0,
-            )
-        else:
-            self._padding: tuple[int, ...] = (
-                self.padding[2],
-                self.padding[2],
-                self.padding[1],
-                self.padding[1],
-                2 * self.padding[0],
-                0,
-            )
-        self.padding = (0, 0, 0)
+        # Fold symmetric W padding (and H when not height-sharded) into the conv;
+        # height padding is controlled by the halo exchange when sharded, and the
+        # causal temporal front-padding is done manually. Avoids the per-conv
+        # F.pad that breaks channels_last and triggers a .contiguous() copy.
+        pt, ph, pw = self.padding
+        self._t_pad = 2 * pt
+        conv_h = 0 if self.height_halo_size > 0 else ph
+        self.padding = (0, conv_h, pw)
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
         self.rank = get_sp_parallel_rank()
         self.world_size = get_sp_world_size()
 
     def forward(self, x, cache_x=None):
-        padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
+        t_pad = self._t_pad
+        if cache_x is not None and self._t_pad > 0:
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
+            t_pad -= cache_x.shape[2]
 
-        x = F.pad(x, padding)
+        x = causal_t_pad(x, t_pad)
 
         x = (
             x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
