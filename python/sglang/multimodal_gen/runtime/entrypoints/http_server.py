@@ -96,7 +96,6 @@ async def _run_server_warmup_after_http_ready(
         if (
             not server_args.warmup
             or not server_args.server_warmup
-            or server_args.warmup_resolutions is not None
             or _is_realtime_serving(server_args)
         ):
             warmup_done.set()
@@ -110,11 +109,10 @@ async def _run_server_warmup_after_http_ready(
 
         warmup_reqs = build_warmup_reqs(
             server_args,
-            warmup_resolutions=None,
+            warmup_resolutions=server_args.warmup_resolutions,
             warmup_input_path=warmup_input_path,
             return_warmup_result=True,
             server_based_warmup=True,
-            use_model_sampling_defaults=True,
         )
         warmup_total = len(warmup_reqs)
         for req in warmup_reqs:
