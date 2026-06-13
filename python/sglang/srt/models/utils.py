@@ -55,7 +55,7 @@ class WeightsMapper:
     orig_to_new_prefix: WeightsMapping = field(default_factory=dict)
     orig_to_new_suffix: WeightsMapping = field(default_factory=dict)
 
-    def __or__(self, other: "WeightsMapper") -> "WeightsMapper":
+    def __or__(self, other: WeightsMapper) -> WeightsMapper:
         return WeightsMapper(
             orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
             orig_to_new_prefix={**self.orig_to_new_prefix, **other.orig_to_new_prefix},
