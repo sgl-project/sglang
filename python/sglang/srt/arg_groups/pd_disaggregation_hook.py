@@ -31,11 +31,15 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --enable-hisparse"
                 )
-            if server_args.disaggregation_transfer_backend not in ("nixl", "mooncake"):
+            if server_args.disaggregation_transfer_backend not in (
+                "nixl",
+                "mooncake",
+                "mori",
+            ):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache currently "
                     "requires --disaggregation-transfer-backend in "
-                    "('nixl', 'mooncake'), but got "
+                    "('nixl', 'mooncake', 'mori'), but got "
                     f"{server_args.disaggregation_transfer_backend!r}"
                 )
             if server_args.speculative_algorithm is not None:
