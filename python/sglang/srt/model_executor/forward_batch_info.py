@@ -108,6 +108,15 @@ class ForwardMode(IntEnum):
     # Used in dLLM
     DLLM_EXTEND = auto()
 
+    # ---- Shape-classified canonical names (additive foundation) ----
+    # Only the two clean 1:1 aliases. `MIXED` is intentionally NOT aliased to a
+    # shape class here, and `is_extend()` / `is_mixed()` are NOT redefined: they
+    # are semantic grab-bags (e.g. `is_extend()` also covers TARGET_VERIFY/MIXED)
+    # that do not map onto disjoint shape classes, so their callsite
+    # reclassification is deferred to a later semantic pass.
+    VAR_LEN = EXTEND
+    SINGLE_TOKEN = DECODE
+
     def is_prefill(self, include_draft_extend_v2: bool = False):
         return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
 
@@ -192,6 +201,35 @@ class ForwardMode(IntEnum):
 
     def is_dllm_extend(self):
         return self == ForwardMode.DLLM_EXTEND
+
+    # ---- Shape predicates (additive; canonical shape classifiers for new code) ----
+    # Disjoint + complete over all members: every mode is exactly one of
+    # var-len / single-token / uniform-len / idle. These are the clean shape
+    # classification; they are NOT behavior-preserving aliases of the legacy
+    # is_extend()/is_mixed() grab-bags (is_var_len() excludes TARGET_VERIFY, which
+    # is_extend() includes). Existing is_extend/is_mixed callsites are left as-is.
+    def is_var_len(self) -> bool:
+        # Per-req variable length: prefill / chunked-prefill / draft-extend /
+        # split-prefill / dllm-extend.
+        return self in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+            ForwardMode.DRAFT_EXTEND,
+            ForwardMode.SPLIT_PREFILL,
+            ForwardMode.DLLM_EXTEND,
+        )
+
+    def is_single_token(self) -> bool:
+        # Per-req exactly one token. Behavior-equivalent to is_decode().
+        return self == ForwardMode.DECODE
+
+    def is_uniform_len(self) -> bool:
+        # Per-req uniform length (>=1): target-verify / draft-extend-v2 / prebuilt.
+        return self in (
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND_V2,
+            ForwardMode.PREBUILT,
+        )
 
 
 @total_ordering

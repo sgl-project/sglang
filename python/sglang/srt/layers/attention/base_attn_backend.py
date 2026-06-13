@@ -234,6 +234,50 @@ class AttentionBackend(ABC):
         """Run a forward for mix."""
         raise NotImplementedError()
 
+    # ---- Shape-classified method names (additive foundation) ----
+    # Default-delegate to the legacy names so existing backend overrides keep
+    # working unchanged. The per-backend implementation rename (forward_extend ->
+    # forward_var_len, ...) and the forward() dispatch switch are separate
+    # follow-up changes.
+    def forward_var_len(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        return self.forward_extend(
+            q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
+        )
+
+    def forward_single_token(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        return self.forward_decode(
+            q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
+        )
+
+    def forward_uniform_len(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        return self.forward_mixed(
+            q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
+        )
+
     def support_triton(self):
         """Check if the current backend supports triton."""
         return True
