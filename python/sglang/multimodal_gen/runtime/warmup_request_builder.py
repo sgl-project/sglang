@@ -28,10 +28,6 @@ logger = init_logger(__name__)
 
 DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION = (64, 64)
-DEFAULT_REPRESENTATIVE_PROMPT = (
-    "A detailed cinematic scene with a clear subject, natural lighting, "
-    "and rich background details"
-)
 SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION = (512, 512)
 SERVER_WARMUP_VIDEO_FALLBACK_RESOLUTION = (832, 480)
 SERVER_WARMUP_IMAGE_MAX_AREA = 768 * 768
@@ -167,16 +163,6 @@ def _fit_resolution_to_area(
     )
 
 
-def _resolve_warmup_prompt(
-    *,
-    server_based_warmup: bool,
-    use_model_sampling_defaults: bool,
-) -> str:
-    if server_based_warmup and use_model_sampling_defaults:
-        return DEFAULT_REPRESENTATIVE_PROMPT
-    return DEFAULT_PLACEHOLDER_PROMPT
-
-
 def _resolve_warmup_num_frames(
     server_args: ServerArgs,
     sampling_defaults: SamplingParams,
@@ -282,10 +268,6 @@ def build_warmup_reqs(
         server_based_warmup=server_based_warmup,
         use_model_sampling_defaults=use_model_sampling_defaults,
     )
-    warmup_prompt = _resolve_warmup_prompt(
-        server_based_warmup=server_based_warmup,
-        use_model_sampling_defaults=use_model_sampling_defaults,
-    )
 
     warmup_reqs = []
     include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
@@ -294,7 +276,7 @@ def build_warmup_reqs(
             data_type=task_type.data_type(),
             width=width,
             height=height,
-            prompt=warmup_prompt,
+            prompt=DEFAULT_PLACEHOLDER_PROMPT,
         )
         if use_model_sampling_defaults:
             req_kwargs["sampling_params"] = copy(sampling_defaults)
@@ -311,7 +293,7 @@ def build_warmup_reqs(
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"
                 )
-            req_kwargs["prompt"] = warmup_prompt
+            req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
             if not use_model_sampling_defaults:
                 req_kwargs["negative_prompt"] = ""
             req_kwargs["image_path"] = [warmup_input_path]

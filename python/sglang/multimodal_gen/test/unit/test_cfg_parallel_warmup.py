@@ -34,7 +34,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 )
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     DEFAULT_PLACEHOLDER_PROMPT,
-    DEFAULT_REPRESENTATIVE_PROMPT,
     SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION,
     build_warmup_reqs,
     should_include_warmup_image,
@@ -184,7 +183,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(req.num_inference_steps, 2)
         self.assertEqual(req.extra["cache_dit_num_inference_steps"], 20)
         self.assertEqual(req.negative_prompt, "model default negative")
-        self.assertEqual(req.prompt, DEFAULT_REPRESENTATIVE_PROMPT)
+        self.assertEqual(req.prompt, DEFAULT_PLACEHOLDER_PROMPT)
         self.assertIs(req.do_classifier_free_guidance, True)
         self.assertTrue(req.extra["return_warmup_result"])
         self.assertTrue(req.extra["server_based_warmup"])
