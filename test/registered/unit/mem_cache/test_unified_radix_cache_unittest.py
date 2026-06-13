@@ -2994,8 +2994,11 @@ class UnifiedRadixCacheSuite:
         return chain
 
     def _release_ongoing_load_back_locks(self, tree):
-        for node, lock_params in list(tree.ongoing_load_back.values()):
+        for node, lock_params, host_lock_params in list(
+            tree.ongoing_load_back.values()
+        ):
             tree.dec_lock_ref(node, lock_params)
+            tree.dec_host_lock_ref(node, host_lock_params)
         tree.ongoing_load_back.clear()
 
     def _finish_pending_loads(self, tree):
