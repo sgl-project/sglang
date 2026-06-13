@@ -4,7 +4,7 @@ FastAPI server example for text generation using SGLang Engine and demonstrating
 Starts the server, sends requests to it, and prints responses.
 
 Usage:
-python fastapi_engine_inference.py --model-path Qwen/Qwen2.5-0.5B-Instruct --tp_size 1 --host 127.0.0.1 --port 8000
+python fastapi_engine_inference.py --model-path Qwen/Qwen2.5-0.5B-Instruct --tp_size 1 --host 127.0.0.1 --port 8000 [--startup-timeout 60]
 """
 
 import os
@@ -160,6 +160,12 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-path", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--tp_size", type=int, default=1)
+    parser.add_argument(
+        "--startup-timeout",
+        type=int,
+        default=60,
+        help="Time in seconds to wait for the server to be ready (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     # Pass the model to the child uvicorn process via an env var
@@ -167,7 +173,7 @@ if __name__ == "__main__":
     os.environ["TP_SIZE"] = str(args.tp_size)
 
     # Start the server
-    process = start_server(args)
+    process = start_server(args, timeout=args.startup_timeout)
 
     # Define the prompts and sampling parameters
     prompts = [

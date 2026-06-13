@@ -24,19 +24,35 @@ include_directories(
     ${Python_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# Platform-specific library directory
+# Build all cpp files in current and sub dirs
+file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+
+# Exclude all arch dependent files, then add back only files for this arch
+set(ARCH_DIRS "x86_64|aarch64|ppc64")
+list(FILTER SOURCES EXCLUDE REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/(${ARCH_DIRS})/")
+
+# Platform-specific source and library directory
+set(MY_ARCH_DIR "")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(PLAT_LIB_DIR "/usr/lib/x86_64-linux-gnu")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(MY_ARCH_DIR "x86_64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(PLAT_LIB_DIR "/usr/lib/aarch64-linux-gnu")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
+    set(MY_ARCH_DIR "aarch64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
     set(PLAT_LIB_DIR "/usr/lib/powerpc64le-linux-gnu")
+    set(MY_ARCH_DIR "ppc64")
 else()
     set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
 endif()
 link_directories(${PLAT_LIB_DIR})
+if(MY_ARCH_DIR)
+    file(GLOB_RECURSE ARCH_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/${MY_ARCH_DIR}/*.cpp")
+    list(APPEND SOURCES ${ARCH_SOURCES})
+endif()
 
 # Conda library path support
 if(DEFINED ENV{CONDA_PREFIX})
@@ -54,9 +70,41 @@ if(DEFINED ENV{CONDA_PREFIX})
         message(FATAL_ERROR "libnuma not found in Conda environment at ${CONDA_LIB_DIR}\n"
                             "Please install it using: conda install libnuma numactl\n")
     endif()
+else()
+    if(DEFINED ENV{VIRTUAL_ENV})
+        set(VENV_LIB_DIR "$ENV{VIRTUAL_ENV}/lib")
+        message(STATUS "Using venv lib dir: ${VENV_LIB_DIR}")
+        link_directories(${VENV_LIB_DIR})
+        set(VENV_INCLUDE_DIR "$ENV{VIRTUAL_ENV}/include")
+        include_directories(${VENV_INCLUDE_DIR})
+    endif()
+    # Look for libnuma in system env paths
+    find_library(NUMA_LIB numa)
+    if(NUMA_LIB)
+        message(STATUS "Found libnuma: ${NUMA_LIB}")
+    else()
+        message(FATAL_ERROR "libnuma not found in system environment\n"
+                            "Please install it using: apt-get install libnuma numactl\n")
+    endif()
 endif()
 
-file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+
+# These kernels still rely on x86-specific AMX/AVX512 implementations.
+# Keep them out of Arm64 bootstrap builds until native Arm paths land.
+set(SGLANG_CPU_X86_ONLY_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/gemm_int4.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe_fp8.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe_int4.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe_int8.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/qkv_proj.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/mamba/conv.cpp
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    add_compile_definitions(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+    list(REMOVE_ITEM SOURCES ${SGLANG_CPU_X86_ONLY_SOURCES})
+endif()
 
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
     set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")
@@ -67,12 +115,26 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
-add_compile_options(
-    -O3
-    -Wno-unknown-pragmas
-    -march=native
-    -fopenmp
-)
+if(MY_ARCH_DIR STREQUAL "x86_64")
+    add_compile_options(
+        -O3
+        -Wno-unknown-pragmas
+        -march=x86-64-v4
+        -mavx512bf16
+        -mavx512vnni
+        -mamx-tile
+        -mamx-bf16
+        -mamx-int8
+        -fopenmp
+    )
+else()
+    add_compile_options(
+        -O3
+        -Wno-unknown-pragmas
+        -march=native
+        -fopenmp
+    )
+endif()
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})

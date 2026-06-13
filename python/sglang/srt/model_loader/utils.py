@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/utils.py
 
 """Utilities for selecting and loading models."""
+
+import concurrent.futures
 import contextlib
 import logging
-from typing import Tuple, Type
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
 
 import torch
 import transformers
@@ -11,6 +15,7 @@ from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.layers import deep_gemm_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +29,87 @@ def set_default_torch_dtype(dtype: torch.dtype):
     torch.set_default_dtype(old_dtype)
 
 
+def _is_moe_model(model_config: ModelConfig, architectures: list[str]) -> bool:
+    lowered_arches = [arch.lower() for arch in architectures]
+    if any("moe" in arch or "mixtral" in arch for arch in lowered_arches):
+        return True
+
+    text_config = model_config.hf_text_config
+    expert_attrs = (
+        "num_local_experts",
+        "num_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+        "n_routed_experts",
+    )
+    for attr in expert_attrs:
+        value = getattr(text_config, attr, None)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            if value:
+                return True
+            continue
+        if isinstance(value, (int, float)):
+            threshold = 0 if attr == "moe_intermediate_size" else 1
+            if value > threshold:
+                return True
+            continue
+        if isinstance(value, (list, tuple, set, dict)):
+            if len(value) > 0:
+                return True
+            continue
+        if isinstance(value, str) and value == "":
+            continue
+        if value is not None:
+            return True
+    return False
+
+
+def _is_sequence_classification_model(architectures: list[str]) -> bool:
+    return any(
+        "sequenceclassification" in lowered or "rewardmodel" in lowered
+        for lowered in (arch.lower() for arch in architectures)
+    )
+
+
+def _get_transformers_backend_arch(
+    model_config: ModelConfig, architectures: list[str]
+) -> str:
+    is_pooling = not model_config.is_generation
+    is_multimodal = model_config.is_multimodal or (
+        model_config.hf_config is not model_config.hf_text_config
+    )
+    is_moe = _is_moe_model(model_config, architectures)
+    base_arch = "ForCausalLM"
+    if is_pooling:
+        base_arch = (
+            "ForSequenceClassification"
+            if _is_sequence_classification_model(architectures)
+            else "EmbeddingModel"
+        )
+
+    arch = "Transformers"
+    if is_multimodal:
+        arch += "MultiModal"
+    if is_moe:
+        arch += "MoE"
+    return arch + base_arch
+
+
+def _model_impl_from_architecture(architecture: str) -> ModelImpl:
+    if architecture.startswith("Transformers"):
+        return ModelImpl.TRANSFORMERS
+    if architecture.startswith("MindSpore"):
+        return ModelImpl.MINDSPORE
+    return ModelImpl.SGLANG
+
+
 def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str]):
-    for i, arch in enumerate(architectures):
-        if arch == "TransformersForCausalLM":
+    backend_arch = _get_transformers_backend_arch(model_config, architectures)
+
+    for arch in architectures:
+        if arch.startswith("Transformers"):
             continue
         auto_map: dict[str, str] = (
             getattr(model_config.hf_config, "auto_map", None) or dict()
@@ -39,15 +122,33 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
         #     "AutoModel": "<your-repo-name>--<config-name>",
         #     "AutoModelFor<Task>": "<your-repo-name>--<config-name>",
         # },
-        auto_modules = {
-            name: get_class_from_dynamic_module(
-                module, model_config.model_path, revision=model_config.revision
+        auto_modules = {}
+        try:
+            auto_modules = {
+                name: get_class_from_dynamic_module(
+                    module, model_config.model_path, revision=model_config.revision
+                )
+                for name, module in sorted(auto_map.items(), key=lambda x: x[0])
+            }
+        except Exception as e:
+            logger.warning(
+                "Failed to load dynamic modules from auto_map for '%s': %s. "
+                "Skipping remote model compatibility checks.",
+                arch,
+                e,
             )
-            for name, module in sorted(auto_map.items(), key=lambda x: x[0])
-        }
         model_module = getattr(transformers, arch, None)
         if model_module is None:
-            if "AutoModel" not in auto_map:
+            has_auto_model = "AutoModel" in auto_modules
+            if not has_auto_model and model_config.model_impl == ModelImpl.TRANSFORMERS:
+                logger.warning(
+                    "Cannot resolve model class for '%s' and no auto_map.AutoModel "
+                    "is present. Skipping compatibility gate because "
+                    "--model-impl=transformers is explicitly requested.",
+                    arch,
+                )
+                continue
+            if not has_auto_model and "AutoModel" not in auto_map:
                 raise ValueError(
                     f"Cannot find model module. '{arch}' is not a registered "
                     "model in the Transformers library (only relevant if the "
@@ -55,16 +156,29 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
                     "not present in the model config's 'auto_map' (relevant "
                     "if the model is custom)."
                 )
+            if not has_auto_model:
+                raise ValueError(
+                    f"Cannot find model module. '{arch}' is not a registered "
+                    "model in the Transformers library and loading the custom "
+                    f"model from auto_map failed. The remote model code may be "
+                    f"incompatible with the installed transformers version."
+                )
             model_module = auto_modules["AutoModel"]
         if model_config.model_impl == ModelImpl.TRANSFORMERS:
-            if not model_module.is_backend_compatible():
-                raise ValueError(
-                    f"The Transformers implementation of {arch} is not "
-                    "compatible with SGLang."
+            if hasattr(model_module, "is_backend_compatible") and (
+                not model_module.is_backend_compatible()
+            ):
+                logger.warning(
+                    "The Transformers implementation of %s reports it is not "
+                    "backend-compatible (_supports_attention_backend=False). "
+                    "Proceeding anyway because --model-impl=transformers was "
+                    "explicitly requested. The model may not work correctly.",
+                    arch,
                 )
-            architectures[i] = "TransformersForCausalLM"
         if model_config.model_impl == ModelImpl.AUTO:
-            if not model_module.is_backend_compatible():
+            if hasattr(model_module, "is_backend_compatible") and (
+                not model_module.is_backend_compatible()
+            ):
                 raise ValueError(
                     f"{arch} has no SGlang implementation and the Transformers "
                     "implementation is not compatible with SGLang."
@@ -75,8 +189,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
                 "performance may not be optimal.",
                 arch,
             )
-            architectures[i] = "TransformersForCausalLM"
-    return architectures
+    return [backend_arch]
 
 
 def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
@@ -85,7 +198,13 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     architectures = getattr(model_config.hf_config, "architectures", [])
     # Special handling for quantized Mixtral.
     # FIXME(woosuk): This is a temporary hack.
-    mixtral_supported = ["fp8", "compressed-tensors", "gptq_marlin", "awq_marlin"]
+    mixtral_supported = [
+        "fp8",
+        "compressed-tensors",
+        "gptq_marlin",
+        "awq_marlin",
+        "quark_int4fp8_moe",
+    ]
 
     if (
         model_config.quantization is not None
@@ -97,10 +216,33 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     supported_archs = ModelRegistry.get_supported_archs()
     is_native_supported = any(arch in supported_archs for arch in architectures)
 
-    if not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
+    if model_config.model_impl == ModelImpl.MINDSPORE:
+        architectures = ["MindSporeForCausalLM"]
+    elif not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
         architectures = resolve_transformers_arch(model_config, architectures)
+    model_cls, resolved_arch = ModelRegistry.resolve_model_cls(architectures)
+    setattr(model_config, "_resolved_model_arch", resolved_arch)
+    setattr(
+        model_config,
+        "_resolved_model_impl",
+        _model_impl_from_architecture(resolved_arch),
+    )
+    return model_cls, resolved_arch
 
-    return ModelRegistry.resolve_model_cls(architectures)
+
+def get_resolved_model_impl(model_config: ModelConfig) -> ModelImpl:
+    resolved_model_impl = getattr(model_config, "_resolved_model_impl", None)
+    if resolved_model_impl is not None:
+        return resolved_model_impl
+
+    resolved_arch = getattr(model_config, "_resolved_model_arch", None)
+    if resolved_arch is None:
+        _, resolved_arch = get_model_architecture(model_config)
+
+    resolved_model_impl = _model_impl_from_architecture(resolved_arch)
+    setattr(model_config, "_resolved_model_arch", resolved_arch)
+    setattr(model_config, "_resolved_model_impl", resolved_model_impl)
+    return resolved_model_impl
 
 
 def get_architecture_class_name(model_config: ModelConfig) -> str:
@@ -117,3 +259,68 @@ def post_load_weights(model: nn.Module, model_config: ModelConfig):
             model.post_load_weights(is_nextn=True)
         else:
             model.post_load_weights()
+
+
+def should_deepgemm_weight_requant_ue8m0(
+    weight_block_size, output_dtype=None, weight_shape=None
+):
+    """Should we requant fp8 weights into UE8M0 format when loading the model.
+
+    When output_dtype or weight_shape are provided, also checks that DeepGEMM
+    can actually run this layer at runtime (bf16 output, N%64==0, K%128==0).
+    Without these checks, scales would be converted to UE8M0 but the GEMM would
+    fall back to triton which expects float32 scales, causing wrong results.
+    """
+    if not (
+        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and weight_block_size is not None
+    ):
+        return False
+    if output_dtype is not None and output_dtype != torch.bfloat16:
+        return False
+    if weight_shape is not None and (
+        weight_shape[0] % 64 != 0 or weight_shape[1] % 128 != 0
+    ):
+        return False
+    return True
+
+
+def should_async_load(weight: torch.Tensor) -> bool:
+    """Return True if we should load the given weight asynchronously.
+
+    For host (CPU) tensors, using a threadpool can overlap H2D copies
+    and improve throughput. For device tensors, threading often adds overhead
+    (e.g., GIL contention) without benefit, so we do it synchronously.
+    """
+    device = getattr(weight, "device", None)
+    if device is None:
+        return False
+    return device.type == "cpu"
+
+
+def maybe_executor_submit(
+    *,
+    executor: concurrent.futures.ThreadPoolExecutor,
+    futures: List[concurrent.futures.Future],
+    use_async: bool,
+    func: Callable[..., Any],
+    func_args: Iterable[Any] = (),
+    func_kwargs: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Submit a task to the executor if async loading is enabled.
+
+    Parameters (keyword-only):
+    - executor: ThreadPoolExecutor used to submit background tasks
+    - futures: a list collecting the submitted Future objects
+    - use_async: whether to submit to executor or run inline
+    - func: the callable to run
+    - func_args: positional args for the callable (defaults to empty tuple)
+    - func_kwargs: keyword args for the callable (defaults to empty dict)
+    """
+    if func_kwargs is None:
+        func_kwargs = {}
+    if use_async:
+        futures.append(executor.submit(func, *func_args, **func_kwargs))
+    else:
+        func(*func_args, **func_kwargs)

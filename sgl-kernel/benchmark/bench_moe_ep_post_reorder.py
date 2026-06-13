@@ -2,8 +2,16 @@ import torch
 import triton
 
 from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
+from sglang.utils import is_in_ci
 
-batch_sizes = [64, 128, 256, 512, 640, 768, 1024, 2048, 4096]
+IS_CI = is_in_ci()
+
+# CI environment uses simplified parameters
+if IS_CI:
+    batch_sizes = [64, 128]  # Only test 2 values in CI
+else:
+    batch_sizes = [64, 128, 256, 512, 640, 768, 1024, 2048, 4096]
+
 configs = [(bs,) for bs in batch_sizes]
 
 

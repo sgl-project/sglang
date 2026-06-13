@@ -1,4 +1,4 @@
-## Bench Serving Guide
+# Bench Serving Guide
 
 This guide explains how to benchmark online serving throughput and latency using `python -m sglang.bench_serving`. It supports multiple inference backends via OpenAI-compatible and native endpoints, and produces both console metrics and optional JSONL outputs.
 
@@ -21,7 +21,7 @@ If `--base-url` is provided, requests are sent to it. Otherwise, `--host` and `-
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.10+
 - Dependencies typically used by this script: `aiohttp`, `numpy`, `requests`, `tqdm`, `transformers`, and for some datasets `datasets`, `pillow`, `pybase64`. Install as needed.
 - An inference server running and reachable via the endpoints above
 - If your server requires authentication, set environment variable `OPENAI_API_KEY` (used as `Authorization: Bearer <key>`)
@@ -59,15 +59,16 @@ Select with `--dataset-name`:
 - `sharegpt` (default): loads ShareGPT-style pairs; optionally restrict with `--sharegpt-context-len` and override outputs with `--sharegpt-output-len`
 - `random`: random text lengths; sampled from ShareGPT token space
 - `random-ids`: random token ids (can lead to gibberish)
-- `random-image`: generates random images and wraps them in chat messages; supports custom resolutions via 'heightxwidth' format
+- `image`: generates images and wraps them in chat messages; supports custom resolutions, multiple formats, and different content types
 - `generated-shared-prefix`: synthetic dataset with shared long system prompts and short questions
 - `mmmu`: samples from MMMU (Math split) and includes images
 
 Common dataset flags:
 
 - `--num-prompts N`: number of requests
-- `--random-input-len`, `--random-output-len`, `--random-range-ratio`: for random/random-ids/random-image
-- `--random-image-num-images`, `--random-image-resolution`: for random-image dataset (supports presets 1080p/720p/360p or custom 'heightxwidth' format)
+- `--random-input-len`, `--random-output-len`, `--random-range-ratio`: for random/random-ids/image
+- `--image-count`: Number of images per request (for `image` dataset).
+
 - `--apply-chat-template`: apply tokenizer chat template when constructing prompts
 - `--dataset-path PATH`: file path for ShareGPT json; if blank and missing, it will be downloaded and cached
 
@@ -79,14 +80,16 @@ Generated Shared Prefix flags (for `generated-shared-prefix`):
 - `--gsp-question-len`
 - `--gsp-output-len`
 
-Random Image dataset flags (for `random-image`):
+Image dataset flags (for `image`):
 
-- `--random-image-num-images`: Number of images per request
-- `--random-image-resolution`: Image resolution; supports presets (1080p, 720p, 360p) or custom 'heightxwidth' format (e.g., 1080x1920, 512x768)
+- `--image-count`: Number of images per request
+- `--image-resolution`: Image resolution; supports presets (4k, 1080p, 720p, 360p) or custom 'heightxwidth' format (e.g., 1080x1920, 512x768)
+- `--image-format`: Image format (jpeg or png)
+- `--image-content`: Image content type (random or blank)
 
 ### Examples
 
-1. To benchmark random-image dataset with 3 images per request, 500 prompts, 512 input length, and 512 output length, you can run:
+1. To benchmark image dataset with 3 images per request, 500 prompts, 512 input length, and 512 output length, you can run:
 
 ```bash
 python -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-3B-Instruct --disable-radix-cache
@@ -95,10 +98,10 @@ python -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-3B-Instruct --disabl
 ```bash
 python -m sglang.bench_serving \
     --backend sglang-oai-chat \
-    --dataset-name random-image \
+    --dataset-name image \
     --num-prompts 500 \
-    --random-image-num-images 3 \
-    --random-image-resolution 720p \
+    --image-count 3 \
+    --image-resolution 720p \
     --random-input-len 512 \
     --random-output-len 512
 ```
@@ -159,9 +162,10 @@ The script will add `Authorization: Bearer $OPENAI_API_KEY` automatically for Op
 Printed after each run:
 
 - Request throughput (req/s)
-- Input token throughput (tok/s)
+- Input token throughput (tok/s) - includes both text and vision tokens
 - Output token throughput (tok/s)
-- Total token throughput (tok/s)
+- Total token throughput (tok/s) - includes both text and vision tokens
+- Total input text tokens and Total input vision tokens - per-modality breakdown
 - Concurrency: aggregate time of all requests divided by wall time
 - End-to-End Latency (ms): mean/median/std/p99 per-request total latency
 - Time to First Token (TTFT, ms): mean/median/std/p99 for streaming mode
@@ -227,31 +231,48 @@ python3 -m sglang.bench_serving \
   --apply-chat-template
 ```
 
-4) Random images (VLM) with chat template:
+4) Images (VLM) with chat template:
 
 ```bash
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model your-vlm-model \
-  --dataset-name random-image \
-  --random-image-num-images 2 \
-  --random-image-resolution 720p \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
   --random-input-len 128 --random-output-len 256 \
   --num-prompts 200 \
   --apply-chat-template
 ```
 
-4a) Random images with custom resolution:
+4a) Images with custom resolution:
 
 ```bash
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model your-vlm-model \
-  --dataset-name random-image \
-  --random-image-num-images 1 \
-  --random-image-resolution 512x768 \
+  --dataset-name image \
+  --image-count 1 \
+  --image-resolution 512x768 \
+  --random-input-len 64 --random-output-len 128 \
+  --num-prompts 100 \
+  --apply-chat-template
+```
+
+4b) 1080p images with PNG format and blank content:
+
+```bash
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 --port 30000 \
+  --model your-vlm-model \
+  --dataset-name image \
+  --image-count 1 \
+  --image-resolution 1080p \
+  --image-format png \
+  --image-content blank \
   --random-input-len 64 --random-output-len 128 \
   --num-prompts 100 \
   --apply-chat-template
@@ -311,7 +332,7 @@ python3 -m sglang.bench_serving \
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
-  --model mode-name \
+  --model model-name \
   --dataset-name mooncake \
   --mooncake-slowdown-factor 1.0 \
   --mooncake-num-rounds 1000 \
@@ -320,15 +341,50 @@ python3 -m sglang.bench_serving \
   --random-output-len 256
 ```
 
+10) Fake decode stress testing (PD disaggregation, decode-only):
+
+When benchmarking pure decode performance in a PD disaggregation setup, you can bypass the prefill node entirely by using `--fake-prefill`. This requires the decode server to be started with `--disaggregation-transfer-backend fake`:
+
+```bash
+# Step 1: Start a decode-only server with fake transfer backend
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend fake \
+  --port 30001
+
+# Step 2: Run bench_serving with --fake-prefill
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 --port 30001 \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --dataset-name random \
+  --num-prompts 500 \
+  --random-input-len 1024 --random-output-len 256 \
+  --fake-prefill
+```
+
+Similarly, `bench_one_batch_server` also supports `--fake-prefill`:
+
+```bash
+python3 -m sglang.bench_one_batch_server \
+  --base-url http://127.0.0.1:30001 \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --batch-size 32 --input-len 1024 --output-len 256 \
+  --fake-prefill
+```
+
+The `--fake-prefill` flag automatically injects special sentinel values into each request, telling the decode server to skip real KV transfer and generate fake KV data locally.
+
 ### Troubleshooting
 
 - All requests failed: verify `--backend`, server URL/port, `--model`, and authentication. Check warmup errors printed by the script.
 - Throughput seems too low: adjust `--request-rate` and `--max-concurrency`; verify server batch size/scheduling; ensure streaming is enabled if appropriate.
 - Token counts look odd: prefer chat/instruct models with proper chat templates; otherwise tokenization of gibberish may be inconsistent.
-- Random-image/MMMU datasets: ensure you installed extra deps (`pillow`, `datasets`, `pybase64`).
+- Image/MMMU datasets: ensure you installed extra deps (`pillow`, `datasets`, `pybase64`).
 - Authentication errors (401/403): set `OPENAI_API_KEY` or disable auth on your server.
 
 ### Notes
 
 - The script raises the file descriptor soft limit (`RLIMIT_NOFILE`) to help with many concurrent connections.
-- For sglang, `/get_server_info` is queried post-run to report speculative decoding accept length when available.
+- For sglang, `/server_info` is queried post-run to report speculative decoding accept length when available.

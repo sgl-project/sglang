@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
 import logging
@@ -11,14 +13,22 @@ from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    parallel_state,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_allocation_symmetric,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -30,13 +40,16 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
     is_cpu,
+    is_npu,
     set_weight_attrs,
 )
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +135,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,
@@ -148,6 +161,28 @@ def get_masked_input_and_mask(
     vocab_mask = org_vocab_mask | added_vocab_mask
     input_ = vocab_mask * (input_ - valid_offset)
     return input_, ~vocab_mask
+
+
+def get_embedding_tp_kwargs() -> dict:
+    """Vocab-parallel layout kwargs for the *input embedding* of models that
+    support embedding replication (the DeepSeek-V2 target family: DeepSeek
+    V3.1 / Kimi K2.5, plus their EAGLE3 / NextN drafts).
+
+    EAGLE / NextN share the target's ``embed_tokens.weight`` tensor with the
+    draft (``set_embed`` / ``set_embed_and_head``), so the target and every
+    draft that shares it MUST use the same vocab-parallel layout -- otherwise
+    the draft's masking/index math runs against a tensor with a different
+    layout and accept_len silently drops. Route all of them through this one
+    helper so they can never drift.
+    """
+    if envs.SGLANG_ENABLE_EMBED_REPLICATION.get():
+        # Replicate the full table on every rank: skips the embed all-reduce
+        # at the cost of duplicated embedding weights.
+        return {"enable_tp": False}
+    # Shard along the vocab dim. Under DP attention each rank owns only its
+    # local tokens, so reduce within the attention-TP group, not the full TP
+    # group.
+    return {"enable_tp": True, "use_attn_tp_group": is_dp_attention_enabled()}
 
 
 class VocabParallelEmbedding(torch.nn.Module):
@@ -207,6 +242,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.quant_config = quant_config
 
         self.enable_tp = enable_tp
+        self.use_attn_tp_group = use_attn_tp_group
         if self.enable_tp:
             if use_attn_tp_group:
                 tp_rank = get_attention_tp_rank()
@@ -460,6 +496,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[loaded_weight.shape[0] :].data.fill_(0)
 
     def forward(self, input_):
+        # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
+        # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
+        maybe_detect_oob(
+            input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
+        )
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
@@ -472,18 +513,23 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         else:
             masked_input = input_
+
         # Get the embeddings.
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
             output_parallel = self.quant_method.embedding(self, masked_input.long())
-            sm.tag(output_parallel)
-        # Mask the output embedding.
+
         if self.tp_size > 1:
+            # Mask the output embedding.
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            # Reduce across all the model parallel GPUs.
-            output = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            output = output_parallel
-        return output
+            if not get_attn_tp_context().input_scattered:
+                if self.use_attn_tp_group:
+                    output_parallel = attn_tp_all_reduce(output_parallel)
+                else:
+                    # Reduce across all the model parallel GPUs.
+                    output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"
@@ -540,7 +586,10 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         # We only support pack LMHead if it's not quantized.
         if _is_cpu and _is_cpu_amx_available:
-            if hasattr(self, "weight") and self.weight.dtype == torch.bfloat16:
+            if hasattr(self, "weight") and self.weight.dtype in [
+                torch.bfloat16,
+                torch.float16,
+            ]:
                 self.quant_method = PackWeightMethod(weight_names=["weight"])
 
         if bias:

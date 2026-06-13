@@ -2,109 +2,87 @@ name: Build and Push Development Docker Images
 
 on:
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to build from (leave empty to use current branch)"
+        required: false
+        default: ""
+      tag:
+        description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
+        required: false
+        default: ""
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang"
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: release-docker-dev-${{ inputs.tag || inputs.pr_number || 'nightly' }}
+  cancel-in-progress: true
 
 jobs:
-  build-dev-x86:
-    if: ${{ github.repository == 'sgl-project/sglang' }}
-    runs-on: nvidia
-    strategy:
-      matrix:
-        variant:
-          - version: 12.9.1
-            type: all
-            tag: dev
+  prepare:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      checkout_ref: ${{ steps.config.outputs.checkout_ref }}
+      extra_build_args: ${{ steps.config.outputs.extra_build_args }}
+      tag_config: ${{ steps.config.outputs.tag_config }}
     steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          docker-images: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and Push Dev Image (x86)
+      - name: Compute build configuration
+        id: config
         run: |
-          docker buildx build --platform linux/amd64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }} --no-cache .
+          # Determine checkout ref
+          if [ -n "${{ inputs.pr_number }}" ]; then
+            echo "checkout_ref=refs/pull/${{ inputs.pr_number }}/head" >> $GITHUB_OUTPUT
+          else
+            echo "checkout_ref=" >> $GITHUB_OUTPUT
+          fi
 
-  build-blackwell-arm:
-    if: ${{ github.repository == 'sgl-project/sglang' }}
-    runs-on: labubu
-    strategy:
-      matrix:
-        variant:
-          - version: 12.9.1
-            type: blackwell_aarch
-            tag: blackwell-cu129
-    steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
+          # Determine extra build args
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "extra_build_args=--build-arg USE_LATEST_SGLANG=1 --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+          else
+            echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
+          # Determine tag suffix
+          SUFFIX=""
+          if [ -n "${{ inputs.tag }}" ]; then
+            SUFFIX="-${{ inputs.tag }}"
+          elif [ -n "${{ inputs.pr_number }}" ]; then
+            SUFFIX="-pr-${{ inputs.pr_number }}"
+          fi
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          docker-images: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
+          # Build tag config. dev-cu13 / nightly-dev-cu13 are published as
+          # aliases on the cu130 image for backwards compatibility with
+          # consumers pinned to the pre-flip names.
+          if [ -z "${SUFFIX}" ]; then
+            # Nightly: include dated tags
+            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
+          else
+            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
+          fi
+          echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+  build-and-publish:
+    needs: prepare
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: framework_final
+      checkout_ref: ${{ needs.prepare.outputs.checkout_ref }}
+      extra_build_args: ${{ needs.prepare.outputs.extra_build_args }}
+      tag_config: ${{ needs.prepare.outputs.tag_config }}
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+    secrets: inherit
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and Push Blackwell Image (ARM)
-        run: |
-          docker buildx build --platform linux/arm64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }}-arm64 --no-cache .
-
-
-  create-manifests:
-    runs-on: ubuntu-22.04
-    needs: [build-dev-x86, build-blackwell-arm]
-    if: ${{ github.repository == 'sgl-project/sglang' }}
-    strategy:
-      matrix:
-        variant:
-          - tag: dev-manifest
-            x86_tag: dev
-            arm64_tag: blackwell-cu129-arm64
-    steps:
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - run: |
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:${{ matrix.variant.tag }} \
-            lmsysorg/sglang:${{ matrix.variant.x86_tag }} \
-            lmsysorg/sglang:${{ matrix.variant.arm64_tag }}
+  cleanup-nightly:
+    needs: build-and-publish
+    if: ${{ !inputs.tag && !inputs.pr_number }}
+    uses: ./.github/workflows/_docker-cleanup-nightly.yml
+    with:
+      tag_prefixes: '["nightly-dev", "nightly-dev-cu12", "nightly-dev-cu13"]'
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+    secrets: inherit

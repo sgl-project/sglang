@@ -1,665 +1,564 @@
-name: PR Test
+name: PR Test Base
+run-name: >-
+  ${{
+    github.event_name == 'schedule' && 'Scheduled Full Run'
+    || github.event_name == 'workflow_dispatch' && format('Manual run by {0}', github.actor)
+    || github.event_name == 'pull_request' && format('PR #{0} - {1}', github.event.pull_request.number, github.event.pull_request.title)
+    || 'PR Test Base'
+  }}
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
   pull_request:
-    branches: [main]
-    types: [synchronize, labeled]
   workflow_dispatch:
     inputs:
-      version:
-        description: "FlashInfer version"
-        required: true
-        type: choice
-        default: 'release'
-        options:
-          - 'release'
-          - 'nightly'
+      force_continue_on_error:
+        description: "Force continue-on-error (test scheduled CI behavior)"
+        required: false
+        type: boolean
+        default: false
+      test_parallel_dispatch:
+        description: "Test parallel dispatch behavior (simulates scheduled run)"
+        required: false
+        type: boolean
+        default: false
+      run_all_tests:
+        description: "Run all tests (mirrors the scheduled cron's behavior — combine with test_parallel_dispatch for full sim)"
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      git_ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
+      skip_pr_test_health_check:
+        description: "Skip PR test health check fast-fail (e.g. for release branch cuts)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-  group: pr-test-${{ github.ref }}
-  cancel-in-progress: true
+  # Concurrency group structure: pr-test-{event}-{branch}-{git_ref}
+  # - event_name prevents scheduled runs from colliding with fork PRs whose branch is named 'main'
+  #   (without it, both resolve the branch segment to 'main' and block each other)
+  # - github.head_ref (pull_request) or github.ref_name (workflow_dispatch) normalizes to branch name
+  group: pr-test-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true) && 'true' || 'false' }}
+  # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: false
+
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
 
 jobs:
   # =============================================== check changes ====================================================
   check-changes:
+    uses: ./.github/workflows/_pr-test-check-changes.yml
+    with:
+      git_ref: ${{ inputs.git_ref || '' }}
+      run_all_tests: ${{ inputs.run_all_tests == true }}
+      force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
+    secrets: inherit
+
+  call-pr-test-extra:
+    if: github.event_name == 'schedule' || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true
+    uses: ./.github/workflows/pr-test-extra.yml
+    with:
+      git_ref: ${{ inputs.git_ref || '' }}
+      run_all_tests: true
+    secrets: inherit
+
+  # =============================================== Wait Jobs for Sequential PR Execution ====================================================
+  # These jobs poll GitHub API to wait for previous stages to complete.
+  # For PR runs: wait jobs run and enforce sequential execution via polling.
+  # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
+  # For PRs with the `bypass-fastfail` label: wait jobs run but return success immediately
+  # (handled inside the wait-for-jobs action), so downstream stages dispatch in parallel.
+
+  wait-for-base-a:
+    needs: [check-changes, call-gate]
+    if: |
+      always() &&
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      inputs.test_parallel_dispatch != true &&
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
-      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+      base_a_result: ${{ steps.wait.outputs.result }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Fail if the PR does not have the 'run-ci' label
-        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
-        run: |
-          echo "This pull request does not have the 'run-ci' label. Failing the workflow."
-          exit 1
+      - uses: ./.github/actions/check-maintenance
 
-      - name: Fail if the PR is a draft
-        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
-        run: |
-          echo "This pull request is a draft. Failing the workflow."
-          exit 1
-
-      - name: Detect file changes
-        id: filter
-        uses: dorny/paths-filter@v3
+      - uses: ./.github/actions/wait-for-jobs
+        id: wait
         with:
-          filters: |
-            main_package:
-              - "python/**"
-              - "scripts/ci/**"
-              - "test/**"
-              - ".github/workflows/pr-test.yml"
-            sgl_kernel:
-              - "sgl-kernel/**"
+          stage-name: base-a
+          jobs: |
+            [
+              {"prefix": "base-a-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-1-gpu-small'].size }}},
+              {"prefix": "base-a-test-cpu", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].size }}}
+            ]
+          max-wait-minutes: '240'
+
+  wait-for-base-b:
+    needs: [check-changes, call-gate, wait-for-base-a]
+    if: |
+      always() &&
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      inputs.test_parallel_dispatch != true &&
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.wait-for-base-a.result == 'success' || needs.wait-for-base-a.result == 'skipped') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      base_b_result: ${{ steps.wait.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/check-maintenance
+
+      - uses: ./.github/actions/wait-for-jobs
+        id: wait
+        with:
+          stage-name: base-b
+          jobs: |
+            [
+              {"prefix": "base-b-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-small'].size }}},
+              {"prefix": "base-b-test-1-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-large'].size }}},
+              {"prefix": "base-b-test-2-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-2-gpu-large'].size }}},
+              {"prefix": "base-b-test-4-gpu-b200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-4-gpu-b200'].size }}}
+            ]
+          max-wait-minutes: '480'
+
+  # =============================================== PR Gate ====================================================
+  call-gate:
+    needs: check-changes
+    # Skip for scheduled runs (they run all tests)
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      (
+        needs.check-changes.outputs.main_package == 'true' ||
+        needs.check-changes.outputs.sgl_kernel == 'true' ||
+        needs.check-changes.outputs.jit_kernel == 'true' ||
+        needs.check-changes.outputs.multimodal_gen == 'true'
+      )
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
 
   sgl-kernel-build-wheels:
-    needs: [check-changes]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: sgl-kernel-build-node
-    strategy:
-      matrix:
-        include:
-          - python-version: "3.10"
-            cuda-version: "12.4"
-          - python-version: "3.10"
-            cuda-version: "12.8"
-          - python-version: "3.10"
-            cuda-version: "12.9"
-    name: Build Wheel (CUDA ${{ matrix.cuda-version }})
-    steps:
-      - name: Cleanup
-        run: |
-          sudo rm -rf $GITHUB_WORKSPACE/* || true
+    needs: [check-changes, call-gate]
+    # Skip for scheduled runs (they run stages independently).
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true' &&
+      needs.call-gate.result == 'success'
+    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
+    with:
+      runs_on: x64-kernel-build-node
+      job_display_name: Build Wheel
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
 
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
+  sgl-kernel-build-wheels-arm:
+    needs: [check-changes, call-gate]
+    # Skip for scheduled runs (they run stages independently).
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true' &&
+      needs.call-gate.result == 'success'
+    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
+    with:
+      runs_on: arm-kernel-build-node
+      job_display_name: Build Wheel Arm
+      arch_suffix: '-aarch64'
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+  call-sgl-kernel-tests:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
+    uses: ./.github/workflows/pr-test-sgl-kernel.yml
+    with:
+      runner_config: 4-gpu-b200
+      runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
 
-      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
-        if: github.event_name != 'push' || (matrix.cuda-version != '11.8')
-        run: |
-          cd sgl-kernel
-          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+  # =============================================== jit-kernel ====================================================
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
-          path: sgl-kernel/dist/*
-
-  sgl-kernel-unit-test:
-    needs: [check-changes, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd sgl-kernel
-          pytest tests/
-
-  sgl-kernel-mla-test:
-    needs: [check-changes, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-runner
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          python3 test_mla_deepseek_v3.py
+  call-jit-kernel-tests:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      !failure() && !cancelled() &&
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      needs.check-changes.outputs.jit_kernel == 'true'
+    uses: ./.github/workflows/pr-test-jit-kernel.yml
+    with:
+      runner_config: 4-gpu-b200
+      runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
+      jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
 
   # =============================================== primary ====================================================
 
-  unit-test-frontend:
-    needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  # Runs on 5090 (32GB, SM120)
+  base-a-test-1-gpu-small:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-a-test-1-gpu-small
+      runner_config: 1-gpu-small
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '10'
+    secrets: inherit
 
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 10
-        run: |
-          cd test/lang
-          python3 run_suite.py --suite per-commit
-
-  unit-test-backend-1-gpu:
-    needs: [check-changes, unit-test-frontend, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 1-gpu-runner
+  base-a-test-cpu:
+    needs: [check-changes, call-gate]
+    if: |
+      always() &&
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+      (needs.check-changes.outputs.main_package == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_HOME: ${{ github.workspace }}/.hf-cache
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].max_parallel }}
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].arr }}
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          ref: ${{ inputs.git_ref || github.sha }}
 
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+      - uses: ./.github/actions/check-pr-test-health
 
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 11
+      - uses: ./.github/actions/check-maintenance
 
-  unit-test-backend-2-gpu:
-    needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 2-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
 
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
+      - name: Install protoc + Rust toolchain
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
 
-  unit-test-backend-4-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 4-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+      - name: Rust cache (sglang-grpc)
+        uses: Swatinem/rust-cache@v2
         with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          workspaces: rust/sglang-grpc
+          shared-key: "sglang-grpc-cpu"
+          save-if: ${{ matrix.partition == 0 }}
 
+      # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
         timeout-minutes: 20
+        env:
+          UV_SYSTEM_PYTHON: "1"
         run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
 
-  unit-test-backend-8-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 8-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1, 2]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+      # Hosted runners are ephemeral, so models are re-fetched every run and the
+      # Hub occasionally returns 429s. Persist the HF cache in GitHub's cache
+      # storage (rolling key + restore-keys) so warm runs never hit the network.
+      - name: Cache HF hub
+        uses: actions/cache@v4
         with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+          path: ${{ github.workspace }}/.hf-cache
+          key: hf-cpu-${{ matrix.partition }}-${{ github.run_id }}
+          restore-keys: hf-cpu-${{ matrix.partition }}-
 
       - name: Run test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
-
-  performance-test-1-gpu-part-1:
-    needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 1-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Benchmark single latency
         timeout-minutes: 10
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
-          cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
+          cd test/
+          python3 run_suite.py --hw cpu --suite base-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].size }} $CONTINUE_ON_ERROR_FLAG
 
-      - name: Benchmark online latency
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
+  # Runs on 5090 (32GB, SM120)
+  base-b-test-1-gpu-small:
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-b-test-1-gpu-small
+      runner_config: 1-gpu-small
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+    secrets: inherit
 
-      - name: Benchmark offline throughput
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
+  # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
+  base-b-test-1-gpu-large:
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-b-test-1-gpu-large
+      runner_config: 1-gpu-large
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+      timeout_per_file: '1800'
+    secrets: inherit
 
-      - name: Benchmark offline throughput (Non-streaming, small batch size)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
+  base-b-test-2-gpu-large:
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-b-test-2-gpu-large
+      runner_config: 2-gpu-large
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+    secrets: inherit
 
-      - name: Benchmark online latency (EAGLE)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
+  base-b-test-4-gpu-b200:
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-b-test-4-gpu-b200
+      runner_config: 4-gpu-b200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '40'
+    secrets: inherit
 
-      - name: Benchmark online latency (LoRA)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency
-          python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
+  call-multimodal-gen-tests:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      !cancelled() &&
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+      needs.check-changes.outputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/pr-test-multimodal-gen.yml
+    with:
+      runner_config: 4-gpu-b200
+      runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
+      multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      caller_needs_failure: ${{ (needs.call-gate.result == 'failure' || needs.sgl-kernel-build-wheels.result == 'failure' || needs.check-changes.result == 'failure') && 'true' || 'false' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
+    secrets: inherit
 
-  performance-test-1-gpu-part-2:
-    needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 1-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  base-c-test-4-gpu-h100:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-4-gpu-h100
+      runner_config: 4-gpu-h100
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+    secrets: inherit
 
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+  base-c-test-8-gpu-h200:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-8-gpu-h200
+      runner_config: 8-gpu-h200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+      # Per-model TP must match the test's launch in test/registered/ -- see
+      # FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for extra dp/ep
+      # flags. Only models that actually invoke DeepGEMM kernels at runtime
+      # are listed. Cold-cache ~13 min; warm-cache <=30 s via marker file.
+      # Server CUDA Graph warmup is combined into this step (warmup_server_models unset).
+      warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8 zai-org/GLM-5-FP8:8 XiaomiMiMo/MiMo-V2-Flash:4 XiaomiMiMo/MiMo-V2.5:8'
+      warmup_timeout_minutes: '60'
+    secrets: inherit
 
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+  base-c-test-8-gpu-h20:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-8-gpu-h20
+      runner_config: 8-gpu-h20
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+    secrets: inherit
 
-      - name: Benchmark offline throughput (w/o RadixAttention)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
+  base-c-test-deepep-4-gpu-h100:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-deepep-4-gpu-h100
+      runner_config: deepep-4-gpu-h100
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+      warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4'
+      warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
+    secrets: inherit
 
-      - name: Benchmark offline throughput (w/ Triton)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
+  base-c-test-deepep-4-gpu-b200:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-deepep-4-gpu-b200
+      runner_config: deepep-4-gpu-b200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+      timeout_per_file: '1800'
+    secrets: inherit
 
-      - name: Benchmark offline throughput (w/ FP8)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
+  base-c-test-deepep-8-gpu-h200:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-deepep-8-gpu-h200
+      runner_config: deepep-8-gpu-h200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+      timeout_per_file: '1800'
+    secrets: inherit
 
-      - name: Benchmark VLM offline throughput
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
+  base-c-test-4-gpu-b200:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-4-gpu-b200
+      runner_config: 4-gpu-b200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+      timeout_per_file: '1800'
+    secrets: inherit
 
-      - name: Benchmark VLM online latency
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
-
-  performance-test-2-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 2-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Benchmark single latency (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
-
-      - name: Benchmark single latency + torch.compile (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
-
-      - name: Benchmark offline throughput (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
-
-      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
-
-      - name: Benchmark offline PP decode throughput (PP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_pp_offline_throughput_default_decode
-
-      - name: Benchmark offline PP prefill throughput (PP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
-
-  accuracy-test-1-gpu:
-    needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 1-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e .
-
-      - name: Evaluate accuracy
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 test_eval_accuracy_large.py
-
-  accuracy-test-2-gpu:
-    needs: [check-changes, accuracy-test-1-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 2-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e .
-
-      - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 test_moe_eval_accuracy_large.py
-
-  unit-test-deepep-4-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 4-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
-
-      - name: Run test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-deepep
-
-  unit-test-deepep-8-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 8-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
-
-      - name: Run test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-deepep
-
-  unit-test-backend-4-gpu-b200:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 4-b200-runner
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.8
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 45
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
+  base-c-test-4-gpu-gb300:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-4-gpu-gb300
+      runner_config: 4-gpu-gb300
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+      timeout_per_file: '1800'
+    secrets: inherit
 
   pr-test-finish:
-    needs: [
-      check-changes,
+    needs:
+      [
+        call-gate,
+        check-changes,
 
-      sgl-kernel-build-wheels,
-      sgl-kernel-unit-test, sgl-kernel-mla-test,
+        sgl-kernel-build-wheels,
+        sgl-kernel-build-wheels-arm,
+        call-sgl-kernel-tests,
 
-      unit-test-frontend, unit-test-backend-1-gpu,
-      unit-test-backend-2-gpu, unit-test-backend-4-gpu, unit-test-backend-8-gpu,
-      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu,
-      unit-test-deepep-4-gpu, unit-test-deepep-8-gpu,
-      unit-test-backend-4-gpu-b200,
-    ]
+        wait-for-base-a,
+        wait-for-base-b,
+
+        call-jit-kernel-tests,
+
+        call-multimodal-gen-tests,
+
+        base-a-test-1-gpu-small,
+        base-a-test-cpu,
+        base-b-test-1-gpu-small,
+        base-b-test-1-gpu-large,
+        base-b-test-2-gpu-large,
+        base-b-test-4-gpu-b200,
+        base-c-test-4-gpu-h100,
+        base-c-test-8-gpu-h20,
+        base-c-test-8-gpu-h200,
+        base-c-test-deepep-4-gpu-h100,
+        base-c-test-deepep-4-gpu-b200,
+        base-c-test-deepep-8-gpu-h200,
+        base-c-test-4-gpu-b200,
+        base-c-test-4-gpu-gb300,
+      ]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -684,7 +583,34 @@ jobs:
               exit 1
             fi
           done
-
           # If the loop completes, all jobs were successful
           echo "All jobs completed successfully"
           exit 0
+
+  # =============================================== notify pr-states ====================================================
+  # Dispatches pr-states.yml after every attempt (initial + every rerun).
+  # workflow_run.completed only fires on the initial completion (one
+  # workflow_run record across attempts), so we explicitly dispatch —
+  # workflow_dispatch is the only event GITHUB_TOKEN can cascade-create.
+  #
+  # Fork PRs are excluded: their pull_request GITHUB_TOKEN is forced
+  # read-only regardless of declared `actions: write`, so dispatch 403s.
+  # Fork PRs get pr-states updates via the workflow_run subscription
+  # there (initial completion) and pull_request_target (push / label).
+  notify-pr-states:
+    needs: [pr-test-finish]
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch pr-states refresh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh workflow run pr-states.yml \
+            --repo ${{ github.repository }} \
+            --ref main \
+            -f pr_number="$PR_NUMBER"

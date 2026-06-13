@@ -40,7 +40,10 @@ class MathEval(Eval):
         num_examples: Optional[int],
         num_threads: int,
     ):
-        df = pandas.read_csv(filename)
+        if "://" in filename:
+            df = pandas.read_csv(filename, storage_options={"timeout": 30})
+        else:
+            df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
         if num_examples:
             examples = random.Random(0).sample(examples, num_examples)
@@ -54,6 +57,7 @@ class MathEval(Eval):
                 sampler._pack_message(content=QUERY_TEMPLATE.format(**row), role="user")
             ]
             response_text = sampler(prompt_messages)
+            response_text = response_text or ""
             match = re.search(ANSWER_PATTERN, response_text)
             extracted_answer = match.group(1) if match else None
             score = float(

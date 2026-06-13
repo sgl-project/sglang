@@ -1,19 +1,12 @@
 import torch
 
-from sglang.srt.sampling.penaltylib.orchestrator import (
-    BatchedPenalizerOrchestrator,
-    _BatchedPenalizer,
-)
+from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
 
 
 class BatchedFrequencyPenalizer(_BatchedPenalizer):
     """
     Frequency penalizer penalizes tokens based on their frequency in the output.
     """
-
-    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
-        self.orchestrator = orchestrator
-        self._is_prepared = False
 
     def _is_required(self) -> bool:
         return any(
@@ -63,3 +56,8 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
             [self.cumulated_frequency_penalties, their.cumulated_frequency_penalties],
             dim=0,
         )
+
+    def _teardown(self) -> None:
+        for name in ("frequency_penalties", "cumulated_frequency_penalties"):
+            if hasattr(self, name):
+                delattr(self, name)

@@ -14,12 +14,6 @@ from sglang.srt.layers.attention.fla.utils import check_shared_mem, input_guard
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
-@triton.heuristics(
-    {
-        "HAS_SCALE": lambda args: args["scale"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 # @triton.autotune(
 #     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
 #     key=["B", "H", "BT", "IS_VARLEN", "REVERSE"],
@@ -74,19 +68,14 @@ def chunk_local_cumsum_scalar_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.heuristics(
-    {
-        "HAS_SCALE": lambda args: args["scale"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 @triton.autotune(
     configs=[
-        triton.Config({"BS": BS}, num_warps=num_warps)
+        triton.Config({"BS": BS}, num_warps=num_warps, num_stages=num_stages)
         for BS in BS_LIST
         for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
     ],
-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
+    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_vector_kernel(
@@ -175,6 +164,7 @@ def chunk_local_cumsum_scalar(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
+    chunk_indices: Optional[torch.LongTensor] = None,
 ) -> torch.Tensor:
     if head_first:
         B, H, T = g.shape
@@ -184,9 +174,8 @@ def chunk_local_cumsum_scalar(
         chunk_size.bit_length() - 1
     ), "chunk_size must be a power of 2"
     BT = chunk_size
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
@@ -202,6 +191,8 @@ def chunk_local_cumsum_scalar(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        HAS_SCALE=scale is not None,
+        IS_VARLEN=cu_seqlens is not None,
         num_warps=8,
         num_stages=3,
     )
@@ -216,17 +207,15 @@ def chunk_local_cumsum_vector(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
+    chunk_indices: Optional[torch.LongTensor] = None,
 ) -> torch.Tensor:
     if head_first:
         B, H, T, S = g.shape
     else:
         B, T, H, S = g.shape
     BT = chunk_size
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     assert chunk_size == 2 ** (
         chunk_size.bit_length() - 1
@@ -253,6 +242,8 @@ def chunk_local_cumsum_vector(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        HAS_SCALE=scale is not None,
+        IS_VARLEN=cu_seqlens is not None,
     )
     return g
 
@@ -266,6 +257,7 @@ def chunk_local_cumsum(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
+    chunk_indices: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
@@ -281,6 +273,7 @@ def chunk_local_cumsum(
             cu_seqlens=cu_seqlens,
             head_first=head_first,
             output_dtype=output_dtype,
+            chunk_indices=chunk_indices,
         )
     elif len(g.shape) == 4:
         return chunk_local_cumsum_vector(
@@ -291,6 +284,7 @@ def chunk_local_cumsum(
             cu_seqlens=cu_seqlens,
             head_first=head_first,
             output_dtype=output_dtype,
+            chunk_indices=chunk_indices,
         )
     else:
         raise ValueError(

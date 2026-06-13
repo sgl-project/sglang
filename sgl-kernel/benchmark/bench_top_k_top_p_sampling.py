@@ -1,9 +1,15 @@
 import itertools
+import os
 
+import flashinfer.sampling
 import sgl_kernel
 import torch
 import triton
 import triton.testing
+
+from sglang.utils import is_in_ci
+
+IS_CI = is_in_ci()
 
 
 def torch_top_k_top_p_joint_sampling_from_probs(
@@ -62,15 +68,21 @@ def calculate_diff(batch_size, vocab_size, p):
     torch_samples = torch_top_k_top_p_joint_sampling_from_probs(
         normalized_prob, top_k_tensor, top_p_tensor
     )
-    sglang_samples = sgl_kernel.top_k_top_p_sampling_from_probs(
+    sglang_samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         normalized_prob, top_k_tensor, top_p_tensor, filter_apply_order="joint"
     )
 
 
-# parameter space
-batch_size_range = [16, 64, 128]
-vocab_size_range = [111, 32000]
-p_range = [0.1, 0.5]
+# parameter space - simplified for CI
+if IS_CI:
+    batch_size_range = [16]  # Single batch size for CI
+    vocab_size_range = [111]  # Single vocab size for CI
+    p_range = [0.1]  # Single p value for CI
+else:
+    batch_size_range = [16, 64, 128]
+    vocab_size_range = [111, 32000]
+    p_range = [0.1, 0.5]
+
 configs = list(itertools.product(batch_size_range, vocab_size_range, p_range))
 
 
@@ -107,22 +119,26 @@ def benchmark_sampling(batch_size, vocab_size, p, provider):
             normalized_prob.clone(), top_k_tensor, top_p_tensor
         )
     elif provider == "sglang":
-        fn = lambda: sgl_kernel.top_k_top_p_sampling_from_probs(
+        fn = lambda: flashinfer.sampling.top_k_top_p_sampling_from_probs(
             normalized_prob.clone(),
             top_k_tensor,
             top_p_tensor,
             filter_apply_order="joint",
         )
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-        fn, quantiles=[0.5, 0.2, 0.8]
-    )
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=[0.5, 0.2, 0.8])
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
 if __name__ == "__main__":
-    # Correctness check
-    for cfg in configs:
+    # Correctness check - simplified for CI
+    if IS_CI:
+        # Only test one configuration in CI
+        test_configs = [configs[0]] if configs else [(16, 111, 0.1)]
+    else:
+        test_configs = configs
+
+    for cfg in test_configs:
         calculate_diff(*cfg)
 
     print("\n" + "=" * 60)

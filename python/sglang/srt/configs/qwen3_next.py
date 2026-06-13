@@ -15,26 +15,25 @@
 """Qwen3Hybrid model configuration"""
 
 import enum
-import os
 
-import numpy as np
-import torch
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
-from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
+from sglang.srt.configs.update_config import adjust_tp_num_heads_if_necessary
+from sglang.srt.utils import is_cpu
 
 logger = logging.get_logger(__name__)
+_is_cpu = is_cpu()
 
 
-# NOTE: HybridLayerType
 class HybridLayerType(enum.Enum):
     full_attention = "attention"
-    swa_attention = "swa_attention"
     linear_attention = "linear_attention"
-    mamba2 = "mamba"
 
 
 class Qwen3NextConfig(PretrainedConfig):
@@ -69,6 +68,8 @@ class Qwen3NextConfig(PretrainedConfig):
             paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to `32`.
         hidden_act (`str`, *optional*, defaults to `"silu"`):
             The non-linear activation function in the decoder.
+        output_gate_type (`str`, *optional*, defaults to `None`):
+            The gate activation function used by the linear attention output norm.
         max_position_embeddings (`int`, *optional*, defaults to 32768):
             The maximum sequence length that this model might ever be used with.
         initializer_range (`float`, *optional*, defaults to 0.02):
@@ -187,6 +188,7 @@ class Qwen3NextConfig(PretrainedConfig):
         num_attention_heads=16,
         num_key_value_heads=2,
         hidden_act="silu",
+        output_gate_type=None,
         max_position_embeddings=32768,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
@@ -224,6 +226,7 @@ class Qwen3NextConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
+        self.output_gate_type = output_gate_type
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
@@ -233,7 +236,6 @@ class Qwen3NextConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.head_dim = head_dim
-        rope_config_validation(self)
 
         # linear attention (gdn now part)
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
@@ -282,45 +284,23 @@ class Qwen3NextConfig(PretrainedConfig):
         ]
 
     @property
-    def hybrid_gdn_params(self):
-        world_size = get_attention_tp_size()
-        conv_dim = (
-            self.linear_key_head_dim * self.linear_num_key_heads * 2
-            + self.linear_value_head_dim * self.linear_num_value_heads
-        )
-        conv_state_shape = (
-            divide(conv_dim, world_size),
-            self.linear_conv_kernel_dim - 1,
+    def mamba2_cache_params(self) -> Mamba2CacheParams:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+        if _is_cpu:
+            world_size = get_attention_tp_size()
+            adjust_tp_num_heads_if_necessary(self, world_size, False)
+
+        shape = Mamba2StateShape.create(
+            tp_world_size=get_attention_tp_size(),
+            intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
+            n_groups=self.linear_num_key_heads,
+            num_heads=self.linear_num_value_heads,
+            head_dim=self.linear_value_head_dim,
+            state_size=self.linear_key_head_dim,
+            conv_kernel=self.linear_conv_kernel_dim,
         )
 
-        temporal_state_shape = (
-            divide(self.linear_num_value_heads, world_size),
-            self.linear_key_head_dim,
-            self.linear_value_head_dim,
+        return Mamba2CacheParams(
+            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
         )
-        conv_dtype = torch.bfloat16
-        dtype_map = {
-            "float32": torch.float32,
-            "bfloat16": torch.bfloat16,
-        }
-        ssm_dtype = dtype_map[os.environ["SGLANG_MAMBA_SSM_DTYPE"]]
-        mamba_layers = self.linear_layer_ids
-        return (
-            conv_state_shape,
-            temporal_state_shape,
-            conv_dtype,
-            ssm_dtype,
-            mamba_layers,
-        )
-
-    @property
-    def mamba_cache_per_req(self):
-        conv_state_shape, temporal_state_shape, conv_dtype, ssm_dtype, mamba_layers = (
-            self.hybrid_gdn_params
-        )
-        mamba_layers_len = len(mamba_layers)
-
-        return (
-            int(np.prod(conv_state_shape)) * conv_dtype.itemsize
-            + int(np.prod(temporal_state_shape)) * ssm_dtype.itemsize
-        ) * mamba_layers_len

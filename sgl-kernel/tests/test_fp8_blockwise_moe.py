@@ -1,4 +1,5 @@
 import random
+import sys
 from typing import Tuple
 
 import pytest
@@ -86,8 +87,8 @@ def baseline_scaled_mm(
     ).to(out_dtype)
 
 
-def is_sm100_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 10) and (
+def is_blackwell_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
         torch.version.cuda >= "12.8"
     )
 
@@ -99,7 +100,7 @@ def is_sm90_supported(device=None) -> bool:
 
 
 @pytest.mark.skipif(
-    not (is_sm100_supported() or is_sm90_supported()),
+    not (is_blackwell_supported() or is_sm90_supported()),
     reason="fp8_blockwise_scaled_grouped_mm at sgl-kernel is only supported on sm100 or sm90",
 )
 @pytest.mark.parametrize("num_experts", [8, 16, 32, 64, 128])
@@ -218,4 +219,4 @@ def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

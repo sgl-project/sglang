@@ -15,17 +15,17 @@
 
 import dataclasses
 import logging
-from typing import List, Optional, Union
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-import triton
-import triton.language as tl
 from torch import nn
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather,
@@ -38,35 +38,68 @@ from sglang.srt.layers.dp_attention import (
     get_dp_device,
     get_dp_dtype,
     get_dp_hidden_size,
-    get_global_dp_buffer,
-    get_local_attention_dp_size,
-    set_dp_buffer_len,
+)
+from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
+from sglang.srt.layers.utils.logprob import (
+    InputLogprobsResult,
+    get_token_ids_logprobs_chunk,
+    get_token_ids_logprobs_prefill,
+    get_top_logprobs_chunk,
+    get_top_logprobs_prefill,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import dump_to_file, is_npu, use_intel_amx_backend
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import (
+    is_cpu,
+    is_npu,
+    is_pin_memory_available,
+    use_intel_amx_backend,
+)
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+
+# When set, LogitsProcessor.forward returns an empty output and skips the
+# LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
+# attention/MoE/GEMM kernels, so the LM-head all-gather is wasted work --
+# and its [batch * dp_size, vocab] output OOMs under DP attention with a
+# tight mem_fraction_static.
+_in_autotune_dummy_run = False
+
+
+def get_in_autotune_dummy_run() -> bool:
+    return _in_autotune_dummy_run
+
+
+@contextmanager
+def autotune_dummy_run_mode():
+    global _in_autotune_dummy_run
+    _in_autotune_dummy_run = True
+    try:
+        yield
+    finally:
+        _in_autotune_dummy_run = False
 
 
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
-    next_token_logits: torch.Tensor
+    # Can be None for certain prefill-only requests (e.g., multi-item scoring) that don't need next token generation
+    next_token_logits: Optional[torch.Tensor]
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
-    # he log probs of output tokens, if RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
+    # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
@@ -82,11 +115,22 @@ class LogitsProcessorOutput:
     # The logprobs of input tokens.        shape: [#token]
     input_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
-    input_top_logprobs_val: List = None
-    input_top_logprobs_idx: List = None
+    input_top_logprobs_val: Optional[List] = None
+    input_top_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
-    input_token_ids_logprobs_val: Optional[List] = None
+    # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
+    input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
+        None
+    )
     input_token_ids_logprobs_idx: Optional[List] = None
+
+    ## Part 4: Diffusion LLM only.
+    full_logits: Optional[torch.Tensor] = None
+
+    ## Part 5: Customized Info
+    customized_info: Optional[Dict[str, List[Any]]] = None
+
+    mm_input_embeds: Optional[torch.Tensor] = None
 
 
 @dataclasses.dataclass
@@ -107,9 +151,7 @@ class LogitsMetadata:
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # logits and logprobs post processing
-    temp_scaled_logprobs: bool = False
     temperature: torch.Tensor = None
-    top_p_normalized_logprobs: bool = False
     top_p: torch.Tensor = None
 
     # DP attention metadata. Not needed when DP attention is not used.
@@ -126,6 +168,11 @@ class LogitsMetadata:
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for padding
     padded_static_len: int = -1
+
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+
+    mm_input_embeds: Optional[torch.Tensor] = None
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -169,6 +216,7 @@ class LogitsMetadata:
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             padded_static_len=forward_batch.padded_static_len,
+            is_prefill_only=forward_batch.is_prefill_only,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -176,10 +224,10 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
+            mm_input_embeds=forward_batch.mm_input_embeds,
         )
 
     def compute_dp_attention_metadata(self):
-
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
         if dp_rank == 0:
@@ -214,12 +262,18 @@ class LogitsMetadata:
 
 class LogitsProcessor(nn.Module):
     def __init__(
-        self, config, skip_all_gather: bool = False, logit_scale: Optional[float] = None
+        self,
+        config,
+        skip_all_gather: bool = False,
+        logit_scale: Optional[float] = None,
+        return_full_logits: bool = False,
     ):
         super().__init__()
         self.config = config
+        self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
+        self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
+        self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
@@ -242,9 +296,13 @@ class LogitsProcessor(nn.Module):
         ):
             self.final_logit_softcapping = None
 
-        self.debug_tensor_dump_output_folder = global_server_args_dict.get(
-            "debug_tensor_dump_output_folder", None
-        )
+        self.return_full_logits = return_full_logits
+        self.enable_mis = get_global_server_args().enable_mis
+
+        # enable chunked logprobs processing
+        self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
+        # chunk size for logprobs processing
+        self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
 
     def forward(
         self,
@@ -253,19 +311,144 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[torch.Tensor] = None,
+        hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
+        multi_item_delimiter_indices = None
         if isinstance(logits_metadata, ForwardBatch):
+            multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+
+        # Autotune dummy run discards this output; see _in_autotune_dummy_run.
+        # Placed before the MIS / DLLM / common dispatch so all three LM-head
+        # paths are skipped.
+        if _in_autotune_dummy_run:
+            return LogitsProcessorOutput(next_token_logits=None)
+
+        # Multi-item scoring only for prefill-only requests with pre-computed indices.
+        if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
+            return self.compute_logprobs_for_multi_item_scoring(
+                input_ids,
+                hidden_states,
+                lm_head,
+                logits_metadata,
+                multi_item_delimiter_indices,
+            )
+
+        # Diffusion LLM only.
+        if logits_metadata.forward_mode.is_dllm_extend():
+            return self._get_dllm_logits(hidden_states, lm_head, logits_metadata)
+
         # Get the last hidden states and last logits for the next token prediction
+        (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            input_logprob_indices,
+            token_to_seq_idx,
+        ) = self._get_pruned_states(
+            hidden_states,
+            hidden_states_before_norm,
+            aux_hidden_states,
+            logits_metadata,
+        )
+
+        hidden_states_to_store = self._get_hidden_states_to_store(
+            hidden_states,
+            hidden_states_before_norm,
+            aux_hidden_states,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
+        del hidden_states
+
+        if not logits_metadata.extend_return_logprob:
+            # Compute logits for both input and sampled tokens.
+            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            sampled_logits = (
+                logits[sample_indices] if sample_indices is not None else logits
+            )
+
+            # Decode mode or extend mode without return_logprob.
+            return LogitsProcessorOutput(
+                next_token_logits=sampled_logits,
+                hidden_states=hidden_states_to_store,
+                # FIXME: These fields are not logits-related but are passed through here as a
+                # workaround since ForwardBatch is local to forward_batch_generation().
+                # They should be moved to GenerationBatchResult to keep this class clean.
+                mm_input_embeds=logits_metadata.mm_input_embeds,
+            )
+
+        # Start to process input logprobs
+        # Determine whether to use chunked or non-chunked logits processing.
+        # Skip chunking if:
+        # 1. Chunking is disabled
+        # 2. Total count is below chunk size threshold
+        # 3. DP attention all-gather is enabled (can use "enable_dp_lm_head" to enable chunking)
+        should_skip_chunking = (
+            not self.enable_logprobs_chunk
+            or pruned_states.shape[0] <= self.logprobs_chunk_size
+            or self.do_tensor_parallel_all_gather_dp_attn
+        )
+
+        if should_skip_chunking:
+            # Compute logits for both input and sampled tokens.
+            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            sampled_logits = (
+                logits[sample_indices] if sample_indices is not None else logits
+            )
+            input_logits = logits[input_logprob_indices]
+            del logits
+
+            logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
+        else:
+            logprobs_result, sampled_logits = self.process_input_logprobs_by_chunk(
+                pruned_states,
+                sample_indices,
+                input_logprob_indices,
+                token_to_seq_idx,
+                lm_head,
+                logits_metadata,
+            )
+
+        return LogitsProcessorOutput(
+            next_token_logits=sampled_logits,
+            hidden_states=hidden_states_to_store,
+            input_token_logprobs=logprobs_result.input_token_logprobs,
+            input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
+            input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
+            input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
+
+    def _get_pruned_states(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_before_norm: Optional[torch.Tensor],
+        aux_hidden_states: Optional[torch.Tensor],
+        logits_metadata: LogitsMetadata,
+    ):
+        pruned_states_before_norm: Optional[torch.Tensor] = None
+        aux_pruned_states = None
+        token_to_seq_idx = []
+
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
+            or logits_metadata.forward_mode.is_draft_extend_v2()
         ):
             pruned_states = hidden_states
+            pruned_states_before_norm = hidden_states_before_norm
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
+
         elif (
             logits_metadata.forward_mode.is_extend()
             and not logits_metadata.extend_return_logprob
@@ -287,24 +470,52 @@ class LogitsProcessor(nn.Module):
                     - 1
                 )
             pruned_states = hidden_states[last_index]
+            if hidden_states_before_norm is not None:
+                pruned_states_before_norm = hidden_states_before_norm[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
         else:
-            # Input logprobs are required.
-            # Find 3 different indices.
+            # Prefill with input logprobs.
+            # Find 4 different indices.
             # 1. pruned_states: hidden states that we want logprobs from.
             # 2. sample_indices: Indices that have sampled tokens.
             # 3. input_logprob_indices: Indices that have input logprob tokens.
+            # 4. token_to_seq_idx: map each token to its sequence index
+            #
+            # Example
+            # -------
+            # Suppose a batch (flattened by sequence):
+            # [t00, t01, t02, t03, t10, t11, t12, t13, t14, t20, t21, t22, t23, t24, t25]
+            # extend_seq_lens_cpu           = [4, 5, 6]
+            # extend_logprob_start_lens_cpu = [0, 5, 3]
+            #
+            # Then, the indices are:
+            # pruned_states         -> [t00, t01, t02, t03, t14, t23, t24, t25]
+            # sample_indices        -> [3, 4, 7]
+            # input_logprob_indices -> [0, 1, 2, 3, 5, 6, 7]
+            # token_to_seq_idx      -> [0, 0, 0, 0, 1, 2, 2, 2]
+            #
+            # If chunk is enabled and chunk_size = 3, the chunks will be computed in a chunked manner:
+            # [t00, t01, t02], [t03, t14, t23], [t24, t25]
+
             sample_index_pt = -1
             sample_indices = []
             input_logprob_indices_pt = 0
             input_logprob_indices = []
-            pt, pruned_states = 0, []
-            for extend_logprob_start_len, extend_len in zip(
-                logits_metadata.extend_logprob_start_lens_cpu,
-                logits_metadata.extend_seq_lens_cpu,
+            pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
+            aux_pruned_states_lists = (
+                [[] for _ in aux_hidden_states]
+                if aux_hidden_states is not None
+                else None
+            )
+
+            for idx, (extend_logprob_start_len, extend_len) in enumerate(
+                zip(
+                    logits_metadata.extend_logprob_start_lens_cpu,
+                    logits_metadata.extend_seq_lens_cpu,
+                )
             ):
                 # It can happen in chunked prefill. We still need to sample 1 token,
                 # But we don't want to include it in input logprob.
@@ -316,7 +527,21 @@ class LogitsProcessor(nn.Module):
                 # We always need at least 1 token to sample because that's required
                 # by a caller.
                 assert extend_len > start_len
-                pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
+                pruned_states_list.append(
+                    hidden_states[pt + start_len : pt + extend_len]
+                )
+                if hidden_states_before_norm is not None:
+                    pruned_states_before_norm_list.append(
+                        hidden_states_before_norm[pt + start_len : pt + extend_len]
+                    )
+                if aux_pruned_states_lists is not None:
+                    for j, hidden in enumerate(aux_hidden_states):
+                        aux_pruned_states_lists[j].append(
+                            hidden[pt + start_len : pt + extend_len]
+                        )
+                # Map each token to its sequence index, for chunked computation
+                # of input logprobs
+                token_to_seq_idx.extend([idx] * (extend_len - start_len))
                 pt += extend_len
                 sample_index_pt += extend_len - start_len
                 sample_indices.append(sample_index_pt)
@@ -328,29 +553,49 @@ class LogitsProcessor(nn.Module):
                 )
                 input_logprob_indices_pt += extend_len - start_len
 
-            pruned_states = torch.cat(pruned_states)
-            sample_indices = torch.tensor(
-                sample_indices, device=pruned_states.device, dtype=torch.int64
-            )
-            input_logprob_indices = torch.tensor(
-                input_logprob_indices, device=pruned_states.device, dtype=torch.int64
-            )
+            # Set the last token of the last sequence
+            token_to_seq_idx.append(len(logits_metadata.extend_seq_lens_cpu) - 1)
+            pruned_states = torch.cat(pruned_states_list)
+            if hidden_states_before_norm is not None:
+                pruned_states_before_norm = torch.cat(pruned_states_before_norm_list)
+            if aux_pruned_states_lists is not None:
+                aux_pruned_states = [torch.cat(lst) for lst in aux_pruned_states_lists]
 
-        # Compute logits for both input and sampled tokens.
-        logits = self._get_logits(pruned_states, lm_head, logits_metadata)
-        sampled_logits = (
-            logits[sample_indices] if sample_indices is not None else logits
+            # Build the index tensors via pinned host memory + non-blocking H2D
+            # so the small copy doesn't drain the stream.
+            sample_indices = torch.tensor(
+                sample_indices,
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(),
+            ).to(pruned_states.device, non_blocking=True)
+            input_logprob_indices = torch.tensor(
+                input_logprob_indices,
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(),
+            ).to(pruned_states.device, non_blocking=True)
+
+        return (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            input_logprob_indices,
+            token_to_seq_idx,
         )
 
-        if self.debug_tensor_dump_output_folder:
-            assert (
-                not self.do_tensor_parallel_all_gather
-                or get_local_attention_dp_size() == 1
-            ), "dp attention + sharded lm_head doesn't support full logits"
-            full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
-            dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)
-
+    def _get_hidden_states_to_store(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_before_norm: Optional[torch.Tensor],
+        aux_hidden_states: Optional[List[torch.Tensor]],
+        pruned_states: torch.Tensor,
+        pruned_states_before_norm: Optional[torch.Tensor],
+        aux_pruned_states: Optional[List[torch.Tensor]],
+        sample_indices: Optional[torch.Tensor],
+        logits_metadata: LogitsMetadata,
+    ) -> Optional[torch.Tensor]:
         hidden_states_to_store: Optional[torch.Tensor] = None
+        hidden_states_to_store_before_norm: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
@@ -358,6 +603,7 @@ class LogitsProcessor(nn.Module):
                     hidden_states_to_store = aux_hidden_states
                 else:
                     hidden_states_to_store = hidden_states
+                hidden_states_to_store_before_norm = hidden_states_before_norm
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
@@ -374,70 +620,215 @@ class LogitsProcessor(nn.Module):
                         if sample_indices is not None
                         else pruned_states
                     )
+                    if hidden_states_before_norm is not None:
+                        hidden_states_to_store_before_norm = (
+                            pruned_states_before_norm[sample_indices]
+                            if sample_indices is not None
+                            else pruned_states_before_norm
+                        )
             else:
                 assert False, "Should never reach"
 
-        if not logits_metadata.extend_return_logprob:
-            # Decode mode or extend mode without return_logprob.
-            return LogitsProcessorOutput(
-                next_token_logits=sampled_logits,
-                hidden_states=hidden_states_to_store,
-            )
-        else:
-            input_logprobs = logits[input_logprob_indices]
-            del hidden_states, logits
+        if hidden_states_to_store_before_norm is not None:
+            # NOTE: when hidden_states_before_norm is provided, we always
+            # prefer to return it.
+            hidden_states_to_store = hidden_states_to_store_before_norm
 
-            # Normalize the logprob w/o temperature, top-p
-            pruned_lens = torch.tensor(
-                logits_metadata.extend_logprob_pruned_lens_cpu,
-                device=input_logprobs.device,
+        return hidden_states_to_store
+
+    def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
+        input_logprobs = torch.nn.functional.log_softmax(input_logits, dim=-1)
+
+        # Get the logprob of top-k tokens
+        if logits_metadata.extend_return_top_logprob:
+            (
+                input_top_logprobs_val,
+                input_top_logprobs_idx,
+            ) = get_top_logprobs_prefill(input_logprobs, logits_metadata)
+        else:
+            input_top_logprobs_val = input_top_logprobs_idx = None
+
+        # Get the logprob of given token id
+        if logits_metadata.extend_token_ids_logprob:
+            (
+                input_token_ids_logprobs_val,
+                input_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs_prefill(input_logprobs, logits_metadata)
+        else:
+            input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
+
+        input_token_logprobs = input_logprobs[
+            torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
+            logits_metadata.extend_input_logprob_token_ids_gpu,
+        ]
+
+        return InputLogprobsResult(
+            input_token_logprobs=input_token_logprobs,
+            input_top_logprobs_val=input_top_logprobs_val,
+            input_top_logprobs_idx=input_top_logprobs_idx,
+            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+        )
+
+    def process_input_logprobs_by_chunk(
+        self,
+        pruned_states: torch.Tensor,
+        sample_indices: torch.Tensor,
+        input_logprob_indices: torch.Tensor,
+        token_to_seq_idx: list[int],
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> Tuple[InputLogprobsResult, torch.Tensor]:
+        """
+        compute logprobs for the output token from the hidden states.
+        To avoid using too much memory, we split pruned_states into chunks of
+        rows to compute input_logprobs separately, then concatenate the results.
+
+        Returns:
+            InputLogprobsResult: logprobs result
+            torch.Tensor: sampled logits
+        """
+
+        # The peak memory usage is proportional to the chunk size.
+        chunk_size = self.logprobs_chunk_size
+        total_size = pruned_states.shape[0]
+        num_chunks = (total_size + chunk_size - 1) // chunk_size
+
+        input_token_logprobs = []
+        if logits_metadata.extend_return_top_logprob:
+            input_top_logprobs_val = []
+            input_top_logprobs_idx = []
+        else:
+            input_top_logprobs_val = None
+            input_top_logprobs_idx = None
+        if logits_metadata.extend_token_ids_logprob:
+            input_token_ids_logprobs_val = []
+            input_token_ids_logprobs_idx = []
+        else:
+            input_token_ids_logprobs_val = None
+            input_token_ids_logprobs_idx = None
+
+        # If a single sequence is split into multiple chunks, we need to keep track
+        # of the pruned length of the sequences in the previous chunks.
+        split_len_topk = 0
+        split_len_token_ids = 0
+
+        for i in range(num_chunks):
+            start_idx = i * chunk_size
+            end_idx = min((i + 1) * chunk_size, total_size)
+
+            # Notify lm_head LoRA about the current chunk so it can swap
+            # to the precomputed per-chunk batch_info.  This is a no-op
+            # for non-LoRA lm_head modules.
+            if hasattr(lm_head, "set_lm_head_pass"):
+                lm_head.set_lm_head_pass(i)
+
+            # Get indices for this chunk
+            chunk_mask = (input_logprob_indices >= start_idx) & (
+                input_logprob_indices < end_idx
             )
-            if logits_metadata.temp_scaled_logprobs:
-                logits_metadata.temperature = torch.repeat_interleave(
-                    logits_metadata.temperature.view(-1),
-                    pruned_lens,
-                ).view(-1, 1)
-            if logits_metadata.top_p_normalized_logprobs:
-                logits_metadata.top_p = torch.repeat_interleave(
-                    logits_metadata.top_p,
-                    pruned_lens,
+            global_indices = input_logprob_indices[chunk_mask]
+            chunk_indices = global_indices - start_idx
+            # Get the positions in the original array where chunk_mask is True
+            # This is needed to correctly index into extend_input_logprob_token_ids_gpu
+            mask_indices = torch.nonzero(chunk_mask, as_tuple=True)[0]
+
+            # Get the logits for this chunk
+            chunk_states = pruned_states[start_idx:end_idx]
+            chunk_logits = self._get_logits(chunk_states, lm_head, logits_metadata)
+
+            # Initialize sampled_logits on first chunk
+            if i == 0:
+                sampled_logits = torch.empty(
+                    (sample_indices.shape[0], chunk_logits.shape[1]),
+                    dtype=chunk_logits.dtype,
+                    device=chunk_logits.device,
                 )
-            input_logprobs = self.compute_temp_top_p_normalized_logprobs(
-                input_logprobs, logits_metadata
+
+            # Handle sampled logits for the chunk if needed
+            # This must be done before the continue statement to ensure all sampled_logits are filled
+            chunk_sample_mask = (sample_indices >= start_idx) & (
+                sample_indices < end_idx
+            )
+            if chunk_sample_mask.any():
+                chunk_sample_indices = sample_indices[chunk_sample_mask] - start_idx
+                sampled_logits[chunk_sample_mask] = chunk_logits[chunk_sample_indices]
+
+            # If there are no input logprobs in this chunk, skip the rest
+            if chunk_indices.numel() == 0:
+                continue
+
+            # Compute the logprobs of the chunk
+            chunk_input_logprobs = chunk_logits[chunk_indices]
+            chunk_input_logprobs = torch.nn.functional.log_softmax(
+                chunk_input_logprobs, dim=-1
+            )
+
+            # For each chunk, we need to get the slice of the token_to_seq_idx
+            chunk_slice = slice(
+                token_to_seq_idx[start_idx], token_to_seq_idx[end_idx] + 1
             )
 
             # Get the logprob of top-k tokens
             if logits_metadata.extend_return_top_logprob:
-                (
+                top_k_nums = logits_metadata.top_logprobs_nums[chunk_slice]
+                pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
+                    chunk_slice
+                ]
+                split_len_topk = get_top_logprobs_chunk(
+                    chunk_input_logprobs,
+                    logits_metadata,
+                    top_k_nums,
+                    pruned_lens,
                     input_top_logprobs_val,
                     input_top_logprobs_idx,
-                ) = self.get_top_logprobs(input_logprobs, logits_metadata)
-            else:
-                input_top_logprobs_val = input_top_logprobs_idx = None
+                    split_len_topk,
+                )
 
             # Get the logprob of given token id
             if logits_metadata.extend_token_ids_logprob:
-                (
+                token_ids_logprobs = logits_metadata.token_ids_logprobs[chunk_slice]
+                pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
+                    chunk_slice
+                ]
+                split_len_token_ids = get_token_ids_logprobs_chunk(
+                    chunk_input_logprobs,
+                    token_ids_logprobs,
+                    pruned_lens,
                     input_token_ids_logprobs_val,
                     input_token_ids_logprobs_idx,
-                ) = self.get_token_ids_logprobs(input_logprobs, logits_metadata)
-            else:
-                input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
+                    split_len_token_ids,
+                )
 
-            input_token_logprobs = input_logprobs[
-                torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
-                logits_metadata.extend_input_logprob_token_ids_gpu,
+            # Get the logprob of the requested token ids
+            chunk_input_token_logprobs = chunk_input_logprobs[
+                torch.arange(
+                    chunk_input_logprobs.shape[0], device=chunk_input_logprobs.device
+                ),
+                logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
             ]
+            input_token_logprobs.append(chunk_input_token_logprobs)
 
-            return LogitsProcessorOutput(
-                next_token_logits=sampled_logits,
+        # Restore the full-pruned lm_head batch_info after chunk iteration.
+        if hasattr(lm_head, "reset_lm_head_pass"):
+            assert hasattr(
+                lm_head, "set_lm_head_pass"
+            ), "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
+            lm_head.reset_lm_head_pass()
+
+        # Concatenate the results
+        input_token_logprobs = torch.cat(input_token_logprobs, dim=0)
+
+        return (
+            InputLogprobsResult(
                 input_token_logprobs=input_token_logprobs,
                 input_top_logprobs_val=input_top_logprobs_val,
                 input_top_logprobs_idx=input_top_logprobs_idx,
-                hidden_states=hidden_states_to_store,
                 input_token_ids_logprobs_val=input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
-            )
+            ),
+            sampled_logits,
+        )
 
     def _get_logits(
         self,
@@ -452,83 +843,26 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
-        if self.do_tensor_parallel_all_gather_dp_attn:
-            logits_metadata.compute_dp_attention_metadata()
-            hidden_states, local_hidden_states = (
-                logits_metadata.gathered_buffer,
-                hidden_states,
-            )
-            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+        hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
+            hidden_states, logits_metadata
+        )
 
-        if hasattr(lm_head, "weight"):
-            if use_intel_amx_backend(lm_head):
-                logits = torch.ops.sgl_kernel.weight_packed_linear(
-                    hidden_states.to(lm_head.weight.dtype),
-                    lm_head.weight,
-                    None,  # bias
-                    True,  # is_vnni
-                )
-            else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
-        else:
-            # GGUF models
-            # TODO: use weight_packed_linear for GGUF models
-            logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
+        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
-                if self.config.vocab_size % self.attn_tp_size == 0:
-                    global_logits = torch.empty(
-                        (
-                            self.attn_tp_size,
-                            logits.shape[0],
-                            self.config.vocab_size // self.attn_tp_size,
-                        ),
-                        device=logits.device,
-                        dtype=logits.dtype,
-                    )
-                    attn_tp_all_gather_into_tensor(global_logits, logits)
-                    global_logits = global_logits.permute(1, 0, 2).reshape(
-                        logits.shape[0], self.config.vocab_size
-                    )
-                else:
-                    global_logits = torch.empty(
-                        (self.config.vocab_size, logits.shape[0]),
-                        device=logits.device,
-                        dtype=logits.dtype,
-                    )
-                    global_logits = global_logits.T
-                    attn_tp_all_gather(
-                        list(global_logits.tensor_split(self.attn_tp_size, dim=-1)),
-                        logits,
-                    )
-                logits = global_logits
+                logits = self._gather_attn_tp_logits(logits)
             else:
                 logits = tensor_model_parallel_all_gather(logits)
 
-        if self.do_tensor_parallel_all_gather_dp_attn:
-            logits, global_logits = (
-                torch.empty(
-                    (local_hidden_states.shape[0], logits.shape[1]),
-                    device=logits.device,
-                    dtype=logits.dtype,
-                ),
-                logits,
-            )
-            dp_scatter(logits, global_logits, logits_metadata)
+        logits = self._scatter_dp_attn_logits(
+            logits, local_hidden_states, logits_metadata
+        )
 
-        if logits_metadata.next_token_logits_buffer is not None:
-            logits_buffer = logits_metadata.next_token_logits_buffer
-            assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.config.vocab_size])
-            logits = logits_buffer
-        else:
-            logits = logits[:, : self.config.vocab_size].float()
+        logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
         if self.final_logit_softcapping:
             if not _is_npu:
@@ -540,125 +874,227 @@ class LogitsProcessor(nn.Module):
 
         return logits
 
-    @staticmethod
-    def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
-        max_k = max(logits_metadata.top_logprobs_nums)
-        ret = all_logprobs.topk(max_k, dim=1)
-        values = ret.values.tolist()
-        indices = ret.indices.tolist()
-
-        input_top_logprobs_val, input_top_logprobs_idx = [], []
-
-        pt = 0
-        for k, pruned_len in zip(
-            logits_metadata.top_logprobs_nums,
-            logits_metadata.extend_logprob_pruned_lens_cpu,
-        ):
-            if pruned_len <= 0:
-                input_top_logprobs_val.append([])
-                input_top_logprobs_idx.append([])
-                continue
-
-            input_top_logprobs_val.append(
-                [values[pt + j][:k] for j in range(pruned_len)]
-            )
-            input_top_logprobs_idx.append(
-                [indices[pt + j][:k] for j in range(pruned_len)]
-            )
-            pt += pruned_len
-
-        return input_top_logprobs_val, input_top_logprobs_idx
-
-    @staticmethod
-    def get_token_ids_logprobs(
-        all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata
-    ):
-        input_token_ids_logprobs_val, input_token_ids_logprobs_idx = [], []
-        pt = 0
-        for token_ids, pruned_len in zip(
-            logits_metadata.token_ids_logprobs,
-            logits_metadata.extend_logprob_pruned_lens_cpu,
-        ):
-            if pruned_len <= 0:
-                input_token_ids_logprobs_val.append([])
-                input_token_ids_logprobs_idx.append([])
-                continue
-
-            input_token_ids_logprobs_val.append(
-                [all_logprobs[pt + j, token_ids].tolist() for j in range(pruned_len)]
-            )
-            input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
-            pt += pruned_len
-
-        return input_token_ids_logprobs_val, input_token_ids_logprobs_idx
-
-    @staticmethod
-    def compute_temp_top_p_normalized_logprobs(
-        last_logits: torch.Tensor, logits_metadata: LogitsMetadata
+    def _compute_lm_head(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        compute logprobs for the output token from the given logits.
-
-        Returns:
-            torch.Tensor: logprobs from logits
-        """
-        # Scale logits if temperature scaling is enabled
-        if logits_metadata.temp_scaled_logprobs:
-            last_logits = last_logits / logits_metadata.temperature
-
-        # Normalize logprobs if top_p normalization is enabled
-        # NOTE: only normalize logprobs when top_p is set and not equal to 1.0
-        if (
-            logits_metadata.top_p_normalized_logprobs
-            and (logits_metadata.top_p != 1.0).any()
-        ):
-            from sglang.srt.layers.sampler import top_p_normalize_probs_torch
-
-            probs = torch.softmax(last_logits, dim=-1)
-            del last_logits
-            probs = top_p_normalize_probs_torch(probs, logits_metadata.top_p)
-            return torch.log(probs)
+        if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+            # This is a LoRA-wrapped module, use its forward method
+            logits = lm_head(hidden_states)
+        elif hasattr(lm_head, "weight"):
+            # Normal linear layer
+            if self.use_fp32_lm_head:
+                logits = torch.matmul(
+                    hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
+                )
+            elif use_intel_amx_backend(lm_head):
+                logits = torch.ops.sgl_kernel.weight_packed_linear(
+                    hidden_states.to(lm_head.weight.dtype),
+                    lm_head.weight,
+                    None,  # bias
+                    True,  # is_vnni
+                )
+            elif get_global_server_args().rl_on_policy_target is not None:
+                # Due to tie-weight, we may not be able to change lm_head's weight dtype
+                logits = torch.matmul(
+                    hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                )
+            else:
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
         else:
-            return torch.nn.functional.log_softmax(last_logits, dim=-1)
+            # GGUF models
+            # TODO: use weight_packed_linear for GGUF models
+            if self.use_fp32_lm_head:
+                with torch.cuda.amp.autocast(enabled=False):
+                    logits = lm_head.quant_method.apply(
+                        lm_head, hidden_states.to(torch.float32), embedding_bias
+                    )
+            else:
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states, embedding_bias
+                )
+        return logits
 
+    def _gather_dp_attn_hidden_states(
+        self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.do_tensor_parallel_all_gather_dp_attn:
+            logits_metadata.compute_dp_attention_metadata()
+            local_hidden_states = hidden_states
+            hidden_states = logits_metadata.gathered_buffer
+            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            return hidden_states, local_hidden_states
+        return hidden_states, hidden_states
 
-@triton.jit
-def fused_softcap_kernel(
-    full_logits_ptr,
-    softcapping_value,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0).to(tl.int64)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+    def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.vocab_size % self.attn_tp_size == 0:
+            global_logits = torch.empty(
+                (
+                    self.attn_tp_size,
+                    logits.shape[0],
+                    self.vocab_size // self.attn_tp_size,
+                ),
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            attn_tp_all_gather_into_tensor(global_logits, logits)
+            global_logits = global_logits.permute(1, 0, 2).reshape(
+                logits.shape[0], self.vocab_size
+            )
+        else:
+            global_logits = torch.empty(
+                (self.vocab_size, logits.shape[0]),
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            global_logits = global_logits.T
+            attn_tp_all_gather(
+                list(global_logits.tensor_split(self.attn_tp_size, dim=-1)),
+                logits,
+            )
+        return global_logits
 
-    # Load values
-    x = tl.load(full_logits_ptr + offsets, mask=mask)
+    def _scatter_dp_attn_logits(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ) -> torch.Tensor:
+        if self.do_tensor_parallel_all_gather_dp_attn:
+            global_logits = logits
+            logits = torch.empty(
+                (local_hidden_states.shape[0], global_logits.shape[1]),
+                device=global_logits.device,
+                dtype=global_logits.dtype,
+            )
+            dp_scatter(logits, global_logits, logits_metadata)
+        return logits
 
-    # Perform operations in-place
-    x = x / softcapping_value
+    def _copy_logits_to_buffer(
+        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> torch.Tensor:
+        if logits_metadata.next_token_logits_buffer is not None:
+            logits_buffer = logits_metadata.next_token_logits_buffer
+            assert logits_buffer.dtype == torch.float
+            logits_buffer.copy_(logits[:, : self.vocab_size])
+            logits = logits_buffer
+        else:
+            logits = logits[:, : self.vocab_size].float()
+        return logits
 
-    # Manual tanh implementation using exp
-    exp2x = tl.exp(2 * x)
-    x = (exp2x - 1) / (exp2x + 1)
+    def _get_dllm_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> LogitsProcessorOutput:
+        assert self.return_full_logits
+        full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+        return LogitsProcessorOutput(
+            full_logits=full_logits,
+            next_token_logits=None,
+        )
 
-    x = x * softcapping_value
+    def compute_logprobs_for_multi_item_scoring(
+        self,
+        input_ids,
+        hidden_states,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: Union[LogitsMetadata, ForwardBatch],
+        multi_item_delimiter_indices: List[torch.Tensor],
+    ):
+        """
+        Compute logprobs for multi-item scoring using pre-computed delimiter indices.
 
-    # Store result
-    tl.store(full_logits_ptr + offsets, x, mask=mask)
+        Sequence format: Query<delimiter>Item1<delimiter>Item2<delimiter>...
+        Scoring positions: Extracts logprobs at positions before each <delimiter>
 
+        Args:
+            input_ids: Input token IDs. Shape: [total_sequence_length].
+            hidden_states: Hidden states from the model. Shape: [sequence_length, hidden_dim].
+            lm_head: Language model head for computing logits.
+            logits_metadata: Metadata containing batch info and logprob specs.
+            multi_item_delimiter_indices: Pre-computed delimiter positions per request (CPU tensors).
+        """
+        # Compute positions just before each delimiter.
+        # Build offset-adjusted indices on CPU, then do a single CPU→GPU transfer.
+        device = input_ids.device
+        all_tensors = []
+        if logits_metadata.extend_seq_lens_cpu is not None:
+            offset = 0
+            for req_seq_len, indices_tensor in zip(
+                logits_metadata.extend_seq_lens_cpu, multi_item_delimiter_indices
+            ):
+                if len(indices_tensor) > 0:
+                    # Note: if the first delimiter is at position 0 (empty query),
+                    # indices - 1 wraps to -1. This is harmless — the first
+                    # delimiter entry is always discarded by
+                    # _process_multi_item_scoring_results.
+                    all_tensors.append(indices_tensor + (offset - 1))
+                offset += req_seq_len
+        else:
+            all_tensors.append(multi_item_delimiter_indices[0] - 1)
+        multi_item_indices = torch.cat(all_tensors).to(device, non_blocking=True)
 
-def fused_softcap(full_logits, final_logit_softcapping):
-    n_elements = full_logits.numel()
-    BLOCK_SIZE = 1024
-    grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE, 1, 1)
+        # Extract hidden states at delimiter positions for multi-item scoring
+        sliced_hidden = hidden_states[multi_item_indices]
 
-    fused_softcap_kernel[grid](
-        full_logits_ptr=full_logits,
-        softcapping_value=final_logit_softcapping,
-        n_elements=n_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return full_logits
+        sliced_logits = self._get_logits(sliced_hidden, lm_head, logits_metadata)
+        sliced_logprobs = torch.nn.functional.log_softmax(sliced_logits, dim=-1)
+
+        # Initialize return values
+        input_token_ids_logprobs_val = []
+        input_token_ids_logprobs_idx = []
+        input_top_logprobs_val = None
+        input_top_logprobs_idx = None
+
+        # Recalculate extend_logprob_pruned_lens_cpu to match delimiter counts per request
+        if (
+            logits_metadata.token_ids_logprobs
+            or logits_metadata.extend_return_top_logprob
+        ):
+            logits_metadata.extend_logprob_pruned_lens_cpu = [
+                len(t) for t in multi_item_delimiter_indices
+            ]
+
+        # Get the logprobs of specified token ids
+        if logits_metadata.extend_token_ids_logprob:
+            (
+                input_token_ids_logprobs_val,
+                input_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs_prefill(
+                sliced_logprobs, logits_metadata, no_copy_to_cpu=True
+            )
+
+        # Get the logprob of top-k tokens
+        if logits_metadata.extend_return_top_logprob:
+            (
+                input_top_logprobs_val,
+                input_top_logprobs_idx,
+            ) = get_top_logprobs_prefill(sliced_logprobs, logits_metadata)
+
+        # MIS scores come from input_token_ids_logprobs_val (label-token logprobs),
+        # not from per-position input_token_logprobs. However, the shared logprob
+        # pipeline (add_input_logprob_return_values) asserts input_token_logprobs is
+        # non-None, converts it to a tuple, slices it, and validates its length —
+        # all before score_request() ever sees the result. We can't set it to None
+        # without changing those shared asserts, so we fill with zeros to satisfy
+        # the pipeline. score_request() ignores this field entirely.
+        input_token_logprobs = torch.zeros(multi_item_indices.shape[0], device=device)
+
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            input_token_logprobs=input_token_logprobs,
+            input_top_logprobs_val=input_top_logprobs_val,
+            input_top_logprobs_idx=input_top_logprobs_idx,
+            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+            # FIXME: These fields are not logits-related but are passed through here as a
+            # workaround since ForwardBatch is local to forward_batch_generation().
+            # They should be moved to GenerationBatchResult to keep this class clean.
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )

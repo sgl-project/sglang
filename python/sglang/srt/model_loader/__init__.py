@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/__init__.py
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ def get_model(
     load_config: LoadConfig,
     device_config: DeviceConfig,
 ) -> nn.Module:
-    loader = get_model_loader(load_config)
+    loader = get_model_loader(load_config, model_config)
     return loader.load_model(
         model_config=model_config,
         device_config=device_config,

@@ -1,6 +1,7 @@
 import atexit
 import json
 import multiprocessing
+import time
 import warnings
 from typing import Dict, List, Optional, Union
 
@@ -66,7 +67,7 @@ class RuntimeEndpoint(BaseBackend):
 
     def get_server_info(self):
         res = http_request(
-            self.base_url + "/get_server_info",
+            self.base_url + "/server_info",
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -365,15 +366,23 @@ class Runtime:
     def __init__(
         self,
         log_level: str = "error",
+        launch_timeout: float = 300.0,
         *args,
         **kwargs,
     ):
-        """See the arguments in server_args.py::ServerArgs"""
+        """See the arguments in server_args.py::ServerArgs
+
+        Args:
+            log_level: Log level for the server.
+            timeout: Timeout in seconds for waiting for the server to start.
+            *args: Additional arguments passed to ServerArgs.
+            **kwargs: Additional keyword arguments passed to ServerArgs.
+        """
         # We delay the import of any `sglang.srt` components in `sglang.lang`, so users can run
         # client code without installing SRT server and its dependency if they want.
         from sglang.srt.entrypoints.http_server import launch_server
         from sglang.srt.server_args import ServerArgs
-        from sglang.srt.utils import is_port_available
+        from sglang.srt.utils.network import is_port_available
 
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
 
@@ -388,31 +397,39 @@ class Runtime:
 
         # NOTE: We store pid instead of proc to fix some issues during __delete__
         self.pid = None
-        pipe_reader, pipe_writer = multiprocessing.Pipe(duplex=False)
 
         ctx = multiprocessing.get_context("spawn")
         proc = ctx.Process(
             target=launch_server,
-            args=(self.server_args, pipe_writer),
+            args=(self.server_args,),
         )
         proc.start()
-        pipe_writer.close()
         self.pid = proc.pid
 
         # Before python program terminates, call shutdown implicitly. Therefore, users don't have to explicitly call .shutdown()
         atexit.register(self.shutdown)
 
-        # TODO: remove this pipe_writer mechanism and use `/health_generate` instead.
-        try:
-            init_state = pipe_reader.recv()
-        except EOFError:
-            init_state = ""
+        # Wait for server to be ready by polling /health_generate
+        start_time = time.time()
+        with requests.Session() as session:
+            while time.time() - start_time < launch_timeout:
+                try:
+                    response = session.get(f"{self.url}/health_generate")
+                    if response.status_code == 200:
+                        break
+                except requests.RequestException:
+                    pass
 
-        if init_state != "ready":
-            self.shutdown()
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
+                if not proc.is_alive():
+                    self.shutdown()
+                    raise RuntimeError(
+                        "Initialization failed. Please see the error messages above."
+                    )
+
+                time.sleep(2)
+            else:
+                self.shutdown()
+                raise TimeoutError("Server failed to start within the timeout period.")
 
         self.endpoint = RuntimeEndpoint(self.url)
 
@@ -433,7 +450,7 @@ class Runtime:
         self.endpoint.cache_prefix(prefix)
 
     def get_tokenizer(self):
-        from sglang.srt.hf_transformers_utils import get_tokenizer
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(
             self.server_args.tokenizer_path,
@@ -514,7 +531,7 @@ class Runtime:
 
     async def get_server_info(self):
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self.url}/get_server_info") as response:
+            async with session.get(f"{self.url}/server_info") as response:
                 if response.status == 200:
                     return await response.json()
                 else:

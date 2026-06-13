@@ -1,7 +1,5 @@
-import itertools
 import unittest
 
-import sgl_kernel
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 from utils import precision
@@ -117,6 +115,10 @@ class TestMLA(CustomTestCase):
             b_seq_len,
             sm_scale,
             logit_cap,
+            False,
+            0,
+            None,
+            None,
         )
 
         self._run_sdpa_forward_decode(

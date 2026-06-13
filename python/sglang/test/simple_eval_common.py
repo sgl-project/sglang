@@ -91,8 +91,10 @@ class ChatCompletionSampler(SamplerBase):
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         temperature: float = 0.0,
+        top_p: float = 1.0,
         reasoning_effort: Optional[str] = None,
         max_tokens: int = 2048,
+        extra_body: Optional[Dict[str, Any]] = None,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
@@ -102,11 +104,14 @@ class ChatCompletionSampler(SamplerBase):
         self.model = model
         self.system_message = system_message
         self.temperature = temperature
+        self.top_p = top_p
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
+        self.extra_body = extra_body
         self.image_format = "url"
+        self._completion_tokens: list[int] = []
         print(
-            f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=}"
+            f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=}"
         )
 
     def _handle_image(
@@ -142,10 +147,14 @@ class ChatCompletionSampler(SamplerBase):
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,
+                    top_p=self.top_p,
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
+                    extra_body=self.extra_body,
                 )
-                return response.choices[0].message.content
+                if response.usage and response.usage.completion_tokens is not None:
+                    self._completion_tokens.append(response.usage.completion_tokens)
+                return response.choices[0].message.content or ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)
@@ -158,7 +167,78 @@ class ChatCompletionSampler(SamplerBase):
                 )
                 time.sleep(exception_backoff)
                 trial += 1
-            # unknown error shall throw exception
+        # If all retries are exhausted, return empty string instead of None
+        print(f"All retry attempts exhausted for request. Returning empty response.")
+        return ""
+
+
+class CompletionSampler(SamplerBase):
+    """
+    Sample from OpenAI's completion API (non-chat).
+    Sends raw text prompts without chat template wrapping.
+    """
+
+    def __init__(
+        self,
+        base_url: str = None,
+        model: Optional[str] = None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        max_tokens: int = 2048,
+        stop: Optional[List[str]] = None,
+    ):
+        self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
+
+        if model is None:
+            model = self.client.models.list().data[0].id
+
+        self.model = model
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
+        self.stop = stop
+        self._completion_tokens: list[int] = []
+        print(
+            f"CompletionSampler initialized with {self.model=} {self.temperature=} {self.max_tokens=} {self.stop=}"
+        )
+
+    def _pack_message(self, role: str, content: Any):
+        return {"role": str(role), "content": content}
+
+    def __call__(self, message_list: MessageList) -> str:
+        # Extract raw text from message list (eval objects pack prompt as a single user message)
+        prompt = "\n".join(
+            msg["content"]
+            for msg in message_list
+            if isinstance(msg.get("content"), str)
+        )
+        trial = 0
+        while trial < 6:
+            try:
+                response = self.client.completions.create(
+                    model=self.model,
+                    prompt=prompt,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    max_tokens=self.max_tokens,
+                    stop=self.stop,
+                )
+                if response.usage and response.usage.completion_tokens is not None:
+                    self._completion_tokens.append(response.usage.completion_tokens)
+                return response.choices[0].text or ""
+            except openai.BadRequestError as e:
+                print("Bad Request Error", e)
+                return ""
+            except Exception as e:
+                exception_backoff = 2**trial
+                print(
+                    f"Rate limit exception so wait and retry {trial} after {exception_backoff} sec",
+                    e,
+                )
+                time.sleep(exception_backoff)
+                trial += 1
+        print(f"All retry attempts exhausted for request. Returning empty response.")
+        return ""
 
 
 QUERY_TEMPLATE_MULTICHOICE = """
@@ -258,7 +338,7 @@ def format_multichoice_question(row):
 def check_equality(sampler: SamplerBase, expr1: str, expr2: str):
     prompt = EQUALITY_TEMPLATE % {"expression1": expr1, "expression2": expr2}
     response = sampler([dict(content=prompt, role="user")])
-    return response.lower().strip() == "yes"
+    return (response or "").lower().strip() == "yes"
 
 
 def _compute_stat(values: list, stat: str):
@@ -287,6 +367,9 @@ def aggregate_results(
     htmls = []
     convos = []
     for single_eval_result in single_eval_results:
+        # Skip None results
+        if single_eval_result is None:
+            continue
         for name, value in single_eval_result.metrics.items():
             name2values[name].append(value)
         if single_eval_result.score is not None:
@@ -439,19 +522,22 @@ def make_report_from_example_htmls(htmls: List[str]):
 def download_dataset(path, url):
     print(f"Downloading dataset {path} from {url}")
     try:
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=30)
         response.raise_for_status()
 
         total_size = int(response.headers.get("content-length", 0))
         block_size = 8192
 
-        with open(path, "wb") as f, tqdm(
-            desc="Downloading",
-            total=total_size,
-            unit="iB",
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as progress_bar:
+        with (
+            open(path, "wb") as f,
+            tqdm(
+                desc="Downloading",
+                total=total_size,
+                unit="iB",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as progress_bar,
+        ):
             for data in response.iter_content(block_size):
                 size = f.write(data)
                 progress_bar.update(size)

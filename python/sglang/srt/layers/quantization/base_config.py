@@ -1,9 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/base_config.py
 from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import torch
@@ -11,13 +12,14 @@ from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.models.utils import WeightsMapper
 
 
 class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
 
-    @abstractmethod
     def create_weights(
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
     ):
@@ -44,7 +46,6 @@ class QuantizeMethodBase(ABC):
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
-    @abstractmethod
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -84,7 +85,6 @@ class LinearMethodBase(QuantizeMethodBase):
 
 class FusedMoEMethodBase(QuantizeMethodBase):
 
-    @abstractmethod
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -96,7 +96,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ):
         raise NotImplementedError
 
-    @abstractmethod
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -110,6 +109,19 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> CombineInput:
         raise NotImplementedError
 
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        """Return a ``TritonMoeQuantInfo`` describing the quantisation state
+        stored on *layer*.
+
+        The LoRA MoE runner calls this so that ``invoke_fused_moe_kernel``
+        receives the correct flags / scales / block-shape for the base
+        weights.  Each quantisation method must override this with the
+        same construction it already uses inside ``apply()``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_triton_quant_info()"
+        )
+
 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
@@ -118,6 +130,9 @@ class QuantizationConfig(ABC):
         super().__init__()
         # mapping is updated by models as they initialize
         self.packed_modules_mapping: Dict[str, List[str]] = dict()
+
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
+        self.packed_modules_mapping = mapping
 
     @abstractmethod
     def get_name(self) -> str:
@@ -148,7 +163,7 @@ class QuantizationConfig(ABC):
 
     @classmethod
     @abstractmethod
-    def from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+    def from_config(cls, config: Dict[str, Any]) -> QuantizationConfig:
         """Create a config class from the model's quantization config."""
         raise NotImplementedError()
 
@@ -160,6 +175,33 @@ class QuantizationConfig(ABC):
         this method should only be overwritten by subclasses in exceptional
         circumstances
         """
+        return None
+
+    @classmethod
+    def _modelopt_override_quantization_method(
+        cls, hf_quant_config, user_quant
+    ) -> Optional[str]:
+        """Shared ModelOpt quantization method override logic."""
+        if hf_quant_config is None:
+            return None
+
+        # Check if this is a ModelOpt config
+        quant_algo = hf_quant_config.get("quant_algo", "").upper()
+
+        # If user specified generic "modelopt", auto-detect the specific method
+        if user_quant == "modelopt":
+            if "FP8" in quant_algo:
+                return "modelopt_fp8"
+            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
+                return "modelopt_fp4"
+
+        # The hf_quant_config may be a parsed quant config, so we need to check the
+        # quant_method.
+        if hf_quant_config.get("quant_method", "") == "modelopt_fp8":
+            return "modelopt_fp8"
+        elif hf_quant_config.get("quant_method", "") == "modelopt_fp4":
+            return "modelopt_fp4"
+
         return None
 
     @staticmethod
@@ -202,6 +244,17 @@ class QuantizationConfig(ABC):
         For now, this is only used by AWQ.
         """
         raise NotImplementedError()
+
+    def apply_weight_name_mapper(
+        self, hf_to_sglang_mapper: WeightsMapper
+    ):  # noqa: B027
+        """
+        Interface for models to update module names referenced in
+        quantization configs in order to reflect the sglang model structure
+        :param hf_to_sglang_mapper: maps from hf model structure (the assumed
+            structure of the qconfig) to sglang model structure
+        """
+        pass
 
 
 def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:

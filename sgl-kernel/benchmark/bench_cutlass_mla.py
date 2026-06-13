@@ -1,13 +1,24 @@
 import argparse
 import copy
 import itertools
+import os
 
 import torch
 import triton
 from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 
-bs_range = [1, 8, 32, 64, 128, 256]
-qlen_range = [1, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+from sglang.srt.utils import get_device_capability
+from sglang.utils import is_in_ci
+
+IS_CI = is_in_ci()
+
+# CI environment uses simplified parameters
+if IS_CI:
+    bs_range = [1]  # Single batch size for CI
+    qlen_range = [64]  # Single sequence length for CI
+else:
+    bs_range = [1, 8, 32, 64, 128, 256]
+    qlen_range = [1, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
 configs = list(itertools.product(bs_range, qlen_range))
 
@@ -131,13 +142,34 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    for block_size in args.block_sizes:
-        for kv_split in args.num_kv_splits:
-            print(f"block_size={block_size}, num_kv_splits={kv_split}: ")
-            benchmark.run(
-                print_data=True,
-                block_size=block_size,
-                num_kv_splits=kv_split,
-            )
-
-    print("Benchmark finished!")
+    # Skip in CI environment or unsupported architectures
+    if IS_CI:
+        major, minor = get_device_capability()
+        if major is None or major < 10:  # Requires compute capability 10.0+
+            print("Skipping Cutlass MLA benchmark in CI environment")
+            if major is not None:
+                print(
+                    f"Cutlass MLA requires compute capability 10.0+, but found {major}.{minor}"
+                )
+            else:
+                print("Could not determine device capability")
+        else:
+            for block_size in args.block_sizes:
+                for kv_split in args.num_kv_splits:
+                    print(f"block_size={block_size}, num_kv_splits={kv_split}: ")
+                    benchmark.run(
+                        print_data=True,
+                        block_size=block_size,
+                        num_kv_splits=kv_split,
+                    )
+            print("Benchmark finished!")
+    else:
+        for block_size in args.block_sizes:
+            for kv_split in args.num_kv_splits:
+                print(f"block_size={block_size}, num_kv_splits={kv_split}: ")
+                benchmark.run(
+                    print_data=True,
+                    block_size=block_size,
+                    num_kv_splits=kv_split,
+                )
+        print("Benchmark finished!")

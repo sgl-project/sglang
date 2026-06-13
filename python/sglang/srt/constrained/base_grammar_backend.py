@@ -15,13 +15,13 @@
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from threading import Event
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,8 @@ class GrammarStats:
     is_cache_hit: bool = False
     is_grammar_aborted: bool = False
     tree_traversal_time: List[float] = field(default_factory=list)
+    dispatch_type: Optional[str] = None
+    num_timeout: int = 0
 
 
 class BaseGrammarObject:
@@ -43,6 +45,9 @@ class BaseGrammarObject:
         self._finished = False
         self.grammar_stats = None
         self.current_token = None
+
+    def maybe_init_reasoning(self, reasoning: bool):
+        pass
 
     def accept_token(self, token: int) -> None:
         """
@@ -112,44 +117,67 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
 
-INVALID_GRAMMAR_OBJ = BaseGrammarObject()
+class InvalidGrammarObject(BaseGrammarObject):
+    """Represents a grammar that failed to compile, carrying the original error message."""
 
+    def __init__(self, error_message: str = "Unknown grammar error"):
+        super().__init__()
+        self.error_message = error_message
 
-@dataclass
-class CacheEntry:
-    value: BaseGrammarObject
-    event: Event
+    def __repr__(self):
+        return f"InvalidGrammarObject(error_message={self.error_message!r})"
 
 
 class BaseGrammarBackend:
+    _enable_strict_thinking: bool = False
+
     def __init__(self):
         self.executor = ThreadPoolExecutor()
-        self.cache: Dict[Tuple[str, str], CacheEntry] = {}
+        self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
 
-    def _not_supported(self, key_type: str, key_string: str) -> None:
+    def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
+        return InvalidGrammarObject()
 
-    def dispatch_fallback(
-        self, key_type: str, key_string: str
-    ) -> Optional[BaseGrammarObject]:
+    @property
+    def enable_strict_thinking(self):
+        return self._enable_strict_thinking
+
+    @property
+    def is_support_token_filter(self):
+        return False
+
+    def set_token_filter(
+        self, vocab_mask, token_ids, batch_idx, is_allowed=True, reset_vocab_mask=True
+    ):
+        """Set or clear specific tokens in the vocab mask. No-op by default."""
+        pass
+
+    def init_strict_reasoning_grammar(self, reasoning: bool):
+        """Create a grammar object for strict token filtering only. Returns None by default."""
+        return None
+
+    def dispatch_fallback(self, key_type: str, key_string: str) -> BaseGrammarObject:
         """
         This function should not be reached in any case.
         """
         raise ValueError(f"Invalid key_type: {key_type}={key_string}")
 
-    def dispatch_json(self, key_string: str) -> Optional[BaseGrammarObject]:
+    def dispatch_json(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("json", key_string)
 
-    def dispatch_regex(self, key_string: str) -> Optional[BaseGrammarObject]:
+    def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("regex", key_string)
 
-    def dispatch_ebnf(self, key_string: str) -> Optional[BaseGrammarObject]:
+    def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("ebnf", key_string)
 
-    def dispatch_structural_tag(self, key_string: str) -> Optional[BaseGrammarObject]:
+    def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("structural_tag", key_string)
 
-    def _init_value_dispatch(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
+    def _init_value_dispatch(
+        self, key: Tuple[str, str], require_reasoning: bool
+    ) -> BaseGrammarObject:
         s = time.perf_counter()
         key_type, key_string = key
         if key_type == "json":
@@ -160,10 +188,6 @@ class BaseGrammarBackend:
             grammar = self.dispatch_ebnf(key_string)
         elif key_type == "structural_tag":
             grammar = self.dispatch_structural_tag(key_string)
-        elif key_type == "structural_pattern":
-            grammar = self.dispatch_structural_pattern(key_string)
-        elif key_type == "structural_pattern_v2":
-            grammar = self.dispatch_structural_pattern_v2(key_string)
         else:
             grammar = self.dispatch_fallback(key_type, key_string)
 
@@ -172,12 +196,14 @@ class BaseGrammarBackend:
         return grammar
 
     def get_cached_or_future_value(
-        self, key: Tuple[str, str]
-    ) -> Optional[BaseGrammarObject]:
+        self, key: Tuple[str, str], require_reasoning: bool
+    ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
         value = self.cache.get(key)
         if value:
-            return value.copy(), True
-        value = self.executor.submit(self._init_value_dispatch, key)
+            copied_value = value.copy()
+            copied_value.maybe_init_reasoning(require_reasoning)
+            return copied_value, True
+        value = self.executor.submit(self._init_value_dispatch, key, require_reasoning)
         return value, False
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
@@ -199,6 +225,7 @@ def create_grammar_backend(
     tokenizer,
     vocab_size: int,
     eos_token_ids: Optional[set] = None,
+    think_end_id: Optional[int] = None,
 ) -> Optional[BaseGrammarBackend]:
     name = server_args.grammar_backend
 
@@ -217,33 +244,70 @@ def create_grammar_backend(
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
         )
     elif name == "xgrammar":
-        from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+        from sglang.srt.constrained.xgrammar_backend import (
+            TokenizerNotSupportedError,
+            XGrammarGrammarBackend,
+        )
 
         # Convert Set[int] to List[int] if needed
         eos_list = list(eos_token_ids) if eos_token_ids else None
 
-        grammar_backend = XGrammarGrammarBackend(
-            tokenizer, vocab_size=vocab_size, model_eos_token_ids=eos_list
-        )
+        try:
+            grammar_backend = XGrammarGrammarBackend(
+                tokenizer,
+                vocab_size=vocab_size,
+                model_eos_token_ids=eos_list,
+                any_whitespace=not server_args.constrained_json_disable_any_whitespace,
+            )
+        except TokenizerNotSupportedError as e:
+            if server_args.enable_strict_thinking:
+                raise ValueError(
+                    f"--enable-strict-thinking requires a grammar backend with "
+                    f"token filtering support, but XGrammar failed to initialize: "
+                    f"{e}. Cannot fall back to grammar_backend='none' with strict "
+                    f"thinking enabled."
+                ) from e
+            logger.warning(
+                f"Grammar backend disabled because tokenizer is not supported by XGrammar: {e}. "
+                "Falling back to grammar_backend='none'. "
+                "Structured outputs (JSON schema, regex, EBNF) will not be available."
+            )
+            server_args.grammar_backend = "none"
+            return None
     elif name == "llguidance":
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 
         grammar_backend = GuidanceBackend(
             tokenizer=tokenizer,
+            any_whitespace=not server_args.constrained_json_disable_any_whitespace,
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
         )
     elif name == "none":
+        if server_args.enable_strict_thinking:
+            raise ValueError(
+                "--enable-strict-thinking requires a grammar backend that supports "
+                "token filtering, but grammar_backend='none' was specified. Use "
+                "--grammar-backend xgrammar or another backend that supports token "
+                "filtering."
+            )
         return None
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
+    if server_args.reasoning_parser and think_end_id is not None:
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )
 
+        reasoning_parser = ReasoningParser(
+            model_type=server_args.reasoning_parser, stream_reasoning=False
+        )
+
         grammar_backend = ReasonerGrammarBackend(
-            grammar_backend, tokenizer.think_end_id
+            grammar_backend,
+            reasoning_parser,
+            tokenizer,
+            enable_strict_thinking=server_args.enable_strict_thinking,
         )
 
     return grammar_backend

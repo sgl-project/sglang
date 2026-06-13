@@ -5,16 +5,17 @@ import json
 import logging
 import os
 import random
-import socket
 import ssl
 import subprocess
 import sys
 import time
 import traceback
 import urllib.request
+import warnings
 import weakref
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from functools import wraps
+from functools import cached_property, wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
@@ -26,7 +27,61 @@ from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
+
+KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
+    "hunyuan3d": "Hunyuan3D2Pipeline",
+    "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
+    "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "comfy-org--ideogram-4": "Ideogram4Nvfp4Pipeline",
+}
+
+
+def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
+    raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
+    if not raw_value:
+        return {}
+
+    if raw_value.startswith("{"):
+        payload = json.loads(raw_value)
+    else:
+        with open(os.path.expanduser(raw_value), encoding="utf-8") as f:
+            payload = json.load(f)
+
+    if not isinstance(payload, dict):
+        return {}
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for source_model_id, spec in payload.items():
+        if isinstance(spec, str):
+            normalized[source_model_id] = {"overlay_repo_id": spec}
+        elif isinstance(spec, dict) and spec.get("overlay_repo_id"):
+            normalized[source_model_id] = dict(spec)
+    return normalized
+
+
+def has_diffusion_overlay_registry_match(
+    model_path: str, registry: dict[str, dict[str, Any]] | None = None
+) -> bool:
+    registry = (
+        load_diffusion_overlay_registry_from_env() if registry is None else registry
+    )
+    if model_path in registry:
+        return True
+    if not os.path.exists(model_path):
+        return False
+    base_name = os.path.basename(os.path.normpath(model_path))
+    return any(base_name == key.rsplit("/", 1)[-1] for key in registry)
+
+
+def is_known_non_diffusers_diffusion_model(model_path: str) -> bool:
+    model_path_lower = model_path.lower()
+    return any(
+        pattern in model_path_lower
+        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
+    )
 
 
 def execute_once(func):
@@ -119,12 +174,34 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
             )
 
 
+def normalize_base_url(host: str, port: int) -> str:
+    from sglang.srt.utils.network import NetworkAddress
+
+    if host.startswith("http://") or host.startswith("https://"):
+        warnings.warn(
+            f"Including the scheme in --host ('{host}') is deprecated. "
+            f"Pass just the hostname (e.g. '127.0.0.1') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return f"{host}:{port}"
+    return NetworkAddress(host, port).to_url()
+
+
 class HttpResponse:
     def __init__(self, resp):
         self.resp = resp
 
+    @cached_property
+    def _body(self):
+        return self.resp.read()
+
     def json(self):
-        return json.loads(self.resp.read())
+        return json.loads(self._body)
+
+    @property
+    def text(self):
+        return self._body.decode("utf-8", errors="replace")
 
     @property
     def status_code(self):
@@ -179,7 +256,16 @@ def encode_image_base64(image_path: Union[str, bytes]):
     elif isinstance(image_path, bytes):
         return pybase64.b64encode(image_path).decode("utf-8")
     else:
-        # image_path is PIL.WebPImagePlugin.WebPImageFile
+        import torch
+
+        if isinstance(image_path, torch.Tensor):
+            # Convert GPU-decoded image tensor (C, H, W) uint8 to PIL Image
+            from PIL import Image
+
+            tensor = image_path.cpu() if image_path.device.type != "cpu" else image_path
+            image_path = Image.fromarray(tensor.permute(1, 2, 0).numpy())
+
+        # image_path is a PIL Image
         image = image_path
         buffered = BytesIO()
         image.save(buffered, format="PNG")
@@ -342,13 +428,16 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     chunk_size = 1024  # Download in chunks of 1KB
 
     # Use tqdm to display the progress bar
-    with open(filename, "wb") as f, tqdm(
-        desc=filename,
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
+    with (
+        open(filename, "wb") as f,
+        tqdm(
+            desc=filename,
+            total=total_size,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar,
+    ):
         for chunk in response.iter_content(chunk_size=chunk_size):
             f.write(chunk)
             bar.update(len(chunk))
@@ -356,10 +445,8 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
-def is_in_ci():
-    from sglang.test.test_utils import is_in_ci
-
-    return is_in_ci()
+def is_in_ci() -> bool:
+    return envs.SGLANG_IS_IN_CI.get()
 
 
 def print_highlight(html_content: str):
@@ -378,18 +465,15 @@ def reserve_port(host, start=30000, end=40000):
     Reserve an available port by trying to bind a socket.
     Returns a tuple (port, lock_socket) where `lock_socket` is kept open to hold the lock.
     """
+    from sglang.srt.utils.network import try_bind_socket
+
     candidates = list(range(start, end))
     random.shuffle(candidates)
-
     for port in candidates:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            # Attempt to bind to the port on localhost
-            sock.bind((host, port))
+            sock = try_bind_socket(host, port)
             return port, sock
-        except socket.error:
-            sock.close()  # Failed to bind, try next port
+        except OSError:
             continue
     raise RuntimeError("No free port available.")
 
@@ -407,10 +491,28 @@ def release_port(lock_socket):
 def execute_shell_command(command: str) -> subprocess.Popen:
     """
     Execute a shell command and return its process handle.
+    Supports leading KEY=VALUE env vars (e.g. "VAR=1 python script.py") so that
+    notebook/CI commands work without requiring shell=True.
     """
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
-    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+    env = os.environ.copy()
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if "=" in part and not part.startswith("-") and not part.startswith("/"):
+            key, _, value = part.partition("=")
+            if key and value is not None and key.replace("_", "").isalnum():
+                env[key] = value
+                i += 1
+                continue
+        break
+    parts = parts[i:]
+    if not parts:
+        raise ValueError(
+            "Command contains only environment variable assignments, no executable"
+        )
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT, env=env)
 
 
 def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
@@ -445,55 +547,122 @@ def terminate_process(process):
         release_port(lock_socket)
 
 
-def wait_for_server(base_url: str, timeout: int = None) -> None:
+def _raise_if_process_exited(process: Optional[Any]) -> None:
+    if process is None:
+        return
+
+    if hasattr(process, "poll"):
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(f"Server process exited with code {return_code}")
+        return
+
+    if hasattr(process, "is_alive") and not process.is_alive():
+        return_code = getattr(process, "exitcode", None)
+        if return_code is None:
+            raise RuntimeError("Server process exited")
+        raise RuntimeError(f"Server process exited with code {return_code}")
+
+
+def _is_wait_timeout(start_time: float, timeout: Optional[int]) -> bool:
+    if timeout is None:
+        return False
+    return time.perf_counter() - start_time > timeout
+
+
+def wait_for_http_ready(
+    url: str,
+    timeout: Optional[int] = None,
+    process: Optional[Any] = None,
+    headers: Optional[dict] = None,
+    request_timeout: int = 5,
+) -> None:
+    """Wait for an HTTP endpoint to return status 200."""
+    start_time = time.perf_counter()
+    while True:
+        _raise_if_process_exited(process)
+        try:
+            response = requests.get(url, headers=headers, timeout=request_timeout)
+            if response.status_code == 200:
+                return
+        except requests.exceptions.RequestException:
+            _raise_if_process_exited(process)
+
+        if _is_wait_timeout(start_time, timeout):
+            raise TimeoutError(
+                f"Endpoint {url} did not become ready within timeout period"
+            )
+        time.sleep(1)
+
+
+def wait_for_server(
+    base_url: str,
+    timeout: int = None,
+    process: Optional[subprocess.Popen] = None,
+) -> None:
     """Wait for the server to be ready by polling the /v1/models endpoint.
 
     Args:
-        base_url: The base URL of the server
+        base_url: The base URL of the server.
         timeout: Maximum time to wait in seconds. None means wait forever.
+        process: Optional server process used for early-exit checks.
     """
-    start_time = time.perf_counter()
-    while True:
-        try:
-            response = requests.get(
-                f"{base_url}/v1/models",
-                headers={"Authorization": "Bearer None"},
-            )
-            if response.status_code == 200:
-                time.sleep(5)
-                print_highlight(
-                    """\n
-                    NOTE: Typically, the server runs in a separate terminal.
-                    In this notebook, we run the server and notebook code together, so their outputs are combined.
-                    To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    To reduce the log length, we set the log level to warning for the server, the default log level is info.
-                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
-                    """
-                )
-                break
-
-            if timeout and time.perf_counter() - start_time > timeout:
-                raise TimeoutError("Server did not become ready within timeout period")
-        except requests.exceptions.RequestException:
-            time.sleep(1)
+    wait_for_http_ready(
+        url=f"{base_url}/v1/models",
+        timeout=timeout,
+        process=process,
+        headers={"Authorization": "Bearer None"},
+    )
+    time.sleep(5)
+    print_highlight("""\n
+        NOTE: Typically, the server runs in a separate terminal.
+        In this notebook, we run the server and notebook code together, so their outputs are combined.
+        To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+        To reduce the log length, we set the log level to warning for the server, the default log level is info.
+        We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
+        """)
 
 
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
-        self._mapping = mapping
+        # Use dictionary for fast exact type matching, using OrderedDict(mapping)
+        # to maintains registration order
+        self._mapping = OrderedDict(mapping)
+        # MRO cache for inheritance-based matching
+        self._mro_cache = {}
         self._fallback_fn = None
 
     def add_fallback_fn(self, fallback_fn: Callable):
         self._fallback_fn = fallback_fn
 
     def __iadd__(self, other: "TypeBasedDispatcher"):
-        self._mapping.extend(other._mapping)
+        for ty, fn in other._mapping.items():
+            if ty not in self._mapping:
+                self._mapping[ty] = fn
+
+        self._mro_cache.clear()
         return self
 
     def __call__(self, obj: Any):
-        for ty, fn in self._mapping:
+        obj_type = type(obj)
+        # 1. First try exact match(o(1))
+        fn = self._mapping.get(obj_type)
+        if fn is not None:
+            return fn(obj)
+
+        # 2. If exact match fails, check MRO cache
+        cached_fn = self._mro_cache.get(obj_type)
+        if cached_fn is not None:
+            return cached_fn(obj)
+
+        # 3.search in registration order for compatible type(maintains origin behavior)
+        for ty, fn in self._mapping.items():
             if isinstance(obj, ty):
+                self._mro_cache[obj_type] = fn
                 return fn(obj)
+
+        # 4. if no matching type found, cache this result
+        self._mro_cache[obj_type] = None
 
         if self._fallback_fn is not None:
             return self._fallback_fn(obj)

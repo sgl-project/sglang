@@ -2,26 +2,35 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import warnings
 from typing import Optional
 
 import torch
 from einops import rearrange
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from sglang.srt.layers.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
 from sglang.srt.layers.attention.fla.chunk_o import chunk_fwd_o
-from sglang.srt.layers.attention.fla.chunk_scaled_dot_kkt import (
-    chunk_scaled_dot_kkt_fwd,
-)
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
+from sglang.srt.layers.attention.fla.index import (
+    prepare_chunk_indices,
+)
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
-from sglang.srt.layers.attention.fla.solve_tril import solve_tril
 from sglang.srt.layers.attention.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,
+    is_intel,
 )
-from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
+
+if is_intel:
+    from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h,
+    )
+    from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_fwd import (
+        chunk_gated_delta_rule_fwd_intra,
+    )
+
+CHUNK_SIZE = 64
 
 
 def chunk_gated_delta_rule_fwd(
@@ -32,31 +41,33 @@ def chunk_gated_delta_rule_fwd(
     beta: torch.Tensor,
     scale: float,
     initial_state: torch.Tensor,
-    output_final_state: bool,
+    initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    chunk_indices: torch.LongTensor | None = None,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
-    # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g_cumsum=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
+    g = chunk_local_cumsum(
+        g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    w, u = recompute_w_u_fwd(
+
+    # fused kkt + solve_tril + recompute_w_u
+    w, u, A = chunk_gated_delta_rule_fwd_intra(
         k=k,
         v=v,
+        g=g,
         beta=beta,
-        A=A,
-        g_cumsum=g,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
     )
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+
+    h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
         u=u,
         g=g,
         initial_state=initial_state,
-        output_final_state=output_final_state,
+        initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
     )
     o = chunk_fwd_o(
         q=q,
@@ -68,9 +79,9 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
     )
     if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
+        return g, o, A, None, h, None
     elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
+        return g, o, A, w, h, v_new
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -87,7 +98,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         beta: torch.Tensor,
         scale: float,
         initial_state: torch.Tensor,
-        output_final_state: bool,
+        initial_state_indices: torch.Tensor,
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
     ):
@@ -98,7 +109,12 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
 
-        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
+        chunk_indices = (
+            prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
+            if cu_seqlens is not None
+            else None
+        )
+        g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,
@@ -106,10 +122,11 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             beta=beta,
             scale=scale,
             initial_state=initial_state,
-            output_final_state=output_final_state,
+            initial_state_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
         )
-        return o.to(q.dtype), final_state
+        return o.to(q.dtype), h
 
 
 @torch.compiler.disable
@@ -121,7 +138,7 @@ def chunk_gated_delta_rule(
     beta: torch.Tensor,
     scale: float = None,
     initial_state: torch.Tensor = None,
-    output_final_state: bool = False,
+    initial_state_indices: torch.Tensor = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
@@ -142,11 +159,11 @@ def chunk_gated_delta_rule(
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, H, K, V]` for `N` input sequences.
+            Initial state of shape `[N, H, V, K]` for `N` input sequences.
             For equal-length input sequences, `N` equals the batch size `B`.
             Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
+            Whether to output the final state of shape `[N, H, V, K]`. Default: `False`.
         cu_seqlens (torch.LongTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
@@ -158,7 +175,7 @@ def chunk_gated_delta_rule(
         o (torch.Tensor):
             Outputs of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
         final_state (torch.Tensor):
-            Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
+            Final state of shape `[N, H, V, K]` if `output_final_state=True` else `None`.
 
     Examples::
         >>> import torch
@@ -218,14 +235,17 @@ def chunk_gated_delta_rule(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+        if (
+            initial_state_indices is not None
+            and initial_state_indices.shape[0] != len(cu_seqlens) - 1
+        ):
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
+                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
+    o, h = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
         v,
@@ -233,10 +253,10 @@ def chunk_gated_delta_rule(
         beta,
         scale,
         initial_state,
-        output_final_state,
+        initial_state_indices,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
-    return o, final_state
+    return o, None, h
