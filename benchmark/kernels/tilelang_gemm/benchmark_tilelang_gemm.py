@@ -19,8 +19,12 @@ import triton
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
     AUTOTUNE_SEARCH_POLICIES,
     KERNEL_TYPES,
-    SelectedConfigStore,
     write_selected_config_file,
+)
+from sglang.srt.layers.tilelang_gemm_wrapper.tuning import (
+    concrete_shapes,
+    load_selected_config_store,
+    make_autotune_metadata,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,7 +119,7 @@ def _benchmark_one(
         if checkpoint_config_path:
             tilelang_gemm_wrapper.export_selected_configs(
                 checkpoint_config_path,
-                metadata=_autotune_metadata(
+                metadata=make_autotune_metadata(
                     autotune_backend,
                     autotune_policy,
                     autotune_warmup,
@@ -198,30 +202,6 @@ def _parse_shape_values(values: Iterable[str]) -> list[tuple[int, int]]:
     return shapes
 
 
-def _concrete_shapes(
-    nk_shapes: Iterable[tuple[int, int]], m_values: Iterable[int]
-) -> list[tuple[int, int, int]]:
-    return [(M, N, K) for N, K in nk_shapes for M in m_values]
-
-
-def _autotune_metadata(
-    autotune_backend: str,
-    autotune_policy: str,
-    autotune_warmup: int,
-    autotune_rep: int,
-    autotune_max_configs: int | None,
-    kernel_types: list[str] | None,
-) -> dict:
-    return {
-        "autotune_backend": autotune_backend,
-        "autotune_search_policy": autotune_policy,
-        "autotune_warmup": autotune_warmup,
-        "autotune_rep": autotune_rep,
-        "autotune_max_configs": autotune_max_configs,
-        "autotune_kernel_types": kernel_types,
-    }
-
-
 def _parse_gpus(value: str) -> list[str]:
     gpus = [item.strip() for item in value.split(",") if item.strip()]
     if not gpus:
@@ -231,17 +211,6 @@ def _parse_gpus(value: str) -> list[str]:
 
 def _shape_label(M: int, N: int, K: int) -> str:
     return f"M{M}_N{N}_K{K}"
-
-
-def _load_optional_store(paths: Iterable[str | None]) -> SelectedConfigStore:
-    store = SelectedConfigStore()
-    for path in paths:
-        if not path:
-            continue
-        if not os.path.exists(path):
-            continue
-        store.update(SelectedConfigStore.from_path(path))
-    return store
 
 
 def _tail(path: Path, max_chars: int = 4000) -> str:
@@ -266,7 +235,7 @@ def _parallel_autotune(
         or args.export_config_path
         or str(work_dir / "selected_configs.json")
     )
-    metadata = _autotune_metadata(
+    metadata = make_autotune_metadata(
         args.autotune_backend,
         args.autotune_policy,
         args.autotune_warmup,
@@ -275,7 +244,7 @@ def _parallel_autotune(
         args.kernel_type,
     )
 
-    store = _load_optional_store(
+    store = load_selected_config_store(
         (args.config_path, args.resume_config_path, args.checkpoint_config_path)
     )
     pending = [
@@ -378,7 +347,11 @@ def _parallel_autotune(
                 )
                 continue
 
-            store.update(SelectedConfigStore.from_file(str(item["config_path"])))
+            store.update(
+                load_selected_config_store(
+                    (str(item["config_path"]),), skip_missing=False
+                )
+            )
             write_selected_config_file(
                 checkpoint_path, store.as_list(), metadata=metadata
             )
@@ -491,10 +464,10 @@ def main() -> None:
         tilelang_gemm_wrapper.merge_selected_configs(args.checkpoint_config_path)
 
     nk_shapes = _parse_shape_values(args.shape)
-    concrete_shapes = _concrete_shapes(nk_shapes, args.m_values)
+    shapes = concrete_shapes(nk_shapes, args.m_values)
 
     if args.gpus and args.autotune:
-        config_path = _parallel_autotune(args, concrete_shapes)
+        config_path = _parallel_autotune(args, shapes)
         if args.autotune_only:
             return
         tilelang_gemm_wrapper.load_selected_configs(config_path)
@@ -502,7 +475,7 @@ def main() -> None:
 
     if args.autotune_only:
         tilelang_gemm_wrapper.autotune_shapes(
-            concrete_shapes,
+            shapes,
             warmup=args.autotune_warmup,
             rep=args.autotune_rep,
             backend=args.autotune_backend,
@@ -510,7 +483,7 @@ def main() -> None:
             max_configs=args.autotune_max_configs,
             search_policy=args.autotune_policy,
             checkpoint_config_path=args.checkpoint_config_path,
-            export_metadata=_autotune_metadata(
+            export_metadata=make_autotune_metadata(
                 args.autotune_backend,
                 args.autotune_policy,
                 args.autotune_warmup,
@@ -522,7 +495,7 @@ def main() -> None:
         if args.export_config_path:
             tilelang_gemm_wrapper.export_selected_configs(
                 args.export_config_path,
-                metadata=_autotune_metadata(
+                metadata=make_autotune_metadata(
                     args.autotune_backend,
                     args.autotune_policy,
                     args.autotune_warmup,
@@ -562,7 +535,7 @@ def main() -> None:
     if args.export_config_path:
         tilelang_gemm_wrapper.export_selected_configs(
             args.export_config_path,
-            metadata=_autotune_metadata(
+            metadata=make_autotune_metadata(
                 args.autotune_backend,
                 args.autotune_policy,
                 args.autotune_warmup,

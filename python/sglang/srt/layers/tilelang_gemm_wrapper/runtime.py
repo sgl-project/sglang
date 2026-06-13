@@ -9,13 +9,13 @@ from typing import TYPE_CHECKING, Dict, Iterable, Literal, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.tilelang_gemm_wrapper.configurer import assert_available
+from sglang.srt.layers.tilelang_gemm_wrapper.availability import assert_available
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
     AUTOTUNE_SEARCH_POLICIES,
-    KERNEL_TYPES,
     SPLIT_K_KERNEL_TYPES,
     SWAP_AB_KERNEL_TYPES,
     SelectedConfigStore,
+    config_compatibility_error,
     default_config,
     generate_candidate_configs,
     write_selected_config_file,
@@ -116,28 +116,13 @@ def _select_config(M: int, N: int, K: int) -> dict:
 
 
 def _validate_config(config: dict) -> None:
-    kernel_type = config["kernel_type"]
-    if kernel_type not in KERNEL_TYPES:
+    error = config_compatibility_error(
+        config, int(config["M"]), int(config["N"]), int(config["K"])
+    )
+    if error is not None:
         raise RuntimeError(
-            "TileLang FP8 GEMM got unsupported kernel_type="
-            f"{kernel_type}; expected one of {KERNEL_TYPES}."
-        )
-
-    split_k = config["split_k"]
-    if kernel_type in SPLIT_K_KERNEL_TYPES:
-        K = config["K"]
-        if split_k <= 1:
-            raise RuntimeError(
-                f"TileLang {kernel_type} requires split_k > 1, got {split_k}."
-            )
-        if K % split_k != 0 or (K // split_k) % 128 != 0:
-            raise RuntimeError(
-                f"TileLang {kernel_type} requires K/split_k to be divisible by 128; "
-                f"got K={K}, split_k={split_k}."
-            )
-    elif split_k != 1:
-        raise RuntimeError(
-            f"TileLang {kernel_type} does not use split_k, got split_k={split_k}."
+            "TileLang FP8 GEMM selected config is incompatible with the "
+            f"requested shape: {error}."
         )
 
 

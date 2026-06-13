@@ -1,12 +1,12 @@
 """TileLang GEMM wrapper for FP8 blockwise GEMM."""
 
-from sglang.srt.layers.tilelang_gemm_wrapper.configurer import (
+from sglang.srt.layers.tilelang_gemm_wrapper.availability import (
     TILELANG_MIN_VERSION,
     assert_available,
     get_availability_error,
     is_available,
 )
-from sglang.srt.layers.tilelang_gemm_wrapper.entrypoint import (
+from sglang.srt.layers.tilelang_gemm_wrapper.runtime import (
     autotune_shape,
     autotune_shapes,
     clear_cache,
@@ -21,6 +21,12 @@ from sglang.srt.layers.tilelang_gemm_wrapper.entrypoint import (
     update_tilelang_config,
     warmup_or_autotune_shapes,
 )
+from sglang.srt.layers.tilelang_gemm_wrapper.tuning import (
+    concrete_shapes,
+    load_selected_config_store,
+    make_autotune_metadata,
+    warmup_tilelang_shapes,
+)
 
 __all__ = [
     "TILELANG_MIN_VERSION",
@@ -28,6 +34,7 @@ __all__ = [
     "autotune_shape",
     "autotune_shapes",
     "clear_cache",
+    "concrete_shapes",
     "export_selected_configs",
     "get_candidate_configs",
     "get_kernel_info",
@@ -36,8 +43,11 @@ __all__ = [
     "has_selected_config",
     "is_available",
     "list_available_configs",
+    "load_selected_config_store",
     "load_selected_configs",
+    "make_autotune_metadata",
     "merge_selected_configs",
     "update_tilelang_config",
     "warmup_or_autotune_shapes",
+    "warmup_tilelang_shapes",
 ]

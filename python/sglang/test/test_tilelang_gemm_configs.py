@@ -44,3 +44,34 @@ def test_tilelang_gemm_selected_config_export_roundtrip(tmp_path):
 
     store = SelectedConfigStore.from_file(str(path))
     assert store.get_exact(1, 4096, 1024)["kernel_type"] == "swapAB"
+
+
+def test_tilelang_gemm_selected_config_skips_incompatible_m_family():
+    decode_config = generate_candidate_configs(
+        1, 4096, 1024, search_policy="fast_sm90"
+    )[0]
+    assert decode_config["kernel_type"] == "swapAB"
+
+    store = SelectedConfigStore()
+    store.add(decode_config)
+
+    selected = store.select(64, 4096, 1024)
+    assert selected["kernel_type"] == "base"
+    assert "tuned_M" not in selected
+
+
+def test_tilelang_gemm_selected_config_uses_nearest_compatible_m_family():
+    decode_config = generate_candidate_configs(
+        1, 4096, 1024, search_policy="fast_sm90"
+    )[0]
+    prefill_config = generate_candidate_configs(
+        128, 4096, 1024, search_policy="fast_sm90"
+    )[0]
+
+    store = SelectedConfigStore()
+    store.add(decode_config)
+    store.add(prefill_config)
+
+    selected = store.select(64, 4096, 1024)
+    assert selected["kernel_type"] == "base"
+    assert selected["tuned_M"] == 128

@@ -9,13 +9,14 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from typing import Iterable, Set, Tuple
+from typing import Set, Tuple
 
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
     AUTOTUNE_SEARCH_POLICIES,
     DEFAULT_M_VALUES,
     KERNEL_TYPES,
 )
+from sglang.srt.layers.tilelang_gemm_wrapper.tuning import warmup_tilelang_shapes
 
 logger = logging.getLogger(__name__)
 
@@ -64,61 +65,6 @@ def get_model_weight_shapes(
             add_shape(hidden_size, mlp_size)
 
     return shapes
-
-
-def warmup_tilelang_shapes(
-    nk_shapes: Iterable[Tuple[int, int]],
-    m_values: Iterable[int],
-    config_path: str | None = None,
-    export_config_path: str | None = None,
-    autotune: bool = False,
-    autotune_backend: str = "cudagraph",
-    autotune_policy: str = "family_pruned",
-    autotune_warmup: int = 25,
-    autotune_rep: int = 100,
-    autotune_max_configs: int | None = None,
-    kernel_types: Iterable[str] | None = None,
-    checkpoint_config_path: str | None = None,
-    resume_config_path: str | None = None,
-) -> None:
-    from sglang.srt.layers import tilelang_gemm_wrapper
-
-    if config_path:
-        tilelang_gemm_wrapper.load_selected_configs(config_path)
-
-    shapes = [(M, N, K) for N, K in sorted(nk_shapes) for M in m_values]
-    if not shapes:
-        raise RuntimeError("No TileLang GEMM shapes to warm up.")
-
-    action = "Autotuning" if autotune else "Warming"
-    logger.info("%s %s TileLang FP8 GEMM shapes", action, len(shapes))
-    tilelang_gemm_wrapper.warmup_or_autotune_shapes(
-        shapes,
-        autotune=autotune,
-        warmup=autotune_warmup,
-        rep=autotune_rep,
-        backend=autotune_backend,
-        max_configs=autotune_max_configs,
-        kernel_types=kernel_types,
-        search_policy=autotune_policy,
-        checkpoint_config_path=checkpoint_config_path,
-        resume_config_path=resume_config_path,
-    )
-
-    if export_config_path:
-        tilelang_gemm_wrapper.export_selected_configs(
-            export_config_path,
-            metadata={
-                "autotune": autotune,
-                "autotune_backend": autotune_backend,
-                "autotune_search_policy": autotune_policy,
-                "autotune_warmup": autotune_warmup,
-                "autotune_rep": autotune_rep,
-                "autotune_max_configs": autotune_max_configs,
-                "autotune_kernel_types": list(kernel_types) if kernel_types else None,
-            },
-        )
-        logger.info("Exported selected TileLang configs to %s", export_config_path)
 
 
 def main() -> None:
@@ -214,6 +160,8 @@ def main() -> None:
             nk_shapes.add((N, K))
 
     logger.info("TileLang FP8 GEMM N,K shapes: %s", sorted(nk_shapes))
+    action = "Autotuning" if args.autotune else "Warming"
+    logger.info("%s TileLang FP8 GEMM shapes for M values: %s", action, args.m_values)
     warmup_tilelang_shapes(
         nk_shapes,
         args.m_values,

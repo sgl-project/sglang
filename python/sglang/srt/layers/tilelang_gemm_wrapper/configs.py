@@ -175,6 +175,44 @@ def _select_kernel_types(
     return _pruned_kernel_types(M, N, K)
 
 
+def kernel_type_m_compatibility_error(kernel_type: str, M: int) -> Optional[str]:
+    if kernel_type not in KERNEL_TYPES:
+        return (
+            f"unknown kernel_type={kernel_type}; expected one of {KERNEL_TYPES}"
+        )
+    if M > 32 and kernel_type in SWAP_AB_KERNEL_TYPES:
+        return f"{kernel_type} is only supported for M <= 32; got M={M}"
+    if M > 128 and kernel_type in SPLIT_K_KERNEL_TYPES:
+        return f"{kernel_type} is only supported for M <= 128; got M={M}"
+    return None
+
+
+def config_compatibility_error(config: dict, M: int, N: int, K: int) -> Optional[str]:
+    del N
+    kernel_type = config["kernel_type"]
+    error = kernel_type_m_compatibility_error(kernel_type, M)
+    if error is not None:
+        return error
+
+    split_k = int(config.get("split_k", 1))
+    if kernel_type in SPLIT_K_KERNEL_TYPES:
+        if split_k <= 1:
+            return f"{kernel_type} requires split_k > 1; got split_k={split_k}"
+        if K % split_k != 0 or (K // split_k) % 128 != 0:
+            return (
+                f"{kernel_type} requires K/split_k to be divisible by 128; "
+                f"got K={K}, split_k={split_k}"
+            )
+    elif split_k != 1:
+        return f"{kernel_type} does not use split_k; got split_k={split_k}"
+
+    return None
+
+
+def is_config_compatible_with_shape(config: dict, M: int, N: int, K: int) -> bool:
+    return config_compatibility_error(config, M, N, K) is None
+
+
 def _fast_sm90_candidate_filter(config: dict) -> bool:
     """Aggressive SM90 shortlist learned from H20 TileLang 0.1.9 tuning runs."""
 
@@ -222,9 +260,7 @@ def generate_candidate_configs(
                 f"Unknown TileLang FP8 GEMM kernel type {kernel_type}; "
                 f"expected one of {KERNEL_TYPES}."
             )
-        if M > 32 and kernel_type in SWAP_AB_KERNEL_TYPES:
-            continue
-        if M > 128 and kernel_type in SPLIT_K_KERNEL_TYPES:
+        if kernel_type_m_compatibility_error(kernel_type, M) is not None:
             continue
 
         base_configs = (
@@ -281,8 +317,16 @@ class SelectedConfigStore:
         if not configs:
             return default_config(M, N, K)
 
-        tuned_m = min(configs, key=lambda candidate_m: abs(candidate_m - M))
-        selected = dict(configs[tuned_m])
+        compatible_configs = {
+            candidate_m: config
+            for candidate_m, config in configs.items()
+            if is_config_compatible_with_shape(config, M, N, K)
+        }
+        if not compatible_configs:
+            return default_config(M, N, K)
+
+        tuned_m = min(compatible_configs, key=lambda candidate_m: abs(candidate_m - M))
+        selected = dict(compatible_configs[tuned_m])
         selected.update({"M": M, "N": N, "K": K, "tuned_M": tuned_m})
         return normalize_config(selected, M, N, K)
 
