@@ -556,7 +556,11 @@ class Evo2HyenaFilter(nn.Module):
         u_filt = F.conv1d(
             u_padded,
             self.short_filter_weight.to(u.dtype),
-            bias=self.short_filter_bias.to(u.dtype) if self.short_filter_bias is not None else None,
+            bias=(
+                self.short_filter_bias.to(u.dtype)
+                if self.short_filter_bias is not None
+                else None
+            ),
             groups=3 * self.hidden_size,
         )
         u_filt = u_filt.transpose(1, 2)  # (B, L, 3*hidden_size)

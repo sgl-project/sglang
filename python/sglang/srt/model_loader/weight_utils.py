@@ -1124,7 +1124,11 @@ def _load_pt_file(bin_file: str) -> dict:
             logger.warning(
                 "Loading %s with weights_only=False (%s)",
                 os.path.basename(bin_file),
-                "unsupported global" if isinstance(e, pickle.UnpicklingError) else "legacy tar format",
+                (
+                    "unsupported global"
+                    if isinstance(e, pickle.UnpicklingError)
+                    else "legacy tar format"
+                ),
             )
             return torch.load(bin_file, map_location="cpu", weights_only=False)
         raise

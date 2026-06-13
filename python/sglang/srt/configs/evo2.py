@@ -196,9 +196,6 @@ class Evo2Config(PretrainedConfig):
         self.num_layers = value
 
 
-
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # YAML-derived defaults for each Evo 2 variant
 # Keys match vortex model YAML config names.
@@ -344,11 +341,16 @@ def patch_evo2_config_json(model: str) -> None:
             # Try HuggingFace Hub download
             try:
                 from huggingface_hub import hf_hub_download
+
                 for fname in ("config.json", "config.yml"):
                     try:
                         cfg_path = hf_hub_download(model, fname)
                         with open(cfg_path) as f:
-                            cfg = json.load(f) if fname.endswith(".json") else yaml.safe_load(f)
+                            cfg = (
+                                json.load(f)
+                                if fname.endswith(".json")
+                                else yaml.safe_load(f)
+                            )
                         break
                     except Exception:
                         continue
@@ -374,7 +376,10 @@ def patch_evo2_config_json(model: str) -> None:
         return
 
     variant = _detect_evo2_variant(
-        cfg.get("name", "") or cfg.get("_name_or_path", "") or cfg.get("model_name", "") or str(model)
+        cfg.get("name", "")
+        or cfg.get("_name_or_path", "")
+        or cfg.get("model_name", "")
+        or str(model)
     )
 
     # Build complete defaults
