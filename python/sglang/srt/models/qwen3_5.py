@@ -80,7 +80,11 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+from sglang.srt.models.qwen2_moe import (
+    Qwen2MoeMLP,
+    Qwen2MoeSparseMoeBlock,
+    can_fuse_shared_expert,
+)
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -1117,6 +1121,21 @@ class Qwen3_5ForCausalLM(nn.Module):
                 f"get_hidden_dim not implemented for {module_name}"
             )
 
+    def _maybe_autodisable_shared_experts_fusion(self, config, quant_config):
+        # Auto-disable fusion when the checkpoint can't fuse (e.g. MXFP4 Qwen3.5)
+        # so the model still gets the #25885 multi-streaming path. ROCm-only.
+        server_args = get_global_server_args()
+        if (
+            config.model_type == "qwen3_5_moe_text"
+            and not server_args.disable_shared_experts_fusion
+            and not can_fuse_shared_expert(config, quant_config)
+        ):
+            server_args.disable_shared_experts_fusion = True
+            logger.info(
+                "Qwen3.5: shared-expert fusion not supported for this checkpoint; "
+                "auto-disabling (multi-streaming #25885 still applies)."
+            )
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1128,6 +1147,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+
+        if _is_hip:
+            self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
         alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
 

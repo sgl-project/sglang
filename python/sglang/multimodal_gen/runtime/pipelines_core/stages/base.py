@@ -98,9 +98,11 @@ class PipelineStage(StageDedupMixin, ABC):
         total: int | None = None,
         *,
         disable: bool = False,
+        batch: Req | None = None,
         **kwargs,
     ) -> tqdm:
         is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
+        disable = disable or (batch is not None and batch.is_warmup)
         return tqdm(
             iterable=iterable,
             total=total,

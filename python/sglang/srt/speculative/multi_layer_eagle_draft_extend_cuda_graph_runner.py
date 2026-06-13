@@ -336,7 +336,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
-            global_num_tokens_for_logprob_cpu = [bs]
+            # DRAFT_EXTEND_V2 produces logits for all tokens, not bs (see mlp branch above)
+            global_num_tokens_for_logprob_cpu = [num_tokens]
         else:
             global_num_tokens_cpu = None
 

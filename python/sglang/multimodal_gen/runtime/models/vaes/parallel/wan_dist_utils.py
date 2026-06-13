@@ -6,9 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_sp_group,
-    get_sp_parallel_rank,
-    get_sp_world_size,
+    get_decode_parallel_group_coordinator,
+    get_decode_parallel_rank,
+    get_decode_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import (
@@ -115,7 +115,9 @@ def _halo_memory_format(reference: torch.Tensor) -> torch.memory_format:
 def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
     if expected_height is None:
         return x
-    x = get_sp_group().all_gather(_maybe_contiguous_for_sp_gather(x), dim=-2)
+    x = get_decode_parallel_group_coordinator().all_gather(
+        _maybe_contiguous_for_sp_gather(x), dim=-2
+    )
     if x.shape[-2] != expected_height:
         x = x[..., :expected_height, :].contiguous()
     return x
@@ -150,11 +152,11 @@ def halo_exchange(
     if height_halo_size == 0:
         return x, recv_top_buf, recv_bottom_buf
 
-    sp_group = get_sp_group()
-    rank = get_sp_parallel_rank()
-    world_size = get_sp_world_size()
-    group = sp_group.device_group
-    group_ranks = sp_group.ranks
+    decode_group = get_decode_parallel_group_coordinator()
+    rank = get_decode_parallel_rank()
+    world_size = get_decode_parallel_world_size()
+    group = decode_group.device_group
+    group_ranks = decode_group.ranks
 
     top_row_ref = x[..., :height_halo_size, :]
     bottom_row_ref = x[..., -height_halo_size:, :]
@@ -234,8 +236,8 @@ class WanDistConv2d(nn.Conv2d):
         self.padding = (0, self.padding[1])
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
-        self.rank = get_sp_parallel_rank()
-        self.world_size = get_sp_world_size()
+        self.rank = get_decode_parallel_rank()
+        self.world_size = get_decode_parallel_world_size()
 
     def forward(self, x):
         if any(self._padding):
@@ -324,8 +326,8 @@ class WanDistCausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
-        self.rank = get_sp_parallel_rank()
-        self.world_size = get_sp_world_size()
+        self.rank = get_decode_parallel_rank()
+        self.world_size = get_decode_parallel_world_size()
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
@@ -386,8 +388,8 @@ class WanDistZeroPad2d(nn.Module):
     def __init__(self, padding: tuple[int, int, int, int]) -> None:
         super().__init__()
         self.padding = padding  # (left, right, top, bottom)
-        self.rank = get_sp_parallel_rank()
-        self.world_size = get_sp_world_size()
+        self.rank = get_decode_parallel_rank()
+        self.world_size = get_decode_parallel_world_size()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         left, right, top, bottom = self.padding
@@ -512,13 +514,13 @@ class WanDistAttentionBlock(nn.Module):
         self.norm = WanRMS_norm(dim)
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
-        self.rank = get_sp_parallel_rank()
-        self.world_size = get_sp_world_size()
-        self.sp_group = get_sp_group()
+        self.rank = get_decode_parallel_rank()
+        self.world_size = get_decode_parallel_world_size()
+        self.decode_group = get_decode_parallel_group_coordinator()
 
     def forward(self, x):
         if self.world_size > 1:
-            x = self.sp_group.all_gather(_maybe_contiguous_for_sp_gather(x), dim=-2)
+            x = self.decode_group.all_gather(_maybe_contiguous_for_sp_gather(x), dim=-2)
             x = x.contiguous()
         x = attention_block_forward(self, x)
         if self.world_size > 1:
