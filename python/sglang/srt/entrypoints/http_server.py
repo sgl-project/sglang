@@ -607,7 +607,9 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-    rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+    # pid keeps rids unique across tokenizer workers (a bare time.time() can
+    # collide and crash the shared DetokenizerManager decode_status).
+    rid = f"{HEALTH_CHECK_RID_PREFIX}_{os.getpid()}_{time.time()}"
 
     if _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
