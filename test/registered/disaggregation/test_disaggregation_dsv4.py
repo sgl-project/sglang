@@ -7,11 +7,12 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    is_in_ci,
     popen_launch_pd_server,
     try_cached_model,
 )
 
-register_cuda_ci(est_time=500, stage="base-c", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=1600, stage="base-c", runner_config="deepep-8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 
@@ -25,6 +26,7 @@ DSV4_FLASH_ENV = {
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
 }
+DSV4_NIXL_SERVER_LAUNCH_TIMEOUT = 1800
 
 _EAGLE_SPEC_ARGS = [
     "--speculative-algorithm",
@@ -38,8 +40,15 @@ _EAGLE_SPEC_ARGS = [
 ]
 
 
-class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
+def _has_nixl():
+    try:
+        import nixl._api  # noqa: F401
+    except Exception:
+        return False
+    return True
 
+
+class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
     gsm8k_accuracy_thres = 0.93
 
     @classmethod
@@ -128,7 +137,6 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
 
 
 class TestDisaggregationDSV4HiSparseMooncake(PDDisaggregationServerBase, GSM8KMixin):
-
     gsm8k_accuracy_thres = 0.93
     gsm8k_num_questions = 200
     gsm8k_num_shots = 20
@@ -225,6 +233,36 @@ class TestDisaggregationDSV4HiSparseMooncake(PDDisaggregationServerBase, GSM8KMi
             other_args=decode_args,
             env=DSV4_FLASH_ENV,
         )
+
+
+@unittest.skipUnless(
+    is_in_ci() or _has_nixl(),
+    "NIXL is required for DSV4 HiSparse disaggregation coverage.",
+)
+class TestDisaggregationDSV4HiSparseNixl(TestDisaggregationDSV4HiSparseMooncake):
+    @classmethod
+    def setUpClass(cls):
+        PDDisaggregationServerBase.setUpClass.__func__(cls)
+
+        cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
+        cls.rdma_devices = []
+        cls.model = try_cached_model(DSV4_FLASH_MODEL)
+
+        cls.start_prefill()
+        cls.start_decode()
+
+        cls.wait_server_ready(
+            cls.prefill_url + "/health",
+            timeout=DSV4_NIXL_SERVER_LAUNCH_TIMEOUT,
+            process=cls.process_prefill,
+        )
+        cls.wait_server_ready(
+            cls.decode_url + "/health",
+            timeout=DSV4_NIXL_SERVER_LAUNCH_TIMEOUT,
+            process=cls.process_decode,
+        )
+
+        cls.launch_lb()
 
 
 if __name__ == "__main__":
