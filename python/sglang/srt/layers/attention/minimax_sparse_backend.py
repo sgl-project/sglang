@@ -141,6 +141,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             Phase.DECODE, Backend.DISABLED
         )
         self._use_msa_decode = self.use_msa and not _decode_cuda_graph
+
+        # MSA + speculative decode + cuda graph is unsupported: spec verify
+        # (TARGET_VERIFY) batches route to forward_extend and are captured into the
+        # decode graph, which both dereferences extend metadata absent in the capture
+        # batch and would record the MSA prefill kernel into a graph. Fail loudly at
+        # startup instead of crashing mid-capture.
+        if (
+            self.use_msa
+            and _decode_cuda_graph
+            and getattr(_sa, "speculative_algorithm", None) is not None
+        ):
+            raise NotImplementedError(
+                "MiniMax-M3 MSA attention does not support speculative decoding under "
+                "CUDA graph. Use --disable-cuda-graph, set SGLANG_DISABLE_MSA=1, or "
+                "disable speculative decoding."
+            )
         # MSA owns the main decode step unless dense-sparse-decode does; the dense
         # path only engages when k_cache.shape[1] == 1 (see forward_decode).
         self._msa_owns_decode = self._use_msa_decode and not (
