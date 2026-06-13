@@ -71,7 +71,7 @@ class TransferInfo:
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
-    staging: Optional["StagingTransferInfo"] = None
+    staging: Optional[StagingTransferInfo] = None
 
     def is_dummy(self):
         # A transfer is "dummy" only for CP non-authoritative ranks.
@@ -124,7 +124,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
     # Keep last: optional, parsed from a variable-length tail of the ZMQ
     # frame in from_zmq() below, so positional construction stays stable.
-    staging: Optional["StagingRegisterInfo"] = None
+    staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -1293,9 +1293,9 @@ class NixlKVManager(CommonKVManager):
     def _do_staging_transfer(
         self,
         staging_strategy,
-        kv_chunk: "TransferKVChunk",
-        req: "TransferInfo",
-        dst_info: "KVArgsRegisterInfo",
+        kv_chunk: TransferKVChunk,
+        req: TransferInfo,
+        dst_info: KVArgsRegisterInfo,
         queue: FastQueue,
     ):
         """Attempt staging transfer for one chunk. Returns (xfer_handle, deferred).

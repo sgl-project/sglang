@@ -150,7 +150,7 @@ All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU a
 Deploy Qwen3.6 with the following command (H200, all features enabled). Swap `--model-path` to `Qwen/Qwen3.6-27B-FP8` for the dense 27B variant — all other flags carry over:
 
 ```shell Command
-SGLANG_ENABLE_SPEC_V2=1 sglang serve \
+sglang serve \
   --model-path Qwen/Qwen3.6-35B-A3B-FP8 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
