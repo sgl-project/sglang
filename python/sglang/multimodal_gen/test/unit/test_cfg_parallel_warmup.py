@@ -132,9 +132,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertTrue(processed[0][1].is_warmup)
         self.assertTrue(processed[0][1].metrics.suppress_stage_breakdown)
         self.assertEqual(processed[0][1].num_inference_steps, 1)
-        self.assertEqual(
-            processed[0][1].extra["cache_dit_num_inference_steps"], 20
-        )
+        self.assertEqual(processed[0][1].extra["cache_dit_num_inference_steps"], 20)
         self.assertTrue(scheduler.warmed_up)
 
     def test_req_based_warmup_skips_default_server_warmup_path(self):
