@@ -3416,7 +3416,7 @@ class TestGlm47MoeDetector(unittest.TestCase):
             self.assertFalse(self.detector.supports_structural_tag())
             self.assertIsNone(self.detector.get_structural_tag(self.tools))
 
-            parser = FunctionCallParser(self.tools, "glm47_moe")
+            parser = FunctionCallParser(self.tools, "glm47")
             constraint = parser.get_structure_constraint("required")
 
             self.assertIsNotNone(constraint)
