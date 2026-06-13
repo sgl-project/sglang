@@ -29,7 +29,10 @@ _is_hip = is_hip()
 if _is_hip:
     from aiter.ops.shuffle import shuffle_weight
 
-    ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+    ON_GFX950 = (
+        torch.cuda.is_available()
+        and "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+    )
 
 logger = logging.getLogger(__name__)
 
