@@ -39,16 +39,22 @@ Caveats discovered in the pilot:
   standard-IB H100 multi-node needs none.
 - `dockerImages`: only the tags the legacy page pinned. CPU/Xeon stays unmapped
   (`:dev` fallback) with a "install from source" tip.
-- **Accuracy-degrading flags in legacy commands** (`--kv-cache-dtype
-  fp8_e4m3`, W4A4-style runtime quant): the format rule says a cell's
-  accuracy is exactly what its quant chip declares — these flags are
-  Playground/tips material (DSv4 gates W4A4 behind the Playground's
-  `megamoeQuant`). But DON'T silently strip them either: the legacy
-  measurements ran with them, and fp8 KV halves KV memory — the recipe may
-  OOM without it. **Ask the maintainer per occurrence** and record the call
-  in the PR body. Known pattern to expect: legacy AMD recipes routinely
-  append `--kv-cache-dtype fp8_e4m3` ("for memory efficiency"); GLM-5's
-  NVFP4 path ships it too.
+- **Accuracy-degrading flags** (`--kv-cache-dtype fp8_e4m3`, W4A4-style
+  runtime quant) — deterministic rule, enforced in migration without
+  asking:
+  - offered as a legacy **selectable option/toggle** → never select it;
+    cells mirror the accuracy-safe default side (route the option to an
+    existing Playground axis if one fits — DSv4 gates W4A4 behind
+    `megamoeQuant` — otherwise mention it in §2 tips);
+  - baked into the recipe's **unconditional/default command** → keep it
+    verbatim. The legacy measurements ran with it, and fp8 KV halves KV
+    memory — stripping could OOM the recipe. Expect this pattern: legacy
+    AMD recipes routinely append `--kv-cache-dtype fp8_e4m3` ("for memory
+    efficiency"), and GLM-5's NVFP4 path ships it too — all keep.
+
+  (Only migration gets this auto-keep — faithfulness wins here. On new
+  pages the same flags are flag-and-confirm with the maintainer:
+  authoring-reference §2.2 / review checklist.)
 
 ## 2b. Playground axes: opt-out, not opt-in
 

@@ -311,9 +311,10 @@ sgl-eval run gsm8k \\
 
   // EXAMPLE cells — one per hardware family to show the shape. REPLACE each with
   // your model's verified recipe, or DELETE families you don't support. `match`
-  // MUST have exactly the 5 keys; env/flags are flat literals. No
-  // accuracy-degrading flags (W4A4-style runtime quant, lossy --kv-cache-dtype):
-  // those are Playground/tips material — authoring-reference §2.2.
+  // MUST have exactly the 5 keys; env/flags are flat literals.
+  // Accuracy-degrading flags (W4A4-style runtime quant, lossy --kv-cache-dtype)
+  // default to Playground/tips — putting one in a cell needs explicit user
+  // confirmation (authoring-reference §2.2).
   cells: [
     // ==== NVIDIA Blackwell + FP4 (single node) ====
     {

@@ -90,12 +90,16 @@ Each cell describes one verified (or auto-estimated) launch recipe.
   flags, then tuning knobs, with `--host` / `--port` last. The playground
   engine assumes this ordering when inserting overrides (its anchors target
   `--model-path` / `--tp` / etc., and inserts before the `--host` tail).
-- NO accuracy-degrading flags: a cell's output quality must be exactly what
-  its quantization chip declares. Runtime quant below the checkpoint's
-  precision (e.g. MegaMoE **W4A4** — DSv4 gates it behind the Playground's
-  `megamoeQuant` opt-in) and lossy KV-cache dtypes (`--kv-cache-dtype
-  fp8_e4m3` over a higher-precision-KV checkpoint) are Playground opt-ins
-  or §2-tips material, never part of a deployment cell.
+- Accuracy-degrading flags don't belong in cells by default: a cell's
+  output quality should be exactly what its quantization chip declares.
+  Runtime quant below the checkpoint's precision (e.g. MegaMoE **W4A4** —
+  DSv4 gates it behind the Playground's `megamoeQuant` opt-in) and lossy
+  KV-cache dtypes (`--kv-cache-dtype fp8_e4m3` over a higher-precision-KV
+  checkpoint) default to Playground opt-ins or §2-tips material. If the
+  model's recipe genuinely needs one in a cell, **flag it to the user and
+  get explicit confirmation** — never ship it silently. (Migrations are the
+  sanctioned exception: a flag baked into the legacy recipe's default
+  command keeps verbatim — see the migrate skill.)
 
 **Cells are denormalized on purpose** — common flags repeat across cells.
 This makes each cell self-contained and easy to verify. When sweeping a
