@@ -933,7 +933,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     run_once,
                     dummies=None,
                     post_warmup_hook=getattr(
-                        attn_backend,
+                        self.model_runner.attn_backend,
                         "on_after_cuda_graph_warmup",
                         None,
                     ),
