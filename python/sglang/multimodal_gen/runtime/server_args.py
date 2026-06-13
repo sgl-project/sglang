@@ -325,6 +325,9 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
 
+    # SGLang backend for encoder stage
+    srt_encoder_url: str | None = None
+
     @property
     def broker_port(self) -> int:
         return self.port + 1
@@ -421,9 +424,11 @@ class ServerArgs(DisaggServerArgsMixin):
         enabled = False
         for text_encoder_config in self.pipeline_config.text_encoder_configs:
             if isinstance(text_encoder_config, T5Config):
-                text_encoder_config.parallel_folding = True
-                enabled = True
-                text_encoder_config.parallel_folding_mode = "sp"
+                # TODO text_encoder_config there not included real num_heads need to fix
+                enabled = False
+                # text_encoder_config.parallel_folding = True
+                # enabled = True
+                # text_encoder_config.parallel_folding_mode = "sp"
 
         if enabled:
             logger.info(
@@ -1570,6 +1575,15 @@ class ServerArgs(DisaggServerArgsMixin):
             help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
             "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
         )
+
+        # SGLang backend for encoder stage
+        parser.add_argument(
+            "--srt-encoder-url",
+            type=str,
+            default=ServerArgs.srt_encoder_url,
+            help="Url of SGLang server for encoder stage",
+        )
+
         return parser
 
     def url(self):
