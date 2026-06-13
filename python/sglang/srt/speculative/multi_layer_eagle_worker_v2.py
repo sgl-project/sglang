@@ -253,7 +253,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = draft_input.prepare_for_draft(
+        forward_batch, can_cuda_graph = self.prepare_for_draft(
+            draft_input,
             self.req_to_token_pool,
             batch,
             self.cuda_graph_runner,
