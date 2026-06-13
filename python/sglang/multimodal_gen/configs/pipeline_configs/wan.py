@@ -88,6 +88,49 @@ class WanT2V480PConfig(PipelineConfig):
     vae_precision: str = "fp32"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
 
+    @staticmethod
+    def _expand_cond_tensor_batch(
+        tensor: torch.Tensor, target_batch_size: int, cond_name: str
+    ) -> torch.Tensor:
+        current_batch_size = tensor.shape[0]
+        if current_batch_size == target_batch_size:
+            return tensor
+
+        if target_batch_size % current_batch_size != 0:
+            raise ValueError(
+                f"Wan expects `{cond_name}` batch size ({current_batch_size}) "
+                f"to divide target batch size ({target_batch_size})."
+            )
+
+        repeat_factor = target_batch_size // current_batch_size
+        return tensor.repeat_interleave(repeat_factor, dim=0).contiguous()
+
+    @classmethod
+    def _expand_cond_batch(
+        cls,
+        cond: list[torch.Tensor] | torch.Tensor | None,
+        batch,
+        cond_name: str,
+    ) -> list[torch.Tensor] | torch.Tensor | None:
+        if cond is None:
+            return None
+
+        target_batch_size = batch.batch_size
+        if isinstance(cond, list):
+            return [
+                cls._expand_cond_tensor_batch(tensor, target_batch_size, cond_name)
+                for tensor in cond
+            ]
+        return cls._expand_cond_tensor_batch(cond, target_batch_size, cond_name)
+
+    def get_pos_prompt_embeds(self, batch):
+        return self._expand_cond_batch(batch.prompt_embeds, batch, "prompt_embeds")
+
+    def get_neg_prompt_embeds(self, batch):
+        return self._expand_cond_batch(
+            batch.negative_prompt_embeds, batch, "negative_prompt_embeds"
+        )
+
     def __post_init__(self):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
