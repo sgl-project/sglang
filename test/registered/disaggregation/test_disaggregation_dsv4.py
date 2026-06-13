@@ -41,7 +41,7 @@ _EAGLE_SPEC_ARGS = [
 
 class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8KMixin):
     gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 1.6
+    accept_length_thres = 1.8
     bs_1_speed_thres = 140
 
     @classmethod
