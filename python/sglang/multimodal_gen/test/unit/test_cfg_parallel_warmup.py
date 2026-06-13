@@ -98,11 +98,15 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
     def test_warmup_req_cfg_parallel_sets_do_cfg(self):
         server_args = _make_bare_scheduler(enable_cfg_parallel=True).server_args
-        req = build_warmup_reqs(
-            server_args,
-            warmup_resolutions=["512x512"],
-            server_based_warmup=True,
-        )[0]
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
         self.assertIs(req.do_classifier_free_guidance, True)
         self.assertEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
 
@@ -113,11 +117,15 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         # "warmup" placeholder for negative_prompt (which would indicate
         # the fix's kwargs leaked into this branch).
         server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
-        req = build_warmup_reqs(
-            server_args,
-            warmup_resolutions=["512x512"],
-            server_based_warmup=True,
-        )[0]
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
         self.assertIs(req.do_classifier_free_guidance, False)
         self.assertNotEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
 
@@ -185,7 +193,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertTrue(req.is_warmup)
         self.assertEqual((req.width, req.height), (832, 480))
         self.assertEqual(req.num_frames, 17)
-        self.assertEqual(req.num_inference_steps, 1)
+        self.assertEqual(req.num_inference_steps, 2)
         self.assertTrue(req.extra["return_warmup_result"])
         self.assertTrue(req.extra["server_based_warmup"])
         self.assertEqual(req.extra["warmup_total"], 1)
@@ -289,7 +297,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         req = reqs[0]
         self.assertEqual((req.width, req.height), (832, 480))
         self.assertEqual(req.num_frames, 17)
-        self.assertEqual(req.num_inference_steps, 1)
+        self.assertEqual(req.num_inference_steps, 2)
         self.assertEqual(req.extra["cache_dit_num_inference_steps"], 50)
         self.assertEqual(req.negative_prompt, "model default negative")
         self.assertIs(req.do_classifier_free_guidance, True)
