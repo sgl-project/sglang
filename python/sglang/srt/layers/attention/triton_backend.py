@@ -482,6 +482,19 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            # SWA target models need the window buffer here too, not only in
+            # target_verify. Use the cached-prefix length (kv_lens).
+            update_sliding_window_buffer(
+                self.window_kv_indptr,
+                self.req_to_token,
+                self.sliding_window_size,
+                kv_lens,
+                req_pool_indices,
+                bs,
+                token_to_kv_pool=self.token_to_kv_pool,
+                window_kv_indices=self.cuda_graph_window_kv_indices,
+            )
         return qo_indptr, kv_indptr, num_tokens_per_bs
 
     def init_forward_metadata_out_graph(
@@ -711,6 +724,28 @@ class TritonAttnBackend(AttentionBackend):
                 )
             )
             kv_indices = kv_indices.to(torch.int64)
+
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                # SWA target models need window_kv_indices populated even in
+                # the draft_extend path; the kernel dispatches on it when
+                # layer.sliding_window_size > -1. custom_mask is None here so
+                # window_kv_offsets is unused and can stay None.
+                (
+                    window_kv_indptr,
+                    window_kv_indices,
+                    window_kv_lens,
+                    window_kv_offsets,
+                ) = update_sliding_window_buffer(
+                    self.window_kv_indptr,
+                    self.req_to_token,
+                    self.sliding_window_size,
+                    forward_batch.seq_lens,
+                    forward_batch.req_pool_indices,
+                    bs,
+                    self.device,
+                    self.token_to_kv_pool,
+                )
+
             mask_indptr = None
             # TODO(FIXME): This will trigger an invalid Eagle tree when using
             # `max(spec_info.num_accept_tokens_cpu)`.
@@ -963,8 +998,8 @@ class TritonAttnBackend(AttentionBackend):
                 qo_indptr=self.qo_indptr[: bs + 1],
                 custom_mask=None,
                 mask_indptr=None,
-                window_kv_indptr=self.window_kv_indptr,
-                window_kv_indices=None,
+                window_kv_indptr=self.window_kv_indptr[: bs + 1] if swa else None,
+                window_kv_indices=self.cuda_graph_window_kv_indices if swa else None,
                 window_num_kv_splits=None,
                 window_kv_offsets=None,
                 swa_out_cache_loc=swa_out_cache_loc,

@@ -556,13 +556,25 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=None,
+                prefix_lens=seq_lens[:bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=False,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=spec_info,
+            )
+        elif forward_mode.is_draft_extend():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                prefix_lens=seq_lens[:bs] - spec_info.num_accept_tokens,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
@@ -634,7 +646,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
-                prefix_lens=None,
+                prefix_lens=(
+                    forward_batch.seq_lens - forward_batch.spec_info.num_accept_tokens
+                ),
                 prefill_wrappers=self.prefill_wrappers_paged,
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
@@ -652,7 +666,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
-                prefix_lens=None,
+                prefix_lens=forward_batch.seq_lens,
                 prefill_wrappers=self.prefill_wrappers_verify,
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
