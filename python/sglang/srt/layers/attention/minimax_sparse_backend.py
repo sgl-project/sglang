@@ -77,12 +77,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             msa_available,
         )
 
+        # MSA (fmha_sm100) is bf16/fp16-only. With an fp8 main KV cache
+        # (--kv-cache-dtype fp8_*) keep the sparse path on Triton (it dequants fp8 on
+        # load) rather than feeding fp8 bytes to the bf16 kernel; mirrors vLLM's
+        # select_main_impl_cls (fp8 KV -> Triton, never MSA).
+        _main_kv_is_fp8 = self.kv_pool.main_pool.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
         self.use_msa = (
             not envs.SGLANG_DISABLE_MSA.get()
             and msa_available()
             and self.block_size_k == 128
             and self.kv_pool.page_size == self.block_size_k
             and self.topk_blocks in (4, 8, 16, 32)
+            and not _main_kv_is_fp8
         )
         # Per-forward MSA decode metadata (page table + fmha plan), shared by every
         # sparse layer of a forward; (re)built in init_forward_metadata_out_graph.
