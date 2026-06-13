@@ -7,11 +7,14 @@ spec server (sequential -- one model resident at a time; see SpecParityKit).
 import unittest
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_server_kits import SpecParityKit
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
+
+DEVICE = get_device()
 
 
 class TestEagle3Parity(SpecParityKit, Eagle3Base):
@@ -22,7 +25,11 @@ class TestEagle3Parity(SpecParityKit, Eagle3Base):
     at a time.
     """
 
-    disable_overlap = False
+    if DEVICE == "xpu":
+        disable_overlap = True
+        attention_backend = "triton"
+    else:
+        disable_overlap = False
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
