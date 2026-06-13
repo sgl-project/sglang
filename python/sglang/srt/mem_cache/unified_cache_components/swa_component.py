@@ -526,14 +526,6 @@ class SWAComponent(TreeComponent):
         window — the SWA portion of the tree lock is no longer needed but the
         Full lock must stay so the request's prefix is protected.
 
-        Mirrors `acquire_component_lock`'s walk (leaf -> root, skip nodes with
-        no SWA value), but for the leaf-at-lock_ref-1 case it goes further than
-        the standard `release_component_lock` does: it free()s the SWA pool
-        slots and removes the leaf from `lru_lists[SWA]`. The protection is
-        necessary because `_cascade_evict` asserts `cd.lock_ref == 0` on
-        leaves, so a Full-locked leaf stranded in the SWA LRU would crash the
-        scheduler when SWA-eviction picks it.
-
         Caller (UnifiedRadixCache.dec_swa_lock_only) must ensure this is
         invoked at most once per (node, swa_uuid_for_lock) pair.
         """
@@ -551,28 +543,15 @@ class SWAComponent(TreeComponent):
                 cur = cur.parent
                 continue
 
-            if cd.lock_ref == 1:
+            cd.lock_ref -= 1
+            if cd.lock_ref == 0:
                 key_len = len(cur.key)
                 self.cache.component_protected_size_[ct] -= key_len
-                if len(cur.children) == 0:
-                    # Leaf: tombstone SWA and detach from the SWA LRU.
-                    # Bypass `evict_component` because that path would
-                    # subtract from `component_evictable_size_` — we never
-                    # credited evictable for a locked leaf, so subtracting
-                    # would drift the accounting negative.
-                    self.cache.token_to_kv_pool_allocator.free_swa(
-                        cur.component_data[BASE_COMPONENT_TYPE].value
+                self.cache.component_evictable_size_[ct] += key_len
+                if self.cache._is_device_leaf(cur):
+                    self.cache._evict_component_and_detach_lru(
+                        cur, self, target=EvictLayer.DEVICE
                     )
-                    cd.value = None
-                    lru = self.cache.lru_lists[ct]
-                    if lru.in_list(cur):
-                        lru.remove_node(cur)
-                else:
-                    # Internal: protected -> evictable, mirror of
-                    # `acquire_component_lock`'s evictable -= key_len at
-                    # lock_ref 0 -> 1.
-                    self.cache.component_evictable_size_[ct] += key_len
-            cd.lock_ref -= 1
 
             if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
                 break
