@@ -34,7 +34,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
-from sglang.multimodal_gen.runtime.layers.spatial_parallel import (
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv3d,
     chunk_height_by_sizes,
     disable_spatial_parallel_decode,
