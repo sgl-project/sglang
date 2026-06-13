@@ -23,7 +23,10 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 )
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    is_ltx2_two_stage_pipeline_name,
+)
 from sglang.multimodal_gen.runtime.utils.common import parse_size
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -89,9 +92,10 @@ def _resolve_representative_warmup_resolution(
     sampling_defaults: SamplingParams,
 ) -> tuple[int, int]:
     target_area = _target_warmup_area(server_args)
+    alignment = _warmup_resolution_alignment(server_args)
 
     supported_resolution = _select_supported_warmup_resolution(
-        sampling_defaults.supported_resolutions, target_area
+        sampling_defaults.supported_resolutions, target_area, alignment
     )
     if supported_resolution is not None:
         return supported_resolution
@@ -99,9 +103,10 @@ def _resolve_representative_warmup_resolution(
     width = sampling_defaults.width
     height = sampling_defaults.height
     if width is not None and height is not None:
-        return _fit_resolution_to_area(width, height, target_area)
+        return _fit_resolution_to_area(width, height, target_area, alignment)
 
-    return _fallback_warmup_resolution(server_args)
+    width, height = _fallback_warmup_resolution(server_args)
+    return _fit_resolution_to_area(width, height, target_area, alignment)
 
 
 def _target_warmup_area(server_args: ServerArgs) -> int:
@@ -129,9 +134,17 @@ def _is_video_warmup_task(server_args: ServerArgs) -> bool:
     return server_args.pipeline_config.task_type.data_type() == DataType.VIDEO
 
 
+def _warmup_resolution_alignment(server_args: ServerArgs) -> int:
+    if is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name):
+        vae_scale_factor = server_args.pipeline_config.vae_scale_factor
+        return max(64, int(vae_scale_factor) * 2)
+    return 16
+
+
 def _select_supported_warmup_resolution(
     supported_resolutions: list[tuple[int, int]] | None,
     target_area: int,
+    alignment: int,
 ) -> tuple[int, int] | None:
     if not supported_resolutions:
         return None
@@ -140,25 +153,40 @@ def _select_supported_warmup_resolution(
         resolution
         for resolution in supported_resolutions
         if resolution[0] * resolution[1] <= target_area
+        and _is_resolution_aligned(resolution, alignment)
     ]
     if candidates:
         return max(candidates, key=lambda size: size[0] * size[1])
-    return min(supported_resolutions, key=lambda size: size[0] * size[1])
+
+    aligned_resolutions = [
+        resolution
+        for resolution in supported_resolutions
+        if _is_resolution_aligned(resolution, alignment)
+    ]
+    if aligned_resolutions:
+        return min(aligned_resolutions, key=lambda size: size[0] * size[1])
+    return None
 
 
 def _fit_resolution_to_area(
-    width: int, height: int, target_area: int
+    width: int, height: int, target_area: int, alignment: int
 ) -> tuple[int, int]:
     """adjust the warmup resolution to balance between warmup time and warmup effect"""
     area = width * height
-    if area <= target_area:
-        return width, height
+    if area > target_area:
+        scale = (target_area / area) ** 0.5
+        width = int(width * scale)
+        height = int(height * scale)
 
-    scale = (target_area / area) ** 0.5
     return (
-        max(16, int(width * scale) // 16 * 16),
-        max(16, int(height * scale) // 16 * 16),
+        max(alignment, width // alignment * alignment),
+        max(alignment, height // alignment * alignment),
     )
+
+
+def _is_resolution_aligned(resolution: tuple[int, int], alignment: int) -> bool:
+    width, height = resolution
+    return width % alignment == 0 and height % alignment == 0
 
 
 def _resolve_warmup_num_frames(

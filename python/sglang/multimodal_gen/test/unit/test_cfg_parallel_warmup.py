@@ -468,6 +468,40 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(reqs[0].num_frames, 17)
         self.assertEqual(reqs[0].num_inference_steps, 2)
 
+    def test_ltx2_two_stage_warmup_uses_pipeline_alignment(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.pipeline_class_name = "LTX2TwoStageHQPipeline"
+
+        task_type = MagicMock()
+        task_type.requires_image_input.return_value = False
+        task_type.accepts_image_input.return_value = False
+        task_type.is_image_gen.return_value = False
+        task_type.data_type.return_value = ModelTaskType.T2V.data_type()
+        server_args.pipeline_config.task_type = task_type
+        server_args.pipeline_config.vae_scale_factor = 32
+
+        sampling_defaults = SamplingParams(
+            width=1920,
+            height=1088,
+            num_frames=121,
+            num_inference_steps=15,
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual((reqs[0].width, reqs[0].height), (832, 448))
+        self.assertEqual(reqs[0].width % 64, 0)
+        self.assertEqual(reqs[0].height % 64, 0)
+
     def test_server_based_warmup_uses_representative_image_fallback(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
