@@ -56,7 +56,10 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
             # the Marlin FP8 block path reads "weight_scale_inv". Rename it and
             # leave the weight in [output, input] layout (size_k_first=False),
             # mirroring the Fp8 block-quant path.
-            assert not self.is_static_input_scheme
+            if self.is_static_input_scheme:
+                layer.input_scale = torch.nn.Parameter(
+                    layer.input_scale.data, requires_grad=False
+                )
             layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
             weight_scale = layer.weight_scale.data
             del layer._parameters["weight_scale"]

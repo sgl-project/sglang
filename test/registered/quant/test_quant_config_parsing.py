@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
@@ -42,6 +42,29 @@ class TestCompressedTensorsW8A16Fp8(CustomTestCase):
         self.assertIsInstance(layer.weight_scale, BlockQuantScaleParameter)
         self.assertEqual(tuple(layer.weight_scale.shape), (16, 8))
         self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
+
+        static_block_scheme = CompressedTensorsW8A16Fp8(
+            strategy=QuantizationStrategy.BLOCK,
+            is_static_input_scheme=True,
+            weight_block_size=[128, 128],
+        )
+        static_layer = torch.nn.Module()
+        static_block_scheme.create_weights(
+            layer=static_layer,
+            input_size=1024,
+            output_partition_sizes=[2048],
+            input_size_per_partition=1024,
+            params_dtype=torch.bfloat16,
+            weight_loader=noop_loader,
+        )
+        with patch(
+            "sglang.srt.layers.quantization.compressed_tensors.schemes."
+            "compressed_tensors_w8a16_fp8.prepare_fp8_layer_for_marlin"
+        ):
+            static_block_scheme.process_weights_after_loading(static_layer)
+
+        self.assertIsInstance(static_layer.input_scale, torch.nn.Parameter)
+        self.assertTrue(hasattr(static_layer, "weight_scale_inv"))
 
         channel_scheme = CompressedTensorsW8A16Fp8(
             strategy=QuantizationStrategy.CHANNEL,
