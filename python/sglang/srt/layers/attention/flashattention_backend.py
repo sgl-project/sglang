@@ -109,6 +109,10 @@ class FlashAttentionBackend(AttentionBackend):
     - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
     """
 
+    # CUDA-graph replay and eager init derive max_seq_len_k from GPU tensors
+    # via _replay_max_len / _max_seq_len; no host seq_lens mirror needed.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -371,6 +375,12 @@ class FlashAttentionBackend(AttentionBackend):
                 out_cache_loc=out_cache_loc,
             )
 
+    def _max_seq_len(self, forward_batch: ForwardBatch) -> int:
+        """Sync-free max of seq_lens; falls back to GPU .max() if CPU mirror absent."""
+        if forward_batch.seq_lens_cpu is not None:
+            return forward_batch.seq_lens_cpu.max().item()
+        return int(forward_batch.seq_lens.max())
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -385,7 +395,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
                     ).to(torch.int32)
-                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                    metadata.max_seq_len_k = self._max_seq_len(forward_batch) + (
                         self.speculative_step_id + 1
                     )
                     metadata.cu_seqlens_q = torch.arange(
@@ -404,7 +414,7 @@ class FlashAttentionBackend(AttentionBackend):
                     # Draft-extend's idle batch (padded for DP MLP-sync) has no
                     # tree; build plain metadata (padded output is discarded).
                     metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    metadata.max_seq_len_k = self._max_seq_len(forward_batch)
                     metadata.cu_seqlens_q = torch.arange(
                         0, batch_size + 1, dtype=torch.int32, device=device
                     )
@@ -417,7 +427,7 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
                     metadata.max_seq_len_q = self.topk
-                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    metadata.max_seq_len_k = self._max_seq_len(forward_batch)
                     metadata.cu_seqlens_q = torch.arange(
                         0,
                         batch_size * self.topk + 1,
@@ -467,7 +477,7 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = self._max_seq_len(forward_batch)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -494,8 +504,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ).to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
                 metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item()
-                    + self.speculative_num_draft_tokens
+                    self._max_seq_len(forward_batch) + self.speculative_num_draft_tokens
                 )
                 metadata.cu_seqlens_q = torch.arange(
                     0,
@@ -518,7 +527,7 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = self._max_seq_len(forward_batch)
                 metadata.cu_seqlens_q = torch.arange(
                     0,
                     batch_size * self.speculative_num_draft_tokens + 1,
@@ -618,7 +627,7 @@ class FlashAttentionBackend(AttentionBackend):
             include_draft_extend_v2=True
         ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = self._max_seq_len(forward_batch)
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
@@ -633,10 +642,15 @@ class FlashAttentionBackend(AttentionBackend):
                 self.attn_cp_size > 1
                 and forward_batch.global_num_tokens_cpu is not None
                 and forward_batch.extend_num_tokens is not None
-                and forward_batch.extend_seq_lens_cpu is not None
+                and forward_batch.extend_seq_lens is not None
             ):
                 padded_extend = int(forward_batch.extend_num_tokens)
-                real_extend = int(sum(forward_batch.extend_seq_lens_cpu))
+                # Prefer the CPU mirror; fall back to the GPU tensor when the
+                # opt-out path leaves seq_lens_cpu / extend_seq_lens_cpu unset.
+                if forward_batch.extend_seq_lens_cpu is not None:
+                    real_extend = int(sum(forward_batch.extend_seq_lens_cpu))
+                else:
+                    real_extend = int(forward_batch.extend_seq_lens.sum())
                 pad_delta = padded_extend - real_extend
                 if pad_delta > 0:
                     metadata.max_seq_len_k += pad_delta
@@ -645,11 +659,16 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if any(
-                forward_batch.extend_prefix_lens_cpu
-            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            has_prefix = (
+                forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
+            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            if has_prefix:
                 extend_seq_lens = forward_batch.extend_seq_lens
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.extend_seq_lens_cpu is not None:
+                    metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                else:
+                    metadata.max_seq_len_q = int(extend_seq_lens.max())
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
@@ -2056,6 +2075,14 @@ class FlashAttentionBackend(AttentionBackend):
 
         return metadata, metadata_expand
 
+    def _replay_max_len(
+        self, seq_lens: torch.Tensor, seq_lens_cpu: Optional[torch.Tensor]
+    ) -> int:
+        """Max seq_len for CG replay page-table sizing; GPU fallback if CPU absent."""
+        if seq_lens_cpu is not None:
+            return seq_lens_cpu.max().item()
+        return int(seq_lens.max())
+
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -2076,7 +2103,8 @@ class FlashAttentionBackend(AttentionBackend):
         are gone.
         """
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
         device = seq_lens.device
         metadata = None
@@ -2097,7 +2125,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if self.topk <= 1:
                     # When topk = 1, we use the normal decode metadata
                     metadata = self.decode_cuda_graph_metadata[bs]
-                    max_len = seq_lens_cpu.max().item()
+                    max_len = self._replay_max_len(seq_lens, seq_lens_cpu)
                     metadata.max_seq_len_k = max_len + self.speculative_step_id + 1
                     max_seq_pages = (
                         metadata.max_seq_len_k + self.page_size - 1
@@ -2140,7 +2168,9 @@ class FlashAttentionBackend(AttentionBackend):
                     # metadata.cu_seqlens_q already set in capture
                     # metadata.cu_seqlens_k is not needed
 
-                    metadata.max_seq_len_k = seq_lens_cpu.max().item()
+                    metadata.max_seq_len_k = self._replay_max_len(
+                        seq_lens, seq_lens_cpu
+                    )
                     max_seq_pages = (
                         metadata.max_seq_len_k + self.page_size - 1
                     ) // self.page_size
@@ -2188,7 +2218,7 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
+                max_len = self._replay_max_len(seq_lens, seq_lens_cpu)
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
@@ -2241,7 +2271,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 metadata.max_seq_len_k = (
-                    seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
+                    self._replay_max_len(seq_lens, seq_lens_cpu)
+                    + self.speculative_num_draft_tokens
                 )
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -2273,7 +2304,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata = self.target_verify_metadata_topk_normal[bs]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
                 # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
-                metadata.max_seq_len_k = seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = self._replay_max_len(seq_lens, seq_lens_cpu)
                 # metadata.cu_seqlens_q already set in capture
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -2359,7 +2390,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = self._replay_max_len(seq_lens, seq_lens_cpu)
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -2393,7 +2424,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = self._replay_max_len(seq_lens, seq_lens_cpu)
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -2736,6 +2767,12 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionMultiStepBackend:
+
+    # Wraps per-step FlashAttentionBackend instances, all of which derive
+    # max_seq_len_k from GPU tensors; opt out so decide_needs_cpu_seq_lens'
+    # OR over the spec_v2 backends stays False on an all-FA3 path.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
