@@ -87,7 +87,7 @@ class TestDSV4FlashFP4B200Balanced(
     """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
 
     gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 1.6
+    accept_length_thres = 1.8
     bs_1_speed_thres = 100
 
     @classmethod
