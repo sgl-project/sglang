@@ -262,6 +262,29 @@ def _fused_scale_shift_4d_kernel(
     tl.store(out_ptrs, output, mask=mask)
 
 
+# Streaming-row threshold: above this many rows the kernel is DRAM-bandwidth
+# bound and a "few rows x wide contiguous columns" tile maximizes coalesced
+# throughput. Below it the kernel is launch/latency bound, so we pack many rows
+# per block to amortize launch cost and keep the SMs busy. autotune is avoided
+# deliberately: its per-call host overhead dominates the small/mid rows (which
+# are host-dispatch bound), erasing any device-side win.
+_SS_STREAM_ROW_THRESHOLD = 12000
+
+
+def _pick_scale_shift_blc(L: int, C: int):
+    """Return (block_l, block_c, num_warps, num_stages) for the (L, C) regime."""
+    if L >= _SS_STREAM_ROW_THRESHOLD:
+        if C % 1024 == 0:
+            block_c = 1024
+        elif C % 512 == 0:
+            block_c = 512
+        else:
+            block_c = 256
+        return 8, block_c, 8, 4
+    # Latency/launch-bound: many rows per block, square-ish tile.
+    return 128, 128, 4, 2
+
+
 @triton.jit
 def fuse_scale_shift_kernel_blc_opt(
     x_ptr,
@@ -283,6 +306,8 @@ def fuse_scale_shift_kernel_blc_opt(
     stride_sc_c,
     SCALE_IS_SCALAR: tl.constexpr,
     SHIFT_IS_SCALAR: tl.constexpr,
+    SCALE_BCAST_L: tl.constexpr,
+    SHIFT_BCAST_L: tl.constexpr,
     BLOCK_L: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -302,32 +327,48 @@ def fuse_scale_shift_kernel_blc_opt(
         + l_offsets[:, None] * stride_x_l
         + c_offsets[None, :] * stride_x_c
     )
-    x = tl.load(x_ptr + x_off, mask=mask, other=0)
+    # x/y are pure streams (read/written once): evict_first so they do not
+    # displace the reused modulation rows from L2.
+    x = tl.load(x_ptr + x_off, mask=mask, other=0, eviction_policy="evict_first")
 
+    # shift: scalar -> 1 load; broadcast-over-L ([B,1,C]) -> load one C-row and
+    # reuse across the BLOCK_L rows (evict_last keeps it hot in L2); else 2D.
     if SHIFT_IS_SCALAR:
-        shift_val = tl.load(shift_ptr)
-        shift = tl.full((BLOCK_L, BLOCK_C), shift_val, dtype=shift_val.dtype)
+        shift = tl.load(shift_ptr)
+    elif SHIFT_BCAST_L:
+        s_off = pid_b * stride_s_b + c_offsets * stride_s_c
+        shift = tl.load(
+            shift_ptr + s_off, mask=mask_c, other=0, eviction_policy="evict_last"
+        )[None, :]
     else:
         s_off = (
             pid_b * stride_s_b
             + l_offsets[:, None] * stride_s_l
             + c_offsets[None, :] * stride_s_c
         )
-        shift = tl.load(shift_ptr + s_off, mask=mask, other=0)
+        shift = tl.load(
+            shift_ptr + s_off, mask=mask, other=0, eviction_policy="evict_first"
+        )
 
     if SCALE_IS_SCALAR:
-        scale_val = tl.load(scale_ptr)
-        scale = tl.full((BLOCK_L, BLOCK_C), scale_val, dtype=scale_val.dtype)
+        scale = tl.load(scale_ptr)
+    elif SCALE_BCAST_L:
+        sc_off = pid_b * stride_sc_b + c_offsets * stride_sc_c
+        scale = tl.load(
+            scale_ptr + sc_off, mask=mask_c, other=0, eviction_policy="evict_last"
+        )[None, :]
     else:
         sc_off = (
             pid_b * stride_sc_b
             + l_offsets[:, None] * stride_sc_l
             + c_offsets[None, :] * stride_sc_c
         )
-        scale = tl.load(scale_ptr + sc_off, mask=mask, other=0)
+        scale = tl.load(
+            scale_ptr + sc_off, mask=mask, other=0, eviction_policy="evict_first"
+        )
 
     y = x * (scale_constant + scale) + shift
-    tl.store(y_ptr + x_off, y, mask=mask)
+    tl.store(y_ptr + x_off, y, mask=mask, eviction_policy="evict_first")
 
 
 def fuse_scale_shift_kernel(
@@ -439,7 +480,14 @@ def fuse_scale_shift_kernel(
                 output.copy_(x)
                 return output
 
+        # Detect broadcast-over-L (stride_l == 0, e.g. [B,1,C] or [1,1,C]) so the
+        # kernel can load one C-row of scale/shift and reuse it across all rows.
+        scale_bcast_l = (not need_scale_scalar) and s_sl == 0
+        shift_bcast_l = (not need_shift_scalar) and sh_sl == 0
+
+        block_l, block_c, num_warps, num_stages = _pick_scale_shift_blc(L, C)
         grid = (triton.cdiv(L, block_l), triton.cdiv(C, block_c), B)
+
         fuse_scale_shift_kernel_blc_opt[grid](
             x,
             shift_blc if need_shift_scalar else shift_exp,
@@ -460,10 +508,12 @@ def fuse_scale_shift_kernel(
             s_sc,
             SCALE_IS_SCALAR=need_scale_scalar,
             SHIFT_IS_SCALAR=need_shift_scalar,
+            SCALE_BCAST_L=scale_bcast_l,
+            SHIFT_BCAST_L=shift_bcast_l,
             BLOCK_L=block_l,
             BLOCK_C=block_c,
-            num_warps=4,
-            num_stages=2,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     return output
 
