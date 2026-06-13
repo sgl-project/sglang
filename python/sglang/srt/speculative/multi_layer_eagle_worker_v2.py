@@ -41,7 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -92,7 +92,7 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
-class MultiLayerEagleDraftWorker(BaseDraftWorker):
+class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -253,7 +253,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
+        forward_batch, can_cuda_graph = draft_input.prepare_for_draft(
             self.req_to_token_pool,
             batch,
             self.cuda_graph_runner,
@@ -518,7 +518,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Prepare for draft extend in a separate stream
         # Notice that here we use batch_result.next_token_ids as the input ids
         with self.plan_stream_ctx:
-            forward_batch = draft_extend_input.prepare_for_extend_to_fill_draft_kvcache(
+            forward_batch = self.prepare_for_draft_extend(
+                draft_extend_input,
                 batch,
                 batch_result.next_token_ids,
                 self.speculative_num_draft_tokens,
@@ -805,12 +806,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = (
-                verify_input.prepare_for_v2_verify(
-                    self.req_to_token_pool,
-                    batch,
-                    self.target_worker,
-                )
+            verify_forward_batch, can_run_cuda_graph = verify_input.prepare_for_verify(
+                self.req_to_token_pool,
+                batch,
+                self.target_worker,
             )
 
         # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
@@ -834,7 +833,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 ),
             )
         # NOTE: metadata init is skipped here unconditionally, although
-        # prepare_for_v2_verify only plans when cuda-graph replay_prepare ran.
+        # prepare_for_verify only plans when cuda-graph replay_prepare ran.
         # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
         # worker has not adopted that fix, so preserve its behavior verbatim.
         # On NPU with --disable-cuda-graph, non-graph verify needs metadata init

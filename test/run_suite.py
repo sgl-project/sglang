@@ -43,6 +43,14 @@ PER_COMMIT_SUITES = {
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
+        # extra-a: label-gated PR opt-in suite in pr-test-amd-extra.yml
+        # (mirror of CUDA extra-a; tests stay tagged per-commit but only
+        # dispatch when the PR carries the `run-ci-extra` label). Only the
+        # 1-gpu-small mock-model / kv_canary *unit* tests are onboarded so
+        # far; the canary *e2e* tests (1-/2-gpu-large) need the canary JIT
+        # kernel ported to ROCm first, so those suites are intentionally
+        # not yet registered for AMD.
+        "extra-a-test-1-gpu-small-amd",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [
