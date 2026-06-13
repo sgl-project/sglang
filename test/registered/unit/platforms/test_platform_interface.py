@@ -231,6 +231,36 @@ class TestSRTPlatform(CustomTestCase):
         self.assertFalse(base.is_cuda())
         self.assertFalse(base.is_cuda_alike())
 
+    def test_base_pin_memory_default_stays_true(self):
+        """Keep the documented base default for compatibility."""
+        base = SRTPlatform()
+        self.assertTrue(base.is_pin_memory_available())
+        self.assertFalse(base.has_custom_pin_memory_availability())
+
+    def test_pin_memory_override_detection(self):
+        class P(_StubPlatform):
+            def is_pin_memory_available(self):
+                return False
+
+        self.assertTrue(P().has_custom_pin_memory_availability())
+
+    def test_pin_memory_for_cpu_device_stays_false(self):
+        self.assertFalse(SRTPlatform().is_pin_memory_available_for_device("cpu"))
+
+    @patch("sglang.srt.platforms.interface.torch.cuda.is_available", return_value=False)
+    def test_pin_memory_for_device_uses_cuda_unavailable_fallback(
+        self, mock_cuda_available
+    ):
+        self.assertFalse(SRTPlatform().is_pin_memory_available_for_device())
+        mock_cuda_available.assert_called_once_with()
+
+    @patch("sglang.srt.platforms.interface.torch.cuda.is_available", return_value=True)
+    def test_pin_memory_for_device_uses_cuda_available_fallback(
+        self, mock_cuda_available
+    ):
+        self.assertTrue(SRTPlatform().is_pin_memory_available_for_device())
+        mock_cuda_available.assert_called_once_with()
+
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
@@ -355,6 +385,116 @@ class TestSRTPlatformOverrides(CustomTestCase):
                 return "inductor"
 
         self.assertEqual(P().get_compile_backend(mode="npugraph_ex"), "inductor")
+
+
+class TestPinMemoryAvailability(CustomTestCase):
+    """Tests for common pin-memory helper dispatch through platforms."""
+
+    def test_oot_platform_override_true_bypasses_cuda_probe(self):
+        from sglang.srt.utils import common
+
+        class P(_StubPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def is_pin_memory_available(self):
+                return True
+
+        with (
+            patch.object(common, "current_platform", P()),
+            patch(
+                "sglang.srt.platforms.interface.torch.cuda.is_available",
+                return_value=False,
+            ) as mock_cuda_available,
+        ):
+            self.assertTrue(common.is_pin_memory_available())
+            mock_cuda_available.assert_not_called()
+
+    def test_oot_platform_override_false_bypasses_cuda_probe(self):
+        from sglang.srt.utils import common
+
+        class P(_StubPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def is_pin_memory_available(self):
+                return False
+
+        with (
+            patch.object(common, "current_platform", P()),
+            patch(
+                "sglang.srt.platforms.interface.torch.cuda.is_available",
+                return_value=True,
+            ) as mock_cuda_available,
+        ):
+            self.assertFalse(common.is_pin_memory_available())
+            mock_cuda_available.assert_not_called()
+
+    @patch("sglang.srt.platforms.interface.torch.cuda.is_available", return_value=False)
+    def test_oot_platform_without_override_preserves_cuda_unavailable_behavior(
+        self, mock_cuda_available
+    ):
+        from sglang.srt.utils import common
+
+        class P(_StubPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+        with patch.object(common, "current_platform", P()):
+            self.assertFalse(common.is_pin_memory_available())
+            mock_cuda_available.assert_called_once_with()
+
+    @patch("sglang.srt.platforms.interface.torch.cuda.is_available", return_value=True)
+    def test_oot_platform_without_override_preserves_cuda_available_behavior(
+        self, mock_cuda_available
+    ):
+        from sglang.srt.utils import common
+
+        class P(_StubPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+        with patch.object(common, "current_platform", P()):
+            self.assertTrue(common.is_pin_memory_available())
+            mock_cuda_available.assert_called_once_with()
+
+    def test_cpu_device_stays_false_for_oot_platform(self):
+        from sglang.srt.utils import common
+
+        class P(_StubPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def is_pin_memory_available(self):
+                return True
+
+        with patch.object(common, "current_platform", P()):
+            self.assertFalse(common.is_pin_memory_available(device="cpu"))
+
+    @patch("sglang.srt.platforms.interface.torch.cuda.is_available", return_value=False)
+    def test_in_tree_platform_returns_false_when_cuda_unavailable(
+        self, mock_cuda_available
+    ):
+        from sglang.srt.utils import common
+
+        with patch.object(common, "current_platform", _StubPlatform()):
+            self.assertFalse(common.is_pin_memory_available())
+            mock_cuda_available.assert_called_once_with()
+
+    @patch("sglang.srt.platforms.interface.torch.cuda.is_available", return_value=True)
+    def test_in_tree_platform_returns_true_when_cuda_available(
+        self, mock_cuda_available
+    ):
+        from sglang.srt.utils import common
+
+        with patch.object(common, "current_platform", _StubPlatform()):
+            self.assertTrue(common.is_pin_memory_available())
+            mock_cuda_available.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
