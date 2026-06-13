@@ -108,138 +108,76 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                 getattr(self, "cuda_graph_kv_indices", None) is not None
                 and bs <= self.cuda_graph_kv_indices.shape[0]
             )
-            if use_bound:
-                block_kv_indices = self.cuda_graph_kv_indices
-                create_flashmla_kv_indices_triton[
-                    (
-                        bs,
-                        get_num_kv_index_blocks_flashmla(
-                            block_kv_indices.stride(0), PAGE_SIZE
-                        ),
-                    )
-                ](
-                    self.req_to_token,
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    None,
-                    block_kv_indices,
-                    self.req_to_token.stride(0),
-                    block_kv_indices.stride(0),
-                    PAGED_SIZE=PAGE_SIZE,
-                )
-                self.forward_metadata = CutlassMLADecodeMetadata(
-                    self.cuda_graph_mla_workspace,
-                    block_kv_indices[:bs, : block_kv_indices.shape[1]],
-                )
-            else:
-                max_seqlen_pad = triton.cdiv(
-                    forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
-                )
-                block_kv_indices = torch.full(
-                    (bs, max_seqlen_pad),
-                    -1,
-                    dtype=torch.int32,
-                    device=seq_lens.device,
-                )
-                create_flashmla_kv_indices_triton[
-                    (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
-                ](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    None,
-                    block_kv_indices,
-                    self.req_to_token.stride(0),
-                    max_seqlen_pad,
-                    PAGED_SIZE=PAGE_SIZE,
-                )
-                workspace_size = cutlass_mla_get_workspace_size(
-                    max_seqlen_pad * PAGE_SIZE, bs, num_kv_splits=1
-                )
-                workspace = torch.empty(
-                    workspace_size, device="cuda", dtype=torch.uint8
-                )
-                self.forward_metadata = CutlassMLADecodeMetadata(
-                    workspace,
-                    block_kv_indices,
-                )
+            self._compute_decode_metadata(forward_batch, use_bound=use_bound)
         else:
             super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def _compute_decode_metadata(self, forward_batch: ForwardBatch, *, use_bound: bool):
+        """Cutlass-MLA decode (no-spec) metadata, shared by eager/capture/replay.
+
+        ``use_bound`` selects the pre-bound cuda-graph block table + bound
+        workspace (capture / replay / eager-at-captured-bs) vs a freshly
+        allocated block table + workspace (pure-eager / bs beyond capacity).
+        """
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
-        forward_mode = forward_batch.forward_mode
-        spec_info = forward_batch.spec_info
 
-        if forward_mode.is_decode_or_idle() and spec_info is None:
-            # Converged decode+no-spec body -- identical to the decode+no-spec
-            # branch of init_forward_metadata_out_graph, modulo the `in_capture
-            # or` below (eager never captures). Merged into a shared helper next.
-            use_bound = (
-                getattr(self, "cuda_graph_kv_indices", None) is not None
-                and bs <= self.cuda_graph_kv_indices.shape[0]
+        if use_bound:
+            block_kv_indices = self.cuda_graph_kv_indices
+            create_flashmla_kv_indices_triton[
+                (
+                    bs,
+                    get_num_kv_index_blocks_flashmla(
+                        block_kv_indices.stride(0), PAGE_SIZE
+                    ),
+                )
+            ](
+                self.req_to_token,
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                None,
+                block_kv_indices,
+                self.req_to_token.stride(0),
+                block_kv_indices.stride(0),
+                PAGED_SIZE=PAGE_SIZE,
             )
-            if use_bound:
-                block_kv_indices = self.cuda_graph_kv_indices
-                create_flashmla_kv_indices_triton[
-                    (
-                        bs,
-                        get_num_kv_index_blocks_flashmla(
-                            block_kv_indices.stride(0), PAGE_SIZE
-                        ),
-                    )
-                ](
-                    self.req_to_token,
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    None,
-                    block_kv_indices,
-                    self.req_to_token.stride(0),
-                    block_kv_indices.stride(0),
-                    PAGED_SIZE=PAGE_SIZE,
-                )
-                self.forward_metadata = CutlassMLADecodeMetadata(
-                    self.cuda_graph_mla_workspace,
-                    block_kv_indices[:bs, : block_kv_indices.shape[1]],
-                )
-            else:
-                max_seqlen_pad = triton.cdiv(
-                    forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
-                )
-                block_kv_indices = torch.full(
-                    (bs, max_seqlen_pad),
-                    -1,
-                    dtype=torch.int32,
-                    device=seq_lens.device,
-                )
-                create_flashmla_kv_indices_triton[
-                    (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
-                ](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    None,
-                    block_kv_indices,
-                    self.req_to_token.stride(0),
-                    max_seqlen_pad,
-                    PAGED_SIZE=PAGE_SIZE,
-                )
-                workspace_size = cutlass_mla_get_workspace_size(
-                    max_seqlen_pad * PAGE_SIZE, bs, num_kv_splits=1
-                )
-                workspace = torch.empty(
-                    workspace_size, device="cuda", dtype=torch.uint8
-                )
-                self.forward_metadata = CutlassMLADecodeMetadata(
-                    workspace,
-                    block_kv_indices,
-                )
+            self.forward_metadata = CutlassMLADecodeMetadata(
+                self.cuda_graph_mla_workspace,
+                block_kv_indices[:bs, : block_kv_indices.shape[1]],
+            )
         else:
-            super().init_forward_metadata(forward_batch)
+            max_seqlen_pad = triton.cdiv(
+                forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE
+            )
+            block_kv_indices = torch.full(
+                (bs, max_seqlen_pad),
+                -1,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+            create_flashmla_kv_indices_triton[
+                (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
+            ](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                None,
+                block_kv_indices,
+                self.req_to_token.stride(0),
+                max_seqlen_pad,
+                PAGED_SIZE=PAGE_SIZE,
+            )
+            workspace_size = cutlass_mla_get_workspace_size(
+                max_seqlen_pad * PAGE_SIZE, bs, num_kv_splits=1
+            )
+            workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
+            self.forward_metadata = CutlassMLADecodeMetadata(
+                workspace,
+                block_kv_indices,
+            )
 
     def init_cuda_graph_state(
         self,
