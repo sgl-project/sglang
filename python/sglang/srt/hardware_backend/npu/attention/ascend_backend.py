@@ -2104,7 +2104,7 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if sinks is not None:
+        if sinks is not None or self.is_hybrid_swa:
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
                 block_tables = self.forward_metadata.block_tables_swa
@@ -2158,7 +2158,9 @@ class AscendAttnBackend(AttentionBackend):
                         if layer.sliding_window_size != -1
                         else FULL_ATTENTION_WINDOW
                     ),
-                    next_tokens=0,
+                    next_tokens=(
+                        0 if layer.sliding_window_size == -1 else FULL_ATTENTION_WINDOW
+                    ),
                     atten_mask=self.fia_mask.to(torch.int8),
                     sparse_mode=sparse_mode,
                     softmax_scale=layer.scaling,
@@ -2212,59 +2214,6 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_len_kv = seq_lens_cpu_list
             else:
                 actual_seq_len_kv = seq_lens_cpu_int.cpu().int().tolist()
-
-            if (layer.qk_head_dim != layer.v_head_dim) and (
-                self.is_hybrid_swa and layer.sliding_window_size == -1
-            ):
-                query_v2 = q.reshape(
-                    -1, layer.tp_q_head_num, layer.qk_head_dim
-                ).contiguous()
-                actual_seq_qlen = (
-                    torch.tensor([1] * len(actual_seq_len_kv), dtype=torch.int32)
-                    .cumsum(dim=0)
-                    .tolist()
-                )
-                common_kwargs = dict(
-                    num_query_heads=layer.tp_q_head_num,
-                    num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="TND",
-                    pre_tokens=FULL_ATTENTION_WINDOW,
-                    next_tokens=0,
-                    atten_mask=self.fia_mask.to(torch.int8),
-                    sparse_mode=3,
-                    softmax_scale=layer.scaling,
-                    block_table=self.forward_metadata.block_tables,
-                    block_size=self.page_size,
-                    actual_seq_qlen=actual_seq_qlen,
-                    actual_seq_kvlen=actual_seq_len_kv,
-                )
-                workspace = (
-                    torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
-                        query_v2,
-                        k_cache.contiguous(),
-                        v_cache.contiguous(),
-                        **common_kwargs,
-                    )
-                )
-                attn_output = torch.empty(
-                    (
-                        query_v2.shape[0],
-                        layer.tp_q_head_num,
-                        layer.v_head_dim,
-                    ),
-                    dtype=q.dtype,
-                    device=q.device,
-                )
-                softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
-                torch_npu.npu_fused_infer_attention_score_v2.out(
-                    query_v2,
-                    k_cache.contiguous(),
-                    v_cache.contiguous(),
-                    **common_kwargs,
-                    workspace=workspace,
-                    out=[attn_output, softmax_lse],
-                )
-                return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             num_tokens = query.shape[0]
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
