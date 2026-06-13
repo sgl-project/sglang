@@ -7,10 +7,10 @@ from sgl_kernel import int8_scaled_mm
 
 def _int8_unsupported() -> bool:
     # int8_scaled_mm covers sm75-sm90 and sm120/sm121 (consumer Blackwell,
-    # via the SM89 tiling). Datacenter Blackwell (sm100-sm11x) has no int8
-    # path, so skip only that range.
+    # via the SM89 tiling). Skip GPUs below sm75 and datacenter Blackwell
+    # (sm100-sm11x), neither of which has an int8 path.
     cap = torch.cuda.get_device_capability()
-    return (10, 0) <= cap < (12, 0)
+    return cap < (7, 5) or (10, 0) <= cap < (12, 0)
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
