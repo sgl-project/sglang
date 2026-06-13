@@ -1,10 +1,15 @@
 import json
 
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
+    DEFAULT_M_VALUES,
     SelectedConfigStore,
     generate_candidate_configs,
     write_selected_config_file,
 )
+
+
+def test_tilelang_gemm_default_m_values_are_unique():
+    assert DEFAULT_M_VALUES == sorted(set(DEFAULT_M_VALUES))
 
 
 def test_tilelang_gemm_autotune_search_policy_counts():
@@ -71,6 +76,15 @@ def test_tilelang_gemm_exact_compatible_rejects_incompatible_m_family():
 
     assert store.get_exact(64, 4096, 1024)["kernel_type"] == "swapAB"
     assert store.get_exact_compatible(64, 4096, 1024) is None
+
+
+def test_tilelang_gemm_exact_compatible_rejects_illegal_config_fields():
+    config = generate_candidate_configs(128, 4096, 1024, search_policy="fast_sm90")[0]
+    store = SelectedConfigStore()
+    store.add({**config, "block_K": 64})
+
+    assert store.get_exact(128, 4096, 1024)["block_K"] == 64
+    assert store.get_exact_compatible(128, 4096, 1024) is None
 
 
 def test_tilelang_gemm_selected_config_uses_nearest_compatible_m_family():

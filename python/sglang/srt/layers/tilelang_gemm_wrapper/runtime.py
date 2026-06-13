@@ -20,6 +20,7 @@ from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
     generate_candidate_configs,
     write_selected_config_file,
 )
+from sglang.srt.layers.tilelang_gemm_wrapper.tuning import make_autotune_metadata
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -556,14 +557,14 @@ def warmup_or_autotune_shapes(
             search_policy=search_policy,
             checkpoint_config_path=checkpoint_config_path,
             resume_config_path=resume_config_path,
-            export_metadata={
-                "autotune_backend": backend,
-                "autotune_search_policy": search_policy,
-                "autotune_warmup": warmup,
-                "autotune_rep": rep,
-                "autotune_kernel_types": list(kernel_types) if kernel_types else None,
-                "autotune_max_configs": max_configs,
-            },
+            export_metadata=make_autotune_metadata(
+                backend,
+                search_policy,
+                warmup,
+                rep,
+                max_configs,
+                kernel_types,
+            ),
         )
         return
 

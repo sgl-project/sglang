@@ -18,6 +18,7 @@ import triton
 
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
     AUTOTUNE_SEARCH_POLICIES,
+    DEFAULT_M_VALUES,
     KERNEL_TYPES,
     write_selected_config_file,
 )
@@ -385,7 +386,7 @@ def main() -> None:
         "--m-values",
         type=int,
         nargs="+",
-        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+        default=DEFAULT_M_VALUES,
     )
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument("--config-path", help="Selected-config JSON file or directory")

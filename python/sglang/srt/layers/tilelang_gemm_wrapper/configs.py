@@ -13,6 +13,13 @@ SPLIT_K_KERNEL_TYPES = {"splitK", "splitK_swapAB"}
 SWAP_AB_KERNEL_TYPES = {"swapAB", "splitK_swapAB"}
 AUTOTUNE_SEARCH_POLICIES = ("full", "family_pruned", "fast_sm90")
 SCHEMA_VERSION = 1
+_BLOCK_M_VALUES = (64, 128)
+_BLOCK_N_VALUES = (16, 32, 64, 128)
+_BLOCK_K_VALUES = (128,)
+_THREAD_VALUES = (128, 256)
+_MATMUL_STAGE_VALUES = (1, 2, 3, 4)
+_SPLIT_K_STAGE_VALUES = (0, 1, 2)
+_SPLIT_K_VALUES = (2, 4, 8)
 
 DEFAULT_M_VALUES = [
     1,
@@ -73,10 +80,10 @@ def default_config(M: int, N: int, K: int) -> dict:
 def _matmul_configs(M: int, N: int, K: int) -> List[dict]:
     del N, K
     tiles_m = [64] if M < 128 else [64, 128]
-    tiles_n = [16, 32, 64, 128]
-    tiles_k = [128]
-    stages = [1, 2, 3, 4]
-    threads = [128, 256]
+    tiles_n = _BLOCK_N_VALUES
+    tiles_k = _BLOCK_K_VALUES
+    stages = _MATMUL_STAGE_VALUES
+    threads = _THREAD_VALUES
     configs = []
     for block_m in tiles_m:
         for block_n in tiles_n:
@@ -103,11 +110,11 @@ def _matmul_configs(M: int, N: int, K: int) -> List[dict]:
 def _matmul_splitk_configs(M: int, N: int, K: int) -> List[dict]:
     del N
     tiles_m = [64] if M < 128 else [64, 128]
-    tiles_n = [16, 32, 64, 128]
-    tiles_k = [128]
-    stages = [0, 1, 2]
-    threads = [128, 256]
-    split_ks = [2, 4, 8]
+    tiles_n = _BLOCK_N_VALUES
+    tiles_k = _BLOCK_K_VALUES
+    stages = _SPLIT_K_STAGE_VALUES
+    threads = _THREAD_VALUES
+    split_ks = _SPLIT_K_VALUES
     configs = []
     for block_m in tiles_m:
         for block_n in tiles_n:
@@ -177,9 +184,7 @@ def _select_kernel_types(
 
 def kernel_type_m_compatibility_error(kernel_type: str, M: int) -> Optional[str]:
     if kernel_type not in KERNEL_TYPES:
-        return (
-            f"unknown kernel_type={kernel_type}; expected one of {KERNEL_TYPES}"
-        )
+        return f"unknown kernel_type={kernel_type}; expected one of {KERNEL_TYPES}"
     if M > 32 and kernel_type in SWAP_AB_KERNEL_TYPES:
         return f"{kernel_type} is only supported for M <= 32; got M={M}"
     if M > 128 and kernel_type in SPLIT_K_KERNEL_TYPES:
@@ -188,23 +193,69 @@ def kernel_type_m_compatibility_error(kernel_type: str, M: int) -> Optional[str]
 
 
 def config_compatibility_error(config: dict, M: int, N: int, K: int) -> Optional[str]:
-    del N
+    if M <= 0 or N <= 0 or K <= 0:
+        return f"shape dimensions must be positive; got M={M}, N={N}, K={K}"
+    if N % 128 != 0 or K % 128 != 0:
+        return f"N and K must be multiples of 128; got N={N}, K={K}"
+
+    config = normalize_config(config, M, N, K)
     kernel_type = config["kernel_type"]
     error = kernel_type_m_compatibility_error(kernel_type, M)
     if error is not None:
         return error
 
-    split_k = int(config.get("split_k", 1))
+    if config["block_M"] not in _BLOCK_M_VALUES:
+        return f"block_M must be one of {_BLOCK_M_VALUES}; got {config['block_M']}"
+    if config["block_N"] not in _BLOCK_N_VALUES:
+        return f"block_N must be one of {_BLOCK_N_VALUES}; got {config['block_N']}"
+    if config["block_K"] not in _BLOCK_K_VALUES:
+        return f"block_K must be one of {_BLOCK_K_VALUES}; got {config['block_K']}"
+    if config["threads"] not in _THREAD_VALUES:
+        return f"threads must be one of {_THREAD_VALUES}; got {config['threads']}"
+    if config["out_dtype"] != "bfloat16":
+        return f"out_dtype must be bfloat16; got {config['out_dtype']}"
+    if config["accum_dtype"] != "float32":
+        return f"accum_dtype must be float32; got {config['accum_dtype']}"
+
+    split_k = config["split_k"]
     if kernel_type in SPLIT_K_KERNEL_TYPES:
-        if split_k <= 1:
-            return f"{kernel_type} requires split_k > 1; got split_k={split_k}"
+        if config["num_stages"] not in _SPLIT_K_STAGE_VALUES:
+            return (
+                f"{kernel_type} num_stages must be one of {_SPLIT_K_STAGE_VALUES}; "
+                f"got {config['num_stages']}"
+            )
+        if split_k not in _SPLIT_K_VALUES:
+            return (
+                f"{kernel_type} split_k must be one of {_SPLIT_K_VALUES}; got {split_k}"
+            )
         if K % split_k != 0 or (K // split_k) % 128 != 0:
             return (
                 f"{kernel_type} requires K/split_k to be divisible by 128; "
                 f"got K={K}, split_k={split_k}"
             )
+    elif config["num_stages"] not in _MATMUL_STAGE_VALUES:
+        return (
+            f"{kernel_type} num_stages must be one of {_MATMUL_STAGE_VALUES}; "
+            f"got {config['num_stages']}"
+        )
     elif split_k != 1:
         return f"{kernel_type} does not use split_k; got split_k={split_k}"
+
+    if kernel_type in SWAP_AB_KERNEL_TYPES:
+        if config["a_scale_shm"]:
+            return f"{kernel_type} uses b_scale_shm; a_scale_shm must be False"
+    elif config["b_scale_shm"]:
+        return f"{kernel_type} uses a_scale_shm; b_scale_shm must be False"
+
+    stage_for_smem = max(config["num_stages"], 1)
+    if (
+        config["block_M"] * config["block_K"] + config["block_N"] * config["block_K"]
+    ) * stage_for_smem >= 256 * 1024:
+        return (
+            "shared-memory tile footprint is too large: "
+            f"block_M={config['block_M']}, block_N={config['block_N']}, "
+            f"block_K={config['block_K']}, num_stages={config['num_stages']}"
+        )
 
     return None
 
