@@ -687,6 +687,8 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+            self.host_mem_release_queue.queue.clear()
+            self.prefetch_tokens_occupied = 0
 
         self.stop_event.clear()
         self.storage_stop_event.clear()

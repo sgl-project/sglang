@@ -191,7 +191,10 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    create_dummy_verify_input,
+)
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,
@@ -2737,69 +2740,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             global_dp_buffer_len = None
             global_num_tokens_cpu = None
 
-        def get_spec_info():
-            spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
-                from sglang.srt.speculative.eagle_info import EagleVerifyInput
-
-                if self.is_draft_worker:
-                    raise RuntimeError("This should not happen.")
-                else:
-                    spec_info = EagleVerifyInput(
-                        draft_token=None,
-                        custom_mask=buffers.custom_mask,
-                        positions=None,
-                        retrieve_index=None,
-                        retrieve_next_token=None,
-                        retrieve_next_sibling=None,
-                        retrieve_cum_len=None,
-                        spec_steps=self.server_args.speculative_num_steps,
-                        topk=self.server_args.speculative_eagle_topk,
-                        draft_token_num=self.server_args.speculative_num_draft_tokens,
-                        capture_hidden_mode=CaptureHiddenMode.FULL,
-                        seq_lens_sum=None,
-                        seq_lens_cpu=None,
-                    )
-                    # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
-                    # during forward; provide a dummy so warmup doesn't crash.
-                    spec_info.hidden_states = torch.zeros(
-                        (num_tokens, self.model_config.hidden_size),
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
-            elif self.spec_algorithm.is_dflash():
-                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-
-                # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
-                spec_info = DFlashVerifyInput(
-                    draft_token=None,
-                    positions=None,
-                    draft_token_num=self.server_args.speculative_num_draft_tokens,
-                    custom_mask=None,
-                    capture_hidden_mode=(
-                        CaptureHiddenMode.NULL
-                        if self.is_draft_worker
-                        else CaptureHiddenMode.FULL
-                    ),
-                )
-
-            elif self.spec_algorithm.is_ngram():
-                from sglang.srt.speculative.ngram_info import NgramVerifyInput
-
-                spec_info = NgramVerifyInput(
-                    draft_token=None,
-                    custom_mask=buffers.custom_mask,
-                    positions=None,
-                    retrieve_index=None,
-                    retrieve_next_token=None,
-                    retrieve_next_sibling=None,
-                    draft_token_num=num_tokens_per_bs,
-                )
-                spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
-
-            return spec_info
-
-        spec_info = get_spec_info()
+        spec_info = create_dummy_verify_input(
+            self.spec_algorithm,
+            self.server_args,
+            buffers.custom_mask,
+            num_tokens_per_bs,
+            self.is_draft_worker,
+        )
+        if spec_info is not None and (
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()
+        ):
+            # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
+            # during forward; provide a dummy so warmup doesn't crash.
+            spec_info.hidden_states = torch.zeros(
+                (num_tokens, self.model_config.hidden_size),
+                dtype=self.dtype,
+                device=self.device,
+            )
         if capture_hidden_mode != CaptureHiddenMode.FULL:
             capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
