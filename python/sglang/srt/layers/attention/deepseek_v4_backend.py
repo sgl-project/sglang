@@ -787,6 +787,15 @@ class DeepseekV4AttnBackend(
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        # MTP idle is a no-op in eager: the eager init_forward_metadata returned
+        # before touching metadata. Preserve that once eager flows through the
+        # base wrapper (out_graph + in_graph) -- skip the raw->full upgrade and
+        # the swa write-target translate for an idle MTP draft batch, which has
+        # no real metadata to materialize. Capture/replay never reach here with a
+        # literal idle mode (the MultiStep wrapper pins inner forward_mode to
+        # DECODE and carries the runtime mode in actual_forward_mode).
+        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+            return
         # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
         # materialization is recorded inside the cuda graph; a no-op (Full
         # already) when PREP_IN_CUDA_GRAPH=0.
