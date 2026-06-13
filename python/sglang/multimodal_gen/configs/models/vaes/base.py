@@ -4,6 +4,7 @@
 import argparse
 import dataclasses
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -16,12 +17,28 @@ AUTO_PARALLEL_DECODE_MODE = "auto"
 SPATIAL_SHARD_PARALLEL_DECODE_MODES = ("spatial_shard", "spatial")
 
 
+@lru_cache(maxsize=8)
 def is_spatial_shard_parallel_decode_mode(mode: str) -> bool:
     return mode in SPATIAL_SHARD_PARALLEL_DECODE_MODES
 
 
+@lru_cache(maxsize=8)
 def is_auto_parallel_decode_mode(mode: str) -> bool:
     return mode == AUTO_PARALLEL_DECODE_MODE
+
+
+@lru_cache(maxsize=128)
+def _should_use_auto_spatial_shard_parallel_decode(
+    z_shape: tuple[int, ...],
+    world_size: int,
+    min_latent_elements_per_rank: int,
+) -> bool:
+    if world_size <= 1 or z_shape[-2] < world_size:
+        return False
+    latent_elements_per_rank = (
+        z_shape[0] * z_shape[-3] * z_shape[-2] * z_shape[-1]
+    ) // world_size
+    return latent_elements_per_rank >= min_latent_elements_per_rank
 
 
 def should_use_spatial_shard_parallel_decode(
@@ -92,14 +109,10 @@ class VAEConfig(ModelConfig):
     def should_use_auto_spatial_shard_parallel_decode(
         self, z: torch.Tensor, world_size: int
     ) -> bool:
-        if world_size <= 1 or z.shape[-2] < world_size:
-            return False
-        latent_elements_per_rank = (
-            z.shape[0] * z.shape[-3] * z.shape[-2] * z.shape[-1]
-        ) // world_size
-        return (
-            latent_elements_per_rank
-            >= self.auto_parallel_decode_min_latent_elements_per_rank
+        return _should_use_auto_spatial_shard_parallel_decode(
+            tuple(z.shape),
+            world_size,
+            self.auto_parallel_decode_min_latent_elements_per_rank,
         )
 
     @staticmethod
