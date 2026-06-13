@@ -406,6 +406,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
+    _original_batch_size: Optional[int] = None
+    _original_forward_mode: Optional[ForwardMode] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -1082,6 +1084,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
+        self._original_batch_size = self.batch_size
         global_num_tokens = self.global_num_tokens_cpu
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
@@ -1135,20 +1138,68 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_draft_extend(include_v2=True)
             or self.forward_mode.is_idle()
         ):
-            if self.is_extend_in_batch and dp_padding_mode.is_max_len():
-                setattr(self, "_original_forward_mode", self.forward_mode)
-                self.forward_mode = ForwardMode.EXTEND
-                self.extend_num_tokens = bs
-                self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
-                self.extend_prefix_lens = self.seq_lens - 1
-                self.extend_start_loc = torch.arange(
-                    bs, dtype=torch.int32, device=self.seq_lens.device
+            # Mamba-hybrid families need the fabricated-row idle conversion
+            # below; this includes their MTP draft workers, whose mamba-less
+            # "*E" pattern makes mambaish_config return None.
+            hybrid_ssm = model_runner.mambaish_config is not None or (
+                model_runner.is_draft_worker
+                and getattr(
+                    model_runner.model_config.hf_config,
+                    "mtp_hybrid_override_pattern",
+                    None,
                 )
-                self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
-                self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
-                self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
+                is not None
+            )
+            if (
+                hybrid_ssm
+                and self.spec_info is not None
+                and not self.spec_info.is_draft_input()
+            ):
+                if self.forward_mode.is_idle():
+                    self._original_forward_mode = self.forward_mode
+                    self.forward_mode = ForwardMode.TARGET_VERIFY
+                bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
+            elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
+                self._original_forward_mode = self.forward_mode
+                self.forward_mode = ForwardMode.EXTEND
+                if hybrid_ssm:
+                    dev = self.seq_lens.device
+                    assert (
+                        self.seq_lens.shape[0] == 0
+                    ), "extend-idle conversion expects an empty rank"
+                    self.extend_num_tokens = num_tokens
+                    self.extend_seq_lens = torch.tensor(
+                        [num_tokens], dtype=torch.int32, device=dev
+                    )
+                    self.extend_prefix_lens = torch.zeros(
+                        1, dtype=self.seq_lens.dtype, device=dev
+                    )
+                    self.extend_start_loc = torch.zeros(
+                        1, dtype=torch.int32, device=dev
+                    )
+                    self.seq_lens = torch.tensor(
+                        [num_tokens], dtype=self.seq_lens.dtype, device=dev
+                    )
+                    self.seq_lens_sum = int(num_tokens)
+                    if self.seq_lens_cpu is not None:
+                        self.seq_lens_cpu = torch.tensor(
+                            [num_tokens], dtype=self.seq_lens.dtype
+                        )
+                    self.extend_prefix_lens_cpu = [0]
+                    self.extend_seq_lens_cpu = [int(num_tokens)]
+                    self.extend_logprob_start_lens_cpu = [0]
+                    bs = self.batch_size = 1
+                else:
+                    self.extend_num_tokens = bs
+                    self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
+                    self.extend_prefix_lens = self.seq_lens - 1
+                    self.extend_start_loc = torch.arange(
+                        bs, dtype=torch.int32, device=self.seq_lens.device
+                    )
+                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
+                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+                    self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
-                setattr(self, "_original_batch_size", self.batch_size)
                 if self.spec_info is not None:
                     bs = self.batch_size = (
                         num_tokens // self.spec_info.num_tokens_per_req
@@ -1277,8 +1328,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
-        self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
-        self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
+        if self._original_forward_mode is not None:
+            self.forward_mode = self._original_forward_mode
+        if self._original_batch_size is not None:
+            self.batch_size = self._original_batch_size
         bs = self.batch_size
 
         if self.spec_info is not None:
