@@ -309,6 +309,10 @@ class Envs:
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
+    # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
+    # already enabled regardless of this flag (see start_event_loop).
+    SGLANG_ENABLE_WAR_BARRIER = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
@@ -467,6 +471,7 @@ class Envs:
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
     SGLANG_MLX_USE_CUSTOM_ROPE = EnvBool(False)
+    SGLANG_MLX_FUSE_SWIGLU = EnvBool(False)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
@@ -619,7 +624,6 @@ class Envs:
     SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
 
     # Overlap Spec V2
-    SGLANG_ENABLE_SPEC_V2 = EnvBool(True)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     SGLANG_DFLASH_PREFILL_REFILL_TARGET = EnvInt(None)
 
@@ -779,6 +783,9 @@ class Envs:
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
 
+    # Unified radix cache
+    SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
+
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
@@ -860,6 +867,7 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")

@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     FP8_WEIGHT_DTYPE,
+    W8A8_FP8_GEMM_ENV,
     WeightOnlyFP8ColumnParallelLinear,
     WeightOnlyFP8Linear,
     dequantize_rowwise_fp8_weight,
@@ -909,6 +910,24 @@ class TestIdeogram4(unittest.TestCase):
         self.assertEqual(model.weight.dtype, FP8_WEIGHT_DTYPE)
         self.assertEqual(model.weight_scale.dtype, torch.float32)
 
+    def test_weight_only_fp8_w8a8_gemm_defaults_to_off(self):
+        with patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "0"}):
+            model = WeightOnlyFP8Linear(3, 2, bias=False)
+
+        self.assertFalse(model.enable_fused_w8a8)
+
+    def test_weight_only_fp8_w8a8_gemm_env_opt_in(self):
+        with patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}):
+            model = WeightOnlyFP8Linear(3, 2, bias=False)
+
+        self.assertTrue(model.enable_fused_w8a8)
+
+    def test_weight_only_fp8_w8a8_gemm_explicit_flag_overrides_env(self):
+        with patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}):
+            model = WeightOnlyFP8Linear(3, 2, bias=False, enable_fused_w8a8=False)
+
+        self.assertFalse(model.enable_fused_w8a8)
+
     def test_ideogram_text_encoder_post_config_hook_preserves_local_arch(self):
         config = Ideogram4TextEncoderConfig()
         config.arch_config.architectures = ["RemoteQwen3VLTextModel"]
@@ -961,13 +980,20 @@ class TestIdeogram4(unittest.TestCase):
             set_global_server_args(
                 SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
             )
-            with torch.device("meta"):
+            with (
+                patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}),
+                torch.device("meta"),
+            ):
                 encoder = IdeogramQwen3VLTextEncoder(config)
         finally:
             set_global_server_args(prev_args)
-        self.assertTrue(
-            any(isinstance(module, WeightOnlyFP8Linear) for module in encoder.modules())
-        )
+        fp8_linears = [
+            module
+            for module in encoder.modules()
+            if isinstance(module, WeightOnlyFP8Linear)
+        ]
+        self.assertTrue(fp8_linears)
+        self.assertTrue(all(not module.enable_fused_w8a8 for module in fp8_linears))
         self.assertFalse(
             any(isinstance(module, torch.nn.Linear) for module in encoder.modules())
         )

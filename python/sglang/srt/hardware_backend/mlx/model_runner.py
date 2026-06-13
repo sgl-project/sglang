@@ -27,6 +27,7 @@ from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.aot import (
     MLX_AOT_KERNEL_REGISTRY,
     MlxAOTKernelSet,
@@ -460,6 +461,21 @@ class MlxModelRunner:
 
         load_time = time.time() - start_time
         logger.info(f"MLX model loaded in {load_time:.2f}s")
+
+        # Optional: Path B fusion — keep up_proj/gate_proj weights separate
+        # (no matmul-kernel tile regression) but fuse the swiglu activation
+        # into the gate matmul via a custom Metal kernel. Activated by
+        # SGLANG_MLX_FUSE_SWIGLU=1. Mutually exclusive with FUSE_SWITCHGLU.
+        # See: python/sglang/srt/hardware_backend/mlx/moe/fused_swiglu.py
+        if envs.SGLANG_MLX_FUSE_SWIGLU.get():
+            from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
+                patch_switch_glu_with_fused_swiglu,
+            )
+
+            n_patched = patch_switch_glu_with_fused_swiglu(self.model)
+            logger.info(
+                f"MLX SwiGLU activation fusion enabled: patched {n_patched} blocks"
+            )
 
     def _attention_module_for_layer(self, layer_idx: int) -> Any:
         attn = getattr(
