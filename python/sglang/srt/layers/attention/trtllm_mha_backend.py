@@ -910,25 +910,208 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize the metadata for a forward pass."""
+        """Initialize the metadata for a forward pass (eager).
 
-        metadata = TRTLLMMHAMetadata()
-        seqlens_in_batch = forward_batch.seq_lens
-        batch_size = forward_batch.batch_size
-        device = seqlens_in_batch.device
+        Converged eager == replay == capture body -- identical to the
+        post-pre-roll body of init_forward_metadata_out_graph, modulo the
+        `in_capture or` in the use_bound seam (eager never captures). Merged into
+        a shared helper in a follow-up commit.
+        """
+        bs = forward_batch.batch_size
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
 
-        if forward_batch.forward_mode.is_decode_or_idle():
-            if forward_batch.spec_info is not None:
-                # Draft Decode
+        # Converged eager == replay == capture metadata body. `use_bound`
+        # selects the pre-bound per-bs cuda-graph metadata (capture / replay /
+        # eager-at-captured-bs, refilled in place) vs a fresh per-iter metadata.
+        # use_bound=True reproduces the old _apply_cuda_graph_metadata body;
+        # use_bound=False reproduces the old eager init_forward_metadata body
+        # (kept identical modulo the in_capture pre-roll above and the
+        # `in_capture or` below, so this body can later replace eager verbatim).
+        use_bound = self._use_cuda_graph_buffers(bs, forward_mode)
+
+        if use_bound:
+            # Bound cuda-graph path (replay / capture / eager-at-captured-bs):
+            # refill the pre-bound per-bs metadata in place. Mirrors the old
+            # _apply_cuda_graph_metadata body exactly ([:bs] slicing, in-place
+            # copy_ into the captured buffer slices).
+            seq_lens = forward_batch.seq_lens[:bs]
+            seq_lens_cpu = forward_batch.seq_lens_cpu[:bs]
+            req_pool_indices = forward_batch.req_pool_indices[:bs]
+            metadata = None
+            if forward_mode.is_decode_or_idle():
+                if spec_info is not None:
+                    # Draft Decode
+                    # Here we only support topk = 1 for now.
+                    metadata = self.decode_cuda_graph_metadata[bs]
+                    metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+                        "cache_seqlens"
+                    ][:bs]
+                    metadata.cache_seqlens_int32.copy_(
+                        seq_lens + self.speculative_step_id + 1
+                    )
+                    metadata.max_seq_len_k = seq_lens.max().item() + (
+                        self.speculative_step_id + 1
+                    )
+
+                    max_seq_pages = (
+                        metadata.max_seq_len_k + self.page_size - 1
+                    ) // self.page_size
+                else:
+                    # Normal Decode
+                    metadata = self.decode_cuda_graph_metadata[bs]
+                    max_len = seq_lens_cpu.max().item()
+                    max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+                    metadata.max_seq_len_k = max_len
+
+                    metadata.cache_seqlens_int32.copy_(seq_lens)
+
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+                )
+                page_indices = self.req_to_token[
+                    req_pool_indices[:, None],
+                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
+                        None, :
+                    ],
+                ]
+                metadata.page_table[:, :max_seq_pages].copy_(
+                    page_indices // self.page_size
+                )
+                self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+            elif forward_mode.is_target_verify():
                 # Here we only support topk = 1 for now.
+                metadata = self.target_verify_metadata[bs]
+                metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
+
+                metadata.max_seq_len_k = (
+                    seq_lens_cpu.max().item() + metadata.max_seq_len_q
+                )
+                max_len = seq_lens_cpu.max().item()
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+                )
+                max_seq_pages = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
+                page_indices = self.req_to_token[
+                    req_pool_indices[:, None],
+                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
+                ]
+                metadata.page_table[:, :max_seq_pages].copy_(
+                    page_indices // self.page_size
+                )
+                self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+            elif forward_mode.is_draft_extend_v2():
+                metadata = self.draft_extend_metadata[bs]
+                metadata.cache_seqlens_int32.copy_(seq_lens)
+
+                metadata.max_seq_len_k = seq_lens_cpu.max().item()
+                max_len = seq_lens_cpu.max().item()
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+                )
+                if forward_mode.is_draft_extend_v2():
+                    num_tokens_per_bs = spec_info.num_tokens_per_req
+                    if num_tokens_per_bs <= 0:
+                        # Capture uses a synthetic EagleDraftExtendInput; infer the
+                        # fixed V2 stride from the capture buffer when it is unset.
+                        num_tokens_per_bs = int(
+                            spec_info.num_accept_tokens[:bs].max().item()
+                        )
+                    metadata.max_seq_len_q = num_tokens_per_bs
+                    metadata.cu_seqlens_q[1:].copy_(
+                        torch.arange(
+                            num_tokens_per_bs,
+                            bs * num_tokens_per_bs + 1,
+                            num_tokens_per_bs,
+                            dtype=torch.int32,
+                            device=metadata.cu_seqlens_q.device,
+                        )
+                    )
+                else:
+                    extend_lens = spec_info.num_accept_tokens[:bs]
+                    if spec_info.num_accept_tokens_cpu:
+                        metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
+                    else:
+                        metadata.max_seq_len_q = 1
+
+                    metadata.cu_seqlens_q[1:].copy_(
+                        torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
+                    )
+
+                max_seq_pages = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
+                page_indices = self.req_to_token[
+                    req_pool_indices[:, None],
+                    self.draft_extend_metadata["strided_indices"][:max_seq_pages],
+                ]
+                metadata.page_table[:, :max_seq_pages].copy_(
+                    page_indices // self.page_size
+                )
+                self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+            self.forward_metadata = metadata
+        else:
+            # Eager (use_bound=False) path: build a fresh per-iter metadata.
+            # Mirrors the old eager init_forward_metadata body exactly (plain
+            # EXTEND and eager draft_extend_v2 both land in the final `else`).
+            metadata = TRTLLMMHAMetadata()
+            seqlens_in_batch = forward_batch.seq_lens
+            batch_size = forward_batch.batch_size
+            device = seqlens_in_batch.device
+
+            if forward_batch.forward_mode.is_decode_or_idle():
+                if forward_batch.spec_info is not None:
+                    # Draft Decode
+                    # Here we only support topk = 1 for now.
+                    metadata.cache_seqlens_int32 = (
+                        seqlens_in_batch + (self.speculative_step_id + 1)
+                    ).to(torch.int32)
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                        self.speculative_step_id + 1
+                    )
+                    metadata.cu_seqlens_q = torch.arange(
+                        0, batch_size + 1, dtype=torch.int32, device=device
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        ),
+                        (1, 0),
+                    )
+                    metadata.page_table = self.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
+                else:
+                    # Normal Decode
+                    metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    metadata.cu_seqlens_q = torch.arange(
+                        0, batch_size + 1, dtype=torch.int32, device=device
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                    )
+                    metadata.page_table = self.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
+            elif forward_batch.forward_mode.is_target_verify():
+                # Only support topk = 1 for now.
+                tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
                 metadata.cache_seqlens_int32 = (
-                    seqlens_in_batch + (self.speculative_step_id + 1)
+                    forward_batch.seq_lens + tokens_per_req
                 ).to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
-                    self.speculative_step_id + 1
+                metadata.max_seq_len_q = tokens_per_req
+                metadata.max_seq_len_k = (
+                    forward_batch.seq_lens_cpu.max().item() + tokens_per_req
                 )
                 metadata.cu_seqlens_q = torch.arange(
-                    0, batch_size + 1, dtype=torch.int32, device=device
+                    0,
+                    batch_size * tokens_per_req + 1,
+                    tokens_per_req,
+                    dtype=torch.int32,
+                    device=device,
                 )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
@@ -939,97 +1122,83 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+
             else:
-                # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-                metadata.cu_seqlens_q = torch.arange(
-                    0, batch_size + 1, dtype=torch.int32, device=device
-                )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
-        elif forward_batch.forward_mode.is_target_verify():
-            # Only support topk = 1 for now.
-            tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
-            metadata.cache_seqlens_int32 = (forward_batch.seq_lens + tokens_per_req).to(
-                torch.int32
-            )
-            metadata.max_seq_len_q = tokens_per_req
-            metadata.max_seq_len_k = (
-                forward_batch.seq_lens_cpu.max().item() + tokens_per_req
-            )
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                batch_size * tokens_per_req + 1,
-                tokens_per_req,
-                dtype=torch.int32,
-                device=device,
-            )
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
-                (1, 0),
-            )
-            metadata.page_table = self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
 
-        else:
-            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-            )
-            metadata.page_table = self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
+                if (
+                    any(forward_batch.extend_prefix_lens_cpu)
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                ):
+                    extend_seq_lens = forward_batch.extend_seq_lens
+                    # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
+                    # Python's max() returns a 0-d tensor, but flashinfer expects an int.
+                    max_q = max(forward_batch.extend_seq_lens_cpu)
+                    metadata.max_seq_len_q = (
+                        int(max_q.item())
+                        if isinstance(max_q, torch.Tensor)
+                        else int(max_q)
+                    )
+                    metadata.cu_seqlens_q = torch.nn.functional.pad(
+                        torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                    )
+                else:
+                    metadata.max_seq_len_q = metadata.max_seq_len_k
+                    metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
+            # Compute SWA page table (None for non-SWA models)
+            metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
+
+            # int64 scatter index (unlike the int32 read page table above).
             if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode.is_draft_extend_v2()
+                self.use_sliding_window_kv_pool
+                and forward_batch.out_cache_loc is not None
             ):
-                extend_seq_lens = forward_batch.extend_seq_lens
-                # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
-                # Python's max() returns a 0-d tensor, but flashinfer expects an int.
-                max_q = max(forward_batch.extend_seq_lens_cpu)
-                metadata.max_seq_len_q = (
-                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
+                metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
                 )
-                metadata.cu_seqlens_q = torch.nn.functional.pad(
-                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+
+            # Convert the page tables to a strided format
+            if self.page_size > 1:
+                self.strided_indices = torch.arange(
+                    0, metadata.page_table.shape[1], self.page_size, device=self.device
                 )
-            else:
-                metadata.max_seq_len_q = metadata.max_seq_len_k
-                metadata.cu_seqlens_q = metadata.cu_seqlens_k
+                metadata.page_table = (
+                    metadata.page_table[:, self.strided_indices] // self.page_size
+                )
+                if metadata.swa_page_table is not None:
+                    metadata.swa_page_table = (
+                        metadata.swa_page_table[:, self.strided_indices]
+                        // self.page_size
+                    )
 
-        # Compute SWA page table (None for non-SWA models)
-        metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
+            self.forward_metadata = metadata
 
-        # int64 scatter index (unlike the int32 read page table above).
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            metadata.swa_out_cache_loc = (
+        # Bound-path SWA: refill the captured write-target buffer from the live
+        # out_cache_loc before replay (the per-bs metadata holds a view bound in
+        # _build). The eager (use_bound=False) path instead sets
+        # metadata.swa_out_cache_loc directly inside the body above.
+        if (
+            use_bound
+            and self.use_sliding_window_kv_pool
+            and forward_batch.out_cache_loc is not None
+        ):
+            n = forward_batch.out_cache_loc.shape[0]
+            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
             )
-
-        # Convert the page tables to a strided format
-        if self.page_size > 1:
-            self.strided_indices = torch.arange(
-                0, metadata.page_table.shape[1], self.page_size, device=self.device
-            )
-            metadata.page_table = (
-                metadata.page_table[:, self.strided_indices] // self.page_size
-            )
-            if metadata.swa_page_table is not None:
-                metadata.swa_page_table = (
-                    metadata.swa_page_table[:, self.strided_indices] // self.page_size
-                )
-
-        self.forward_metadata = metadata
 
     def forward_decode(
         self,
