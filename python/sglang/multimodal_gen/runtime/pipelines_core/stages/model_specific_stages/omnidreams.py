@@ -795,6 +795,8 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 ctx_noise_t,
                 rng=gen,
             )
+            if pin:
+                ctx_latent = ctx_latent * (1.0 - inject_mask) + image_full * inject_mask
             self.transformer(
                 hidden_states=ctx_latent,
                 encoder_hidden_states=text,
