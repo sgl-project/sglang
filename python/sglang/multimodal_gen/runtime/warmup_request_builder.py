@@ -40,21 +40,17 @@ SERVER_WARMUP_VIDEO_STEPS = 2
 
 def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
     pipeline_class_name = server_args.pipeline_class_name
-    try:
-        if pipeline_class_name:
-            config_classes = get_pipeline_config_classes(pipeline_class_name)
-            if config_classes is not None:
-                _, sampling_params_cls = config_classes
-                return sampling_params_cls()
+    if pipeline_class_name:
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is not None:
+            _, sampling_params_cls = config_classes
+            return sampling_params_cls()
 
-        return SamplingParams.from_pretrained(
-            server_args.model_path,
-            backend=server_args.backend,
-            model_id=server_args.model_id,
-        )
-    except Exception:
-        logger.debug("Falling back to base SamplingParams for server warmup")
-        return SamplingParams()
+    return SamplingParams.from_pretrained(
+        server_args.model_path,
+        backend=server_args.backend,
+        model_id=server_args.model_id,
+    )
 
 
 def _resolve_default_warmup_resolution(
@@ -64,10 +60,9 @@ def _resolve_default_warmup_resolution(
     server_based_warmup: bool,
     use_model_sampling_defaults: bool,
 ) -> tuple[int, int]:
+    """returns a default resolution to warmup"""
     if server_based_warmup and use_model_sampling_defaults:
-        return _resolve_representative_warmup_resolution(
-            server_args, sampling_defaults
-        )
+        return _resolve_representative_warmup_resolution(server_args, sampling_defaults)
 
     width = sampling_defaults.width
     height = sampling_defaults.height
@@ -152,6 +147,7 @@ def _select_supported_warmup_resolution(
 def _fit_resolution_to_area(
     width: int, height: int, target_area: int
 ) -> tuple[int, int]:
+    """adjust the warmup resolution to balance between warmup time and warmup effect"""
     area = width * height
     if area <= target_area:
         return width, height
@@ -176,6 +172,7 @@ def _resolve_warmup_num_frames(
         or not use_model_sampling_defaults
         or not _is_video_warmup_task(server_args)
     ):
+        # use default num frames
         return num_frames
 
     return min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
@@ -269,6 +266,7 @@ def build_warmup_reqs(
         use_model_sampling_defaults=use_model_sampling_defaults,
     )
 
+    # build warmup reqs
     warmup_reqs = []
     include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
     for width, height in resolutions:

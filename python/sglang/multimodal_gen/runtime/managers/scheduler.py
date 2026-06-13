@@ -1029,6 +1029,7 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: List[tuple[bytes, Any]]
     ) -> List[tuple[bytes, Any]]:
+        """maybe insert a cloend req before actual req to avoid compile/cold-start"""
         if (
             self.warmed_up
             or not self.server_args.warmup
