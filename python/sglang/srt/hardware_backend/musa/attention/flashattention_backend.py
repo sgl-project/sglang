@@ -423,13 +423,9 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     _fa_cp_attn,
                 )
             elif (
-                (
-                    forward_batch.extend_prefix_lens_cpu is not None
-                    and any(forward_batch.extend_prefix_lens_cpu)
-                )
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
-            ):
+                forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
+            ) or forward_batch.forward_mode.is_target_verify():
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,

@@ -612,11 +612,7 @@ class DeepseekSparseAttnBackend(
                 )
                 page_table = page_table[bs_idx, :max_seqlen_k]
 
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-                or bs_idx_cpu is not None
-            ):
+            if any(forward_batch.extend_prefix_lens_cpu) or bs_idx_cpu is not None:
                 max_seqlen_q = (
                     max(extend_seq_lens_cpu) if len(extend_seq_lens_cpu) != 0 else 1
                 )
@@ -1223,8 +1219,6 @@ class DeepseekSparseAttnBackend(
                     mode_int = 0  # DECODE
                 elif forward_mode.is_target_verify():
                     mode_int = 1  # TARGET_VERIFY
-                elif forward_mode.is_draft_extend():
-                    mode_int = 2  # DRAFT_EXTEND
                 else:
                     raise ValueError(f"Unsupported forward_mode: {forward_mode}")
 
@@ -1309,18 +1303,6 @@ class DeepseekSparseAttnBackend(
                 )
                 metadata.dsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
                 metadata.dsa_cache_seqlens_int32.copy_(precomputed.dsa_cache_seqlens)
-
-            elif forward_mode.is_draft_extend():
-                # Draft extend mode
-                rows = precomputed.page_indices.shape[0]
-                cols = precomputed.max_seqlen_k
-                metadata.page_table_1[:rows, :cols].copy_(precomputed.page_indices)
-
-                size = precomputed.seqlens_expanded_size
-                metadata.dsa_seqlens_expanded[:size].copy_(precomputed.seqlens_expanded)
-                metadata.dsa_cache_seqlens_int32[:size].copy_(
-                    precomputed.dsa_cache_seqlens
-                )
 
             # Copy DSA cu_seqlens
             size = precomputed.seqlens_expanded_size

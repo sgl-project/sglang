@@ -1612,7 +1612,6 @@ class Indexer(MultiPlatformOp):
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend()
         )
 
         bs = q_lora.shape[0]
@@ -1799,7 +1798,6 @@ class Indexer(MultiPlatformOp):
                 if (
                     forward_batch.forward_mode.is_draft_extend_v2()
                     or forward_batch.forward_mode.is_target_verify()
-                    or forward_batch.forward_mode.is_draft_extend()
                 ):
                     num_draft_tokens = get_attn_backend().speculative_num_draft_tokens
                     actual_seq_lengths_q = torch.arange(

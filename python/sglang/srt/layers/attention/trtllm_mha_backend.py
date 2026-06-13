@@ -620,12 +620,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
             )
-            if forward_mode.is_draft_extend():
-                # CUDA graph bakes max_seq_len_q as a constant. replay() sets it
-                # to max(num_accept_tokens_cpu) which is None/empty at capture
-                # time, falling back to 1. Restore the correct upper bound so
-                # the kernel sees num_tokens_per_bs (not 1) for all replays.
-                self.forward_metadata.max_seq_len_q = num_tokens // bs
         else:
             self._apply_cuda_graph_metadata(
                 bs=bs,
