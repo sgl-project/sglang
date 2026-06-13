@@ -20,6 +20,9 @@ BF16_DTYPE = "bfloat16"
 FP32_DTYPE = "float32"
 GROUP_SIZE = 128
 
+# Keep these kernel families as separate TileLang entrypoints. The JIT specializes
+# function arguments into generated code, and the base/swapAB/splitK variants have
+# different tensor signatures and launch orders.
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
 def fp8_blockwise_gemm_base_kernel(

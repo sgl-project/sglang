@@ -11,13 +11,13 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.tilelang_gemm_wrapper.availability import assert_available
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
-    AUTOTUNE_SEARCH_POLICIES,
     SPLIT_K_KERNEL_TYPES,
     SWAP_AB_KERNEL_TYPES,
     SelectedConfigStore,
     config_compatibility_error,
     default_config,
     generate_candidate_configs,
+    validate_search_policy,
     write_selected_config_file,
 )
 from sglang.srt.layers.tilelang_gemm_wrapper.tuning import make_autotune_metadata
@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_M_MAX = 1024 * 16
 _DO_COMPILE = True
 _SELECTED_CONFIGS: Dict[Tuple[int, int, int], dict] = {}
 _PARTIAL_BUFFER_CACHE: Dict[Tuple[str, int, int, int, str, str], torch.Tensor] = {}
@@ -35,7 +34,6 @@ _CONFIG_STORE = SelectedConfigStore()
 _CONFIG_PATH_LOADED: Optional[str] = None
 _AUTOTUNE_BACKENDS = ("event", "cupti", "cudagraph")
 _AUTOTUNE_BACKEND = Literal["event", "cupti", "cudagraph"]
-_AUTOTUNE_SEARCH_POLICY = Literal["full", "family_pruned", "fast_sm90"]
 
 
 def update_tilelang_config(gpu_id: int, server_args: "ServerArgs") -> None:
@@ -45,21 +43,14 @@ def update_tilelang_config(gpu_id: int, server_args: "ServerArgs") -> None:
     graph capture.
     """
 
-    global _M_MAX, _DO_COMPILE
+    global _DO_COMPILE
 
     assert_available()
 
-    m_max = 1024 * 16
-    if server_args.chunked_prefill_size < 1:
-        m_max = 1024 * 64
-    elif server_args.chunked_prefill_size > 8192:
-        m_max = server_args.chunked_prefill_size * 2
-    _M_MAX = min(1024 * 128, m_max)
     _DO_COMPILE = server_args.base_gpu_id == gpu_id
 
     logger.info(
-        "TileLang FP8 GEMM config updated: m_max=%s, do_compile=%s",
-        _M_MAX,
+        "TileLang FP8 GEMM config updated: do_compile=%s",
         _DO_COMPILE,
     )
 
@@ -237,15 +228,6 @@ def _validate_autotune_backend(backend: str) -> _AUTOTUNE_BACKEND:
     return backend  # type: ignore[return-value]
 
 
-def _validate_search_policy(search_policy: str) -> _AUTOTUNE_SEARCH_POLICY:
-    if search_policy not in AUTOTUNE_SEARCH_POLICIES:
-        raise ValueError(
-            "TileLang FP8 GEMM autotune search_policy must be one of "
-            f"{AUTOTUNE_SEARCH_POLICIES}, got {search_policy}."
-        )
-    return search_policy  # type: ignore[return-value]
-
-
 def _make_autotune_inputs(M: int, N: int, K: int) -> tuple[torch.Tensor, ...]:
     A_fp8 = torch.empty((M, K), dtype=torch.float8_e4m3fn, device="cuda")
     A_scale = torch.ones(
@@ -332,7 +314,7 @@ def autotune_shape(
     assert_available()
 
     profile_backend = _validate_autotune_backend(backend)
-    policy = _validate_search_policy(search_policy)
+    policy = validate_search_policy(search_policy)
     candidates = generate_candidate_configs(M, N, K, kernel_types, policy)
     if max_configs is not None and max_configs > 0:
         candidates = candidates[:max_configs]
@@ -619,7 +601,19 @@ def export_selected_configs(path: str, metadata: Optional[dict] = None) -> None:
     )
 
 
-def clear_cache() -> None:
+def clear_runtime_cache() -> None:
+    """Clear compiled kernels and temporary buffers, preserving selected configs."""
+
     _get_kernel.cache_clear()
-    _SELECTED_CONFIGS.clear()
     _PARTIAL_BUFFER_CACHE.clear()
+
+
+def clear_cache() -> None:
+    """Reset TileLang wrapper cache and loaded selected-config state."""
+
+    global _CONFIG_STORE, _CONFIG_PATH_LOADED
+
+    clear_runtime_cache()
+    _SELECTED_CONFIGS.clear()
+    _CONFIG_STORE = SelectedConfigStore()
+    _CONFIG_PATH_LOADED = None

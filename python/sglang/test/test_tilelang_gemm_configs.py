@@ -1,9 +1,13 @@
 import json
 
+import pytest
+
+from sglang.srt.layers.tilelang_gemm_wrapper import runtime
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
     DEFAULT_M_VALUES,
     SelectedConfigStore,
     generate_candidate_configs,
+    validate_search_policy,
     write_selected_config_file,
 )
 
@@ -33,6 +37,12 @@ def test_tilelang_gemm_autotune_search_policy_counts():
     )
     assert len(fast_prefill) == 12
     assert {config["kernel_type"] for config in fast_prefill} == {"base"}
+
+
+def test_tilelang_gemm_autotune_search_policy_validation():
+    assert validate_search_policy("fast_sm90") == "fast_sm90"
+    with pytest.raises(ValueError, match="autotune search_policy"):
+        validate_search_policy("unknown")
 
 
 def test_tilelang_gemm_selected_config_export_roundtrip(tmp_path):
@@ -102,3 +112,22 @@ def test_tilelang_gemm_selected_config_uses_nearest_compatible_m_family():
     selected = store.select(64, 4096, 1024)
     assert selected["kernel_type"] == "base"
     assert selected["tuned_M"] == 128
+
+
+def test_tilelang_gemm_clear_cache_resets_loaded_configs(tmp_path, monkeypatch):
+    monkeypatch.delenv("SGLANG_TILELANG_GEMM_CONFIG_PATH", raising=False)
+    runtime.clear_cache()
+    config = generate_candidate_configs(1, 4096, 1024, search_policy="fast_sm90")[0]
+    path = tmp_path / "selected.json"
+    write_selected_config_file(str(path), [config])
+
+    try:
+        runtime.load_selected_configs(str(path))
+        assert runtime.has_selected_config(1, 4096, 1024)
+
+        runtime.clear_cache()
+
+        assert not runtime.has_selected_config(1, 4096, 1024)
+        assert runtime.list_available_configs() == []
+    finally:
+        runtime.clear_cache()

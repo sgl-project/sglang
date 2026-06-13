@@ -720,8 +720,6 @@ def tilelang_w8a8_block_fp8_linear(
     caller or handled before dispatching here.
     """
 
-    tilelang_gemm_wrapper.assert_available()
-
     if input_scale is not None:
         raise RuntimeError("TileLang FP8 GEMM only supports dynamic activation scales.")
 
@@ -752,8 +750,6 @@ def tilelang_w8a8_block_fp8_linear(
     M, K = input_2d.shape
     N, weight_k = weight.shape
 
-    if M <= 0:
-        raise RuntimeError("TileLang FP8 GEMM requires M > 0.")
     if K != weight_k:
         raise RuntimeError(
             f"TileLang FP8 GEMM got mismatched K dimensions: input K={K}, weight K={weight_k}."
@@ -769,6 +765,11 @@ def tilelang_w8a8_block_fp8_linear(
             "TileLang FP8 GEMM requires weight_scale shape "
             f"{expected_scale_shape}, got {tuple(weight_scale.shape)}."
         )
+
+    if M == 0:
+        return input.new_empty(output_shape)
+
+    tilelang_gemm_wrapper.assert_available()
 
     q_input, x_scale = per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=False

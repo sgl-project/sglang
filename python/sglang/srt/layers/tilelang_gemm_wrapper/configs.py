@@ -144,7 +144,7 @@ def _matmul_splitk_configs(M: int, N: int, K: int) -> List[dict]:
     return configs
 
 
-def _validate_search_policy(search_policy: str) -> str:
+def validate_search_policy(search_policy: str) -> str:
     if search_policy not in AUTOTUNE_SEARCH_POLICIES:
         raise ValueError(
             "TileLang FP8 GEMM autotune search_policy must be one of "
@@ -301,7 +301,7 @@ def generate_candidate_configs(
 ) -> List[dict]:
     """Generate the legal TileLang FP8 GEMM config space for one shape."""
 
-    search_policy = _validate_search_policy(search_policy)
+    search_policy = validate_search_policy(search_policy)
     kernel_types = _select_kernel_types(M, N, K, search_policy, kernel_types)
 
     configs = []
