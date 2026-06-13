@@ -160,6 +160,32 @@ class SchedulerProfilerManager:
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
         )
 
+        if use_mlx():
+            import mlx.core as mx
+
+            self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
+            mlx_trace_filename = str(
+                self.torch_profiler_output_dir / f"{self.profile_id}.gputrace"
+            )
+            try:
+                mx.metal.start_capture(mlx_trace_filename)
+            except RuntimeError as e:
+                # Metal's capture layer is only inserted when the process is
+                # launched with MTL_CAPTURE_ENABLED=1. Without it, start_capture
+                # raises instead of producing a trace, so surface an actionable
+                # error rather than letting the request fail with a 500.
+                return ProfileReqOutput(
+                    success=False,
+                    message=(
+                        f"Failed to start MLX Metal capture: {e}. "
+                        "Set MTL_CAPTURE_ENABLED=1 in the server's environment "
+                        "before launching to enable GPU trace capture."
+                    ),
+                )
+            logger.info(f"MLX Metal capture started, saving to {mlx_trace_filename}")
+            self.profile_in_progress = True
+            return ProfileReqOutput(success=True, message="Succeeded")
+
         activities = self.profiler_activities
         with_stack = self.torch_profiler_with_stack
         record_shapes = self.torch_profiler_record_shapes
@@ -243,17 +269,6 @@ class SchedulerProfilerManager:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
-        if use_mlx():
-            import mlx.core as mx
-
-            self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
-            mlx_trace_filename = str(
-                self.torch_profiler_output_dir / f"{self.profile_id}.gputrace"
-            )
-            mx.metal.start_capture(mlx_trace_filename)
-            logger.info(f"MLX Metal capture started, saving to {mlx_trace_filename}")
-            self.profile_in_progress = True
-
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _merge_profile_traces(self) -> str:
@@ -301,6 +316,18 @@ class SchedulerProfilerManager:
             )
 
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
+
+        if use_mlx():
+            import mlx.core as mx
+
+            mx.metal.stop_capture()
+            logger.info(
+                "MLX Metal capture stopped. Trace saved to: %s",
+                self.torch_profiler_output_dir,
+            )
+            self.profile_in_progress = False
+            self.profiler_start_forward_ct = None
+            return ProfileReqOutput(success=True, message="Succeeded.")
 
         if self.profile_prefix:
             stage_prefix = self.profile_prefix + "-"
@@ -362,15 +389,6 @@ class SchedulerProfilerManager:
         if "CUDA_PROFILER" in self.profiler_activities:
             if self.ps.gpu_id == get_global_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
-
-        if use_mlx():
-            import mlx.core as mx
-
-            mx.metal.stop_capture()
-            logger.info(
-                "MLX Metal capture stopped. Trace saved to: %s",
-                self.torch_profiler_output_dir,
-            )
 
         merge_message = self._merge_profile_traces()
 
