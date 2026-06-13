@@ -3389,7 +3389,7 @@ class TestGlm47MoeDetector(unittest.TestCase):
         self.assertIsInstance(
             xgr.Grammar.from_structural_tag(structural_tag), xgr.Grammar
         )
-        self.assertNotIn("</think>", structural_tag.model_dump_json())
+        self.assertNotEqual("sequence", structural_tag.model_dump()["format"]["type"])
 
         # tool_choice="required" must still compile to a grammar.
         structural_tag = self.detector.get_structural_tag(
