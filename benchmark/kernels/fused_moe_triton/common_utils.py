@@ -156,8 +156,15 @@ def get_model_config(
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
     elif architecture == "MiniMaxM3SparseForConditionalGeneration":
-        E = config.num_local_experts // ep_size
-        topk = config.num_experts_per_tok
+        # Serving fuses the shared expert into the routed-expert tensor by
+        # default (E = num_local_experts + 1), so tune for that shape unless
+        # fusion is explicitly disabled.
+        E = config.num_local_experts // ep_size + (
+            0 if disable_shared_experts_fusion else 1
+        )
+        topk = config.num_experts_per_tok + (
+            0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
+        )
         intermediate_size = config.intermediate_size
     else:
         # Default: Mixtral
