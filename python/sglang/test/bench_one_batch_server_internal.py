@@ -532,7 +532,7 @@ def run_one_case(
         random_output_len=output_len,
         random_range_ratio=1.0,
         dataset_path=dataset_path,
-        tokenize_prompt=dataset_name not in ("mmmu", "generated-shared-prefix"),
+        tokenize_prompt=dataset_name not in ("mmmu",),
         backend=backend,
         seed=BenchArgs.seed,
         gsp_num_groups=actual_gsp_groups,
@@ -547,7 +547,7 @@ def run_one_case(
 
     if dataset_name == "generated-shared-prefix":
         input_requests = input_requests[:batch_size]
-        input_ids = [tokenizer.encode(req.prompt) for req in input_requests]
+        input_ids = [req.prompt for req in input_requests]
         input_len = sum(len(ids) for ids in input_ids) // len(input_ids)
         output_len = gsp_output_len
         image_data = None
@@ -672,6 +672,7 @@ def run_one_case(
 
     # Get the TTFT of the last request in the batch
     last_ttft = 0.0
+    per_request_cache_info = []  # (cached_tokens, prompt_tokens, ttft)
     if backend == "vllm":
         # Parse OpenAI-compatible streaming format from vLLM
         first_token_indices = set()
@@ -704,8 +705,14 @@ def run_one_case(
                     data["meta_info"]["finish_reason"] is None
                     or data["meta_info"]["finish_reason"]["type"] == "length"
                 )
-                if data["meta_info"]["completion_tokens"] == 1:
+                ct = data["meta_info"]["completion_tokens"]
+                if ct == 1:
                     last_ttft = time.perf_counter() - tic
+                    cached = data["meta_info"].get("cached_tokens", -1)
+                    prompt = data["meta_info"].get("prompt_tokens", -1)
+                    per_request_cache_info.append(
+                        (cached, prompt, time.perf_counter() - tic)
+                    )
 
     # Compute metrics
     latency = time.perf_counter() - tic
@@ -743,6 +750,14 @@ def run_one_case(
         print(f"acc_length: {acc_length:.2f} ")
     if metrics_cache_hit_rate is not None:
         print(f"cache hit rate: {metrics_cache_hit_rate:.4f}")
+    if per_request_cache_info and run_name:
+        print(f"per-request cache (from server meta_info):")
+        for i, (cached, prompt, ttft) in enumerate(per_request_cache_info):
+            hit = cached / prompt if prompt > 0 else 0
+            print(
+                f"  req#{i}: cached={cached}, prompt={prompt}, "
+                f"hit={hit:.4f}, ttft={ttft:.3f}s"
+            )
 
     # Dump results
     result = BenchOneCaseResult(
