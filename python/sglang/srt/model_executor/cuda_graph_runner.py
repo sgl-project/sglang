@@ -1213,15 +1213,6 @@ class CudaGraphRunner:
                 else contextlib.nullcontext()
             )
             with canary_ctx:
-                # swa_loc must be set before capture so that set_kv_buffer's
-                # Python branch (if self.swa_loc is not None) takes the fast path,
-                # and the graph records GPU ops using this buffer instead of the
-                # per-layer translate_loc_from_full_to_swa fallback.
-                if self.buffers.out_cache_loc_swa is not None:
-                    self.model_runner.token_to_kv_pool.set_swa_loc(
-                        self.buffers.out_cache_loc_swa[:num_tokens]
-                    )
-
                 for _ in range(2):
                     self.device_module.synchronize()
                     self.model_runner.tp_group.barrier()
