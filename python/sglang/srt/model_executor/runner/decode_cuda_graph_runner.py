@@ -782,8 +782,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def capture(self) -> None:
         profile_context = empty_context()
+        # Holds the active torch profiler during capture so capture_one_shape
+        # can advance its schedule; None when profiling is disabled.
+        self._profiler = None
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
+            self._profiler = profile_context
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -807,6 +811,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
+        self._profiler = None
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
