@@ -2764,6 +2764,31 @@ class TestGlm4MoeDetector(unittest.TestCase):
         )
         self.assertEqual(result.normal_text, "")
 
+    def test_string_argument_preserves_bare_underscore_id(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="lookup",
+                    description="Lookup by identifier",
+                    parameters={
+                        "type": "object",
+                        "properties": {"item_id": {"type": "string"}},
+                        "required": ["item_id"],
+                    },
+                ),
+            ),
+        ]
+        text = (
+            "<tool_call>lookup\n"
+            "<arg_key>item_id</arg_key>\n<arg_value>10220_3939392</arg_value>\n"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["item_id"], "10220_3939392")
+
     def test_multiple_tool_calls(self):
         text = (
             "<tool_call>get_weather\n"
@@ -3087,6 +3112,31 @@ class TestGlm47MoeDetector(unittest.TestCase):
             result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
         )
         self.assertEqual(result.normal_text, "")
+
+    def test_string_argument_preserves_bare_underscore_id(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="lookup",
+                    description="Lookup by identifier",
+                    parameters={
+                        "type": "object",
+                        "properties": {"item_id": {"type": "string"}},
+                        "required": ["item_id"],
+                    },
+                ),
+            ),
+        ]
+        text = (
+            "<tool_call>lookup"
+            "<arg_key>item_id</arg_key><arg_value>10220_3939392</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["item_id"], "10220_3939392")
 
     def test_multiple_tool_calls(self):
         text = (
