@@ -152,6 +152,8 @@ The MXFP8 kernels are Blackwell-only, so Hopper (H200) serves the full-precision
 - **Attention**: FlashAttention-3 with page size 1. MSA (§2.1) is a Blackwell kernel, so M3's sparse step runs on the built-in Triton path here.
 - **CUDA graph**: on, with full decode-graph capture.
 
+**High-concurrency throughput (optional).** On Hopper the sparse prefill runs on the Triton path as a separate eager forward, which briefly stalls the in-flight decode batch under heavy concurrent load. Adding `--enable-mixed-chunk --chunked-prefill-size 2048` merges the running decodes into the prefill step instead of preempting them, which recovers roughly **+10% output throughput** and **~10% lower median TPOT** at high concurrency on 8×H200, with no change in accuracy. Leave it off for latency-sensitive low-concurrency serving.
+
 Validated on 8×H200 — reasoning and tool-call auto-detection plus long-context generation. For prefill/decode disaggregation on Hopper, see §3.4.
 
 ## 3. Advanced Usage
