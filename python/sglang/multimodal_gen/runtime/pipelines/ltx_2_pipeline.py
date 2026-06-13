@@ -6,6 +6,9 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    STAGE_2_DISTILLED_SIGMA_VALUES as _SHARED_STAGE_2_DISTILLED_SIGMA_VALUES,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     is_ltx23_native_variant,
     sync_ltx23_runtime_vae_markers,
@@ -32,18 +35,22 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipel
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
+    TextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    LTX2ImageEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2 import (
     LTX2AVDecodingStage,
     LTX2AVDenoisingStage,
     LTX2AVLatentPreparationStage,
     LTX2HalveResolutionStage,
-    LTX2ImageEncodingStage,
     LTX2LoRASwitchStage,
     LTX2RefinementStage,
     LTX2TextConnectorStage,
     LTX2UpsampleStage,
-    TextEncodingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
     LTX2_RESIDENT_AUTO_ENABLE_MEM_GB,
@@ -779,7 +786,7 @@ class LTX2TwoStageResidencyController:
 
 class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     pipeline_name = "LTX2TwoStagePipeline"
-    STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+    STAGE_2_DISTILLED_SIGMA_VALUES = list(_SHARED_STAGE_2_DISTILLED_SIGMA_VALUES)
     STAGE_1_DISTILLED_LORA_STRENGTH = 0.0
     STAGE_2_DISTILLED_LORA_STRENGTH = 1.0
     STAGE_1_DENOISING_SAMPLER_NAME = "euler"

@@ -88,7 +88,7 @@ class PrefillStats:
 
 @dataclass(kw_only=True)
 class SchedulerMetricsReporter:
-    scheduler: "Scheduler"
+    scheduler: Scheduler
     tp_rank: int
     pp_rank: int
     dp_rank: Optional[int]
@@ -990,17 +990,19 @@ class SchedulerMetricsReporter:
         self.forward_pass_device_timer._report()
         now = time.perf_counter()
         if self._device_timer_window_batch_count == 0:
+            # Window start: keep the last published value instead of NaN-ing
+            # the gauge. Readers sample it asynchronously, and the window
+            # boundary can phase-lock with the decode-log cadence, turning a
+            # one-tick NaN into NaN on every log line. NaN is published only
+            # when truly stale (reset_device_timer_window after idle).
             self._device_timer_window_start = now
             self._device_timer_window_gpu_time = 0.0
-            cpu_time = 0
-            self.fwd_occupancy = float("nan")
         else:
             cpu_time = now - self._device_timer_window_start
-            self.fwd_occupancy = min(
-                self._device_timer_window_gpu_time / cpu_time * 100, 100
-            )
-        # ratio = self._device_timer_window_gpu_time / cpu_time if cpu_time > 0 else float("nan")
-        # print(f"{self._device_timer_window_batch_count=} {self.fwd_occupancy=}, {self._device_timer_window_gpu_time=}, {cpu_time=}, {ratio=}")
+            if cpu_time > 0:
+                self.fwd_occupancy = min(
+                    self._device_timer_window_gpu_time / cpu_time * 100, 100
+                )
         self._device_timer_window_batch_count += 1
         if (
             self._device_timer_window_batch_count

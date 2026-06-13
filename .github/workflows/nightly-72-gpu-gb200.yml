@@ -31,6 +31,7 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
+  SGLANG_ENABLE_ASYNC_ASSERT: true
   SRT_SLURM_BRANCH: sglang-nightly-regression
   SLURM_PARTITION: batch
   SLURM_ACCOUNT: sglang
