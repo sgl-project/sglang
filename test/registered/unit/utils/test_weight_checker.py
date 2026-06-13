@@ -336,6 +336,15 @@ class TestCheckTensors(CustomTestCase):
         with self.assertRaises(AssertionError):
             _check_tensors(expect_tensors=expect, actual_tensors=actual)
 
+    def test_chunked_raw_stats_match_unchunked(self):
+        expect = [("a", True, ("raw", torch.zeros(10)))]
+        actual = [("a", True, ("raw", torch.arange(10.0)))]
+        with patch("sglang.srt.utils.weight_checker._CHUNK_NUMEL", 3):
+            with self.assertRaises(Exception) as ctx:
+                _check_tensors(expect_tensors=expect, actual_tensors=actual)
+        self.assertIn("max_abs_err=9.0", str(ctx.exception))
+        self.assertIn("mean_abs_err=4.5", str(ctx.exception))
+
     def test_zip_strict_raises_on_length_mismatch(self):
         t = torch.ones(2, 2)
         expect = [("a", True, ("raw", t.clone())), ("b", True, ("raw", t.clone()))]

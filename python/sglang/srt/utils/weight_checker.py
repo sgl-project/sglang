@@ -169,8 +169,6 @@ def _check_tensors(
     actual_tensors: Iterable[Tuple[str, bool, Tuple]],
     allow_quant_error: bool = False,
 ):
-    from sglang.srt.debug_utils.dumper import get_tensor_info
-
     good_names = []
     error_messages = []
     info_messages = []
@@ -223,21 +221,28 @@ def _check_tensors(
                 error_messages.append(msg)
             continue
 
-        expect = expect_entry[1].cuda()
-        actual = actual_entry[1].cuda()
-
-        if torch.all(expect == actual):
+        expect = expect_entry[1]
+        actual = actual_entry[1]
+        equal, max_abs_err, mean_abs_err = _compare_raw_pair(
+            expect, actual, compute_stats=should_compare
+        )
+        if equal:
             good_names.append(name)
-        else:
-            abs_diff = (actual.float() - expect.float()).abs()
-            msg = (
-                f"name={name} "
-                f"max_abs_err={abs_diff.max()} "
-                f"mean_abs_err={abs_diff.mean()} "
-                f"{get_tensor_info(expect)=} "
-                f"{get_tensor_info(actual)=} "
+        elif not should_compare:
+            info_messages.append(
+                f"name={name} differs (not compared) "
+                f"shape={tuple(actual.shape)} dtype={actual.dtype} "
             )
-            (error_messages if should_compare else info_messages).append(msg)
+        else:
+            error_messages.append(
+                f"name={name} "
+                f"max_abs_err={max_abs_err} "
+                f"mean_abs_err={mean_abs_err} "
+                f"shape={tuple(actual.shape)} "
+                f"expect_dtype={expect.dtype} actual_dtype={actual.dtype} "
+                f"expect_head={expect.reshape(-1)[:5].float().tolist()} "
+                f"actual_head={actual.reshape(-1)[:5].float().tolist()} "
+            )
 
     logger.info(f"[check_tensors] equal tensors: {good_names}")
     if len(info_messages) > 0:
@@ -359,6 +364,36 @@ def _compare_quant_pair(
         # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
         num_exceed += int((~(abs_diff <= tolerance)).sum())
     return equal, max_abs_err.item(), sum_abs_err / expect_q.numel(), num_exceed
+
+
+def _compare_raw_pair(
+    expect: torch.Tensor, actual: torch.Tensor, compute_stats: bool
+) -> Tuple[bool, float, float]:
+    """Chunked exact-compare of two raw tensors; optionally accumulates
+    abs-diff stats without materializing full-size fp32 intermediates.
+
+    Returns (equal, max_abs_err, mean_abs_err).
+    """
+    assert expect.shape == actual.shape, f"{expect.shape=} {actual.shape=}"
+    expect_flat = expect.reshape(-1)
+    actual_flat = actual.reshape(-1)
+
+    equal = True
+    max_abs_err = torch.zeros((), dtype=torch.float32)
+    sum_abs_err = 0.0
+    for start in range(0, expect_flat.numel(), _CHUNK_NUMEL):
+        e = expect_flat[start : start + _CHUNK_NUMEL].cuda()
+        a = actual_flat[start : start + _CHUNK_NUMEL].cuda()
+        if torch.all(e == a):
+            continue
+        equal = False
+        if not compute_stats:
+            break
+        abs_diff = (a.float() - e.float()).abs()
+        # torch.maximum propagates NaN, unlike builtin max().
+        max_abs_err = torch.maximum(max_abs_err, abs_diff.max().cpu())
+        sum_abs_err += abs_diff.sum().item()
+    return equal, max_abs_err.item(), sum_abs_err / max(expect_flat.numel(), 1)
 
 
 def _postprocess_tensors(
