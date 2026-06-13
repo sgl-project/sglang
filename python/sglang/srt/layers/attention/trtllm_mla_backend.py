@@ -369,60 +369,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
-    def _apply_cuda_graph_metadata(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-    ):
-        """Shared decode / target-verify / draft-extend capture+replay body.
-
-        Public entry: :py:meth:`init_forward_metadata_out_graph` (which routes
-        the non-decode-family modes to the FlashInferMLA parent).
-        """
-        metadata = self.decode_cuda_graph_metadata[bs]
-
-        if forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-        elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
-            metadata.cu_seqlens_q[: bs + 1].copy_(
-                torch.arange(
-                    0,
-                    bs * num_tokens_per_bs + 1,
-                    step=num_tokens_per_bs,
-                    dtype=torch.int32,
-                    device=seq_lens.device,
-                )
-            )
-            metadata.seq_lens_q[:bs].fill_(num_tokens_per_bs)
-            # see NOTE(draft_extend seq_len handling)
-            seq_lens = seq_lens[:bs] - metadata.seq_lens_q[:bs] + metadata.max_seq_len_q
-            metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
-
-        # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[
-            (
-                bs,
-                get_num_kv_index_blocks_flashmla(
-                    metadata.block_kv_indices.shape[1], self.page_size
-                ),
-            )
-        ](
-            self.req_to_token,
-            req_pool_indices[:bs],
-            seq_lens,
-            None,
-            metadata.block_kv_indices,
-            self.req_to_token.stride(0),
-            metadata.block_kv_indices.shape[1],
-            PAGED_SIZE=self.page_size,
-        )
-
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
