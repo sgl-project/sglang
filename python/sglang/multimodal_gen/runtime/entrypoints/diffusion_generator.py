@@ -36,7 +36,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.server_warmup import prepare_warmup_image_path_sync
+from sglang.multimodal_gen.runtime.server_warmup import (
+    run_sync_client_warmup,
+    should_run_explicit_client_warmup,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
     RESET,
@@ -47,10 +50,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     init_diffusion_tracing,
     trace_req,
-)
-from sglang.multimodal_gen.runtime.warmup_request_builder import (
-    build_warmup_reqs,
-    should_include_warmup_image,
 )
 
 logger = init_logger(__name__)
@@ -156,26 +155,10 @@ class DiffGenerator:
         return processes
 
     def _run_client_warmup_if_needed(self) -> None:
-        if not self.server_args.warmup or self.server_args.warmup_resolutions is None:
+        if not should_run_explicit_client_warmup(self.server_args):
             return
 
-        warmup_input_path = None
-        if should_include_warmup_image(self.server_args, server_based_warmup=True):
-            warmup_input_path = prepare_warmup_image_path_sync(self.server_args)
-
-        warmup_reqs = build_warmup_reqs(
-            self.server_args,
-            warmup_resolutions=self.server_args.warmup_resolutions,
-            warmup_input_path=warmup_input_path,
-            return_warmup_result=True,
-            server_based_warmup=True,
-        )
-        warmup_total = len(warmup_reqs)
-        for req in warmup_reqs:
-            req.extra["warmup_total"] = warmup_total
-            response = sync_scheduler_client.forward(req)
-            if response.error is not None:
-                raise RuntimeError(response.error)
+        run_sync_client_warmup(self.server_args, sync_scheduler_client.forward)
 
     def _check_remote_scheduler(self):
         """Check if the remote scheduler is accessible."""
