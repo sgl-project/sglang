@@ -2412,15 +2412,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         device=x.device,
                     )
 
-            # Forward parameterized-SwiGLU values to the kernel; otherwise it
-            # computes vanilla SwiGLU and such models generate garbage. Two
-            # families need this:
-            #   - GPT-OSS-style clamped swiglu (gemm1_alpha + gemm1_clamp_limit,
-            #     e.g. alpha=1.702, limit=7.0): the linear branch is shifted by
-            #     +1, so swiglu_beta=1.0 (matches the mxfp4 path).
-            #   - clamp-limit-only swiglu (gemm1_clamp_limit, no gemm1_alpha,
-            #     e.g. step3p5): plain SiLU gate with a clamp, no +1 shift, so
-            #     swiglu_beta=0.0.
+            # Forward parameterized SwiGLU to the kernel (else it runs vanilla SwiGLU and the model generates garbage); swiglu_beta=1.0 only for the GPT-OSS-style +1 shift (gemm1_alpha set), else 0.0 for clamp-limit-only models (e.g. step3p5).
             swiglu_kwargs = {}
             _gemm1_alpha = moe_runner_config.gemm1_alpha
             _gemm1_limit = moe_runner_config.gemm1_clamp_limit
