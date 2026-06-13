@@ -2395,7 +2395,6 @@ class DeepseekSparseAttnMultiStepBackend:
                 seq_lens=forward_batch.seq_lens,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
             )
 
             # Use multi-backend fused copy when we have 3 or more backends
