@@ -33,7 +33,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 
 try:
     from vllm import _custom_ops as ops
@@ -499,7 +501,7 @@ def apply_gptq_marlin_linear(
         dtype=input.dtype,
     )
 
-    forward_context = get_forward_context()
+    forward_context = get_tc_piecewise_forward_context()
     if forward_context is None:
         output = gptq_marlin_gemm(
             reshaped_x,
@@ -569,7 +571,7 @@ def apply_awq_marlin_linear(
         dtype=input.dtype,
     )
 
-    forward_context = get_forward_context()
+    forward_context = get_tc_piecewise_forward_context()
     if forward_context is None:
         output = gptq_marlin_gemm(
             reshaped_x,
@@ -677,7 +679,7 @@ class MarlinConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "MarlinConfig":
+    def from_config(cls, config: dict[str, Any]) -> MarlinConfig:
         group_size = cls.get_from_keys(config, ["group_size"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         return cls(group_size, lm_head_quantized)
@@ -906,7 +908,7 @@ def unified_apply_gptq_marlin_gemm(
     use_fp32_reduce: bool,
     is_zp_float: bool,
 ) -> torch.Tensor:
-    quant_config = get_forward_context().quant_config
+    quant_config = get_tc_piecewise_forward_context().quant_config
     quant_type = quant_config.quant_type
     return gptq_marlin_gemm(
         input,

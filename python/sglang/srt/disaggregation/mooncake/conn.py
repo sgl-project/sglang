@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
+    KVTransferError,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingContext,
@@ -60,16 +61,6 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
-
-
-class KVTransferError(Exception):
-    def __init__(self, bootstrap_room: int, failure_reason: str):
-        super().__init__(failure_reason)
-        self.bootstrap_room = bootstrap_room
-        self.failure_reason = failure_reason
-
-    def __str__(self):
-        return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
 
 
 # decode
@@ -265,6 +256,21 @@ class MooncakeKVManager(CommonKVManager):
         ):
             if ptrs and lens:
                 self.engine.batch_register(ptrs, lens)
+
+    def deregister_buffer_to_engine(self):
+        if self.kv_args.kv_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+
+        if self.kv_args.aux_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+
+        for ptrs in self.kv_args.state_data_ptrs or []:
+            if ptrs:
+                self.engine.batch_deregister(ptrs)
+
+        if hasattr(self, "connection_pool"):
+            with self.connection_lock:
+                self.connection_pool.clear()
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -1169,6 +1175,21 @@ class MooncakeKVManager(CommonKVManager):
                     )
 
                 if (
+                    kv_chunk.room not in self.request_status
+                    or self.check_status(kv_chunk.room) == KVPoll.Failed
+                ):
+                    logger.debug(
+                        f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
+                    )
+                    if self.enable_trace:
+                        kv_chunk.trace_ctx.trace_slice_end(
+                            MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+                            MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                            thread_finish_flag=True,
+                        )
+                    continue
+
+                if (
                     self.enable_staging
                     and staging_strategy is None
                     and staging_buffer is not None
@@ -1386,6 +1407,44 @@ class MooncakeKVManager(CommonKVManager):
 
                     handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
+                # Decode-side abort notification: mark room as failed and ACK
+                if room == "ABORT":
+                    room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
+                    decode_ip = waiting_req_bytes[2].decode("ascii")
+                    decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                    # No need to abort the room if it has already succeeded
+                    if (
+                        room_to_be_aborted in self.request_status
+                        and self.check_status(room_to_be_aborted) != KVPoll.Success
+                    ):
+                        self.update_status(room_to_be_aborted, KVPoll.Failed)
+                        logger.debug(
+                            f"Received abort notification for room {room_to_be_aborted}, "
+                            f"marked as Failed"
+                        )
+                    else:
+                        logger.debug(
+                            f"Received abort notification for room {room_to_be_aborted}, "
+                            f"ignoring (already completed or unknown)"
+                        )
+                    # Send ACK back to decode endpoint
+                    try:
+                        na = NetworkAddress(decode_ip, decode_port)
+                        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+                            [
+                                b"ABORT_ACK",
+                                str(room_to_be_aborted).encode("ascii"),
+                            ]
+                        )
+                        logger.debug(
+                            f"Sent ABORT_ACK for room {room_to_be_aborted} to "
+                            f"{decode_ip}:{decode_port}"
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
+                        )
+                    continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     self.decode_kv_args_table[mooncake_session_id] = (
@@ -1455,6 +1514,13 @@ class MooncakeKVManager(CommonKVManager):
                 # Staging: prefill pre-requests staging allocation before forward
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
+                    continue
+
+                # Prefill acknowledges abort notification
+                if msg[0] == b"ABORT_ACK":
+                    # TODO(shangming): use this info to implement the deferred release mechanism if needed
+                    ack_aborted_room = int(msg[1].decode("ascii"))
+                    logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
                     continue
 
                 bootstrap_room, status, prefill_rank = msg
@@ -1585,37 +1651,6 @@ class MooncakeKVManager(CommonKVManager):
         ):
             self._run_one_probe_pass()
 
-    def _handle_node_failure(self, failed_bootstrap_addr):
-        with self.connection_lock:
-            keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
-            ]
-            for k in keys_to_remove:
-                del self.connection_pool[k]
-
-            possible_affected_rooms = self.addr_to_rooms_tracker.get(
-                failed_bootstrap_addr, []
-            )
-            self.prefill_info_table.pop(failed_bootstrap_addr, None)
-            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
-
-        # Report the requests associated with the failed bootstrap addr and mark their status as KVPoll.Failed
-        affected_rooms = []
-        for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != KVPoll.Success
-            ):
-                self.record_failure(
-                    room,
-                    f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
-                )
-                self.update_status(room, KVPoll.Failed)
-                affected_rooms.append(room)
-        logger.error(
-            f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), {len(affected_rooms)} requests affected"
-        )
-
 
 class MooncakeKVSender(CommonKVSender):
 
@@ -1687,10 +1722,13 @@ class MooncakeKVSender(CommonKVSender):
         self.clear()
 
         with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(
-                self.bootstrap_room, "Failed due to an unknown reason from another rank"
-            )
-        raise KVTransferError(self.bootstrap_room, failure_reason)
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "Failed due to an unknown reason from another rank"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )
 
     def _init_trace_ctx(self):
         if self.kv_mgr.enable_trace:
@@ -1848,10 +1886,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.clear()
 
         with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(
-                self.bootstrap_room, "Failed due to an unknown reason from another rank"
-            )
-        raise KVTransferError(self.bootstrap_room, failure_reason)
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "Failed due to an unknown reason from another rank"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

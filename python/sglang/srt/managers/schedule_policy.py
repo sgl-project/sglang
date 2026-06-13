@@ -38,6 +38,10 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
@@ -45,12 +49,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
-from sglang.srt.mem_cache.hisparse_memory_pool import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -108,12 +108,20 @@ def match_prefix_for_req(
         req.last_host_node,
         req.best_match_node,
         req.host_hit_length,
+        req.swa_host_hit_length,
+        req.mamba_host_hit_length,
     ) = (
         match_result.device_indices,
         match_result.last_device_node,
         match_result.last_host_node,
         match_result.best_match_node,
         match_result.host_hit_length,
+        match_result.swa_host_hit_length,
+        match_result.mamba_host_hit_length,
+    )
+    max_len = req._compute_max_prefix_len(len(token_ids))
+    req.num_matched_prefix_tokens = min(
+        len(req.prefix_indices) + req.host_hit_length, max_len
     )
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
@@ -162,14 +170,26 @@ class SchedulePolicy:
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
     ) -> None:
+        policy = self._determine_active_policy(waiting_queue)
+
+        # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
+        # set it in _compute_prefix_matches; do the same full match for
+        # cache-agnostic policies when the radix supports it, so the load
+        # snapshot has it. Skip on decode (never prefills).
+        if (
+            not isinstance(policy, CacheAwarePolicy)
+            and self.tree_cache.supports_fast_match_prefix()
+            and get_global_server_args().disaggregation_mode != "decode"
+        ):
+            for r in waiting_queue:
+                match_prefix_for_req(self.tree_cache, r)
+
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
             return
-
-        policy = self._determine_active_policy(waiting_queue)
 
         if isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
@@ -279,7 +299,7 @@ class SchedulePolicy:
         """Sorts the waiting queue based on the longest prefix match."""
         waiting_queue.sort(
             key=lambda r: (
-                -len(r.prefix_indices)
+                -r.num_matched_prefix_tokens
                 if r.rid not in temporary_deprioritized
                 else float("inf")
             )
@@ -542,7 +562,9 @@ class PrefillAdder:
 
         return available_and_evictable - self.cur_rem_token_offset
 
-    def _swa_budget_for_req(self, extend_input_len: int) -> int:
+    def _swa_budget_for_req(
+        self, extend_input_len: int, swa_host_hit_length: int = 0
+    ) -> int:
         """SWA pool budget per request. Only valid when is_hybrid_swa is True.
 
         With chunked prefill + overlap scheduler, the peak SWA occupancy is:
@@ -557,7 +579,10 @@ class PrefillAdder:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
             alloc = extend_input_len
-        return max(alloc, self.tree_cache.sliding_window_size) + self.page_size
+        budget = max(alloc, self.tree_cache.sliding_window_size) + self.page_size
+        if swa_host_hit_length > 0:
+            budget += self.ceil_paged_tokens(swa_host_hit_length)
+        return budget
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -635,7 +660,7 @@ class PrefillAdder:
         )
 
         req.extend_input_len = trunc_len
-        req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
+        req.fill_len = prefix_len + trunc_len
 
         self.can_run_list.append(req)
 
@@ -656,7 +681,7 @@ class PrefillAdder:
         # Truncate input length to available tokens and update request metadata
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
-        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        req.fill_len = len(req.prefix_indices) + req.extend_input_len
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -696,7 +721,7 @@ class PrefillAdder:
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
-        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        req.fill_len = len(req.prefix_indices) + req.extend_input_len
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -802,7 +827,11 @@ class PrefillAdder:
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
         ):
-            # Non-chunked prefill
+            # Non-chunked prefill — the whole sequence is committed this iter.
+            req.fill_len = len(req.full_untruncated_fill_ids)
+            assert (
+                req.fill_len == len(req.prefix_indices) + req.extend_input_len
+            ), f"{req.fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
@@ -818,7 +847,8 @@ class PrefillAdder:
             trunc_len = self.rem_chunk_tokens
 
             req.set_extend_input_len(trunc_len)
-            req.fill_ids = req.fill_ids[:trunc_len]
+            assert len(req.prefix_indices) == 0
+            req.fill_len = len(req.prefix_indices) + trunc_len
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0, req.retracted_stain)
@@ -870,7 +900,9 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         if self.is_hybrid_swa:
-            swa_needed = self._swa_budget_for_req(req.extend_input_len)
+            swa_needed = self._swa_budget_for_req(
+                req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+            )
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
 
@@ -890,11 +922,13 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
-                swa_needed = self._swa_budget_for_req(req.extend_input_len)
+                swa_needed = self._swa_budget_for_req(
+                    req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                )
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
-            if req.host_hit_length > 0:
+            if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
@@ -903,7 +937,9 @@ class PrefillAdder:
                     )
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                req.set_extend_input_len(
+                    len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                )
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
@@ -930,7 +966,11 @@ class PrefillAdder:
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
+                # Non-chunked prefill — the whole sequence is committed this iter.
+                req.fill_len = len(req.full_untruncated_fill_ids)
+                assert (
+                    req.fill_len == len(req.prefix_indices) + req.extend_input_len
+                ), f"{req.fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
@@ -970,7 +1010,7 @@ class PrefillAdder:
 
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)
-                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                req.fill_len = len(req.prefix_indices) + trunc_len
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
