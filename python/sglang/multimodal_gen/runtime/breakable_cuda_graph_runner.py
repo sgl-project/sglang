@@ -86,6 +86,27 @@ def _flatten_kwargs(kwargs: dict[str, Any]) -> list[torch.Tensor]:
     return out
 
 
+def _signature_leaf(obj: Any) -> Any:
+    if torch.is_tensor(obj):
+        return ("tensor", tuple(obj.shape), str(obj.dtype))
+    if isinstance(obj, tuple):
+        return ("tuple", tuple(_signature_leaf(o) for o in obj))
+    if isinstance(obj, list):
+        return ("list", tuple(_signature_leaf(o) for o in obj))
+    if isinstance(obj, dict):
+        return (
+            "dict",
+            tuple((k, _signature_leaf(obj[k])) for k in sorted(obj)),
+        )
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return ("const", obj)
+    return ("object", type(obj).__module__, type(obj).__qualname__, id(obj))
+
+
+def _signature_kwargs(kwargs: dict[str, Any]) -> tuple:
+    return tuple((name, _signature_leaf(kwargs[name])) for name in sorted(kwargs))
+
+
 @dataclass
 class _CaptureEntry:
     graph: BreakableCUDAGraph
@@ -157,13 +178,15 @@ class DiffusionBreakableCudaGraphRunner:
     # Internals
     # ------------------------------------------------------------------ #
     def _signature(self, kwargs: dict[str, Any]) -> tuple:
-        """Capture key: shape+dtype of every tensor leaf (including tensors
-        nested in list/tuple/dict kwargs), in deterministic order. Non-tensor
-        leaves are assumed structurally constant within a request and are baked
-        into the captured graph."""
-        return tuple(
-            (tuple(t.shape), str(t.dtype)) for t in _flatten_kwargs(kwargs)
-        )
+        """Capture key for tensor leaves and non-tensor control values.
+
+        Tensor leaves are keyed by shape+dtype so their values can change per
+        replay. Non-tensor leaves are baked into the captured Python control
+        flow, so simple constants must be part of the key as well. Mutable
+        objects are keyed by identity to avoid replaying a graph whose eager
+        break points still reference a previous request's state object.
+        """
+        return _signature_kwargs(kwargs)
 
     def _capture(self, kwargs: dict[str, Any], key: tuple) -> _CaptureEntry:
         # Persistent static buffers at every tensor leaf; bake non-tensors.

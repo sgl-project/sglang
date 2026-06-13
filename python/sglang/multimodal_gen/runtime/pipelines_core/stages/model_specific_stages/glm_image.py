@@ -307,6 +307,12 @@ class GlmImageAR(PipelineStage):
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
 
+        if batch.seed is not None:
+            seed = int(batch.seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+
         time_start = time.time()
         prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
             prompt=prompt,
