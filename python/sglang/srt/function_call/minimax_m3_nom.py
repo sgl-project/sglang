@@ -4,11 +4,11 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Union
 from typing_extensions import Self
 
 from sglang.srt.function_call.compatibility import CompatibilityEvent, CompatibilityMode
-from sglang.srt.function_call.core_types import _GetInfoFunc
 from sglang.srt.function_call.compatibility.param_types import (
     AtomDataType,
     FunctionCallParameterDataType,
 )
+from sglang.srt.function_call.core_types import _GetInfoFunc
 from sglang.srt.function_call.parsing import (
     TagToolCallParser,
     default_tool_call_output_key,
@@ -121,7 +121,7 @@ class M3TextParser(TagToolCallParser):
                         self._emit_call_close(tool_call_index)
                         break
                     if tried is None:
-                        # Unparseable text: drop the rest of this invoke and
+                        # Unparsable text: drop the rest of this invoke and
                         # close its arguments, hoping the format recovers
                         # after the invoke ends.
                         yield from self._recover_invoke(

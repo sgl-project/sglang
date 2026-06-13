@@ -198,9 +198,7 @@ class FunctionCallParser:
         final_calls = []
 
         try:
-            sp_result = self.detector.parse_streaming_increment(
-                chunk_text, self.tools
-            )
+            sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
         except Exception as e:
             # Fail-open (scope 4): recovery is owned by the compatibility
             # module; latch so the rest of the stream passes through as text.

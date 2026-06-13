@@ -138,9 +138,7 @@ class BaseFormatDetector(ABC):
                 except json.JSONDecodeError:
                     args = None
         if tid < len(self.prev_tool_call_arr):
-            self.prev_tool_call_arr[tid]["arguments"] = (
-                args if args is not None else {}
-            )
+            self.prev_tool_call_arr[tid]["arguments"] = args if args is not None else {}
         return calls
 
     def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
@@ -176,9 +174,7 @@ class BaseFormatDetector(ABC):
         )
         return True
 
-    def _note_malformed_tool_call(
-        self, error: Exception, *, detail: str = ""
-    ) -> None:
+    def _note_malformed_tool_call(self, error: Exception, *, detail: str = "") -> None:
         """Record a detector-local parse fallback.
 
         Detectors that can locally recover from malformed model output call
@@ -328,14 +324,10 @@ class BaseFormatDetector(ABC):
                 # bot_token which skips past all inter-object markup.
                 # e.g. Qwen25: separator "," matches between eot/bot tags.
                 if used_separator_branch and self.bot_token in current_text:
-                    start_idx = current_text.find(self.bot_token) + len(
-                        self.bot_token
-                    )
+                    start_idx = current_text.find(self.bot_token) + len(self.bot_token)
                     if start_idx >= len(current_text):
                         return StreamingParseResult()
-                    obj, end_idx = _partial_json_loads(
-                        current_text[start_idx:], flags
-                    )
+                    obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
                 else:
                     raise
 
@@ -418,9 +410,9 @@ class BaseFormatDetector(ABC):
                 cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
                 prev_arguments = None
                 if self.current_tool_id < len(self.prev_tool_call_arr):
-                    prev_arguments = self.prev_tool_call_arr[
-                        self.current_tool_id
-                    ].get("arguments")
+                    prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get(
+                        "arguments"
+                    )
 
                 argument_diff = None
 
@@ -446,9 +438,7 @@ class BaseFormatDetector(ABC):
                     # Ensure prev_tool_call_arr is large enough
                     while len(self.prev_tool_call_arr) <= self.current_tool_id:
                         self.prev_tool_call_arr.append({})
-                    self.prev_tool_call_arr[self.current_tool_id] = (
-                        current_tool_call
-                    )
+                    self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
 
                 # Advance to next tool if complete
                 if is_current_complete:

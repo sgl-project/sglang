@@ -10,6 +10,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 
+
 class Apertus2509Detector(BaseFormatDetector):
     """
     Detector for Apertus 2509 tool/function call format

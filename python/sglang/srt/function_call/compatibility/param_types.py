@@ -236,8 +236,7 @@ class FunctionCallParameterDataType:
     def candidates_allow_structure(self) -> bool:
         """Whether the schema admits nested structure (object/array/unknown)."""
         return any(
-            candidate
-            in (AtomDataType.array, AtomDataType.object, AtomDataType.other)
+            candidate in (AtomDataType.array, AtomDataType.object, AtomDataType.other)
             for candidate in self.candidates
         )
 

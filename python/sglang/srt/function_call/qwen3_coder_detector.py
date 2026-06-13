@@ -19,7 +19,7 @@ Tolerances (recorded on the detector compatibility policy, see the compatibility
 the historical parser): one newline on each side of
 a parameter value is structural and stripped; a parameter value may also be
 terminated by the next ``<parameter=`` or by ``</function>`` when the model
-omits ``</parameter>``; unparseable text inside a block is skipped up to the
+omits ``</parameter>``; unparsable text inside a block is skipped up to the
 next recognizable tag; ``null`` becomes JSON null for any parameter type;
 values are converted via the tool's JSON schema.
 """
@@ -110,6 +110,7 @@ class Qwen3CoderTextParser(TagToolCallParser):
                 consume_suffix=True,
             )
             tool_call_index += 1
+
 
 class Qwen3CoderDetector(TagToolCallDetector):
     """Detector for Qwen3-Coder models; the wire format is documented above.

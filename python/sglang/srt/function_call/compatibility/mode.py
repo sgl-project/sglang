@@ -24,7 +24,7 @@ class CompatibilityEvent(str, Enum):
         return obj
 
     # -- Scope 1: wire structure -----------------------------------------
-    #: Unparseable text dropped up to the next recognizable marker.
+    #: Unparsable text dropped up to the next recognizable marker.
     SKIPPED_GARBAGE = ("skipped-garbage", 1, True)
     #: A block whose JSON (or literal) body failed to parse was dropped;
     #: surrounding output is preserved.

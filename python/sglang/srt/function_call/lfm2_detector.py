@@ -142,7 +142,9 @@ class Lfm2Detector(BaseFormatDetector):
                 arguments[keyword.arg] = self._get_parameter_value(keyword.value)
             except ValueError as e:
                 logger.warning(f"Failed to parse argument {keyword.arg}: {e}")
-                self._note_malformed_tool_call(e, detail=f"{function_name}.{keyword.arg}")
+                self._note_malformed_tool_call(
+                    e, detail=f"{function_name}.{keyword.arg}"
+                )
                 return None
 
         return ToolCallItem(

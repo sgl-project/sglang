@@ -580,9 +580,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                             logger.debug(
                                 f"Failed to parse arguments: {e}", exc_info=True
                             )
-                            self._note_malformed_tool_call(
-                                e, detail=func_args_raw[:80]
-                            )
+                            self._note_malformed_tool_call(e, detail=func_args_raw[:80])
 
                         # Remove the completed tool call from buffer
                         self._buffer = current_text[partial_match.end(3) :]

@@ -223,7 +223,9 @@ class GeneratorParser(ABC):
         """Mark everything consumed or emitted so far as accounted for."""
         self._committed_offset = self._consumed_offset()
 
-    def _note(self, event: CompatibilityEvent, detail: str = "") -> Optional[CompatibilityRecord]:
+    def _note(
+        self, event: CompatibilityEvent, detail: str = ""
+    ) -> Optional[CompatibilityRecord]:
         """Record an applied tolerance at the current consume offset.
 
         Raises ``CompatibilityViolation`` in strict mode; see the ``compatibility`` package.
@@ -685,7 +687,7 @@ class TagToolCallParser(GeneratorParser, ABC):
         detail: str = "",
         consume_suffix: bool = False,
     ) -> Generator:
-        """Compatibility scope 1: drop unparseable text up to a recognizable marker.
+        """Compatibility scope 1: drop unparsable text up to a recognizable marker.
 
         Records ``SKIPPED_GARBAGE`` only when non-whitespace text was actually
         dropped (in strict mode that record raises ``CompatibilityViolation``); the
@@ -743,9 +745,7 @@ class TagToolCallParser(GeneratorParser, ABC):
             or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
         ):
             return False
-        self._note(
-            CompatibilityEvent.UNKNOWN_TOOL_DROPPED, detail=repr(function_name)
-        )
+        self._note(CompatibilityEvent.UNKNOWN_TOOL_DROPPED, detail=repr(function_name))
         yield from self._take_any(until=end_marker)
         self._commit()
         return True

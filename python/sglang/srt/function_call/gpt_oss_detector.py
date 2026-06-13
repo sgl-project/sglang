@@ -219,9 +219,7 @@ class GptOssDetector(BaseFormatDetector):
         )
 
         # Check if tool exists
-        if function_name not in tool_indices and self._skip_unknown_tool(
-            function_name
-        ):
+        if function_name not in tool_indices and self._skip_unknown_tool(function_name):
             return None
 
         # Parse JSON arguments

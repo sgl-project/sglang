@@ -28,7 +28,7 @@ class M2TextParser(TagToolCallParser):
                     should_raise=False,
                 )
                 if tried is None:
-                    # Unparseable text inside the block: skip to the next
+                    # Unparsable text inside the block: skip to the next
                     # invoke or to the block close.
                     yield from self._skip_garbage(
                         until=(self.INVOKE_PREFIX, self.BLOCK_CLOSE),
@@ -58,7 +58,7 @@ class M2TextParser(TagToolCallParser):
                         self._emit_call_close(tool_call_index)
                         break
                     if tried is None:
-                        # Unparseable text inside the invoke: skip to the
+                        # Unparsable text inside the invoke: skip to the
                         # next parameter or to the end of the invoke.
                         yield from self._skip_garbage(
                             until=(self.PARAM_PREFIX, self.INVOKE_END),
@@ -85,6 +85,7 @@ class M2TextParser(TagToolCallParser):
                     is_first_parameter = False
 
                 tool_call_index += 1
+
 
 class MinimaxM2Detector(TagToolCallDetector):
     """Detector for MiniMax M2 models; the wire format is documented above.

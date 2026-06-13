@@ -9,6 +9,7 @@ import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.compatibility import (
     CompatibilityEvent,
@@ -16,16 +17,20 @@ from sglang.srt.function_call.compatibility import (
     CompatibilityViolation,
     synthesize_json_close,
 )
-from sglang.srt.function_call.parsing import GeneratorParser, default_tool_call_output_key
+from sglang.srt.function_call.compatibility.param_types import (
+    FunctionCallParameterDataType,
+)
 from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
-from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.hermes_detector import HermesDetector
+from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.minimax_m3_nom import M3TextParser, MinimaxM3NomDetector
-from sglang.srt.function_call.mimo_detector import MiMoDetector
-from sglang.srt.function_call.compatibility.param_types import FunctionCallParameterDataType
+from sglang.srt.function_call.parsing import (
+    GeneratorParser,
+    default_tool_call_output_key,
+)
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.tag_format_detector import TagToolCallDetector
@@ -132,9 +137,7 @@ PLAN_TRIP_TOOL = Tool(
 COMPLEX_TOOLS = TOOLS + [PLAN_TRIP_TOOL]
 
 
-def _make_parser(
-    detector=None, name="minimax-m3-nom", enable_compatibility_mode=True
-):
+def _make_parser(detector=None, name="minimax-m3-nom", enable_compatibility_mode=True):
     if detector is not None:
         return FunctionCallParser.with_detector(
             detector, TOOLS, enable_compatibility_mode=enable_compatibility_mode
@@ -150,9 +153,7 @@ def _stream(parser, text, chunk_size):
     normal_text = ""
     calls = []
     for i in range(0, len(text), chunk_size):
-        chunk_normal, chunk_calls = parser.parse_stream_chunk(
-            text[i : i + chunk_size]
-        )
+        chunk_normal, chunk_calls = parser.parse_stream_chunk(text[i : i + chunk_size])
         normal_text += chunk_normal
         calls.extend(chunk_calls)
     # Allow deferred emission, mirroring the serving loop's trailing ticks.
@@ -194,11 +195,11 @@ class _MidCallFailingGrammar(GeneratorParser):
 
     def _process(self):
         self._append_delta(
-            default_tool_call_output_key(
-                0, {"name": "get_weather", "arguments": "{"}
-            )
+            default_tool_call_output_key(0, {"name": "get_weather", "arguments": "{"})
         )
-        self._append_delta(default_tool_call_output_key(0, {"arguments": '"city": "Par'}))
+        self._append_delta(
+            default_tool_call_output_key(0, {"arguments": '"city": "Par'})
+        )
         while True:
             ch = yield from self._peek(0)
             if ch == "X":
@@ -490,9 +491,7 @@ class TestJsonDetectorCompatibility(CustomTestCase):
         )
         result = detector.detect_and_parse(text, TOOLS)
         self.assertEqual(len(result.calls), 1)
-        self.assertEqual(
-            json.loads(result.calls[0].parameters), {"city": "Paris"}
-        )
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Paris"})
         events = [r.event for r in detector.compatibility_records]
         self.assertEqual(events, [CompatibilityEvent.MALFORMED_JSON_DROPPED])
 
@@ -761,7 +760,6 @@ class TestRemainingCompatibilityEvents(CustomTestCase):
         )
 
     def test_truncated_call_dropped_identical_in_both_modes(self):
-        from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 
         text = "Check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBei"
         for enable_compatibility_mode in (True, False):
@@ -782,7 +780,6 @@ class TestRemainingCompatibilityEvents(CustomTestCase):
         )
 
     def test_skipped_non_function_entry(self):
-        from sglang.srt.function_call.step3_detector import Step3Detector
 
         text = (
             "<｜tool_calls_begin｜>\n"
@@ -793,9 +790,7 @@ class TestRemainingCompatibilityEvents(CustomTestCase):
             "</steptml:invoke><｜tool_call_end｜>\n"
             "<｜tool_calls_end｜>"
         )
-        parser = FunctionCallParser(
-            TOOLS, "step3", enable_compatibility_mode=True
-        )
+        parser = FunctionCallParser(TOOLS, "step3", enable_compatibility_mode=True)
         _, calls = parser.parse_non_stream(text)
         self.assertEqual([c.name for c in calls], ["get_weather"])
         self.assertIn(
@@ -878,7 +873,9 @@ class TestComplexSchemaCompatibility(CustomTestCase):
         self.assertEqual(args["contact"], None)
         self.assertEqual(args["metadata"], {"season": "spring", "pace": "moderate"})
         self.assertEqual(args["transport"], {"mode": "train", "priority": 2})
-        self.assertEqual(args["travelers"][0]["preferences"]["tags"], ["museum", "ramen"])
+        self.assertEqual(
+            args["travelers"][0]["preferences"]["tags"], ["museum", "ramen"]
+        )
         self.assertEqual(args["travelers"][1]["age"], "old")
         self.assertEqual(args["itinerary"][1]["day"], 2)
 
@@ -955,7 +952,9 @@ class TestTagStreamingGates(CustomTestCase):
             # recorded; the FAIL_OPEN record carries it in its detail.
             records = parser.detector.compatibility_records
             self.assertEqual([r.event for r in records], [CompatibilityEvent.FAIL_OPEN])
-            self.assertIn(CompatibilityEvent.UNKNOWN_TOOL_DROPPED.value, records[0].detail)
+            self.assertIn(
+                CompatibilityEvent.UNKNOWN_TOOL_DROPPED.value, records[0].detail
+            )
 
     def test_strict_fail_open_after_completed_block_is_not_corrupted(self):
         # Regression: emitted content is not a contiguous prefix of the raw

@@ -208,7 +208,6 @@ class KimiK2Detector(BaseFormatDetector):
         content = text[: text.find(self.bot_token)]
         return StreamingParseResult(normal_text=content, calls=tool_calls)
 
-
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
@@ -283,9 +282,7 @@ class KimiK2Detector(BaseFormatDetector):
                     else function_args
                 )
 
-                parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[
-                    0
-                ]
+                parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[0]
                 # Hold back a possible partial <|tool_call_end|> at the chunk
                 # boundary: marker text must never leak into streamed
                 # arguments. The next chunk disambiguates and re-emits.
@@ -336,7 +333,6 @@ class KimiK2Detector(BaseFormatDetector):
                     return result
 
         return StreamingParseResult(normal_text="", calls=calls)
-
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""

@@ -19,16 +19,16 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.hermes_detector import HermesDetector
-from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
+from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.minimax_m3_nom import MinimaxM3NomDetector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
-from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -344,7 +344,9 @@ def assert_stream_matches_non_stream(case: StreamingFuzzCase) -> None:
             f"got {len(collected)} from {all_calls}"
         )
         assert [call.name for call in collected] == reference_names
-        assert [_load_parameters(call.parameters) for call in collected] == reference_args
+        assert [
+            _load_parameters(call.parameters) for call in collected
+        ] == reference_args
 
         if case.check_normal_text:
             if case.exact_normal_text:
@@ -1195,7 +1197,9 @@ VALID_CASES: List[StreamingFuzzCase] = [
 def _registered_no_crash_cases() -> List[NoCrashFuzzCase]:
     cases: List[NoCrashFuzzCase] = []
     seen_classes = set()
-    for parser_name, detector_cls in sorted(FunctionCallParser.ToolCallParserEnum.items()):
+    for parser_name, detector_cls in sorted(
+        FunctionCallParser.ToolCallParserEnum.items()
+    ):
         if detector_cls in seen_classes:
             continue
         seen_classes.add(detector_cls)

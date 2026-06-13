@@ -185,9 +185,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         )
                     )
                     self._last_arguments += argument_diff
-                    self.streamed_args_for_tool[
-                        self.current_tool_id
-                    ] += argument_diff
+                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
                 if _is_complete_json(func_args_raw):
                     # Update the stored arguments
@@ -203,9 +201,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
                     tool_call_end_pattern = (
                         r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
                     )
-                    match = re.search(
-                        tool_call_end_pattern, current_text, re.DOTALL
-                    )
+                    match = re.search(tool_call_end_pattern, current_text, re.DOTALL)
                     if match:
                         # Remove the completed tool call from buffer, keep any remaining content
                         self._buffer = current_text[match.end() :]
@@ -219,7 +215,6 @@ class DeepSeekV3Detector(BaseFormatDetector):
                     return result
 
         return StreamingParseResult(normal_text="", calls=calls)
-
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

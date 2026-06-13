@@ -75,7 +75,9 @@ class PythonicDetector(BaseFormatDetector):
         # recorded on self.compatibility; unexpected failures bubble to
         # FunctionCallParser, which fails open to text (see the ``compatibility`` package).
         with self.compatibility.absorb(
-            CompatibilityEvent.MALFORMED_JSON_DROPPED, SyntaxError, detail=tool_call_text[:80]
+            CompatibilityEvent.MALFORMED_JSON_DROPPED,
+            SyntaxError,
+            detail=tool_call_text[:80],
         ) as absorbed:
             module = ast.parse(tool_call_text)
         if absorbed.fired:

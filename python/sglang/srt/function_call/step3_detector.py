@@ -16,7 +16,7 @@ One ``<｜tool_calls_begin｜>`` block per message; multiple
 after ``<｜tool_calls_end｜>`` is normal content.
 
 Tolerances (recorded on the detector compatibility policy, see the compatibility package): entries whose type part is not ``function`` are skipped
-per-call (historical behavior); unparseable text between tags is skipped up to
+per-call (historical behavior); unparsable text between tags is skipped up to
 the next recognizable tag; parameter values are whitespace-stripped and
 converted via the tool's JSON schema; ``null`` becomes JSON null for any
 parameter type.
@@ -53,7 +53,7 @@ class Step3TextParser(TagToolCallParser):
                 (self.CALL_BEGIN, self.EOT), should_raise=False
             )
             if tried is None:
-                # Unparseable text between calls: skip to the next call or
+                # Unparsable text between calls: skip to the next call or
                 # to the end of the block.
                 yield from self._skip_garbage(
                     until=(self.CALL_BEGIN, self.EOT),
@@ -83,9 +83,7 @@ class Step3TextParser(TagToolCallParser):
                 continue
 
             function_name = yield from self._take_any(until=self.INVOKE_SUFFIX)
-            dropped = yield from self._drop_unknown_invoke(
-                function_name, self.CALL_END
-            )
+            dropped = yield from self._drop_unknown_invoke(function_name, self.CALL_END)
             if dropped:
                 continue
             self._emit_name(tool_call_index, function_name)
@@ -115,9 +113,7 @@ class Step3TextParser(TagToolCallParser):
                     )
                     continue
 
-                parameter_name = yield from self._take_any(
-                    until=self.PARAM_NAME_SUFFIX
-                )
+                parameter_name = yield from self._take_any(until=self.PARAM_NAME_SUFFIX)
                 self._emit_param_key(
                     tool_call_index, parameter_name, is_first_parameter
                 )
@@ -136,6 +132,7 @@ class Step3TextParser(TagToolCallParser):
         # After the closing token, everything is normal content.
         self._commit()
         yield from self._take_any(key=self._content_field, commit_each=True)
+
 
 class Step3Detector(TagToolCallDetector):
     """Detector for the Step3 function call format documented above.
