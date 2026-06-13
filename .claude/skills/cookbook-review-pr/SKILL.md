@@ -91,6 +91,11 @@ than restating.
 - NO `--reasoning-parser` / `--tool-call-parser` in any cell — parsers are a
   Playground-only feature added on top of the base command (DSv4 convention);
   flag any cell that bakes them in.
+- NO accuracy-degrading flags in cells — output quality must be exactly what
+  the quant chip declares: runtime quant below the checkpoint (e.g. MegaMoE
+  W4A4 — DSv4 gates it behind the Playground's `megamoeQuant`) and lossy
+  `--kv-cache-dtype` (e.g. `fp8_e4m3` over a higher-precision-KV checkpoint)
+  are Playground/tips material; flag any cell that bakes them in.
 - Flag order: `--model-path` first (an optional `--trust-remote-code` may precede it —
   the DSv4 cells do), then parallelism, then MoE, then tuning, `--host`/`--port`
   last (the playground's insert anchors assume this).
@@ -189,8 +194,8 @@ than restating.
   is legitimate ONLY when the vendor published an **MXFP4** checkpoint for it (e.g.
   `amd/Qwen3.5-397B-A17B-MXFP4` on MI355X) — verify the HF repo resolves; otherwise the
   AMD FP4 chip must be absent/`disabled`.
-- BF16 / FP8 work on NVIDIA and AMD. FP8 configs adding `--kv-cache-dtype fp8_e4m3` should
-  note the accuracy trade-off.
+- BF16 / FP8 work on NVIDIA and AMD. `--kv-cache-dtype fp8_e4m3` in a cell is an
+  accuracy-degrading flag — see §3 (Playground/tips material, not a deployment flag).
 
 ### 11. Scope
 - Changes match the PR title. Flag global changes hiding behind a platform-specific title

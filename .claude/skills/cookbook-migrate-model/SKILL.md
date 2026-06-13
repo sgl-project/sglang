@@ -31,7 +31,14 @@ your dispatch prompt, or ask for it.
    the five alias rewrites in dimension-mapping.md §2 (`launch_server`→`sglang
    serve`, `--model`→`--model-path`, `--tp-size`→`--tp`, abbreviated
    `--speculative-algo`→`--speculative-algorithm`,
-   `--expert-parallel-size`→`--ep`).
+   `--expert-parallel-size`→`--ep`). One conflict class has NO silent default:
+   **accuracy-degrading flags** in a legacy command (`--kv-cache-dtype
+   fp8_e4m3`, W4A4-style runtime quant) violate the format rule that a cell's
+   accuracy is exactly what its quant chip declares — but stripping them
+   silently breaks faithfulness AND the memory budget (fp8 KV halves KV
+   memory; the recipe may OOM without it). Neither keep nor strip on your
+   own — ask the maintainer and record the call in the PR body
+   (dimension-mapping.md §2 caveats).
 2. **Never invent versions or numbers.** Benchmark numbers only from the
    legacy page's measured blocks. **Speed measurements migrate ONLY when the
    legacy page pins an exact, reproducible build** (a release tag or a commit
