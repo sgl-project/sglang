@@ -626,6 +626,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
 
+    def dec_swa_lock_only(
+        self,
+        node: UnifiedTreeNode,
+        swa_uuid_for_lock: Optional[int] = None,
+    ) -> None:
+        """Early-release the SWA portion of a request's tree lock.
+
+        Thin dispatcher to `SWAComponent.release_window_lock` — kept on the
+        cache class because callers (`ScheduleBatch.maybe_evict_swa`) discover
+        the method via `hasattr(tree_cache, "dec_swa_lock_only")` and pass the
+        request's `last_node` + `swa_uuid_for_lock`. All SWA-specific state
+        transitions live in the component.
+        """
+        if self.disable:
+            return
+        swa_component = self.components.get(ComponentType.SWA)
+        if swa_component is None:
+            return
+        swa_component.release_window_lock(node, swa_uuid_for_lock)
+
     def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult()
