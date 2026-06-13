@@ -81,6 +81,15 @@ class BaseFormatDetector(ABC):
 
         results = []
         for act in action:
+            if not isinstance(act, dict):
+                # The model emitted valid JSON that is not an object
+                # (e.g. `[1, 2, 3]` or a bare string after the bot token).
+                # Such an element can never describe a tool call, so skip it
+                # instead of crashing on ``act.get(...)``.
+                logger.warning(
+                    f"Skipping non-object tool call entry: {act!r}"
+                )
+                continue
             name = act.get("name")
             if not (name and name in tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
