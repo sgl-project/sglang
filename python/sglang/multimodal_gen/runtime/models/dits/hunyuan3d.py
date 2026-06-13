@@ -74,9 +74,9 @@ def _flux_timestep_embedding(
     half = dim // 2
     freqs = torch.exp(
         -math.log(max_period)
-        * torch.arange(start=0, end=half, dtype=torch.float32)
+        * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
         / half
-    ).to(t.device)
+    )
 
     args = t[:, None].float() * freqs[None]
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
