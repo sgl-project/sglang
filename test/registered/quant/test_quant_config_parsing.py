@@ -85,13 +85,33 @@ class TestQuantLogString(unittest.TestCase):
             sparsity_ignore_list=[],
         )
         sentinel = object()
-        cfg.get_linear_scheme = lambda **_: sentinel
+        cfg.get_linear_scheme = MagicMock(return_value=sentinel)
         layer = ParallelLMHead.__new__(ParallelLMHead)
 
         method = cfg.get_quant_method(layer, prefix="lm_head")
 
         self.assertIsInstance(method, CompressedTensorsLinearMethod)
         self.assertIs(layer.scheme, sentinel)
+        cfg.get_linear_scheme.assert_called_once_with(layer=layer, layer_name="lm_head")
+
+        fallback_cfg = CompressedTensorsConfig(
+            target_scheme_map={},
+            ignore=[],
+            quant_format="pack-quantized",
+            sparsity_scheme_map={},
+            sparsity_ignore_list=[],
+        )
+        fallback_cfg.get_linear_scheme = MagicMock(
+            side_effect=ValueError("Not targeted")
+        )
+        fallback_layer = ParallelLMHead.__new__(ParallelLMHead)
+
+        fallback_method = fallback_cfg.get_quant_method(
+            fallback_layer, prefix="lm_head"
+        )
+
+        self.assertIsNone(fallback_method)
+        self.assertFalse(hasattr(fallback_layer, "scheme"))
 
 
 if __name__ == "__main__":
