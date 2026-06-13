@@ -5,8 +5,9 @@ Why this exists
 The existing `FusedSwitchUpGate` (fused_switch_glu.py) concatenates up_proj
 and gate_proj weights along the output dim and runs one gather_qmm. That saves
 one kernel launch per layer but doubles the matmul's output dim, which pushes
-MLX's quantized GEMV into a worse tile/occupancy config. At bs >= 4 on
-Qwen3-30B-A3B-4bit this is a net regression (~2% slower at bs=32).
+MLX's quantized GEMV into a worse tile/occupancy config. On
+Qwen3-30B-A3B-4bit this measured ~2% slower at bs=8 (within trial variance;
+bs >= 16 unmeasured, OOM on 24GB).
 
 Path B keeps up_proj and gate_proj separate (matmul kernels see their natural
 N — no tile regression) and instead fuses the *activation* into the gate
