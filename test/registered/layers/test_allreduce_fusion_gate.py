@@ -35,9 +35,7 @@ def _fake_self(*, mlp_mode=ScatterMode.TP_ATTN_FULL, is_last_layer=False, tp_siz
 
 
 def _fake_forward_batch(batch_size=8):
-    return types.SimpleNamespace(
-        input_ids=types.SimpleNamespace(shape=(batch_size,))
-    )
+    return types.SimpleNamespace(input_ids=types.SimpleNamespace(shape=(batch_size,)))
 
 
 class TestAiterAllreduceFusionGate(CustomTestCase):
@@ -54,9 +52,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         tp_size=8,
     ):
         """Run the gate with the aiter branch isolated (flashinfer forced off)."""
-        server_args = types.SimpleNamespace(
-            enable_aiter_allreduce_fusion=aiter_enabled
-        )
+        server_args = types.SimpleNamespace(enable_aiter_allreduce_fusion=aiter_enabled)
         a2a_backend = types.SimpleNamespace(is_none=lambda: a2a_is_none)
 
         with ExitStack() as stack:
@@ -86,9 +82,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                 mock.patch.object(comm, "get_global_server_args", lambda: server_args)
             )
             stack.enter_context(
-                mock.patch.object(
-                    comm, "is_dp_attention_enabled", lambda: dp_attention
-                )
+                mock.patch.object(comm, "is_dp_attention_enabled", lambda: dp_attention)
             )
             stack.enter_context(
                 mock.patch.object(comm, "get_moe_a2a_backend", lambda: a2a_backend)
@@ -103,31 +97,21 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
 
     def test_dense_tp_fuses(self):
         # Baseline supported path: dense TP, no DP attention, no EP backend.
-        self.assertTrue(
-            self._evaluate_gate(dp_attention=False, a2a_is_none=True)
-        )
+        self.assertTrue(self._evaluate_gate(dp_attention=False, a2a_is_none=True))
 
     def test_dp_attention_disables_fusion(self):
         # The fix: DP attention has no dense TP all-reduce to fuse.
-        self.assertFalse(
-            self._evaluate_gate(dp_attention=True, a2a_is_none=True)
-        )
+        self.assertFalse(self._evaluate_gate(dp_attention=True, a2a_is_none=True))
 
     def test_ep_backend_disables_fusion(self):
         # The fix: with an EP A2A backend (e.g. mori) the reduction lives in
         # combine(), not a TP all-reduce.
-        self.assertFalse(
-            self._evaluate_gate(dp_attention=False, a2a_is_none=False)
-        )
+        self.assertFalse(self._evaluate_gate(dp_attention=False, a2a_is_none=False))
 
     def test_dp_attention_and_ep_disables_fusion(self):
         # The crashing config from the TP8+EP8+mori repro.
-        self.assertFalse(
-            self._evaluate_gate(dp_attention=False, a2a_is_none=False)
-        )
-        self.assertFalse(
-            self._evaluate_gate(dp_attention=True, a2a_is_none=False)
-        )
+        self.assertFalse(self._evaluate_gate(dp_attention=False, a2a_is_none=False))
+        self.assertFalse(self._evaluate_gate(dp_attention=True, a2a_is_none=False))
 
     def test_flag_off_disables_fusion(self):
         # Sanity: the gate still respects the opt-in flag on the dense path.
