@@ -25,6 +25,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 
@@ -344,6 +346,37 @@ def mxfp4_moe_forward_triton(
     Each (token, expert) slot is processed independently with a fixed grid,
     eliminating .unique()/.item()/.nonzero() that break CUDA graph capture.
     """
+    # Prefill-sized batches route to the expert-grouped GEMM kernel (tensor-core
+    # tl.dot reuses each expert's weights across its block of tokens). Decode
+    # stays on the per-slot GEMV below. The grouped path uses torch.argsort and a
+    # host sync (moe_align), neither of which is capturable, so it is also gated
+    # off CUDA-graph capture explicitly: a large captured decode batch (max_bs >
+    # 128, e.g. on a 96 GB SM120 card) also has hidden_states.shape[0] > 128, and
+    # the shape check alone would route it here and abort capture.
+    if (
+        hidden_states.shape[0] > 128
+        and envs.SGLANG_SM120_GROUPED_MXFP4_PREFILL_MOE.get()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton.mxfp4_grouped_moe_sm120_triton import (
+            mxfp4_moe_forward_grouped,
+        )
+
+        return mxfp4_moe_forward_grouped(
+            hidden_states,
+            w13_packed,
+            w2_packed,
+            w13_scale,
+            w2_scale,
+            topk_ids,
+            topk_weights,
+            hidden_size,
+            intermediate_size,
+            inplace,
+            routed_scaling_factor,
+            clamp_limit,
+        )
+
     import torch.nn.functional as F
 
     M, K = hidden_states.shape
