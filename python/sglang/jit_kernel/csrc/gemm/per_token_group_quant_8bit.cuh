@@ -16,22 +16,12 @@ namespace {
 
 constexpr int kThreadsPerGroup = 16;
 
-__device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
-#ifdef USE_ROCM
-  // ROCm-only: the hand-rolled CUDA reduction below uses a 32-bit shuffle mask
-  // + warp==32 lane math, which fails to compile on ROCm/gfx942 (HIP requires a
-  // 64-bit mask). Delegate to the portable warp-reduce primitive, which emits
-  // __shfl_xor with an explicit kThreadsPerGroup sub-group width on HIP.
-  (void)tid;
+__device__ __forceinline__ float GroupReduceMax(float val) {
+  // Portable warp-reduce primitive: CUDA emits __shfl_xor_sync (width=32), HIP
+  // emits __shfl_xor with an explicit kThreadsPerGroup sub-group width. The
+  // previous hand-rolled __shfl_xor_sync used a 32-bit mask + warp==32 lane
+  // math, which fails to compile on ROCm/gfx942 (HIP requires a 64-bit mask).
   return device::warp::reduce_max<kThreadsPerGroup>(val);
-#else
-  unsigned mask = threadIdx.x % 32 >= 16 ? 0xffff0000 : 0x0000ffff;
-  val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
-  val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
-  val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
-  val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
-  return val;
-#endif
 }
 
 template <bool kScaleUE8M0>
@@ -104,7 +94,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     }
   }
 
-  local_absmax = GroupReduceMax(local_absmax, lane_id);
+  local_absmax = GroupReduceMax(local_absmax);
 
   float y_s = local_absmax / max_8bit;
   if constexpr (kScaleUE8M0) {
