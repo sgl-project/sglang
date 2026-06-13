@@ -318,13 +318,13 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 return
 
-        # Converged eager == replay == capture metadata body. `use_bound`
-        # selects the pre-bound cuda-graph FlashAttentionMetadata buffers
-        # (capture / replay / eager-at-captured-bs; in-place fused-kernel fill)
-        # vs a fresh eager FlashAttentionMetadata (torch ops). Kept identical to
-        # the eager init_forward_metadata body, modulo the in_capture pre-roll
-        # above, the `in_capture or` below, and the capture-only fixups after;
-        # the two are merged into a shared helper in a follow-up commit.
+        # Single eager == replay == capture metadata path; `use_bound` selects
+        # the pre-bound cuda-graph FlashAttentionMetadata buffers (capture /
+        # replay / eager-at-captured-bs; in-place fused-kernel fill) vs a fresh
+        # eager FlashAttentionMetadata (torch ops). Eager reaches the same
+        # _compute_forward_metadata via the base init_forward_metadata wrapper
+        # (out_graph(in_capture=False) + in_graph); the capture-only pre-roll
+        # above and fixups below are skipped there.
         use_bound = in_capture or self._use_cuda_graph_buffers(bs, forward_mode)
         self._compute_forward_metadata(forward_batch, use_bound=use_bound)
 
@@ -1203,24 +1203,6 @@ class FlashAttentionBackend(AttentionBackend):
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
         self.forward_metadata = metadata
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize forward metadata hence all layers in the forward pass can reuse it.
-
-        Converged onto the shared _compute_forward_metadata body: its post-
-        pre-roll form is byte-identical to init_forward_metadata_out_graph's,
-        modulo the `in_capture or` in the use_bound seam (eager never captures).
-        For pure-eager runs the seam is False, so this reduces to exactly the
-        previous eager behavior (fresh FlashAttentionMetadata built with torch
-        ops); for an eager forward that lands on a captured bs+mode it harmlessly
-        re-fills the bound buffers (refilled again by out_graph before the next
-        replay). The override is removed in a follow-up commit so eager flows
-        through the base wrapper (out_graph(in_capture=False) + in_graph).
-        """
-        bs = forward_batch.batch_size
-        forward_mode = forward_batch.forward_mode
-        use_bound = self._use_cuda_graph_buffers(bs, forward_mode)
-        self._compute_forward_metadata(forward_batch, use_bound=use_bound)
 
     def forward_extend(
         self,
