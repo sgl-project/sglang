@@ -1,0 +1,228 @@
+name: 'Nightly Test (NPU) Single Node Template'
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+        default: linux-aarch64-a3-16
+      test_type:
+        required: false
+        type: string
+        default: perf
+        description: perf or accuracy
+      test_config_name:
+        required: true
+        type: string
+        description: test config name
+      test_case:
+        required: true
+        type: string
+        description: path of test case file
+      image:
+        required: false
+        type: string
+        description: image for pods
+        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3"
+      install_sglang_from_source:
+        required: false
+        type: boolean
+        default: false
+        description: use sglang from source code or from docker image
+      transformers_version:
+        required: false
+        type: string
+        default: ""
+        description: "The transformers version number for running sglang. Use default version in image if keep empty."
+
+concurrency:
+  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: ${{ inputs.test_config_name }}
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: ${{ inputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check npu info
+        run: |
+          npu-smi info
+
+      - name: Run test
+        timeout-minutes: 120
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          HF_ENDPOINT: https://hf-mirror.com
+          SGLANG_IS_IN_CI: true
+          TRANSFORMERS_VERBOSITY: "error"
+          GDN_ATTN_BACKEND_TRITON: 1
+          SGLANG_TEST_METRICS_OUTPUT: /root/.cache/tests/output/metrics/metrics
+        shell: bash
+        run: |
+          sglang_source_path=$(pwd)
+          echo "Source code path: ${sglang_source_path}"
+          ln -sf ${sglang_source_path} /root/sglang
+
+          test_case=${{ inputs.test_case }}
+          if [ ! -f "${sglang_source_path}/${test_case}" ]; then
+            echo "The testcase does not exit: ${sglang_source_path}/${test_case}"
+            exit 1
+          fi
+
+          # prepare for output data
+          current_date=$(date +%Y%m%d)
+          test_data_output_path=/root/.cache/tests/output/${{ inputs.test_type }}/${current_date}
+          mkdir -p ${test_data_output_path}
+          tc_name=${test_case##*/}
+          tc_name=${tc_name%.*}
+          export METRICS_DATA_FILE=${test_data_output_path}/${tc_name}
+          mkdir -p ${METRICS_DATA_FILE}
+          echo "Metrics file path: ${METRICS_DATA_FILE}"
+
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+          export TRANSFORMERS_VERSION_FOR_SGLANG="${{ inputs.transformers_version }}"
+          PYTHON_FOR_SGLANG="python"
+          PIP_FOR_SGLANG="pip"
+          if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
+            echo "===== Install transformers for sglang - Begin ====="
+            TRANSFORMERS_PKG_PATH_SOURCE=/root/.cache/.cache/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
+            if [ ! -d "${TRANSFORMERS_PKG_PATH_SOURCE}" ]; then
+              echo "The dependent transformers package does not exist: ${TRANSFORMERS_PKG_PATH_SOURCE}."
+              echo "Install transformers ${TRANSFORMERS_VERSION_FOR_SGLANG} online."
+              pip install transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}" -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+            else
+              echo "Install transformers ${TRANSFORMERS_VERSION_FOR_SGLANG} locally."
+              TRANSFORMERS_PKG_PATH_TARGET=/tmp/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
+              mkdir -p "${TRANSFORMERS_PKG_PATH_TARGET}"
+              cp "${TRANSFORMERS_PKG_PATH_SOURCE}/*" "${TRANSFORMERS_PKG_PATH_TARGET}/"
+              pip install --no-index --find-links="${TRANSFORMERS_PKG_PATH_TARGET}" transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}"
+            fi
+            echo "===== Install transformers for sglang in virtual env - End ====="
+          fi
+          echo "Transformers version for sglang: $(${PIP_FOR_SGLANG} show transformers | grep Version | cut -d: -f2)"
+
+          echo "scaling_governor performance num: \
+            $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | grep performance | wc -l)"
+          echo "swappiness: $(cat /proc/sys/vm/swappiness)"
+          echo "numa_balancing: $(cat /proc/sys/kernel/numa_balancing)"
+          echo "sched_migration_cost_ns: $(cat /proc/sys/kernel/sched_migration_cost_ns)"
+
+          export SGLANG_TEST_MAX_RETRY=0
+          export SGLANG_SET_CPU_AFFINITY=1
+          echo "SGLANG_SET_CPU_AFFINITY: $SGLANG_SET_CPU_AFFINITY"
+
+          install_sglang_from_source=${{ inputs.install_sglang_from_source }}
+          if [ "$install_sglang_from_source" = "true" ] || [ "$install_sglang_from_source" = "True" ];then
+            echo "Install sglang from source"
+            commit_id=${{ github.sha }}
+            echo "commit id: ${commit_id}" > ${test_data_output_path}/commit_id
+            export PYTHONPATH=${sglang_source_path}/python:$PYTHONPATH
+          else
+            echo "Use sglang from image: ${{ inputs.image }}"
+            sglang_pkg_path=/sgl-workspace/sglang/python
+            ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
+            mkdir -p ${ascend_test_util_path}
+            mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
+            cp -r ${sglang_source_path}/python/sglang/test/ascend ${ascend_test_util_path}
+          fi
+
+          source /usr/local/Ascend/cann/set_env.sh || true
+          source /usr/local/Ascend/nnal/atb/set_env.sh || true
+
+          # Set environment of cann
+          log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+          rm -rf ${log_path}
+          mkdir -p ${log_path}
+          echo "Log path: ${log_path}"
+
+          echo "Running test case ${test_case}"
+          test_exit_code=0
+          ${PYTHON_FOR_SGLANG} -u ${test_case} 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
+          echo "Finished test case ${test_case}"
+
+          if [ "${test_exit_code}" = "0" ]; then
+            test_status="pass"
+            status_icon="✅"
+          else
+            test_status="fail"
+            status_icon="❌"
+          fi
+
+          echo "test_status=${test_status}" >> $GITHUB_ENV
+          echo "tc_name=${tc_name}" >> $GITHUB_ENV
+          export test_status tc_name
+
+          echo "## ${tc_name}  ${status_icon} ${test_status}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          metric_count=$(grep -c '\[METRIC\]' /tmp/test_output.log 2>/dev/null || echo 0)
+          if [ "${metric_count}" -gt 0 ]; then
+            echo "| Metric | Value | Pass |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|------|" >> $GITHUB_STEP_SUMMARY
+            grep '\[METRIC\]' /tmp/test_output.log | while IFS= read -r line; do
+              metric_name=$(echo "$line" | sed -E 's/.*\[METRIC\] ([^=]+)=.*/\1/')
+              metric_value=$(echo "$line" | sed -E 's/.*\[METRIC\] [^=]+=([^ ]+).*/\1/')
+              echo "| ${metric_name} | ${metric_value} | ${status_icon} |" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "No metrics collected (test may have failed before producing results)." >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "import json, re, os" > /tmp/dump_metrics.py
+          echo "tc = os.environ.get('tc_name', 'unknown')" >> /tmp/dump_metrics.py
+          echo "st = os.environ.get('test_status', 'unknown')" >> /tmp/dump_metrics.py
+          echo "tp = '${{ inputs.test_type }}'" >> /tmp/dump_metrics.py
+          echo "metrics = {}" >> /tmp/dump_metrics.py
+          echo "with open('/tmp/test_output.log') as f:" >> /tmp/dump_metrics.py
+          echo "    for line in f:" >> /tmp/dump_metrics.py
+          echo "        m = re.match(r'\[METRIC\] (\S+)=(\S+)', line)" >> /tmp/dump_metrics.py
+          echo "        if m:" >> /tmp/dump_metrics.py
+          echo "            v = m.group(2)" >> /tmp/dump_metrics.py
+          echo "            try:" >> /tmp/dump_metrics.py
+          echo "                v = float(v)" >> /tmp/dump_metrics.py
+          echo "            except ValueError:" >> /tmp/dump_metrics.py
+          echo "                pass" >> /tmp/dump_metrics.py
+          echo "            metrics[m.group(1)] = v" >> /tmp/dump_metrics.py
+          echo "baselines = {}" >> /tmp/dump_metrics.py
+          echo "for k, v in list(metrics.items()):" >> /tmp/dump_metrics.py
+          echo "    if k.endswith('_baseline'):" >> /tmp/dump_metrics.py
+          echo "        baselines[k[:-9]] = v" >> /tmp/dump_metrics.py
+          echo "        del metrics[k]" >> /tmp/dump_metrics.py
+          echo "with open('/tmp/metrics.json', 'w') as f:" >> /tmp/dump_metrics.py
+          echo "    json.dump({'test_case': tc, 'test_type': tp, 'status': st, 'metrics': metrics, 'baselines': baselines}, f)" >> /tmp/dump_metrics.py
+          python3 /tmp/dump_metrics.py
+          exit ${test_exit_code}
+
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ inputs.test_config_name }}
+          path: /tmp/metrics.json
+          retention-days: 7
+
+      - name: Backup plog
+        if: always()
+        shell: bash
+        run: |
+          plog_path="/root/ascend/log/debug/plog"
+          if [ -d "$plog_path" ];then
+            echo "Plog files found. Begin to backup them."
+            tc_name=${{ inputs.test_case }}
+            tc_name=${tc_name##*/}
+            tc_name=${tc_name%.*}
+            target_plog_path="/root/.cache/tests/logs/plog/${tc_name}/${HOSTNAME}"
+            echo "Save path: ${target_plog_path}"
+            rm -rf ${target_plog_path}
+            mkdir -p ${target_plog_path}
+            cp ${plog_path}/* ${target_plog_path}
+          fi
