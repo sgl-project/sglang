@@ -24,6 +24,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+import msgspec
+
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -258,49 +260,39 @@ def trace_set_thread_info(
     )
 
 
-class TraceReqContext:
-    def __init__(
-        self,
-        rid,
-        bootstrap_room=None,
-        role="unified",
-        module_name="",
-        external_trace_header: Optional[Dict[str, str]] = None,
-    ):
-        self.rid: str = str(rid)
+class TraceReqContext(msgspec.Struct, tag=True):
+    rid: str
+    trace_level: int
+    pid: int
+    tracing_enable: bool = False
+    start_time_ns: Optional[int] = None
+    thread_context: Optional[TraceThreadContext] = None
+    bootstrap_room: Optional[int] = None
+    role: str = "unified"
+    module_name: str = ""
+    is_copy: bool = False
+    root_span: Optional[trace.span.Span] = None
+    root_span_context: Optional[context.Context] = None
+    last_span_context: Optional[trace.span.SpanContext] = None
+    external_trace_header: Optional[Dict[str, str]] = None
+    events_cache: List[TraceEvent] = []
+    is_initialized: bool = False
+
+    def __post_init__(self):
+        self.rid = str(self.rid)
         self.trace_level = global_trace_level
-        self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0
+        self.tracing_enable = opentelemetry_initialized and self.trace_level > 0
 
         # Filter by --trace-modules only for explicitly named modules; contexts
         # created with the default empty module_name are always traced.
         if (
-            module_name
+            self.module_name
             and global_trace_modules is not None
-            and module_name not in global_trace_modules
+            and self.module_name not in global_trace_modules
         ):
             self.tracing_enable = False
 
-        if not self.tracing_enable:
-            return
-
-        self.start_time_ns: Optional[int] = None
-        self.thread_context: Optional[TraceThreadContext] = None
-        self.bootstrap_room: Optional[int] = bootstrap_room
-        self.role: str = role
-        self.module_name = module_name
-
-        # Indicates whether this instance is a replica from the main process.
-        # When True, root_span is None and only root_span_context is preserved.
-        self.is_copy: bool = False
-        self.root_span: Optional[trace.span.Span] = None
-        self.root_span_context: Optional[context.Context] = None
-        # Record the most recently completed span as the previous span for the next span to be created.
-        self.last_span_context: Optional[trace.span.SpanContext] = None
-        self.external_trace_header: Optional[Dict[str, str]] = external_trace_header
-
-        self.events_cache: List[TraceEvent] = []
-
-        self.pid: int = threading.get_native_id()
+        self.pid = threading.get_native_id()
 
     def is_tracing_enabled(self) -> bool:
         return self.tracing_enable
@@ -768,11 +760,8 @@ class TraceReqContext:
 # Temporary remove the @dataclass decorator to make msgpack treat
 # TraceReqContext as a custom class and serialize with pickle like TraceReqContext.
 # When the TraceReqContext fixed with msgpack, we can consider to add @dataclass back.
-class TraceNullContext:
+class TraceNullContext(msgspec.Struct, tag=True):
     tracing_enable: bool = False
-
-    def __init__(self, tracing_enable=False):
-        self.tracing_enable = tracing_enable
 
     def __getattr__(self, name):
         # fix the .__dataclass_fields__ is not a dict error

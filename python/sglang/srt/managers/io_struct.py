@@ -42,7 +42,9 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
-    ReqTimeStatsBase,
+    APIServerReqTimeStats,
+    DPControllerReqTimeStats,
+    MetricsCollectorWrapper,
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -824,8 +826,8 @@ class TokenizedGenerateReqInput(BaseReqIpc, kw_only=True):
     multi_item_delimiter_indices: Optional[List[int]] = None
 
     # For observability
-    # Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
-    time_stats: Optional[ReqTimeStatsBase] = None
+    # Optional[]
+    time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
 
 class BatchTokenizedGenerateReqInput(BaseBatchReqIpc, kw_only=True):
@@ -1079,8 +1081,7 @@ class TokenizedEmbeddingReqInput(BaseReqIpc, kw_only=True):
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
     # For observability
-    # Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
-    time_stats: Optional[ReqTimeStatsBase] = None
+    time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
@@ -2149,6 +2150,8 @@ def enc_hook(obj: Any) -> Any:
         return (obj.typecode, obj.tobytes())
     elif isinstance(obj, np.floating):
         return float(obj)
+    elif isinstance(obj, MetricsCollectorWrapper):
+        return None
     else:
         if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
             logger.info(f"Object of type {type(obj)} is encoding with pickle.")

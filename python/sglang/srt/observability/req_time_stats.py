@@ -18,9 +18,10 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import msgspec
 from typing_extensions import Self
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -219,17 +220,38 @@ class RequestStage:
     ANONYMOUS = RequestStageConfig("")
 
 
-@dataclass
-class ReqTimeStatsBase:
+# The metrics collector is not serializable,
+# and it is only used for observing metrics in the current process.
+class MetricsCollectorWrapper:  # the non-serializable wrapper
+    __slots__ = ("inner",)
+
+    def __init__(self, inner=None):
+        self.inner = inner
+
+    def __getattr__(self, name):  # delegate to internal object
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(self.inner, name)
+
+
+class ReqTimeStatsBase(msgspec.Struct, kw_only=True, tag=True):
     enable_metrics: bool = False
-    # use object to avoid msgpack decode build issue, not use Any due to the
-    # custom object serialized by pickle.
-    # Optional[Union[SchedulerMetricsCollector, TokenizerMetricsCollector]]
-    metrics_collector: Optional[object] = None
-    # Union[TraceReqContext, TraceNullContext]
-    trace_ctx: object = field(default_factory=TraceNullContext)
+    trace_ctx: Union[TraceReqContext, TraceNullContext] = msgspec.field(
+        default_factory=TraceNullContext
+    )
+    metrics_collector: Optional[MetricsCollectorWrapper] = None
     disagg_mode: Optional[DisaggregationMode] = DisaggregationMode.NULL
     diff_realtime_monotonic: float = 0.0
+    is_initialized: bool = False
+
+    def __post_init__(self):
+        if self.is_initialized:
+            return
+
+        if not isinstance(self.metrics_collector, MetricsCollectorWrapper):
+            self.metrics_collector = MetricsCollectorWrapper(self.metrics_collector)
+
+        self.is_initialized = True
 
     @classmethod
     def new_from_obj(cls, obj: Optional[ReqTimeStatsBase], *args, **kwargs) -> Self:
@@ -237,7 +259,7 @@ class ReqTimeStatsBase:
         new_obj = cls(*args, **kwargs)
         if obj is None:
             return new_obj
-        for key, value in obj.__dict__.items():
+        for key, value in msgspec.structs.asdict(obj).items():
             if hasattr(new_obj, key):
                 setattr(new_obj, key, value)
 
@@ -261,7 +283,7 @@ class ReqTimeStatsBase:
     ):
         if collector:
             self.enable_metrics = True
-            self.metrics_collector = collector
+            self.metrics_collector = MetricsCollectorWrapper(collector)
 
     def observe_per_stage_req_latency(self, stage: RequestStageConfig, latency: float):
         if self.enable_metrics and stage.metrics_is_observed:
@@ -324,7 +346,6 @@ class ReqTimeStatsBase:
         self.__dict__.update(state)
 
 
-@dataclass
 class APIServerReqTimeStats(ReqTimeStatsBase):
     # get by time.perf_counter()
     created_time: float = 0.0
@@ -475,7 +496,6 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
         return span_attrs
 
 
-@dataclass
 class DPControllerReqTimeStats(ReqTimeStatsBase):
     # propagated from tokenizer/grpc_server, get by time.perf_counter()
     created_time: float = 0.0
@@ -521,7 +541,6 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
             )
 
 
-@dataclass
 class SchedulerReqTimeStats(ReqTimeStatsBase):
     """
     Store the timestamps for each stage of a request.
