@@ -18,20 +18,11 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu
-
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_npu = is_npu()
-_is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import (
         EagleDraftInput,
     )
-
-if is_cuda() or is_musa():
-    pass
 
 
 @dataclass
