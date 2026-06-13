@@ -209,7 +209,7 @@ class StorageOperation:
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
 
-    def __lt__(self, other: "StorageOperation"):
+    def __lt__(self, other: StorageOperation):
         return self.id < other.id
 
 

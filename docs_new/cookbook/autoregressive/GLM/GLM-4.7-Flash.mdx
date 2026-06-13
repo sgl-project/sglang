@@ -53,7 +53,7 @@ import { GLM47FlashDeployment } from "/src/snippets/autoregressive/glm-47-flash-
 
 ### 3.2 Configuration Tips
 
-- **EAGLE Speculative Decoding:** Supported for GLM-4.7-Flash. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default (`SGLANG_ENABLE_SPEC_V2=True`); set `SGLANG_ENABLE_SPEC_V2=0` to disable. Enable via the interactive command generator above.
+- **EAGLE Speculative Decoding:** Supported for GLM-4.7-Flash. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default; pass `--disable-overlap-schedule` to disable. Enable via the interactive command generator above.
 
 ## 4. Model Invocation
 

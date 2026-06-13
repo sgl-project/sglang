@@ -311,7 +311,7 @@ def _make_spec_verify_input(
     if spec_kind == "ngram":
         return NgramVerifyInput(
             draft_token=batch.input_ids,
-            tree_mask=custom_mask,
+            custom_mask=custom_mask,
             positions=batch.positions,
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,

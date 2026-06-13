@@ -42,12 +42,12 @@ if TYPE_CHECKING:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    recv_from_tokenizer: Union[zmq.Socket, "ScriptedTokenizerRecvProxy"]
+    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
-    ps: "ParallelState"
+    ps: ParallelState
     tp_group: Any
     tp_cpu_group: Any
     attn_tp_group: Any
@@ -55,12 +55,12 @@ class SchedulerRequestReceiver:
     attn_cp_group: Any
     attn_cp_cpu_group: Any
     world_group: Any
-    server_args: "ServerArgs"
-    model_config: "ModelConfig"
+    server_args: ServerArgs
+    model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
-    scripted_scheduler_hook: Optional["ScriptedSchedulerHook"] = None
+    scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:

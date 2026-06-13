@@ -146,12 +146,12 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    def get_prefix_hash_values(self, node: "TreeNode") -> List[str]:
+    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
         if node is None or node.hash_value is None:
             return []
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
-    def __lt__(self, other: "TreeNode"):
+    def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
 
@@ -319,7 +319,7 @@ class LRUList:
             return False
         return node.id in self.cache
 
-    def pretty_print(self, tree_cache: Optional["MambaRadixCache"] = None):
+    def pretty_print(self, tree_cache: Optional[MambaRadixCache] = None):
         """
         Pretty print the lru list
         """
@@ -358,7 +358,7 @@ class LRUList:
         return evictable_size
 
     # Note: this is expensive, only use for debug or idle check
-    def sanity_check(self, tree_cache: "MambaRadixCache"):
+    def sanity_check(self, tree_cache: MambaRadixCache):
         """
         Check if the lru list is valid by rebuilding the lru list from the tree, heapifying it, and
         checking if the lru list is valid.

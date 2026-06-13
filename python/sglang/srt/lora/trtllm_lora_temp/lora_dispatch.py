@@ -39,11 +39,11 @@ if TYPE_CHECKING:
 
 
 def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
-    dispatch_output: "StandardDispatchOutput",
-    quant_info: "FlashInferTrtllmFp8MoeQuantInfo",
-    runner_config: "MoeRunnerConfig",
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmFp8MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
     lora_info,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
     from flashinfer.fused_moe import Fp8QuantizationType
 
     from sglang.jit_kernel.trtllm_lora_temp import (
@@ -66,7 +66,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
     from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
         merged_experts_fused_moe_lora_add,
     )
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
         "experimental_sgl_trtllm LoRA currently supports the gated SwiGLU FP8 "
@@ -302,11 +302,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
 
 
 def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
-    dispatch_output: "StandardDispatchOutput",
-    quant_info: "FlashInferTrtllmFp4MoeQuantInfo",
-    runner_config: "MoeRunnerConfig",
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
     lora_info,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
     """NVFP4 sibling of ``fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``.
 
     Decomposed (unfused-activation) MoE-LoRA: routing -> gather -> gate_up grouped
@@ -327,7 +327,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
         merged_experts_fused_moe_lora_add,
     )
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
     assert (
         runner_config.activation == "silu" and runner_config.is_gated

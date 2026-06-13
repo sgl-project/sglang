@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeVar
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -756,6 +757,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
 
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(
+                    req, effective_cache_len - 1, insert_params
+                )
+
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
@@ -1424,7 +1431,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.cache_controller is not None
                 and self.cache_controller.write_policy == "write_back"
             ):
-                self.write_backup(node, write_back=True)
+                written = self.write_backup(node, write_back=True)
+                if written == 0:
+                    return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
                 return
@@ -2792,7 +2801,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _check_lru_linked_list(
         self,
-        lru: "UnifiedLRUList",
+        lru: UnifiedLRUList,
         ct: ComponentType,
         label: str,
         errors: list[str],
