@@ -35,10 +35,12 @@ your dispatch prompt, or ask for it.
    (`--kv-cache-dtype fp8_e4m3`, W4A4-style runtime quant) follow a
    deterministic rule — enforced in migration, no asking: offered as a
    legacy **selectable option** → never select it (cells mirror the
-   accuracy-safe side); baked into the recipe's **default/unconditional
-   command** → keep it verbatim (the recipe was measured with it, and fp8
-   KV halves KV memory — stripping could OOM it). See dimension-mapping.md
-   §2 caveats.
+   accuracy-safe side), and the option **survives as a Playground axis** —
+   an existing one where it fits, else add one via a separate prior engine
+   PR (rule 4); a legacy choice never degrades to a tips mention. Baked
+   into the recipe's **default/unconditional command** → keep it verbatim
+   (the recipe was measured with it, and fp8 KV halves KV memory —
+   stripping could OOM it). See dimension-mapping.md §2 caveats.
 2. **Never invent versions or numbers.** Benchmark numbers only from the
    legacy page's measured blocks. **Speed measurements migrate ONLY when the
    legacy page pins an exact, reproducible build** (a release tag or a commit

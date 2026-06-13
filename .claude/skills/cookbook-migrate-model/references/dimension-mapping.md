@@ -13,9 +13,9 @@ this file is about the *mapping decisions*.
 | model-size / model-name radio | `variants` | One variant per deployable checkpoint family; single `{id:"default"}` when there's no variant axis (then `modelNames` keys drop the variant half). |
 | quantization radio | `quantizations` | Real precision ids (`bf16`/`fp8`/`fp4`/`int4`/…). One `fp4` id even when checkpoints differ per vendor — route via `hw\|variant\|quant` triple keys in `modelNames` (NVFP4 on Blackwell vs AMD MXFP4 is the precedent); per-hw greying falls out of which cells exist. |
 | toggle that **couples** with other parts of the command (changes TP/mem/EP), OR one the legacy page labels with **operating-point words** | `strategies` | The Playground applies pure flag diffs — it cannot do coupled changes. Example: Qwen3.5's MTP toggle bumps TP on three H100 combos → strategies `low-latency` (MTP on) / `high-throughput` (MTP off). **Naming counts like coupling**: GLM-5.1's / Kimi-K2.6's `dpattention` adds only `--dp N --enable-dp-attention` (uncoupled), but its options are subtitled "Low Latency" / "High Throughput" — the page's own named operating-point split → strategies; a flag-only spec toggle riding alongside it stays a Playground axis and bakes per its legacy default. GPU-count radios (GLM-4.7, MiniMax-M2.5/2.7) → budget-tier strategies with the legacy SUPPORT matrix preserved by which cells exist. Strategy count follows the page's operating points: 1 → `balanced`, 2 → `low-latency`+`high-throughput`, 3 → the full trio (§4). |
-| toggle that only adds/removes its own flags | Playground axis (+ bake, EXCEPT parsers) | **Parsers (`--reasoning-parser` / `--tool-call-parser`) are NEVER baked into cells** — Deployment commands ship without them regardless of the legacy default or the measured command; the `parsers` axis adds them on top (DSv4 convention; cells mirror the legacy generator's parsers-OFF output). Other flag-only toggles: legacy default ON → bake into cells AND declare the axis so users can strip (red strikethrough); default OFF → keep cells clean, axis preset only. MTP/EAGLE presets → `speculative` axis; dp-attention → a strategy when the legacy page labels it as the operating-point split or when coupled (see the row above), else `attention.dpAttn`. |
+| toggle that only adds/removes its own flags | Playground axis (+ bake, EXCEPT parsers and accuracy-degrading flags) | **Parsers (`--reasoning-parser` / `--tool-call-parser`) are NEVER baked into cells** — Deployment commands ship without them regardless of the legacy default or the measured command; the `parsers` axis adds them on top (DSv4 convention; cells mirror the legacy generator's parsers-OFF output). Accuracy-degrading toggles are never baked either — §2 caveats (axis-only, accuracy-safe cells). Other flag-only toggles: legacy default ON → bake into cells AND declare the axis so users can strip (red strikethrough); default OFF → keep cells clean, axis preset only. MTP/EAGLE presets → `speculative` axis; dp-attention → a strategy when the legacy page labels it as the operating-point split or when coupled (see the row above), else `attention.dpAttn`. |
 | per-combo hidden option (e.g. spec hidden on Xeon) | absent cells | Don't create cells for combos the legacy widget couldn't produce; the engine greys them automatically. `# Error:` pseudo-commands → no cell + explanation in §2 tips and/or a chip `disable`/`disableReason`. |
-| coupled secondary knob with no axis (e.g. mamba cache V1/V2) | cells + prose | No new engine axis for a migration. Bake the correct value per cell following the legacy coupling (Qwen3.5: MTP ⇒ `--mamba-scheduler-strategy extra_buffer` on NVIDIA; AMD/Xeon ⇒ V1/no flag), document the knob in §2 tips. |
+| coupled secondary knob with no axis (e.g. mamba cache V1/V2) | cells + prose | No new engine axis when the knob's values **bake into cells** per the legacy coupling — nothing is lost (Qwen3.5: MTP ⇒ `--mamba-scheduler-strategy extra_buffer` on NVIDIA; AMD/Xeon ⇒ V1/no flag); document the knob in §2 tips. Contrast: an option the accuracy rule excludes from cells (§2 caveats, e.g. a KV Cache DType radio) CANNOT bake — it must surface as a Playground axis, added via a separate prior engine PR if missing. |
 
 ## 2. Command rewrite table (the ONLY allowed normalizations)
 
@@ -43,9 +43,14 @@ Caveats discovered in the pilot:
   runtime quant) — deterministic rule, enforced in migration without
   asking:
   - offered as a legacy **selectable option/toggle** → never select it;
-    cells mirror the accuracy-safe default side (route the option to an
-    existing Playground axis if one fits — DSv4 gates W4A4 behind
-    `megamoeQuant` — otherwise mention it in §2 tips);
+    cells mirror the accuracy-safe side (even if the legacy default was the
+    lossy side). The option itself **must survive as a Playground axis** — the user's choice may not degrade to a
+    tips mention. Use the existing axis when one fits (DSv4 gates W4A4
+    behind `megamoeQuant`); when the playground lacks one — e.g.
+    Nemotron3-Ultra's "KV Cache DType" radio (None default / fp8_e4m3 /
+    bf16) has no kv-cache axis today — **add the axis** via the engine-axis
+    flow: a separate PRIOR engine PR (hard rule 4, like accuracyLabels
+    #27842), then the migration config declares it;
   - baked into the recipe's **unconditional/default command** → keep it
     verbatim. The legacy measurements ran with it, and fp8 KV halves KV
     memory — stripping could OOM the recipe. Expect this pattern: legacy
