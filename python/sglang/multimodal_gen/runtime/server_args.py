@@ -1258,11 +1258,12 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Perform warmup before normal traffic. `sglang serve` runs a "
                 "server warmup through the scheduler client after HTTP is ready. "
-                "Other entrypoints use request-based warmup unless "
-                "`--warmup-resolutions` is specified. Recommended to enable when "
-                "benchmarking to ensure fair comparison and best performance. "
-                "When enabled, look for the line ending with `(with warmup "
-                "excluded)` for actual processing time."
+                "Other client entrypoints run explicit `--warmup-resolutions` "
+                "through the scheduler client, otherwise they use request-based "
+                "warmup. Recommended to enable when benchmarking to ensure fair "
+                "comparison and best performance. When enabled, look for the "
+                "line ending with `(with warmup excluded)` for actual processing "
+                "time."
             ),
         )
         parser.add_argument(
@@ -1270,7 +1271,7 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             nargs="+",
             default=ServerArgs.warmup_resolutions,
-            help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
+            help="Specify explicit warmup resolutions. e.g., `--warmup-resolutions 256x256 720x720`",
         )
         parser.add_argument(
             "--warmup-steps",

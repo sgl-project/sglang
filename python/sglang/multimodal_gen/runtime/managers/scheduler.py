@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
-from sglang.multimodal_gen.runtime.distributed import get_world_group
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
@@ -59,17 +58,12 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     get_first_generation_req,
     is_server_based_warmup,
     is_warmup_req,
-    prepare_warmup_image_path_sync,
     should_return_warmup_result,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
-from sglang.multimodal_gen.runtime.warmup_request_builder import (
-    build_warmup_reqs,
-    should_include_warmup_image,
-)
 
 logger = init_logger(__name__)
 
@@ -159,15 +153,13 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
 
-        # whether we've send the necessary warmup reqs
+        # whether lazy req-based warmup has already been scheduled
         self.warmed_up = False
         # warmup progress tracking
         self._warmup_total = 0
         self._warmup_processed = 0
         self._warmup_progress_bar: Any | None = None
         self._logged_server_ready_after_warmup = False
-
-        self.prepare_internal_warmup_reqs()
 
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
@@ -963,69 +955,6 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
             stop_reason=stop_reason,
         )
         return batch_items
-
-    def prepare_internal_warmup_reqs(self):
-        if (
-            not self.server_args.warmup
-            or self.warmed_up
-            or self.server_args.server_warmup
-            or self.server_args.warmup_resolutions is None
-        ):
-            return
-
-        self._warmup_total = len(self.server_args.warmup_resolutions)
-        self._warmup_processed = 0
-
-        warmup_input_path = None
-        if should_include_warmup_image(self.server_args, server_based_warmup=False):
-            warmup_input_path = self._prepare_shared_warmup_image_path()
-
-        warmup_reqs = build_warmup_reqs(
-            self.server_args,
-            warmup_resolutions=self.server_args.warmup_resolutions,
-            warmup_input_path=warmup_input_path,
-        )
-        for req in warmup_reqs:
-            self.waiting_queue.append((None, req, time.monotonic()))
-
-        # if server is warmed-up, set this flag to avoid req-based warmup
-        self.warmed_up = True
-
-    def _prepare_shared_warmup_image_path(self) -> str:
-        world_group = get_world_group()
-        src_rank = world_group.ranks[0]
-
-        warmup_sync: dict[str, str | None]
-        if world_group.rank == src_rank:
-            try:
-                input_path = prepare_warmup_image_path_sync(self.server_args)
-                warmup_sync = {"input_path": input_path, "error": None}
-            except Exception as e:
-                warmup_sync = {"input_path": None, "error": str(e)}
-        else:
-            warmup_sync = {}
-
-        # Sync rank 0's warmup-image write result (path or error) to all ranks.
-        warmup_sync = broadcast_pyobj(
-            warmup_sync,
-            world_group.rank,
-            world_group.cpu_group,
-            src=src_rank,
-        )
-        if not isinstance(warmup_sync, dict):
-            raise RuntimeError("Invalid warmup sync payload received across ranks")
-
-        error = warmup_sync.get("error")
-        if error is not None:
-            raise RuntimeError(
-                f"Warmup image preparation failed on rank {src_rank}: {error}"
-            )
-
-        input_path = warmup_sync.get("input_path")
-        if not isinstance(input_path, str) or not input_path:
-            raise RuntimeError("Warmup image preparation returned empty input path")
-
-        return input_path
 
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: List[tuple[bytes, Any]]
