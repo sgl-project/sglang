@@ -18,8 +18,6 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.dsv4 import (
@@ -116,6 +114,9 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 )
 from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.triton_ops.deepseek_v4 import (
+    rms_normalize_triton as rms_normalize_triton,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -258,57 +259,6 @@ def deepseek_v4_attention_with_output(
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
 )
-
-
-@triton.jit
-def _rms_normalize_kernel(
-    x_ptr,
-    weight_ptr,
-    eps,
-    stride_row,
-    dim,
-    BLOCK_SIZE: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < dim
-
-    base = pid * stride_row
-    x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-
-    mean_sq = tl.sum(x * x, axis=0) / dim
-    rms_inv = tl.rsqrt(mean_sq + eps)
-    out = x * rms_inv
-
-    if HAS_WEIGHT:
-        weight = tl.load(weight_ptr + offs, mask=mask, other=0.0)
-        out = out * weight
-
-    tl.store(x_ptr + base + offs, out, mask=mask)
-
-
-def rms_normalize_triton(
-    x: torch.Tensor, eps: float, weight: torch.Tensor = None
-) -> torch.Tensor:
-    dim = x.shape[-1]
-    x_flat = x.view(-1, dim)
-    num_rows = x_flat.shape[0]
-
-    BLOCK_SIZE = triton.next_power_of_2(dim)
-    grid = (num_rows,)
-
-    _rms_normalize_kernel[grid](
-        x_flat,
-        weight,
-        eps,
-        x_flat.stride(0),
-        dim,
-        BLOCK_SIZE=BLOCK_SIZE,
-        HAS_WEIGHT=(weight is not None),
-    )
-    return x
 
 
 class MQALayer(nn.Module):
@@ -817,18 +767,10 @@ class MQALayer(nn.Module):
 
             token_to_kv_pool = get_token_to_kv_pool()
             if unified:
-                swa_ring_size = token_to_kv_pool.unified_swa_ring_size
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
-                # ring slot = req_slot * ring + pos % ring, per token.
-                # positions is per-token; req_pool_indices is per-req.
-                req_slot = forward_batch.req_pool_indices.to(torch.int64)
-                if req_slot.shape[0] != positions.shape[0]:
-                    req_slot = req_slot.repeat_interleave(
-                        positions.shape[0] // req_slot.shape[0]
-                    )
-                swa_loc = (
-                    req_slot * swa_ring_size + positions.to(torch.int64) % swa_ring_size
-                ).to(torch.int32)
+                # swa_loc is layer-independent; computed once per forward by the
+                # backend and cached on the metadata (read here by every layer).
+                swa_loc = attn_backend.get_unified_swa_loc(forward_batch)
                 swa_page_size, bf16_store = 1, True
             else:
                 swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
