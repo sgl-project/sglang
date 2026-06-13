@@ -1,6 +1,4 @@
-# If the device is Battlemage, we need to set UBUNTU_VERSION to 24.10
-
-# Usage: docker build --build-arg UBUNTU_VERSION=24.04 --build-arg PYTHON_VERSION=3.10 -t sglang:xpu_kernel -f  xpu.Dockerfile --no-cache .
+# docker build -t sglang:xpu -f xpu.Dockerfile --build-arg http_proxy=${http_proxy} --build-arg https_proxy=${https_proxy} --build-arg no_proxy=${no_proxy} --no-cache .
 
 # Use Intel deep learning essentials base image with Ubuntu 24.04
 FROM intel/deep-learning-essentials:2025.3.2-0-devel-ubuntu24.04
@@ -17,57 +15,41 @@ ARG SG_LANG_BRANCH=main
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
 ARG SG_LANG_KERNEL_BRANCH=main
 
-RUN useradd -m -d /home/sdp -s /bin/bash sdp && \
-    chown -R sdp:sdp /home/sdp
-
-# Switch to non-root user 'sdp'
-USER sdp
-
-# Set HOME and WORKDIR to user's home directory
-ENV HOME=/home/sdp
-WORKDIR /home/sdp
-
-RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/releases/download/25.1.1-0/Miniforge3-Linux-x86_64.sh && \
-    bash miniforge.sh -b -p ./miniforge3 && \
-    rm miniforge.sh && \
-    # Initialize conda environment and install pip
-    . ./miniforge3/bin/activate && \
-    conda create -y -n py${PYTHON_VERSION} python=${PYTHON_VERSION} && \
-    conda activate py${PYTHON_VERSION} && \
-    conda install pip && \
-    # Append environment activation to .bashrc for interactive shells
-    echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; . /opt/intel/oneapi/setvars.sh; cd /home/sdp" >> /home/sdp/.bashrc
-
 USER root
-RUN apt-get update && apt install -y intel-ocloc
 
-# Switch back to user sdp
-USER sdp
+# Install the latest UMD driver for SYCL-TLA
+RUN apt-get update && apt-get install -y software-properties-common && \
+    add-apt-repository -y ppa:kobuk-team/intel-graphics && \
+    apt-get update && \
+    apt-get install -y \
+        libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
+        intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
+        libze-dev intel-ocloc && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN --mount=type=secret,id=github_token \
-    cd /home/sdp && \
-    . /home/sdp/miniforge3/bin/activate && \
-    conda activate py${PYTHON_VERSION} && \
-    pip3 install torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
 
-RUN --mount=type=secret,id=github_token \
-    cd /home/sdp && \
-    . /home/sdp/miniforge3/bin/activate && \
-    conda activate py${PYTHON_VERSION} && \
-    echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
-    git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} && \
+RUN apt-get update && apt-get install -y \
+    python3-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+WORKDIR /sgl-workspace
+
+RUN  pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
+     pip install --no-cache-dir torch==2.12.0+xpu torchao==0.17.0+xpu torchvision==0.27.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
+
+RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
+    git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
-    pip install . --extra-index-url https://download.pytorch.org/whl/xpu && \
-    pip install xgrammar --no-deps && \
-    pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
-    conda install libsqlite=3.48.0 -y && \
-    # Add environment setup commands to .bashrc again (in case it was overwritten)
-    echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /home/sdp" >> /home/sdp/.bashrc
+    pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu && \
+    pip install --no-cache-dir --no-deps xgrammar==0.1.33
 
-# Use bash as default shell with initialization from .bashrc
-SHELL ["bash", "-c"]
-
-# Start an interactive bash shell with all environment set up
-USER sdp
-CMD ["bash", "-c", "source /home/sdp/.bashrc && exec bash"]
+CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && exec bash"]

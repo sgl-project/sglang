@@ -15,7 +15,7 @@ COMMON_ARGS = [
     "--trust-remote-code",
     "--reasoning-parser=glm45",
     "--tool-call-parser=glm47",
-    "--mem-fraction-static=0.9",
+    "--mem-fraction-static=0.85",
     "--enable-metrics",
 ]
 
@@ -51,7 +51,6 @@ class TestGlm51Fp8(unittest.TestCase):
                 tp_size=8,
                 extra_args=COMMON_ARGS + dp_args + MTP_ARGS,
                 variant="TP8+DP8+MTP",
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
 

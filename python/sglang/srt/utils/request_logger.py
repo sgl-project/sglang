@@ -15,11 +15,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
@@ -36,7 +34,7 @@ WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
 
 
 def _extract_whitelisted_headers(
-    request: Optional["fastapi.Request"],
+    request: Optional[fastapi.Request],
 ) -> Optional[Dict[str, str]]:
     if request is None:
         return None
@@ -89,9 +87,9 @@ class RequestLogger:
 
     def log_received_request(
         self,
-        obj: Union["GenerateReqInput", "EmbeddingReqInput"],
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenizer: Any = None,
-        request: Optional["fastapi.Request"] = None,
+        request: Optional[fastapi.Request] = None,
     ) -> None:
         if not self.log_requests:
             return
@@ -133,7 +131,7 @@ class RequestLogger:
     def log_openai_received_request(
         self,
         obj: Any,
-        request: Optional["fastapi.Request"] = None,
+        request: Optional[fastapi.Request] = None,
     ) -> None:
         """Log the raw OpenAI request payload before request adaptation/tokenization."""
         max_length, _, _ = self.metadata
@@ -160,9 +158,9 @@ class RequestLogger:
 
     def log_finished_request(
         self,
-        obj: Union["GenerateReqInput", "EmbeddingReqInput"],
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
         out: Any,
-        request: Optional["fastapi.Request"] = None,
+        request: Optional[fastapi.Request] = None,
     ) -> None:
         if not self.log_requests:
             return
@@ -207,6 +205,8 @@ class RequestLogger:
                     "input_embeds",
                     "image_data",
                     "audio_data",
+                    "video_data",
+                    "mm_data_mooncake",
                     "lora_path",
                     "sampling_params",
                 }
@@ -219,6 +219,8 @@ class RequestLogger:
                     "input_embeds",
                     "image_data",
                     "audio_data",
+                    "video_data",
+                    "mm_data_mooncake",
                     "lora_path",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}
@@ -235,12 +237,6 @@ class RequestLogger:
     def _log(self, msg: str) -> None:
         for target in self.targets:
             target.info(msg)
-
-
-# TODO remove this?
-@lru_cache(maxsize=2)
-def disable_request_logging() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough

@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Adapted from
@@ -119,6 +120,10 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
 def get_world_group() -> GroupCoordinator:
     assert _WORLD is not None, "world group is not initialized"
     return _WORLD
+
+
+def world_group_is_initialized() -> bool:
+    return _WORLD is not None
 
 
 def init_world_group(
@@ -467,7 +472,7 @@ def get_dp_rank() -> int:
 def maybe_init_distributed_environment_and_model_parallel(
     tp_size: int,
     sp_size: int,
-    enable_cfg_parallel: bool,
+    cfg_degree: int = 1,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     dp_size: int = 1,
@@ -508,7 +513,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     )
     initialize_model_parallel(
         data_parallel_size=dp_size,
-        classifier_free_guidance_degree=2 if enable_cfg_parallel else 1,
+        classifier_free_guidance_degree=cfg_degree,
         tensor_parallel_degree=tp_size,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
@@ -805,6 +810,22 @@ def get_vae_parallel_world_size() -> int:
 def get_vae_parallel_rank() -> int:
     """Return my rank for the VAE parallel group."""
     return torch.distributed.get_rank(group=get_vae_parallel_group())
+
+
+def get_decode_parallel_group_coordinator() -> GroupCoordinator:
+    sp_group = get_sp_group()
+    cfg_group = get_cfg_group()
+    if sp_group.world_size == 1 and cfg_group.world_size > 1:
+        return cfg_group
+    return sp_group
+
+
+def get_decode_parallel_world_size() -> int:
+    return get_decode_parallel_group_coordinator().world_size
+
+
+def get_decode_parallel_rank() -> int:
+    return get_decode_parallel_group_coordinator().rank_in_group
 
 
 def init_dit_group(

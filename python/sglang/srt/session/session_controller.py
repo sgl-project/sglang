@@ -36,7 +36,7 @@ class SessionReqNode:
     def __init__(
         self,
         req: Req,
-        parent: Optional["SessionReqNode"] = None,
+        parent: Optional[SessionReqNode] = None,
         children=None,
     ):
         self.req = req
@@ -233,6 +233,7 @@ class Session:
             require_reasoning=req.require_reasoning,
             return_hidden_states=req.return_hidden_states,
             return_routed_experts=req.return_routed_experts,
+            routed_experts_start_len=req.routed_experts_start_len,
             priority=req.priority,
             routing_key=req.routing_key,
             extra_key=req.extra_key,
