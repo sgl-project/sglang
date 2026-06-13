@@ -156,20 +156,17 @@ def can_fuse_shared_expert(
     ):
         return False
 
-    # If the shared expert is excluded from quantization (stored as FP32 in the
-    # checkpoint), fusing it into the quantized MoE weight tensor requires online
-    # quantization which is not supported. Disable fusion in this case.
     if quant_config is not None:
         exclude_layers = getattr(quant_config, "exclude_layers", None)
         if exclude_layers is None:
             exclude_layers = getattr(quant_config, "ignored_layers", [])
-        if any(
-            "shared_expert" in layer
-            and "shared_expert_gate" not in layer
-            and not layer.startswith("mtp.")
-            for layer in exclude_layers
-        ):
-            return False
+
+        # Other backends than quark do not exclude the shared expert here, so they
+        # intentionally fall through and remain fusable
+        can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+        if can_fuse_fn is not None:
+            if not can_fuse_fn():
+                return False
 
     return True
 

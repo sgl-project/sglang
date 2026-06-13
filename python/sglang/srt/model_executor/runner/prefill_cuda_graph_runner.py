@@ -263,9 +263,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.raw_num_tokens = 0
 
-    # -----------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------
     def _is_mamba_track_enabled(self) -> bool:
         return (
             self.model_runner.server_args.enable_mamba_extra_buffer()
@@ -423,9 +420,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
-    # -----------------------------------------------------------------
-    # can_run
-    # -----------------------------------------------------------------
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         if forward_batch.input_embeds is not None:
             return False
@@ -468,9 +462,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # logits_processor eagerly on top with live multi-req metadata.
         return True
 
-    # -----------------------------------------------------------------
-    # capture_prepare
-    # -----------------------------------------------------------------
     def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
@@ -595,9 +586,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
-    # -----------------------------------------------------------------
-    # capture
-    # -----------------------------------------------------------------
     def capture(self) -> None:
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
@@ -628,9 +616,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             self.capture_one_shape(num_tokens)
 
-    # -----------------------------------------------------------------
-    # capture_one_shape
-    # -----------------------------------------------------------------
     def capture_one_shape(self, size: int) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
@@ -663,9 +648,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook=post_warmup_hook,
         )
 
-    # -----------------------------------------------------------------
-    # replay_prepare
-    # -----------------------------------------------------------------
     def replay_prepare(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
@@ -800,9 +782,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._static_num_tokens = static_num_tokens
         return static_forward_batch
 
-    # -----------------------------------------------------------------
-    # replay
-    # -----------------------------------------------------------------
     def replay(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
