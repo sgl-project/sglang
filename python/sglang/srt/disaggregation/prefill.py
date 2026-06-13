@@ -26,6 +26,7 @@ from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
@@ -991,6 +992,19 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
 
+            def _swa_ring_payload():
+                # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
+                # for the last `window` positions, in ascending position order so
+                # decode (its own req_pool_idx) matches positionally.
+                _pool = self.token_to_kv_pool_allocator.get_kvcache()
+                ring_stride = _pool.unified_swa_ring_size
+                window_size = _pool.unified_swa_window
+                window_start = max(0, seq_len - window_size)
+                positions = np.arange(window_start, seq_len, dtype=np.int64)
+                state_slot = int(req.req_pool_idx)
+                ring_rows = state_slot * ring_stride + (positions % ring_stride)
+                return ring_rows.astype(np.int32)
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1002,6 +1016,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
+                elif st == StateType.SWA_RING:
+                    state_indices.append(_swa_ring_payload())
                 else:
                     state_indices.append(None)
 
