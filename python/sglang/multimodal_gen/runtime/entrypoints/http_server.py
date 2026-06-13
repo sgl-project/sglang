@@ -35,9 +35,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
-from sglang.multimodal_gen.runtime.server_warmup import (
+from sglang.multimodal_gen.runtime.server_warmup import prepare_warmup_image_path
+from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
-    prepare_warmup_image_path,
     should_include_warmup_image,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -116,7 +116,9 @@ async def _run_server_warmup_after_http_ready(
             server_based_warmup=True,
             use_model_sampling_defaults=True,
         )
+        warmup_total = len(warmup_reqs)
         for req in warmup_reqs:
+            req.extra["warmup_total"] = warmup_total
             response = await async_scheduler_client.forward(req)
             if response.error is not None:
                 raise RuntimeError(response.error)
