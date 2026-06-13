@@ -1,4 +1,4 @@
-"""Benchmark TileLang FP8 GEMM against the Triton FP8 baseline."""
+"""Benchmark TileLang FP8 GEMM against Triton and optional DeepGEMM baselines."""
 
 from __future__ import annotations
 
@@ -78,6 +78,22 @@ def _prepare_data(M: int, N: int, K: int):
     return A_fp8, A_scale, B_fp8, B_scale
 
 
+def _prepare_deepgemm_a_scale(A_scale: torch.Tensor) -> torch.Tensor:
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        raise RuntimeError(
+            "DeepGEMM comparison requested, but DeepGEMM is not available. "
+            "Install deep_gemm or set SGLANG_ENABLE_JIT_DEEPGEMM=1."
+        )
+
+    if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
+
+        return get_mn_major_tma_aligned_tensor(A_scale.clone())
+    return A_scale
+
+
 def _benchmark_one(
     M: int,
     N: int,
@@ -85,6 +101,7 @@ def _benchmark_one(
     rep: int,
     bench_backend: str,
     skip_baseline: bool,
+    compare_deepgemm: bool,
     autotune: bool,
     autotune_backend: str,
     autotune_warmup: int,
@@ -153,7 +170,40 @@ def _benchmark_one(
         "speedup": float("nan"),
         "allclose": "",
         "max_diff": float("nan"),
+        "deepgemm_ms": float("nan"),
+        "deepgemm_tflops": float("nan"),
+        "tilelang_deepgemm_speedup": float("nan"),
+        "deepgemm_allclose": "",
+        "deepgemm_max_diff": float("nan"),
     }
+
+    if compare_deepgemm:
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        A_scale_deepgemm = _prepare_deepgemm_a_scale(A_scale)
+        C_deepgemm = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
+        deep_gemm_wrapper.gemm_nt_f8f8bf16(
+            (A_fp8, A_scale_deepgemm), (B_fp8, B_scale), C_deepgemm
+        )
+
+        def deepgemm_run():
+            deep_gemm_wrapper.gemm_nt_f8f8bf16(
+                (A_fp8, A_scale_deepgemm), (B_fp8, B_scale), C_deepgemm
+            )
+
+        deepgemm_ms = _do_bench(deepgemm_run, rep=rep, backend=bench_backend)
+        deepgemm_max_diff = (C_tl - C_deepgemm).abs().max().item()
+        result.update(
+            {
+                "deepgemm_ms": deepgemm_ms,
+                "deepgemm_tflops": _tflops(M, N, K, deepgemm_ms),
+                "tilelang_deepgemm_speedup": deepgemm_ms / tl_ms,
+                "deepgemm_allclose": torch.allclose(
+                    C_tl, C_deepgemm, rtol=1e-2, atol=1e-2
+                ),
+                "deepgemm_max_diff": deepgemm_max_diff,
+            }
+        )
 
     if skip_baseline:
         return result
@@ -406,9 +456,17 @@ def main() -> None:
         "--bench-backend",
         default="cudagraph",
         choices=("event", "cudagraph"),
-        help="Timing backend for final TileLang/Triton benchmark measurements",
+        help="Timing backend for final benchmark measurements",
     )
     parser.add_argument("--skip-baseline", action="store_true")
+    parser.add_argument(
+        "--compare-deepgemm",
+        action="store_true",
+        help=(
+            "Also benchmark DeepGEMM on each shape and compare its output with "
+            "TileLang. This requires the deep_gemm package and a supported GPU."
+        ),
+    )
     parser.add_argument(
         "--autotune",
         action="store_true",
@@ -454,6 +512,11 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+
+    if args.compare_deepgemm:
+        # The benchmark only needs the concrete shapes under test. Avoid
+        # DeepGEMM's server warmup path, which can precompile a very large M list.
+        os.environ.setdefault("SGLANG_JIT_DEEPGEMM_PRECOMPILE", "0")
 
     from sglang.srt.layers import tilelang_gemm_wrapper
 
@@ -518,6 +581,7 @@ def main() -> None:
                 args.rep,
                 args.bench_backend,
                 args.skip_baseline,
+                args.compare_deepgemm,
                 args.autotune,
                 args.autotune_backend,
                 args.autotune_warmup,
