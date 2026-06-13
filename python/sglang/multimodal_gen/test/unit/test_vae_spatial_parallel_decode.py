@@ -24,12 +24,19 @@ from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
 from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import parallel_state
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    SpatialParallelCausalConv3d,
+    SpatialParallelConv2d,
+    SpatialParallelConv3d,
+    chunk_height_by_sizes,
+    split_for_parallel_decode,
+)
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage import (
     QwenImageAttentionBlock,
     QwenImageDecoder3d,
 )
+from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vaes.hunyuanvae import (
     HunyuanVideoDecoder3D,
     HunyuanVideoMidBlock3D,
@@ -40,13 +47,6 @@ from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
     LTX2VideoCausalConv3d,
     LTX2VideoDecoder3d,
     _enable_ltx_decoder_spatial_parallel,
-)
-from sglang.multimodal_gen.runtime.layers.parallel_conv import (
-    SpatialParallelCausalConv3d,
-    SpatialParallelConv2d,
-    SpatialParallelConv3d,
-    chunk_height_by_sizes,
-    split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     WanDecoder3d,
@@ -246,9 +246,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         rank0, expected_height = split_for_parallel_decode(
             x, upsample_count=1, world_size=2, rank=0
         )
-        rank1, _ = split_for_parallel_decode(
-            x, upsample_count=1, world_size=2, rank=1
-        )
+        rank1, _ = split_for_parallel_decode(x, upsample_count=1, world_size=2, rank=1)
 
         self.assertEqual(expected_height, 10)
         self.assertEqual(rank0.shape[-2], 3)

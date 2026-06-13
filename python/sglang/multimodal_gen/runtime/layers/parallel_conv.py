@@ -14,7 +14,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
-
 _SPATIAL_PARALLEL_DECODE_DISABLED = contextvars.ContextVar(
     "spatial_parallel_decode_disabled", default=False
 )
@@ -313,7 +312,9 @@ def _make_boundary_halo(
     raise ValueError(f"Unsupported spatial padding mode for parallel decode: {mode}")
 
 
-def _pad_with_mode(x: torch.Tensor, padding: tuple[int, ...], mode: str) -> torch.Tensor:
+def _pad_with_mode(
+    x: torch.Tensor, padding: tuple[int, ...], mode: str
+) -> torch.Tensor:
     if mode == "zeros":
         return F.pad(x, padding)
     return F.pad(x, padding, mode=mode)
@@ -447,9 +448,7 @@ class SpatialParallelConv2d(nn.Conv2d):
             bias=bias,
             padding_mode=padding_mode,
         )
-        self.height_halo_size = (
-            self.dilation[-2] * (self.kernel_size[-2] - 1)
-        ) // 2
+        self.height_halo_size = (self.dilation[-2] * (self.kernel_size[-2] - 1)) // 2
         if height_padding is None:
             height_padding = (self.padding[-2], self.padding[-2])
         self.height_pad_top, self.height_pad_bottom = height_padding
@@ -606,9 +605,7 @@ class SpatialParallelConv3d(nn.Conv3d):
             bias=bias,
             padding_mode=padding_mode,
         )
-        self.height_halo_size = (
-            self.dilation[-2] * (self.kernel_size[-2] - 1)
-        ) // 2
+        self.height_halo_size = (self.dilation[-2] * (self.kernel_size[-2] - 1)) // 2
         if height_padding is None:
             height_padding = (self.padding[-2], self.padding[-2])
         self.height_pad_top, self.height_pad_bottom = height_padding

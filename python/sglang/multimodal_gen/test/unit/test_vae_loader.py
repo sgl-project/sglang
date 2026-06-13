@@ -176,12 +176,8 @@ class TestVAELoader(unittest.TestCase):
         )
 
         with (
-            patch.object(
-                wanvae.current_platform, "is_cuda", return_value=False
-            ),
-            patch.object(
-                wanvae.current_platform, "is_rocm", return_value=False
-            ),
+            patch.object(wanvae.current_platform, "is_cuda", return_value=False),
+            patch.object(wanvae.current_platform, "is_rocm", return_value=False),
         ):
             out = wanvae.match_conv3d_input_format(x, weight)
 
@@ -197,12 +193,8 @@ class TestVAELoader(unittest.TestCase):
         )
 
         with (
-            patch.object(
-                wanvae.current_platform, "is_cuda", return_value=True
-            ),
-            patch.object(
-                wanvae.current_platform, "is_rocm", return_value=False
-            ),
+            patch.object(wanvae.current_platform, "is_cuda", return_value=True),
+            patch.object(wanvae.current_platform, "is_rocm", return_value=False),
         ):
             out = wanvae.match_conv3d_input_format(x, weight)
 

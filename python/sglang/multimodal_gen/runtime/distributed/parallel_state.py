@@ -176,9 +176,7 @@ def init_parallel_group_coordinator(
             local_rank=local_rank,
             torch_distributed_backend=backend,
             group_name=(
-                "vae_decode_group"
-                if parallel_mode == "vae_decode"
-                else "cfg_group"
+                "vae_decode_group" if parallel_mode == "vae_decode" else "cfg_group"
             ),
         )
 

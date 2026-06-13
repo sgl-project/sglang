@@ -19,10 +19,10 @@ from diffusers.models.autoencoders.vae import (
 )
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
-from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     should_use_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
 )

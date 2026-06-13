@@ -33,7 +33,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv3d,
     chunk_height_by_sizes,
@@ -42,6 +41,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     gather_variable_height,
     split_height_for_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
 
 def prepare_causal_attention_mask(

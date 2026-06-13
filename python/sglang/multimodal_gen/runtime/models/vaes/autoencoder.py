@@ -22,10 +22,10 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torch import nn
 
-from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     should_use_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
 )
@@ -349,7 +349,6 @@ class AutoencoderKL(nn.Module, LayerwiseOffloadableModuleMixin):
             and dist.is_initialized()
             and get_decode_parallel_world_size() > 1
         )
-
 
     def decode(self, z: torch.FloatTensor) -> Union[DecoderOutput, torch.FloatTensor]:
         """

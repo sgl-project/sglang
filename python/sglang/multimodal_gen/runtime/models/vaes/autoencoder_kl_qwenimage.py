@@ -13,16 +13,15 @@ from diffusers.models.autoencoders.vae import (
 )
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
-from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     should_use_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelCausalConv3d,
     SpatialParallelConv2d,
@@ -33,6 +32,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     gather_height_for_global_op,
     split_for_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -451,9 +451,7 @@ class QwenImageMidBlock(nn.Module):
 
         # Create the components
         resnets = [
-            QwenImageResidualBlock(
-                dim, dim, dropout, non_linearity, causal_conv3d_cls
-            )
+            QwenImageResidualBlock(dim, dim, dropout, non_linearity, causal_conv3d_cls)
         ]
         attentions = []
         for _ in range(num_layers):

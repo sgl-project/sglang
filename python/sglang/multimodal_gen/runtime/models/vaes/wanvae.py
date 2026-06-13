@@ -46,11 +46,11 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     gather_height_for_global_op,
     split_for_parallel_decode,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
     ParallelTiledVAE,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 CACHE_T = 2
 
@@ -667,9 +667,7 @@ class WanAttentionBlock(nn.Module):
     def __init__(self, dim, *, spatial_parallel: bool = False) -> None:
         super().__init__()
         self.dim = dim
-        self.world_size = (
-            get_decode_parallel_world_size() if spatial_parallel else 1
-        )
+        self.world_size = get_decode_parallel_world_size() if spatial_parallel else 1
 
         # layers
         self.norm = WanRMS_norm(dim)
