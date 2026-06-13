@@ -966,7 +966,9 @@ class Evo2ForCausalLM(nn.Module):
         # filter can accumulate bf16 numerical error that produces NaN in
         # the logits.  nan_to_num here keeps the sampler from crashing
         # while preserving the model's output distribution.
-        hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=65504.0, neginf=-65504.0)
+        hidden_states = torch.nan_to_num(
+            hidden_states, nan=0.0, posinf=65504.0, neginf=-65504.0
+        )
         output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
