@@ -28,6 +28,7 @@ try:
 except:
     pass
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
@@ -542,8 +543,6 @@ def sglang_per_token_group_quant_fp8(
 
     # Optimized JIT kernel for the plain (no silu-fuse, no masked-layout) path;
     # byte-identical to AOT v2 but faster. silu/masked variants stay on AOT v2.
-    from sglang.srt.environ import envs
-
     use_jit_quant = (
         envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get()
         # JIT kernel is byte-identical to AOT v2, so only take it when v2 is
@@ -663,19 +662,31 @@ def sglang_per_token_group_quant_fp8_row_padded(
         (k // group_size, m_pad), device=x.device, dtype=torch.float32
     ).transpose(0, 1)
     if m > 0:
-        sgl_per_token_group_quant_8bit(
-            x,
-            x_q[:m],
-            x_s[:m],
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            False,  # scale_ue8m0
-            False,  # fuse_silu_and_mul
-            None,  # masked_m
-            enable_v2=True,
-        )
+        if envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get():
+            sgl_per_token_group_quant_8bit_jit(
+                input=x,
+                output_q=x_q[:m],
+                output_s=x_s[:m],
+                group_size=group_size,
+                eps=eps,
+                fp8_min=fp8_min,
+                fp8_max=fp8_max,
+                scale_ue8m0=False,
+            )
+        else:
+            sgl_per_token_group_quant_8bit(
+                x,
+                x_q[:m],
+                x_s[:m],
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                False,  # scale_ue8m0
+                False,  # fuse_silu_and_mul
+                None,  # masked_m
+                enable_v2=True,
+            )
     if m_pad != m:
         # Tail rows [m, m_pad) feed the cutlass GEMM's padded region; the legacy
         # pad_tensor path zero-fills them, so zero here to stay bit-identical
