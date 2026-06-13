@@ -26,7 +26,6 @@ from sglang.multimodal_gen.configs.models.dits.omnidreams import (
 from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_kvcache import BlockKVCache
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (
-    ROPE_IS_NEOX_STYLE,
     RotaryPositionEmbedding3D,
     apply_rope_freqs,
     rope_dims,
@@ -45,12 +44,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.o
 
 
 # --------------------------------------------------------------------- RoPE -- #
-def test_rope_dims_44_42_42_neox():
-    assert rope_dims(128) == (44, 42, 42)
-    assert sum(rope_dims(128)) == 128
-    assert ROPE_IS_NEOX_STYLE is True
-
-
+# (the bare rope_dims/NeoX-style layout assertion lives in test_omnidreams_scaffold)
 def test_apply_rope_matches_neox_reference_and_preserves_norm():
     torch.manual_seed(0)
     emb = RotaryPositionEmbedding3D(
@@ -235,12 +229,9 @@ def test_full_concat_dim_and_per_layer_normalization():
 
 
 # ------------------------------------------------------- tiny DiT forward ---- #
-def _tiny_dit() -> OmniDreamsDiT:
-    """A small CPU-constructible OmniDreamsDiT for end-to-end forward testing.
-
-    head_dim = 24/2 = 12 keeps the RoPE 6-way split valid (dim_t/h/w = 4/4/4).
-    """
-    arch = OmniDreamsDiTArchConfig(
+def _tiny_arch() -> OmniDreamsDiTArchConfig:
+    """Shared tiny arch: head_dim = 24/2 = 12 keeps the RoPE 6-way split valid."""
+    return OmniDreamsDiTArchConfig(
         in_channels=4,
         out_channels=4,
         model_channels=24,
@@ -252,7 +243,13 @@ def _tiny_dit() -> OmniDreamsDiT:
         crossattn_emb_channels=16,
         additional_concat_ch=4,
     )
-    model = OmniDreamsDiT(config=OmniDreamsDiTConfig(arch_config=arch), hf_config={})
+
+
+def _tiny_dit(arch: OmniDreamsDiTArchConfig | None = None) -> OmniDreamsDiT:
+    """A small CPU-constructible OmniDreamsDiT for end-to-end forward testing."""
+    model = OmniDreamsDiT(
+        config=OmniDreamsDiTConfig(arch_config=arch or _tiny_arch()), hf_config={}
+    )
     model.post_load_weights()  # fuse padding-mask (24->20) + last-layer shuffle
     return model.eval()
 
@@ -396,21 +393,8 @@ def _ar_batch(
 @torch.no_grad()
 def test_ar_denoising_unconditioned_rollout(monkeypatch):
     torch.manual_seed(0)
-    arch = OmniDreamsDiTArchConfig(
-        in_channels=4,
-        out_channels=4,
-        model_channels=24,
-        num_blocks=2,
-        num_heads=2,
-        mlp_ratio=2.0,
-        adaln_lora_dim=8,
-        crossattn_proj_in_channels=32,
-        crossattn_emb_channels=16,
-        additional_concat_ch=4,
-    )
-    dit = OmniDreamsDiT(config=OmniDreamsDiTConfig(arch_config=arch), hf_config={})
-    dit.post_load_weights()
-    dit.eval()
+    arch = _tiny_arch()
+    dit = _tiny_dit(arch)
     sched = OmniDreamsFlowMatchScheduler()
     stage, server_args = _ar_stage_and_args(arch, dit, sched, monkeypatch)
 
@@ -425,21 +409,8 @@ def test_ar_denoising_unconditioned_rollout(monkeypatch):
 @torch.no_grad()
 def test_ar_denoising_i2v_pins_frame0(monkeypatch):
     torch.manual_seed(0)
-    arch = OmniDreamsDiTArchConfig(
-        in_channels=4,
-        out_channels=4,
-        model_channels=24,
-        num_blocks=2,
-        num_heads=2,
-        mlp_ratio=2.0,
-        adaln_lora_dim=8,
-        crossattn_proj_in_channels=32,
-        crossattn_emb_channels=16,
-        additional_concat_ch=4,
-    )
-    dit = OmniDreamsDiT(config=OmniDreamsDiTConfig(arch_config=arch), hf_config={})
-    dit.post_load_weights()
-    dit.eval()
+    arch = _tiny_arch()
+    dit = _tiny_dit(arch)
     sched = OmniDreamsFlowMatchScheduler()
     stage, server_args = _ar_stage_and_args(arch, dit, sched, monkeypatch)
 
@@ -462,21 +433,8 @@ def test_ar_denoising_i2v_pins_frame0(monkeypatch):
 @torch.no_grad()
 def test_ar_denoising_window_roll_many_chunks(monkeypatch):
     torch.manual_seed(0)
-    arch = OmniDreamsDiTArchConfig(
-        in_channels=4,
-        out_channels=4,
-        model_channels=24,
-        num_blocks=2,
-        num_heads=2,
-        mlp_ratio=2.0,
-        adaln_lora_dim=8,
-        crossattn_proj_in_channels=32,
-        crossattn_emb_channels=16,
-        additional_concat_ch=4,
-    )
-    dit = OmniDreamsDiT(config=OmniDreamsDiTConfig(arch_config=arch), hf_config={})
-    dit.post_load_weights()
-    dit.eval()
+    arch = _tiny_arch()
+    dit = _tiny_dit(arch)
     sched = OmniDreamsFlowMatchScheduler()
     stage, server_args = _ar_stage_and_args(arch, dit, sched, monkeypatch)
 
@@ -551,21 +509,8 @@ class _RecordingDiT:
 
 
 def _ar_setup(monkeypatch, num_chunks, window_size_t=4):
-    arch = OmniDreamsDiTArchConfig(
-        in_channels=4,
-        out_channels=4,
-        model_channels=24,
-        num_blocks=2,
-        num_heads=2,
-        mlp_ratio=2.0,
-        adaln_lora_dim=8,
-        crossattn_proj_in_channels=32,
-        crossattn_emb_channels=16,
-        additional_concat_ch=4,
-    )
-    dit = OmniDreamsDiT(config=OmniDreamsDiTConfig(arch_config=arch), hf_config={})
-    dit.post_load_weights()
-    dit.eval()
+    arch = _tiny_arch()
+    dit = _tiny_dit(arch)
     rec = _RecordingDiT(dit)
     sched = OmniDreamsFlowMatchScheduler()
     stage, server_args = _ar_stage_and_args(arch, rec, sched, monkeypatch)

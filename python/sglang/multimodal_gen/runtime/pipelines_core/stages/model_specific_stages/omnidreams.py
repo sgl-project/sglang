@@ -78,6 +78,38 @@ _MAX_AR_CHUNKS = 256
 # any other single string is treated as one image (degenerate broadcast).
 _HDMAP_VIDEO_EXTS = (".mp4", ".gif", ".webm", ".mov", ".mkv", ".avi")
 
+# --------------------------------------------------------------------------- #
+# Diagnostics helpers                                                         #
+# --------------------------------------------------------------------------- #
+_OMNIDREAMS_DIAG_ENVS = ("SGLANG_OMNIDREAMS_DIAGNOSTICS",)
+
+
+def _omnidreams_diag_enabled() -> bool:
+    import os as _os
+
+    return any(
+        _os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+        for name in _OMNIDREAMS_DIAG_ENVS
+    )
+
+
+def _log_omnidreams_stats(label: str, tensor: torch.Tensor) -> None:
+    """Log per-frame tensor statistics when ``SGLANG_OMNIDREAMS_DIAGNOSTICS``
+    is set (default off). Stats include global + per-frame (ndim==5) mean/std.
+    """
+    if not _omnidreams_diag_enabled():
+        return
+    t = tensor.float()
+    lines = [
+        f"[omnidreams diag] {label}: shape={tuple(t.shape)} "
+        f"mean={t.mean():.4f} std={t.std():.4f} min={t.min():.3f} max={t.max():.3f}"
+    ]
+    if t.ndim == 5:
+        for f_idx in range(t.shape[2]):
+            ff = t[:, :, f_idx]
+            lines.append(f"  frame {f_idx:2d}: mean={ff.mean():.4f} std={ff.std():.4f}")
+    logger.info("\n".join(lines))
+
 
 # --------------------------------------------------------------------------- #
 # Pre-processing stage                                                        #
@@ -129,24 +161,38 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
     # ----- helpers ---------------------------------------------------------- #
     @torch.no_grad()
     def _encode_text(self, prompt: str, device: torch.device) -> torch.Tensor:
-        """Cosmos-Reason1-7B text -> ``[1, L, 100352]`` full_concat embedding."""
+        """Cosmos-Reason1-7B text -> ``[1, L, 100352]`` full_concat embedding.
+
+        CRITICAL: no ``attention_mask`` is passed to the encoder. The checkpoint
+        was trained with FlashDreams' ``CosmosReason1TextEncoder``, which runs the
+        LM on the full padded sequence WITHOUT a mask. The DiT cross-attends over
+        all ``_TEXT_MAX_LENGTH`` token embeddings (valid + padding), so the padding
+        embeddings are part of the trained conditioning distribution. Passing a
+        mask changes the padding-token hidden states drastically (abs diff up to
+        ~99 vs the no-mask path), pushing the conditioning out of distribution and
+        producing washed-out / blurry rollouts. Message format and ``add_vision_id``
+        mirror FlashDreams exactly so the token sequence is identical.
+        """
         messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": [{"type": "text", "text": _SYSTEM_PROMPT}]},
+            {"role": "user", "content": [{"type": "text", "text": prompt}]},
         ]
         input_ids = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=False,
+            add_vision_id=False,
             return_tensors="pt",
         )
         # Newer transformers return a BatchEncoding (dict-like) rather than a
         # bare tensor; normalize to the input_ids tensor.
         if not isinstance(input_ids, torch.Tensor):
             input_ids = input_ids["input_ids"]
-        # Pad/truncate to a fixed context length (FlashDreams uses 512). Build
-        # an attention mask so the encoder does not attend to padding tokens
-        # (otherwise short prompts get corrupted embeddings).
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        # Pad/truncate to a fixed context length (FlashDreams uses 512). NO
+        # attention mask -- see the docstring: the model is trained on the
+        # unmasked padded sequence.
         pad_id = getattr(self.tokenizer, "pad_token_id", None) or 0
         valid_len = input_ids.shape[1]
         if valid_len < _TEXT_MAX_LENGTH:
@@ -154,23 +200,11 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                 (input_ids.shape[0], _TEXT_MAX_LENGTH - valid_len), pad_id
             )
             input_ids = torch.cat([input_ids, pad], dim=1)
-            attention_mask = torch.cat(
-                [
-                    input_ids.new_ones((input_ids.shape[0], valid_len)),
-                    input_ids.new_zeros(
-                        (input_ids.shape[0], _TEXT_MAX_LENGTH - valid_len)
-                    ),
-                ],
-                dim=1,
-            )
         else:
             input_ids = input_ids[:, :_TEXT_MAX_LENGTH]
-            attention_mask = input_ids.new_ones(input_ids.shape)
         input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
         out = self.text_encoder(
             input_ids=input_ids,
-            attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
         )
@@ -307,7 +341,9 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         std = torch.tensor(
             self.vae.latents_std, device=latent.device, dtype=latent.dtype
         ).view(1, -1, 1, 1, 1)
-        return (latent - mean) / std
+        normed = (latent - mean) / std
+        _log_omnidreams_stats("vae_encode_normed", normed)
+        return normed
 
     @staticmethod
     def _resolve_hdmap_frames(hdmap) -> list | None:
@@ -408,9 +444,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                 frames = list(frames) + [frames[-1]] * (total_pixel - len(frames))
             else:
                 frames = list(frames[:total_pixel])
-            clip = self._preprocess_hdmap_clip(
-                frames, height, width, device, vae_dtype
-            )
+            clip = self._preprocess_hdmap_clip(frames, height, width, device, vae_dtype)
             if clip is None:
                 logger.warning(
                     "OmniDreams: HD-map clip preprocessed to None; disabling "
@@ -824,6 +858,8 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # Phase 6: SP post-process — latents may need gathering when SP is
         # eventually supported. Currently a no-op (SP is guarded at entry).
         batch.latents = self._postprocess_sp_latents(batch, server_args)
+
+        _log_omnidreams_stats("ar_concat_latents", batch.latents)
 
         if residency_manager is not None and transformer_use is not None:
             residency_manager.end_use(transformer_use, self.transformer)
