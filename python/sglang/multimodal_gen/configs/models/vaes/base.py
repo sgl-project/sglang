@@ -12,11 +12,29 @@ from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
 from sglang.multimodal_gen.utils import StoreBoolean
 
 
-SPATIAL_SHARD_PARALLEL_DECODE_MODES = ("spatial_shard", "spatial", "auto")
+AUTO_PARALLEL_DECODE_MODE = "auto"
+SPATIAL_SHARD_PARALLEL_DECODE_MODES = ("spatial_shard", "spatial")
 
 
 def is_spatial_shard_parallel_decode_mode(mode: str) -> bool:
     return mode in SPATIAL_SHARD_PARALLEL_DECODE_MODES
+
+
+def is_auto_parallel_decode_mode(mode: str) -> bool:
+    return mode == AUTO_PARALLEL_DECODE_MODE
+
+
+def should_use_spatial_shard_parallel_decode(config: Any) -> bool:
+    if not config.use_parallel_decode:
+        return False
+
+    if is_spatial_shard_parallel_decode_mode(config.parallel_decode_mode):
+        return True
+
+    return (
+        is_auto_parallel_decode_mode(config.parallel_decode_mode)
+        and config.auto_parallel_decode_prefers_spatial_shard()
+    )
 
 
 @dataclass
@@ -49,7 +67,7 @@ class VAEConfig(ModelConfig):
     use_parallel_tiling: bool = True
     use_temporal_scaling_frames: bool = True
     use_parallel_decode: bool = True
-    parallel_decode_mode: str = "spatial_shard"
+    parallel_decode_mode: str = AUTO_PARALLEL_DECODE_MODE
 
     def __post_init__(self):
         self.blend_num_frames = (
@@ -58,6 +76,9 @@ class VAEConfig(ModelConfig):
 
     def post_init(self):
         pass
+
+    def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
+        return False
 
     @staticmethod
     def add_cli_args(parser: Any, prefix: str = "vae-config") -> Any:

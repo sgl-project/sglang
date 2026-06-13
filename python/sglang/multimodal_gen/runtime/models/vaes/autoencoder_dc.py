@@ -8,7 +8,7 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
-    is_spatial_shard_parallel_decode_mode,
+    should_use_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
@@ -95,10 +95,7 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
     def _use_spatial_parallel_decode(self) -> bool:
         return (
             self._config is not None
-            and self._config.use_parallel_decode
-            and is_spatial_shard_parallel_decode_mode(
-                self._config.parallel_decode_mode
-            )
+            and should_use_spatial_shard_parallel_decode(self._config)
             and dist.is_initialized()
             and get_decode_parallel_world_size() > 1
         )

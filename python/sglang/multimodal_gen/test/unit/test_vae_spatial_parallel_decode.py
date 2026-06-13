@@ -7,6 +7,7 @@ import torch
 from sglang.multimodal_gen.configs.models.vaes.base import (
     VAEConfig,
     is_spatial_shard_parallel_decode_mode,
+    should_use_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.configs.models.vaes.ernie_image import ErnieImageVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
@@ -76,13 +77,13 @@ class _DispatchProbeVAE(ParallelTiledVAE):
 
 
 class TestVAESpatialParallelDecode(unittest.TestCase):
-    def test_base_vae_config_defaults_to_spatial_parallel_decode(self):
+    def test_base_vae_config_defaults_to_auto_parallel_decode(self):
         config = VAEConfig()
 
         self.assertTrue(config.use_parallel_decode)
-        self.assertEqual(config.parallel_decode_mode, "spatial_shard")
+        self.assertEqual(config.parallel_decode_mode, "auto")
 
-    def test_image_video_vae_configs_default_to_spatial_parallel_decode(self):
+    def test_image_video_vae_configs_default_to_auto_parallel_decode(self):
         configs = (
             ErnieImageVAEConfig(),
             FluxVAEConfig(),
@@ -99,7 +100,19 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         for config in configs:
             with self.subTest(config=type(config).__name__):
                 self.assertTrue(config.use_parallel_decode)
-                self.assertEqual(config.parallel_decode_mode, "spatial_shard")
+                self.assertEqual(config.parallel_decode_mode, "auto")
+
+    def test_auto_parallel_decode_policy_is_conservative(self):
+        self.assertFalse(is_spatial_shard_parallel_decode_mode("auto"))
+        self.assertFalse(should_use_spatial_shard_parallel_decode(VAEConfig()))
+        self.assertFalse(
+            should_use_spatial_shard_parallel_decode(QwenImageVAEConfig())
+        )
+        self.assertTrue(should_use_spatial_shard_parallel_decode(WanVAEConfig()))
+
+        config = QwenImageVAEConfig()
+        config.parallel_decode_mode = "spatial_shard"
+        self.assertTrue(should_use_spatial_shard_parallel_decode(config))
 
     def test_unsupported_vae_configs_opt_out_of_spatial_parallel_decode(self):
         configs = (Hunyuan3DVAEConfig(), LTXAudioVAEConfig())
@@ -118,7 +131,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         update_config_from_args(config, parsed, "vae_config")
 
         self.assertTrue(config.use_parallel_decode)
-        self.assertEqual(config.parallel_decode_mode, "spatial_shard")
+        self.assertEqual(config.parallel_decode_mode, "auto")
 
     def test_vae_nested_cli_explicit_args_override_model_defaults(self):
         parser = FlexibleArgumentParser()
@@ -158,6 +171,25 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.models.vaes.common.get_decode_parallel_world_size",
                 return_value=2,
             ),
+        ):
+            out = vae.decode(z)
+
+        self.assertTrue(vae.used_decode)
+        self.assertFalse(vae.used_parallel_tiled_decode)
+        torch.testing.assert_close(out, z)
+
+    def test_auto_decode_does_not_fall_back_to_parallel_tiling(self):
+        config = VAEConfig()
+        config.arch_config.temporal_compression_ratio = 1
+        config.arch_config.spatial_compression_ratio = 1
+        config.use_parallel_decode = True
+        config.parallel_decode_mode = "auto"
+        vae = _DispatchProbeVAE(config)
+        z = torch.randn(1, 1, 1, 2, 2)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.models.vaes.common.get_sp_world_size",
+            return_value=2,
         ):
             out = vae.decode(z)
 

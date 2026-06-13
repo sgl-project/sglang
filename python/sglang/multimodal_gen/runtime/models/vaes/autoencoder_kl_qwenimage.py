@@ -15,7 +15,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
-    is_spatial_shard_parallel_decode_mode,
+    should_use_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -904,6 +904,9 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.latents_mean = config.arch_config.latents_mean
         self.config = config.arch_config
         self.use_parallel_decode = config.use_parallel_decode
+        self._spatial_parallel_decode_enabled = (
+            should_use_spatial_shard_parallel_decode(config)
+        )
 
         self.encoder = QwenImageEncoder3d(
             base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temperal_downsample, dropout,
@@ -915,8 +918,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.decoder = QwenImageDecoder3d(
             base_dim, z_dim, dim_mult, num_res_blocks, attn_scales, self.temperal_upsample, dropout,
             input_channels=self.input_channels,
-            use_parallel_decode=self.use_parallel_decode
-            and is_spatial_shard_parallel_decode_mode(config.parallel_decode_mode),
+            use_parallel_decode=self._spatial_parallel_decode_enabled,
         )
 
         # When decoding a batch of video latents at a time, one can save memory by slicing across the batch dimension
@@ -1083,15 +1085,15 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             num_frame = z.shape[2]
             num_sample_frames = (num_frame - 1) * self.temporal_compression_ratio + 1
             mode = self.parallel_decode_mode
-            if mode == "auto":
-                mode = "spatial_shard"
 
-            if is_spatial_shard_parallel_decode_mode(mode):
+            if self._spatial_parallel_decode_enabled:
                 decoded = self._decode(z)[:, :, :num_sample_frames]
             elif mode == "patch":
                 decoded = super().parallel_patch_decode(z)[:, :, :num_sample_frames]
-            else:
+            elif mode == "tiled":
                 decoded = super().parallel_tiled_decode(z)[:, :, :num_sample_frames]
+            else:
+                decoded = self._decode(z)[:, :, :num_sample_frames]
             return DecoderOutput(sample=decoded)
 
         return DecoderOutput(sample=self._decode(z))

@@ -14,7 +14,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
-    is_spatial_shard_parallel_decode_mode,
+    should_use_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
@@ -1756,8 +1756,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
     def _use_spatial_parallel_decode(self) -> bool:
         return (
-            self.use_parallel_decode
-            and is_spatial_shard_parallel_decode_mode(self.parallel_decode_mode)
+            should_use_spatial_shard_parallel_decode(self.config)
             and dist.is_initialized()
             and get_decode_parallel_world_size() > 1
         )
