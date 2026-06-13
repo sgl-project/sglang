@@ -86,7 +86,7 @@ class OmniDreamsFlowMatchScheduler:
         self._full_sigmas = full_sigmas.to(device)
         self._full_timesteps = full_timesteps.to(device)
 
-    def to(self, device: torch.device | str) -> "OmniDreamsFlowMatchScheduler":
+    def to(self, device: torch.device | str) -> OmniDreamsFlowMatchScheduler:
         self.denoising_step_list = self.denoising_step_list.to(device)
         self.denoising_sigmas = self.denoising_sigmas.to(device)
         self._full_sigmas = self._full_sigmas.to(device)

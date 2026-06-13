@@ -956,7 +956,7 @@ class SamplingParams:
                 "generation (the central per-frame control signal). Pass a video "
                 "path (decoded to per-frame rasters), a per-frame list of image "
                 "paths, or a single image (broadcast fallback, no motion), e.g.: "
-                '--hdmap-path scene_hdmap.mp4  OR  --hdmap-path f0.png f1.png ...'
+                "--hdmap-path scene_hdmap.mp4  OR  --hdmap-path f0.png f1.png ..."
             ),
         )
         add_argument(
