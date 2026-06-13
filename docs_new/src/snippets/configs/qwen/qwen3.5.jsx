@@ -257,6 +257,41 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         { id: "write_through_selective", label: "Write-through (selective)" },
       ],
     },
+
+    // ----- Card: "Mamba Radix Cache" (generic flagSelects single-select) -----
+    // The legacy generator exposed this as a radio for MoE variants on non-Xeon
+    // hardware; V2 emits `--mamba-scheduler-strategy extra_buffer`, V1 emits no
+    // flag. Cells already bake each combo's value (V2 on most NVIDIA
+    // low-latency cells, where MTP defaults to it; V1/no flag elsewhere —
+    // including the verified H200/397B/BF16 flagship, whose measured NEXTN
+    // command runs V1, so V1 is NOT force-disabled on low-latency: the page's
+    // own verified cell proves MTP+V1 is valid). deriveFromBase recovers the
+    // per-cell default; this axis lets users flip it. Gating faithful to cells:
+    //   - hidden on dense variants (legacy showed it MoE-only);
+    //   - V2 disabled on AMD + Xeon (V2 needs the FLA backend, NVIDIA GPU
+    //     only — and no AMD/Xeon cell bakes it).
+    // NOTE: `--mamba-ssm-dtype bfloat16` is a separate H200-FP8 attention
+    // optimization (not this control) — left baked in its cells, untouched.
+    flagSelects: [
+      {
+        id: "mamba",
+        title: "Mamba Radix Cache",
+        stripPrefixes: ["--mamba-scheduler-strategy"],
+        options: [
+          {
+            id: "v1", label: "V1",
+            hide: { variant: ["27b", "9b", "4b", "2b", "0.8b"] },
+          },
+          {
+            id: "v2", label: "V2",
+            flags: ["--mamba-scheduler-strategy extra_buffer"],
+            hide: { variant: ["27b", "9b", "4b", "2b", "0.8b"] },
+            disable: { hw: ["mi300x", "mi325x", "mi355x", "xeon"] },
+            disableReason: "V2 needs the FLA backend (NVIDIA GPU only).",
+          },
+        ],
+      },
+    ],
   },
 
   // One cell per combination the legacy widget could produce (variant × hw ×

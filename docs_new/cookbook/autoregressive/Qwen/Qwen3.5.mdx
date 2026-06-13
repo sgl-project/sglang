@@ -169,6 +169,8 @@ Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling
 - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage. Required for AMD MI GPUs and Xeon.
 - **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-scheduler-strategy extra_buffer --page-size 64`. Requires FLA kernel backend (NVIDIA GPUs only). Trades higher mamba state memory for better throughput. Strictly superior in non-KV-cache-bound scenarios; in KV-cache-bound cases, weigh the overlap scheduling benefit against reduced max concurrency. `--page-size` must satisfy `FLA_CHUNK_SIZE % page_size == 0` or `page_size % FLA_CHUNK_SIZE == 0` (`FLA_CHUNK_SIZE` is currently 64). MTP requires V2 — the NVIDIA Low-Latency cells set it automatically.
 
+Use the **Mamba Radix Cache** card in the [Playground above](#playground) to switch V1 ↔ V2 on a MoE recipe; each cell starts on the value its verified command baked. V2 is offered only where the FLA backend exists (disabled on AMD/Xeon).
+
 **Hardware-specific notes**
 
 - **H100 FP8:** `--enable-symm-mem` (already in the generated commands) enables NCCL symmetric memory for faster collectives under multi-GPU settings.
