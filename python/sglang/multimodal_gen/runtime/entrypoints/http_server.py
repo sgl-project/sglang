@@ -36,11 +36,11 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import prepare_warmup_image_path
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
     should_include_warmup_image,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 

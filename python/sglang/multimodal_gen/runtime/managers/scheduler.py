@@ -62,14 +62,14 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     prepare_warmup_image_path_sync,
     should_return_warmup_result,
 )
-from sglang.multimodal_gen.runtime.warmup_request_builder import (
-    build_warmup_reqs,
-    should_include_warmup_image,
-)
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
+from sglang.multimodal_gen.runtime.warmup_request_builder import (
+    build_warmup_reqs,
+    should_include_warmup_image,
+)
 
 logger = init_logger(__name__)
 
@@ -128,6 +128,7 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
         self.task_pipes_to_slaves = task_pipes_to_slaves
         self.result_pipes_from_slaves = result_pipes_from_slaves
         self.gpu_id = gpu_id
+        self._show_warmup_progress = gpu_id == 0
         self._running = True
 
         self.request_handlers = {
@@ -289,6 +290,9 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
         return max(self._warmup_total, 1)
 
     def _ensure_warmup_progress_bar(self, req_or_group: Any) -> None:
+        if not self._show_warmup_progress:
+            return
+
         if self._warmup_progress_bar is None:
             self._warmup_progress_bar = tqdm(
                 total=self._warmup_progress_total(req_or_group),
@@ -302,6 +306,9 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
     def _advance_warmup_progress_bar(
         self, req_or_group: Any, output_batch: OutputBatch
     ) -> None:
+        if not self._show_warmup_progress:
+            return
+
         if self._warmup_progress_bar is None:
             self._ensure_warmup_progress_bar(req_or_group)
 
