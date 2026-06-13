@@ -406,9 +406,7 @@ class DeepseekSparseAttnBackend(
             and is_sm100_supported()
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
-        if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
-            include_v2=True
-        ):
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
@@ -488,7 +486,7 @@ class DeepseekSparseAttnBackend(
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or forward_batch.forward_mode.is_draft_extend_v2()
             )
             else self.dsa_prefill_impl
         )
@@ -531,7 +529,7 @@ class DeepseekSparseAttnBackend(
             page_table = torch.repeat_interleave(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
-        elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
+        elif forward_batch.forward_mode.is_draft_extend_v2():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
@@ -690,7 +688,7 @@ class DeepseekSparseAttnBackend(
         if is_cuda() and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -905,9 +903,7 @@ class DeepseekSparseAttnBackend(
                 )
             else:
                 flashmla_metadata = None
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend(
-            include_v2=True
-        ):
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
             )
@@ -975,7 +971,7 @@ class DeepseekSparseAttnBackend(
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend(include_v2=True)
+            or forward_mode.is_draft_extend_v2()
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
@@ -1094,7 +1090,7 @@ class DeepseekSparseAttnBackend(
                 seqlens_expanded, self.dsa_index_topk
             )
             metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             max_seqlen_k = int(seq_lens_cpu.max().item())
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
@@ -1133,9 +1129,9 @@ class DeepseekSparseAttnBackend(
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend(include_v2=True)
+            or forward_mode.is_draft_extend_v2()
         ):
-            if forward_mode.is_draft_extend(include_v2=True):
+            if forward_mode.is_draft_extend_v2():
                 schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
             else:
                 schedule_seqlens_expanded = seqlens_expanded
@@ -1400,7 +1396,7 @@ class DeepseekSparseAttnBackend(
             self.dsa_decode_impl
             if (
                 forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or forward_batch.forward_mode.is_draft_extend_v2()
             )
             else self.dsa_prefill_impl
         )

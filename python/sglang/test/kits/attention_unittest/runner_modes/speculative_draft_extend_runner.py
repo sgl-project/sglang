@@ -702,7 +702,7 @@ def run_dsv4_eagle_draft_extend_cuda_graph_case(
         "uses `need_compress=False` so C4/C128 metadata is unpopulated. See "
         "the 'Production-Unsupported' note in dsv4/README.md."
     )
-    assert case.forward_mode.is_draft_extend(include_v2=True), (
+    assert case.forward_mode.is_draft_extend_v2(), (
         f"run_dsv4_eagle_draft_extend_cuda_graph_case requires DRAFT_EXTEND; "
         f"got {case.forward_mode}"
     )
@@ -1184,7 +1184,7 @@ def _check_eagle_draft_extend_cuda_graph_runner_case(
     adapter: EagleDraftExtendCudaGraphRunnerAdapter,
     settings: EagleDraftRunnerSettings,
 ) -> None:
-    if not case.forward_mode.is_draft_extend(include_v2=True):
+    if not case.forward_mode.is_draft_extend_v2():
         raise ValueError(
             "EAGLE draft-extend CUDA graph runner coverage expects DRAFT_EXTEND "
             "or DRAFT_EXTEND_V2 cases."
@@ -2241,7 +2241,7 @@ def run_dsa_eagle_draft_extend_cuda_graph_runner_case(
     Routes through `DraftBackendFactory._create_dsa_prefill_backend`
     which returns a single `DeepseekSparseAttnBackend` (not multi-step),
     and the forward goes through `forward_extend` with
-    `dsa_decode_impl` selected via `is_draft_extend(include_v2=True)`."""
+    `dsa_decode_impl` selected via `is_draft_extend_v2()`."""
     settings = EagleDraftRunnerSettings(
         topk=topk,
         speculative_num_steps=speculative_num_steps,

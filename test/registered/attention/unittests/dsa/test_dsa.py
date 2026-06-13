@@ -386,7 +386,7 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
     # `DraftBackendFactory._create_dsa_prefill_backend` which returns a
     # single `DeepseekSparseAttnBackend` (not multi-step); the forward
     # goes through `forward_extend` with `dsa_decode_impl` selected via
-    # `is_draft_extend(include_v2=True)`.
+    # `is_draft_extend_v2()`.
     EAGLE_DRAFT_EXTEND_CASES = (
         DSAAttentionCase(
             name="runner_eagle_draft_extend_cuda_graph_dsa",

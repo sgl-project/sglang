@@ -944,7 +944,7 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
                 swa_out_cache_loc=swa_out_cache_loc,
             )
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
@@ -1000,7 +1000,7 @@ class TritonAttnBackend(AttentionBackend):
             self._update_target_verify_buffers(
                 bs, seq_lens, req_pool_indices, spec_info
             )
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             self._update_draft_extend_buffers(
                 bs, seq_lens, req_pool_indices, forward_mode, spec_info
             )

@@ -1135,7 +1135,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if (
             self.forward_mode.is_decode()
             or self.forward_mode.is_target_verify()
-            or self.forward_mode.is_draft_extend(include_v2=True)
+            or self.forward_mode.is_draft_extend_v2()
             or self.forward_mode.is_idle()
         ):
             # Mamba-hybrid families need the fabricated-row idle conversion

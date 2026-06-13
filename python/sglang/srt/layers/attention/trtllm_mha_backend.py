@@ -409,7 +409,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 bs,
             )
             self.target_verify_metadata[bs] = metadata
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             num_tokens_per_bs = num_tokens // bs
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
@@ -506,7 +506,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
@@ -725,9 +725,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if any(
-                forward_batch.extend_prefix_lens_cpu
-            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            if (
+                any(forward_batch.extend_prefix_lens_cpu)
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
                 # Python's max() returns a 0-d tensor, but flashinfer expects an int.

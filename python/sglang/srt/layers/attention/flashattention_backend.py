@@ -352,7 +352,7 @@ class FlashAttentionBackend(AttentionBackend):
                         self._sched_meta_buf[n:] = 0
                         metadata.scheduler_metadata = self._sched_meta_buf[:n]
 
-            if forward_mode.is_draft_extend(include_v2=True):
+            if forward_mode.is_draft_extend_v2():
                 # CUDA graph bakes max_seq_len_q as a constant. replay() sets it to
                 # max(num_accept_tokens_cpu) which is None/empty at capture time,
                 # falling back to 1. Restore the correct upper bound so the kernel
@@ -645,9 +645,10 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if any(
-                forward_batch.extend_prefix_lens_cpu
-            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            if (
+                any(forward_batch.extend_prefix_lens_cpu)
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -1056,7 +1057,7 @@ class FlashAttentionBackend(AttentionBackend):
             if (
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
@@ -2024,7 +2025,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.target_verify_metadata_topk_swa[bs] = metadata_swa
                     metadata.swa_spec_metadata = metadata_swa
 
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             num_tokens_per_bs = num_tokens // bs
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs

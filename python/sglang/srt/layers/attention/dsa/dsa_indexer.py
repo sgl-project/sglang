@@ -594,7 +594,7 @@ class Indexer(MultiPlatformOp):
         blocksize = page_size
         if (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
@@ -1505,7 +1505,7 @@ class Indexer(MultiPlatformOp):
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
