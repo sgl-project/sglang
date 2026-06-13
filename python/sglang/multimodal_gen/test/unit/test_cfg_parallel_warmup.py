@@ -67,7 +67,7 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     server_args.pipeline_config.task_type = task_type
 
     scheduler.server_args = server_args
-    scheduler.warmed_up = False
+    scheduler.req_based_warmup_scheduled = False
     scheduler.waiting_queue = deque()
     return scheduler
 
@@ -160,7 +160,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertTrue(processed[0][1].metrics.suppress_stage_breakdown)
         self.assertEqual(processed[0][1].num_inference_steps, 1)
         self.assertEqual(processed[0][1].extra["cache_dit_num_inference_steps"], 20)
-        self.assertTrue(scheduler.warmed_up)
+        self.assertTrue(scheduler.req_based_warmup_scheduled)
 
     def test_req_based_warmup_skips_default_server_warmup_path(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)
@@ -172,7 +172,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
         self.assertIs(processed, recv_reqs)
         self.assertEqual(len(processed), 1)
-        self.assertFalse(scheduler.warmed_up)
+        self.assertFalse(scheduler.req_based_warmup_scheduled)
 
     def test_diff_generator_runs_explicit_warmup_through_scheduler_client(self):
         generator = object.__new__(DiffGenerator)

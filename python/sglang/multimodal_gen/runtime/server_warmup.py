@@ -1,19 +1,18 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import asyncio
 import os
 import tempfile
 from typing import Any, Awaitable, Callable
 
 from tqdm.auto import tqdm
 
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import save_image_to_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
@@ -133,7 +132,7 @@ async def run_async_client_warmup(
 ) -> None:
     warmup_input_path = None
     if should_include_warmup_image(server_args, server_based_warmup=True):
-        warmup_input_path = await prepare_warmup_image_path(server_args)
+        warmup_input_path = prepare_warmup_image_path(server_args)
 
     for req in build_client_warmup_reqs(
         server_args, warmup_input_path=warmup_input_path
@@ -149,7 +148,7 @@ def run_sync_client_warmup(
 ) -> None:
     warmup_input_path = None
     if should_include_warmup_image(server_args, server_based_warmup=True):
-        warmup_input_path = prepare_warmup_image_path_sync(server_args)
+        warmup_input_path = prepare_warmup_image_path(server_args)
 
     for req in build_client_warmup_reqs(
         server_args, warmup_input_path=warmup_input_path
@@ -159,7 +158,7 @@ def run_sync_client_warmup(
             raise RuntimeError(response.error)
 
 
-async def prepare_warmup_image_path(server_args: ServerArgs) -> str:
+def prepare_warmup_image_path(server_args: ServerArgs) -> str:
     if server_args.input_save_path is not None:
         uploads_dir = server_args.input_save_path
         os.makedirs(uploads_dir, exist_ok=True)
@@ -167,13 +166,9 @@ async def prepare_warmup_image_path(server_args: ServerArgs) -> str:
         uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
 
     warmup_image_base = os.path.join(uploads_dir, "warmup_image")
-    return await save_image_to_path(
+    return save_base64_image_to_path(
         MINIMUM_PICTURE_BASE64_FOR_WARMUP, warmup_image_base
     )
-
-
-def prepare_warmup_image_path_sync(server_args: ServerArgs) -> str:
-    return asyncio.run(prepare_warmup_image_path(server_args))
 
 
 class SchedulerWarmupMixin:
@@ -257,7 +252,7 @@ class SchedulerWarmupMixin:
         self, recv_reqs: list[tuple[bytes, Any]]
     ) -> list[tuple[bytes, Any]]:
         if (
-            self.warmed_up
+            self.req_based_warmup_scheduled
             or not self.server_args.warmup
             or not recv_reqs
             or self.server_args.warmup_resolutions is not None
@@ -272,5 +267,5 @@ class SchedulerWarmupMixin:
             recv_reqs.insert(0, (identity, warmup_req))
             self._warmup_total = 1
             self._warmup_processed = 0
-            self.warmed_up = True
+            self.req_based_warmup_scheduled = True
         return recv_reqs

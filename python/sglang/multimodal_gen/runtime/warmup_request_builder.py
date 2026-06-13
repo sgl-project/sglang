@@ -9,8 +9,8 @@ resolution/frame buckets and trimming the denoising step count.
 Image models may run a tiny second step because first/last step paths often
 initialize different kernels or scheduler state. Video models cap frames and
 steps to keep startup bounded. Explicit warmup resolutions share this builder;
-online serving sends them through the scheduler client after HTTP is ready,
-while non-server entrypoints can still enqueue them internally.
+callers send them through the scheduler client so warmup exercises the same
+request transport path as real generation.
 """
 
 from copy import copy
@@ -22,9 +22,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
 )
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import _parse_size
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.common import parse_size
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -240,7 +240,7 @@ def build_warmup_reqs(
         )
         resolutions: list[tuple[int, int]] = [(width, height)]
     else:
-        resolutions = [_parse_size(resolution) for resolution in warmup_resolutions]
+        resolutions = [parse_size(resolution) for resolution in warmup_resolutions]
 
     negative_prompt: Any = sampling_defaults.negative_prompt
     cfg_scale = _effective_cfg_scale(sampling_defaults)
