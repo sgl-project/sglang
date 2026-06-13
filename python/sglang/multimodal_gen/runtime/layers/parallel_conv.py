@@ -135,6 +135,7 @@ def chunk_height_by_sizes(x: torch.Tensor, heights: list[int]) -> torch.Tensor:
 
 
 def gather_height_sizes(x: torch.Tensor) -> list[int]:
+    """gather heights of sharded feature_maps from peers"""
     if spatial_parallel_decode_disabled():
         return [x.shape[-2]]
     world_size = get_decode_parallel_world_size()
@@ -210,6 +211,7 @@ def halo_exchange(
     recv_bottom_buf: torch.Tensor | None = None,
     height_pad_mode: str = "zeros",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """exchange(send and recv) top/bottom conv-input halos with adjacent spatial ranks"""
     if spatial_parallel_decode_disabled():
         return x, recv_top_buf, recv_bottom_buf
     if height_halo_size == 0:
@@ -545,6 +547,8 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
                 self.groups,
             )
 
+        # send and recv halo
+        # x_padded: concatenated input
         x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
             x,
             height_halo_size=self.height_halo_size,
@@ -578,7 +582,11 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
                 x_padded = x_padded[..., shift:, :]
                 global_start += shift
             x_padded = _match_conv3d_input_format(x_padded, self.weight)
+
+        # performs conv on padded input
         out = super().forward(x_padded)
+
+        # trim the output to original shape
         return _trim_conv_output_height(
             out,
             local_height=x.shape[-2],
