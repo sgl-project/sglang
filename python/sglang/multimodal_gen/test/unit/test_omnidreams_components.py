@@ -354,6 +354,7 @@ def _ar_stage_and_args(arch, dit, scheduler, monkeypatch):
     stage.transformer = dit
     stage.scheduler = scheduler
     stage.vae = None
+    stage._component_residency_manager = None
     server_args = types.SimpleNamespace(
         pipeline_config=types.SimpleNamespace(
             dit_precision="fp32",
@@ -622,33 +623,166 @@ def test_ar_hdmap_none_falls_back_to_zeros(monkeypatch):
     assert all(bool((h == 0).all()) for h in rec.hdmap_calls)
 
 
-def test_encode_hdmap_broadcast_clamp_and_none(monkeypatch):
-    """`_encode_hdmap` assembles the per-chunk list (broadcast / clamp / None).
+def _hdmap_stage(monkeypatch):
+    """Stage with stubbed preprocess + a fake causal VAE (tc=4) + identity patchify.
 
-    Stubs preprocess+encode+patchify so the test isolates the per-chunk control
-    flow (the VAE numerics are a GPU concern). Each src tag flows through as a
-    1-element tensor so chunk identity is traceable.
+    The fake VAE maps a ``T``-frame clip to ``1 + (T-1)//4`` latent frames (mirroring
+    the Wan VAE temporal compression), filling latent frame ``j`` with value ``j`` so
+    chunk slicing is verifiable. patchify is identity so the returned tokens are the
+    sliced latents themselves. (Real VAE numerics are a GPU concern.)
     """
     stage = OmniDreamsBeforeDenoisingStage.__new__(OmniDreamsBeforeDenoisingStage)
     stage.transformer = types.SimpleNamespace(patchify=lambda latent: latent)
     monkeypatch.setattr(
         stage,
         "_preprocess_pixels",
-        lambda src, h, w, d, dt: torch.tensor([float(src)]),
+        lambda src, h, w, d, dt: torch.zeros(1, 3, 1, 2, 2),
     )
-    monkeypatch.setattr(stage, "_vae_encode_normalized", lambda x: x)
+
+    def fake_vae(clip):
+        t = clip.shape[2] if clip.dim() == 5 else 1
+        n_latent = 1 + (t - 1) // 4
+        return torch.cat(
+            [torch.full((1, 16, 1, 2, 2), float(j)) for j in range(n_latent)], dim=2
+        )
+
+    monkeypatch.setattr(stage, "_vae_encode_normalized", fake_vae)
+    return stage
+
+
+def test_encode_hdmap_per_frame_clip_slicing(monkeypatch):
+    """Per-frame HD-map (option 2): the full raster sequence is encoded once as a
+    causal clip and sliced into ``num_chunks`` groups of ``len_t`` *distinct*
+    latent frames (this is what makes the generated viewpoint move)."""
+    stage = _hdmap_stage(monkeypatch)
     dev = torch.device("cpu")
+    num_chunks, len_t = 3, 2
+    num_latent = num_chunks * len_t  # 6
+    total_pixel = 1 + (num_latent - 1) * 4  # 21
 
-    # Single (non-list) input broadcasts to every chunk.
-    b1 = types.SimpleNamespace(hdmap_path=7, hdmap_pixels=None)
-    toks = stage._encode_hdmap(b1, dev, torch.float32, torch.float32, 3, 16, 16)
-    assert [float(t) for t in toks] == [7.0, 7.0, 7.0]
+    b = types.SimpleNamespace(hdmap_path=list(range(total_pixel)), hdmap_pixels=None)
+    toks = stage._encode_hdmap(
+        b, dev, torch.float32, torch.float32, num_chunks, len_t, 16, 16
+    )
+    assert len(toks) == num_chunks
+    for ci, t in enumerate(toks):
+        assert t.shape[2] == len_t  # len_t latent frames per chunk
+        got = [float(t[0, 0, k, 0, 0]) for k in range(len_t)]
+        assert got == [float(ci * len_t + k) for k in range(len_t)]
+    # Frames must actually differ across the rollout (regression: static angle).
+    assert float(toks[0][0, 0, 0, 0, 0]) != float(toks[-1][0, 0, len_t - 1, 0, 0])
 
-    # Per-chunk list shorter than num_chunks clamps to the last entry.
-    b2 = types.SimpleNamespace(hdmap_path=[1, 2], hdmap_pixels=None)
-    toks2 = stage._encode_hdmap(b2, dev, torch.float32, torch.float32, 4, 16, 16)
-    assert [float(t) for t in toks2] == [1.0, 2.0, 2.0, 2.0]
 
-    # No HD-map input -> None (AR stage falls back to zeros).
-    b3 = types.SimpleNamespace(hdmap_path=None, hdmap_pixels=None)
-    assert stage._encode_hdmap(b3, dev, torch.float32, torch.float32, 2, 16, 16) is None
+def test_encode_hdmap_clamps_short_sequence(monkeypatch):
+    """Fewer frames than needed are clamped (last repeated); still yields the full
+    per-chunk token list with ``len_t`` frames each, without crashing."""
+    stage = _hdmap_stage(monkeypatch)
+    dev = torch.device("cpu")
+    num_chunks, len_t = 2, 2
+    b = types.SimpleNamespace(hdmap_path=[0, 1, 2], hdmap_pixels=None)  # short
+    toks = stage._encode_hdmap(
+        b, dev, torch.float32, torch.float32, num_chunks, len_t, 16, 16
+    )
+    assert len(toks) == num_chunks
+    assert all(t.shape[2] == len_t for t in toks)
+
+
+def test_encode_hdmap_video_path_decoded_per_frame(monkeypatch):
+    """A video-path HD-map is decoded via ``load_video`` into a per-frame clip."""
+    stage = _hdmap_stage(monkeypatch)
+    num_chunks, len_t = 2, 2
+    total_pixel = 1 + (num_chunks * len_t - 1) * 4
+    fake_frames = [PIL.Image.new("RGB", (2, 2)) for _ in range(total_pixel)]
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.omnidreams.load_video",
+        lambda path: fake_frames,
+    )
+    b = types.SimpleNamespace(hdmap_path="scene_hdmap.mp4", hdmap_pixels=None)
+    toks = stage._encode_hdmap(
+        b, torch.device("cpu"), torch.float32, torch.float32, num_chunks, len_t, 16, 16
+    )
+    assert len(toks) == num_chunks
+    assert all(t.shape[2] == len_t for t in toks)
+
+
+def test_encode_hdmap_cli_list_wraps_video_path(monkeypatch):
+    """CLI ``--hdmap-path`` always passes a list, even for a single arg; a lone
+    video-path string inside that list must be expanded via ``load_video``."""
+    stage = _hdmap_stage(monkeypatch)
+    num_chunks, len_t = 2, 2
+    total_pixel = 1 + (num_chunks * len_t - 1) * 4
+    fake_frames = [PIL.Image.new("RGB", (2, 2)) for _ in range(total_pixel)]
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.omnidreams.load_video",
+        lambda path: fake_frames,
+    )
+    # Simulate CLI --hdmap-path "scene.mp4" -> list with one string element.
+    b = types.SimpleNamespace(hdmap_path=["scene_hdmap.mp4"], hdmap_pixels=None)
+    toks = stage._encode_hdmap(
+        b, torch.device("cpu"), torch.float32, torch.float32, num_chunks, len_t, 16, 16
+    )
+    assert len(toks) == num_chunks
+    assert all(t.shape[2] == len_t for t in toks)
+    # Confirm it took the per-frame path (all tokens come from distinct VAE frames).
+    # The first and last chunk should differ because our fake VAE encodes each frame
+    # with a distinct value.
+    assert not torch.equal(toks[0], toks[-1]), (
+        "CLI list-wrapped video path should produce distinct per-chunk tokens; "
+        "fallback broadcast would make them all identical"
+    )
+
+
+def test_encode_hdmap_single_image_broadcast_fallback(monkeypatch):
+    """A single image (non-video string) degenerates to broadcasting one raster
+    across every latent frame (back-compat / smoke; no temporal motion)."""
+    stage = _hdmap_stage(monkeypatch)
+    num_chunks, len_t = 3, 2
+    b = types.SimpleNamespace(hdmap_path="frame.png", hdmap_pixels=None)
+    toks = stage._encode_hdmap(
+        b, torch.device("cpu"), torch.float32, torch.float32, num_chunks, len_t, 16, 16
+    )
+    assert len(toks) == num_chunks
+    for t in toks:
+        assert t.shape[2] == len_t
+        assert bool((t == 0).all())  # all broadcast from the single latent frame
+
+
+def test_encode_hdmap_none_returns_none(monkeypatch):
+    """No HD-map input -> None (AR stage falls back to zeros)."""
+    stage = _hdmap_stage(monkeypatch)
+    b = types.SimpleNamespace(hdmap_path=None, hdmap_pixels=None)
+    assert (
+        stage._encode_hdmap(
+            b, torch.device("cpu"), torch.float32, torch.float32, 2, 2, 16, 16
+        )
+        is None
+    )
+
+
+def test_encode_hdmap_broadcasts_single_frame_across_len_t(monkeypatch):
+    """A single HD-map image (1 latent frame) must be tiled to ``len_t`` frames so
+    the patchified token count matches ``chunk_tokens`` (regression: a real
+    hdmap input previously produced tokens_per_frame and crashed the DiT add).
+    """
+    stage = OmniDreamsBeforeDenoisingStage.__new__(OmniDreamsBeforeDenoisingStage)
+    # Real patchify so token length reflects the latent temporal extent.
+    stage.transformer = OmniDreamsDiT.__new__(OmniDreamsDiT)
+    stage.transformer.arch = OmniDreamsDiTArchConfig(
+        in_channels=16, out_channels=16, patch_spatial=2, patch_temporal=1
+    )
+    # VAE-encode stub returns a single-frame latent [B=1, C=16, t=1, h=2, w=2]
+    # -> tokens_per_frame = (h/ps)*(w/ps) = 1.
+    monkeypatch.setattr(
+        stage, "_preprocess_pixels", lambda src, h, w, d, dt: torch.zeros(1, 3, 1, 2, 2)
+    )
+    monkeypatch.setattr(
+        stage, "_vae_encode_normalized", lambda x: torch.zeros(1, 16, 1, 2, 2)
+    )
+    dev = torch.device("cpu")
+    b = types.SimpleNamespace(hdmap_path=1, hdmap_pixels=None)
+    tokens_per_frame = (2 // 2) * (2 // 2)  # = 1
+    for len_t in (1, 2, 3):
+        toks = stage._encode_hdmap(b, dev, torch.float32, torch.float32, 1, len_t, 2, 2)
+        assert toks[0].shape[1] == len_t * tokens_per_frame

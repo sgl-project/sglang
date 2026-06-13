@@ -952,10 +952,11 @@ class SamplingParams:
             type=str,
             nargs="+",
             help=(
-                "Path(s) to HD-map / trajectory conditioning input(s) for "
-                "OmniDreams autoregressive video generation. Pass a single path "
-                "(broadcast to every chunk) or one per autoregressive chunk, e.g.: "
-                '--hdmap-path "chunk0.png" "chunk1.png"'
+                "HD-map conditioning input for OmniDreams autoregressive video "
+                "generation (the central per-frame control signal). Pass a video "
+                "path (decoded to per-frame rasters), a per-frame list of image "
+                "paths, or a single image (broadcast fallback, no motion), e.g.: "
+                '--hdmap-path scene_hdmap.mp4  OR  --hdmap-path f0.png f1.png ...'
             ),
         )
         add_argument(

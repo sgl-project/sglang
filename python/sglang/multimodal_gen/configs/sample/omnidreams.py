@@ -33,6 +33,8 @@ class OmniDreamsSamplingParams(SamplingParams):
     # Raw timestep injected as context noise on cached/clean frames.
     context_noise: int = 128
 
-    # HD-map / trajectory conditioning input (Phase 4). A single path (broadcast
-    # to every AR chunk) or a per-chunk list of paths. ``None`` disables HDMap.
+    # HD-map conditioning input -- OmniDreams' central per-frame control signal.
+    # Accepts a video path (``.mp4``/``.gif``/...; decoded to per-frame rasters),
+    # a per-frame list of image paths, or -- degenerate fallback -- a single image
+    # broadcast across every frame (no temporal motion). ``None`` disables HDMap.
     hdmap_path: str | list[str] | None = None

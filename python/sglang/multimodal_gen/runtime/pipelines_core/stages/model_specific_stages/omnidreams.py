@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     load_image,
+    load_video,
     normalize,
     numpy_to_pt,
     pil_to_numpy,
@@ -73,6 +74,9 @@ _TEXT_MAX_LENGTH = 512
 # length (and thus GPU memory/compute) against an unbounded ``num_frames`` from
 # the HTTP API. ~256 chunks * len_t(2) * 4 = ~2048 pixel frames.
 _MAX_AR_CHUNKS = 256
+# HD-map inputs ending in one of these are decoded as a per-frame raster video;
+# any other single string is treated as one image (degenerate broadcast).
+_HDMAP_VIDEO_EXTS = (".mp4", ".gif", ".webm", ".mov", ".mkv", ".avi")
 
 
 # --------------------------------------------------------------------------- #
@@ -233,6 +237,30 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             x = x.unsqueeze(2)
         return x
 
+    def _preprocess_hdmap_clip(
+        self,
+        frames: list,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Per-frame HD-map rasters -> a single clip ``[B, 3, T, H, W]`` in ``[-1, 1]``.
+
+        Each frame runs the same single-frame ``_preprocess_pixels`` path
+        (PIL/path/tensor -> resize -> normalize) and the results are stacked on
+        the temporal axis. Returns ``None`` if any frame fails to preprocess.
+        """
+        per_frame: list[torch.Tensor] = []
+        for f in frames:
+            x = self._preprocess_pixels(f, height, width, device, dtype)
+            if x is None:
+                return None
+            per_frame.append(x)  # [B,3,1,H,W]
+        if not per_frame:
+            return None
+        return torch.cat(per_frame, dim=2)  # [B,3,T,H,W]
+
     @torch.no_grad()
     def _encode_reference_image(
         self,
@@ -281,6 +309,34 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         ).view(1, -1, 1, 1, 1)
         return (latent - mean) / std
 
+    @staticmethod
+    def _resolve_hdmap_frames(hdmap) -> list | None:
+        """Resolve an HD-map input to a per-frame raster list, or ``None`` for the
+        degenerate single-image case (caller broadcasts one raster).
+
+        * video path (``_HDMAP_VIDEO_EXTS``) -> decoded to per-frame PIL images;
+        * ``list`` / ``tuple`` -> per-frame sequence as-is, **except** a single
+          video-path element is expanded via ``load_video`` (CLI ``--hdmap-path``
+          always passes a list, even for a single arg);
+        * single image (path / PIL / tensor) -> ``None``.
+        """
+        if isinstance(hdmap, (list, tuple)):
+            items = list(hdmap)
+            if len(items) == 0:
+                return None
+            # CLI passes --hdmap-path as a list even for a single arg; expand a
+            # lone video-path element via load_video so it becomes per-frame rasters.
+            if (
+                len(items) == 1
+                and isinstance(items[0], str)
+                and items[0].lower().endswith(_HDMAP_VIDEO_EXTS)
+            ):
+                return load_video(items[0])
+            return items
+        if isinstance(hdmap, str) and hdmap.lower().endswith(_HDMAP_VIDEO_EXTS):
+            return load_video(hdmap)
+        return None
+
     @torch.no_grad()
     def _encode_hdmap(
         self,
@@ -289,22 +345,28 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         vae_dtype: torch.dtype,
         dit_dtype: torch.dtype,
         num_chunks: int,
+        len_t: int,
         height: int,
         width: int,
     ) -> list[torch.Tensor] | None:
-        """Per-chunk HD-map conditioning -> ``list[num_chunks]`` of patchified tokens.
+        """Per-frame HD-map conditioning -> ``list[num_chunks]`` of patchified tokens.
 
-        HD-map is a *per-chunk* driving condition (each latent chunk has its own
-        HD-map frames), so this returns a list indexed by chunk -- not one tensor
-        shared across chunks. Returns ``None`` when the request carries no HD-map
-        input, in which case the AR stage falls back to zeros (HDMap disabled).
+        HD-map is OmniDreams' central per-frame control signal (lane lines + actor
+        boxes rendered at the ego pose); the generated viewpoint changes *because*
+        the raster shifts frame-to-frame. The full per-frame raster sequence is
+        VAE-encoded as one causal clip -- matching the output latent temporal
+        layout -- then sliced into ``num_chunks`` groups of ``len_t`` latent
+        frames. Returns ``None`` when the request carries no HD-map input, in
+        which case the AR stage falls back to zeros (HDMap disabled).
 
-        Accepts ``batch.hdmap_path`` / ``batch.hdmap_pixels`` as either a single
-        input (broadcast to every chunk) or a per-chunk list. Each entry runs the
-        same pixel-preprocess + VAE-encode + patchify path as the reference image.
+        Accepts ``batch.hdmap_path`` / ``batch.hdmap_pixels`` as a video path
+        (decoded per-frame), a per-frame list of rasters, or -- as a degenerate
+        back-compat / smoke fallback -- a single image broadcast across every
+        latent frame (no temporal motion).
 
-        TODO(gpu): the HD-map pixel -> 16ch-latent VAE numerics are validated on
-        GPU; this encode path only runs when real HD-map input is supplied.
+        TODO(gpu): the HD-map pixel -> 16ch-latent VAE numerics and the causal
+        multi-frame temporal compression are validated on GPU; this encode path
+        only runs when real HD-map input is supplied.
         """
         hdmap = getattr(batch, "hdmap_path", None)
         if hdmap is None:
@@ -312,24 +374,66 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         if hdmap is None:
             return None
 
-        per_chunk = list(hdmap) if isinstance(hdmap, (list, tuple)) else None
-        tokens: list[torch.Tensor] = []
-        for ci in range(num_chunks):
-            if per_chunk is not None:
-                src = per_chunk[ci] if ci < len(per_chunk) else per_chunk[-1]
-            else:
-                src = hdmap
-            x = self._preprocess_pixels(src, height, width, device, vae_dtype)
+        # L latent frames total -> 1 + (L-1)*4 pixel frames (causal VAE, tc=4),
+        # matching the output chunk math (chunk0=1+(len_t-1)*4, later=len_t*4).
+        num_latent = num_chunks * len_t
+        total_pixel = 1 + (num_latent - 1) * 4
+
+        frames = self._resolve_hdmap_frames(hdmap)
+        if frames is None:
+            # Degenerate single-image fallback: one raster broadcast across all
+            # latent frames (no temporal motion -- back-compat / smoke only).
+            x = self._preprocess_pixels(hdmap, height, width, device, vae_dtype)
             if x is None:
                 logger.warning(
-                    "OmniDreams: HD-map chunk %d preprocessed to None; disabling "
-                    "HDMap (all chunks fall back to zeros). Check hdmap input.",
-                    ci,
+                    "OmniDreams: HD-map preprocessed to None; disabling HDMap "
+                    "(all chunks fall back to zeros). Check hdmap input."
                 )
                 return None
-            latent = self._vae_encode_normalized(x).to(dit_dtype)
-            # [B,16,t,h,w] -> [B, L, additional_concat_ch*pdim] via the DiT patchify.
-            tokens.append(self.transformer.patchify(latent))
+            latent = self._vae_encode_normalized(x).to(dit_dtype)  # [B,16,1,h,w]
+            if num_latent > 1 and latent.ndim == 5 and latent.shape[2] == 1:
+                latent = latent.repeat(1, 1, num_latent, 1, 1)
+        else:
+            # Per-frame path: clamp/truncate to total_pixel, then encode the whole
+            # clip causally -> num_latent distinct latent frames.
+            if len(frames) < total_pixel:
+                logger.warning(
+                    "OmniDreams: HD-map has %d frames but %d are needed for "
+                    "%d chunks x len_t=%d; clamping (repeating last frame).",
+                    len(frames),
+                    total_pixel,
+                    num_chunks,
+                    len_t,
+                )
+                frames = list(frames) + [frames[-1]] * (total_pixel - len(frames))
+            else:
+                frames = list(frames[:total_pixel])
+            clip = self._preprocess_hdmap_clip(
+                frames, height, width, device, vae_dtype
+            )
+            if clip is None:
+                logger.warning(
+                    "OmniDreams: HD-map clip preprocessed to None; disabling "
+                    "HDMap (all chunks fall back to zeros). Check hdmap input."
+                )
+                return None
+            latent = self._vae_encode_normalized(clip).to(dit_dtype)  # [B,16,L,h,w]
+
+        if latent.shape[2] != num_latent:
+            logger.warning(
+                "OmniDreams: HD-map encoded to %d latent frames, expected %d "
+                "(num_chunks=%d, len_t=%d). Check VAE temporal compression.",
+                latent.shape[2],
+                num_latent,
+                num_chunks,
+                len_t,
+            )
+        # Slice into per-chunk groups of len_t latent frames, patchify each:
+        # [B,16,len_t,h,w] -> [B, chunk_tokens, additional_concat_ch*pdim].
+        tokens: list[torch.Tensor] = []
+        for ci in range(num_chunks):
+            chunk_latent = latent[:, :, ci * len_t : (ci + 1) * len_t]
+            tokens.append(self.transformer.patchify(chunk_latent))
         return tokens
 
     @torch.no_grad()
@@ -393,7 +497,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         # Per-chunk HD-map tokens (None -> AR stage uses zeros / HDMap disabled).
         with self.use_declared_component(component_name="vae", module=self.vae):
             hdmap_tokens = self._encode_hdmap(
-                batch, device, vae_dtype, dit_dtype, num_chunks, height, width
+                batch, device, vae_dtype, dit_dtype, num_chunks, len_t, height, width
             )
         batch.extra["omnidreams"] = {
             "hp": hp,
