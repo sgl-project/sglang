@@ -47,6 +47,10 @@ from sglang.srt.observability.req_time_stats import (
     MetricsCollectorWrapper,
     SchedulerReqTimeStats,
 )
+from sglang.srt.observability.trace import (
+    TraceContext,
+    TraceSpanContext,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData, VideoData
@@ -826,7 +830,6 @@ class TokenizedGenerateReqInput(BaseReqIpc, kw_only=True):
     multi_item_delimiter_indices: Optional[List[int]] = None
 
     # For observability
-    # Optional[]
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
 
@@ -2176,6 +2179,17 @@ def dec_hook(tp: Type, obj: Any) -> Any:
         res = array(typecode)
         res.frombytes(raw_data)
         return res
+    elif tp is TraceContext:
+        if isinstance(obj, dict):
+            obj = {k: pickle.loads(v) if v is not None else v for k, v in obj.items()}
+        return TraceContext(obj)
+    elif tp is TraceSpanContext:
+        trace_id, span_id, is_remote, trace_flags, trace_state, _ = obj
+        if trace_flags is not None:
+            trace_flags = pickle.loads(trace_flags)
+        if trace_state is not None:
+            trace_state = pickle.loads(trace_state)
+        return TraceSpanContext(trace_id, span_id, is_remote, trace_flags, trace_state)
     else:
         if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
             logger.info(
