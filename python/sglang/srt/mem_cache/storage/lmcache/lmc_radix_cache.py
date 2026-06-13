@@ -5,7 +5,6 @@ import logging
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
-from contextlib import nullcontext
 
 import torch
 
@@ -362,7 +361,6 @@ class LMCRadixCache(RadixCache):
         )
         slot_mapping[:value_numel].fill_(-1)
         slot_mapping[value_numel:].copy_(token_slots)
-
 
         with _device_stream_context(self.load_stream):
             num_retrieved = self.lmcache_connector.start_load_kv(

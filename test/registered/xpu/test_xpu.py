@@ -20,6 +20,7 @@ import os
 import unittest
 
 import torch
+
 from sglang.test.ci.ci_register import register_xpu_ci
 
 # Must be set before lmcache imports
