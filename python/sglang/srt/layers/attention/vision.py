@@ -502,30 +502,43 @@ class VisionFlash4Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-        elif isinstance(cu_seqlens, SingletonCache):
-            if cu_seqlens.empty():
-                cu_seqlens.set_data(
-                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-                )
-            cu_seqlens = cu_seqlens.get_data()
 
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            max_seqlen = cu_seqlens[1]
+            fa_kwargs = dict(
+                cu_seqlens_q=cu_seqlens[0],
+                cu_seqlens_k=cu_seqlens[0],
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=softmax_scale,
+                ver=4,
+            )
+            output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
+        else:
+            if cu_seqlens is None:
+                cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+            elif isinstance(cu_seqlens, SingletonCache):
+                if cu_seqlens.empty():
+                    cu_seqlens.set_data(
+                        _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                    )
+                cu_seqlens = cu_seqlens.get_data()
 
-        output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            softmax_scale=softmax_scale,
-            ver=4,
-        )
+            cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seq_lens.max().item()
+
+            output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=softmax_scale,
+                ver=4,
+            )
 
         return output
 
