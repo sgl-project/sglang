@@ -373,6 +373,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             score_type=self.score_type,
             disable_index_value=disable_value,
             use_msa=self.use_msa,
+            # Host seq-lens let get_cu_seqblocks avoid a per-layer .item() sync.
+            seqlens_cpu=forward_batch.extend_seq_lens_cpu,
         )
 
         # Pad output back to original size for DP communication

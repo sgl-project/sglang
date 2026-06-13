@@ -2,7 +2,7 @@
 
 import functools
 from collections import deque
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import triton.language as tl
@@ -95,6 +95,7 @@ def get_cu_seqblocks(
     max_seqlen: int,
     block_size_q: int,
     block_size_k: int,
+    seqlens_cpu: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, int, int, torch.Tensor, int, int]:
     """Compute cumulative sequence block indices for blocked sparse attention.
 
@@ -111,6 +112,8 @@ def get_cu_seqblocks(
         max_seqlen: Maximum sequence length in the batch.
         block_size_q: Query block size.
         block_size_k: Key-value block size.
+        seqlens_cpu: Optional host copy of ``torch.diff(cu_seqlens)``; when given,
+            ``all_seqblock_q/k`` are summed on the host to avoid a per-layer sync.
 
     Returns:
         A tuple of 6 values:
@@ -132,8 +135,17 @@ def get_cu_seqblocks(
     cu_seqblocks_k[1:] = seqblocks_k
     cu_seqblocks_q.cumsum_(0)
     cu_seqblocks_k.cumsum_(0)
-    all_seqblock_q = seqblocks_q.sum().item()
-    all_seqblock_k = seqblocks_k.sum().item()
+    if seqlens_cpu is not None:
+        # Bit-identical to seqblocks.sum().item() but no device->host sync.
+        all_seqblock_q = sum(
+            (s + block_size_q - 1) // block_size_q for s in seqlens_cpu
+        )
+        all_seqblock_k = sum(
+            (s + block_size_k - 1) // block_size_k for s in seqlens_cpu
+        )
+    else:
+        all_seqblock_q = seqblocks_q.sum().item()
+        all_seqblock_k = seqblocks_k.sum().item()
     return (
         cu_seqblocks_q,
         max_seqblock_q,

@@ -1,6 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -43,16 +43,19 @@ def minimax_sparse_prefill(
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
+    seqlens_cpu: Optional[List[int]] = None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
     ``cu_seqblocks_q``, ``max_seqblock_q``, and ``all_seqblock_q`` are optional
     precomputed query-block metadata shared by the index and value sparse
     kernels. Supplying them avoids recomputing the same block layout twice.
+    ``seqlens_cpu`` (host copy of ``torch.diff(cu_seqlens)``) is forwarded to
+    ``get_cu_seqblocks`` to avoid a per-layer device sync when it recomputes.
     """
     if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
-            cu_seqlens, max_seqlen_q, block_size_q, block_size_k
+            cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
         )
 
     # All seqlen is less than topk, use full attention
