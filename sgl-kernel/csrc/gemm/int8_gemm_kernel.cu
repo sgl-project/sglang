@@ -739,6 +739,19 @@ torch::Tensor int8_scaled_mm(
           out, mat_a, mat_b, scales_a, scales_b, bias);
     }
 #endif
+  } else if (sm_version >= 120) {
+    // Consumer Blackwell (SM120/SM121: RTX PRO 6000, RTX 50-series, GB10).
+    // These share the ~100KB shared-memory-per-block limit with SM89 and run
+    // the same m16n8k32 INT8 IMMA tensor-core path, so reuse the SM89 tiling
+    // (cutlass 2.x, Sm80 arch tag). Functional enablement; SM120-specific tile
+    // tuning can follow.
+    if (out_dtype == torch::kBFloat16) {
+      sm89_dispatch_shape<cutlass::bfloat16_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
+          out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else {
+      sm89_dispatch_shape<cutlass::half_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
+          out, mat_a, mat_b, scales_a, scales_b, bias);
+    }
   } else {
     TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented int8_scaled_mm for current compute capability.");
   }
