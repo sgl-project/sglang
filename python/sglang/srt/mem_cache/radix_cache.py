@@ -28,7 +28,7 @@ import sys
 import time
 from array import array
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
 from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
 
 if TYPE_CHECKING:
@@ -223,6 +224,10 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # Sessions holding this leaf; release_session frees the node only once the
+        # set empties (last holder). None for plain nodes; LRU-neutral.
+        self.session_ids: Optional[Set[str]] = None
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -261,7 +266,7 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-class RadixCache(KVCacheEventMixin, BasePrefixCache):
+class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
@@ -457,6 +462,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
+        self._tag_session_leaf(req, radix_key)
+
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
@@ -526,6 +533,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
 
         req.last_node = new_last_node
+
+        self._tag_session_leaf(req, radix_key, node=new_last_node)
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)

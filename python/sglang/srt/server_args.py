@@ -470,6 +470,7 @@ class ServerArgs:
     stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
+    enable_session_radix_cache: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
@@ -5295,6 +5296,15 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_streaming_session,
             help="Enable streaming session mode and StreamingSession wrapper.",
+        )
+        parser.add_argument(
+            "--enable-session-radix-cache",
+            action="store_true",
+            default=ServerArgs.enable_session_radix_cache,
+            help="Hold per-session KV as ordinary evictable radix entries "
+            "(tagged by session id, floor priority, bulk-evicted on close) "
+            "instead of pinned streaming slots. Requires "
+            "--radix-eviction-policy priority.",
         )
         parser.add_argument(
             "--random-seed",
