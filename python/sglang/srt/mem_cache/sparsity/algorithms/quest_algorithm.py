@@ -106,15 +106,15 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             // self.page_size
         )
 
-        idx = pg_mask.nonzero(as_tuple=False)
-        if idx.numel() == 0:
+        idx = pg_mask.nonzero(as_tuple=True)
+        if idx[0].numel() == 0:
             return
 
-        target_pages = phys_pg[idx[:, 0], idx[:, 1]].clamp(
+        target_pages = phys_pg[idx[0], idx[1]].clamp(
             0, self.page_k_min[layer_id].shape[0] - 1
         )
-        self.page_k_min[layer_id][target_pages] = page_min[idx[:, 0], idx[:, 1]]
-        self.page_k_max[layer_id][target_pages] = page_max[idx[:, 0], idx[:, 1]]
+        self.page_k_min[layer_id][target_pages] = page_min[idx[0], idx[1]]
+        self.page_k_max[layer_id][target_pages] = page_max[idx[0], idx[1]]
         self.page_valid[layer_id][target_pages] = True
 
     def _retrieve_page_scores(
