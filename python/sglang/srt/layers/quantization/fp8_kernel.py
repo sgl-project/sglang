@@ -546,6 +546,9 @@ def sglang_per_token_group_quant_fp8(
 
     use_jit_quant = (
         envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get()
+        # JIT kernel is byte-identical to AOT v2, so only take it when v2 is
+        # wanted; an explicit enable_v2=False (AOT-v1 intent) must fall through.
+        and enable_v2
         and not fuse_silu_and_mul
         and masked_m is None
         and x.dim() == 2
