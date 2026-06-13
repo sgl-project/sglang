@@ -1048,15 +1048,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
         retrieve_index = torch.arange(bs, dtype=torch.long, device=device).unsqueeze(1)
         retrieve_next_token = torch.full((bs, 1), -1, dtype=torch.long, device=device)
         retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
-        positions = batch.seq_lens.to(torch.int64)
 
-        # With a single verify token the tree is one node, so there is no tree mask
-        # to apply (the token just attends causally to its own KV). Leaving it None
-        # avoids building the mask and the seq_lens_sum it would need -- which under
-        # fully-overlap backends (no seq_lens_cpu) would force a per-step D2H sync.
+        attn_backend = self._target_worker.model_runner.attn_backend
+        mask_buf, position_buf = attn_backend.get_verify_buffers_to_fill_after_draft()
+        if mask_buf is not None:
+            custom_mask = mask_buf
+            custom_mask.fill_(True)
+        else:
+            if batch.seq_lens_sum is not None:
+                seq_lens_sum = batch.seq_lens_sum
+            elif batch.seq_lens_cpu is not None:
+                seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            else:
+                seq_lens_sum = bs * attn_backend.max_context_len
+            custom_mask = torch.ones(seq_lens_sum + bs, dtype=torch.bool, device=device)
+
+        if position_buf is not None:
+            positions = position_buf
+            positions[:bs].copy_(batch.seq_lens)
+        else:
+            positions = batch.seq_lens.to(torch.int64)
+
         return EagleVerifyInput(
             draft_token=draft_input.bonus_tokens,
-            custom_mask=None,
+            custom_mask=custom_mask,
             positions=positions,
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
