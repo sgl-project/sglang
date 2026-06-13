@@ -49,7 +49,12 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
+    prepare_for_verify,
+    sample,
+)
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
@@ -807,7 +812,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = verify_input.prepare_for_verify(
+            verify_forward_batch, can_run_cuda_graph = prepare_for_verify(
+                verify_input,
                 self.req_to_token_pool,
                 batch,
                 self.target_worker,
@@ -856,7 +862,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             predict,
             accept_lens,
             accept_index,
-        ) = verify_input.sample(batch, logits_output)
+        ) = sample(verify_input, batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_lens
 
         if not batch.forward_mode.is_idle():

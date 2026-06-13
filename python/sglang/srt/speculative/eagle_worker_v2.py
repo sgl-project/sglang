@@ -67,6 +67,8 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
     per_step_draft_out_cache_loc,
+    prepare_for_verify,
+    sample,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -1215,7 +1217,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = verify_input.prepare_for_verify(
+            verify_forward_batch, can_run_cuda_graph = prepare_for_verify(
+                verify_input,
                 self.req_to_token_pool,
                 batch,
                 self.target_worker,
@@ -1301,7 +1304,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             predict,
             accept_lens,
             accept_index,
-        ) = verify_input.sample(batch, logits_output, vocab_mask)
+        ) = sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification
