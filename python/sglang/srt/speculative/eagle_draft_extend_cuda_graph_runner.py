@@ -539,7 +539,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
             seq_lens_sum=seq_lens_sum,
-            seq_lens_cpu=buffers.seq_lens_cpu,
+            seq_lens_cpu=(
+                buffers.seq_lens_cpu if forward_batch.seq_lens_cpu is not None else None
+            ),
+            seq_len_cpu_ub=forward_batch.seq_len_cpu_ub,
             encoder_lens=None,
             out_cache_loc=forward_batch.out_cache_loc,
             spec_info=forward_batch.spec_info,

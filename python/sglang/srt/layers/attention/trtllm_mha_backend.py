@@ -45,6 +45,30 @@ DEFAULT_WORKSPACE_SIZE_MB = 512
 global_zero_init_workspace_buffer = None
 
 
+def _max_kv_len(
+    seq_lens_cpu: Optional[torch.Tensor],
+    seq_len_cpu_ub: Optional[int],
+    seq_lens: torch.Tensor,
+) -> int:
+    """Max KV length used to size attention metadata (page-table width)."""
+    assert (
+        seq_lens_cpu is None or seq_len_cpu_ub is None
+    ), "seq_lens_cpu and seq_len_cpu_ub should not be both set"
+    if seq_lens_cpu is not None:
+        # Prefer the host-side ``seq_lens_cpu`` if present, since it carries
+        # the exact value and is sync free
+        return int(seq_lens_cpu.max().item())
+    elif seq_len_cpu_ub is not None:
+        # When the ``seq_lens_cpu`` is absent, prefer the host-side
+        # ``seq_len_cpu_ub`` which is set on the spec-v2 sync-free path
+        # (needs_cpu_seq_lens=False)
+        return seq_len_cpu_ub
+    else:
+        # Fall back to a GPU ``.item()`` sync only when neither is available,
+        # triggers a sync
+        return int(seq_lens.max().item())
+
+
 @dataclass
 class TRTLLMMHAMetadata:
     # Sequence lengths for the forward batch
@@ -67,6 +91,8 @@ class TRTLLMMHAMetadata:
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
+
+    needs_cpu_seq_lens: bool = False
 
     def __init__(
         self,
@@ -440,14 +466,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        seq_len_cpu_ub: Optional[int] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        # seq_lens_cpu is None on the sync-free path (needs_cpu_seq_lens=False);
+        # seq_len_cpu_ub then carries the host upper bound. See _max_kv_len.
+        seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
         req_pool_indices = req_pool_indices[:bs]
+        max_kv = _max_kv_len(seq_lens_cpu, seq_len_cpu_ub, seq_lens)
         metadata = None
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -460,9 +490,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32.copy_(
                     seq_lens + self.speculative_step_id + 1
                 )
-                metadata.max_seq_len_k = seq_lens.max().item() + (
-                    self.speculative_step_id + 1
-                )
+                metadata.max_seq_len_k = max_kv + (self.speculative_step_id + 1)
 
                 max_seq_pages = (
                     metadata.max_seq_len_k + self.page_size - 1
@@ -470,7 +498,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
+                max_len = max_kv
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
@@ -492,8 +520,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata = self.target_verify_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
 
-            metadata.max_seq_len_k = seq_lens_cpu.max().item() + metadata.max_seq_len_q
-            max_len = seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = max_kv + metadata.max_seq_len_q
+            max_len = max_kv
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -510,8 +538,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
-            max_len = seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = max_kv
+            max_len = max_kv
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -608,7 +636,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
-            seq_lens_cpu = seq_lens.cpu()
             self._build_cuda_graph_metadata(
                 bs, num_tokens, forward_mode, spec_info, seq_lens.device
             )
@@ -618,7 +645,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
-                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                seq_len_cpu_ub=forward_batch.seq_len_cpu_ub,
             )
             if forward_mode.is_draft_extend():
                 # CUDA graph bakes max_seq_len_q as a constant. replay() sets it
@@ -634,6 +662,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
+                seq_len_cpu_ub=forward_batch.seq_len_cpu_ub,
             )
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
@@ -662,9 +691,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = (
                     seqlens_in_batch + (self.speculative_step_id + 1)
                 ).to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
-                    self.speculative_step_id + 1
-                )
+                metadata.max_seq_len_k = _max_kv_len(
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_len_cpu_ub,
+                    forward_batch.seq_lens,
+                ) + (self.speculative_step_id + 1)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -680,7 +711,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = _max_kv_len(
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_len_cpu_ub,
+                    forward_batch.seq_lens,
+                )
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -698,7 +733,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             metadata.max_seq_len_q = tokens_per_req
             metadata.max_seq_len_k = (
-                forward_batch.seq_lens_cpu.max().item() + tokens_per_req
+                _max_kv_len(
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_len_cpu_ub,
+                    forward_batch.seq_lens,
+                )
+                + tokens_per_req
             )
             metadata.cu_seqlens_q = torch.arange(
                 0,
@@ -717,7 +757,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         else:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = _max_kv_len(
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_len_cpu_ub,
+                forward_batch.seq_lens,
+            )
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
@@ -725,8 +769,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if any(
-                forward_batch.extend_prefix_lens_cpu
+            if (
+                forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
             ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
@@ -971,6 +1016,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
 class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     """Multi-step TRTLLM MHA attention kernel used by EAGLE."""
+
+    needs_cpu_seq_lens: bool = False
 
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int

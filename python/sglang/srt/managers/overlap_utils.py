@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Sequence, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.srt.utils import is_cuda, is_hip, is_npu
@@ -25,18 +24,11 @@ def decide_needs_cpu_seq_lens(
 ) -> bool:
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
-    OR over per-backend needs_cpu_seq_lens; force True under TBO / piecewise CG
-    (they read the CPU mirror outside the backend layer).
+    OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
+    CPU mirror outside the backend layer).
     """
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
-        return True
-    cuda_graph_config = server_args.cuda_graph_config
-    if (
-        cuda_graph_config is not None
-        and cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE
-    ):
-        # FIXME: support PCG without seq lens cpu value
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
     # missing flag -> True so undeclared backends stay on the legacy path.
@@ -285,11 +277,17 @@ class FutureMap:
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None
             batch.seq_lens_sum = None
+            # Host-side upper bound on max(seq_lens) so bound-safe backends can
+            # size attention metadata (max_seq_len_k) without a D2H sync.
+            batch.seq_len_cpu_ub = max(
+                (r.kv_allocated_len for r in batch.reqs), default=0
+            )
             return
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            batch.seq_len_cpu_ub = None
             return
 
         # Mechanism: don't sync the schedule stream; gate a private stream on the
@@ -302,6 +300,7 @@ class FutureMap:
         # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        batch.seq_len_cpu_ub = None
 
     def publish(self, future_indices: torch.Tensor, new_seq_lens: torch.Tensor) -> None:
         indices = future_indices
