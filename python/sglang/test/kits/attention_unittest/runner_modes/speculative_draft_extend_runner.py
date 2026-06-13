@@ -1013,6 +1013,28 @@ def _assert_draft_extend_outputs_close(actual, expected, settings) -> None:
     torch.testing.assert_close(actual.topk_index, expected.topk_index)
 
 
+def _assert_draft_extend_v2_outputs_close(actual, expected, settings) -> None:
+    # DRAFT_EXTEND_V2 graph runner only anchors the full-row
+    # `next_token_logits` / `hidden_states`; the selected-row `topk_p` /
+    # `topk_index` are owned by EAGLEWorkerV2 and computed *after* replay (see
+    # `eagle_worker_v2._draft_extend_for_decode` and the early-return in
+    # `EAGLEDraftExtendCudaGraphRunner.replay` for DRAFT_EXTEND_V2). The V2
+    # production runner output therefore carries no topk fields, so the
+    # runner-mode reference must only compare what the graph actually anchors.
+    torch.testing.assert_close(
+        actual.next_token_logits,
+        expected.next_token_logits,
+        atol=settings.atol,
+        rtol=settings.rtol,
+    )
+    torch.testing.assert_close(
+        actual.hidden_states,
+        expected.hidden_states,
+        atol=settings.atol,
+        rtol=settings.rtol,
+    )
+
+
 @dataclass(frozen=True)
 class EagleDraftExtendCudaGraphRunnerAdapter:
     build_fixture: Callable[..., Any]
@@ -1022,13 +1044,6 @@ class EagleDraftExtendCudaGraphRunnerAdapter:
     make_forward_batch: Callable[
         [Any, Any, Any, EagleDraftRunnerSettings], ForwardBatch
     ]
-    # Optional hook invoked with `(draft_extend_attn_backend, batch)` right
-    # before `graph_runner.replay(batch)`. DSV4 needs this to set the
-    # out-of-band `_replay_forward_batch` attribute that
-    # `DeepseekV4AttnBackend.init_forward_metadata_replay_cuda_graph` reads
-    # (the multi-step DECODE wrapper sets it internally, but the single-
-    # backend DRAFT_EXTEND path does not).
-    pre_replay: Callable[[Any, ForwardBatch], None] = None
     check_case: Callable[[Any, EagleDraftRunnerSettings], None] = (
         lambda _case, _settings: None
     )
@@ -1139,19 +1154,19 @@ def _capture_eagle_draft_extend_graph_runner(
 ) -> EAGLEDraftExtendCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.graph_capture",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.get_attention_cp_size",
+            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
             lambda: 1,
         ),
     ):
@@ -1268,12 +1283,7 @@ def run_eagle_draft_extend_cuda_graph_runner_case(
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
         testcase.assertTrue(graph_runner.can_run(graph_batch))
-        if adapter.pre_replay is not None:
-            adapter.pre_replay(graph_backend, graph_batch)
         actual = graph_runner.replay(graph_batch)
-        if adapter.pre_replay is not None:
-            # Best-effort cleanup of any out-of-band state pre_replay set.
-            adapter.pre_replay(graph_backend, None)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
@@ -1566,6 +1576,7 @@ def run_dense_eagle_draft_extend_v2_cuda_graph_runner_case(
         make_draft_inputs=_make_dense_draft_extend_inputs,
         prepare_replay_state=_prepare_dense_draft_extend_replay_state,
         make_forward_batch=_make_dense_eagle_draft_extend_v2_forward_batch,
+        assert_outputs_close=_assert_draft_extend_v2_outputs_close,
     )
     run_eagle_draft_extend_cuda_graph_runner_case(
         testcase,
@@ -1769,6 +1780,7 @@ def run_mla_eagle_draft_extend_v2_cuda_graph_runner_case(
         make_draft_inputs=_make_mla_draft_extend_inputs,
         prepare_replay_state=_prepare_mla_draft_extend_replay_state,
         make_forward_batch=_make_mla_eagle_draft_extend_v2_forward_batch,
+        assert_outputs_close=_assert_draft_extend_v2_outputs_close,
     )
     run_eagle_draft_extend_cuda_graph_runner_case(
         testcase,
@@ -1934,21 +1946,6 @@ def _dsv4_assert_draft_extend_outputs_close(actual, expected, settings) -> None:
         )
 
 
-def _dsv4_draft_extend_pre_replay(
-    draft_extend_attn_backend,
-    batch: ForwardBatch | None,
-) -> None:
-    """Set/clear the out-of-band `_replay_forward_batch` attribute that
-    `DeepseekV4AttnBackend.init_forward_metadata_replay_cuda_graph` reads.
-
-    The DSV4 multi-step DECODE wrapper sets this internally
-    (`deepseek_v4_backend.py:1231,1242`), but the single-backend DRAFT_EXTEND
-    path used by `_create_dsv4_prefill_backend` does not. Set before
-    `replay()` and clear afterwards to mimic the multi-step pattern.
-    """
-    draft_extend_attn_backend._replay_forward_batch = batch
-
-
 def run_dsv4_eagle_draft_extend_cuda_graph_runner_case(
     testcase,
     case: DSV4AttentionCase,
@@ -2001,7 +1998,6 @@ def run_dsv4_eagle_draft_extend_cuda_graph_runner_case(
         make_draft_inputs=_make_dsv4_draft_extend_inputs,
         prepare_replay_state=_prepare_dsv4_draft_extend_replay_state,
         make_forward_batch=_make_dsv4_eagle_draft_extend_forward_batch,
-        pre_replay=_dsv4_draft_extend_pre_replay,
         assert_outputs_close=_dsv4_assert_draft_extend_outputs_close,
     )
     run_eagle_draft_extend_cuda_graph_runner_case(
