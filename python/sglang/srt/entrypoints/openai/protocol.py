@@ -367,6 +367,8 @@ class CompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Retention duration in seconds for priority decay (0 or None = permanent)
+    retention_seconds: Optional[float] = None
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -739,6 +741,8 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Retention duration in seconds for priority decay (0 or None = permanent)
+    retention_seconds: Optional[float] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None

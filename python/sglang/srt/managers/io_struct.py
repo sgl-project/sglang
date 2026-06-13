@@ -241,6 +241,9 @@ class GenerateReqInput(BaseReq):
     # Priority for the request
     priority: Optional[int] = None
 
+    # Retention duration in seconds for priority decay (0 or None = permanent)
+    retention_seconds: Optional[float] = None
+
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -713,6 +716,7 @@ class GenerateReqInput(BaseReq):
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
+            retention_seconds=self.retention_seconds,
             extra_key=self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -797,6 +801,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Priority for the request
     priority: Optional[int] = None
+
+    # Retention duration in seconds for priority decay (0 or None = permanent)
+    retention_seconds: Optional[float] = None
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None

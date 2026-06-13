@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.evict_policy import PriorityStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1599,6 +1600,7 @@ class HiRadixCache(RadixCache):
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
         new_node = TreeNode(priority=child.priority)
+        new_node.retention_duration = child.retention_duration
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -1632,9 +1634,11 @@ class HiRadixCache(RadixCache):
         value = params.value
         chunked = params.chunked
         priority = params.priority
+        retention_duration = params.retention_duration
 
         if priority is None:
             priority = 0
+        priority = PriorityStrategy.clamp_priority(priority)
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
@@ -1651,7 +1655,11 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
-            node.priority = max(node.priority, priority)
+            node.priority, node.retention_duration = (
+                PriorityStrategy.pick_stronger_policy(
+                    node.priority, node.retention_duration, priority, retention_duration
+                )
+            )
             prefix_len = node.key.match(key, page_size=self.page_size)
 
             if prefix_len == len(node.key):
@@ -1670,8 +1678,15 @@ class HiRadixCache(RadixCache):
             else:
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
-                # shared-prefix node should also reflect max priority
-                new_node.priority = max(new_node.priority, priority)
+                # Shared-prefix nodes must inherit one coherent policy tuple.
+                new_node.priority, new_node.retention_duration = (
+                    PriorityStrategy.pick_stronger_policy(
+                        new_node.priority,
+                        new_node.retention_duration,
+                        priority,
+                        retention_duration,
+                    )
+                )
                 if new_node.evicted:
                     new_node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
@@ -1692,6 +1707,7 @@ class HiRadixCache(RadixCache):
 
         if len(key):
             new_node = TreeNode(priority=priority)
+            new_node.retention_duration = retention_duration
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()

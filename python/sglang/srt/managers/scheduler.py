@@ -2004,6 +2004,7 @@ class Scheduler(
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
+                retention_seconds=recv_req.retention_seconds,
                 metrics_collector=(
                     self.metrics_collector
                     if self.metrics_reporter.enable_metrics

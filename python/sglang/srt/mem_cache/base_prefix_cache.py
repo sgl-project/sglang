@@ -67,6 +67,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    retention_duration: float = 0.0
 
 
 @dataclasses.dataclass

@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.evict_policy import PriorityStrategy
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
@@ -514,6 +515,59 @@ class TestRadixCache(unittest.TestCase):
         remove_events = [e for e in events if isinstance(e, BlockRemoved)]
         for event in remove_events:
             self.assertGreater(len(event.block_hashes), 0)
+
+    def test_priority_retention_shared_prefix_does_not_outlive_stronger_leaf(self):
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+
+        cache = RadixCache.create_simulated(mock_allocator=mock_allocator)
+        cache.eviction_strategy = PriorityStrategy()
+
+        removed = []
+        cache._record_remove_event = lambda node: removed.append(
+            list(node.key.token_ids)
+        )
+
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.time.monotonic", return_value=0.0
+        ):
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", [1, 2])),
+                    value=torch.tensor([1, 2], dtype=torch.int64),
+                    priority=99,
+                    retention_duration=1.0,
+                )
+            )
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", [1, 3])),
+                    value=torch.tensor([1, 3], dtype=torch.int64),
+                    priority=50,
+                    retention_duration=300.0,
+                )
+            )
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", [9])),
+                    value=torch.tensor([9], dtype=torch.int64),
+                    priority=60,
+                    retention_duration=300.0,
+                )
+            )
+
+        shared_prefix = next(iter(cache.root_node.children.values()))
+        self.assertEqual(list(shared_prefix.key.token_ids), [1])
+        self.assertEqual(
+            (shared_prefix.priority, shared_prefix.retention_duration), (99, 1.0)
+        )
+
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.evict_policy.time.monotonic", return_value=100.0
+        ):
+            cache.evict(EvictParams(num_tokens=10))
+
+        self.assertLess(removed.index([1]), removed.index([9]))
 
     def test_extra_key_isolation(self):
         """Test that keys with different extra_key values are isolated."""

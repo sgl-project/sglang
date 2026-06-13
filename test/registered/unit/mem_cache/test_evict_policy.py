@@ -6,7 +6,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.evict_policy import (
     FIFOStrategy,
@@ -25,6 +25,7 @@ def _make_node(**kwargs):
     node.hit_count = kwargs.get("hit_count", 0)
     node.creation_time = kwargs.get("creation_time", 0.0)
     node.priority = kwargs.get("priority", 0)
+    node.retention_duration = kwargs.get("retention_duration", 0.0)
     return node
 
 
@@ -138,6 +139,55 @@ class TestPriorityStrategy(unittest.TestCase):
         self.assertLess(
             self.strategy.get_priority(old), self.strategy.get_priority(new)
         )
+
+    def test_priority_clamped_to_max(self):
+        node = _make_node(priority=500, last_access_time=1.0)
+        pri, _ = self.strategy.get_priority(node)
+        self.assertEqual(pri, 99)
+
+    def test_priority_clamped_to_min(self):
+        node = _make_node(priority=-10, last_access_time=1.0)
+        pri, _ = self.strategy.get_priority(node)
+        self.assertEqual(pri, 0)
+
+    def test_clamp_static_method(self):
+        self.assertEqual(PriorityStrategy.clamp_priority(0), 0)
+        self.assertEqual(PriorityStrategy.clamp_priority(99), 99)
+        self.assertEqual(PriorityStrategy.clamp_priority(100), 99)
+        self.assertEqual(PriorityStrategy.clamp_priority(-1), 0)
+
+    def test_retention_expired_decays_to_zero(self):
+        node = _make_node(priority=50, last_access_time=0.0, retention_duration=10.0)
+        with patch(
+            "sglang.srt.mem_cache.evict_policy.time.monotonic", return_value=100.0
+        ):
+            self.assertEqual(self.strategy.get_priority(node), (0, 0.0))
+
+    def test_retention_active_keeps_priority(self):
+        node = _make_node(priority=50, last_access_time=95.0, retention_duration=10.0)
+        with patch(
+            "sglang.srt.mem_cache.evict_policy.time.monotonic", return_value=100.0
+        ):
+            self.assertEqual(self.strategy.get_priority(node), (50, 95.0))
+
+    def test_zero_retention_never_decays(self):
+        node = _make_node(priority=50, last_access_time=0.0, retention_duration=0.0)
+        with patch(
+            "sglang.srt.mem_cache.evict_policy.time.monotonic", return_value=1e9
+        ):
+            self.assertEqual(self.strategy.get_priority(node), (50, 0.0))
+
+    def test_pick_stronger_policy_keeps_coherent_tuple(self):
+        priority, retention = PriorityStrategy.pick_stronger_policy(99, 1.0, 50, 300.0)
+        self.assertEqual((priority, retention), (99, 1.0))
+
+    def test_pick_stronger_policy_prefers_longer_retention_on_tie(self):
+        priority, retention = PriorityStrategy.pick_stronger_policy(50, 1.0, 50, 300.0)
+        self.assertEqual((priority, retention), (50, 300.0))
+
+    def test_pick_stronger_policy_treats_zero_retention_as_permanent(self):
+        priority, retention = PriorityStrategy.pick_stronger_policy(50, 10.0, 50, 0.0)
+        self.assertEqual((priority, retention), (50, 0.0))
 
 
 class TestSLRUStrategy(unittest.TestCase):
