@@ -697,10 +697,6 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        # Full untruncated sequence: origin + output (+ DLLM mask block).
-        # Rebuilt at the top of each init_next_round_input; admission only
-        # updates fill_len, never mutates this array's length.
-        self.full_untruncated_fill_ids = array("q")
         self.fill_len: int = 0
 
         self.session = session
@@ -1066,8 +1062,24 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def get_full_untruncated_fill_ids(self) -> array:
+        ids = self.origin_input_ids
+        if self.output_ids:
+            ids = ids + self.output_ids
+        if self.is_dllm():
+            ids = ids + array(
+                "q", [self.dllm_config.mask_id] * self.dllm_config.block_size
+            )
+        return ids
+
+    def get_full_untruncated_fill_len(self) -> int:
+        length = len(self.origin_input_ids) + len(self.output_ids)
+        if self.is_dllm():
+            length += self.dllm_config.block_size
+        return length
+
     def get_fill_ids(self) -> array:
-        return self.full_untruncated_fill_ids[: self.fill_len]
+        return self.get_full_untruncated_fill_ids()[: self.fill_len]
 
     def init_next_round_input(
         self,
@@ -1077,10 +1089,9 @@ class Req(ReqDllmMixin):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
-        else:
-            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
-        input_len = len(self.full_untruncated_fill_ids)
+        full_fill_ids = self.get_full_untruncated_fill_ids()
+        input_len = self.get_full_untruncated_fill_len()
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
@@ -1098,9 +1109,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.full_untruncated_fill_ids[
-            : self._compute_max_prefix_len(input_len)
-        ]
+        token_ids_to_match = full_fill_ids[: self._compute_max_prefix_len(input_len)]
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
@@ -1472,7 +1481,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = len(self.full_untruncated_fill_ids)
+            logprob_start_len = self.get_full_untruncated_fill_len()
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
@@ -2314,8 +2323,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
-            req.fill_len = len(req.full_untruncated_fill_ids)
+            req.fill_len = req.get_full_untruncated_fill_len()
             req.set_extend_input_len(1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.

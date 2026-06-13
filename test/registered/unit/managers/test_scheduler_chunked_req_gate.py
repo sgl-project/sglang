@@ -29,9 +29,9 @@ def _make_req(
 ) -> Req:
     req = Req.__new__(Req)
     req.rid = "test-req"
+    req.dllm_config = None
     req.origin_input_ids = array("q", fill_ids)
     req.output_ids = array("q")
-    req.full_untruncated_fill_ids = array("q", fill_ids)
     req.fill_len = fill_len
     req.prefix_indices = prefix_indices
     req.req_pool_idx = req_pool_idx
