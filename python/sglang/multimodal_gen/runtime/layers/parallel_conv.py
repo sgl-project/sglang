@@ -359,6 +359,69 @@ def _match_conv3d_input_format(x: torch.Tensor, weight: torch.Tensor) -> torch.T
     return x
 
 
+def _spatial_parallel_conv_forward(
+    module: nn.Module,
+    x: torch.Tensor,
+    conv_forward,
+    *,
+    height_pad_mode: str,
+    match_conv3d_format: bool = False,
+) -> torch.Tensor:
+    # send and recv halo
+    # x_padded: concatenated input
+    x_padded, module._halo_recv_top_buf, module._halo_recv_bottom_buf = halo_exchange(
+        x,
+        height_halo_size=module.height_halo_size,
+        recv_top_buf=module._halo_recv_top_buf,
+        recv_bottom_buf=module._halo_recv_bottom_buf,
+        height_pad_mode=height_pad_mode,
+    )
+    if match_conv3d_format:
+        x_padded = _match_conv3d_input_format(x_padded, module.weight)
+    if module.height_halo_size == 0:
+        return conv_forward(x_padded)
+
+    stride = module.stride[-2]
+    if _conv_preserves_local_height(
+        height_halo_size=module.height_halo_size,
+        height_pad_top=module.height_pad_top,
+        height_pad_bottom=module.height_pad_bottom,
+        kernel_height=module.kernel_size[-2],
+        dilation_height=module.dilation[-2],
+        stride_height=stride,
+    ):
+        return conv_forward(x_padded)
+
+    heights = gather_height_sizes(x)
+    global_start = sum(heights[: module.rank])
+    global_height = sum(heights)
+    if stride > 1:
+        shift = (
+            global_start - module.height_halo_size + module.height_pad_top
+        ) % stride
+        if shift:
+            x_padded = x_padded[..., shift:, :]
+            global_start += shift
+        if match_conv3d_format:
+            x_padded = _match_conv3d_input_format(x_padded, module.weight)
+
+    out = conv_forward(x_padded)
+
+    # trim the output to original shape
+    return _trim_conv_output_height(
+        out,
+        local_height=x.shape[-2],
+        global_height=global_height,
+        global_start=global_start,
+        height_halo_size=module.height_halo_size,
+        height_pad_top=module.height_pad_top,
+        height_pad_bottom=module.height_pad_bottom,
+        kernel_height=module.kernel_size[-2],
+        dilation_height=module.dilation[-2],
+        stride_height=stride,
+    )
+
+
 class SpatialParallelConv2d(nn.Conv2d):
     def __init__(
         self,
@@ -410,49 +473,11 @@ class SpatialParallelConv2d(nn.Conv2d):
         if any(self._padding):
             x = _pad_with_mode(x, self._padding, self.padding_mode)
 
-        x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
+        return _spatial_parallel_conv_forward(
+            self,
             x,
-            height_halo_size=self.height_halo_size,
-            recv_top_buf=self._halo_recv_top_buf,
-            recv_bottom_buf=self._halo_recv_bottom_buf,
+            super().forward,
             height_pad_mode=self.padding_mode,
-        )
-
-        if self.height_halo_size == 0:
-            return super().forward(x_padded)
-
-        stride = self.stride[-2]
-        if _conv_preserves_local_height(
-            height_halo_size=self.height_halo_size,
-            height_pad_top=self.height_pad_top,
-            height_pad_bottom=self.height_pad_bottom,
-            kernel_height=self.kernel_size[-2],
-            dilation_height=self.dilation[-2],
-            stride_height=stride,
-        ):
-            return super().forward(x_padded)
-
-        heights = gather_height_sizes(x)
-        global_start = sum(heights[: self.rank])
-        global_height = sum(heights)
-        pad_top = self.height_pad_top
-        if stride > 1:
-            shift = (global_start - self.height_halo_size + pad_top) % stride
-            if shift:
-                x_padded = x_padded[..., shift:, :]
-                global_start += shift
-        out = super().forward(x_padded)
-        return _trim_conv_output_height(
-            out,
-            local_height=x.shape[-2],
-            global_height=global_height,
-            global_start=global_start,
-            height_halo_size=self.height_halo_size,
-            height_pad_top=self.height_pad_top,
-            height_pad_bottom=self.height_pad_bottom,
-            kernel_height=self.kernel_size[-2],
-            dilation_height=self.dilation[-2],
-            stride_height=stride,
         )
 
     def _direct_forward(self, x):
@@ -547,57 +572,12 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
                 self.groups,
             )
 
-        # send and recv halo
-        # x_padded: concatenated input
-        x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
+        return _spatial_parallel_conv_forward(
+            self,
             x,
-            height_halo_size=self.height_halo_size,
-            recv_top_buf=self._halo_recv_top_buf,
-            recv_bottom_buf=self._halo_recv_bottom_buf,
+            super().forward,
             height_pad_mode="zeros",
-        )
-
-        x_padded = _match_conv3d_input_format(x_padded, self.weight)
-        if self.height_halo_size == 0:
-            return super().forward(x_padded)
-
-        stride = self.stride[-2]
-        if _conv_preserves_local_height(
-            height_halo_size=self.height_halo_size,
-            height_pad_top=self.height_pad_top,
-            height_pad_bottom=self.height_pad_bottom,
-            kernel_height=self.kernel_size[-2],
-            dilation_height=self.dilation[-2],
-            stride_height=stride,
-        ):
-            return super().forward(x_padded)
-
-        heights = gather_height_sizes(x)
-        global_start = sum(heights[: self.rank])
-        global_height = sum(heights)
-        pad_top = self.height_pad_top
-        if stride > 1:
-            shift = (global_start - self.height_halo_size + pad_top) % stride
-            if shift:
-                x_padded = x_padded[..., shift:, :]
-                global_start += shift
-            x_padded = _match_conv3d_input_format(x_padded, self.weight)
-
-        # performs conv on padded input
-        out = super().forward(x_padded)
-
-        # trim the output to original shape
-        return _trim_conv_output_height(
-            out,
-            local_height=x.shape[-2],
-            global_height=global_height,
-            global_start=global_start,
-            height_halo_size=self.height_halo_size,
-            height_pad_top=self.height_pad_top,
-            height_pad_bottom=self.height_pad_bottom,
-            kernel_height=self.kernel_size[-2],
-            dilation_height=self.dilation[-2],
-            stride_height=stride,
+            match_conv3d_format=True,
         )
 
 
@@ -659,50 +639,12 @@ class SpatialParallelConv3d(nn.Conv3d):
         if any(self._padding):
             x = _pad_with_mode(x, self._padding, self.padding_mode)
 
-        x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
+        return _spatial_parallel_conv_forward(
+            self,
             x,
-            height_halo_size=self.height_halo_size,
-            recv_top_buf=self._halo_recv_top_buf,
-            recv_bottom_buf=self._halo_recv_bottom_buf,
+            super().forward,
             height_pad_mode=self.padding_mode,
-        )
-        x_padded = _match_conv3d_input_format(x_padded, self.weight)
-        if self.height_halo_size == 0:
-            return super().forward(x_padded)
-
-        stride = self.stride[-2]
-        if _conv_preserves_local_height(
-            height_halo_size=self.height_halo_size,
-            height_pad_top=self.height_pad_top,
-            height_pad_bottom=self.height_pad_bottom,
-            kernel_height=self.kernel_size[-2],
-            dilation_height=self.dilation[-2],
-            stride_height=stride,
-        ):
-            return super().forward(x_padded)
-
-        heights = gather_height_sizes(x)
-        global_start = sum(heights[: self.rank])
-        global_height = sum(heights)
-        pad_top = self.height_pad_top
-        if stride > 1:
-            shift = (global_start - self.height_halo_size + pad_top) % stride
-            if shift:
-                x_padded = x_padded[..., shift:, :]
-                global_start += shift
-            x_padded = _match_conv3d_input_format(x_padded, self.weight)
-        out = super().forward(x_padded)
-        return _trim_conv_output_height(
-            out,
-            local_height=x.shape[-2],
-            global_height=global_height,
-            global_start=global_start,
-            height_halo_size=self.height_halo_size,
-            height_pad_top=self.height_pad_top,
-            height_pad_bottom=self.height_pad_bottom,
-            kernel_height=self.kernel_size[-2],
-            dilation_height=self.dilation[-2],
-            stride_height=stride,
+            match_conv3d_format=True,
         )
 
     def _direct_forward(self, x):

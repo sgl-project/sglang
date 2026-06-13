@@ -51,7 +51,6 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     WanDecoder3d,
     WanDistAttentionBlock,
-    WanDistCausalConv3d,
 )
 from sglang.multimodal_gen.runtime.utils.distributed import RankGenerator
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
@@ -353,7 +352,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
             )
 
         self.assertTrue(
-            any(isinstance(m, WanDistCausalConv3d) for m in decoder.modules())
+            any(isinstance(m, SpatialParallelCausalConv3d) for m in decoder.modules())
         )
         self.assertTrue(
             any(isinstance(m, WanDistAttentionBlock) for m in decoder.modules())
