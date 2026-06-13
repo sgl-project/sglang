@@ -536,13 +536,29 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
-                if (
-                    discard_alpha_channel
-                    and not isinstance(img, torch.Tensor)
-                    and img.mode != "RGB"
-                ):
-                    # Needed only when `img` is a PIL image
-                    img = img.convert("RGB")
+                if discard_alpha_channel:
+                    if isinstance(img, torch.Tensor):
+                        # GPU JPEG decode (nvJPEG) returns (C, H, W) preserving
+                        # the source channel count. Downstream HF image
+                        # processors (e.g. Gemma3/Gemma4) assume 3-channel RGB
+                        # and patchify with a fixed in_features=3*patch*patch;
+                        # a grayscale (C=1) image produces patches of the wrong
+                        # shape and crashes the patch-embedder linear layer.
+                        # Normalize to C=3 here so the tensor path matches the
+                        # PIL .convert("RGB") path below.
+                        if img.dim() == 3:
+                            c = img.shape[0]
+                            if c == 1:
+                                img = img.expand(3, -1, -1).contiguous()
+                            elif c == 2:
+                                # LA (luminance + alpha): drop alpha, expand L
+                                img = img[:1].expand(3, -1, -1).contiguous()
+                            elif c == 4:
+                                # RGBA: drop alpha
+                                img = img[:3].contiguous()
+                    elif img.mode != "RGB":
+                        # Needed only when `img` is a PIL image
+                        img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)

@@ -431,6 +431,22 @@ class Gemma4VisionPatchEmbedder(nn.Module):
             pixel_values: [batch, num_patches, patch_pixels] — already patchified
                           by the image processor, values in [0, 1].
         """
+        # Defensive: in_features assumes 3-channel RGB patches
+        # (3 * patch_size**2). A non-RGB image (e.g. a grayscale JPEG that
+        # slipped through GPU-decode without RGB conversion) produces patches
+        # of width patch_size**2 * channels for channels != 3, which would
+        # otherwise surface as a cryptic mat-mul shape mismatch and crash the
+        # scheduler. Surface a typed error here so the upstream isolation
+        # layer in mm_utils can attribute it to the failing request.
+        expected = self.input_proj.in_features
+        if pixel_values.dim() < 1 or pixel_values.shape[-1] != expected:
+            raise ValueError(
+                f"Gemma4VisionPatchEmbedder: pixel_values last dim "
+                f"{tuple(pixel_values.shape)[-1] if pixel_values.dim() else None} "
+                f"!= expected {expected} (= 3 * patch_size**2). "
+                f"This typically means a non-RGB image (1- or 4-channel) "
+                f"reached the vision tower without channel normalization."
+            )
         patches = 2 * (pixel_values - 0.5)
         return self.input_proj(patches.to(self.input_proj.weight.dtype))
 

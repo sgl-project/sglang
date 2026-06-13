@@ -147,6 +147,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_writer
+from sglang.srt.managers.mm_utils import MultimodalEmbeddingError
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     decide_needs_cpu_seq_lens,
@@ -1482,7 +1483,15 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
+                try:
+                    result = self.run_batch(batch)
+                except MultimodalEmbeddingError as e:
+                    # A multimodal item in this batch failed to embed.
+                    # Translate to per-batch aborts so the pod survives;
+                    # see _abort_batch_on_mm_error and embed_mm_inputs.
+                    self._abort_batch_on_mm_error(batch, e)
+                    self.last_batch = batch
+                    continue
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -1528,7 +1537,17 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                try:
+                    batch_result = self.run_batch(batch)
+                except MultimodalEmbeddingError as e:
+                    # See non-overlap loop for rationale. We must still
+                    # advance last_batch and skip the rest of this
+                    # iteration; the result_queue stays untouched so the
+                    # next iteration's pop_and_process sees the previous
+                    # (good) batch.
+                    self._abort_batch_on_mm_error(batch, e)
+                    self.last_batch = batch
+                    continue
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -3047,6 +3066,51 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
+
+    def _abort_batch_on_mm_error(
+        self, batch: ScheduleBatch, err: MultimodalEmbeddingError
+    ) -> None:
+        """Mark every request in ``batch`` as aborted due to a multimodal
+        embedding failure and log the original traceback.
+
+        This is the scheduler-side half of the multimodal blast-radius
+        isolation: ``embed_mm_inputs`` re-raises encoder RuntimeErrors as
+        ``MultimodalEmbeddingError`` so that we can catch them here, mark
+        the offending batch's requests as FINISH_ABORT, and keep the
+        scheduler event loop running instead of SIGQUIT-ing the pod.
+
+        NOTE: This currently aborts ALL requests in the failing batch
+        because the embed layer cannot yet attribute the failure to a
+        specific item / rid. Per-request attribution (retry items
+        one-by-one to identify the failing index, then abort only that
+        request and re-run the remainder) is the follow-up; see the
+        sketch in the linked issue.
+        """
+        logger.error(
+            "MultimodalEmbeddingError in batch (modality=%s, num_items=%d): %s. "
+            "Aborting %d request(s) in this batch; pod stays up.",
+            err.modality.name.lower(),
+            err.num_items,
+            err.original_error,
+            len(batch.reqs) if batch is not None else 0,
+        )
+        if batch is None:
+            return
+        message = (
+            f"Multimodal {err.modality.name.lower()} embedding failed for this "
+            f"batch: {type(err.original_error).__name__}: {err.original_error}. "
+            f"One of the multimodal items in the batch is malformed; per-request "
+            f"attribution is not yet wired up so all requests sharing this "
+            f"forward are aborted."
+        )
+        for req in batch.reqs:
+            if req.finished():
+                continue
+            req.to_finish = FINISH_ABORT(
+                message,
+                HTTPStatus.BAD_REQUEST,
+                err_type="MultimodalEmbeddingError",
+            )
 
     def run_batch(
         self,
