@@ -94,6 +94,8 @@ class VideoGenerationsRequest(BaseModel):
     prompt: str
     input_reference: Optional[str] = None
     reference_url: Optional[str] = None
+    video_path: Optional[str] = None
+    video_url: Optional[str] = None
     model: Optional[str] = None
     n: Optional[int] = 1
     num_outputs_per_prompt: Optional[int] = None
@@ -116,6 +118,21 @@ class VideoGenerationsRequest(BaseModel):
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
     enable_teacache: Optional[bool] = False
+    # Cosmos3 sound / V2V / action extensions.
+    generate_sound: Optional[bool] = None
+    sound_duration: Optional[float] = None
+    condition_frame_indexes: Optional[List[int]] = None
+    condition_frame_indexes_vision: Optional[List[int]] = None
+    condition_video_keep: Optional[str] = None
+    action_mode: Optional[str] = None
+    domain_id: Optional[int] = None
+    domain_name: Optional[str] = None
+    raw_action_dim: Optional[int] = None
+    action_fps: Optional[float] = None
+    action: Optional[Any] = None
+    action_view_point: Optional[str] = None
+    action_stats_path: Optional[str] = None
+    action_normalization: Optional[str] = None
     # Frame interpolation
     enable_frame_interpolation: Optional[bool] = False
     frame_interpolation_exp: Optional[int] = 1  # 1=2×, 2=4×

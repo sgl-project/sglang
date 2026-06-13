@@ -50,9 +50,28 @@ from sglang.srt.observability.trace import extract_trace_headers
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
+_VIDEO_EXTENSIONS = {
+    ".avi",
+    ".gif",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".webm",
+}
+
 
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
     return (request.model_extra or {}).get(name)
+
+
+def _request_value(request: VideoGenerationsRequest, name: str) -> Any:
+    value = getattr(request, name, None)
+    if value is not None:
+        return value
+    return _extra_value(request, name)
 
 
 def _parse_form_extra_value(value: Any) -> Any:
@@ -64,15 +83,151 @@ def _parse_form_extra_value(value: Any) -> Any:
         return value
 
 
+def _is_probably_video_source(source: Any) -> bool:
+    content_type = (getattr(source, "content_type", "") or "").lower()
+    if content_type.startswith("video/"):
+        return True
+
+    if isinstance(source, str):
+        if source.lower().startswith("data:video"):
+            return True
+        source_name = source
+    else:
+        source_name = getattr(source, "filename", None)
+
+    if not source_name:
+        return False
+    source_name = str(source_name).split("?", 1)[0].split("#", 1)[0]
+    return os.path.splitext(source_name)[1].lower() in _VIDEO_EXTENSIONS
+
+
+def _is_cosmos3_server(server_args) -> bool:
+    pipeline_config = getattr(server_args, "pipeline_config", None)
+    values = (
+        getattr(server_args, "model_path", None),
+        getattr(server_args, "pipeline_class_name", None),
+        type(pipeline_config).__name__ if pipeline_config is not None else None,
+    )
+    return any("cosmos3" in str(value).lower() for value in values if value)
+
+
+def _normalize_optional_string(value: Any) -> Any:
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def _coerce_optional_int_list(value: Any) -> list[int] | None:
+    value = _parse_form_extra_value(value)
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(value)]
+
+
+def _resolve_video_path(req: VideoGenerationsRequest) -> str | None:
+    video_path = _request_value(req, "video_path") or _request_value(req, "video_url")
+    if video_path:
+        return str(video_path)
+
+    input_reference = _request_value(req, "input_reference")
+    if _is_probably_video_source(input_reference):
+        return str(input_reference)
+
+    reference_url = _request_value(req, "reference_url")
+    if _is_probably_video_source(reference_url):
+        return str(reference_url)
+
+    return None
+
+
+def _resolve_image_path(
+    req: VideoGenerationsRequest, video_path: str | None
+) -> str | None:
+    image_path = _request_value(req, "input_reference")
+    if video_path and image_path == video_path:
+        return None
+    if _is_probably_video_source(image_path):
+        return None
+    return image_path
+
+
+def _resolve_sound_duration(
+    req: VideoGenerationsRequest, *, num_frames: int, fps: int
+) -> float | None:
+    generate_sound = _request_value(req, "generate_sound")
+    sound_duration = _request_value(req, "sound_duration")
+
+    if generate_sound is False:
+        return 0.0
+    if sound_duration is not None:
+        return float(sound_duration)
+    if generate_sound is True:
+        return float(num_frames) / float(fps)
+    return None
+
+
+def _cosmos3_sampling_param_kwargs(
+    req: VideoGenerationsRequest, *, num_frames: int, fps: int
+) -> Dict[str, Any]:
+    """Map HTTP/API aliases to Cosmos3SamplingParams field names."""
+    kwargs: Dict[str, Any] = {}
+
+    sound_duration = _resolve_sound_duration(req, num_frames=num_frames, fps=fps)
+    if sound_duration is not None:
+        kwargs["sound_duration"] = sound_duration
+
+    condition_frame_indexes = _request_value(req, "condition_frame_indexes")
+    if condition_frame_indexes is None:
+        condition_frame_indexes = _request_value(
+            req, "condition_frame_indexes_vision"
+        )
+    condition_frame_indexes = _coerce_optional_int_list(condition_frame_indexes)
+    if condition_frame_indexes is not None:
+        kwargs["condition_frame_indexes"] = condition_frame_indexes
+
+    for name in (
+        "condition_video_keep",
+        "action_mode",
+        "domain_id",
+        "domain_name",
+        "raw_action_dim",
+        "action_fps",
+        "action",
+        "action_view_point",
+        "action_stats_path",
+        "action_normalization",
+    ):
+        value = _parse_form_extra_value(_request_value(req, name))
+        value = _normalize_optional_string(value)
+        if value is not None:
+            kwargs[name] = value
+
+    return kwargs
+
+
 def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
     """Resolve video-specific defaults (fps, seconds → num_frames) then
     delegate to the shared build_sampling_params."""
+    server_args = get_global_server_args()
     seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
     fps = request.fps if request.fps is not None else DEFAULT_FPS
-    num_frames = request.num_frames if request.num_frames is not None else fps * seconds
+    num_frames = (
+        request.num_frames if request.num_frames is not None else fps * seconds
+    )
     num_outputs = request.num_outputs_per_prompt
     if num_outputs is None:
         num_outputs = request.n or 1
+    video_path = _resolve_video_path(request)
+    image_path = _resolve_image_path(request, video_path)
+    cosmos3_kwargs = (
+        _cosmos3_sampling_param_kwargs(request, num_frames=num_frames, fps=fps)
+        if _is_cosmos3_server(server_args)
+        else {}
+    )
 
     return build_sampling_params(
         request_id,
@@ -83,7 +238,8 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         height=request.height,
         num_frames=num_frames,
         fps=fps,
-        image_path=request.input_reference,
+        image_path=image_path,
+        video_path=video_path,
         output_file_name=request_id,
         seed=request.seed,
         generator_device=request.generator_device,
@@ -110,31 +266,8 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         output_quality=request.output_quality,
         perf_dump_path=request.perf_dump_path,
         diffusers_kwargs=request.diffusers_kwargs,
+        **cosmos3_kwargs,
     )
-
-
-def _reject_unsupported_cosmos3_modes(
-    req: VideoGenerationsRequest, model_path: str | None
-) -> None:
-    if "cosmos3" not in (model_path or "").lower():
-        return
-
-    extra = req.model_extra or {}
-    if extra.get("generate_sound"):
-        raise HTTPException(
-            status_code=400,
-            detail="Cosmos3 video-with-sound is not supported by SGLang yet; omit generate_sound for video-only generation.",
-        )
-    if extra.get("action_mode"):
-        raise HTTPException(
-            status_code=400,
-            detail="Cosmos3 action generation is not supported by SGLang yet.",
-        )
-    if extra.get("condition_frame_indexes_vision") or extra.get("condition_video_keep"):
-        raise HTTPException(
-            status_code=400,
-            detail="Cosmos3 video-to-video conditioning is not supported by SGLang yet.",
-        )
 
 
 # extract metadata which http_server needs to know
@@ -234,6 +367,9 @@ async def create_video(
     prompt: Optional[str] = Form(None),
     input_reference: Optional[UploadFile] = File(None),
     reference_url: Optional[str] = Form(None),
+    video_reference: Optional[UploadFile] = File(None),
+    video_url: Optional[str] = Form(None),
+    video_path: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     num_outputs_per_prompt: Optional[int] = Form(None),
@@ -249,6 +385,20 @@ async def create_video(
     max_sequence_length: Optional[int] = Form(None),
     flow_shift: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(None),
+    generate_sound: Optional[bool] = Form(None),
+    sound_duration: Optional[float] = Form(None),
+    condition_frame_indexes: Optional[str] = Form(None),
+    condition_frame_indexes_vision: Optional[str] = Form(None),
+    condition_video_keep: Optional[str] = Form(None),
+    action_mode: Optional[str] = Form(None),
+    domain_id: Optional[int] = Form(None),
+    domain_name: Optional[str] = Form(None),
+    raw_action_dim: Optional[int] = Form(None),
+    action_fps: Optional[float] = Form(None),
+    action: Optional[str] = Form(None),
+    action_view_point: Optional[str] = Form(None),
+    action_stats_path: Optional[str] = Form(None),
+    action_normalization: Optional[str] = Form(None),
     enable_frame_interpolation: Optional[bool] = Form(None),
     frame_interpolation_exp: Optional[int] = Form(None),
     frame_interpolation_scale: Optional[float] = Form(None),
@@ -287,24 +437,51 @@ async def create_video(
     if "multipart/form-data" in content_type:
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
-        # Validate image input based on model task type
+
+        video_input_path = None
         image_sources = merge_image_input_list(input_reference, reference_url)
+        if video_reference is not None:
+            video_input_path = await _save_first_input_image(
+                video_reference,
+                request_id,
+                uploads_dir,
+                prefer_remote_source=server_args.input_save_path is None,
+            )
+        elif video_path or video_url:
+            video_input_path = video_path or video_url
+        elif input_reference is not None and _is_probably_video_source(
+            input_reference
+        ):
+            video_input_path = await _save_first_input_image(
+                input_reference,
+                request_id,
+                uploads_dir,
+                prefer_remote_source=server_args.input_save_path is None,
+            )
+            image_sources = merge_image_input_list(reference_url)
+        elif reference_url and _is_probably_video_source(reference_url):
+            video_input_path = reference_url
+            image_sources = merge_image_input_list(input_reference)
+
+        # Validate image input based on model task type
         if task_type.requires_image_input() and not image_sources:
             raise HTTPException(
                 status_code=400,
                 detail="input_reference or reference_url is required for image-to-video generation",
             )
-        try:
-            input_path = await _save_first_input_image(
-                image_sources,
-                request_id,
-                uploads_dir,
-                prefer_remote_source=server_args.input_save_path is None,
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=400, detail=f"Failed to process image source: {str(e)}"
-            )
+        input_path = None
+        if image_sources:
+            try:
+                input_path = await _save_first_input_image(
+                    image_sources,
+                    request_id,
+                    uploads_dir,
+                    prefer_remote_source=server_args.input_save_path is None,
+                )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400, detail=f"Failed to process image source: {str(e)}"
+                )
 
         # Parse extra_body JSON (if provided in multipart form) to get fps/num_frames overrides
         extra_from_form: Dict[str, Any] = {}
@@ -322,7 +499,8 @@ async def create_video(
                 pass
 
         def form_value(name: str, value: Any) -> Any:
-            return value if value is not None else extra_from_form.get(name)
+            selected = value if value is not None else extra_from_form.get(name)
+            return _parse_form_extra_value(selected)
 
         raw_form = await request.form()
         for key in (
@@ -331,9 +509,20 @@ async def create_video(
             "use_system_prompt",
             "use_guardrails",
             "guardrails",
+            "video_path",
+            "video_url",
             "generate_sound",
             "sound_duration",
+            "condition_frame_indexes",
             "action_mode",
+            "domain_id",
+            "domain_name",
+            "raw_action_dim",
+            "action_fps",
+            "action",
+            "action_view_point",
+            "action_stats_path",
+            "action_normalization",
             "condition_frame_indexes_vision",
             "condition_video_keep",
         ):
@@ -353,6 +542,8 @@ async def create_video(
         req = VideoGenerationsRequest(
             prompt=prompt,
             input_reference=input_path,
+            video_path=form_value("video_path", video_input_path),
+            video_url=form_value("video_url", video_url),
             model=form_value("model", model),
             n=form_value("n", n),
             num_outputs_per_prompt=form_value(
@@ -370,6 +561,28 @@ async def create_video(
             max_sequence_length=form_value("max_sequence_length", max_sequence_length),
             flow_shift=form_value("flow_shift", flow_shift),
             enable_teacache=form_value("enable_teacache", enable_teacache),
+            generate_sound=form_value("generate_sound", generate_sound),
+            sound_duration=form_value("sound_duration", sound_duration),
+            condition_frame_indexes=form_value(
+                "condition_frame_indexes", condition_frame_indexes
+            ),
+            condition_frame_indexes_vision=form_value(
+                "condition_frame_indexes_vision", condition_frame_indexes_vision
+            ),
+            condition_video_keep=form_value(
+                "condition_video_keep", condition_video_keep
+            ),
+            action_mode=form_value("action_mode", action_mode),
+            domain_id=form_value("domain_id", domain_id),
+            domain_name=form_value("domain_name", domain_name),
+            raw_action_dim=form_value("raw_action_dim", raw_action_dim),
+            action_fps=form_value("action_fps", action_fps),
+            action=form_value("action", action),
+            action_view_point=form_value("action_view_point", action_view_point),
+            action_stats_path=form_value("action_stats_path", action_stats_path),
+            action_normalization=form_value(
+                "action_normalization", action_normalization
+            ),
             enable_frame_interpolation=form_value(
                 "enable_frame_interpolation", enable_frame_interpolation
             ),
@@ -414,8 +627,19 @@ async def create_video(
                 payload.update(flatten_extra_params(extra_json))
             flatten_extra_params(payload)
             # Validate image input based on model task type
-            has_image_input = payload.get("reference_url") or payload.get(
-                "input_reference"
+            if payload.get("video_url") and not payload.get("video_path"):
+                payload["video_path"] = payload["video_url"]
+            if _is_probably_video_source(payload.get("reference_url")):
+                payload.setdefault("video_path", payload.get("reference_url"))
+            if _is_probably_video_source(payload.get("input_reference")):
+                payload.setdefault("video_path", payload.get("input_reference"))
+
+            has_image_input = (
+                payload.get("reference_url")
+                and not _is_probably_video_source(payload.get("reference_url"))
+            ) or (
+                payload.get("input_reference")
+                and not _is_probably_video_source(payload.get("input_reference"))
             )
             if task_type.requires_image_input() and not has_image_input:
                 raise HTTPException(
@@ -423,7 +647,9 @@ async def create_video(
                     detail="input_reference or reference_url is required for image-to-video generation",
                 )
             # for non-multipart/form-data type
-            if payload.get("reference_url"):
+            if payload.get("reference_url") and not _is_probably_video_source(
+                payload.get("reference_url")
+            ):
                 try:
                     input_path = await _save_first_input_image(
                         payload.get("reference_url"),
@@ -453,8 +679,6 @@ async def create_video(
     req.output_path = effective_output_path
 
     logger.debug(f"Server received from create_video endpoint: req={req}")
-
-    _reject_unsupported_cosmos3_modes(req, server_args.model_path)
 
     try:
         sampling_params = _build_video_sampling_params(request_id, req)
