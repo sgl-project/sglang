@@ -118,6 +118,17 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
+    def has_draft_kv(self) -> bool:
+        """Whether the draft phase writes KV chains. NGRAM does not (its tree
+        lives only in the verify mask), so per-decode KV sizing needs no
+        per-topk page rounding; see get_alloc_len_per_decode."""
+        return not self.is_ngram()
+
+    def carries_draft_hidden_states(self) -> bool:
+        """Whether the disagg prefill->decode transfer carries draft hidden
+        states (EAGLE-family only; STANDALONE's vanilla draft ignores them)."""
+        return self.is_eagle()
+
     def create_future_map(
         self,
         device: torch.device,
@@ -145,7 +156,7 @@ class SpeculativeAlgorithm(Enum):
             )
         return None
 
-    def supports_spec_v2(self) -> bool:
+    def need_topk(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
     def get_num_tokens_per_bs_for_target_verify(
@@ -165,16 +176,12 @@ class SpeculativeAlgorithm(Enum):
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
 
-        enable_overlap = not server_args.disable_overlap_schedule
-
         if self.is_dflash():
-            if enable_overlap:
-                raise ValueError(
-                    "DFLASH does not support overlap scheduling (spec v2)."
-                )
-            from sglang.srt.speculative.dflash_worker import DFlashWorker
+            # V2 worker drives both overlap and non-overlap (scheduler runs it
+            # synchronously when overlap is disabled), same as EAGLE.
+            from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
-            return DFlashWorker
+            return DFlashWorkerV2
 
         if self.is_frozen_kv_mtp():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -205,11 +212,6 @@ class SpeculativeAlgorithm(Enum):
 
             return StandaloneWorkerV2
         elif self.is_ngram():
-            if enable_overlap:
-                raise ValueError(
-                    f"Speculative algorithm {self.name} does not support overlap worker creation."
-                )
-
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
@@ -269,3 +271,66 @@ class SpecInput(ABC):
             x * c2 for x in batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
+
+
+def create_dummy_verify_input(
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+    custom_mask: torch.Tensor,
+    num_tokens_per_bs: int,
+    is_draft_worker: bool,
+) -> Optional[SpecInput]:
+    """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch)."""
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+    spec_info = None
+    if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        if is_draft_worker:
+            raise RuntimeError("This should not happen.")
+        else:
+            spec_info = EagleVerifyInput(
+                draft_token=None,
+                custom_mask=custom_mask,
+                positions=None,
+                retrieve_index=None,
+                retrieve_next_token=None,
+                retrieve_next_sibling=None,
+                retrieve_cum_len=None,
+                spec_steps=server_args.speculative_num_steps,
+                topk=server_args.speculative_eagle_topk,
+                draft_token_num=server_args.speculative_num_draft_tokens,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+            )
+    elif spec_algorithm.is_dflash():
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+        spec_info = DFlashVerifyInput(
+            draft_token=None,
+            positions=None,
+            draft_token_num=server_args.speculative_num_draft_tokens,
+            custom_mask=None,
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
+            ),
+        )
+
+    elif spec_algorithm.is_ngram():
+        from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+        spec_info = NgramVerifyInput(
+            draft_token=None,
+            custom_mask=custom_mask,
+            positions=None,
+            retrieve_index=None,
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            draft_token_num=num_tokens_per_bs,
+        )
+        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+    return spec_info

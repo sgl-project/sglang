@@ -485,7 +485,7 @@ def _phase_a_z_kernel(
             k_inv_rms_ptr + pid_b * N + n_idx, mask=mask_s, other=1.0
         ).to(tl.float32)
         K_normed = K_raw * k_inv_rms[:, None] * k_nw[None, :]
-        K = tl.where(K_normed > 0, K_normed, 0.0) * k_scale
+        K = (tl.where(K_normed > 0, K_normed, 0.0) * k_scale).to(tl.float32)
 
         beta_K = beta_t[:, None] * K
 

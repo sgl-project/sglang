@@ -81,10 +81,12 @@ If a plugin is configured but its dependencies are missing, it will be skipped.
 For POSIX / GDS / GDS_MT file-based backends, the default storage location is `/tmp/hicache_storage`. However, you can customize where cached data is stored:
 
 ```bash
-export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/storage/dir
+# When specifying multiple storage directories. SGLang routes each cache object to one
+# directory with a stable hash.
+export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/storage/dir1,/path/to/storage/dir2,/path/to/storage/dir3
 ```
 
-This directory is used only for **FILE-backed** plugins. **OBJ-backed** plugins use object keys instead of local files.
+These directories are used only for **FILE-backed** plugins. **OBJ-backed** plugins use object keys instead of local files.
 
 ### 3. How to Provide Configuration for Backends
 
@@ -300,7 +302,7 @@ python/sglang/srt/mem_cache/storage/nixl/
 
 ### HiCache / NIXL Data Model
 
-- **FILE backends** use local file paths under `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`
+- **FILE backends** use local file paths under `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`. When multiple comma-separated directories are configured, each logical cache key is routed to one base directory with a stable hash and stored as `base_dir/<bucket>/<key>`.
 - **OBJ backends** use object keys directly
 - **MHA naming** includes TP rank and TP size, so each rank stores its own KV data
 - **MLA naming** omits TP rank, so all ranks refer to one shared logical KV object / file
