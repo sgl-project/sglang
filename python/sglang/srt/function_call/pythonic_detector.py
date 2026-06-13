@@ -5,7 +5,6 @@ import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -88,11 +87,8 @@ class PythonicDetector(BaseFormatDetector):
                 function_name = call.func.id
                 # Validate that the function exists in the tools
                 if function_name not in tool_indices:
-                    logger.warning(
-                        f"Model attempted to call undefined function: {function_name}"
-                    )
-                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                        continue  # Skip unknown tools (default legacy behavior)
+                    if self._handle_unknown_tool(function_name):
+                        continue
 
                 arguments = {}
                 for keyword in call.keywords:
