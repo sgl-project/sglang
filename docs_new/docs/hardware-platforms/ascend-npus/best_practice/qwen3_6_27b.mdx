@@ -301,7 +301,10 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
+`--gsp-system-prompt-len 57600` = `int(64000 * 0.9)` is the shared prefix portion.
+`--gsp-question-len 6399` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -309,14 +312,14 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --gsp-num-groups 1 \
+    --gsp-prompts-per-group 80 \
+    --gsp-system-prompt-len 57600 \
+    --gsp-question-len 6399 \
+    --gsp-output-len 1000 \
     --max-concurrency 20 \
-    --random-input-len 64000 \
-    --random-output-len 1000 \
     --num-prompts 80 \
-    --random-range-ratio 1 \
-    --request-rate inf \
-    --warmup-requests 1 \
-    --extra-request-body repeat_rate=0.9
+    --request-rate inf
 ```
 
 ### Qwen3.6-27B W8A8 1P IN3K5 OUT1K5 50ms

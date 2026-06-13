@@ -399,7 +399,10 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
+`--gsp-system-prompt-len 57600` = `int(64000 * 0.9)` is the shared prefix portion.
+`--gsp-question-len 6399` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -407,13 +410,14 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --gsp-num-groups 1 \
+    --gsp-prompts-per-group 412 \
+    --gsp-system-prompt-len 57600 \
+    --gsp-question-len 6399 \
+    --gsp-output-len 1000 \
     --max-concurrency 103 \
-    --random-input-len 64000 \
-    --random-output-len 1000 \
     --num-prompts 412 \
-    --random-range-ratio 1 \
-    --request-rate inf \
-    --extra-request-body repeat_rate=0.9
+    --request-rate inf
 ```
 
 ### Qwen3.6-35B-A3B 1P IN254K OUT1K
@@ -782,7 +786,10 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
+`--gsp-system-prompt-len 58982` = `int(65536 * 0.9)` is the shared prefix portion.
+`--gsp-question-len 6553` = `int(65536 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -790,13 +797,14 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --gsp-num-groups 1 \
+    --gsp-prompts-per-group 42 \
+    --gsp-system-prompt-len 58982 \
+    --gsp-question-len 6553 \
+    --gsp-output-len 1024 \
     --max-concurrency 42 \
-    --random-input-len 65536 \
-    --random-output-len 1024 \
     --num-prompts 42 \
-    --random-range-ratio 1 \
-    --request-rate inf \
-    --extra-request-body repeat_rate=0.9
+    --request-rate inf
 ```
 
 ### Qwen3.6-35B-A3B 2P IN984K OUT1K

@@ -340,7 +340,10 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
+`--gsp-system-prompt-len 117964` = `int(131072 * 0.9)` is the shared prefix portion.
+`--gsp-question-len 13107` = `int(131072 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -348,14 +351,14 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --gsp-num-groups 1 \
+    --gsp-prompts-per-group 40 \
+    --gsp-system-prompt-len 117964 \
+    --gsp-question-len 13107 \
+    --gsp-output-len 1024 \
     --max-concurrency 40 \
-    --random-input-len 131072 \
-    --random-output-len 1024 \
     --num-prompts 40 \
-    --random-range-ratio 1 \
-    --request-rate inf \
-    --warmup-requests 0 \
-    --extra-request-body repeat_rate=0.9
+    --request-rate inf
 ```
 
 ### Qwen3.5-397B W4A8 8P IN16K OUT1K 20ms
@@ -1130,7 +1133,10 @@ python3 -m sglang.launch_server \
 
 #### Benchmark
 
-We tested it based on the `generated-shared-prefix` dataset with 90% cache hit.
+We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
+`--gsp-system-prompt-len 58982` = `int(65536 * 0.9)` is the shared prefix portion.
+`--gsp-question-len 6553` = `int(65536 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -1138,12 +1144,12 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
+    --gsp-num-groups 1 \
+    --gsp-prompts-per-group 128 \
+    --gsp-system-prompt-len 58982 \
+    --gsp-question-len 6553 \
+    --gsp-output-len 1024 \
     --max-concurrency 128 \
-    --random-input-len 65536 \
-    --random-output-len 1024 \
     --num-prompts 128 \
-    --random-range-ratio 1 \
-    --request-rate inf \
-    --warmup-requests 0 \
-    --extra-request-body repeat_rate=0.9
+    --request-rate inf
 ```
