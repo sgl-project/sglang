@@ -63,10 +63,12 @@ your dispatch prompt, or ask for it.
    including combos that look memory-infeasible; keep them verbatim and list
    them in the PR body for the re-verification track.
 4. **Engines are read-only.** `_deployment.jsx` / `_playground.jsx` must not
-   change in a migration PR. If the model needs an engine capability (a new
-   axis, accuracy labels, …), that is a separate prior PR. The every-feature
-   rule (step 2) triggers this routinely: a legacy control no built-in axis
-   covers means an engine-axis PR lands first.
+   change in a migration PR. Model-specific features are config DATA consumed
+   by generic axis handlers (MegaMoE precedent), so they need NO engine
+   change — only a genuinely new control *shape* does, and then as a one-time
+   generic primitive (never a model-named handler) on a separate prior PR
+   (engine-axis.md). KV Cache DType / mamba-cache select trigger this once for
+   the whole round; afterwards both are config.
 5. **`github.cookbookModel` must be set** (`<hf-org>/<page-slug>`, e.g.
    `qwen/qwen3.5`) and the block never pruned — without it Submit ↗ mislabels
    as deepseek-v4. The issue template itself needs NO edits (free-form input).
@@ -113,10 +115,14 @@ ON — EXCEPT parsers:
 `--reasoning-parser`/`--tool-call-parser` are NEVER baked into cells, they are
 Playground-only (DSv4 convention). **Every legacy control survives as an
 interactive control** — a dimension or a Playground axis, never a tips-only
-mention. A feature none of the built-in axes covers (Nemotron3's "KV Cache
-DType" radio is the precedent) still lands in the Playground: add the axis
-via a separate PRIOR engine PR (engine-axis.md), keeping the migration PR
-itself data-only (hard rule 4). The strategy count follows the page's
+mention — and a model-specific control is **config data, not engine code**
+(MegaMoE W4A4 is all DSv4 config on the existing `moe` axis). It's pure
+config whenever it fits an existing axis's data schema. Only a genuinely new
+*shape* (Nemotron3's "KV Cache DType" — a titled single-select stripping a
+flag family no axis manages) needs the engine, and then as a ONE-TIME
+generic config-parameterized primitive (never a model-named handler) on a
+separate PRIOR engine PR, keeping the migration PR data-only (hard rule 4,
+engine-axis.md). The strategy count follows the page's
 operating points: **one recipe → a single `balanced`; two → `low-latency` +
 `high-throughput`; three → the full trio (the ideal)**. The tiers apply per
 (hw × variant × quant) combination — a single-recipe combination on a
