@@ -76,6 +76,10 @@ def is_layer_skipped(
     # proj_name: q_proj
     proj_name = prefix.split(".")[-1]
 
+    # Honor explicit ignores for fused module names (e.g. in_proj_ba).
+    if any(ignored in prefix for ignored in ignored_layers):
+        return True
+
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
