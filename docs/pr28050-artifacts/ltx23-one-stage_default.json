@@ -1,0 +1,195 @@
+{
+  "timestamp": "2026-06-13T01:32:28.006007+00:00",
+  "request_id": "4efa6f61-e745-429b-b06e-898a025491f9",
+  "commit_hash": "696b8b240b871aa98b4ce9c44a2f3bbe557a5055",
+  "tag": "cli_generate",
+  "total_duration_ms": 26965.384054929018,
+  "steps": [
+    {
+      "name": "InputValidationStage",
+      "duration_ms": 0.06809085607528687
+    },
+    {
+      "name": "TextEncodingStage",
+      "duration_ms": 918.8659889623523
+    },
+    {
+      "name": "LTX2TextConnectorStage",
+      "duration_ms": 23.97856116294861
+    },
+    {
+      "name": "LTX2SigmaPreparationStage",
+      "duration_ms": 0.9435452520847321
+    },
+    {
+      "name": "TimestepPreparationStage",
+      "duration_ms": 0.3573838621377945
+    },
+    {
+      "name": "LTX2AVLatentPreparationStage",
+      "duration_ms": 0.18075015395879745
+    },
+    {
+      "name": "LTX2ImageEncodingStage",
+      "duration_ms": 0.02095988020300865
+    },
+    {
+      "name": "LTX2AVDenoisingStage",
+      "duration_ms": 25177.669574972242
+    },
+    {
+      "name": "LTX2AVDecodingStage",
+      "duration_ms": 738.7180710211396
+    },
+    {
+      "name": "Scheduler.return_result.spill_arrays",
+      "duration_ms": 0.12936489656567574
+    },
+    {
+      "name": "SchedulerClient.materialize_file_refs",
+      "duration_ms": 0.04950026050209999
+    }
+  ],
+  "denoise_steps_ms": [
+    {
+      "step": 0,
+      "duration_ms": 845.886898227036
+    },
+    {
+      "step": 1,
+      "duration_ms": 833.6159843020141
+    },
+    {
+      "step": 2,
+      "duration_ms": 835.061346180737
+    },
+    {
+      "step": 3,
+      "duration_ms": 837.2592101804912
+    },
+    {
+      "step": 4,
+      "duration_ms": 838.3178082294762
+    },
+    {
+      "step": 5,
+      "duration_ms": 842.2118779271841
+    },
+    {
+      "step": 6,
+      "duration_ms": 834.3746974132955
+    },
+    {
+      "step": 7,
+      "duration_ms": 841.5450528264046
+    },
+    {
+      "step": 8,
+      "duration_ms": 841.5416600182652
+    },
+    {
+      "step": 9,
+      "duration_ms": 838.4151519276202
+    },
+    {
+      "step": 10,
+      "duration_ms": 842.3341494053602
+    },
+    {
+      "step": 11,
+      "duration_ms": 838.3819190785289
+    },
+    {
+      "step": 12,
+      "duration_ms": 836.6337041370571
+    },
+    {
+      "step": 13,
+      "duration_ms": 837.7718487754464
+    },
+    {
+      "step": 14,
+      "duration_ms": 836.99815813452
+    },
+    {
+      "step": 15,
+      "duration_ms": 840.8481408841908
+    },
+    {
+      "step": 16,
+      "duration_ms": 842.7347191609442
+    },
+    {
+      "step": 17,
+      "duration_ms": 842.9693840444088
+    },
+    {
+      "step": 18,
+      "duration_ms": 838.9466279186308
+    },
+    {
+      "step": 19,
+      "duration_ms": 840.9249410033226
+    },
+    {
+      "step": 20,
+      "duration_ms": 839.8786331526935
+    },
+    {
+      "step": 21,
+      "duration_ms": 837.5859679654241
+    },
+    {
+      "step": 22,
+      "duration_ms": 842.332614120096
+    },
+    {
+      "step": 23,
+      "duration_ms": 844.4808525964618
+    },
+    {
+      "step": 24,
+      "duration_ms": 837.781127076596
+    },
+    {
+      "step": 25,
+      "duration_ms": 834.2757229693234
+    },
+    {
+      "step": 26,
+      "duration_ms": 835.2656620554626
+    },
+    {
+      "step": 27,
+      "duration_ms": 834.034854080528
+    },
+    {
+      "step": 28,
+      "duration_ms": 836.7348522879183
+    },
+    {
+      "step": 29,
+      "duration_ms": 840.1787336915731
+    }
+  ],
+  "memory_checkpoints": {
+    "before_forward": {
+      "allocated_mb": 46849.12,
+      "reserved_mb": 57910.0,
+      "peak_allocated_mb": 46849.12,
+      "peak_reserved_mb": 57910.0
+    },
+    "after_forward": {
+      "allocated_mb": 47245.2,
+      "reserved_mb": 57910.0,
+      "peak_allocated_mb": 51937.98,
+      "peak_reserved_mb": 57910.0
+    }
+  },
+  "meta": {
+    "prompt": [
+      "A beautiful sunset over the ocean"
+    ],
+    "model": "Lightricks/LTX-2.3"
+  }
+}

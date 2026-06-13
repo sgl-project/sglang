@@ -11,3 +11,10 @@
 | 1 | 9.970 s | 10.864 s | 8.575 s | 9.321 s |
 | 2 | 9.994 s | 8.837 s | 8.618 s | 7.523 s |
 | 3 | 9.739 s | 8.565 s | 8.402 s | 7.247 s |
+
+Supplemental LTX-2.3 extra preset, final PR commit `696b8b240b871aa98b4ce9c44a2f3bbe557a5055`:
+
+| Preset | Mode | E2E | Denoise | Peak mem | Notes |
+|---|---|---:|---:|---:|---|
+| `ltx23-one-stage` | `default` | 26.965 s | 25.178 s | 56.6 GB | Native SGLang backend, production helper command, 2x B200 |
+| `ltx23-one-stage` | `max-autotune-no-cudagraphs` | n/a | n/a | n/a | Attempted forced mode; stopped after ~14 min in inductor autotune without a valid perf dump |

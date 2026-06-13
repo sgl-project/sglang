@@ -1,0 +1,420 @@
+
+================================================================
+[DEFAULT] ltx23-one-stage
+  CUDA_VISIBLE_DEVICES=4,6
+  sglang \
+  generate \
+  --backend=sglang \
+  --model-path=Lightricks/LTX-2.3 \
+  --prompt=A beautiful sunset over the ocean \
+  --seed=1234 \
+  --negative-prompt=shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static. \
+  --width=768 \
+  --height=512 \
+  --num-frames=121 \
+  --fps=24 \
+  --num-inference-steps=30 \
+  --guidance-scale=3.0 \
+  --num-gpus=2 \
+  --save-output \
+  --warmup \
+  --enable-torch-compile \
+  --perf-dump-path \
+  /tmp/pr28050_ltx2_sweep/ltx23_extra_mode_compare_20260613_010133/ltx23-one-stage_default.json
+
+Unable to import `torchao` Tensor objects. This may affect loading checkpoints serialized with `torchao`
+
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]
+Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 4181.76it/s]
+[06-13 01:01:53] Auto memory policy for LTX23PipelineConfig selected layerwise offload components: text_encoder, image_encoder, vae
+[06-13 01:01:54] Disabling component offload for LTX23PipelineConfig because minimum available memory on selected GPUs is 171.33 GiB: dit_cpu_offload=False
+[06-13 01:01:54] Downloading overlay metadata for Lightricks/LTX-2.3 from MickJ/LTX-2.3-overlay
+
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]
+Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 64527.75it/s]
+[06-13 01:01:54] Automatically enabled CFG parallel for 2 GPUs. Use --sp-degree / --ulysses-degree to use sequence parallelism instead.
+[06-13 01:01:54] Automatically set torch_sdpa backend for component text_encoder to preserve LTX2 official attention semantics
+[06-13 01:01:54] server_args: {"model_path": "Lightricks/LTX-2.3", "model_id": null, "backend": "sglang", "attention_backend": null, "attention_backend_config": {}, "component_attention_backends": {"text_encoder": "torch_sdpa"}, "cache_dit_config": null, "nccl_port": null, "trust_remote_code": false, "revision": null, "num_gpus": 2, "performance_mode": "auto", "base_gpu_id": 0, "gpu_ids": null, "tp_size": 1, "sp_degree": 1, "ulysses_degree": 1, "ring_degree": 1, "dp_size": 1, "dp_degree": 1, "enable_cfg_parallel": true, "cfg_parallel_degree": 2, "hsdp_replicate_dim": 1, "hsdp_shard_dim": 2, "dist_timeout": 3600, "pipeline_class_name": null, "lora_path": null, "lora_nickname": "default", "lora_scale": 1.0, "lora_merge_mode": "auto", "lora_weight_name": null, "component_paths": {}, "transformer_weights_path": null, "component_transformer_weights_paths": {}, "quantization": null, "quantization_ignored_layers": null, "lora_target_modules": null, "dit_cpu_offload": false, "dit_layerwise_offload": false, "layerwise_offload_components": ["text_encoder", "image_encoder", "vae"], "dit_offload_prefetch_size": 0.0, "text_encoder_cpu_offload": false, "image_encoder_cpu_offload": false, "vae_cpu_offload": false, "use_fsdp_inference": false, "pin_cpu_memory": true, "ltx2_two_stage_device_mode": null, "comfyui_mode": false, "enable_torch_compile": true, "enable_layerwise_nvtx_marker": false, "warmup": true, "server_warmup": false, "warmup_resolutions": null, "warmup_steps": 1, "disable_autocast": false, "master_port": 30005, "host": "127.0.0.1", "port": 30000, "webui": false, "webui_port": 12312, "scheduler_port": 5652, "batching_mode": "dynamic", "batching_max_size": 1, "batching_delay_ms": 0.0, "batching_config": null, "enable_batching_metrics": false, "strict_ports": false, "output_path": "outputs/", "input_save_path": "inputs/uploads", "prompt_file_path": null, "model_paths": {}, "model_loaded": {"transformer": true, "vae": true, "video_vae": true, "audio_vae": true, "video_dit": true, "audio_dit": true, "dual_tower_bridge": true}, "boundary_ratio": null, "disagg_role": "monolithic", "disagg_timeout": 3600, "disagg_downstream_wait_timeout": 1800, "disagg_dispatch_policy": "round_robin", "disagg_mode": false, "disagg_instance_id": 0, "disagg_max_slots_per_instance": 8, "disagg_transfer_redundancy": 1.25, "disagg_role_device": "auto", "disagg_transfer_backend": "auto", "disagg_transfer_pool_size": 268435456, "disagg_transfer_pin_memory": "auto", "disagg_p2p_hostname": "127.0.0.1", "disagg_ib_device": null, "disagg_server_addr": null, "encoder_urls": null, "denoiser_urls": null, "decoder_urls": null, "encoder_tp": null, "denoiser_tp": null, "denoiser_sp": null, "denoiser_ulysses": null, "denoiser_ring": null, "decoder_sp": null, "decoder_tp": null, "pool_work_endpoint": null, "pool_result_endpoint": null, "pool_control_endpoint": null, "pool_control_advertised_endpoint": null, "log_level": "info", "uvicorn_access_log_exclude_prefixes": [], "enable_trace": false, "otlp_traces_endpoint": "localhost:4317"}
+[06-13 01:01:54] Downloading overlay metadata for Lightricks/LTX-2.3 from MickJ/LTX-2.3-overlay
+
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]
+Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 21620.12it/s]
+[06-13 01:01:54] Local mode: True
+[06-13 01:01:54] Starting server...
+Unable to import `torchao` Tensor objects. This may affect loading checkpoints serialized with `torchao`
+Unable to import `torchao` Tensor objects. This may affect loading checkpoints serialized with `torchao`
+[06-13 01:02:06] Scheduler bind at endpoint: tcp://127.0.0.1:5652
+[06-13 01:02:07] Initializing distributed environment with world_size=2, device=cuda:0, timeout=3600
+[06-13 01:02:07] Setting distributed timeout to 3600 seconds
+[06-13 01:02:08] Found nccl from library libnccl.so.2
+[06-13 01:02:08] sglang-diffusion is using nccl==2.28.9
+[06-13 01:02:09] Found nccl from library libnccl.so.2
+[06-13 01:02:09] sglang-diffusion is using nccl==2.28.9
+[06-13 01:02:11] No pipeline_class_name specified, using model_index.json
+[06-13 01:02:11] Downloading overlay metadata for Lightricks/LTX-2.3 from MickJ/LTX-2.3-overlay
+
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]
+Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 6145.50it/s]
+
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]
+Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 62137.84it/s]
+[06-13 01:02:11] Using pipeline from model_index.json: LTX2Pipeline
+[06-13 01:02:11] Loading pipeline modules...
+[06-13 01:02:11] Downloading overlay metadata for Lightricks/LTX-2.3 from MickJ/LTX-2.3-overlay
+
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]
+Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 3319.59it/s]
+
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]
+Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 4265.76it/s]
+[06-13 01:02:12] Checking for cached model in HF Hub cache for Lightricks/LTX-2.3...
+[06-13 01:02:12] Model not found in cache, will download from HF Hub
+[06-13 01:02:12] Downloading model snapshot from HF Hub for Lightricks/LTX-2.3 (attempt 1/5)...
+
+Fetching 3 files:   0%|          | 0/3 [00:00<?, ?it/s]
+Fetching 3 files:  33%|███▎      | 1/3 [06:46<13:33, 406.72s/it]
+Fetching 3 files: 100%|██████████| 3/3 [06:46<00:00, 135.57s/it]
+
+Fetching 40 files:   0%|          | 0/40 [00:00<?, ?it/s]
+Fetching 40 files:   2%|▎         | 1/40 [00:00<00:05,  6.58it/s]
+Fetching 3 files:   0%|          | 0/3 [00:00<?, ?it/s]
+Fetching 3 files: 100%|██████████| 3/3 [00:00<00:00, 19569.07it/s]
+
+Fetching 40 files:   5%|▌         | 2/40 [00:16<06:13,  9.82s/it]
+Fetching 40 files:  12%|█▎        | 5/40 [00:48<06:03, 10.38s/it]
+Fetching 40 files:  15%|█▌        | 6/40 [06:11<50:59, 89.98s/it]
+Fetching 40 files:  35%|███▌      | 14/40 [06:41<11:11, 25.82s/it]
+Fetching 40 files:  50%|█████     | 20/40 [06:45<04:52, 14.62s/it]
+Fetching 40 files:  70%|███████   | 28/40 [06:48<01:37,  8.10s/it]
+Fetching 40 files: 100%|██████████| 40/40 [06:48<00:00,  4.10s/it]
+Fetching 40 files: 100%|██████████| 40/40 [06:48<00:00, 10.22s/it]
+
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]
+Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 8879.97it/s]
+
+Loading required modules:   0%|          | 0/8 [00:00<?, ?it/s][06-13 01:16:32] Model path: /root/.cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-c24cea94ab17c493
+[06-13 01:16:32] Diffusers version: 0.37.0.dev0
+[06-13 01:16:32] Loading pipeline modules from config: {'_class_name': 'LTX2Pipeline', '_diffusers_version': '0.37.0.dev0', 'audio_vae': ['diffusers', 'AutoencoderKLLTX2Audio'], 'connectors': ['ltx2', 'LTX2TextConnectors'], 'scheduler': ['diffusers', 'FlowMatchEulerDiscreteScheduler'], 'text_encoder': ['transformers', 'Gemma3ForConditionalGeneration'], 'tokenizer': ['transformers', 'GemmaTokenizerFast'], 'transformer': ['diffusers', 'LTX2VideoTransformer3DModel'], 'vae': ['diffusers', 'AutoencoderKLLTX2Video'], 'vocoder': ['ltx2', 'LTX2Vocoder']}
+[06-13 01:16:32] Loading required components: ['transformer', 'text_encoder', 'tokenizer', 'scheduler', 'vae', 'audio_vae', 'vocoder', 'connectors']
+[06-13 01:16:32] Memory-aware component load order: ['text_encoder', 'transformer', 'connectors', 'vae', 'vocoder', 'audio_vae', 'tokenizer', 'scheduler']
+
+Loading required modules:   0%|          | 0/8 [00:00<?, ?it/s][06-13 01:16:32] Using torch_sdpa backend for component: text_encoder
+[06-13 01:16:32] Loading text_encoder from /root/.cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-c24cea94ab17c493/text_encoder. avail mem: 171.40 GB
+[06-13 01:16:32] Loading text_encoder on CPU first because it is selected for layerwise offload
+[06-13 01:16:32] Using Torch SDPA backend
+[06-13 01:16:32] Using torch_sdpa backend for text_encoder
+[06-13 01:16:43] [RunAI Streamer] Overall time to stream 45.4 GiB of all files to cpu: 10.21s, 4.4 GiB/s
+[06-13 01:16:44] [RunAI Streamer] Overall time to stream 45.4 GiB of all files to cpu: 12.38s, 3.7 GiB/s
+
+Loading required modules:  12%|█▎        | 1/8 [00:37<04:23, 37.70s/it][06-13 01:17:12] LayerwiseOffloadManager initialized with num prefetched layer: 1, total num layers: 48
+[06-13 01:17:12] Enabled layerwise offload for Gemma3ForConditionalGeneration on modules: ['language_model.layers']
+[06-13 01:17:12] Enabled layerwise offload for pipeline components: ['text_encoder']
+[06-13 01:17:12] Configured layerwise offload for text_encoder immediately after startup CPU staging
+[06-13 01:17:12] Loaded text_encoder: Gemma3ForConditionalGeneration (sgl-diffusion version). model size: 3.2 GB, consumed GPU mem: 3.29 GB, avail GPU mem: 168.11 GB
+
+Loading required modules:  12%|█▎        | 1/8 [00:39<04:35, 39.42s/it][06-13 01:17:12] Loading transformer from /root/.cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-c24cea94ab17c493/transformer. avail mem: 168.11 GB
+[06-13 01:17:12] Loading LTX2VideoTransformer3DModel from 1 safetensors file(s) , param_dtype: torch.bfloat16
+[06-13 01:17:12] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+[06-13 01:17:12] Attention backend not specified for transformer, using fa backend for transformer
+[06-13 01:17:12] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+[06-13 01:17:12] Using Torch SDPA backend
+[06-13 01:17:12] Attention backend not specified for transformer, using torch_sdpa backend for transformer
+[06-13 01:17:33] [RunAI Streamer] Overall time to stream 35.4 GiB of all files to cpu: 23.63s, 1.5 GiB/s
+[06-13 01:17:34] [RunAI Streamer] Overall time to stream 35.4 GiB of all files to cpu: 22.2s, 1.6 GiB/s
+[06-13 01:17:43] Loaded transformer: LTX2VideoTransformer3DModel (sgl-diffusion version). model size: 35.37 GB, consumed GPU mem: 35.64 GB, avail GPU mem: 132.47 GB
+
+Loading required modules:  25%|██▌       | 2/8 [01:10<03:26, 34.43s/it][06-13 01:17:43] Loading connectors from /root/.cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-c24cea94ab17c493/connectors. avail mem: 132.47 GB
+[06-13 01:17:43] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+[06-13 01:17:43] Attention backend not specified for connectors, using fa backend for connectors
+[06-13 01:17:43] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+[06-13 01:17:45] Loaded connectors: LTX2TextConnectors (sgl-diffusion version). model size: 5.91 GB, consumed GPU mem: 5.87 GB, avail GPU mem: 126.60 GB
+
+Loading required modules:  38%|███▊      | 3/8 [01:12<01:39, 19.85s/it][06-13 01:17:45] Loading vae from /root/.cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-c24cea94ab17c493/vae. avail mem: 126.60 GB
+[06-13 01:17:47] Loaded vae: AutoencoderKLLTX2Video (sgl-diffusion version). model size: 2.05 GB, consumed GPU mem: 1.99 GB, avail GPU mem: 124.61 GB
+
+Loading required modules:  50%|█████     | 4/8 [01:14<00:50, 12.57s/it][06-13 01:17:47] Loading vocoder from /root/.cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-c24cea94ab17c493/vocoder. avail mem: 124.61 GB
+[06-13 01:17:47] Loaded vocoder: LTX2Vocoder (sgl-diffusion version). model size: 0.24 GB, consumed GPU mem: 0.20 GB, avail GPU mem: 124.42 GB
+
+Loading required modules:  62%|██████▎   | 5/8 [01:14<00:24,  8.21s/it][06-13 01:17:47] Loading audio_vae from /root/.cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-c24cea94ab17c493/audio_vae. avail mem: 124.42 GB
+
+Loading required modules:  25%|██▌       | 2/8 [01:16<03:49, 38.19s/it][06-13 01:17:47] Loaded audio_vae: AutoencoderKLLTX2Audio (sgl-diffusion version). model size: 0.1 GB, consumed GPU mem: 0.10 GB, avail GPU mem: 124.31 GB
+[06-13 01:17:47] Loading tokenizer from /root/.cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-c24cea94ab17c493/tokenizer. avail mem: 124.31 GB
+[06-13 01:17:49] Loaded tokenizer: GemmaTokenizer (sgl-diffusion version). model size: NA GB, consumed GPU mem: 0.00 GB, avail GPU mem: 124.31 GB
+
+Loading required modules:  88%|████████▊ | 7/8 [01:16<00:04,  4.56s/it][06-13 01:17:49] Loading scheduler from /root/.cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-c24cea94ab17c493/scheduler. avail mem: 124.31 GB
+[06-13 01:17:49] Loaded scheduler: FlowMatchEulerDiscreteScheduler (sgl-diffusion version). model size: NA GB, consumed GPU mem: 0.00 GB, avail GPU mem: 124.31 GB
+
+Loading required modules: 100%|██████████| 8/8 [01:16<00:00,  9.60s/it]
+[06-13 01:17:49] Creating pipeline stages...
+[06-13 01:17:49] Compiling transformer with mode: default
+[93m[06-13 01:17:49] Multiple transformer attention backends detected: ['fa', 'torch_sdpa']. Using fa for denoising metadata.[0;0m
+[06-13 01:17:49] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+[06-13 01:17:49] Pipeline instantiated
+[06-13 01:17:49] LayerwiseOffloadManager initialized with num prefetched layer: 1, total num layers: 4
+[06-13 01:17:50] LayerwiseOffloadManager initialized with num prefetched layer: 1, total num layers: 9
+[06-13 01:17:50] Enabled layerwise offload for AutoencoderKLLTX2Video on modules: ['encoder.down_blocks', 'decoder.up_blocks']
+[06-13 01:17:50] Enabled layerwise offload for pipeline components: ['text_encoder', 'vae']
+[06-13 01:17:50] Worker 0: Initialized device, model, and distributed environment.
+[06-13 01:17:50] Worker 0: Scheduler loop started.
+
+Loading required modules:  38%|███▊      | 3/8 [01:18<01:49, 21.99s/it]
+Loading required modules:  50%|█████     | 4/8 [01:19<00:54, 13.65s/it]
+Loading required modules:  62%|██████▎   | 5/8 [01:20<00:26,  8.87s/it]
+Loading required modules:  88%|████████▊ | 7/8 [01:21<00:04,  4.81s/it]
+Loading required modules: 100%|██████████| 8/8 [01:21<00:00, 10.24s/it]
+[06-13 01:17:53] Adjusting number of frames from 121 to 121 based on model
+[06-13 01:17:53] Processing 1 grouped request(s)
+[06-13 01:17:53] Processing warmup req... (1/1)
+
+  0%|          | 0/1 [00:00<?, ?it/s]/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/core.py:5435: DeprecationWarning: Use explicit `struct.scalar.ptr` for pointer instead.
+  warnings.warn(
+
+100%|██████████| 1/1 [14:00<00:00, 840.54s/it]
+100%|██████████| 1/1 [14:00<00:00, 840.54s/it]
+[06-13 01:31:58] Warmup req (1/1) processed in [92m844.57[0;0m seconds
+[06-13 01:31:58] The server is fired up and ready to roll!
+[06-13 01:31:58] Sampling params:
+                       width: 768
+                      height: 512
+                  num_frames: 121
+                         fps: 24
+                      prompt: <redacted, len=33>
+                  neg_prompt: <redacted, len=174>
+                        seed: 1234
+                 infer_steps: 30
+      num_outputs_per_prompt: 1
+              guidance_scale: 3.0
+     embedded_guidance_scale: 6.0
+                    n_tokens: None
+                  flow_shift: None
+                  image_path: None
+                 save_output: True
+            output_file_path: outputs/A_beautiful_sunset_over_the_ocean_20260613-011753_d2fd829e.mp4
+        
+[06-13 01:31:58] Running pipeline stages: ['InputValidationStage', 'TextEncodingStage', 'LTX2TextConnectorStage', 'LTX2SigmaPreparationStage', 'TimestepPreparationStage', 'LTX2AVLatentPreparationStage', 'LTX2ImageEncodingStage', 'LTX2AVDenoisingStage', 'LTX2AVDecodingStage']
+[06-13 01:31:58] [InputValidationStage] started...
+[06-13 01:31:58] [InputValidationStage] finished in 0.0001 seconds
+[06-13 01:31:58] [TextEncodingStage] started...
+[06-13 01:31:59] [TextEncodingStage] finished in 0.9189 seconds
+[06-13 01:31:59] [LTX2TextConnectorStage] started...
+[06-13 01:31:59] [LTX2TextConnectorStage] finished in 0.0240 seconds
+[06-13 01:31:59] [LTX2SigmaPreparationStage] started...
+[06-13 01:31:59] [LTX2SigmaPreparationStage] finished in 0.0009 seconds
+[06-13 01:31:59] [TimestepPreparationStage] started...
+[06-13 01:31:59] [TimestepPreparationStage] finished in 0.0004 seconds
+[06-13 01:31:59] [LTX2AVLatentPreparationStage] started...
+[06-13 01:31:59] [LTX2AVLatentPreparationStage] finished in 0.0002 seconds
+[06-13 01:31:59] [LTX2ImageEncodingStage] started...
+[06-13 01:31:59] [LTX2ImageEncodingStage] finished in 0.0000 seconds
+[06-13 01:31:59] [LTX2AVDenoisingStage] started...
+
+  0%|          | 0/30 [00:00<?, ?it/s]
+  3%|▎         | 1/30 [00:00<00:24,  1.18it/s]
+  7%|▋         | 2/30 [00:01<00:23,  1.19it/s]
+ 10%|█         | 3/30 [00:02<00:22,  1.19it/s]
+ 13%|█▎        | 4/30 [00:03<00:21,  1.19it/s]
+ 17%|█▋        | 5/30 [00:04<00:20,  1.19it/s]
+ 20%|██        | 6/30 [00:05<00:20,  1.19it/s]
+ 23%|██▎       | 7/30 [00:05<00:19,  1.19it/s]
+ 27%|██▋       | 8/30 [00:06<00:18,  1.19it/s]
+ 30%|███       | 9/30 [00:07<00:17,  1.19it/s]
+ 33%|███▎      | 10/30 [00:08<00:16,  1.19it/s]
+ 37%|███▋      | 11/30 [00:09<00:15,  1.19it/s]
+ 40%|████      | 12/30 [00:10<00:15,  1.19it/s]
+ 43%|████▎     | 13/30 [00:10<00:14,  1.19it/s]
+ 47%|████▋     | 14/30 [00:11<00:13,  1.19it/s]
+ 50%|█████     | 15/30 [00:12<00:12,  1.19it/s]
+ 53%|█████▎    | 16/30 [00:13<00:11,  1.19it/s]
+ 57%|█████▋    | 17/30 [00:14<00:10,  1.19it/s]
+ 60%|██████    | 18/30 [00:15<00:10,  1.19it/s]
+ 63%|██████▎   | 19/30 [00:15<00:09,  1.19it/s]
+ 67%|██████▋   | 20/30 [00:16<00:08,  1.19it/s]
+ 70%|███████   | 21/30 [00:17<00:07,  1.19it/s]
+ 73%|███████▎  | 22/30 [00:18<00:06,  1.19it/s]
+ 77%|███████▋  | 23/30 [00:19<00:05,  1.19it/s]
+ 80%|████████  | 24/30 [00:20<00:05,  1.19it/s]
+ 83%|████████▎ | 25/30 [00:20<00:04,  1.19it/s]
+ 87%|████████▋ | 26/30 [00:21<00:03,  1.19it/s]
+ 90%|█████████ | 27/30 [00:22<00:02,  1.19it/s]
+ 93%|█████████▎| 28/30 [00:23<00:01,  1.20it/s]
+ 97%|█████████▋| 29/30 [00:24<00:00,  1.20it/s]
+100%|██████████| 30/30 [00:25<00:00,  1.19it/s]
+100%|██████████| 30/30 [00:25<00:00,  1.19it/s]
+[06-13 01:32:24] [LTX2AVDenoisingStage] average time per step: 0.8390 seconds
+[06-13 01:32:24] [LTX2AVDenoisingStage] finished in 25.1777 seconds
+[06-13 01:32:24] [LTX2AVDecodingStage] started...
+[06-13 01:32:25] [LTX2AVDecodingStage] finished in 0.7387 seconds
+[06-13 01:32:27] Output saved to [1;36moutputs/A_beautiful_sunset_over_the_ocean_20260613-011753_d2fd829e.mp4[0;0m
+[06-13 01:32:27] Metrics dumped to: [1;36m/tmp/pr28050_ltx2_sweep/ltx23_extra_mode_compare_20260613_010133/ltx23-one-stage_default.json[0;0m
+[06-13 01:32:28] Pixel data generated successfully in [92m874.03[0;0m seconds
+[06-13 01:32:28] Warmed-up request processed in [92m26.97[0;0m seconds (with warmup excluded)
+[06-13 01:32:28] Memory usage - Max peak: 57910.00 MB, Avg peak: 57910.00 MB
+[06-13 01:32:28] Metrics dumped to: [1;36m/tmp/pr28050_ltx2_sweep/ltx23_extra_mode_compare_20260613_010133/ltx23-one-stage_default.json[0;0m
+[93m[06-13 01:32:28] Generator was garbage collected without being shut down. Attempting to shut down the local server and client.[0;0m
+[06-13 01:32:36] Worker 0: Shutdown complete.
+[93m[06-13 01:32:38] Local worker sglang-diffusionWorker-0 did not terminate gracefully, forcing.[0;0m
+[93m[06-13 01:32:48] Local worker sglang-diffusionWorker-1 did not terminate gracefully, forcing.[0;0m
+
+=========================================================================================================
+BENCHMARK RESULTS — Denoise Latency (primary metric ★)
+(Models and params match benchmark-and-profile.md)
+=========================================================================================================
+Model                    Nightly                      Label          Denoise(s)     E2E(s)   Peak Mem(GB)
+---------------------------------------------------------------------------------------------------------
+ltx23-one-stage          -                            default             25.18      26.97           56.6
+---------------------------------------------------------------------------------------------------------
+
+★ Denoise latency = sum of stages ending with DenoisingStage plus any RefinementStage.
+  Compare two runs with python/sglang/multimodal_gen/benchmarks/compare_perf.py.
+Perf dump JSONs → /tmp/pr28050_ltx2_sweep/ltx23_extra_mode_compare_20260613_010133
+Compare across runs: follow benchmark-and-profile.md -> Perf dump & before/after compare.
