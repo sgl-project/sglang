@@ -450,13 +450,77 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 app.include_router(v1_loads_router)
 
 
+def _anthropic_validation_message(raw_errors) -> str:
+    """Render Pydantic-style errors for an Anthropic /v1/messages route.
+
+    Builds a short ``loc: msg`` digest that names the offending fields without
+    leaking file paths or Python internals (the default ``str(exc)`` includes
+    the dispatcher's ``File "/.../http_server.py"`` line).
+    """
+    parts: list[str] = []
+    for err in raw_errors or []:
+        loc = err.get("loc") or ()
+        if loc:
+            loc_str = ".".join(str(p) for p in loc if p not in ("body",))
+        else:
+            loc_str = ""
+        msg = (err.get("msg") or "").strip()
+        if loc_str and msg:
+            parts.append(f"{loc_str}: {msg}")
+        elif msg:
+            parts.append(msg)
+    text = "; ".join(parts) or "Invalid request"
+    if len(text) > 500:
+        text = text[:500] + "…"
+    return text
+
+
+def _anthropic_error_response(*, status_code: int, error_type: str, message: str):
+    """Anthropic-format error envelope: {"type":"error","error":{"type":...,"message":...}}."""
+    return ORJSONResponse(
+        status_code=status_code,
+        content={
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        },
+    )
+
+
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
 
     For /v1/responses, emit OpenAI-style nested error envelope:
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
+    For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
+    if request.url.path.startswith("/v1/messages"):
+        # Map HTTP status to Anthropic error.type; fall back to api_error.
+        anthropic_type = {
+            400: "invalid_request_error",
+            401: "authentication_error",
+            403: "permission_error",
+            404: "not_found_error",
+            413: "request_too_large",
+            422: "invalid_request_error",
+            429: "rate_limit_error",
+            500: "api_error",
+            502: "api_error",
+            503: "overloaded_error",
+            504: "api_error",
+        }.get(exc.status_code, "api_error")
+        # 5xx must never echo upstream detail (may contain stack/PII).
+        message = (
+            "Internal server error"
+            if exc.status_code >= 500
+            else (str(exc.detail) if exc.detail else "Request failed")
+        )
+        return _anthropic_error_response(
+            status_code=exc.status_code,
+            error_type=anthropic_type,
+            message=message,
+        )
+
     # adjust fmt for responses api
     if request.url.path.startswith("/v1/responses"):
         nested_error = {
@@ -483,8 +547,18 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Override FastAPI's default 422 validation error with 400.
 
-    For /v1/responses, emit OpenAI-style nested error envelope; for other endpoints keep legacy format.
+    For /v1/messages, emit Anthropic-style envelope and scrub the message so
+    file paths or Python internals from the default ``str(exc)`` representation
+    never reach the client. For /v1/responses, keep OpenAI-style. Otherwise
+    use the legacy ErrorResponse shape.
     """
+    if request.url.path.startswith("/v1/messages"):
+        return _anthropic_error_response(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            error_type="invalid_request_error",
+            message=_anthropic_validation_message(exc.errors()),
+        )
+
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
@@ -1096,7 +1170,11 @@ async def update_weights_from_disk(
     obj: UpdateWeightFromDiskReqInputSpec, request: Request
 ):
     """Update the weights from disk inplace without re-launching the server."""
-    success, message, num_paused_requests = (
+    (
+        success,
+        message,
+        num_paused_requests,
+    ) = (
         await _global_state.tokenizer_manager.update_weights_from_disk(
             UpdateWeightFromDiskReqInput(**obj.__dict__),
             request,
@@ -1125,7 +1203,10 @@ async def update_weights_from_disk(
 async def init_weights_send_group_for_remote_instance(
     obj: InitWeightsSendGroupForRemoteInstanceReqInputSpec, request: Request
 ):
-    success, message = (
+    (
+        success,
+        message,
+    ) = (
         await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
             InitWeightsSendGroupForRemoteInstanceReqInput(**obj.__dict__),
             request,
@@ -1143,7 +1224,10 @@ async def init_weights_send_group_for_remote_instance(
 async def send_weights_to_remote_instance(
     obj: SendWeightsToRemoteInstanceReqInputSpec, request: Request
 ):
-    success, message = (
+    (
+        success,
+        message,
+    ) = (
         await _global_state.tokenizer_manager.send_weights_to_remote_instance(
             SendWeightsToRemoteInstanceReqInput(**obj.__dict__),
             request,
@@ -1217,7 +1301,10 @@ async def destroy_weights_update_group(
     obj: DestroyWeightsUpdateGroupReqInputSpec, request: Request
 ):
     """Destroy the parameter update group."""
-    success, message = (
+    (
+        success,
+        message,
+    ) = (
         await _global_state.tokenizer_manager.destroy_weights_update_group(
             DestroyWeightsUpdateGroupReqInput(**obj.__dict__),
             request,
@@ -1257,7 +1344,10 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInputSpec, request: Request
 ):
     """Update model parameter from distributed online."""
-    success, message = (
+    (
+        success,
+        message,
+    ) = (
         await _global_state.tokenizer_manager.update_weights_from_distributed(
             UpdateWeightsFromDistributedReqInput(**obj.__dict__),
             request,
@@ -1800,12 +1890,11 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 
 
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
-async def v1_responses_request(request: dict, raw_request: Request):
+async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
-    request_obj = ResponsesRequest(**request)
     result = await raw_request.app.state.openai_serving_responses.create_responses(
-        request_obj, raw_request
+        request, raw_request
     )
 
     # Handle streaming responses

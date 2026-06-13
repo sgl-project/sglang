@@ -120,7 +120,7 @@ def record_stream_each(tensors, stream):
 def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
     """Mark pre-prepare SB / verify_input GPU tensors as used on `fwd_stream`.
 
-    Spec V2 mutates SB mid-forward (`prepare_for_v2_verify` rebinds
+    Spec V2 mutates SB mid-forward (`prepare_for_verify` rebinds
     `batch.input_ids` / `out_cache_loc`; `_draft_extend_for_decode` later
     replaces `batch.input_ids` again). Each rebind drops the only SB Python
     ref to the old tensor while the verify forward kernel may still be

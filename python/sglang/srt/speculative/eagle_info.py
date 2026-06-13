@@ -168,10 +168,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
-    # V2 reuses `EagleDraftInput` across phases (V1 has a separate
-    # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
-    num_correct_drafts: Optional[torch.Tensor] = None
-    num_accept_tokens: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -277,16 +273,17 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
 @dataclass
 class EagleDraftExtendInput(SpecInput):
-    """Inputs to the draft-extend forward (the per-accepted-token pass after verify).
+    """Inputs to the draft-extend forward (the fill-draft-kvcache pass after
+    target prefill / verify).
 
-    Produced by `EagleVerifyInput.verify`, installed on `batch.spec_info` for
-    the draft-extend forward, then replaced with a fresh `EagleDraftInput` for
-    the next iter's draft.
+    Installed on `batch.spec_info` by the worker's `_draft_extend_for_*`
+    (and synthetically by draft-extend cuda-graph capture), then replaced
+    with a fresh `EagleDraftInput` for the next iter's draft.
     """
 
-    # shape: (total_accepted, hidden_size). Sliced from verify-time hidden_states
-    # by accept_index; consumed by the draft-extend forward. None when the spec
-    # algorithm's draft doesn't read hidden_states (e.g., STANDALONE).
+    # Target-model hidden states for the draft-extend forward; None when the
+    # draft doesn't read hidden_states (e.g., STANDALONE). Shape: decode
+    # (bs * num_draft_tokens, hidden), prefill (extend_num_tokens, hidden).
     hidden_states: Optional[torch.Tensor] = None
 
     # Per-req accept counts. `num_accept_tokens = num_correct_drafts + 1`.

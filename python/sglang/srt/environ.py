@@ -783,6 +783,9 @@ class Envs:
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
 
+    # Unified radix cache
+    SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
+
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
@@ -864,6 +867,7 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
