@@ -14,6 +14,7 @@ from sglang.srt.parser.reasoning_parser import (
     Qwen3Detector,
     ReasoningParser,
     StreamingParseResult,
+    resolve_think_end_id,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1544,6 +1545,47 @@ class TestPoolsideV1Registered(CustomTestCase):
         rp = ReasoningParser("poolside_v1", stream_reasoning=True)
         self.assertEqual(rp.detector.reasoning_default, "explicit_enable_thinking")
         self.assertTrue(rp.detector.thinks_internally)
+
+
+class _FakeTokenizer:
+    def __init__(self, think_end_ids):
+        self._think_end_ids = think_end_ids
+
+    def encode(self, text, add_special_tokens=False):
+        return list(self._think_end_ids)
+
+
+class TestResolveThinkEndId(CustomTestCase):
+    def _parser(self):
+        return ReasoningParser("deepseek-r1", stream_reasoning=False)
+
+    def test_single_token(self):
+        result = resolve_think_end_id(_FakeTokenizer([128009]), self._parser())
+        self.assertEqual(result, 128009)
+
+    def test_multi_token_without_strict(self):
+        result = resolve_think_end_id(_FakeTokenizer([151, 6031, 235]), self._parser())
+        self.assertIsNone(result)
+
+    def test_multi_token_with_strict_raises(self):
+        with self.assertRaises(ValueError):
+            resolve_think_end_id(
+                _FakeTokenizer([151, 6031, 235]),
+                self._parser(),
+                enable_strict_thinking=True,
+            )
+
+    def test_empty_encoding_without_strict(self):
+        result = resolve_think_end_id(_FakeTokenizer([]), self._parser())
+        self.assertIsNone(result)
+
+    def test_empty_encoding_with_strict_raises(self):
+        with self.assertRaises(ValueError):
+            resolve_think_end_id(
+                _FakeTokenizer([]),
+                self._parser(),
+                enable_strict_thinking=True,
+            )
 
 
 if __name__ == "__main__":
