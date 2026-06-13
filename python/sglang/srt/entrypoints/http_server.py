@@ -1174,11 +1174,9 @@ async def update_weights_from_disk(
         success,
         message,
         num_paused_requests,
-    ) = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(
-            UpdateWeightFromDiskReqInput(**obj.__dict__),
-            request,
-        )
+    ) = await _global_state.tokenizer_manager.update_weights_from_disk(
+        UpdateWeightFromDiskReqInput(**obj.__dict__),
+        request,
     )
 
     content = {
@@ -1206,11 +1204,9 @@ async def init_weights_send_group_for_remote_instance(
     (
         success,
         message,
-    ) = (
-        await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
-            InitWeightsSendGroupForRemoteInstanceReqInput(**obj.__dict__),
-            request,
-        )
+    ) = await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
+        InitWeightsSendGroupForRemoteInstanceReqInput(**obj.__dict__),
+        request,
     )
     content = {"success": success, "message": message}
     if success:
@@ -1227,11 +1223,9 @@ async def send_weights_to_remote_instance(
     (
         success,
         message,
-    ) = (
-        await _global_state.tokenizer_manager.send_weights_to_remote_instance(
-            SendWeightsToRemoteInstanceReqInput(**obj.__dict__),
-            request,
-        )
+    ) = await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+        SendWeightsToRemoteInstanceReqInput(**obj.__dict__),
+        request,
     )
     content = {"success": success, "message": message}
     if success:
@@ -1304,11 +1298,9 @@ async def destroy_weights_update_group(
     (
         success,
         message,
-    ) = (
-        await _global_state.tokenizer_manager.destroy_weights_update_group(
-            DestroyWeightsUpdateGroupReqInput(**obj.__dict__),
-            request,
-        )
+    ) = await _global_state.tokenizer_manager.destroy_weights_update_group(
+        DestroyWeightsUpdateGroupReqInput(**obj.__dict__),
+        request,
     )
     content = {"success": success, "message": message}
     return ORJSONResponse(
@@ -1347,11 +1339,9 @@ async def update_weights_from_distributed(
     (
         success,
         message,
-    ) = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
-            UpdateWeightsFromDistributedReqInput(**obj.__dict__),
-            request,
-        )
+    ) = await _global_state.tokenizer_manager.update_weights_from_distributed(
+        UpdateWeightsFromDistributedReqInput(**obj.__dict__),
+        request,
     )
 
     content = {"success": success, "message": message}
