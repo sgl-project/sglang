@@ -1282,7 +1282,7 @@ class ModelConfig:
         if self.is_draft_model and quant_cfg is None and self.quantization is not None:
             logger.info(
                 f"Draft model has no quantization config in its checkpoint; "
-                f"loading it unquantized instead of the inherited '{self.quantization}'."
+                f"loading it unquantized instead of '{self.quantization}'."
             )
             self.quantization = None
         if self.quantization is not None:
