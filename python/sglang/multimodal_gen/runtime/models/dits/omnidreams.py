@@ -495,21 +495,21 @@ class OmniDreamsBlock(nn.Module):
         self.layer_norm_self_attn = LayerNormScaleShift(
             x_dim, eps=1e-6
         )
-        self.self_attn = OmniDreamsAttention(x_dim, None, num_heads, head_dim)
+        self.self_attn = OmniDreamsSelfAttention(x_dim, num_heads, head_dim)
 
         # Cross-view attention (Phase 5) — learnable LayerNorm (unlike AdaLN).
         if enable_cross_view_attn:
             self.layer_norm_cross_view_attn = nn.LayerNorm(
                 x_dim, elementwise_affine=True, eps=1e-6
             )
-            self.cross_view_attn = OmniDreamsAttention(
-                x_dim, x_dim, num_heads, head_dim
+            self.cross_view_attn = OmniDreamsSelfAttention(
+                x_dim, num_heads, head_dim
             )
 
         self.layer_norm_cross_attn = LayerNormScaleShift(
             x_dim, eps=1e-6
         )
-        self.cross_attn = OmniDreamsAttention(x_dim, context_dim, num_heads, head_dim)
+        self.cross_attn = OmniDreamsCrossAttention(x_dim, context_dim, num_heads, head_dim)
 
         self.layer_norm_mlp = LayerNormScaleShift(x_dim, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
