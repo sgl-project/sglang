@@ -334,6 +334,81 @@ class VisionSdpaAttention(nn.Module):
         return output
 
 
+def _native_sinks_window_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    bsz: int,
+    seq_len: int,
+    softmax_scale: Optional[float],
+    window_size: Tuple[int, int],
+    s_aux: Optional[torch.Tensor],
+) -> torch.Tensor:
+    del seq_len
+    _, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"GQA misconfigured: num_q_heads={num_q_heads} not a multiple "
+            f"of num_kv_heads={num_kv_heads}"
+        )
+    group = num_q_heads // num_kv_heads
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    use_window = (
+        window_size is not None
+        and window_size != (-1, -1)
+        and window_size[0] >= 0
+    )
+    win = window_size[0] if use_window else None
+
+    output = torch.empty_like(q)
+    cu = cu_seqlens.tolist() if isinstance(cu_seqlens, torch.Tensor) else list(cu_seqlens)
+    for i in range(bsz):
+        start, end = cu[i], cu[i + 1]
+        s = end - start
+        if s == 0:
+            continue
+
+        q_i = q[start:end].transpose(0, 1).unsqueeze(0).contiguous()
+        k_i = k[start:end].transpose(0, 1).unsqueeze(0).contiguous()
+        v_i = v[start:end].transpose(0, 1).unsqueeze(0).contiguous()
+        if group > 1:
+            k_i = k_i.repeat_interleave(group, dim=1)
+            v_i = v_i.repeat_interleave(group, dim=1)
+
+        attn_mask = None
+        if use_window or s_aux is not None:
+            attn_mask = torch.zeros(
+                (1, num_q_heads, s, s), dtype=q_i.dtype, device=q_i.device
+            )
+            if use_window:
+                idx = torch.arange(s, device=q_i.device)
+                window_mask = (idx.view(s, 1) - idx.view(1, s)).abs() > win
+                attn_mask = attn_mask.masked_fill(
+                    window_mask.view(1, 1, s, s), float("-inf")
+                )
+            if s_aux is not None:
+                attn_mask[..., 0] = attn_mask[..., 0] + s_aux.view(
+                    1, num_q_heads, 1
+                ).to(attn_mask.dtype)
+
+        out_i = F.scaled_dot_product_attention(
+            q_i, k_i, v_i,
+            attn_mask=attn_mask,
+            is_causal=False,
+            scale=softmax_scale,
+        )
+        out_i = torch.nan_to_num(out_i, nan=0.0)
+
+        output[start:end] = out_i.squeeze(0).transpose(0, 1).contiguous()
+
+    return output
+
+
 class VisionTritonAttention(nn.Module):
     """
     Triton-implemented attention without a causal mask
@@ -367,7 +442,22 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        window_size = kwargs.get("window_size", (-1, -1))
+        s_aux = kwargs.get("s_aux", None)
+        needs_sinks_or_window = (
+            s_aux is not None
+            or (window_size is not None and window_size != (-1, -1))
+        )
+
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            if needs_sinks_or_window:
+                raise NotImplementedError(
+                    "VisionTritonAttention does not support s_aux or "
+                    "window_size in cuda-graph mode; the wrapped triton "
+                    "context_attention_fwd kernel would silently drop "
+                    "these kwargs. Disable SGLANG_VIT_ENABLE_CUDA_GRAPH "
+                    "to use the SDPA fallback."
+                )
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for cuda-graph mode")
 
@@ -385,6 +475,19 @@ class VisionTritonAttention(nn.Module):
                 cu_seqlens[2],
                 is_causal=False,
                 sm_scale=softmax_scale,
+            )
+        elif needs_sinks_or_window:
+            cu_seqlens_t = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+            return _native_sinks_window_attention(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens=cu_seqlens_t,
+                bsz=bsz,
+                seq_len=seq_len,
+                softmax_scale=softmax_scale,
+                window_size=window_size,
+                s_aux=s_aux,
             )
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
