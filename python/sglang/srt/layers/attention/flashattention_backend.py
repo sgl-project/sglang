@@ -497,19 +497,29 @@ class FlashAttentionBackend(AttentionBackend):
                 and forward_batch.spec_algorithm is not None
                 and forward_batch.spec_algorithm.is_ddtree()
             )
-            if self.topk <= 1 and not is_ddtree:
+            # Spine DDTree trees use the same linear metadata as DFLASH
+            _ddtree_spine = is_ddtree and getattr(
+                forward_batch.spec_info, "tree_is_spine", False
+            )
+            # Use spec_info.draft_token_num for spine DDTree (may differ from block_size)
+            _num_draft = (
+                forward_batch.spec_info.draft_token_num
+                if _ddtree_spine and forward_batch.spec_info is not None
+                else self.speculative_num_draft_tokens
+            )
+            if self.topk <= 1 and (not is_ddtree or _ddtree_spine):
                 metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + self.speculative_num_draft_tokens
+                    forward_batch.seq_lens + _num_draft
                 ).to(torch.int32)
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.max_seq_len_q = _num_draft
                 metadata.max_seq_len_k = (
                     forward_batch.seq_lens_cpu.max().item()
-                    + self.speculative_num_draft_tokens
+                    + _num_draft
                 )
                 metadata.cu_seqlens_q = torch.arange(
                     0,
-                    batch_size * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
+                    batch_size * _num_draft + 1,
+                    _num_draft,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -853,9 +863,14 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         # We do cascade attention for Target Verify with topk > 1
+        # We skip cascade for DDTree spine trees (no branching → causal is fine).
         # We don't use cascade attention for Sliding Window Attention:
         # - Different window sizes should be passed in for each q in the first stage of cascade attention, but FA3 interface doesn't support pass in a list of window sizes.
         # - The overhead of duplicated computation of the common prefix part is small for sliding window layers (seq_len <= window_size), so we can just expand it.
+        _ddtree_is_spine = (
+            forward_batch.spec_info is not None
+            and getattr(forward_batch.spec_info, "tree_is_spine", False)
+        )
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
             and (
@@ -864,6 +879,7 @@ class FlashAttentionBackend(AttentionBackend):
                     hasattr(forward_batch, "spec_algorithm")
                     and forward_batch.spec_algorithm is not None
                     and forward_batch.spec_algorithm.is_ddtree()
+                    and not _ddtree_is_spine
                 )
             )
             and not is_swa_layer

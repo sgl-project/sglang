@@ -455,6 +455,7 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
+            custom_mask = custom_mask.to(tl.int1)
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             final_mask &= custom_mask
         elif IS_CAUSAL:

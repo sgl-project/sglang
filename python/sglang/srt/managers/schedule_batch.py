@@ -2261,7 +2261,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         server_args = get_global_server_args()
         len_per_topk = server_args.speculative_num_steps or 1
         spec_topk = server_args.speculative_eagle_topk or 1
-        spec_tokens = server_args.speculative_num_draft_tokens
+        spec_tokens = server_args.speculative_num_draft_tokens or 1
+
+        # DDTREE: the per-step token count is max_tree_nodes = ddtree_budget + 1,
+        # which may differ from speculative_num_draft_tokens (the draft model's
+        # verify-window / block_size).
+        if (
+            server_args.speculative_algorithm == "DDTREE"
+            and server_args.speculative_ddtree_budget is not None
+        ):
+            spec_tokens = server_args.speculative_ddtree_budget + 1
 
         if page_size > 1 and spec_topk > 1:
             # last partial page and ceil alignment

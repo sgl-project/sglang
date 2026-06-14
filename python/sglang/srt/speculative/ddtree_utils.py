@@ -1,19 +1,105 @@
 import heapq
+import math
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 
 
+# Dynamic early-stop margin for tree building.
+# When the heap top's log-prob falls below (root_log_prob - log(budget) - margin),
+# we stop expanding the tree — remaining candidates are too unlikely to contribute.
+_DDTREE_EARLY_STOP_MARGIN: float = 1.0
+
+# Depth bonus: added to child log-probs to encourage deeper tree exploration
+# over clustering siblings at shallow depths.  Kept small (0.2) to allow
+# some sibling exploration when budget exceeds draft depth.
+_DDTREE_DEPTH_BONUS: float = 0.2
+
+
 def build_ddtree_tree(
     draft_logits: torch.Tensor,  # [bs, L, vocab_size]
-    tree_budget: int,            # 鑺傜偣棰勭畻 B
+    tree_budget: int,            # 节点预算 B
     device: torch.device,
+    _out_node_token_ids: torch.Tensor | None = None,
+    _out_node_depths: torch.Tensor | None = None,
+    _out_parents: torch.Tensor | None = None,
+    _out_visibility: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[Dict[int, Dict[int, int]]], torch.Tensor]:
     bs, L, V = draft_logits.shape
-    topk = min(tree_budget, V)
+    max_nodes = tree_budget + 1
 
     logits = draft_logits.float()
+
+    # --- Spine fast path: when budget equals L, the beam search only ever
+    # picks spine nodes (one per depth).  No siblings can be chosen because
+    # the spine consumes the entire budget.  This holds for any depth_bonus >= 0
+    # since child_push always happens before sibling_push in the loop.
+    if tree_budget == L:
+        _, top_token_ids = torch.topk(logits, k=1, dim=-1)  # [bs, L, 1]
+        top_token_ids = top_token_ids.squeeze(-1)  # [bs, L]
+        spine_nodes = tree_budget  # all non-root nodes
+
+        if _out_node_token_ids is None or _out_node_token_ids.shape[0] < bs:
+            padded_node_token_ids = torch.zeros(bs, tree_budget, dtype=torch.long, device=device)
+        else:
+            padded_node_token_ids = _out_node_token_ids[:bs]
+            padded_node_token_ids.zero_()
+        padded_node_token_ids[:, :spine_nodes] = top_token_ids[:, :spine_nodes]
+
+        if _out_node_depths is None or _out_node_depths.shape[0] < bs:
+            padded_node_depths = torch.zeros(bs, tree_budget, dtype=torch.long, device=device)
+        else:
+            padded_node_depths = _out_node_depths[:bs]
+            padded_node_depths.zero_()
+        padded_node_depths[:, :spine_nodes] = torch.arange(
+            1, spine_nodes + 1, device=device
+        ).unsqueeze(0)
+
+        if _out_parents is None or _out_parents.shape[0] < bs:
+            padded_parents = torch.full((bs, max_nodes), -1, dtype=torch.long, device=device)
+        else:
+            padded_parents = _out_parents[:bs]
+            padded_parents.fill_(-1)
+        padded_parents[:, 1 : spine_nodes + 1] = torch.arange(
+            spine_nodes, device=device
+        ).unsqueeze(0)
+
+        # Lower-triangular visibility (ancestral: node i sees nodes 0..i)
+        if _out_visibility is None or _out_visibility.shape[0] < bs:
+            padded_visibility = torch.zeros(bs, max_nodes, max_nodes, dtype=torch.bool, device=device)
+        else:
+            padded_visibility = _out_visibility[:bs]
+            padded_visibility.zero_()
+        actual = spine_nodes + 1
+        padded_visibility[:, :actual, :actual] = torch.tril(
+            torch.ones(actual, actual, dtype=torch.bool, device=device)
+        ).unsqueeze(0)
+
+        actual_tree_sizes_t = torch.full((bs,), actual, dtype=torch.long, device=device)
+
+        # Build per-batch child_maps (chain: node i → {token: i+1})
+        top_ids_cpu = top_token_ids[:, :spine_nodes].to(device="cpu", dtype=torch.long)
+        all_child_maps = []
+        for b in range(bs):
+            cm: Dict[int, Dict[int, int]] = {0: {}}
+            for i in range(spine_nodes):
+                tok = int(top_ids_cpu[b, i])
+                cm[i][tok] = i + 1
+                cm[i + 1] = {}
+            all_child_maps.append(cm)
+
+        return (
+            padded_node_token_ids,
+            padded_node_depths,
+            padded_parents,
+            all_child_maps,
+            padded_visibility,
+            actual_tree_sizes_t,
+        )
+
+    # --- Full tree path (budget > L): beam search with branching ---
+    topk = min(max(tree_budget // max(L, 1) + 1, 2), V, 6)
     top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
     log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
     top_log_probs = (top_logits - log_z).to(device="cpu", dtype=torch.float32)
@@ -37,11 +123,30 @@ def build_ddtree_tree(
         all_visibility.append(vis)
         actual_sizes.append(actual)
 
-    max_nodes = tree_budget + 1
-    padded_node_token_ids = torch.zeros(bs, tree_budget, dtype=torch.long, device=device)
-    padded_node_depths = torch.zeros(bs, tree_budget, dtype=torch.long, device=device)
-    padded_parents = torch.full((bs, max_nodes), -1, dtype=torch.long, device=device)
-    padded_visibility = torch.zeros(bs, max_nodes, max_nodes, dtype=torch.bool, device=device)
+    # Reuse or allocate padded output buffers.
+    if _out_node_token_ids is None or _out_node_token_ids.shape[0] < bs:
+        padded_node_token_ids = torch.zeros(bs, tree_budget, dtype=torch.long, device=device)
+    else:
+        padded_node_token_ids = _out_node_token_ids[:bs]
+        padded_node_token_ids.zero_()
+
+    if _out_node_depths is None or _out_node_depths.shape[0] < bs:
+        padded_node_depths = torch.zeros(bs, tree_budget, dtype=torch.long, device=device)
+    else:
+        padded_node_depths = _out_node_depths[:bs]
+        padded_node_depths.zero_()
+
+    if _out_parents is None or _out_parents.shape[0] < bs:
+        padded_parents = torch.full((bs, max_nodes), -1, dtype=torch.long, device=device)
+    else:
+        padded_parents = _out_parents[:bs]
+        padded_parents.fill_(-1)
+
+    if _out_visibility is None or _out_visibility.shape[0] < bs:
+        padded_visibility = torch.zeros(bs, max_nodes, max_nodes, dtype=torch.bool, device=device)
+    else:
+        padded_visibility = _out_visibility[:bs]
+        padded_visibility.zero_()
 
     for b in range(bs):
         n = actual_sizes[b] - 1
@@ -50,14 +155,18 @@ def build_ddtree_tree(
             padded_node_depths[b, :n] = torch.from_numpy(all_node_depths[b]).to(device)
         padded_parents[b, :actual_sizes[b]] = torch.from_numpy(all_parents[b]).to(device)
         vis = all_visibility[b]
-        padded_visibility[b, :actual_sizes[b], :actual_sizes[b]] = torch.from_numpy(vis).to(device)
+        padded_visibility[b, :actual_sizes[b], :actual_sizes[b]] = (
+            torch.from_numpy(vis).to(device=device, dtype=torch.bool)
+        )
 
+    actual_tree_sizes_t = torch.tensor(actual_sizes, dtype=torch.long, device=device)
     return (
         padded_node_token_ids,
         padded_node_depths,
         padded_parents,
         all_child_maps,
         padded_visibility,
+        actual_tree_sizes_t,
     )
 
 
@@ -79,9 +188,17 @@ def _build_single_tree(
     first_logw = float(log_probs_np[0, 0])
     heap = [(-first_logw, (0,), 0, 1, 0, first_logw)]
 
+    # Dynamic early-stop: skip candidates whose log-prob is more than
+    # log(budget) + margin below the root log-prob.
+    _stop_threshold = first_logw - math.log(max(budget, 1)) - _DDTREE_EARLY_STOP_MARGIN
+
     node_count = 0
     while heap and node_count < budget:
         _, ranks, parent_idx, depth, rank, logw = heapq.heappop(heap)
+
+        # Early stop: remaining candidates' log-prob is too low to matter.
+        if logw < _stop_threshold:
+            break
 
         token_id = int(token_ids_np[depth - 1, rank])
         current_idx = node_count + 1
@@ -106,7 +223,7 @@ def _build_single_tree(
             )
 
         if depth < depth_limit:
-            child_logw = logw + float(log_probs_np[depth, 0])
+            child_logw = logw + float(log_probs_np[depth, 0]) + _DDTREE_DEPTH_BONUS
             child_ranks = ranks + (0,)
             heapq.heappush(
                 heap,
@@ -139,16 +256,12 @@ def compile_ddtree_tree(
     start_positions: torch.Tensor,
     past_lengths: torch.Tensor,
     tree_budget: int,
+    actual_tree_sizes: torch.Tensor,
     dtype: torch.dtype,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = root_token_ids.shape[0]
     max_nodes = tree_budget + 1
-
-    actual_tree_sizes = torch.zeros(bs, dtype=torch.long, device=device)
-    for b in range(bs):
-        non_zero = (node_token_ids[b] != 0).sum().item()
-        actual_tree_sizes[b] = non_zero + 1
 
     verify_input_ids = torch.zeros(bs, max_nodes, dtype=torch.long, device=device)
     verify_input_ids[:, 0] = root_token_ids
@@ -161,24 +274,41 @@ def compile_ddtree_tree(
     max_past = int(past_lengths.max().item())
     total_kv_len = max_past + max_nodes
 
+    # The Triton attention kernel interprets `custom_mask` values as:
+    #   0.0 (→ tl.int1: False)  → masked  (Q-K pair SKIPPED)
+    #   ≠0.0 (→ tl.int1: True)  → allowed (Q-K pair COMPUTED)
+    #
+    # We initialise the whole mask to 0.0 (= all masked) and then set allowed
+    # positions to 1.0.
     tree_attention_mask = torch.zeros(bs, max_nodes, total_kv_len, dtype=dtype, device=device)
 
+    # --- Prefix portion (vectorized broadcast) ---
+    # All actual tree nodes may attend to their full prefix.
+    # Build a mask of shape [bs, max_nodes, total_kv_len] where
+    # mask[b, q, k] = 1.0 if k < past_lengths[b] and q < actual_tree_sizes[b]
+    past_lens_t = past_lengths.to(device=device)  # [bs]
+    actual_t = actual_tree_sizes.to(device=device)  # [bs]
+    kv_range = torch.arange(total_kv_len, device=device)  # [total_kv_len]
+    q_range = torch.arange(max_nodes, device=device)  # [max_nodes]
+    # [bs, 1, total_kv_len]: True where k < past_len
+    prefix_visible = kv_range.unsqueeze(0).unsqueeze(0) < past_lens_t.unsqueeze(1).unsqueeze(2)
+    # [bs, max_nodes, 1]: True where q < actual_size
+    actual_query_mask = q_range.unsqueeze(0).unsqueeze(2) < actual_t.unsqueeze(1).unsqueeze(2)
+    tree_attention_mask.copy_(prefix_visible.logical_and(actual_query_mask).to(dtype=dtype))
+
+    # --- Tree portion (per-batch, visibility shapes differ) ---
+    # Within the tree portion, only ancestor-visible pairs are allowed.
     for b in range(bs):
-        past_len = int(past_lengths[b].item())
+        past_len_i = int(past_lengths[b].item())
         actual_size = int(actual_tree_sizes[b].item())
 
-        tree_attention_mask[b, :actual_size, :past_len] = 0.0
-
         vis = visibility[b, :actual_size, :actual_size]
-        neg_inf = torch.finfo(dtype).min
-        tree_attention_mask[b, :actual_size, past_len:past_len + actual_size] = torch.where(
-            vis,
-            torch.tensor(0.0, dtype=dtype, device=device),
-            torch.tensor(neg_inf, dtype=dtype, device=device),
+        tree_attention_mask[b, :actual_size, past_len_i:past_len_i + actual_size] = (
+            vis.to(dtype=dtype, device=device)
         )
 
-        if actual_size < max_nodes:
-            tree_attention_mask[b, actual_size:, :] = neg_inf
+        # Padding nodes that are not part of the actual tree stay at 0.0
+        # (fully masked).
 
     return verify_input_ids, verify_position_ids, tree_attention_mask, actual_tree_sizes
 
@@ -218,6 +348,17 @@ def compact_ddtree_kv_cache(
     past_lengths: torch.Tensor,
     actual_tree_sizes: torch.Tensor,
 ):
+    """Compact KV cache by moving kept slots to the front.
+
+    Uses batched index_select + index_copy_ to replace per-element
+    set_kv_buffer kernel launches with 2 launches per layer.
+    """
+    k_buffer, v_buffer = kv_cache_pool.get_kv_buffer(layer.layer_id)
+    device = cache_locs.device
+
+    src_list: List[torch.Tensor] = []
+    tgt_list: List[torch.Tensor] = []
+
     for b in range(len(keep_indices)):
         keep = keep_indices[b]
         actual = int(actual_tree_sizes[b].item())
@@ -225,16 +366,32 @@ def compact_ddtree_kv_cache(
         if len(keep) == actual:
             continue
 
-        all_locs = cache_locs[b, :actual]
-        keep_locs = all_locs[keep]
+        # Safety: clamp keep indices to valid range [0, actual).
+        keep = [idx for idx in keep if 0 <= idx < actual]
+        if not keep or len(keep) == actual:
+            continue
 
-        for i, (src_loc, tgt_loc) in enumerate(zip(keep_locs, all_locs[:len(keep)])):
-            if src_loc == tgt_loc:
-                continue
-            k_buffer, v_buffer = kv_cache_pool.get_kv_buffer(layer)
-            kv_cache_pool.set_kv_buffer(
-                layer,
-                tgt_loc.unsqueeze(0),
-                k_buffer[src_loc:src_loc + 1],
-                v_buffer[src_loc:src_loc + 1],
-            )
+        # Fast path: if kept indices are contiguous from 0, no compaction needed.
+        if keep == list(range(len(keep))):
+            continue
+
+        all_locs = cache_locs[b, :actual]
+        keep_t = torch.tensor(keep, dtype=torch.long, device=device)
+        keep_locs = all_locs[keep_t]
+        tgt_locs = all_locs[: len(keep)]
+
+        mask = keep_locs != tgt_locs
+        if mask.any():
+            src_list.append(keep_locs[mask])
+            tgt_list.append(tgt_locs[mask])
+
+    if not src_list:
+        return
+
+    src_idx = torch.cat(src_list)
+    tgt_idx = torch.cat(tgt_list)
+
+    k_selected = k_buffer.index_select(0, src_idx)
+    v_selected = v_buffer.index_select(0, src_idx)
+    k_buffer.index_copy_(0, tgt_idx, k_selected)
+    v_buffer.index_copy_(0, tgt_idx, v_selected)

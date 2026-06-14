@@ -522,53 +522,27 @@ class DFlashWorker:
 
         return int(resolved_id)
 
-    def _prepare_for_speculative_decoding(
+    def _run_draft_forward(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput
-    ):
-        if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
-            return
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the draft model forward for a single block.
 
-        if batch.has_grammar:
-            raise RuntimeError(
-                "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
-            )
-        if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
-            if (
-                not is_dflash_sampling_verify_available()
-                and not self._warned_sampling_fallback
-                and self.tp_rank == 0
-            ):
-                logger.warning(
-                    "DFLASH non-greedy verification is unavailable on this build/device; "
-                    "falling back to greedy argmax verification."
-                )
-                self._warned_sampling_fallback = True
-
+        Returns:
+            draft_hidden: [bs, block_size, hidden_size]  draft hidden states.
+            positions_2d: [bs, block_size]               RoPE positions.
+            block_ids:    [bs, block_size]               input token ids.
+        """
         bs = batch.batch_size()
 
-        # --- 1) Append any newly committed tokens into the draft KV cache.
-        self._append_target_hidden_to_draft_kv(batch, draft_input)
-
-        target_model = self.target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
-        lm_head = getattr(target_model, "lm_head", None)
-        if (
-            lm_head is None
-            or not hasattr(lm_head, "weight")
-            or not hasattr(lm_head, "shard_indices")
-        ):
-            raise RuntimeError(
-                "DFLASH requires the target model to expose a vocab-parallel `lm_head` with `weight` and "
-                "`shard_indices` attributes."
-            )
-
-        # --- 2) Draft a non-causal block with the draft model.
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
         assert self._draft_block_tokens_buf is not None
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
+
+        target_model = self.target_worker.model_runner.model
+        embed_module = target_model.get_input_embeddings()
 
         block_ids = self._draft_block_ids_buf[:bs]
         block_ids.fill_(int(self._mask_token_id))
@@ -577,10 +551,7 @@ class DFlashWorker:
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        # For spec-v1, the draft KV cache is always materialized before drafting the
-        # next block. `target_prefix_lens` stay absolute for RoPE; `draft_prefix_lens`
-        # are the logical resident lengths in the draft-local cache.
-        target_prefix_lens = batch.seq_lens  # int32, device
+        target_prefix_lens = batch.seq_lens
         draft_prefix_lens = draft_input.draft_seq_lens
         if draft_prefix_lens.dtype != torch.int32:
             draft_prefix_lens = draft_prefix_lens.to(torch.int32)
@@ -633,9 +604,6 @@ class DFlashWorker:
                 bs,
             )
 
-            # Use TARGET_VERIFY mode (cuda-graphable) to run a fixed-size draft block.
-            # In this mode, `seq_lens` stores the prefix lengths; attention backends
-            # derive kv_len by adding `draft_token_num`.
             draft_spec_info = self._draft_block_spec_info
             seq_lens = draft_prefix_lens
             seq_lens_sum = int(draft_prefix_lens.sum().item())
@@ -660,13 +628,59 @@ class DFlashWorker:
                     forward_batch
                 ).logits_output
         finally:
-            # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
 
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
+
+        return draft_hidden, positions_2d, block_ids
+
+    def _prepare_for_speculative_decoding(
+        self, batch: ScheduleBatch, draft_input: DFlashDraftInput
+    ):
+        if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
+            return
+
+        if batch.has_grammar:
+            raise RuntimeError(
+                "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
+            )
+        if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
+            if (
+                not is_dflash_sampling_verify_available()
+                and not self._warned_sampling_fallback
+                and self.tp_rank == 0
+            ):
+                logger.warning(
+                    "DFLASH non-greedy verification is unavailable on this build/device; "
+                    "falling back to greedy argmax verification."
+                )
+                self._warned_sampling_fallback = True
+
+        bs = batch.batch_size()
+
+        # --- 1) Append any newly committed tokens into the draft KV cache.
+        self._append_target_hidden_to_draft_kv(batch, draft_input)
+
+        target_model = self.target_worker.model_runner.model
+        lm_head = getattr(target_model, "lm_head", None)
+        if (
+            lm_head is None
+            or not hasattr(lm_head, "weight")
+            or not hasattr(lm_head, "shard_indices")
+        ):
+            raise RuntimeError(
+                "DFLASH requires the target model to expose a vocab-parallel `lm_head` with `weight` and "
+                "`shard_indices` attributes."
+            )
+
+        # --- 2) Draft a non-causal block with the draft model.
+        draft_hidden, positions_2d, block_ids = self._run_draft_forward(
+            batch, draft_input
+        )
+
         draft_next = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,

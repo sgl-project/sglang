@@ -110,6 +110,8 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
 
     if server_args.speculative_algorithm == "DFLASH":
         _handle_dflash(server_args)
+    elif server_args.speculative_algorithm == "DDTREE":
+        _handle_ddtree(server_args)
     elif server_args.speculative_algorithm == "FROZEN_KV_MTP":
         _handle_frozen_kv_mtp(server_args)
     elif server_args.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
@@ -247,6 +249,159 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         logger.warning(
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
         )
+
+
+def _handle_ddtree(server_args: "ServerArgs") -> None:
+    """Validate and set defaults for DDTREE speculative decoding.
+
+    DDTREE extends DFLASH (DDTreeWorker inherits from DFlashWorker) and
+    shares most of the DFLASH validation.  The key difference is that
+    DDTREE adds a tree-budget parameter that controls how many tree nodes
+    are verified per round; ``max_tree_nodes = ddtree_budget + 1``, which
+    is *not* the same as ``speculative_num_draft_tokens`` (the draft model's
+    verify-window / block_size).
+    """
+
+    # --- Common validation (shared with DFLASH) ---
+    if server_args.enable_dp_attention:
+        raise ValueError(
+            "Currently DDTREE speculative decoding does not support dp attention."
+        )
+
+    if server_args.pp_size != 1:
+        raise ValueError(
+            "Currently DDTREE speculative decoding only supports pp_size == 1."
+        )
+
+    if server_args.speculative_draft_model_path is None:
+        raise ValueError(
+            "DDTREE speculative decoding requires setting --speculative-draft-model-path."
+        )
+
+    # DDTREE does not use EAGLE-style num_steps/topk; force them to 1
+    # so generic scheduler/KV-cache accounting behaves correctly.
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = 1
+    elif int(server_args.speculative_num_steps) != 1:
+        logger.warning(
+            "DDTREE only supports speculative_num_steps == 1; "
+            "overriding speculative_num_steps=%s to 1.",
+            server_args.speculative_num_steps,
+        )
+        server_args.speculative_num_steps = 1
+
+    if server_args.speculative_eagle_topk is None:
+        server_args.speculative_eagle_topk = 1
+    elif int(server_args.speculative_eagle_topk) != 1:
+        logger.warning(
+            "DDTREE only supports speculative_eagle_topk == 1; "
+            "overriding speculative_eagle_topk=%s to 1.",
+            server_args.speculative_eagle_topk,
+        )
+        server_args.speculative_eagle_topk = 1
+
+    # --- Infer speculative_num_draft_tokens (block_size) ---
+    # DDTREE requires this to match the draft model's verify-window.
+    # It is NOT the same as max_tree_nodes (ddtree_budget + 1).
+    if server_args.speculative_dflash_block_size is not None:
+        logger.warning(
+            "--speculative-dflash-block-size has no effect with "
+            "speculative_algorithm=DDTREE (use --speculative-ddtree-budget instead)."
+        )
+
+    if server_args.speculative_num_draft_tokens is None:
+        from sglang.srt.speculative.dflash_utils import (
+            parse_dflash_draft_config,
+        )
+
+        model_override_args = json.loads(server_args.json_model_override_args)
+        inferred_block_size = None
+        try:
+            from sglang.srt.utils.hf_transformers_utils import get_config
+
+            draft_hf_config = get_config(
+                server_args.speculative_draft_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.speculative_draft_model_revision,
+                model_override_args=model_override_args,
+            )
+            inferred_block_size = parse_dflash_draft_config(
+                draft_hf_config=draft_hf_config
+            ).resolve_block_size(default=None)
+        except Exception as e:
+            logger.warning(
+                "Failed to infer DDTREE block_size from draft model config; "
+                "defaulting speculative_num_draft_tokens to 16. Error: %s",
+                e,
+            )
+
+        if inferred_block_size is None:
+            inferred_block_size = 16
+            logger.warning(
+                "speculative_num_draft_tokens is not set; defaulting to %d for DDTREE.",
+                inferred_block_size,
+            )
+        server_args.speculative_num_draft_tokens = inferred_block_size
+        logger.info(
+            "Inferred speculative_num_draft_tokens=%d (block_size) "
+            "from draft model config for DDTREE.",
+            server_args.speculative_num_draft_tokens,
+        )
+
+    # --- DDTREE-specific: handle tree budget ---
+    if server_args.speculative_ddtree_budget is None:
+        # Default: budget = block_size - 1, matching DDTreeWorker fallback.
+        server_args.speculative_ddtree_budget = (
+            server_args.speculative_num_draft_tokens - 1
+        )
+        logger.info(
+            "Inferred speculative_ddtree_budget=%d from "
+            "speculative_num_draft_tokens=%d for DDTREE.",
+            server_args.speculative_ddtree_budget,
+            server_args.speculative_num_draft_tokens,
+        )
+    elif server_args.speculative_ddtree_budget < 1:
+        raise ValueError(
+            "--speculative-ddtree-budget must be >= 1, got "
+            f"{server_args.speculative_ddtree_budget}."
+        )
+
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 48
+        logger.warning(
+            "Max running requests is reset to 48 for DDTREE speculative decoding. "
+            "You can override this by explicitly setting --max-running-requests."
+        )
+
+    server_args.disable_overlap_schedule = True
+    logger.warning(
+        "Overlap scheduler is disabled when using DDTREE speculative decoding "
+        "(spec v2 is not supported yet)."
+    )
+
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning(
+            "Mixed chunked prefill is disabled because of using "
+            "DDTREE speculative decoding."
+        )
+
+    # DDTREE uses large verify token counts (max_tree_nodes = budget + 1).
+    # Piecewise CUDA graph compilation pre-allocates workspace sized to
+    # ``piecewise_cuda_graph_max_tokens`` and easily OOMs on mid-range GPUs
+    # when budget is large.  Disable it only when budget > block_size-1
+    # (branching mode); spine mode has the same verify size as DFLASH.
+    if not server_args.disable_piecewise_cuda_graph:
+        _ddtree_block_size = server_args.speculative_num_draft_tokens
+        if server_args.speculative_ddtree_budget > _ddtree_block_size - 1:
+            server_args.disable_piecewise_cuda_graph = True
+            logger.warning(
+                "Piecewise CUDA graph is disabled when using DDTREE speculative "
+                "decoding with budget=%d > block_size-1=%d (large verify-token "
+                "counts may OOM during compilation).",
+                server_args.speculative_ddtree_budget,
+                _ddtree_block_size - 1,
+            )
 
 
 def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:

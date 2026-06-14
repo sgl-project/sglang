@@ -1299,21 +1299,48 @@ class CudaGraphRunner:
             )
 
         elif self.model_runner.spec_algorithm.is_ddtree():
-            from sglang.srt.speculative.ddtree_info import DDTreeVerifyInput
-
             tree_budget = getattr(
                 self.model_runner.server_args, "speculative_ddtree_budget", None
             )
             if tree_budget is None:
                 tree_budget = self.model_runner.server_args.speculative_num_draft_tokens - 1
             draft_token_num = tree_budget + 1
-            spec_info = DDTreeVerifyInput(
-                draft_token=None,
-                positions=None,
-                draft_token_num=draft_token_num,
-                tree_budget=tree_budget,
-                custom_mask=self.buffers.custom_mask,
-            )
+
+            # Spine mode (budget <= block_size-1) uses DFLASH verify for CUDA-graph
+            # compatibility.  Full-tree mode uses DDTree verify.
+            if tree_budget <= self.model_runner.server_args.speculative_num_draft_tokens - 1:
+                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+                from sglang.srt.speculative.dflash_utils import (
+                    resolve_dflash_verify_mask_policy,
+                )
+                _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                    self.model_runner.attn_backend
+                )
+                spec_info = DFlashVerifyInput(
+                    draft_token=None,
+                    positions=None,
+                    draft_token_num=draft_token_num,
+                    custom_mask=(
+                        None
+                        if (self.model_runner.is_draft_worker or not build_custom_mask)
+                        else self.buffers.custom_mask
+                    ),
+                    capture_hidden_mode=(
+                        CaptureHiddenMode.NULL
+                        if self.model_runner.is_draft_worker
+                        else CaptureHiddenMode.FULL
+                    ),
+                )
+            else:
+                from sglang.srt.speculative.ddtree_info import DDTreeVerifyInput
+
+                spec_info = DDTreeVerifyInput(
+                    draft_token=None,
+                    positions=None,
+                    draft_token_num=draft_token_num,
+                    tree_budget=tree_budget,
+                    custom_mask=self.buffers.custom_mask,
+                )
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
