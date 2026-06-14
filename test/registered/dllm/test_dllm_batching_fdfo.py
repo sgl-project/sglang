@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=139, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=200, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=330, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
@@ -20,7 +20,9 @@ from sglang.test.test_utils import (
 )
 
 
-class TestLLaDA2Mini(CustomTestCase):
+class TestBatchingFDFO(CustomTestCase):
+    """End-to-end dLLM coverage on the default First-Done-First-Out scheduler."""
+
     @classmethod
     def setUpClass(cls):
         cls.model = "inclusionAI/LLaDA2.0-mini"
@@ -38,6 +40,7 @@ class TestLLaDA2Mini(CustomTestCase):
             "flashinfer",
             "--dllm-algorithm",
             "LowConfidence",
+            "--dllm-fdfo",
             "--cuda-graph-bs",
             "1",
             "2",
@@ -83,7 +86,7 @@ class TestLLaDA2Mini(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (llada2-mini) with tp1\n"
+                f"### test_bs_1_speed (llada2-mini FDFO) with tp1\n"
                 f"{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
