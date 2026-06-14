@@ -43,8 +43,8 @@ class SchedulerLoadInquirer:
     spec_algorithm: SpeculativeAlgorithm
     get_running_batch: Callable
     get_waiting_queue: Callable
+    get_partially_extended_reqs: Callable
     get_stats: Callable
-    get_chunked_req: Callable
     get_disagg_prefill_bootstrap_queue: Callable
     get_disagg_prefill_inflight_queue: Callable
     get_disagg_decode_prealloc_queue: Callable
@@ -67,9 +67,13 @@ class SchedulerLoadInquirer:
                 0 is correct.
         """
         num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
-        if self.get_chunked_req() is not None:
-            req = self.get_chunked_req()
-            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
+        partially_extended_req = next(iter(self.get_partially_extended_reqs()), None)
+        if partially_extended_req is not None:
+            num_pending_tokens += (
+                partially_extended_req.seqlen
+                - len(partially_extended_req.prefix_indices)
+                - chunk_deduct
+            )
         return num_pending_tokens
 
     def get_num_waiting_uncached_tokens(self) -> int:
@@ -80,7 +84,7 @@ class SchedulerLoadInquirer:
         for req in self.get_waiting_queue():
             # if match-in-waiting-queue disabled, this metric returns seq_lens
             num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
-        cr = self.get_chunked_req()
+        cr = next(iter(self.get_partially_extended_reqs()), None)
         if cr is not None:
             num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
         return num_tokens

@@ -160,7 +160,9 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
     Req,
+    ReqPhase,
     ScheduleBatch,
+    release_req,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -908,6 +910,7 @@ class Scheduler(
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
+        self.active_reqs: Dict[str, Req] = {}
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -924,6 +927,38 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+
+    def _activate_req(self, req: Req) -> None:
+        if req.is_dllm():
+            return
+        assert req.rid not in self.active_reqs, f"already active: {req.rid}"
+        self.active_reqs[req.rid] = req
+
+    def _deactivate_req(self, req: Req) -> None:
+        self.active_reqs.pop(req.rid, None)
+
+    def _assert_reqs_invariants(self) -> None:
+        if not envs.SGLANG_DEBUG_REQS_INVARIANTS.get():
+            return
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            return
+        waiting_rids = {r.rid for r in self.waiting_queue}
+        active_rids = set(self.active_reqs.keys())
+        running_rids = {r.rid for r in self.running_batch.reqs if not r.finished()}
+
+        assert not waiting_rids & active_rids, (
+            f"waiting_queue and active_reqs must be disjoint (sync mode); "
+            f"overlap: {waiting_rids & active_rids}"
+        )
+
+        assert (
+            running_rids <= active_rids
+        ), f"running not subset of active: {running_rids - active_rids}"
+
+    def partially_extended_reqs(self) -> List[Req]:
+        return [
+            r for r in self.active_reqs.values() if r.phase is ReqPhase.EXTEND_NON_LAST
+        ]
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -943,7 +978,6 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
-        self.chunked_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -1678,6 +1712,7 @@ class Scheduler(
             max_total_num_tokens=self.max_total_num_tokens,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_active_reqs=lambda: self.active_reqs,
         )
 
     def init_invariant_checker(self) -> None:
@@ -1696,6 +1731,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_active_reqs=lambda: self.active_reqs,
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -1727,7 +1763,7 @@ class Scheduler(
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
-            get_chunked_req=lambda: self.chunked_req,
+            get_partially_extended_reqs=self.partially_extended_reqs,
             get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
@@ -1771,6 +1807,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            deactivate_req=self._deactivate_req,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -2382,12 +2419,16 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
-    def stash_chunked_request(self, req: Req):
-        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+    def stash_partially_extended_req(self, req: Req):
+        maybe_cache_unfinished_req(req, self.tree_cache, is_partially_extended=True)
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
+
+        # This path bypasses prepare_for_decode, so transition the phase here.
+        for r in reqs:
+            r.phase = ReqPhase.DECODE
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,
@@ -2397,6 +2438,7 @@ class Scheduler(
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
+            forward_mode=ForwardMode.DECODE,
         )
 
         batch.req_pool_indices = torch.tensor(
@@ -2425,6 +2467,7 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self._assert_reqs_invariants()
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -2432,25 +2475,17 @@ class Scheduler(
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
-        # Merge the prefill batch into the running batch
-        chunked_req_to_exclude = set()
-
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
-            chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
+                self.stash_partially_extended_req(req)
 
-        if self.chunked_req is not None:
-            # Move the chunked request out of the batch so that we can merge
-            # only finished requests to running_batch.
-            chunked_req_to_exclude.add(self.chunked_req)
-
+        for req in self.partially_extended_reqs():
             # Stash (cache) the previous chunk only when it produced new KV
-            # beyond what is already cached. A parked chunk (add_chunked_req
-            # hybrid-SWA early-return) leaves fill_len == len(prefix_indices),
-            # so there is nothing new to cache and stashing would be a no-op.
-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
-                self.stash_chunked_request(self.chunked_req)
+            # beyond what is already cached. A chunk that committed no new KV
+            # leaves extend_range.end == len(prefix_indices), so caching would
+            # be a no-op; skip it to avoid a wasted insert pass.
+            if req.extend_range.end > len(req.prefix_indices):
+                self.stash_partially_extended_req(req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -2470,19 +2505,8 @@ class Scheduler(
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         ):
-            if self.last_batch.chunked_req is not None:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
-
-            if self.dllm_config is not None and self.last_batch.reqs:
-                chunked_req_to_exclude.update(self.last_batch.reqs)
-
-            # Filter batch
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            self.last_batch.filter_batch(skip_extend_intermediate=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -2500,6 +2524,10 @@ class Scheduler(
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
+            is_extend_intermediate = self.running_batch.is_extend_intermediate or []
+            assert not any(
+                is_extend_intermediate
+            ), "running_batch contains intermediate-mode reqs in is_prefill_only branch"
             self.running_batch.filter_batch()
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
@@ -2549,6 +2577,7 @@ class Scheduler(
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 
+        self._assert_reqs_invariants()
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -2559,7 +2588,7 @@ class Scheduler(
     def _should_delay_dflash_prefill_for_batching(self, running_bs: int) -> bool:
         if not self.spec_algorithm.is_dflash():
             return False
-        if running_bs <= 0 or self.chunked_req is not None:
+        if running_bs <= 0 or self.partially_extended_reqs():
             return False
 
         return should_delay_dflash_prefill_for_batching(
@@ -2605,23 +2634,27 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
+        partially_extended_in_active = self.partially_extended_reqs()
+        assert len(partially_extended_in_active) <= 1, (
+            f"single-flight violated: {len(partially_extended_in_active)} partially-extended reqs "
+            f"in active ({[r.rid for r in partially_extended_in_active]})"
+        )
+        partially_extended_req = (
+            partially_extended_in_active[0] if partially_extended_in_active else None
+        )
+
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and partially_extended_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs)
         if self._should_delay_dflash_prefill_for_batching(running_bs):
             return None
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is None
+            and partially_extended_req is None
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -2638,8 +2671,8 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
-            history_len = len(self.chunked_req.prefix_indices)
+        if partially_extended_req is not None and self.enable_dynamic_chunking:
+            history_len = len(partially_extended_req.prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
@@ -2663,9 +2696,9 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        if partially_extended_req is not None:
+            partially_extended_req.init_next_round_input()
+            adder.add_resumed_extend_req(partially_extended_req)
 
         if self.enable_lora:
             running_loras = {
@@ -2715,9 +2748,8 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
+            res = adder.add_unstarted_extend_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -2757,19 +2789,17 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        for req in can_run_list:
+            if req.rid in self.active_reqs:
+                continue
+            self._activate_req(req)
+
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
+                self._deactivate_req(req)
                 self._add_request_to_queue(req)
-
-        if adder.new_chunked_req is not None:
-            # Update chunked prefill
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
-
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -2782,11 +2812,6 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
-        )
-
-        new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
         )
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
@@ -2798,17 +2823,29 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        partially_extended_in_batch = [
+            r for r in can_run_list if r.phase is ReqPhase.EXTEND_NON_LAST
+        ]
+        assert (
+            len(partially_extended_in_batch) <= 1
+        ), "single-flight invariant: at most one partially-extended req per batch"
+        chunk_deduct = (
+            partially_extended_in_batch[0].extend_range.length
+            if partially_extended_in_batch
+            else 0
+        )
+
+        new_batch.contains_last_prefill_chunk = (
+            not partially_extended_in_batch or len(can_run_list) != 1
+        )
+
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
             self.running_batch.reqs,
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
-                chunk_deduct=(
-                    self.chunked_req.extend_range.length
-                    if self.chunked_req is not None
-                    else 0
-                ),
+                chunk_deduct=chunk_deduct
             ),
         )
 
@@ -2822,6 +2859,10 @@ class Scheduler(
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch()
+            is_extend_intermediate = self.running_batch.is_extend_intermediate or []
+            assert not any(
+                is_extend_intermediate
+            ), "running_batch contains intermediate-mode reqs before mix_with_running"
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
@@ -2937,7 +2978,10 @@ class Scheduler(
                 )
             logger.warning(msg_prefix + msg_details)
 
+            for req in reqs_to_abort:
+                self._deactivate_req(req)
             for req in retracted_reqs:
+                self._deactivate_req(req)
                 self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
@@ -3151,10 +3195,11 @@ class Scheduler(
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
             if batch.return_logprob:
-                # Decode reqs have no extend_range (it is only consumed for
-                # input-logprob processing on extend/mixed reqs).
+                # extend_range persists into decode for KV bookkeeping; only
+                # extend/mixed batches consume these lengths for input-logprob
+                # processing, so report 0 for decode batches.
                 batch_result.extend_input_len_per_req = [
-                    req.extend_range.length if req.extend_range is not None else 0
+                    req.extend_range.length if batch.forward_mode.is_extend() else 0
                     for req in batch.reqs
                 ]
                 batch_result.extend_logprob_start_len_per_req = (
@@ -3362,12 +3407,12 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
+            and not self.partially_extended_reqs()
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
@@ -3514,6 +3559,7 @@ class Scheduler(
             self.last_batch = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
+            self.active_reqs.clear()
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
@@ -3682,6 +3728,7 @@ class Scheduler(
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
+                self._deactivate_req(req)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -3733,11 +3780,14 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Delete requests in the running batch
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            reqs = self.running_batch.reqs
-        else:
-            reqs = self.running_batch.reqs + self.cur_batch.reqs
+        # Delete requests in the running batch. active_reqs is the source of
+        # truth for scheduler-owned reqs (sync, disagg prefill/decode). DLLM reqs
+        # are owned by DllmManager and never enter active_reqs, so add its
+        # waiting_queue, which holds every in-flight DLLM req across denoising
+        # rounds (staging_queue is a subset).
+        reqs = list(self.active_reqs.values())
+        if self.dllm_config is not None:
+            reqs = reqs + self.dllm_manager.waiting_queue
 
         for req in reqs:
             if not req.finished() and (
@@ -3757,12 +3807,12 @@ class Scheduler(
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
-            # All scheduler state (running_batch, last_batch, chunked_req,
-            # result_queue) is left untouched. On resume, the normal event
-            # loop (get_next_batch_to_run) handles last_batch merge,
-            # chunked_req cleanup, and overlap result processing through
-            # the standard code paths. This avoids duplicating batch
-            # manipulation logic and the accounting bugs that come with it.
+            # All scheduler state (running_batch, last_batch, result_queue) is
+            # left untouched. On resume, the normal event loop
+            # (get_next_batch_to_run) handles last_batch merge and overlap
+            # result processing through the standard code paths. This avoids
+            # duplicating batch manipulation logic and the accounting bugs that
+            # come with it.
             return
 
         if self.enable_overlap and self.last_batch:
@@ -3771,10 +3821,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            chunked_req_to_exclude = set()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            self.last_batch.filter_batch(skip_extend_intermediate=True)
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
@@ -3791,15 +3838,26 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch = None
 
-        if recv_req.mode == "retract" and not self.running_batch.is_empty():
+        if recv_req.mode == "retract":
             self.running_batch.filter_batch()
-            if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_all(self.server_args)
-                for req in retracted_reqs:
-                    self._add_request_to_queue(req)
 
+            retract_reqs = [*self.running_batch.reqs, *self.partially_extended_reqs()]
+
+            for idx, req in enumerate(retract_reqs):
+                release_req(
+                    req=req,
+                    remaing_req_count=len(retract_reqs) - idx,
+                    server_args=self.server_args,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    tree_cache=self.tree_cache,
+                    hisparse_coordinator=self.hisparse_coordinator,
+                )
+                self._deactivate_req(req)
+                self._add_request_to_queue(req)
+
+            self.running_batch.reqs = []
             self.running_batch.batch_is_full = False
-            self.chunked_req = None
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,
