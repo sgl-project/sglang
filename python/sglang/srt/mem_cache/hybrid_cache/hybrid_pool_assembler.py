@@ -302,10 +302,10 @@ def build_deepseek_v4_hicache_stack(
     ):
         if layer_item.compress_ratio == 4:
             c4_layer_mapping[layer_id] = layer_item.compress_layer_id
-            c4_state_global_layers.append(layer_id)
+            c4_state_global_layers.append(layer_id + kvcache.start_layer)
         elif layer_item.compress_ratio == 128:
             c128_layer_mapping[layer_id] = layer_item.compress_layer_id
-            c128_state_global_layers.append(layer_id)
+            c128_state_global_layers.append(layer_id + kvcache.start_layer)
 
     c4_state_mapping = {
         layer_id: local_id for local_id, layer_id in enumerate(c4_state_global_layers)
