@@ -267,8 +267,13 @@ struct sm90_int8_config_M128_smallN {
 };
 
 // Non-swap fallback for M in (16, 64] when N <= kNThreshold. At small N the
-// original non-swap tile is already efficient, while the swap M64_smallN tile
-// (<64,16,256>) regresses ~12% on H20 in this region, so fall back to non-swap.
+// original non-swap tile is already efficient, and the swap M64 tile
+// (<64,16,256>) regressed ~12% on H20 here; routing to non-swap restores parity
+// (no win, but no regression -- M<=16 still swaps and wins ~1.6x). Tile
+// <64,64,128> + cluster <1,4,1> matches the original int8 small-M tile; it is
+// distinct from M128_smallN below (same tile but cluster <2,1,1>, which serves
+// the (64,128] range). Non-swap, so it uses ScaledEpilogue(Bias) (row bias),
+// not the swap configs' ScaledEpilogueColumnBias.
 template <typename InType, typename OutType, bool EnableBias>
 struct sm90_int8_config_M64_smallN_noswap {
   static_assert(std::is_same<InType, int8_t>());
@@ -458,8 +463,9 @@ inline void cutlass_gemm_sm90_int8_dispatch(
   uint32_t const n = b.size(1);
 
   // Threshold separating "smallN" from "largeN" config variants for the M16
-  // and M64 buckets. Seeded from FP8 swap-AB values; subject to int8-specific
-  // tuning on H20.
+  // and M64 buckets (small N ~= attention/KV proj; large N ~= MLP). Seeded from
+  // the FP8 swap-AB dispatch; validated on H20 to give no regression across the
+  // benchmark matrix, but not exhaustively int8-tuned (may shift on H100/H200).
   static constexpr uint32_t kNThreshold = 1280;
 
   // Threshold splitting the M128 bucket into a small-N fallback (non-swap,

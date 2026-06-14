@@ -419,6 +419,7 @@ void sm89_dispatch_shape(
 
 // NOTE: SM90 int8 path moved to cutlass_extensions/gemm/int8_gemm_sm90_dispatch.cuh
 //       (adds small-M swap-AB dispatch; see cutlass_scaled_mm_sm90_int8).
+//       The SM75/80/89 paths (sm75_/sm80_/sm89_dispatch_shape) are unchanged.
 
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
