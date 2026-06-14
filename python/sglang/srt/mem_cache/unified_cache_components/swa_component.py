@@ -521,8 +521,11 @@ class SWAComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
-        if is_finished:
-            insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        # Mark leading out-of-window tokens SWA-evicted on the unfinished path
+        # too: the decode-side radix cache caches reqs at admission whose reused
+        # prefix reaches past the window, and those tokens must be tombstoned, not
+        # counted as swa_evictable, or the SWA pool leaks. 0 on the aggregated path.
+        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
         return None
 
     def free_out_of_window_slots(
