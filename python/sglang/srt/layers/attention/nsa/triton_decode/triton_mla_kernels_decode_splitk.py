@@ -457,11 +457,12 @@ def run_splitk_attention(
     output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
     lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
 
-    grid_splitk = lambda meta: (
-        total_tokens,
-        triton.cdiv(h_q, meta["BLOCK_H"]),
-        split_k,
-    )
+    def grid_splitk(meta):
+        return (
+            total_tokens,
+            triton.cdiv(h_q, meta["BLOCK_H"]),
+            split_k,
+        )
     _splitk_attention_kernel[grid_splitk](
         q_reshaped,
         gathered_kv,
@@ -500,7 +501,8 @@ def run_splitk_attention(
     HAS_ATTN_SINK = attn_sink is not None
     attn_sink_tensor = attn_sink if HAS_ATTN_SINK else lse[:1]
 
-    grid_combine = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
+    def grid_combine(meta):
+        return (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
     _combine_splitk_attention_kernel[grid_combine](
         partial_output,
         partial_lse,

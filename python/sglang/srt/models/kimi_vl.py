@@ -50,7 +50,6 @@ import torch
 from torch import nn
 from transformers.activations import GELUActivation
 
-from sglang.srt.configs import KimiVLConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig

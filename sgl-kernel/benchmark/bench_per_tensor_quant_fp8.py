@@ -120,9 +120,11 @@ def benchmark(batch_size, seq_len, provider):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "vllm":
-        fn = lambda: vllm_scaled_fp8_quant(x.clone())
+        def fn():
+            return vllm_scaled_fp8_quant(x.clone())
     elif provider == "sglang":
-        fn = lambda: sglang_scaled_fp8_quant(x.clone())
+        def fn():
+            return sglang_scaled_fp8_quant(x.clone())
 
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
 

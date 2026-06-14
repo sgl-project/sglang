@@ -1491,7 +1491,7 @@ class Encoder(nn.Module):
         )
 
         # end
-        self.norm_out = Normalize(block_in, norm_type)
+        self.norm_out = _make_norm_layer(block_in, norm_type)
         self.conv_out = nn.Conv2d(
             block_in, z_channels, kernel_size=3, stride=1, padding=1
         )
@@ -1575,7 +1575,7 @@ class Decoder(nn.Module):
             self.conv_blocks.append(conv_block)
 
         # end
-        self.norm_out = Normalize(block_in, norm_type)
+        self.norm_out = _make_norm_layer(block_in, norm_type)
         self.conv_out = nn.Conv2d(
             block_in, out_channels, kernel_size=3, stride=1, padding=1
         )
@@ -1709,11 +1709,11 @@ class ResnetBlock(nn.Module):
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
 
-        self.norm1 = Normalize(in_channels, norm_type)
+        self.norm1 = _make_norm_layer(in_channels, norm_type)
         self.conv1 = nn.Conv2d(
             in_channels, out_channels, kernel_size=3, stride=1, padding=1
         )
-        self.norm2 = Normalize(out_channels, norm_type)
+        self.norm2 = _make_norm_layer(out_channels, norm_type)
         self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(
             out_channels, out_channels, kernel_size=3, stride=1, padding=1
@@ -1750,7 +1750,7 @@ class ResnetBlock(nn.Module):
 class AttnBlock(nn.Module):
     def __init__(self, in_channels, norm_type="group"):
         super().__init__()
-        self.norm = Normalize(in_channels, norm_type)
+        self.norm = _make_norm_layer(in_channels, norm_type)
         self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
@@ -1790,7 +1790,7 @@ def nonlinearity(x):
     return x * torch.sigmoid(x)
 
 
-def Normalize(in_channels, norm_type="group"):
+def _make_norm_layer(in_channels, norm_type="group"):
     assert norm_type in ["group", "batch"]
     if norm_type == "group":
         return nn.GroupNorm(

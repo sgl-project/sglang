@@ -41,8 +41,6 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
-from openai.types.responses.response import ToolChoice
-from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -55,7 +53,7 @@ from typing_extensions import Literal
 
 try:
     from xgrammar import StructuralTag
-except:
+except Exception:
     StructuralTag = Any
 
 from sglang.utils import convert_json_schema_to_str

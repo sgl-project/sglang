@@ -60,7 +60,6 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
-    configure_logger,
     load_audio,
     load_image,
     load_video,

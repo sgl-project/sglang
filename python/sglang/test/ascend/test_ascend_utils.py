@@ -588,11 +588,12 @@ def write_results_to_github_step_summary(results: dict):
 
     write_github_step_summary_once(HEADER)
 
-    get_float = lambda metrics, item, precision: (
-        f"{metrics[item]:.{precision}f}"
-        if isinstance(metrics.get(item, "-"), (int, float))
-        else metrics.get(item, "-")
-    )
+    def get_float(metrics, item, precision):
+        return (
+            f"{metrics[item]:.{precision}f}"
+            if isinstance(metrics.get(item, "-"), (int, float))
+            else metrics.get(item, "-")
+        )
 
     summary = ""
     for model, metrics in results.items():

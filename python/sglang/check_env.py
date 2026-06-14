@@ -117,7 +117,7 @@ class BaseEnv:
                 if "Hypervisor vendor:" in line:
                     return {"Hypervisor vendor:": line.split(":")[1].strip()}
             return {}
-        except:
+        except Exception:
             return {}
 
     def get_ulimit_soft(self) -> dict:

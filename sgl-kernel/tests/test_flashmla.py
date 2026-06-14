@@ -6,6 +6,8 @@ from typing import Optional, Tuple
 import pytest
 import torch
 import triton
+from torch.utils.checkpoint import checkpoint
+
 from sgl_kernel.flash_mla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
@@ -170,8 +172,12 @@ def sdpa(query, key, value, attn_bias, softmax_scale=None):
     query = query.float().transpose(-3, -2)
     key = key.float().transpose(-3, -2)
     value = value.float().transpose(-3, -2)
-    key = key.repeat_interleave(h // h_k, dim=-3)
-    value = value.repeat_interleave(h // h_k, dim=-3)
+    # query.shape after transpose: [B, H_Q, S_Q, D]; key.shape: [B, H_K, S_K, D]
+    h = query.shape[-3]
+    h_k = key.shape[-3]
+    if h_k < h:
+        key = key.repeat_interleave(h // h_k, dim=-3)
+        value = value.repeat_interleave(h // h_k, dim=-3)
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** (-0.5)
     attn_weight = (query @ key.transpose(-2, -1)) * softmax_scale

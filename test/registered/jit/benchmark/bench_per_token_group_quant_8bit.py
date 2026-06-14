@@ -261,13 +261,14 @@ def benchmark(
     if provider == "triton":
         fn = triton_per_token_group_quant_8bit
         kernel_names = "_per_token_group_quant_8bit|_silu_and_mul_post_quant_kernel"
-        bench_fn = lambda: fn(
-            x=x,
-            masked_m=masked_m,
-            group_size=group_size,
-            dst_dtype=dst_dtype,
-            **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
-        )
+        def bench_fn():
+            return fn(
+                    x=x,
+                    masked_m=masked_m,
+                    group_size=group_size,
+                    dst_dtype=dst_dtype,
+                    **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
+                )
     elif provider == "sglang":
         kernel_names = "per_token_group_quant_8bit_kernel"
         bench_fn = _make_sglang_bench_fn(

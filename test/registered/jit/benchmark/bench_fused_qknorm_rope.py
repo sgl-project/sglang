@@ -124,9 +124,11 @@ def bench_fused_qknorm_rope(
     )
 
     if provider == "jit":
-        fn = lambda: fused_qk_norm_rope_jit(qkv.clone(), **common_kwargs)
+        def fn():
+            return fused_qk_norm_rope_jit(qkv.clone(), **common_kwargs)
     elif provider == "aot":
-        fn = lambda: fused_qk_norm_rope_aot(qkv.clone(), **common_kwargs)
+        def fn():
+            return fused_qk_norm_rope_aot(qkv.clone(), **common_kwargs)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

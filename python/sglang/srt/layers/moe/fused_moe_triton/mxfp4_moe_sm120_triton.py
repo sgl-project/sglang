@@ -298,10 +298,11 @@ def mxfp4_gemm_triton(
     B_packed = B_packed.contiguous()
     B_scale = B_scale.contiguous()
 
-    grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_M"]),
-        triton.cdiv(N, meta["BLOCK_N"]),
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
     B_u8 = B_packed.view(torch.uint8)
 
     _mxfp4_gemm_kernel[grid](
@@ -380,7 +381,8 @@ def mxfp4_moe_forward_triton(
     intermediate = torch.empty(num_slots, 2 * I, dtype=dtype, device=device)
 
     w13_u8 = w13_packed.view(torch.uint8)  # [E, 2*I, K//2]
-    grid1 = lambda meta: (num_slots, triton.cdiv(2 * I, meta["BLOCK_N"]))
+    def grid1(meta):
+        return (num_slots, triton.cdiv(2 * I, meta["BLOCK_N"]))
 
     _mxfp4_slot_gemv_kernel[grid1](
         hidden_states,
@@ -417,7 +419,8 @@ def mxfp4_moe_forward_triton(
     slot_ids = torch.arange(num_slots, device=device, dtype=torch.int32)
 
     w2_u8 = w2_packed.view(torch.uint8)  # [E, K, I//2]
-    grid2 = lambda meta: (num_slots, triton.cdiv(K, meta["BLOCK_N"]))
+    def grid2(meta):
+        return (num_slots, triton.cdiv(K, meta["BLOCK_N"]))
 
     _mxfp4_slot_gemv_kernel[grid2](
         activated,

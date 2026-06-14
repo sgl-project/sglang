@@ -455,11 +455,12 @@ def _chunk_cumsum_fwd(
     dA_cumsum = torch.empty(
         batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32
     )
-    grid_chunk_cs = lambda META: (
-        batch,
-        nchunks,
-        triton.cdiv(nheads, META["BLOCK_SIZE_H"]),
-    )
+    def grid_chunk_cs(META):
+        return (
+            batch,
+            nchunks,
+            triton.cdiv(nheads, META["BLOCK_SIZE_H"]),
+        )
     with torch.get_device_module(dt.device).device(dt.device.index):
         _chunk_cumsum_fwd_kernel[grid_chunk_cs](
             dt,
@@ -514,12 +515,13 @@ def _chunk_state_fwd(
             device=x.device,
             dtype=states_dtype,
         )
-    grid = lambda META: (
-        triton.cdiv(headdim, META["BLOCK_SIZE_M"])
-        * triton.cdiv(dstate, META["BLOCK_SIZE_N"]),
-        batch * nchunks,
-        nheads,
-    )
+    def grid(META):
+        return (
+            triton.cdiv(headdim, META["BLOCK_SIZE_M"])
+            * triton.cdiv(dstate, META["BLOCK_SIZE_N"]),
+            batch * nchunks,
+            nheads,
+        )
     with torch.get_device_module(x.device).device(x.device.index):
         _chunk_state_fwd_kernel[grid](
             x,
@@ -590,12 +592,13 @@ def chunk_state_varlen(
         dtype=chunk_states.dtype,
         device=chunk_states.device,
     )
-    grid = lambda META: (
-        triton.cdiv(headdim, META["BLOCK_SIZE_M"])
-        * triton.cdiv(dstate, META["BLOCK_SIZE_N"]),
-        batch,
-        nheads,
-    )
+    def grid(META):
+        return (
+            triton.cdiv(headdim, META["BLOCK_SIZE_M"])
+            * triton.cdiv(dstate, META["BLOCK_SIZE_N"]),
+            batch,
+            nheads,
+        )
     with torch.get_device_module(x.device).device(x.device.index):
         _chunk_state_varlen_kernel[grid](
             x,

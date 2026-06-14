@@ -159,17 +159,20 @@ def benchmark(m, n, k, provider):
     b_fp4, b_sf = scaled_fp4_quant(b, b_global_scale)
 
     if provider == "jit":
-        fn = lambda: cutlass_scaled_fp4_mm(
-            a_fp4, b_fp4, a_sf, b_sf, alpha, torch.bfloat16
-        )
+        def fn():
+            return cutlass_scaled_fp4_mm(
+                    a_fp4, b_fp4, a_sf, b_sf, alpha, torch.bfloat16
+                )
     elif provider == "aot_sgl_kernel":
-        fn = lambda: _aot_cutlass_scaled_fp4_mm(
-            a_fp4, b_fp4, a_sf, b_sf, alpha, torch.bfloat16
-        )
+        def fn():
+            return _aot_cutlass_scaled_fp4_mm(
+                    a_fp4, b_fp4, a_sf, b_sf, alpha, torch.bfloat16
+                )
     elif provider == "torch_ref":
         a_ref = _dequantize_to_fp16(a_fp4, a_sf, a_global_scale)
         b_ref = _dequantize_to_fp16(b_fp4, b_sf, b_global_scale)
-        fn = lambda: torch.matmul(a_ref, b_ref.t())
+        def fn():
+            return torch.matmul(a_ref, b_ref.t())
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

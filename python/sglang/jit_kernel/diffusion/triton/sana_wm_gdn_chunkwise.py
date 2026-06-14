@@ -885,8 +885,10 @@ def phase_b_triton(
 
     load_init = init_state_kv is not None
     dummy = torch.empty(1, device=device, dtype=fdtype)
-    full_M = lambda: torch.empty(BH, F, BLOCK_D, BLOCK_D, device=device, dtype=fdtype)
-    full_z = lambda: torch.empty(BH, F, BLOCK_D, device=device, dtype=fdtype)
+    def full_M():
+        return torch.empty(BH, F, BLOCK_D, BLOCK_D, device=device, dtype=fdtype)
+    def full_z():
+        return torch.empty(BH, F, BLOCK_D, device=device, dtype=fdtype)
     M_fwd = dummy if direction == 2 else full_M()
     z_fwd = dummy if (direction == 2 or skip_z) else full_z()
     # Combined-history reuses M_fwd/z_fwd as M_hist/z_hist; rev outputs are

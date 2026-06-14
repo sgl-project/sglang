@@ -567,11 +567,12 @@ def fused_gather_attn_decode_dsv4(
         attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
 
         # Use autotuned grid
-        grid_splitk = lambda meta: (
-            triton.cdiv(h_q, meta["BLOCK_H"]),
-            total_tokens,
-            split_k,
-        )
+        def grid_splitk(meta):
+            return (
+                    triton.cdiv(h_q, meta["BLOCK_H"]),
+                    total_tokens,
+                    split_k,
+                )
 
         def run_splitk_kernel():
             _fused_gather_attn_dsv4_splitk_kernel[grid_splitk](
@@ -616,10 +617,11 @@ def fused_gather_attn_decode_dsv4(
         # Use autotuned combine kernel for split_k=8
         if split_k == 8:
             # Autotuned kernel - grid is determined by autotune
-            grid_combine = lambda meta: (
-                total_tokens,
-                triton.cdiv(h_q, meta["BLOCK_H"]),
-            )
+            def grid_combine(meta):
+                return (
+                            total_tokens,
+                            triton.cdiv(h_q, meta["BLOCK_H"]),
+                        )
             _combine_splitk_kernel_8_optimized[grid_combine](
                 partial_output,
                 partial_lse,
@@ -695,7 +697,8 @@ def fused_gather_attn_decode_dsv4(
     topk_length_tensor = topk_length if topk_length is not None else lse[:1, 0]
     attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
 
-    grid = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens)
+    def grid(meta):
+        return (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens)
 
     def run_kernel():
         _fused_gather_attn_dsv4_kernel[grid](
@@ -1727,11 +1730,12 @@ def fused_gather_attn_decode_dsv4_dual_scope(
         )
         attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
 
-        grid_splitk = lambda meta: (
-            triton.cdiv(h_q, meta["BLOCK_H"]),
-            total_tokens,
-            split_k,
-        )
+        def grid_splitk(meta):
+            return (
+                    triton.cdiv(h_q, meta["BLOCK_H"]),
+                    total_tokens,
+                    split_k,
+                )
 
         def run_splitk_kernel():
             _fused_gather_attn_dsv4_dual_scope_splitk_kernel[grid_splitk](
@@ -1785,10 +1789,11 @@ def fused_gather_attn_decode_dsv4_dual_scope(
 
         # Use appropriate combine kernel based on split_k
         if split_k == 8:
-            grid_combine = lambda meta: (
-                total_tokens,
-                triton.cdiv(h_q, meta["BLOCK_H"]),
-            )
+            def grid_combine(meta):
+                return (
+                            total_tokens,
+                            triton.cdiv(h_q, meta["BLOCK_H"]),
+                        )
             _combine_splitk_kernel_8_optimized[grid_combine](
                 partial_output,
                 partial_lse,
@@ -1868,7 +1873,8 @@ def fused_gather_attn_decode_dsv4_dual_scope(
     )
     attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
 
-    grid = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens)
+    def grid(meta):
+        return (triton.cdiv(h_q, meta["BLOCK_H"]), total_tokens)
 
     def run_kernel():
         _fused_gather_attn_dsv4_dual_scope_kernel[grid](
@@ -2935,11 +2941,12 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
     )
 
     # Grid for splitk kernel
-    grid_splitk = lambda meta: (
-        triton.cdiv(h_q, meta["BLOCK_H"]),
-        total_tokens,
-        split_k,
-    )
+    def grid_splitk(meta):
+        return (
+            triton.cdiv(h_q, meta["BLOCK_H"]),
+            total_tokens,
+            split_k,
+        )
 
     # Run splitk kernel
     if disable_buffer_ops:
@@ -3031,7 +3038,8 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
 
     # Run combine kernel
     if split_k == 8:
-        grid_combine = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
+        def grid_combine(meta):
+            return (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
         _combine_splitk_kernel_8_optimized[grid_combine](
             partial_output,
             partial_lse,

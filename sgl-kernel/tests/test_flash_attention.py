@@ -351,9 +351,10 @@ def generate_qkv(
             query_padding_mask,
             query_unused_mask,
         )
-        output_pad_fn = lambda output_unpad: pad_input(
-            output_unpad, indices_q, batch_size, seqlen_q
-        )
+        def output_pad_fn(output_unpad):
+            return pad_input(
+                    output_unpad, indices_q, batch_size, seqlen_q
+                )
     else:
         q_unpad = rearrange(q, "b s h d -> (b s) h d")
         cu_seqlens_q = torch.arange(
@@ -365,9 +366,10 @@ def generate_qkv(
         )
         seqused_q = None
         max_seqlen_q = seqlen_q
-        output_pad_fn = lambda output_unpad: rearrange(
-            output_unpad, "(b s) h d -> b s h d", b=batch_size
-        )
+        def output_pad_fn(output_unpad):
+            return rearrange(
+                    output_unpad, "(b s) h d -> b s h d", b=batch_size
+                )
 
     if key_padding_mask is not None:
         k_unpad, indices_k, cu_seqlens_k, max_seqlen_k, seqused_k = unpad_input(
@@ -393,13 +395,15 @@ def generate_qkv(
         qkv_unpad = torch.stack([q_unpad, k_unpad, v_unpad], dim=1)
         qkv = torch.stack([q, k, v], dim=2)
         if query_padding_mask is not None:
-            dqkv_pad_fn = lambda dqkv_unpad: pad_input(
-                dqkv_unpad, indices_q, batch_size, seqlen_q
-            )
+            def dqkv_pad_fn(dqkv_unpad):
+                return pad_input(
+                            dqkv_unpad, indices_q, batch_size, seqlen_q
+                        )
         else:
-            dqkv_pad_fn = lambda dqkv_unpad: rearrange(
-                dqkv_unpad, "(b s) t h d -> b s t h d", b=batch_size
-            )
+            def dqkv_pad_fn(dqkv_unpad):
+                return rearrange(
+                            dqkv_unpad, "(b s) t h d -> b s t h d", b=batch_size
+                        )
         return (
             qkv_unpad.detach().requires_grad_(),
             cu_seqlens_q,
@@ -413,13 +417,15 @@ def generate_qkv(
         kv = torch.stack([k, v], dim=2)
         dq_pad_fn = output_pad_fn
         if key_padding_mask is not None:
-            dkv_pad_fn = lambda dkv_unpad: pad_input(
-                dkv_unpad, indices_k, batch_size, seqlen_k
-            )
+            def dkv_pad_fn(dkv_unpad):
+                return pad_input(
+                            dkv_unpad, indices_k, batch_size, seqlen_k
+                        )
         else:
-            dkv_pad_fn = lambda dkv_unpad: rearrange(
-                dkv_unpad, "(b s) t h d -> b s t h d", b=batch_size
-            )
+            def dkv_pad_fn(dkv_unpad):
+                return rearrange(
+                            dkv_unpad, "(b s) t h d -> b s t h d", b=batch_size
+                        )
         return (
             q_unpad.detach().requires_grad_(),
             kv_unpad.detach().requires_grad_(),
@@ -436,13 +442,15 @@ def generate_qkv(
     else:
         dq_pad_fn = output_pad_fn
         if key_padding_mask is not None:
-            dk_pad_fn = lambda dk_unpad: pad_input(
-                dk_unpad, indices_k, batch_size, seqlen_k
-            )
+            def dk_pad_fn(dk_unpad):
+                return pad_input(
+                            dk_unpad, indices_k, batch_size, seqlen_k
+                        )
         else:
-            dk_pad_fn = lambda dk_unpad: rearrange(
-                dk_unpad, "(b s) h d -> b s h d", b=batch_size
-            )
+            def dk_pad_fn(dk_unpad):
+                return rearrange(
+                            dk_unpad, "(b s) h d -> b s h d", b=batch_size
+                        )
         return (
             q_unpad.detach().requires_grad_(),
             k_unpad.detach().requires_grad_(),
@@ -614,9 +622,10 @@ def test_flash_attn_kvcache(
             q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(
                 q, query_padding_mask
             )
-            output_pad_fn = lambda output_unpad: pad_input(
-                output_unpad, indices_q, batch_size, seqlen_q
-            )
+            def output_pad_fn(output_unpad):
+                return pad_input(
+                            output_unpad, indices_q, batch_size, seqlen_q
+                        )
             qv_unpad = (
                 rearrange(qv, "b s ... -> (b s) ...")[indices_q] if has_qv else None
             )

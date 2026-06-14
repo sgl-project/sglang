@@ -231,19 +231,22 @@ def benchmark(total_tokens, n, k, num_experts, provider):
     case = _prepare_case(total_tokens, n, k, num_experts, torch.bfloat16)
 
     if provider == "jit":
-        fn = lambda: cutlass_fp4_group_mm(
-            case["a_fp4"],
-            case["b_fp4"],
-            case["a_blockscale"],
-            case["b_blockscale"],
-            case["alphas"],
-            case["dtype"],
-            case["params"],
-        )
+        def fn():
+            return cutlass_fp4_group_mm(
+                    case["a_fp4"],
+                    case["b_fp4"],
+                    case["a_blockscale"],
+                    case["b_blockscale"],
+                    case["alphas"],
+                    case["dtype"],
+                    case["params"],
+                )
     elif provider == "aot_sgl_kernel":
-        fn = lambda: _aot_cutlass_fp4_group_mm(case)
+        def fn():
+            return _aot_cutlass_fp4_group_mm(case)
     elif provider == "torch_ref":
-        fn = lambda: _torch_ref_group_mm(case)
+        def fn():
+            return _torch_ref_group_mm(case)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

@@ -135,9 +135,11 @@ class TraceCustomIdGenerator(id_generator.IdGenerator):
 # global variables
 threads_info: Dict[int, TraceThreadInfo] = {}
 
-get_cur_time_ns = lambda: int(time.time() * 1e9)
+def get_cur_time_ns():
+    return int(time.time() * 1e9)
 if hasattr(time, "time_ns"):
-    get_cur_time_ns = lambda: int(time.time_ns())
+    def get_cur_time_ns():
+        return int(time.time_ns())
 
 
 def _get_host_id() -> str:
@@ -150,7 +152,7 @@ def _get_host_id() -> str:
         try:
             with open("/etc/machine-id", "r") as f:
                 return f.read().strip()
-        except:
+        except Exception:
             pass
 
     mac = uuid.getnode()

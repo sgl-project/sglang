@@ -52,11 +52,14 @@ def benchmark(size: int, provider: str):
     )
 
     if provider == "jit":
-        fn = lambda: clamp_position_cuda(seq_lens)
+        def fn():
+            return clamp_position_cuda(seq_lens)
     elif provider == "torch_compile":
-        fn = lambda: _compiled_clamp_position(seq_lens)
+        def fn():
+            return _compiled_clamp_position(seq_lens)
     else:
-        fn = lambda: _torch_clamp_position(seq_lens)
+        def fn():
+            return _torch_clamp_position(seq_lens)
 
     return run_benchmark(fn)
 

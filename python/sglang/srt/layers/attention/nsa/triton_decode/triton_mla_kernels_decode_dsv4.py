@@ -529,7 +529,8 @@ def gather_dequant_fp8_dsv4(
     stride_kv_block = kv_uint8.stride(0)
     workload_size_cat = _get_workload_size_category(total_tokens, topk)
 
-    grid = lambda meta: (triton.cdiv(total_tokens * topk, meta["BLOCK_TK"]),)
+    def grid(meta):
+        return (triton.cdiv(total_tokens * topk, meta["BLOCK_TK"]),)
 
     topk_length_tensor = topk_length if topk_length is not None else output_mask[:1, 0]
     has_topk_length = topk_length is not None
@@ -914,7 +915,8 @@ def _launch_gather_dequant_one_dsv4(
         )
     else:
         workload_cat = _get_workload_size_category(total_tokens, topk)
-        grid = lambda meta: (triton.cdiv(total_elements, meta["BLOCK_TK"]),)
+        def grid(meta):
+            return (triton.cdiv(total_elements, meta["BLOCK_TK"]),)
         _gather_dequant_dsv4_kernel[grid](
             kv_flat,
             indices,

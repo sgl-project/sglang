@@ -249,19 +249,21 @@ def benchmark(total_tokens, n_g, k_g, num_experts, provider):
     case = _prepare_case(total_tokens, n_g, k_g, num_experts, torch.bfloat16)
 
     if provider == "jit":
-        fn = lambda: es_sm100_mxfp8_blockscaled_moe_grouped_gemm(
-            case["b_quant"],
-            case["a_quant"],
-            case["b_scale_factor"],
-            case["a_scale_factor"],
-            case["expert_offsets"],
-            case["a_blockscale_offsets"],
-            case["tokens_per_expert"],
-            case["workspace"],
-            case["dtype"],
-        )
+        def fn():
+            return es_sm100_mxfp8_blockscaled_moe_grouped_gemm(
+                    case["b_quant"],
+                    case["a_quant"],
+                    case["b_scale_factor"],
+                    case["a_scale_factor"],
+                    case["expert_offsets"],
+                    case["a_blockscale_offsets"],
+                    case["tokens_per_expert"],
+                    case["workspace"],
+                    case["dtype"],
+                )
     elif provider == "sgl_kernel":
-        fn = lambda: _sgl_kernel_group_mm(case)
+        def fn():
+            return _sgl_kernel_group_mm(case)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

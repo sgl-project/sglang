@@ -313,7 +313,8 @@ def run_unified_attention(
     HAS_ATTN_SINK = attn_sink is not None
     attn_sink_tensor = attn_sink if HAS_ATTN_SINK else lse[:1]
 
-    grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
+    def grid(meta):
+        return (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
     _unified_sparse_decode_kernel[grid](
         q_reshaped,
         gathered_kv,

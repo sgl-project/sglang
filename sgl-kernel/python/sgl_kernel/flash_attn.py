@@ -6,7 +6,7 @@ from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
 
 try:
     from sgl_kernel import flash_ops
-except:
+except Exception:
     raise ImportError(
         "Can not import FA3 in sgl_kernel. Please check your installation."
     )

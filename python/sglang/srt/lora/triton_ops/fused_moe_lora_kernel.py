@@ -257,13 +257,14 @@ def _fused_moe_lora_shrink(
 
     b_ptr = _get_ptr(lora_a_stacked, device)
 
-    grid = lambda META: (
-        split_k
-        * triton.cdiv(EM, META["BLOCK_SIZE_M"])
-        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        len(lora_a_stacked),
-        lora_a_stacked[0].shape[0],
-    )
+    def grid(META):
+        return (
+            split_k
+            * triton.cdiv(EM, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            len(lora_a_stacked),
+            lora_a_stacked[0].shape[0],
+        )
     _fused_moe_lora_kernel[grid](
         qcurr_hidden_states,
         b_ptr,
@@ -364,11 +365,12 @@ def _fused_moe_lora_expand(
         "launch_pdl": use_gdc,  # triton kernel metadata
     }
 
-    grid = lambda META: (
-        triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        len(lora_b_stacked),
-        lora_b_stacked[0].shape[0],
-    )
+    def grid(META):
+        return (
+            triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            len(lora_b_stacked),
+            lora_b_stacked[0].shape[0],
+        )
     _fused_moe_lora_kernel[grid](
         a_intermediate_cache1,
         b_ptr,

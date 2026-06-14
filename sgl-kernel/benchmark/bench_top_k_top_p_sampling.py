@@ -115,16 +115,18 @@ def benchmark_sampling(batch_size, vocab_size, p, provider):
     top_k_tensor = torch.full((batch_size,), k, device=device)
 
     if provider == "torch":
-        fn = lambda: torch_top_k_top_p_joint_sampling_from_probs(
-            normalized_prob.clone(), top_k_tensor, top_p_tensor
-        )
+        def fn():
+            return torch_top_k_top_p_joint_sampling_from_probs(
+                    normalized_prob.clone(), top_k_tensor, top_p_tensor
+                )
     elif provider == "sglang":
-        fn = lambda: flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            normalized_prob.clone(),
-            top_k_tensor,
-            top_p_tensor,
-            filter_apply_order="joint",
-        )
+        def fn():
+            return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                    normalized_prob.clone(),
+                    top_k_tensor,
+                    top_p_tensor,
+                    filter_apply_order="joint",
+                )
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=[0.5, 0.2, 0.8])
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms

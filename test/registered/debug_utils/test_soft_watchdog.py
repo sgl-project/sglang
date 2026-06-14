@@ -70,17 +70,20 @@ class BaseTestSoftWatchdog:
 
 
 class TestSoftWatchdogDetokenizer(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = lambda: envs.SGLANG_TEST_STUCK_DETOKENIZER.override(30)
+    def env_override():
+        return envs.SGLANG_TEST_STUCK_DETOKENIZER.override(30)
     expected_message = "DetokenizerManager watchdog timeout"
 
 
 class TestSoftWatchdogTokenizer(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = lambda: envs.SGLANG_TEST_STUCK_TOKENIZER.override(30)
+    def env_override():
+        return envs.SGLANG_TEST_STUCK_TOKENIZER.override(30)
     expected_message = "TokenizerManager watchdog timeout"
 
 
 class TestSoftWatchdogSchedulerInit(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = lambda: envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.override(30)
+    def env_override():
+        return envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.override(30)
     expected_message = "Scheduler watchdog timeout"
 
 

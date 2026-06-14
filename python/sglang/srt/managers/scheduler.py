@@ -1560,9 +1560,11 @@ class Scheduler(
         # so all DP ranks make the same overlap decision (avoiding deadlock).
         # In non-DP mode, use the local forward_mode directly.
         if self.require_mlp_sync:
-            is_extend = lambda b: b and b.is_extend_in_batch
+            def is_extend(b):
+                return b and b.is_extend_in_batch
         else:
-            is_extend = lambda b: b and b.forward_mode.is_extend()
+            def is_extend(b):
+                return b and b.forward_mode.is_extend()
 
         batch_is_extend = is_extend(batch)
         last_batch_is_extend = is_extend(self.last_batch)
@@ -2281,10 +2283,11 @@ class Scheduler(
             # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
             # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
             direction = 1 if self.schedule_low_priority_values_first else -1
-            key_fn = lambda item: (
-                direction * item[1].priority,
-                item[1].time_stats.wait_queue_entry_time,
-            )
+            def key_fn(item):
+                return (
+                            direction * item[1].priority,
+                            item[1].time_stats.wait_queue_entry_time,
+                        )
             idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
             abort_existing_req = (
                 direction * recv_req.priority < direction * candidate_req.priority

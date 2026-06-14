@@ -34,7 +34,6 @@ del _apply_hf_patches
 # Frontend Language APIs
 from sglang.global_config import global_config
 from sglang.lang.api import (
-    Engine,
     Runtime,
     assistant,
     assistant_begin,

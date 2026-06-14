@@ -404,14 +404,14 @@ try:
     is_intel_amx_backend_available = hasattr(
         torch.ops.sgl_kernel, "convert_weight_packed"
     )
-except:
+except Exception:
     is_intel_amx_backend_available = False
 
 try:
     # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
     is_amx_tile_supported = torch.cpu._is_amx_tile_supported()
-except:
+except Exception:
     is_amx_tile_supported = False
 
 

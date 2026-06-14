@@ -471,12 +471,13 @@ def _chunk_scan_fwd(
     else:
         out_x = None
 
-    grid = lambda META: (
-        triton.cdiv(chunk_size, META["BLOCK_SIZE_M"])
-        * triton.cdiv(headdim, META["BLOCK_SIZE_N"]),
-        batch * nchunks if chunk_offsets is None else len(chunk_offsets),
-        nheads,
-    )
+    def grid(META):
+        return (
+            triton.cdiv(chunk_size, META["BLOCK_SIZE_M"])
+            * triton.cdiv(headdim, META["BLOCK_SIZE_N"]),
+            batch * nchunks if chunk_offsets is None else len(chunk_offsets),
+            nheads,
+        )
     z_strides = (
         (z.stride(0), z.stride(1), z.stride(2), z.stride(3))
         if z is not None

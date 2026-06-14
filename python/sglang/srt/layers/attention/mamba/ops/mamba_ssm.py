@@ -406,7 +406,8 @@ def selective_state_update(
         assert state_batch_indices.shape == (batch,)
     assert out.shape == x.shape
 
-    grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
+    def grid(META):
+        return (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = (
         (z.stride(0), z.stride(1), z.stride(2), z.stride(3))
         if z is not None

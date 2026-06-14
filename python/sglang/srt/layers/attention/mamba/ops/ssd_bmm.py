@@ -173,12 +173,13 @@ def _bmm_chunk_fwd(a, b, chunk_size, seq_idx=None, causal=False, output_dtype=No
             else tl.float32
         )
     )
-    grid = lambda META: (
-        triton.cdiv(chunk_size, META["BLOCK_SIZE_M"])
-        * triton.cdiv(chunk_size, META["BLOCK_SIZE_N"]),
-        batch,
-        nchunks if not has_groups else nchunks * ngroups,
-    )
+    def grid(META):
+        return (
+            triton.cdiv(chunk_size, META["BLOCK_SIZE_M"])
+            * triton.cdiv(chunk_size, META["BLOCK_SIZE_N"]),
+            batch,
+            nchunks if not has_groups else nchunks * ngroups,
+        )
     with torch.get_device_module(a.device).device(a.device.index):
         _bmm_chunk_fwd_kernel[grid](
             a,

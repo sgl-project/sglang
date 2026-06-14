@@ -605,7 +605,8 @@ def swizzle_blockscale(scale: torch.Tensor):
         scale = scale.unsqueeze(0)
     assert scale.ndim == 3
     B, M, K = scale.shape
-    round_up_multiple = lambda x, m: (x + m - 1) // m * m
+    def round_up_multiple(x, m):
+        return (x + m - 1) // m * m
     M_padded = round_up_multiple(M, 128)
     K_padded = round_up_multiple(K, 4)
     padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)

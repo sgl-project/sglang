@@ -175,7 +175,7 @@ class MmItemMemoryPool:
             try:
                 new_sync_buffer = ShmSyncBuffer()
                 return new_sync_buffer
-            except:
+            except Exception:
                 logger.info("allocate shm buffer failed")
                 raise RuntimeError
         else:
