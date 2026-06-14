@@ -135,10 +135,36 @@ def _is_video_warmup_task(server_args: ServerArgs) -> bool:
 
 
 def _warmup_resolution_alignment(server_args: ServerArgs) -> int:
+    pipeline_config = server_args.pipeline_config
+    alignment = 16
+
+    vae_stride = getattr(pipeline_config, "vae_stride", None)
+    if vae_stride is not None:
+        spatial_stride = (
+            vae_stride[-2:]
+            if isinstance(vae_stride, (tuple, list))
+            else (vae_stride,)
+        )
+        for stride in spatial_stride:
+            alignment = max(alignment, int(stride))
+
+    vae_scale_factor = getattr(pipeline_config, "vae_scale_factor", None)
+    if vae_scale_factor is not None:
+        alignment = max(alignment, int(vae_scale_factor))
+
+    arch_config = getattr(
+        getattr(pipeline_config, "vae_config", None), "arch_config", None
+    )
+    for attr in ("vae_scale_factor", "spatial_compression_ratio"):
+        value = getattr(arch_config, attr, None)
+        if value is not None:
+            alignment = max(alignment, int(value))
+
     if is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name):
-        vae_scale_factor = server_args.pipeline_config.vae_scale_factor
-        return max(64, int(vae_scale_factor) * 2)
-    return 16
+        vae_scale_factor = pipeline_config.vae_scale_factor
+        alignment = max(alignment, 64, int(vae_scale_factor) * 2)
+
+    return alignment
 
 
 def _select_supported_warmup_resolution(

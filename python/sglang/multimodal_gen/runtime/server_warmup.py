@@ -129,17 +129,27 @@ def build_client_warmup_reqs(
 async def run_async_client_warmup(
     server_args: ServerArgs,
     forward: Callable[[Req], Awaitable[OutputBatch]],
+    *,
+    fail_open: bool = False,
 ) -> None:
-    warmup_input_path = None
-    if should_include_warmup_image(server_args, server_based_warmup=True):
-        warmup_input_path = prepare_warmup_image_path(server_args)
+    try:
+        warmup_input_path = None
+        if should_include_warmup_image(server_args, server_based_warmup=True):
+            warmup_input_path = prepare_warmup_image_path(server_args)
 
-    for req in build_client_warmup_reqs(
-        server_args, warmup_input_path=warmup_input_path
-    ):
-        response = await forward(req)
-        if response.error is not None:
-            raise RuntimeError(response.error)
+        for req in build_client_warmup_reqs(
+            server_args, warmup_input_path=warmup_input_path
+        ):
+            response = await forward(req)
+            if response.error is not None:
+                raise RuntimeError(response.error)
+    except Exception as e:
+        if fail_open:
+            logger.warning(
+                "Synthetic server warmup failed; continuing startup: %s", e
+            )
+            return
+        raise
 
 
 def run_sync_client_warmup(
