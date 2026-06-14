@@ -39,6 +39,9 @@ class MambaSSUBackend(ABC):
         cache_steps: int | None = None,
         retrieve_parent_token: torch.Tensor | None = None,
         intermediate_state_indices: torch.Tensor | None = None,
+        rand_seed: torch.Tensor | None = None,
+        use_rs_rounding: bool = False,
+        philox_rounds: int = 10,
     ) -> None: ...
 
 
@@ -76,6 +79,9 @@ class TritonSSUBackend(MambaSSUBackend):
         cache_steps: int | None = None,
         retrieve_parent_token: torch.Tensor | None = None,
         intermediate_state_indices: torch.Tensor | None = None,
+        rand_seed: torch.Tensor | None = None,
+        use_rs_rounding: bool = False,
+        philox_rounds: int = 10,
     ) -> None:
         self._kernel(
             state,
@@ -96,6 +102,9 @@ class TritonSSUBackend(MambaSSUBackend):
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
             intermediate_state_indices=intermediate_state_indices,
+            rand_seed=rand_seed,
+            use_rs_rounding=use_rs_rounding,
+            philox_rounds=philox_rounds,
         )
 
 
@@ -131,6 +140,9 @@ class FlashInferSSUBackend(MambaSSUBackend):
         cache_steps: int | None = None,
         retrieve_parent_token: torch.Tensor | None = None,
         intermediate_state_indices: torch.Tensor | None = None,
+        rand_seed: torch.Tensor | None = None,
+        use_rs_rounding: bool = False,
+        philox_rounds: int = 10,
     ) -> None:
         if retrieve_parent_token is not None:
             raise ValueError(
@@ -223,6 +235,9 @@ def selective_state_update(
     cache_steps: int | None = None,
     retrieve_parent_token: torch.Tensor | None = None,
     intermediate_state_indices: torch.Tensor | None = None,
+    rand_seed: torch.Tensor | None = None,
+    use_rs_rounding: bool = False,
+    philox_rounds: int = 10,
 ) -> None:
     """Dispatch selective-state-update to the configured backend.
 
@@ -274,4 +289,7 @@ def selective_state_update(
         cache_steps=cache_steps,
         retrieve_parent_token=retrieve_parent_token,
         intermediate_state_indices=intermediate_state_indices,
+        rand_seed=rand_seed,
+        use_rs_rounding=use_rs_rounding,
+        philox_rounds=philox_rounds,
     )
