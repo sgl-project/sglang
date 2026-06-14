@@ -372,7 +372,7 @@ class _GraphBucket(enum.Enum):
             return cls.DECODE_OR_IDLE
         if forward_mode.is_target_verify():
             return cls.TARGET_VERIFY
-        if forward_mode.is_draft_extend(include_v2=True):
+        if forward_mode.is_draft_extend_v2():
             return cls.DRAFT_EXTEND
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
@@ -927,7 +927,7 @@ class DeepseekV4HipRadixBackend(
                 and extend_seq_lens is not None
                 and extend_seq_lens_cpu is not None
             )
-            is_draft = forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            is_draft = forward_batch.forward_mode.is_draft_extend_v2()
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
