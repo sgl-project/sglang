@@ -77,6 +77,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.eager_backend import EagerBackend
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -301,8 +302,18 @@ class DecodeRunner(BaseRunner):
         attn_backend=None,
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        eager: bool = False,
     ):
         super().__init__(model_runner)
+        # When True, plug in EagerBackend (no cuda-graph capture): the model
+        # forward runs live each iteration through the same reserve/load/execute
+        # lifecycle the cuda-graph path uses (the eager dual — see _resolve_backend
+        # / prepare / execute).
+        self.eager = eager
+        # Per-shape static ForwardBatch built by reserve_batch (_prepare_one),
+        # reused at execute(): the cuda-graph path runs its baked forward over it;
+        # the eager path runs the live forward over it.
+        self._static_forward_batches: dict = {}
         # --- core state ------------------------------------------------
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -471,7 +482,7 @@ class DecodeRunner(BaseRunner):
         )
 
         # --- backend ---------------------------------------------------
-        self.backend = resolve_decode_backend(self)
+        self.backend = self._resolve_backend()
 
         # --- capture --------------------------------------------------
         try:
@@ -481,6 +492,13 @@ class DecodeRunner(BaseRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _resolve_backend(self):
+        """Pick the ExecutionBackend. Eager plugs in EagerBackend (no capture);
+        otherwise the cuda-graph backend from cuda_graph_config.decode."""
+        if self.eager:
+            return EagerBackend(self)
+        return resolve_decode_backend(self)
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -756,6 +774,17 @@ class DecodeRunner(BaseRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def prepare(self) -> None:
+        if self.eager:
+            # Eager one-time setup: reserve the per-shape static batches + bind
+            # attention metadata (the same reserve path the cuda-graph runner
+            # uses), with NO graph_capture context — EagerBackend records nothing
+            # to replay; the forward runs live at execute() time.
+            self.stream = None
+            with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+                with self.backend.record_session(self.stream):
+                    self._capture_one_stream()
+            return
+
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
@@ -871,6 +900,16 @@ class DecodeRunner(BaseRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)
+                # Persist the static batch + its forward context so execute()
+                # can re-run the forward over it for eager (and so the bound
+                # buffers stay reachable). The cuda-graph path bakes run_once;
+                # the eager path re-invokes _run_model_forward over this batch.
+                self._static_forward_batches[shape_key] = (
+                    forward_batch,
+                    attn_backend,
+                    num_tokens,
+                    pp_proxy_tensors,
+                )
                 self.backend.record(
                     shape_key,
                     run_once,
@@ -1065,6 +1104,30 @@ class DecodeRunner(BaseRunner):
             self.bs, stream_idx, variant_label
         )
 
+    def _eager_forward_fn(self) -> Callable:
+        """Build the live forward closure for the eager path.
+
+        Runs the model forward over the reserved static batch for the current
+        shape (load_batch already refilled its buffers + metadata). The
+        cuda-graph path bakes this same forward via run_once; EagerBackend runs
+        it live. EagerBackend.run passes the static batch positionally; the
+        closure ignores it in favor of the reserved one captured here.
+        """
+        static_fb, attn_backend, num_tokens, static_pp = self._static_forward_batches[
+            self._replay_graph_key
+        ]
+
+        def _forward(_passed_static_forward_batch):
+            return self._run_model_forward(
+                static_fb,
+                attn_backend,
+                num_tokens,
+                static_pp,
+                self.model_runner.model.forward,
+            )
+
+        return _forward
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -1079,7 +1142,11 @@ class DecodeRunner(BaseRunner):
         )
         with timer_ctx, self.backend.run_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
-            output = self.backend.run(self._replay_graph_key, forward_batch)
+            output = self.backend.run(
+                self._replay_graph_key,
+                forward_batch,
+                forward_fn=self._eager_forward_fn() if self.eager else None,
+            )
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

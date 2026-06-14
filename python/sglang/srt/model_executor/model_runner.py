@@ -2891,6 +2891,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_decode_cuda_graph(self):
         """Capture device graphs."""
         self.decode_runner = None
+        # Eager decode runner (DecodeRunner + EagerBackend, no capture). Set when
+        # cuda graph is disabled so eager decode still flows through the unified
+        # Runner lifecycle.
+        self.eager_decode_runner = None
         self.graph_mem_usage = 0
 
         if not self.is_generation:
@@ -2903,6 +2907,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cpu" and check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         ):
+            # CUDA graph disabled: route eager decode through the unified
+            # DecodeRunner + EagerBackend (no capture; live forward via
+            # EagerBackend.run), instead of the bespoke forward_decode path.
+            from sglang.srt.model_executor.runner.decode_runner import DecodeRunner
+
+            self.eager_decode_runner = DecodeRunner(self, eager=True)
             return
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
@@ -3234,6 +3244,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch: ForwardBatch,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if self.eager_decode_runner is not None and not self.server_args.enable_pdmux:
+            # Unified eager decode: DecodeRunner + EagerBackend. The runner's
+            # execute() does the registry fill + metadata + live forward via
+            # EagerBackend.run — the eager dual of cuda-graph replay.
+            return self.eager_decode_runner.execute(forward_batch, pp_proxy_tensors)
+
         if not self.server_args.enable_pdmux:
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
         # Set extra arguments
