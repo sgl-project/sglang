@@ -242,14 +242,13 @@ def benchmark_config(
 
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
-
     def __init__(self, seed: int, server_args: ServerArgs) -> None:
         torch.set_default_device(get_device())
         torch.get_device_module().manual_seed_all(0)
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        self.device_id = 0 if _is_hip else int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
@@ -419,7 +418,7 @@ def main(args: argparse.Namespace):
     if args.tune:
         search_space = get_configs_compute_bound()
         if block_shape is not None:
-            block_n, block_k = block_shape[0], block_shape[1]
+            block_k = block_shape[1]
             search_space = [
                 config
                 for config in search_space
