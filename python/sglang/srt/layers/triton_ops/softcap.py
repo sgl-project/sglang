@@ -39,7 +39,7 @@ def softcap_out_kernel(
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_ele
-    x = tl.load(input_ptr + offsets, mask=mask)
+    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
     fx = x.to(tl.float32)
     fxs = fx / softcap_const
     exped = tl.exp(2 * fxs)
@@ -84,7 +84,7 @@ def softcap_inplace_logits_kernel(
 
     # Load values
     row_ptr = full_logits_ptr + row * row_stride
-    x = tl.load(row_ptr + offsets, mask=mask)
+    x = tl.load(row_ptr + offsets, mask=mask, other=0.0)
 
     # Perform operations in-place
     x = x / softcapping_value
