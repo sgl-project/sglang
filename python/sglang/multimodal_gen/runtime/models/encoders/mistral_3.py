@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import inspect
 from contextlib import nullcontext
 from typing import Iterable, Optional, Union
 
@@ -21,10 +20,6 @@ import torch
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import Cache, DynamicCache, LlavaConfig, Mistral3Config, MistralConfig
-from transformers.masking_utils import (
-    create_causal_mask,
-    create_sliding_window_causal_mask,
-)
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3CausalLMOutputWithPast,
@@ -54,11 +49,6 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-_CREATE_CAUSAL_MASK_ARG = (
-    "inputs_embeds"
-    if "inputs_embeds" in inspect.signature(create_causal_mask).parameters
-    else "input_embeds"
-)
 
 
 class MistralAttention(nn.Module):
@@ -148,8 +138,26 @@ class MistralAttention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
+        attn_mask = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                batch_size, q_len = query_states.shape[:2]
+                kv_len = key_states.shape[1]
+                causal_mask = torch.ones(
+                    (q_len, kv_len), device=hidden_states.device, dtype=torch.bool
+                ).tril(diagonal=kv_len - q_len)
+                padding_mask = attention_mask.to(
+                    device=hidden_states.device, dtype=torch.bool
+                )
+                attn_mask = causal_mask[None, None, :, :].expand(
+                    batch_size, 1, q_len, kv_len
+                )
+                attn_mask = attn_mask & padding_mask[:, None, None, -kv_len:]
+            else:
+                attn_mask = attention_mask
+
         attn_output = self.attn(
-            query_states, key_states, value_states, attn_mask=attention_mask
+            query_states, key_states, value_states, attn_mask=attn_mask
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -263,20 +271,6 @@ class MistralModel(MistralPreTrainedModel):
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-        mask_function = (
-            create_causal_mask
-            if getattr(self.config, "sliding_window", None) is None
-            else create_sliding_window_causal_mask
-        )
-        mask_kwargs = {
-            "config": self.config,
-            _CREATE_CAUSAL_MASK_ARG: inputs_embeds,
-            "attention_mask": attention_mask,
-            "cache_position": cache_position,
-            "past_key_values": past_key_values,
-            "position_ids": position_ids,
-        }
-        causal_mask = mask_function(**mask_kwargs)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -287,7 +281,7 @@ class MistralModel(MistralPreTrainedModel):
                 hidden_states_pool.append(hidden_states)
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
+                attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
