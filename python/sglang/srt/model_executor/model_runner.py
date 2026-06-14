@@ -2887,11 +2887,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_decode_cuda_graph(self):
         """Capture device graphs."""
+        # decode_runner holds either the cuda-graph DecodeRunner or, when cuda
+        # graph is disabled, the eager DecodeRunner (+ EagerBackend, no capture).
+        # They are mutually exclusive, so one attribute suffices; forward_decode
+        # dispatches on decode_runner.eager.
         self.decode_runner = None
-        # Eager decode runner (DecodeRunner + EagerBackend, no capture). Set when
-        # cuda graph is disabled so eager decode still flows through the unified
-        # Runner lifecycle.
-        self.eager_decode_runner = None
         self.graph_mem_usage = 0
 
         if not self.is_generation:
@@ -2909,7 +2909,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # EagerBackend.run), instead of the bespoke forward_decode path.
             from sglang.srt.model_executor.runner.decode_runner import DecodeRunner
 
-            self.eager_decode_runner = DecodeRunner(self, eager=True)
+            self.decode_runner = DecodeRunner(self, eager=True)
             return
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
@@ -2955,12 +2955,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         """Initialize piecewise CUDA graph runner."""
+        # prefill_runner holds either the piecewise-cuda-graph PrefillRunner or,
+        # when prefill cuda graph is disabled, the eager PrefillRunner (+
+        # EagerBackend, no capture) for the common GQA language-model case (other
+        # gates fall back to the inline eager path). Mutually exclusive, so one
+        # attribute suffices; forward_extend dispatches on prefill_runner.eager.
         self.prefill_runner = None
-        # Eager prefill runner (PrefillRunner + EagerBackend, no capture). Built
-        # when prefill cuda graph is disabled so eager prefill still flows
-        # through the unified Runner lifecycle (for the common GQA language-model
-        # case; other gates below fall back to the inline eager path).
-        self.eager_prefill_runner = None
 
         prefill_eager = False
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
@@ -3084,7 +3084,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if prefill_eager:
             # Eager prefill: build the runner with EagerBackend (no capture).
-            self.eager_prefill_runner = PrefillRunner(self, eager=True)
+            self.prefill_runner = PrefillRunner(self, eager=True)
             return
 
         tic = time.perf_counter()
@@ -3256,11 +3256,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch: ForwardBatch,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if self.eager_decode_runner is not None and not self.server_args.enable_pdmux:
+        if (
+            self.decode_runner is not None
+            and getattr(self.decode_runner, "eager", False)
+            and not self.server_args.enable_pdmux
+        ):
             # Unified eager decode: DecodeRunner + EagerBackend. The runner's
             # execute() does the registry fill + metadata + live forward via
             # EagerBackend.run — the eager dual of cuda-graph replay.
-            return self.eager_decode_runner.execute(forward_batch, pp_proxy_tensors)
+            return self.decode_runner.execute(forward_batch, pp_proxy_tensors)
 
         if not self.server_args.enable_pdmux:
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
@@ -3337,6 +3341,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Check piecewies cuda graph
         can_run_graph = (
             self.prefill_runner is not None
+            and not getattr(self.prefill_runner, "eager", False)
             and self.prefill_runner.can_run_graph(forward_batch)
         )
         if can_run_graph:
@@ -3357,11 +3362,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # inline eager path below still handles input_embeds / replace_embeds /
         # pdmux / oversize and the non-runner gates.
         if (
-            self.eager_prefill_runner is not None
+            self.prefill_runner is not None
+            and getattr(self.prefill_runner, "eager", False)
             and not self.server_args.enable_pdmux
             and forward_batch.input_embeds is None
             and forward_batch.replace_embeds is None
-            and len(forward_batch.input_ids) <= self.eager_prefill_runner.max_num_tokens
+            and len(forward_batch.input_ids) <= self.prefill_runner.max_num_tokens
         ):
             ctx = (
                 self.device_timer.wrap(metadata={"category": "extend"})
@@ -3369,7 +3375,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else contextlib.nullcontext()
             )
             with ctx:
-                ret = self.eager_prefill_runner.execute(forward_batch, **kwargs)
+                ret = self.prefill_runner.execute(forward_batch, **kwargs)
             return (ret, False)
 
         if not self.server_args.enable_pdmux:
@@ -3389,7 +3395,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         with ctx:
-            if _is_hip and self.prefill_runner is not None:
+            if (
+                _is_hip
+                and self.prefill_runner is not None
+                and not getattr(self.prefill_runner, "eager", False)
+            ):
                 # AMD/HIP: when PCG is enabled but the batch exceeds max captured
                 # size, run eagerly under enable_tc_piecewise_cuda_graph() and
                 # set_tc_piecewise_forward_context() so that (a) Dynamo guards on
@@ -3593,6 +3603,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             can_run_graph = bool(
                 mode_check()
                 and self.decode_runner
+                and not getattr(self.decode_runner, "eager", False)
                 and self.decode_runner.can_run_graph(forward_batch)
             )
 
