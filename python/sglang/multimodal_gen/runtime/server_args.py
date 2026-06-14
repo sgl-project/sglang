@@ -704,20 +704,33 @@ class ServerArgs(DisaggServerArgsMixin):
         return None, None
 
     def _adjust_warmup(self):
+        # `warmup_mode` is the canonical knob (preferred internally and externally);
+        # `warmup` / `server_warmup` are kept as deprecated, derived projections.
+        # Precedence when resolving the booleans:
+        #   1. an explicitly-passed --warmup-mode wins over everything;
+        #   2. otherwise an explicitly-passed legacy --warmup/--server-warmup wins
+        #      over a *defaulted* warmup_mode (e.g. serve's default of "server"),
+        #      so `sglang serve --warmup false` still disables warmup;
+        #   3. otherwise warmup_mode (explicit or defaulted) drives the booleans.
+        mode_explicit = self.is_arg_explicitly_set("warmup_mode")
+        legacy_explicit = self.is_arg_explicitly_set(
+            "warmup"
+        ) or self.is_arg_explicitly_set("server_warmup")
         if self.warmup_mode is not None:
             if self.warmup_mode not in WARMUP_MODES:
                 raise ValueError(
                     f"Invalid --warmup-mode {self.warmup_mode!r}; "
                     f"expected one of {WARMUP_MODES}."
                 )
-            if self.warmup or self.server_warmup:
+            if mode_explicit and legacy_explicit:
                 logger.warning(
                     "Both --warmup-mode and the deprecated --warmup/--server-warmup "
                     "were set; --warmup-mode=%s takes precedence.",
                     self.warmup_mode,
                 )
-            self.warmup = self.warmup_mode != "off"
-            self.server_warmup = self.warmup_mode == "server"
+            if mode_explicit or not legacy_explicit:
+                self.warmup = self.warmup_mode != "off"
+                self.server_warmup = self.warmup_mode == "server"
 
         # Explicit resolutions imply warmup is on (request-based).
         if self.warmup_resolutions is not None:
