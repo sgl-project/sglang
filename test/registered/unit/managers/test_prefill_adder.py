@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
@@ -161,6 +162,16 @@ class TestPrefillAdder(CustomTestCase):
         # None and it never counts as having a pending chunk, regardless of how
         # many output_ids have accumulated past the prompt length.
         req.extend_range = None
+
+        # The real scheduler builds decode batches with forward_mode=DECODE
+        # (scheduler.py passes ForwardMode.DECODE), which short-circuits
+        # _compute_is_extend_intermediate before it ever reads extend_range — so
+        # a decode req is reported not-intermediate even with extend_range=None.
+        self.assertFalse(
+            _compute_is_extend_intermediate(
+                req, dllm_config=None, forward_mode=ForwardMode.DECODE
+            )
+        )
 
         # A fresh single-chunk prefill whose extend_range already covers the full
         # prompt (no output yet) is the last chunk: not pending, no next token.
