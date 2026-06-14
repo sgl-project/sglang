@@ -286,17 +286,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        super().init_forward_metadata(forward_batch)
-        if self.forward_metadata.has_mamba_track_mask:
-            self.forward_metadata.mamba_track_mask_indices = (
-                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-            )
-            self.forward_metadata.conv_states_mask_indices = (
-                forward_batch.mamba_track_indices[
-                    self.forward_metadata.mamba_track_mask_indices
-                ]
-            )
+    def _compute_forward_metadata(self, forward_batch, *, use_bound, seq_lens_cpu):
+        # GDN augments the base metadata with prefix-cache track indices on the
+        # fresh EXTEND path (has_mamba_track_mask is False for the bound
+        # decode/verify path, so this is a no-op there). Eager flows through the
+        # base out_graph / init_forward_metadata wrapper, which calls this.
+        metadata = super()._compute_forward_metadata(
+            forward_batch, use_bound=use_bound, seq_lens_cpu=seq_lens_cpu
+        )
+        if metadata.has_mamba_track_mask:
+            metadata.mamba_track_mask_indices = forward_batch.mamba_track_mask.nonzero(
+                as_tuple=True
+            )[0]
+            metadata.conv_states_mask_indices = forward_batch.mamba_track_indices[
+                metadata.mamba_track_mask_indices
+            ]
+        return metadata
 
     def forward_decode(
         self,
