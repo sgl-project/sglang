@@ -66,7 +66,7 @@ env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.skip_pr_test_health_check == true || inputs.run_all_tests == true) && 'true' || 'false' }}
   FORCE_REBUILD_DEEPEP: '1'
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  USE_VENV: false
+  USE_VENV: true
 
 permissions:
   actions: write
@@ -186,6 +186,19 @@ jobs:
       run_timeout_minutes: '60'
     secrets: inherit
 
+  extra-b-test-deepep-4-gpu-h100:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: extra-b-test-deepep-4-gpu-h100
+      runner_config: deepep-4-gpu-h100
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+    secrets: inherit
+
   extra-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
@@ -256,6 +269,7 @@ jobs:
         extra-b-test-4-gpu-h100,
         extra-b-test-4-gpu-b200,
         extra-b-test-8-gpu-h200,
+        extra-b-test-deepep-4-gpu-h100,
         extra-b-test-deepep-4-gpu-b200,
         extra-b-test-deepep-8-gpu-h200,
       ]
