@@ -342,8 +342,13 @@ class MoriKVManager(CommonKVManager):
             self._start_decode_thread()
 
     def _init_engine(self) -> IOEngine:
+        use_xgmi = envs.SGLANG_MORI_USE_XGMI.get()
+
         if self.kv_args.ib_device:
             os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
+
+        if use_xgmi:
+            os.environ["MORI_DISABLE_AUTO_XGMI"] = "0"
 
         self.local_ip = get_local_ip_auto()
         config = IOEngineConfig(host=self.local_ip, port=0)
@@ -1605,7 +1610,6 @@ class MoriKVSender(CommonKVSender):
 
 
 class MoriKVReceiver(CommonKVReceiver):
-
     def __init__(
         self,
         mgr: MoriKVManager,
