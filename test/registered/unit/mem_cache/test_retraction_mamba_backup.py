@@ -22,19 +22,24 @@ class _MambaPool:
         self.loaded = state
 
 
-class _Allocator:
+class _KVPool:
     def __init__(self, carries_mamba: bool):
-        self._kv = type("_KV", (), {"cpu_copy_carries_mamba": carries_mamba})()
+        self.cpu_copy_carries_mamba = carries_mamba
         self.loaded_kv = None
-
-    def get_kvcache(self):
-        return self._kv
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return "kv"
 
     def load_cpu_copy(self, cpu_tensors, indices, mamba_indices=None):
         self.loaded_kv = cpu_tensors
+
+
+class _Allocator:
+    def __init__(self, carries_mamba: bool):
+        self._kv = _KVPool(carries_mamba)
+
+    def get_kvcache(self):
+        return self._kv
 
 
 def _req_and_pool():

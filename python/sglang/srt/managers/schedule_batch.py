@@ -1824,7 +1824,7 @@ class Req(ReqDllmMixin):
             req_to_token_pool, token_to_kv_pool_allocator
         )
         self.kv.retraction_backup = RetractionBackup(
-            cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
+            cpu_tensors=token_to_kv_pool_allocator.get_kvcache().get_cpu_copy(
                 token_indices, mamba_indices=self.kv.mamba_pool_idx
             ),
             mamba_cpu=(
@@ -1845,7 +1845,7 @@ class Req(ReqDllmMixin):
             req_to_token_pool.mamba_pool.load_cpu_copy(
                 mamba_cpu, self.kv.mamba_pool_idx.unsqueeze(0)
             )
-        token_to_kv_pool_allocator.load_cpu_copy(
+        token_to_kv_pool_allocator.get_kvcache().load_cpu_copy(
             self.kv.retraction_backup.cpu_tensors,
             token_indices,
             mamba_indices=self.kv.mamba_pool_idx,
