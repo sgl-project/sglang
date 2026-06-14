@@ -770,7 +770,7 @@ class GroupCoordinator:
             and not torch_symm_mem_comm.disabled
             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
-            torch_symm_mem_comm.all_reduce(input_)
+            torch_symm_mem_comm.all_reduce(input_, out=input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
