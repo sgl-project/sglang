@@ -5,8 +5,13 @@ followed by a separate, bandwidth-bound GELU kernel over the ``[tokens, 4*dim]``
 MLP intermediate. ``torch._addmm_activation`` folds the bias-add and GELU into
 the GEMM epilogue (cublasLt), removing the extra kernel launch and the
 intermediate HBM round-trip. cublasLt's GELU matches the tanh-approximate GELU
-to within bf16/fp16 rounding, so the fused path is numerically equivalent for
-half-precision inference.
+to within bf16/fp16 rounding (max abs diff ~5e-6 in fp32), so the fused path is
+numerically equivalent for half-precision inference.
+
+The fused GEMM is exposed as a registered custom op (``register_custom_op``)
+exactly like the other diffusion jit_kernels (e.g. qknorm_rope), so it stays a
+single opaque op under ``torch.compile`` -- no graph break, no fallback to the
+unfused path.
 """
 
 from typing import Any
@@ -16,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.srt.utils.custom_op import register_custom_op
 
 # ``torch._addmm_activation`` is the (private but stable) entry point to the
 # cublasLt GEMM+bias+activation epilogue. Guard for builds where it is absent so
@@ -23,12 +29,39 @@ from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 _HAS_ADDMM_ACTIVATION = hasattr(torch, "_addmm_activation")
 
 
+def _fused_linear_gelu_tanh_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+@register_custom_op(
+    op_name="diffusion_fused_linear_gelu_tanh",
+    mutates_args=[],
+    fake_impl=_fused_linear_gelu_tanh_fake,
+)
+def fused_linear_gelu_tanh(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """``gelu_tanh(x @ weight.T + bias)`` fused in the cublasLt GELU epilogue.
+
+    ``weight`` is ``[out, in]`` (nn.Linear / sglang linear layout). Registered as
+    a custom op so it is opaque under torch.compile.
+    """
+    x2d = x.reshape(-1, x.shape[-1])
+    out = torch._addmm_activation(bias, x2d, weight.t(), use_gelu=True)
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
 def can_fuse_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
     """Whether ``gelu(linear(x))`` can use the fused cublasLt epilogue.
 
     Requires the fused API to exist, a CUDA half-precision input, and an
     unquantized, bias'd, non-output-gathering linear layer (so the local weight
-    shard is exactly what the reference forward multiplies — correct under TP).
+    shard is exactly what the reference forward multiplies -- correct under TP).
+    A column-parallel layer that gathers across multiple ranks is excluded
+    (the per-shard fused op would skip the cross-rank gather); a single-rank
+    no-op gather is fine.
     """
     if not (_HAS_ADDMM_ACTIVATION and x.is_cuda):
         return False
@@ -41,9 +74,6 @@ def can_fuse_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
         return False
     if getattr(linear, "skip_bias_add", False):
         return False
-    # A column-parallel layer that gathers its output across TP ranks would have
-    # the cross-rank gather skipped by the per-shard fused path. Allow it only
-    # when the gather is a no-op (single TP rank); otherwise fall back.
     if getattr(linear, "gather_output", False) and getattr(linear, "tp_size", 1) > 1:
         return False
     weight = getattr(linear, "weight", None)
@@ -56,16 +86,12 @@ def can_fuse_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
 def linear_gelu_tanh(linear: Any, x: torch.Tensor) -> torch.Tensor:
     """Return tanh-approximate ``gelu(linear(x))``.
 
-    Uses the fused cublasLt GELU epilogue when :func:`can_fuse_linear_gelu`
-    holds; otherwise falls back to the exact reference ``linear(x)`` followed by
-    ``F.gelu(approximate="tanh")``.
+    Uses the fused cublasLt GELU epilogue (as a registered custom op, so it is
+    compile-safe) when :func:`can_fuse_linear_gelu` holds; otherwise falls back
+    to the exact reference ``linear(x)`` + ``F.gelu(approximate="tanh")``.
     """
     if can_fuse_linear_gelu(linear, x):
-        x2d = x.reshape(-1, x.shape[-1])
-        out = torch._addmm_activation(
-            linear.bias, x2d, linear.weight.t(), use_gelu=True
-        )
-        return out.view(*x.shape[:-1], out.shape[-1])
+        return fused_linear_gelu_tanh(x, linear.weight, linear.bias)
     out = linear(x)
     if isinstance(out, tuple):
         out = out[0]
