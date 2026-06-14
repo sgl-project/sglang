@@ -1133,9 +1133,12 @@ class ReasoningParser:
         }:
             force_reasoning = True
 
-        # M3 only prefills <mm:think> for thinking_mode=enabled (start tag then
-        # absent from output → force); disabled/adaptive/unset self-emit the tag.
-        if model_type.lower() == "minimax-m3":
+        # M3 prefills <mm:think> only for thinking_mode=enabled (start tag consumed
+        # → absent from output → must force); disabled/adaptive/unset self-emit the
+        # tag so the detector handles them. Covers callers that bypass serving_chat
+        # (e.g. /separate_reasoning); keep in sync with
+        # serving_chat._get_reasoning_from_request's M3 branch.
+        if model_type.lower() == "minimax-m3" and force_reasoning is None:
             force_reasoning = chat_template_kwargs.get("thinking_mode") == "enabled"
 
         # Only pass force_reasoning if explicitly set, let detectors use their defaults
