@@ -145,9 +145,7 @@ async def run_async_client_warmup(
                 raise RuntimeError(response.error)
     except Exception as e:
         if fail_open:
-            logger.warning(
-                "Synthetic server warmup failed; continuing startup: %s", e
-            )
+            logger.warning("Synthetic server warmup failed; continuing startup: %s", e)
             return
         raise
 
