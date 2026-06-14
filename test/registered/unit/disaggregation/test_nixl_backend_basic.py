@@ -212,6 +212,9 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
             pack_int_lists(state_dims, "I"),
             struct.pack("Q", staging_ptr),
             b"1048576",
+            b"64",
+            b"DRAM,DRAM",
+            b"".join(struct.pack("Q", item_len) for item_len in [1024, 2048]),
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -228,6 +231,9 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.decode_tp_size, 4)
         self.assertEqual(info.decode_tp_rank, 1)
         self.assertEqual(info.dst_kv_item_len, 1024)
+        self.assertEqual(info.dst_kv_item_lens, [1024, 2048])
+        self.assertEqual(info.dst_num_slots, 64)
+        self.assertEqual(info.dst_kv_mem_kinds, ["DRAM", "DRAM"])
         self.assertEqual(info.dst_state_item_lens, state_item_lens)
         self.assertEqual(info.dst_state_dim_per_tensor, state_dims)
         self.assertIsNotNone(info.staging)
@@ -255,6 +261,7 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_state_data_ptrs, [])
         self.assertEqual(info.dst_state_item_lens, [])
         self.assertEqual(info.dst_state_dim_per_tensor, [])
+        self.assertEqual(info.dst_kv_item_lens, [256])
         self.assertIsNone(info.staging)
 
 
@@ -672,6 +679,7 @@ class TestNixlStaging(CustomTestCase):
             decode_tp_size=1,
             decode_tp_rank=0,
             dst_kv_item_len=128,
+            dst_kv_item_lens=[],
             staging=SimpleNamespace(base_ptr=0x8000, total_size=4096),
         )
         calls = []
