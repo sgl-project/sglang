@@ -28,6 +28,7 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -43,6 +44,52 @@ def _jit_module(pos_dtype, head_dim, rope_dim) -> Module:
         *args,
         cuda_files=["minimax/fused_gemma_qknorm_rope.cuh"],
         cuda_wrappers=[("fused_gemma_qknorm_rope", f"fused_gemma_qknorm_rope<{args}>")],
+    )
+
+
+@register_custom_op(mutates_args=["qkv"])
+def _fused_gemma_qknorm_rope(
+    qkv: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    off0: int,
+    cnt0: int,
+    off1: int,
+    cnt1: int,
+    off2: int,
+    cnt2: int,
+    off3: int,
+    cnt3: int,
+    num_groups: int,
+    eps: float,
+) -> None:
+    # Wrap the tvm-ffi kernel as a custom op so torch.compile / piecewise CUDA
+    # graph can trace past the otherwise-opaque FFI call. The launch is
+    # graph-capturable (host-side constant offsets/counts), so it stays inside
+    # the captured region.
+    module = _jit_module(positions.dtype, 128, 64)
+    module.fused_gemma_qknorm_rope(
+        qkv,
+        w0,
+        w1,
+        w2,
+        w3,
+        cos_sin_cache,
+        positions,
+        off0,
+        cnt0,
+        off1,
+        cnt1,
+        off2,
+        cnt2,
+        off3,
+        cnt3,
+        num_groups,
+        eps,
     )
 
 
@@ -80,8 +127,7 @@ def minimax_qknorm_rope_grouped(
         offsets.append(0)
         counts.append(0)
 
-    module = _jit_module(positions.dtype, 128, 64)
-    module.fused_gemma_qknorm_rope(
+    _fused_gemma_qknorm_rope(
         qkv,
         weights[0],
         weights[1],

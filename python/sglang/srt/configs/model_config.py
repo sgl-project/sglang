@@ -381,8 +381,15 @@ class ModelConfig:
             self.hf_config.architectures
         )
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
+            or (
+                self.is_multimodal
+                and not is_multimodal_piecewise_cuda_graph_supported(
+                    self.hf_config.architectures
+                )
+            )
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -1719,6 +1726,21 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
 def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
     return any(
         arch in piecewise_cuda_graph_disabled_model_archs
+        for arch in model_architectures
+    )
+
+
+# Multimodal archs whose LM-decoder prefill is validated under piecewise CUDA
+# graph (capture wraps only the decoder; the image encoder runs eager).
+multimodal_piecewise_cuda_graph_supported_archs = [
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
+]
+
+
+def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str]):
+    return any(
+        arch in multimodal_piecewise_cuda_graph_supported_archs
         for arch in model_architectures
     )
 

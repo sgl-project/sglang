@@ -1485,7 +1485,7 @@ class ServerArgs:
             ),
             ("MoE A2A backend", lambda: self.moe_a2a_backend != "none"),
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
-            ("multimodal model", lambda: self.get_model_config().is_multimodal),
+            # Multimodal is gated by the model-arch rule above (piecewise captures only the LM decoder prefill).
             (
                 "GGUF quantization",
                 lambda: self.load_format == "gguf"
