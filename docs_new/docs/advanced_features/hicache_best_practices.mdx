@@ -202,7 +202,7 @@ python3 -m sglang.launch_server \
 
 **Configuration Parameters:**
 - `--hicache-storage-backend`: Set to `dynamic`
-- `--hicache-storage-backend-extra-config`: JSON configuration with:
+- `--hicache-storage-backend-extra-config`: a JSON string, or a `@`-prefixed JSON/TOML/YAML config file, with:
   - `backend_name`: Custom backend identifier
   - `module_path`: Python module path to your implementation
   - `class_name`: Your HiCache implementation class name

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import logging
-import os
 import threading
 import time
 from queue import Queue
@@ -29,6 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    parse_hicache_storage_backend_extra_config,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
 from sglang.srt.utils import get_device_module
@@ -233,28 +232,9 @@ class HybridCacheController(BaseHiCacheController):
     def parse_storage_backend_extra_config(
         storage_backend_extra_config: Optional[str],
     ) -> tuple[dict, int, float, float, bool]:
-        extra_config = {}
-        if storage_backend_extra_config:
-            if storage_backend_extra_config.startswith("@"):
-                path = storage_backend_extra_config[1:]
-                ext = os.path.splitext(path)[1].lower()
-                with open(path, "rb" if ext == ".toml" else "r") as f:
-                    if ext == ".json":
-                        extra_config = json.load(f)
-                    elif ext == ".toml":
-                        import tomllib
-
-                        extra_config = tomllib.load(f)
-                    elif ext in (".yaml", ".yml"):
-                        import yaml
-
-                        extra_config = yaml.safe_load(f)
-                    else:
-                        raise ValueError(
-                            f"Unsupported config file {path} (config format: {ext})"
-                        )
-            else:
-                extra_config = json.loads(storage_backend_extra_config)
+        extra_config = parse_hicache_storage_backend_extra_config(
+            storage_backend_extra_config
+        )
 
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
         prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)
