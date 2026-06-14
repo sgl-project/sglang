@@ -397,12 +397,26 @@ class _RecordingSchedulerCollector(SchedulerMetricsCollector):
     _summary_cls = _FileRecordingMetric
 
 
+def _clear_sglang_metrics_from_default_registry() -> None:
+    """Drop any ``sglang:`` metrics left in the process-global prometheus default
+    REGISTRY by a prior in-process Engine boot. Without this, a second in-process
+    ``sgl.Engine(enable_metrics=True)`` in the same test process re-registers the
+    same Counters and raises "Duplicated timeseries in CollectorRegistry"."""
+    from prometheus_client import REGISTRY
+
+    for collector in list(getattr(REGISTRY, "_collector_to_names", {})):
+        names = REGISTRY._collector_to_names.get(collector, set())
+        if any(name.startswith("sglang:") for name in names):
+            REGISTRY.unregister(collector)
+
+
 class TestStatLoggersDI(CustomTestCase):
     """Verify that a custom MetricsCollector subclass passed through
     ``ServerArgs.stat_loggers`` is the one instantiated inside the
     scheduler subprocess."""
 
     def setUp(self) -> None:
+        _clear_sglang_metrics_from_default_registry()
         try:
             os.unlink(_DI_MARKER_PATH)
         except FileNotFoundError:
@@ -453,6 +467,7 @@ class TestStatLoggersDIRecording(CustomTestCase):
     def setUp(self) -> None:
         # Avoid stale PROMETHEUS_MULTIPROC_DIR from prior in-process Engine boots.
         os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+        _clear_sglang_metrics_from_default_registry()
         try:
             os.unlink(_DI_RECORDING_MARKER_PATH)
         except FileNotFoundError:
