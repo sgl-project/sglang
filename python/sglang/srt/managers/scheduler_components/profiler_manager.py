@@ -20,7 +20,9 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileR
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import is_mps
 from sglang.srt.utils.profile_merger import ProfileMerger
+from sglang.srt.utils.tensor_bridge import is_mlx_available
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
@@ -159,6 +161,32 @@ class SchedulerProfilerManager:
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
         )
 
+        if is_mps() and is_mlx_available():
+            import mlx.core as mx
+
+            self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
+            mlx_trace_filename = str(
+                self.torch_profiler_output_dir / f"{self.profile_id}.gputrace"
+            )
+            try:
+                mx.metal.start_capture(mlx_trace_filename)
+            except RuntimeError as e:
+                # Metal's capture layer is only inserted when the process is
+                # launched with MTL_CAPTURE_ENABLED=1. Without it, start_capture
+                # raises instead of producing a trace, so surface an actionable
+                # error rather than letting the request fail with a 500.
+                return ProfileReqOutput(
+                    success=False,
+                    message=(
+                        f"Failed to start MLX Metal capture: {e}. "
+                        "Set MTL_CAPTURE_ENABLED=1 in the server's environment "
+                        "before launching to enable GPU trace capture."
+                    ),
+                )
+            logger.info(f"MLX Metal capture started, saving to {mlx_trace_filename}")
+            self.profile_in_progress = True
+            return ProfileReqOutput(success=True, message="Succeeded")
+
         activities = self.profiler_activities
         with_stack = self.torch_profiler_with_stack
         record_shapes = self.torch_profiler_record_shapes
@@ -289,6 +317,18 @@ class SchedulerProfilerManager:
             )
 
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
+
+        if is_mps() and is_mlx_available():
+            import mlx.core as mx
+
+            mx.metal.stop_capture()
+            logger.info(
+                "MLX Metal capture stopped. Trace saved to: %s",
+                self.torch_profiler_output_dir,
+            )
+            self.profile_in_progress = False
+            self.profiler_start_forward_ct = None
+            return ProfileReqOutput(success=True, message="Succeeded.")
 
         if self.profile_prefix:
             stage_prefix = self.profile_prefix + "-"
