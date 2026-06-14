@@ -26,6 +26,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -161,7 +162,7 @@ class TinyGemmLinear(ReplicatedLinear):
             and x.dtype == torch.bfloat16
         ):
             out = x.new_empty((x.shape[0], self.output_size))
-            tinygemm_bf16(x, self.weight, out, self.bias)
+            tinygemm_bf16(x, self.weight, out, self.bias, use_pdl=is_arch_support_pdl())
             return out, None
 
         return super().forward(x)
@@ -1094,7 +1095,6 @@ class GptOssForCausalLM(nn.Module):
         weight_name_mapping: dict,
         other_loaded_param_names=[],
     ):
-        tp_rank = get_tensor_model_parallel_rank()
         if is_nextn:
             logging.warning(
                 "Loading weights for nextn is currently not supported in GptOssForCausalLM. "

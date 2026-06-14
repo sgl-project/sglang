@@ -8,16 +8,18 @@ slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, suite="base-b-test-1-gpu-small")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 DEVICE = get_device()
 
@@ -57,6 +59,20 @@ def _make_worker(num_steps: int, num_draft_tokens: int):
     return worker
 
 
+def _make_backend_factory(decode_backend, draft_extend_backend):
+    class FakeDraftBackendFactory:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_decode_backend(self):
+            return decode_backend
+
+        def create_draft_extend_backend(self):
+            return draft_extend_backend
+
+    return FakeDraftBackendFactory
+
+
 class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
     def test_fast_path_matches_slow_path(self):
         bs = 3
@@ -91,6 +107,140 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+
+class TestEagleWorkerV2BackendFallback(CustomTestCase):
+    def test_preserves_initialized_backend_when_draft_extend_backend_is_unset(self):
+        worker = object.__new__(EagleDraftWorker)
+        existing_backend = object()
+        decode_backend = object()
+        worker.server_args = SimpleNamespace()
+        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.topk = 1
+        worker.speculative_num_steps = 2
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
+            _make_backend_factory(decode_backend, None),
+        ):
+            worker.init_attention_backend()
+
+        self.assertIs(worker.draft_attn_backend, decode_backend)
+        self.assertIsNone(worker.draft_extend_attn_backend)
+        self.assertIs(worker.draft_runner.draft_attn_backend, decode_backend)
+        self.assertIs(worker.draft_runner.attn_backend, existing_backend)
+
+    def test_uses_draft_extend_backend_when_available(self):
+        worker = object.__new__(EagleDraftWorker)
+        existing_backend = object()
+        decode_backend = object()
+        draft_extend_backend = object()
+        worker.server_args = SimpleNamespace()
+        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.topk = 1
+        worker.speculative_num_steps = 2
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
+            _make_backend_factory(decode_backend, draft_extend_backend),
+        ):
+            worker.init_attention_backend()
+
+        self.assertIs(worker.draft_attn_backend, decode_backend)
+        self.assertIs(worker.draft_extend_attn_backend, draft_extend_backend)
+        self.assertIs(worker.draft_runner.draft_attn_backend, decode_backend)
+        self.assertIs(worker.draft_runner.attn_backend, draft_extend_backend)
+
+    def _make_adaptive_worker(self, runner_attn_backend):
+        """An EAGLEWorkerV2 with a draft worker whose state-machine fields are
+        filled with sentinels, sufficient to drive _override_worker_state /
+        apply_runtime_state without touching the GPU."""
+        draft_runner = SimpleNamespace(
+            draft_attn_backend=object(),
+            attn_backend=runner_attn_backend,
+        )
+        draft_worker = SimpleNamespace(
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            draft_attn_backend=object(),
+            draft_extend_attn_backend=object(),
+            cuda_graph_runner=object(),
+            cuda_graph_runner_for_draft_extend=object(),
+            draft_runner=draft_runner,
+            # _override_worker_state / apply_runtime_state call this hook; the
+            # topk=1 buffers are exercised by the fast-path tests above.
+            _rebuild_topk1_chain_buffers=lambda: None,
+        )
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._draft_worker = draft_worker
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                attn_backend=object(), decode_cuda_graph_runner=object()
+            )
+        )
+        worker.speculative_num_steps = 2
+        worker.speculative_num_draft_tokens = 3
+        worker.server_args = SimpleNamespace(
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            cuda_graph_bs_decode=None,
+            disable_cuda_graph=False,
+        )
+        return worker, draft_worker
+
+    def test_override_worker_state_restores_runner_attn_backend(self):
+        # build_adaptive_runtime_state runs init_attention_backend inside this
+        # context for each candidate step; the runner backend it assigns must
+        # not leak into the live worker.
+        initial_backend = object()
+        candidate_backend = object()
+        worker, dw = self._make_adaptive_worker(initial_backend)
+
+        with worker._override_worker_state(3, 4):
+            dw.draft_runner.attn_backend = candidate_backend
+            self.assertIs(dw.draft_runner.attn_backend, candidate_backend)
+
+        self.assertIs(dw.draft_runner.attn_backend, initial_backend)
+
+    def test_apply_runtime_state_updates_runner_attn_backend(self):
+        # Switching to another step config must repoint the runner backend at
+        # that config's draft-extend backend (read by the draft-extend forward).
+        new_extend_backend = object()
+        worker, dw = self._make_adaptive_worker(object())
+
+        state = SpecRuntimeState(
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            draft_attn_backend=object(),
+            cuda_graph_runner=object(),
+            target_attn_backend=object(),
+            target_graph_runner=object(),
+            draft_extend_attn_backend=new_extend_backend,
+            cuda_graph_runner_for_draft_extend=object(),
+        )
+        worker.apply_runtime_state(state)
+
+        self.assertIs(dw.draft_runner.attn_backend, new_extend_backend)
+
+    def test_spec_v2_attn_backends_include_draft_extend_fallback(self):
+        target_backend = object()
+        decode_backend = object()
+        fallback_backend = object()
+
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=target_backend)
+        )
+        worker._draft_worker = SimpleNamespace(
+            draft_attn_backend=decode_backend,
+            draft_extend_attn_backend=None,
+            draft_runner=SimpleNamespace(attn_backend=fallback_backend),
+        )
+
+        self.assertEqual(
+            worker.spec_v2_attn_backends,
+            (target_backend, decode_backend, fallback_backend),
+        )
 
 
 if __name__ == "__main__":
