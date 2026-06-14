@@ -2115,24 +2115,31 @@ class GGUFModelLoader(BaseModelLoader):
         return gguf_to_hf_name_map
 
     def _get_gguf_files(self, first_shard_path: str) -> List[str]:
-        # A sharded GGUF checkpoint is split into `<name>-00001-of-000NN.gguf`
-        # files kept side by side; given any single shard, discover the full,
-        # sorted set so every tensor gets loaded. An unsharded file is returned
-        # unchanged.
-        match = re.fullmatch(
-            r"(?P<prefix>.+)-\d{5}-of-(?P<total>\d{5})\.gguf",
-            os.path.basename(first_shard_path),
-        )
+        # A sharded GGUF checkpoint is split into sibling files like
+        # `<name>-00001-of-000NN.gguf`. Given any one shard, rebuild the full
+        # set by shard index (1..total) rather than globbing, so a sibling
+        # model with a similar prefix is never pulled in. Padding width comes
+        # from the matched name; a non-sharded path is returned unchanged.
+        match = re.search(r"-(\d+)-of-(\d+)\.gguf$", os.path.basename(first_shard_path))
         if match is None:
             return [first_shard_path]
+        total = int(match.group(2))
+        num_digits = len(match.group(1))
         directory = os.path.dirname(first_shard_path)
-        pattern = f"{match.group('prefix')}-*-of-{match.group('total')}.gguf"
-        files = sorted(glob.glob(os.path.join(directory, pattern)))
-        expected = int(match.group("total"))
-        if len(files) != expected:
+        base = os.path.basename(first_shard_path)
+        prefix, suffix = base[: match.start(1)], base[match.end(2) :]
+        files = [
+            os.path.join(
+                directory,
+                f"{prefix}{i:0{num_digits}d}-of-{total:0{num_digits}d}{suffix}",
+            )
+            for i in range(1, total + 1)
+        ]
+        missing = [f for f in files if not os.path.isfile(f)]
+        if missing:
             raise ValueError(
-                f"Expected {expected} GGUF shards for {first_shard_path} "
-                f"but found {len(files)}: {files}"
+                f"Incomplete sharded GGUF for {first_shard_path}: missing "
+                f"{len(missing)} of {total} shards: {missing}"
             )
         return files
 
@@ -2157,11 +2164,10 @@ class GGUFModelLoader(BaseModelLoader):
         gguf_weights_map = self._get_gguf_weights_map(model_config)
         # we can only know about tied word embeddings after mapping weights;
         # treat a tensor as absent only if it is missing from every shard.
-        extra_tensor_names = None
+        extra_tensor_names = set(gguf_weights_map.values())
         for gguf_file in gguf_files:
-            names = set(get_gguf_extra_tensor_names(gguf_file, gguf_weights_map))
-            extra_tensor_names = (
-                names if extra_tensor_names is None else extra_tensor_names & names
+            extra_tensor_names &= set(
+                get_gguf_extra_tensor_names(gguf_file, gguf_weights_map)
             )
         if "lm_head.weight" in extra_tensor_names:
             model_config.hf_config.update({"tie_word_embeddings": True})

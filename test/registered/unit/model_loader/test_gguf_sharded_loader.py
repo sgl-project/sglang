@@ -1,8 +1,9 @@
 """Unit tests for sharded GGUF discovery in GGUFModelLoader._get_gguf_files.
 
 A sharded GGUF checkpoint is split into ``<name>-00001-of-000NN.gguf`` files
-kept side by side. Given any single shard, the loader must discover the full,
-sorted set; an unsharded file must be returned unchanged.
+kept side by side. Given any single shard, the loader must rebuild the full,
+ordered set so that every tensor gets loaded; an unsharded file must be
+returned unchanged.
 """
 
 import os
@@ -35,18 +36,28 @@ class TestGGUFShardedDiscovery(CustomTestCase):
                 self._touch(os.path.join(d, f"model-{i:05d}-of-00003.gguf"))
                 for i in range(1, 4)
             ]
-            # A shard set with a different total must not be mixed in.
+            # A sibling set with a different total, or one that merely shares a
+            # prefix, must not be pulled in.
             self._touch(os.path.join(d, "model-00001-of-00005.gguf"))
+            self._touch(os.path.join(d, "model-2-00001-of-00003.gguf"))
 
-            # Given any shard, the full matching set is discovered, sorted.
-            self.assertEqual(self.loader._get_gguf_files(shards[0]), sorted(shards))
-            self.assertEqual(self.loader._get_gguf_files(shards[2]), sorted(shards))
+            # Any shard rebuilds exactly its own ordered set.
+            self.assertEqual(self.loader._get_gguf_files(shards[0]), shards)
+            self.assertEqual(self.loader._get_gguf_files(shards[2]), shards)
+
+    def test_discovers_variable_width_padding(self):
+        with tempfile.TemporaryDirectory() as d:
+            shards = [
+                self._touch(os.path.join(d, f"model-{i:02d}-of-03.gguf"))
+                for i in range(1, 4)
+            ]
+            self.assertEqual(self.loader._get_gguf_files(shards[1]), shards)
 
     def test_rejects_incomplete_shard_set(self):
         with tempfile.TemporaryDirectory() as d:
             first = self._touch(os.path.join(d, "model-00001-of-00003.gguf"))
             self._touch(os.path.join(d, "model-00002-of-00003.gguf"))
-            # third shard absent -> declared count does not match
+            # third shard absent
             with self.assertRaises(ValueError):
                 self.loader._get_gguf_files(first)
 
