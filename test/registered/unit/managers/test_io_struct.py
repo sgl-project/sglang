@@ -263,6 +263,31 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
+    def test_routing_key_preserved_in_batch_sub_requests(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            routing_key="session-a",
+        )
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].routing_key, "session-a")
+        self.assertEqual(req[1].routing_key, "session-a")
+
+    def test_routing_key_preserved_in_parallel_sample_sub_requests(self):
+        req = GenerateReqInput(
+            text="Hello",
+            sampling_params={"n": 2},
+            routing_key="session-a",
+        )
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].routing_key, "session-a")
+        self.assertEqual(req[1].routing_key, "session-a")
+
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
         req = copy.deepcopy(self.base_req)

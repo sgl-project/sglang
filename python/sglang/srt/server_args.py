@@ -554,6 +554,8 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "auto"
+    dp_cache_affinity: str = "none"
+    dp_cache_affinity_max_keys: int = 100_000
 
     attn_cp_size: int = 1
     moe_dp_size: int = 1
@@ -1099,17 +1101,45 @@ class ServerArgs:
                 f"Invalid disaggregation_mode={self.disaggregation_mode!r}"
             )
 
+        valid_dp_cache_affinity = ("none", "routing_key")
+        if self.dp_cache_affinity not in valid_dp_cache_affinity:
+            raise ValueError(
+                f"Invalid dp_cache_affinity={self.dp_cache_affinity!r}; "
+                f"must be one of {valid_dp_cache_affinity}"
+            )
+        if self.dp_cache_affinity_max_keys <= 0:
+            raise ValueError(
+                f"Invalid dp_cache_affinity_max_keys="
+                f"{self.dp_cache_affinity_max_keys!r}; must be positive"
+            )
+
         if self.load_balance_method == "auto":
             # Default behavior:
             # - non-PD: round_robin
             # - PD prefill: follow_bootstrap_room
+            # - PD prefill with cache affinity: total_tokens
             # - PD decode: round_robin
-            self.load_balance_method = (
-                "follow_bootstrap_room"
-                if self.disaggregation_mode == "prefill"
-                else "round_robin"
-            )
+            if self.disaggregation_mode == "prefill":
+                self.load_balance_method = (
+                    "total_tokens"
+                    if self.dp_cache_affinity != "none"
+                    else "follow_bootstrap_room"
+                )
+            else:
+                self.load_balance_method = "round_robin"
             return
+
+        if (
+            self.disaggregation_mode == "prefill"
+            and self.dp_cache_affinity != "none"
+            and self.load_balance_method == "follow_bootstrap_room"
+        ):
+            raise ValueError(
+                "--dp-cache-affinity cannot be used with "
+                "--load-balance-method=follow_bootstrap_room in PD prefill mode. "
+                "Use auto, round_robin, total_requests, or total_tokens so decode "
+                "can query the actual prefill DP rank."
+            )
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
@@ -5769,6 +5799,26 @@ class ServerArgs:
                 "total_requests",
                 "total_tokens",
             ],
+        )
+        parser.add_argument(
+            "--dp-cache-affinity",
+            type=str,
+            default=ServerArgs.dp_cache_affinity,
+            help=(
+                "The DP cache affinity strategy. 'routing_key' keeps requests with "
+                "the same X-SMG-Routing-Key on the same DP rank after the first "
+                "assignment."
+            ),
+            choices=["none", "routing_key"],
+        )
+        parser.add_argument(
+            "--dp-cache-affinity-max-keys",
+            type=int,
+            default=ServerArgs.dp_cache_affinity_max_keys,
+            help=(
+                "Maximum number of routing keys remembered by DP cache affinity. "
+                "When the limit is exceeded, least-recently used keys are evicted."
+            ),
         )
         parser.add_argument(
             "--prefill-round-robin-balance",

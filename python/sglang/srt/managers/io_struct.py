@@ -714,6 +714,7 @@ class GenerateReqInput(BaseReq):
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
+            routing_key=self.routing_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,

@@ -74,6 +74,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="null")
         self.assertEqual(server_args.load_balance_method, "round_robin")
+        self.assertEqual(server_args.dp_cache_affinity, "none")
 
     def test_pd_prefill_defaults_to_follow_bootstrap_room(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="prefill")
@@ -82,6 +83,53 @@ class TestLoadBalanceMethod(unittest.TestCase):
     def test_pd_decode_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
+
+    def test_pd_prefill_cache_affinity_auto_uses_total_tokens(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            dp_cache_affinity="routing_key",
+        )
+        self.assertEqual(server_args.load_balance_method, "total_tokens")
+        self.assertEqual(server_args.dp_cache_affinity, "routing_key")
+
+    def test_pd_prefill_cache_affinity_rejects_follow_bootstrap_room(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="prefill",
+                dp_cache_affinity="routing_key",
+                load_balance_method="follow_bootstrap_room",
+            )
+
+        self.assertIn("--dp-cache-affinity", str(context.exception))
+        self.assertIn("follow_bootstrap_room", str(context.exception))
+
+    def test_dp_cache_affinity_cli_arg(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--dp-cache-affinity",
+                "routing_key",
+                "--dp-cache-affinity-max-keys",
+                "128",
+            ]
+        )
+        self.assertEqual(server_args.dp_cache_affinity, "routing_key")
+        self.assertEqual(server_args.dp_cache_affinity_max_keys, 128)
+
+    def test_invalid_dp_cache_affinity_rejected(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(model_path="dummy", dp_cache_affinity="prefix")
+
+        self.assertIn("dp_cache_affinity='prefix'", str(context.exception))
+
+    def test_invalid_dp_cache_affinity_max_keys_rejected(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(model_path="dummy", dp_cache_affinity_max_keys=0)
+
+        self.assertIn("dp_cache_affinity_max_keys=0", str(context.exception))
 
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         with self.assertRaises(ValueError) as context:
