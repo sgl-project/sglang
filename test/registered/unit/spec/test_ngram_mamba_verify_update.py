@@ -1,9 +1,8 @@
 """Unit tests for NGRAM speculative decoding mamba state rollback.
 
 Tests that `last_correct_step_indices` is correctly computed from
-`accept_indices` and `num_correct_drafts` in NgramVerifyInput.verify(),
-and that NGRAMWorker._mamba_verify_update is invoked for hybrid linear
-attention models.
+`accept_index` and `accept_lens`, and that the shared post-verify mamba
+state commit helper updates hybrid linear-attention models.
 """
 
 import unittest
@@ -127,42 +126,51 @@ class TestNgramLastCorrectStepIndices(CustomTestCase):
         self.assertTrue(torch.equal(result, expected))
 
 
-class TestNgramWorkerMambaVerifyUpdate(CustomTestCase):
-    """Test that NGRAMWorker._mamba_verify_update is invoked correctly."""
+class TestNgramMambaVerifyUpdate(CustomTestCase):
+    """Test that NGRAM verify commits mamba states through the shared helper."""
 
-    def _make_mock_worker(self, has_mambaish_config: bool):
-        """Create a mock NGRAMWorker with necessary attributes."""
-        from sglang.srt.speculative.ngram_worker import NGRAMWorker
+    def _make_mock_target_worker(self, has_mambaish_config: bool):
+        """Create a mock target worker with necessary model runner attributes."""
+        target_worker = MagicMock()
+        target_worker.model_runner.model = MagicMock()
+        target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify = (
+            MagicMock()
+        )
 
-        worker = object.__new__(NGRAMWorker)
-        worker.target_worker = MagicMock()
-        worker.draft_token_num = 5
-
-        if has_mambaish_config:
-            worker.target_worker.model_runner.mambaish_config = {"some": "config"}
-        else:
-            worker.target_worker.model_runner.mambaish_config = None
-
-        worker.target_worker.server_args.mamba_track_interval = 256
-        return worker
+        target_worker.model_runner.mambaish_config = (
+            {"some": "config"} if has_mambaish_config else None
+        )
+        return target_worker
 
     def test_mamba_verify_update_called_with_correct_indices(self):
-        """_mamba_verify_update passes correct last_correct_step_indices to backend."""
-        worker = self._make_mock_worker(has_mambaish_config=True)
+        """commit_mamba_states_after_verify passes correct last_correct_step_indices."""
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
-        mock_verify_input = MagicMock()
-        mock_verify_input.last_correct_step_indices = torch.tensor(
-            [2, 0, 4], dtype=torch.int32
+        target_worker = self._make_mock_target_worker(has_mambaish_config=True)
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = False
+        batch.mamba_track_indices = None
+        batch.seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
+        accept_lens = torch.tensor([3, 1, 5], dtype=torch.int32)
+        accept_index = torch.tensor(
+            [
+                [0, 1, 2, -1, -1],
+                [5, -1, -1, -1, -1],
+                [10, 11, 12, 13, 14],
+            ],
+            dtype=torch.int32,
         )
-        mock_verify_input.num_accept_tokens = torch.tensor([3, 1, 5], dtype=torch.int32)
 
-        mock_batch = MagicMock()
-        mock_batch.mamba_track_indices = None
-
-        worker._mamba_verify_update(mock_batch, mock_verify_input)
+        commit_mamba_states_after_verify(
+            target_worker,
+            batch,
+            accept_lens,
+            accept_index,
+            draft_token_num=5,
+        )
 
         update_call = (
-            worker.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify
+            target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify
         )
         update_call.assert_called_once()
         call_kwargs = update_call.call_args[1]
@@ -176,35 +184,79 @@ class TestNgramWorkerMambaVerifyUpdate(CustomTestCase):
         self.assertIsNone(call_kwargs["mamba_steps_to_track"])
 
     def test_mamba_verify_update_not_called_for_non_mamba_model(self):
-        """Verify _mamba_verify_update is not called when mambaish_config is None."""
-        worker = self._make_mock_worker(has_mambaish_config=False)
+        """Verify the commit helper is a no-op when mambaish_config is None."""
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
-        # Simulate the condition check in forward_batch_generation
-        self.assertIsNone(worker.target_worker.model_runner.mambaish_config)
+        target_worker = self._make_mock_target_worker(has_mambaish_config=False)
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = False
+        batch.mamba_track_indices = None
+        accept_lens = torch.tensor([1], dtype=torch.int32)
+        accept_index = torch.tensor([[0, -1, -1, -1, -1]], dtype=torch.int32)
 
-    def test_mamba_verify_update_with_track_indices(self):
-        """_mamba_verify_update computes mamba_steps_to_track when track indices exist."""
-        worker = self._make_mock_worker(has_mambaish_config=True)
-
-        mock_verify_input = MagicMock()
-        mock_verify_input.last_correct_step_indices = torch.tensor(
-            [3, 2], dtype=torch.int32
+        commit_mamba_states_after_verify(
+            target_worker,
+            batch,
+            accept_lens,
+            accept_index,
+            draft_token_num=5,
         )
-        mock_verify_input.num_accept_tokens = torch.tensor([4, 3], dtype=torch.int32)
-
-        mock_batch = MagicMock()
-        mock_batch.mamba_track_indices = torch.tensor([100, 200], dtype=torch.int64)
-        # seq_lens after verify (already updated in verify())
-        mock_batch.seq_lens = torch.tensor([260, 130], dtype=torch.int32)
-
-        worker._mamba_verify_update(mock_batch, mock_verify_input)
 
         update_call = (
-            worker.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify
+            target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify
+        )
+        update_call.assert_not_called()
+
+    def test_mamba_verify_update_with_track_indices(self):
+        """commit_mamba_states_after_verify computes mamba_steps_to_track."""
+        from unittest.mock import patch
+
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+
+        target_worker = self._make_mock_target_worker(has_mambaish_config=True)
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = False
+        batch.mamba_track_indices = torch.tensor([100, 200], dtype=torch.int64)
+        # seq_lens before verify; helper adds accept_lens to compute the post-verify lengths.
+        batch.seq_lens = torch.tensor([253, 128], dtype=torch.int32)
+        accept_lens = torch.tensor([4, 3], dtype=torch.int32)
+        accept_index = torch.tensor(
+            [
+                [0, 1, 2, 3, -1],
+                [5, 6, 7, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+
+        with patch(
+            "sglang.srt.speculative.spec_utils.get_global_server_args",
+            return_value=MagicMock(mamba_track_interval=256),
+        ):
+            commit_mamba_states_after_verify(
+                target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                draft_token_num=5,
+            )
+
+        update_call = (
+            target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify
         )
         update_call.assert_called_once()
         call_kwargs = update_call.call_args[1]
-        self.assertIsNotNone(call_kwargs["mamba_steps_to_track"])
+        self.assertTrue(
+            torch.equal(
+                call_kwargs["last_correct_step_indices"],
+                torch.tensor([3, 2], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                call_kwargs["mamba_steps_to_track"],
+                torch.tensor([2, -1], dtype=torch.int32),
+            )
+        )
 
 
 if __name__ == "__main__":
