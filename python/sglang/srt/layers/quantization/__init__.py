@@ -49,7 +49,7 @@ from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
-from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
+from sglang.srt.layers.quantization.w4afp8 import KimiW4AFp8Config, W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.platforms import current_platform
@@ -90,6 +90,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
+    "kimi_w4afp8": KimiW4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "quark": QuarkConfig,
