@@ -126,7 +126,11 @@ def _record_component_attn_backend(backend_name: str, reason: str | None) -> boo
 def _log_component_attn_backend_summary(
     context: ComponentAttnBackendContext | None,
 ) -> None:
-    if context is None or context.component_name is None or not context.selected_backends:
+    if (
+        context is None
+        or context.component_name is None
+        or not context.selected_backends
+    ):
         return
 
     backend_parts = []
