@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import logging
 import time
 from contextlib import nullcontext
@@ -137,6 +138,42 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
+_CEIL_TO_UE8M0_RECOMPILE_LIMIT = 1024
+
+
+@functools.cache
+def _compiled_deep_gemm_ceil_to_ue8m0(dynamic: Optional[bool]):
+    import deep_gemm
+    import torch._dynamo.config as dynamo_config
+
+    def ceil_to_ue8m0_for_fp8_einsum(
+        o_s: torch.Tensor, num_tokens: int, num_groups: int
+    ):
+        o_s = deep_gemm.ceil_to_ue8m0(o_s)
+        return (
+            o_s.view(num_tokens, num_groups, o_s.shape[-1])
+            .transpose(0, 1)
+            .contiguous()
+            .transpose(0, 1)
+        )
+
+    # This helper may run when global torch-compile config was not applied.
+    # Decode specializes one o_s shape per CUDA graph bucket, so keep this
+    # process-global limit aligned with the existing torch compile setup.
+    dynamo_config.recompile_limit = max(
+        dynamo_config.recompile_limit,
+        _CEIL_TO_UE8M0_RECOMPILE_LIMIT,
+    )
+    options = {"triton.enable_pdl": True}
+    # Prefill is currently eager mode, cpp wrappers can help reduce CPU overhead.
+    if dynamic is None:
+        options["cpp_wrapper"] = True
+    return torch.compile(
+        ceil_to_ue8m0_for_fp8_einsum,
+        fullgraph=True,
+        dynamic=dynamic,
+        options=options,
+    )
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -994,11 +1031,14 @@ class MQALayer(nn.Module):
                 o.reshape(T * G, D).contiguous(),
                 group_size=128,
             )
-            o_s = deep_gemm.ceil_to_ue8m0(o_s)
+            compile_dynamic = (
+                False if forward_batch.forward_mode.is_decode_or_idle() else None
+            )
+            o_s = _compiled_deep_gemm_ceil_to_ue8m0(compile_dynamic)(o_s, T, G)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
-                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                (o_fp8.view(T, G, D), o_s),
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
                 recipe=(1, 1, 128),
