@@ -295,6 +295,11 @@ class DecodeRunner(BaseRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    # Default for subclasses (e.g. the EAGLE spec runners) whose __init__ does
+    # not thread `eager` through to here; only the eager decode runner sets it
+    # True. Read by _resolve_backend / prepare / execute.
+    eager: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
