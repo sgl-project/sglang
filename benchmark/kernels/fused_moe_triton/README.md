@@ -20,6 +20,46 @@ A specialized tool for separate kernel tuning, optimizing the first and second M
 
 ### Usage Examples
 
+#### User-facing Auto-tune Entrypoint
+```bash
+# Inspect the resolved model/kernel tuning plan without running GPU benchmarks.
+PYTHONPATH=$PWD/python:$PWD:$PYTHONPATH \
+python -m sglang.auto_tune \
+    --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 \
+    --tp 1 \
+    --quick \
+    --dry-run \
+    --output-dir /tmp/sglang-moe-configs
+
+# Run a reduced tuning pass and write configs under
+# /tmp/sglang-moe-configs/configs/triton_<version>/.
+PYTHONPATH=$PWD/python:$PWD:$PYTHONPATH \
+python -m sglang.auto_tune \
+    --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 \
+    --tp 1 \
+    --quick \
+    --batch-size 1,8,32,128 \
+    --output-dir /tmp/sglang-moe-configs
+
+# Reuse the generated configs when launching SGLang.
+SGLANG_MOE_CONFIG_DIR=/tmp/sglang-moe-configs \
+python -m sglang.launch_server \
+    --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 \
+    --tp 1
+```
+
+The `python -m sglang.auto_tune` entrypoint currently wraps the unified
+`fused_moe_triton` tuner in this directory. It resolves the model MoE shape,
+chooses the existing SGLang config filename convention, writes configs in the
+same directory layout read by `SGLANG_MOE_CONFIG_DIR`, and prints a final reuse
+command. Use `--quick` for a smaller candidate search before running a full
+tuning pass. After tuning, the entrypoint validates that the generated JSON is
+loadable through the same runtime `SGLANG_MOE_CONFIG_DIR` path used by
+`get_moe_configs`, which catches misplaced config directories before serving.
+The underlying tuner uses Ray workers, so install SGLang's Ray extra or run
+`pip install 'ray[default]>=2.54.0'` if your environment does not already
+provide Ray.
+
 #### Basic TP Mode Tuning
 ```bash
 # Tune Mixtral-8x7B with default TP settings
