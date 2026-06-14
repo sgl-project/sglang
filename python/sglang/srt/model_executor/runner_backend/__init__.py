@@ -7,6 +7,8 @@ one shape; it is phase-agnostic. Runners (cuda_graph_runner/) own
 Public API:
   - ExecutionBackend — abstract interface.
   - FullCudaGraphBackend — single torch.cuda.CUDAGraph per shape.
+  - EagerBackend — no capture; runs the model forward live (the dual of
+    FullCudaGraphBackend, so eager plugs into the same Runner lifecycle).
   - BreakableCudaGraphBackend — segmented capture with eager break
     markers; no torch.compile.
   - TcPiecewiseCudaGraphBackend — torch.compile-driven piecewise
@@ -18,6 +20,9 @@ from sglang.srt.model_executor.runner_backend.base_execution_backend import (  #
 )
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (  # noqa: F401
     BreakableCudaGraphBackend,
+)
+from sglang.srt.model_executor.runner_backend.eager_backend import (  # noqa: F401
+    EagerBackend,
 )
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (  # noqa: F401
     FullCudaGraphBackend,
