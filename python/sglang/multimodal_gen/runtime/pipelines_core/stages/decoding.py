@@ -9,7 +9,11 @@ import weakref
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_world_size,
+    get_local_torch_device,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -29,6 +33,33 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+
+def scale_and_shift_latents(latents: torch.Tensor, server_args, vae) -> torch.Tensor:
+    """De-normalize latents before VAE decode (single shared implementation).
+
+    Used by DecodingStage.scale_and_shift and by realtime stages that decode
+    outside a DecodingStage instance.
+    """
+    scaling_factor, shift_factor = (
+        server_args.pipeline_config.get_decode_scale_and_shift(
+            latents.device, latents.dtype, vae
+        )
+    )
+
+    # 1. scale
+    if isinstance(scaling_factor, torch.Tensor):
+        latents = latents / scaling_factor.to(latents.device, latents.dtype)
+    else:
+        latents = latents / scaling_factor
+
+    # 2. apply shifting if needed
+    if shift_factor is not None:
+        if isinstance(shift_factor, torch.Tensor):
+            latents = latents + shift_factor.to(latents.device, latents.dtype)
+        else:
+            latents = latents + shift_factor
+    return latents
 
 
 def _ensure_tensor_decode_output(decode_output):
@@ -87,9 +118,19 @@ class DecodingStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        if get_global_server_args().enable_cfg_parallel:
+        server_args = get_global_server_args()
+        if server_args.enable_cfg_parallel:
+            if self._can_use_parallel_decode():
+                return StageParallelismType.REPLICATED
             return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
+
+    def _can_use_parallel_decode(self) -> bool:
+        return (
+            model_parallel_is_initialized()
+            and get_decode_parallel_world_size() > 1
+            and self.vae.use_parallel_decode
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify decoding stage inputs."""
@@ -106,25 +147,7 @@ class DecodingStage(PipelineStage):
         return result
 
     def scale_and_shift(self, latents: torch.Tensor, server_args):
-        scaling_factor, shift_factor = (
-            server_args.pipeline_config.get_decode_scale_and_shift(
-                latents.device, latents.dtype, self.vae
-            )
-        )
-
-        # 1. scale
-        if isinstance(scaling_factor, torch.Tensor):
-            latents = latents / scaling_factor.to(latents.device, latents.dtype)
-        else:
-            latents = latents / scaling_factor
-
-        # 2. apply shifting if needed
-        if shift_factor is not None:
-            if isinstance(shift_factor, torch.Tensor):
-                latents += shift_factor.to(latents.device, latents.dtype)
-            else:
-                latents += shift_factor
-        return latents
+        return scale_and_shift_latents(latents, server_args, self.vae)
 
     @torch.no_grad()
     def decode(

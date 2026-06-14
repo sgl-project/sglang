@@ -463,10 +463,15 @@ def pp_parallel_deep_gemm_warmup(model_runner) -> None:
     # n_splits ~= n_sms / ceil(bs/block_m) with block_m=64; sweep 5 bs to
     # cover the brackets real /generate hits (smallest decode shape,
     # mid-low, two mid, and n_splits=1 for ~5K+ token prefill). Ceil-align
-    # to attn_cp_size for DSA prefill CP's seq_len % cp_size == 0 assert.
+    # bs to the CP padding alignment (cp_size, or 2*cp_size for DSA
+    # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
+    # an unaligned bs makes DSA's padded num_splits longer than the q tokens
+    # and trips FlashMLA's "num_splits must have shape (b+1)" check.
+    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
     n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
     block_m = 64
-    cp = max(model_runner.attn_cp_size, 1)
+    cp = max(get_cp_padding_align_size(), 1)
     batch_sizes = sorted(
         {
             ceil_align(bs, cp)

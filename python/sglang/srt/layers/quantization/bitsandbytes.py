@@ -90,7 +90,7 @@ class BitsAndBytesConfig(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "BitsAndBytesConfig":
+    def from_config(cls, config: dict[str, Any]) -> BitsAndBytesConfig:
         def get_safe_value(config, keys, default_value=None):
             try:
                 value = QuantizationConfig.get_from_keys(config, keys)

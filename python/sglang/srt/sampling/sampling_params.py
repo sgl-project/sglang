@@ -14,6 +14,7 @@
 """Sampling parameters for text generation."""
 
 import logging
+import math
 from typing import Any, Dict, List, Optional, Union
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
@@ -118,9 +119,9 @@ class SamplingParams:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
-        if self.temperature < 0.0:
+        if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
-                f"temperature must be non-negative, got {self.temperature}."
+                f"temperature must be a non-negative finite number, got {self.temperature}."
             )
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")

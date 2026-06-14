@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timing import (
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timer import (
     RealtimeStageTimer,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
@@ -181,7 +181,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             adapter.on_chunk_complete(session, result)
             if pending_send_task is not None:
                 await pending_send_task
-            if batch.realtime_output_pacing:
+            if getattr(batch, "realtime_output_pacing", False):
                 await _send_output_and_log(
                     ws,
                     session,
@@ -306,7 +306,7 @@ async def _wait_for_realtime_output_slot(
     batch: "Req",
     result,
 ) -> float:
-    if not batch.realtime_output_pacing:
+    if not getattr(batch, "realtime_output_pacing", False):
         return 0.0
 
     frame_count = _result_num_frames(result)
@@ -439,10 +439,17 @@ async def _close_realtime_websocket(
         pass
 
 
+async def _wait_for_server_warmup(websocket: WebSocket) -> None:
+    warmup_done = getattr(websocket.app.state, "server_warmup_done", None)
+    if warmup_done is not None and not warmup_done.is_set():
+        await warmup_done.wait()
+
+
 @router.websocket("/generate")
 async def generate(websocket: WebSocket):
     """endpoint for creating a new realtime session"""
     await websocket.accept()
+    await _wait_for_server_warmup(websocket)
     if _ACTIVE_SESSION_IDS and not await _wait_for_active_session_slot():
         logger.warning(
             "reject realtime session because another session is active: %s",

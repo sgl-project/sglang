@@ -41,6 +41,7 @@ class TestEagleLlama2Triton(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
     """EAGLE/Llama-2 topk=8 on triton (spec v1)."""
 
     attention_backend = "triton"
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 if __name__ == "__main__":

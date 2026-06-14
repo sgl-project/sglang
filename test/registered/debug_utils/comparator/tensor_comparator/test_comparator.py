@@ -192,6 +192,24 @@ class TestComputeTensorStats:
         assert stats.percentiles[95] == pytest.approx(95.0, abs=0.5)
         assert stats.percentiles[99] == pytest.approx(99.0, abs=0.5)
 
+    def test_percentiles_exact_for_uniform_range(self):
+        """Percentiles of arange(0, 101) equal the percentile index exactly (linear interp)."""
+        x = torch.arange(0, 101, dtype=torch.float32)
+        stats = _compute_tensor_stats(x)
+
+        for p in (1, 5, 50, 95, 99):
+            assert stats.percentiles[p] == pytest.approx(float(p), abs=1e-4)
+
+    def test_percentiles_match_torch_quantile_reference(self):
+        """numpy-based percentiles must match torch.quantile on the same data within tight tolerance."""
+        torch.manual_seed(0)
+        x = torch.randn(5000)
+        stats = _compute_tensor_stats(x)
+
+        for p in (1, 5, 50, 95, 99):
+            expected = torch.quantile(x.float(), p / 100.0).item()
+            assert stats.percentiles[p] == pytest.approx(expected, abs=1e-4)
+
     def test_large_tensor_skips_quantiles(self):
         x = torch.randn(QUANTILE_NUMEL_THRESHOLD + 1)
         stats = _compute_tensor_stats(x)

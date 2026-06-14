@@ -305,7 +305,7 @@ Speculative decoding topk: `topk` is the number of draft tokens sampled per step
 </Tip>
 
 <Note>
-**Speculative Decoding V2 (Spec V2):** Spec V2 uses overlap scheduling (`SGLANG_ENABLE_SPEC_V2=True`) that benefits various attention backends. Requires `--speculative-eagle-topk 1` and currently applies to EAGLE and EAGLE3.
+**Speculative Decoding V2 (Spec V2):** speculative decoding runs the V2 workers with overlap scheduling by default, which benefits various attention backends. Requires `--speculative-eagle-topk 1`.
 
 **Verified backends:** TRTLLM MLA, TRTLLM MHA, FA3, Ascend (NPU), Triton.
 

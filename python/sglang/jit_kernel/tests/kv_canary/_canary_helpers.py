@@ -55,7 +55,7 @@ class FakeViolationLog:
     @classmethod
     def allocate(
         cls, *, capacity: int = DEFAULT_RING_CAPACITY, device: torch.device
-    ) -> "FakeViolationLog":
+    ) -> FakeViolationLog:
         return cls(
             ring=torch.zeros(
                 capacity, consts.VIOLATION_FIELDS, dtype=torch.int64, device=device

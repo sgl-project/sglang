@@ -18,10 +18,11 @@ from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
 from sglang.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES
 from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=60, suite="extra-a-test-1-gpu-small-amd")
 
 
 class TestInstallOracleSampler(CustomTestCase):

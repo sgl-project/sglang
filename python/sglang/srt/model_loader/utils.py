@@ -249,13 +249,41 @@ def get_architecture_class_name(model_config: ModelConfig) -> str:
     return get_model_architecture(model_config)[1]
 
 
-def should_deepgemm_weight_requant_ue8m0(weight_block_size):
-    """Should we requant fp8 weights into UE8M0 format when loading the model"""
-    return (
+def post_load_weights(model: nn.Module, model_config: ModelConfig):
+    # Model weight loading consists of two stages:
+    # 1. Initial weight loading.
+    # 2. Post-processing of weights, including assigning specific member variables.
+    # For `dummy_init`, only the second stage is required.
+    if hasattr(model, "post_load_weights"):
+        if model_config.hf_config.architectures[0] == "DeepseekV3ForCausalLMNextN":
+            model.post_load_weights(is_nextn=True)
+        else:
+            model.post_load_weights()
+
+
+def should_deepgemm_weight_requant_ue8m0(
+    weight_block_size, output_dtype=None, weight_shape=None
+):
+    """Should we requant fp8 weights into UE8M0 format when loading the model.
+
+    When output_dtype or weight_shape are provided, also checks that DeepGEMM
+    can actually run this layer at runtime (bf16 output, N%64==0, K%128==0).
+    Without these checks, scales would be converted to UE8M0 but the GEMM would
+    fall back to triton which expects float32 scales, causing wrong results.
+    """
+    if not (
         deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         and weight_block_size is not None
-    )
+    ):
+        return False
+    if output_dtype is not None and output_dtype != torch.bfloat16:
+        return False
+    if weight_shape is not None and (
+        weight_shape[0] % 64 != 0 or weight_shape[1] % 128 != 0
+    ):
+        return False
+    return True
 
 
 def should_async_load(weight: torch.Tensor) -> bool:
@@ -293,6 +321,20 @@ def maybe_executor_submit(
     if func_kwargs is None:
         func_kwargs = {}
     if use_async:
-        futures.append(executor.submit(func, *func_args, **func_kwargs))
+        # CRITICAL: Capture current CUDA device and restore it in worker thread.
+        # torch.cuda.current_device() is thread-local and is NOT correctly passed to threads.
+        # This may result in errors in case the `func` relies on torch current device to be already correctly specified.
+        # See details in https://github.com/pytorch/pytorch/issues/56588.
+        current_device = (
+            torch.cuda.current_device() if torch.cuda.is_available() else None
+        )
+
+        def device_aware_wrapper(*args, **kwargs):
+            # Set CUDA device in worker thread to match parent thread
+            if current_device is not None:
+                torch.cuda.set_device(current_device)
+            return func(*args, **kwargs)
+
+        futures.append(executor.submit(device_aware_wrapper, *func_args, **func_kwargs))
     else:
         func(*func_args, **func_kwargs)

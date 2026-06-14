@@ -20,7 +20,7 @@ class SchedulerStatusLogger:
         self.rank = dist.get_rank() if dist.is_initialized() else 0
 
     @staticmethod
-    def maybe_create(enable_metrics: bool) -> Optional["SchedulerStatusLogger"]:
+    def maybe_create(enable_metrics: bool) -> Optional[SchedulerStatusLogger]:
         target = envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.get()
         if not target:
             return None
@@ -37,7 +37,7 @@ class SchedulerStatusLogger:
         )
 
     def maybe_dump(
-        self, running_batch: "ScheduleBatch", waiting_queue: List["Req"]
+        self, running_batch: ScheduleBatch, waiting_queue: List[Req]
     ) -> None:
         now = time.time()
         if now - self.last_dump_time < self.dump_interval:

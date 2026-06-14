@@ -9,6 +9,11 @@ from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.dsa import utils as _dsa_utils
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -289,8 +294,9 @@ class DSAMockModelRunner(ModelRunner):
         # `kAlignedBatchSize=0U`, which fails to compile. We auto-derive
         # the draft-token count from `case.extend_lens` so the
         # speculative paths produce a non-empty `seqlens_expanded`.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             spec_num_draft_tokens = max(case.extend_lens) if case.extend_lens else 1
         else:
@@ -305,8 +311,18 @@ class DSAMockModelRunner(ModelRunner):
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             disable_radix_cache=False,
             dllm_algorithm=None,
             dllm_algorithm_config=None,
@@ -1448,7 +1464,7 @@ def run_dsa_sparse_speculative_forward_mode_case(
 ) -> None:
     """Run a sparse case with a speculative forward mode (TARGET_VERIFY,
     DRAFT_EXTEND, or DRAFT_EXTEND_V2). DSA dispatches both
-    `is_target_verify()` and `is_draft_extend(include_v2=True)` through
+    `is_target_verify()` and `is_draft_extend_v2()` through
     `dsa_decode_impl` (`dsa_backend.py:1352-1358`), so the kernel
     selection matches plain DECODE but `seqlens_expanded` is computed
     differently per forward mode (`dsa_backend.py:469-529`).
@@ -1457,8 +1473,7 @@ def run_dsa_sparse_speculative_forward_mode_case(
     speculative modes so deep_gemm's `paged_mqa_logits_metadata` JIT
     compiles with a non-zero `kAlignedBatchSize`."""
     if not (
-        case.forward_mode.is_target_verify()
-        or case.forward_mode.is_draft_extend(include_v2=True)
+        case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend_v2()
     ):
         raise ValueError(
             "run_dsa_sparse_speculative_forward_mode_case expects a "

@@ -77,7 +77,7 @@ _, scalar_types = get_scalar_types()
 
 
 class AWQLinearKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -106,7 +106,7 @@ class AWQLinearKernel:
 
 
 class AWQMarlinLinearKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -166,7 +166,7 @@ class AWQMarlinLinearKernel:
 
 
 class AWQMoEKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
         self.runner: Optional[MoeRunner] = None
 
@@ -236,8 +236,8 @@ class AWQMoEKernel:
     def apply(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         if self.runner is None:
             raise RuntimeError("moe runner is not initialized")
 

@@ -36,6 +36,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_warmup import (
+    run_sync_client_warmup,
+    should_run_explicit_client_warmup,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
     RESET,
@@ -130,13 +134,13 @@ class DiffGenerator:
         logger.info(f"Local mode: {local_mode}")
         if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
+            instance.owns_scheduler_client = True
+            instance._run_client_warmup_if_needed()
         else:
             # In remote mode, we just need to connect and check.
             sync_scheduler_client.initialize(server_args)
             instance._check_remote_scheduler()
-
-        # In both modes, this DiffGenerator instance is responsible for the client's lifecycle.
-        instance.owns_scheduler_client = True
+            instance.owns_scheduler_client = True
         return instance
 
     def _start_local_server_if_needed(
@@ -149,6 +153,12 @@ class DiffGenerator:
         processes = launch_server(self.server_args, launch_http_server=False)
 
         return processes
+
+    def _run_client_warmup_if_needed(self) -> None:
+        if not should_run_explicit_client_warmup(self.server_args):
+            return
+
+        run_sync_client_warmup(self.server_args, sync_scheduler_client.forward)
 
     def _check_remote_scheduler(self):
         """Check if the remote scheduler is accessible."""

@@ -6,6 +6,7 @@ spec server (sequential -- one model resident at a time; see SpecParityKit).
 
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_server_kits import SpecParityKit
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
@@ -22,6 +23,7 @@ class TestEagle3Parity(SpecParityKit, Eagle3Base):
     """
 
     disable_overlap = False
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 if __name__ == "__main__":

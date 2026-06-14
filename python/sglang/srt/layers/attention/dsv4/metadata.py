@@ -153,7 +153,7 @@ class PagedIndexerMetadata:
     def max_c4_seq_len(self) -> int:
         return self.page_table.shape[1] * self.c4_page_size
 
-    def copy_(self, other: "PagedIndexerMetadata"):
+    def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
             copy_fields = ["page_table", "c4_seq_lens"]
             assign_fields = ["deep_gemm_metadata"]

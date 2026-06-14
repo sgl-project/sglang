@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     is_npu,
     set_weight_attrs,
 )
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -495,6 +496,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[loaded_weight.shape[0] :].data.fill_(0)
 
     def forward(self, input_):
+        # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
+        # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
+        maybe_detect_oob(
+            input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
+        )
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(

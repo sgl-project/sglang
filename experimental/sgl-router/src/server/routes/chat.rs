@@ -6,7 +6,9 @@ use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
+use crate::server::metrics::{
+    MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+};
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
 use axum::extract::State;
@@ -66,6 +68,27 @@ struct RequestProbe {
     model: Option<String>,
 }
 
+/// RAII guard that records `sgl_router_request_duration_seconds` when
+/// dropped. For streaming requests the handler returns at response-headers
+/// time, so recording end-to-end latency at the dispatch site would capture
+/// only time-to-headers (≈ TTFT). Instead this guard is packed into the SSE
+/// pump's `stream_guards`, so it drops — and records — when the stream
+/// completes (or the client disconnects), yielding true end-to-end latency.
+/// Non-streaming requests record at the dispatch site directly (the body is
+/// already buffered there) and do not use this guard.
+struct RecordDurationOnDrop {
+    metrics: Arc<MetricsRegistry>,
+    model: String,
+    start: std::time::Instant,
+}
+
+impl Drop for RecordDurationOnDrop {
+    fn drop(&mut self) {
+        self.metrics
+            .observe_request_duration(&self.model, self.start.elapsed().as_secs_f64());
+    }
+}
+
 /// POST /v1/chat/completions — parse model from body, select a healthy
 /// worker via the per-model policy, then proxy the request. If the
 /// request opts into streaming (`stream: true`), we pipe SSE bytes back;
@@ -75,6 +98,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    let start = std::time::Instant::now();
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe
@@ -106,7 +130,19 @@ pub async fn chat_completions(
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
-    let selection_ctx = SelectionContext::new(&model_id, Some(&body));
+    // Sticky-session routing key. When the sticky policy is configured,
+    // read the routing key from the operator-chosen header into the
+    // selection context; the policy pins it to a worker. Other policies
+    // leave `routing_key` `None` and ignore it.
+    let routing_key = ctx
+        .config
+        .model
+        .sticky
+        .as_ref()
+        .and_then(|s| headers.get(s.header_name.as_str()))
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty());
+    let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key);
     let worker =
         policy
             .select(&workers, &selection_ctx)
@@ -208,6 +244,30 @@ pub async fn chat_completions(
     };
     let metrics_model = model_str.clone();
 
+    // Builds the time-to-first-token hook the SSE pump fires when the first
+    // upstream chunk lands. Installed only on the streaming arms below —
+    // non-streaming "first token" equals total latency, already captured by
+    // `sgl_router_request_duration_seconds`. The proxy drops the hook for
+    // non-2xx responses so error bodies don't pollute TTFT.
+    let make_ttft_hook = || -> Box<dyn FnOnce() + Send + 'static> {
+        let metrics = Arc::clone(&ctx.metrics);
+        let model = metrics_model.clone();
+        let started = start;
+        Box::new(move || {
+            metrics.observe_ttft(&model, started.elapsed().as_secs_f64());
+        })
+    };
+
+    // Builds the end-to-end-latency guard for streaming requests. Packed into
+    // `stream_guards` so it records when the SSE pump finishes (stream end or
+    // client disconnect), not at response-headers time. Non-streaming records
+    // at the dispatch site instead (see below).
+    let make_duration_guard = || RecordDurationOnDrop {
+        metrics: Arc::clone(&ctx.metrics),
+        model: metrics_model.clone(),
+        start,
+    };
+
     let result = if let Some(decode_worker) = decode_peer {
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
         //
@@ -297,7 +357,8 @@ pub async fn chat_completions(
         // cache-aware-zmq decisions on the decode side.
         let decode_guard = decode_worker.load_guard();
         if streaming {
-            let stream_guards: Box<dyn Send + 'static> = Box::new(decode_guard);
+            let stream_guards: Box<dyn Send + 'static> =
+                Box::new((decode_guard, make_duration_guard()));
             let fetch = ctx.proxy.forward_streaming_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
@@ -305,6 +366,7 @@ pub async fn chat_completions(
                 &headers,
                 injected_body,
                 Some(stream_guards),
+                Some(make_ttft_hook()),
             );
             tokio::select! {
                 biased;
@@ -330,7 +392,8 @@ pub async fn chat_completions(
         // Plain mode, streaming. Both guards ride the SSE pump until
         // the body completes — see the matching comment in the
         // non-streaming arm.
-        let stream_guards: Box<dyn Send + 'static> = Box::new((guard, active_guard));
+        let stream_guards: Box<dyn Send + 'static> =
+            Box::new((guard, active_guard, make_duration_guard()));
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             &worker.breaker,
@@ -338,6 +401,7 @@ pub async fn chat_completions(
             &headers,
             body,
             Some(stream_guards),
+            Some(make_ttft_hook()),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing
@@ -396,6 +460,51 @@ pub async fn chat_completions(
     };
     ctx.metrics
         .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
+
+    // Per-request access log — always on at INFO so incoming traffic and its
+    // status are visible without DEBUG. `request_id` is the client/gateway
+    // X-Request-Id (echoed end-to-end); `worker` is the engine the policy
+    // selected. The cache-aware routing rationale is logged separately at
+    // DEBUG by the policy.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let http_status = match &result {
+        Ok(resp) => resp.status().as_u16(),
+        Err(e) => e.status_code().as_u16(),
+    };
+
+    // Record the client-visible HTTP status now that the outcome is known.
+    // For non-streaming requests the body is already buffered here, so
+    // `start.elapsed()` is true end-to-end latency — record it directly. For
+    // streaming, the body is still pending; the `RecordDurationOnDrop` guard
+    // packed into `stream_guards` records it at stream completion instead (so
+    // we don't capture only time-to-headers). `elapsed` still feeds the
+    // access-log `latency_ms` below for both.
+    let elapsed = start.elapsed();
+    if !streaming {
+        ctx.metrics
+            .observe_request_duration(&metrics_model, elapsed.as_secs_f64());
+    }
+    ctx.metrics.record_response(http_status);
+    let outcome_str = match outcome {
+        RequestOutcome::Success => "success",
+        RequestOutcome::Error => "error",
+        RequestOutcome::Cancelled => "cancelled",
+    };
+    tracing::info!(
+        request_id = %request_id,
+        method = "POST",
+        path = "/v1/chat/completions",
+        model = %metrics_model,
+        worker = %metrics_worker_url,
+        outcome = outcome_str,
+        http_status,
+        stream = streaming,
+        latency_ms = elapsed.as_millis() as u64,
+        "chat_completions",
+    );
 
     // Mirror the upstream `x-sgl-decode-url` hint onto the response so
     // external tests / sidecars can observe PD decode affinity without

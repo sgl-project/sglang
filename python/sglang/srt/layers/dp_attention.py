@@ -45,6 +45,7 @@ _ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
+_DP_MAX_LEN_WITH_IDLE = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
@@ -74,6 +75,10 @@ class DpPaddingMode(IntEnum):
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
         # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
+            # Hybrid-SSM models materialize idle ranks via the MAX_LEN
+            # fabricated-row conversion; other models keep mainline SUM_LEN.
+            if _DP_MAX_LEN_WITH_IDLE and min(global_num_tokens) == 0:
+                return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
@@ -277,6 +282,10 @@ def initialize_dp_attention(
 ):
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
+    global _DP_MAX_LEN_WITH_IDLE
+    _DP_MAX_LEN_WITH_IDLE = (
+        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
+    )
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size

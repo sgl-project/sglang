@@ -60,7 +60,7 @@ def unpack_from_int32(
 
 
 class GPTQLinearAscendKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
@@ -128,15 +128,15 @@ class GPTQLinearAscendKernel:
 
 
 class GPTQMoEAscendKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
-        self.moe_runner_config: Optional["MoeRunnerConfig"] = None
+        self.moe_runner_config: Optional[MoeRunnerConfig] = None
 
     def create_moe_runner(
         self,
         layer: torch.nn.Module,
-        moe_runner_config: "MoeRunnerConfig",
+        moe_runner_config: MoeRunnerConfig,
         **extra_weight_attrs,
     ):
         self.moe_runner_config = moe_runner_config
@@ -277,7 +277,7 @@ class GPTQMoEAscendKernel:
     def apply(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 

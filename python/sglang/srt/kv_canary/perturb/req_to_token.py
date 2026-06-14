@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 
 def run(
     *,
-    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional[ForwardBatch],
     config: PerturbConfig,
-    req_to_token_pool: "ReqToTokenPool",
+    req_to_token_pool: ReqToTokenPool,
     warmup_gate: WarmupGate,
 ) -> None:
     if not should_run_perturbation(

@@ -1,20 +1,38 @@
 export const KimiK26Deployment = () => {
   // Config mirrors sgl-cookbook src/components/autoregressive/KimiK26ConfigGenerator/index.js.
+  //
+  // INT4:
+  //   H200/B300: tp=8
+  //   GB300/AMD: tp=4
+  //
+  // NVFP4:
+  //   B300: tp=8
+  //   GB300: tp=4
   const options = {
     hardware: {
       name: 'hardware',
       title: 'Hardware Platform',
       items: [
         { id: 'h200', label: 'H200', default: true },
-        { id: 'b200', label: 'B200', default: false },
         { id: 'b300', label: 'B300', default: false },
-        { id: 'gb200', label: 'GB200', default: false },
         { id: 'gb300', label: 'GB300', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi350x', label: 'MI350X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
       ],
+    },
+    quantization: {
+      name: 'quantization',
+      title: 'Quantization',
+      getDynamicItems: (values) => {
+        const hw = values.hardware;
+        const isBlackwell = ['b300', 'gb300'].includes(hw);
+        return [
+          { id: 'int4', label: 'INT4', subtitle: 'Base checkpoint', default: !isBlackwell },
+          { id: 'nvfp4', label: 'NVFP4', subtitle: 'Blackwell FP4', default: isBlackwell, disabled: !isBlackwell, disabledReason: !isBlackwell ? 'NVFP4 only on NVIDIA Blackwell' : '' },
+        ];
+      },
     },
     reasoning: {
       name: 'reasoning',
@@ -40,18 +58,30 @@ export const KimiK26Deployment = () => {
         { id: 'enabled', label: 'Enabled', subtitle: 'High Throughput', default: false },
       ],
     },
+    speculative: {
+      name: 'speculative',
+      title: 'Speculative Decoding',
+      condition: (values) => !['mi300x', 'mi325x', 'mi350x', 'mi355x'].includes(values.hardware),
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true },
+        { id: 'enabled', label: 'Enabled', default: false },
+      ],
+    },
   };
 
   const modelConfigs = {
     h200: { tp: 8 },
-    b200: { tp: 8 },
     b300: { tp: 8 },
-    gb200: { tp: 4 },
     gb300: { tp: 4 },
     mi300x: { tp: 4 },
     mi325x: { tp: 4 },
     mi350x: { tp: 4 },
     mi355x: { tp: 4 },
+  };
+
+  const nvfp4ModelConfigs = {
+    b300: { tp: 8 },
+    gb300: { tp: 4 },
   };
 
   const resolveItems = (option, values) =>
@@ -89,15 +119,43 @@ export const KimiK26Deployment = () => {
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    setValues((prev) => {
+      const next = { ...prev };
+      for (const [key, option] of Object.entries(options)) {
+        if (typeof option.condition === 'function' && !option.condition(next)) {
+          const items = resolveItems(option, next);
+          const fallback = items.find((item) => item.default && !item.disabled) || items.find((item) => !item.disabled);
+          if (fallback) next[key] = fallback.id;
+          continue;
+        }
+        if (typeof option.getDynamicItems !== 'function') continue;
+        const items = option.getDynamicItems(next);
+        const current = items.find((item) => item.id === next[key]);
+        if (!current || current.disabled) {
+          const fallback = items.find((item) => item.default && !item.disabled) || items.find((item) => !item.disabled);
+          if (fallback) next[key] = fallback.id;
+        }
+      }
+      return next;
+    });
+  }, [values.hardware]);
+
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => ({ ...prev, [optionName]: value }));
   };
 
   const generateCommand = () => {
-    const { hardware, reasoning, toolcall, dpattention } = values;
+    const { hardware, quantization, reasoning, toolcall, dpattention, speculative } = values;
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi350x' || hardware === 'mi355x';
-    const hwConfig = modelConfigs[hardware];
+    const isNVFP4 = quantization === 'nvfp4';
+    const hwConfig = isNVFP4 ? nvfp4ModelConfigs[hardware] : modelConfigs[hardware];
+    if (!hwConfig) return '# NVFP4 is only supported on NVIDIA Blackwell hardware.';
+    if (speculative === 'enabled' && isAMD) {
+      return '# Speculative Decoding for Kimi-K2.6 is only supported on NVIDIA GPUs (H200/B300/GB300)';
+    }
     const tpValue = hwConfig.tp;
+    const modelName = isNVFP4 ? 'nvidia/Kimi-K2.6-NVFP4' : 'moonshotai/Kimi-K2.6';
 
     let cmd = '';
 
@@ -106,8 +164,11 @@ export const KimiK26Deployment = () => {
     }
 
     cmd += 'sglang serve \\\n';
-    cmd += '  --model-path moonshotai/Kimi-K2.6';
+    cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
+    if (isNVFP4) {
+      cmd += ' \\\n  --quantization modelopt_fp4';
+    }
     if (isAMD) {
       cmd += ' \\\n  --mem-fraction-static 0.8';
     }
@@ -123,6 +184,18 @@ export const KimiK26Deployment = () => {
 
     if (toolcall === 'enabled') {
       cmd += ' \\\n  --tool-call-parser kimi_k2';
+    }
+
+    if (speculative === 'enabled') {
+      cmd += ' \\\n  --speculative-algorithm EAGLE3';
+      cmd += ' \\\n  --speculative-num-steps 3';
+      cmd += ' \\\n  --speculative-eagle-topk 1';
+      cmd += ' \\\n  --speculative-num-draft-tokens 4';
+      cmd += ' \\\n  --speculative-draft-model-path lightseekorg/kimi-k2.6-eagle3.1-mla';
+    }
+
+    if (hardware === 'b300' || hardware === 'gb300') {
+      cmd += ' \\\n  --attention-backend tokenspeed_mla';
     }
 
     if (isAMD) {
@@ -146,6 +219,7 @@ export const KimiK26Deployment = () => {
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
+        if (typeof option.condition === 'function' && !option.condition(values)) return null;
         const items = resolveItems(option, values);
         return (
           <div key={key} style={cardStyle}>

@@ -57,7 +57,6 @@ class TestStreamingSessionEagleV2RetractLargePage(TestStreamingSession):
         "256",
     ]
     env_overrides = [
-        ("SGLANG_ENABLE_SPEC_V2", True),
         ("SGLANG_TEST_RETRACT", True),
         ("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
     ]

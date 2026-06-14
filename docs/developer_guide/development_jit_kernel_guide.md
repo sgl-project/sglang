@@ -262,7 +262,7 @@ Finally, import and use the kernel like a regular Python function:
 from sglang.jit_kernel.add_constant import add_constant
 ```
 
-For a complete, runnable example, refer to [test_add_constant.py](../../python/sglang/jit_kernel/tests/test_add_constant.py).
+For a complete, runnable example, refer to [test_add_constant.py](../../test/registered/jit/test_add_constant.py).
 
 ## C++ Include Library Reference
 

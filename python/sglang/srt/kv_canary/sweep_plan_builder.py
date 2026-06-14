@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 def build_verify_plan_radix_sweep(
     *,
-    radix_cache: "BasePrefixCache",
+    radix_cache: BasePrefixCache,
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     unlocked_only: bool = False,

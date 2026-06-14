@@ -608,9 +608,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         if is_first_rank and input_ids is not None:
             ple_ids = input_ids.clone()
             pad_id = self.config.text_config.pad_token_id
-            ple_ids[input_ids == self.config.image_token_id] = pad_id
-            ple_ids[input_ids == self.config.video_token_id] = pad_id
-            ple_ids[input_ids == self.config.audio_token_id] = pad_id
+            # Use torch.where instead of boolean indexing for NPU graph compatibility
+            ple_ids = torch.where(
+                input_ids == self.config.image_token_id, pad_id, ple_ids
+            )
+            ple_ids = torch.where(
+                input_ids == self.config.video_token_id, pad_id, ple_ids
+            )
+            ple_ids = torch.where(
+                input_ids == self.config.audio_token_id, pad_id, ple_ids
+            )
             per_layer_inputs = self.get_per_layer_inputs(ple_ids)
 
         # Prepare bidirectional attention masks for image tokens during prefill.

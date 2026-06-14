@@ -115,6 +115,13 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
     PARSER_RULES_MATRIX = [
         # (name, template_snippet, vocab, expected_parser, expected_toggle_param)
         (
+            "apertus2509_via_unique_vocab_token",
+            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}\n",
+            ["<|inner_prefix|>"],
+            "apertus2509",
+            "enable_thinking",
+        ),
+        (
             "deepseek_r1_think_tags",
             "<think>\nLet me reason about this\n</think>\nAnswer here",
             [],

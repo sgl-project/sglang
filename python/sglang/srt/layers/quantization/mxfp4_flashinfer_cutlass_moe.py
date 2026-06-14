@@ -215,8 +215,8 @@ class Mxfp4FlashinferCutlassMoEMethod:
     def apply(
         self,
         layer: Module,
-        dispatch_output: "DispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: DispatchOutput,
+    ) -> CombineInput:
         from sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4 import (
             FlashInferMxfp4CutlassMoeQuantInfo,
         )

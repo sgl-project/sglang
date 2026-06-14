@@ -26,12 +26,14 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
 logger = logging.getLogger(__name__)
 
 
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
+
+_is_hip = is_hip()
 
 
 class ExpertLocationUpdater:
@@ -483,9 +485,31 @@ def update_expert_weights_single_layer(
         if len(p2p_ops) == 0:
             return
 
-        reqs = torch.distributed.batch_isend_irecv(p2p_ops)
-        for req in reqs:
-            req.wait()
+        if _is_hip:
+            # Submit P2P ops in batches to prevent RCCL GPU-side
+            # accumulation hangs. All ranks use the same expert_id ranges
+            # (based on num_physical_experts) to ensure matching send/recv
+            # pairs land in the same batch. Setting batch_chunk_size >=
+            # num_physical_experts disables batching behavior.
+            batch_chunk_size = get_int_env_var(
+                "SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE", 32
+            )
+            ops_by_expert = {eid: ops for eid, ops in sorted_infos}
+            for start in range(0, num_physical_experts, batch_chunk_size):
+                batch_ops = []
+                for eid in range(
+                    start, min(start + batch_chunk_size, num_physical_experts)
+                ):
+                    if eid in ops_by_expert:
+                        batch_ops.extend(ops_by_expert[eid])
+                if batch_ops:
+                    reqs = torch.distributed.batch_isend_irecv(batch_ops)
+                    for req in reqs:
+                        req.wait()
+        else:
+            reqs = torch.distributed.batch_isend_irecv(p2p_ops)
+            for req in reqs:
+                req.wait()
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (

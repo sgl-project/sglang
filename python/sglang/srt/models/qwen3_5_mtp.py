@@ -89,10 +89,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
-        config.num_hidden_layers = 1
-        config.full_attention_interval = 1
+        mtp_config = copy.deepcopy(config)
+        mtp_config.num_hidden_layers = 1
+        mtp_config.full_attention_interval = 1
         self.model = Qwen3_5ForCausalLM(
-            config,
+            mtp_config,
             quant_config,
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
@@ -160,14 +161,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if (
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 assert input_embeds is not None
-                input_embeds = torch.cat(
-                    [
-                        input_embeds[:-1],
-                        self.model.embed_tokens(input_ids[-1].unsqueeze(0)),
-                    ]
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                input_embeds[last_indices] = self.model.embed_tokens(
+                    input_ids[last_indices]
                 )
 
             if input_embeds is None:

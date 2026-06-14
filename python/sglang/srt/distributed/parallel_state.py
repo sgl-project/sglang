@@ -42,10 +42,14 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -194,6 +198,17 @@ def reg_reduce_scatter_tensor(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     group._reduce_scatter_tensor(output, input)
+
+
+@register_custom_op(mutates_args=["output"])
+def reg_all_to_all_single(
+    output: torch.Tensor, input: torch.Tensor, group_name: str
+) -> None:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._all_to_all_single(output, input)
 
 
 class GroupCoordinator:
@@ -594,7 +609,15 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
+        should_use_pymscclpp_allreduce = (
+            self.pymscclpp_comm is not None
+            and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
+        )
+        if (
+            self.pynccl_comm is not None
+            and self.is_symmetric_memory_enabled()
+            and not should_use_pymscclpp_allreduce
+        ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
                 self.pynccl_comm.all_reduce(input_)
@@ -604,6 +627,7 @@ class GroupCoordinator:
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
+            and not should_use_pymscclpp_allreduce
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"
@@ -613,11 +637,7 @@ class GroupCoordinator:
             and self.qr_comm.should_quick_allreduce(input_)
         ):
             outplace_all_reduce_method = "qr"
-        elif (
-            self.pymscclpp_comm is not None
-            and not self.pymscclpp_comm.disabled
-            and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
-        ):
+        elif self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
             outplace_all_reduce_method = "pymscclpp"
         elif (
             self.torch_symm_mem_comm is not None
@@ -625,7 +645,7 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
-        elif is_in_piecewise_cuda_graph() and self.pynccl_comm is not None:
+        elif is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
             # For piecewise cuda graph, we use pynccl outplace allreduce
             outplace_all_reduce_method = "pynccl"
         if outplace_all_reduce_method is not None:
@@ -692,7 +712,7 @@ class GroupCoordinator:
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
             and not torch.cuda.is_current_stream_capturing()
-            and is_in_piecewise_cuda_graph()
+            and is_in_tc_piecewise_cuda_graph()
         ):
             if not hasattr(ca_comm, "fused_ar_rms"):
                 return None
@@ -776,6 +796,15 @@ class GroupCoordinator:
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
+    def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        torch.distributed.all_to_all_single(output, input, group=self.device_group)
+
+    def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
+        if self.world_size == 1:
+            output.copy_(input)
+            return
+        reg_all_to_all_single(output, input, group_name=self.unique_name)
+
     def reduce_scatter(
         self,
         output: torch.Tensor,
@@ -838,7 +867,7 @@ class GroupCoordinator:
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
                     ca_comm.all_gather_reg(input, out=output, dim=0)
-                elif is_in_piecewise_cuda_graph():
+                elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
                     # True CUDA graph warmup: avoid a different host collective.
@@ -1453,6 +1482,8 @@ class GroupCoordinator:
             self.cpu_group = None
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
+        if self.pymscclpp_comm is not None:
+            self.pymscclpp_comm.destroy()
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.mq_broadcaster is not None:
@@ -1661,17 +1692,14 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
-_DEVICE_TO_DISTRIBUTED_BACKEND = {
-    "cuda": "nccl",
-    "xpu": "xccl",
-    "hpu": "hccl",
-    "cpu": "gloo",
-    "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
-    "musa": "mccl",
-}
-
-
+# TODO: refactor in-tree platforms to get rid of this wrapper
 def get_default_distributed_backend(device: str) -> str:
+    # We deliberately go through ``platforms.current_platform`` (rather than
+    # ``from ... import current_platform``) so each call resolves through the
+    # platforms package's lazy ``__getattr__`` and picks up runtime overrides
+    # of ``_current_platform`` (e.g. in tests).
+    if device == platforms.current_platform.device_type:
+        return platforms.current_platform.get_torch_distributed_backend_str()
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 

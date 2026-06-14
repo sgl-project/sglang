@@ -328,16 +328,18 @@ pub async fn spawn(
     cfg: K8sDiscoveryConfig,
     tx: mpsc::Sender<DiscoveryEvent>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let mode = cfg.mode().context("validate k8s discovery selectors")?;
+    // The mode was resolved + validated at construction (`resolve_mode` in
+    // `Cli::build_discovery`); just destructure it here.
+    let K8sDiscoveryConfig { namespace, mode } = cfg;
 
     let client = Client::try_default()
         .await
         .context("kube client default config")?;
 
-    let api: Api<EndpointSlice> = if cfg.namespace.is_empty() {
+    let api: Api<EndpointSlice> = if namespace.is_empty() {
         Api::all(client)
     } else {
-        Api::namespaced(client, &cfg.namespace)
+        Api::namespaced(client, &namespace)
     };
 
     // Plain mode pushes the single selector to the server side so the LIST
@@ -350,6 +352,36 @@ pub async fn spawn(
         K8sDiscoveryMode::PdDisaggregation { .. } => String::new(),
     };
     let watcher_cfg = watcher::Config::default().labels(&server_side_selector);
+
+    // Log the resolved namespace + selector(s) at startup. We can't
+    // verify the namespace exists (the router's RBAC covers
+    // endpointslices/services/pods, not namespaces, and a correct
+    // namespace legitimately has zero matching workers until they come
+    // up), so a typo'd `--service-discovery-namespace` silently watches
+    // an empty namespace. Surfacing the watch target here lets an
+    // operator spot the typo in the first log lines instead of only
+    // discovering it via later `no workers available` request failures.
+    let namespace_display: &str = if namespace.is_empty() {
+        "<all namespaces>"
+    } else {
+        &namespace
+    };
+    match &mode {
+        K8sDiscoveryMode::Plain { label_selector } => tracing::info!(
+            namespace = %namespace_display,
+            label_selector = %label_selector,
+            "k8s discovery starting (plain mode); a wrong namespace or selector matches zero EndpointSlices"
+        ),
+        K8sDiscoveryMode::PdDisaggregation {
+            prefill_selector,
+            decode_selector,
+        } => tracing::info!(
+            namespace = %namespace_display,
+            prefill_selector = %prefill_selector,
+            decode_selector = %decode_selector,
+            "k8s discovery starting (PD mode); a wrong namespace or selector matches zero EndpointSlices"
+        ),
+    }
 
     let handle = tokio::spawn(async move {
         let stream = watcher(api, watcher_cfg);

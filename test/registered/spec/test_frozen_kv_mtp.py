@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -42,13 +41,6 @@ def get_avg_spec_accept_length(base_url: str) -> Optional[float]:
 
 class TestFrozenKVMTP(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
-
-    @classmethod
-    def _server_env(cls) -> dict[str, str]:
-        env = dict(os.environ)
-        env["SGLANG_ENABLE_SPEC_V2"] = "0"
-        env["SGLANG_ENABLE_ASYNC_ASSERT"] = "1"
-        return env
 
     @classmethod
     def _common_server_args(cls) -> list[str]:
@@ -111,7 +103,6 @@ class TestFrozenKVMTP(CustomTestCase):
                 "google/gemma-4-E4B-it",
                 self.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
-                env=self._server_env(),
                 other_args=self._server_args(topk),
             )
             requests.get(self.base_url + "/flush_cache", timeout=30)

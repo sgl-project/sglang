@@ -8,58 +8,38 @@
 namespace device::hisparse {
 
 /// NOTE: We call nope+rope as a "value" here.
-/// GPU Cache layout:
+/// Paged C4 cache layout:
 /// VALUE 0, VALUE 1, ..., VALUE 63,
 /// SCALE 0, SCALE 1, ..., SCALE 63,
 /// [Padding to align to 576 bytes]
-/// CPU Cache follow a trivial linear layout without any padding.
-inline constexpr int64_t kGPUPageSize = 64;
-inline constexpr int64_t kGPUPageBits = 6;  // log2(kGPUPageSize)
+inline constexpr int64_t kPageSize = 64;
+inline constexpr int64_t kPageBits = 6;  // log2(kPageSize)
 inline constexpr int64_t kValueBytes = 576;
 inline constexpr int64_t kScaleBytes = 8;
 /// NOTE: FlashMLA requires each page to be aligned to 576 bytes
-inline constexpr int64_t kCPUItemBytes = kValueBytes + kScaleBytes;
-inline constexpr int64_t kGPUPageBytes = host::div_ceil(kCPUItemBytes * kGPUPageSize, 576) * 576;
-inline constexpr int64_t kGPUScaleOffset = kValueBytes * kGPUPageSize;
+inline constexpr int64_t kItemBytes = kValueBytes + kScaleBytes;
+inline constexpr int64_t kPageBytes = host::div_ceil(kItemBytes * kPageSize, 576) * 576;
+inline constexpr int64_t kScaleOffset = kValueBytes * kPageSize;
 
 struct PointerInfo {
   int64_t* value_ptr;
   int64_t* scale_ptr;
 };
 
-SGL_DEVICE PointerInfo get_pointer_gpu(void* cache, int32_t index) {
+SGL_DEVICE PointerInfo get_pointer_paged(void* cache, int32_t index) {
   using namespace device;
-  static_assert(1 << kGPUPageBits == kGPUPageSize);
-  const int32_t page_num = index >> kGPUPageBits;
-  const int32_t page_offset = index & (kGPUPageSize - 1);
-  const auto page_ptr = pointer::offset(cache, page_num * kGPUPageBytes);
+  static_assert(1 << kPageBits == kPageSize);
+  const int32_t page_num = index >> kPageBits;
+  const int32_t page_offset = index & (kPageSize - 1);
+  const auto page_ptr = pointer::offset(cache, page_num * kPageBytes);
   const auto value_ptr = pointer::offset(page_ptr, page_offset * kValueBytes);
-  const auto scale_ptr = pointer::offset(page_ptr, kGPUScaleOffset + page_offset * kScaleBytes);
+  const auto scale_ptr = pointer::offset(page_ptr, kScaleOffset + page_offset * kScaleBytes);
   return {static_cast<int64_t*>(value_ptr), static_cast<int64_t*>(scale_ptr)};
 }
 
-SGL_DEVICE PointerInfo get_pointer_cpu(void* cache, int32_t index) {
-  using namespace device;
-  const auto value_ptr = pointer::offset(cache, index * kCPUItemBytes);
-  const auto scale_ptr = pointer::offset(value_ptr, kValueBytes);
-  return {static_cast<int64_t*>(value_ptr), static_cast<int64_t*>(scale_ptr)};
-}
-
-enum class TransferDirection {
-  DeviceToDevice = 0,
-  DeviceToHost = 1,
-  HostToDevice = 2,
-};
-
-template <TransferDirection direction>
 SGL_DEVICE void transfer_item(void* dst_cache, void* src_cache, const int32_t dst_index, const int32_t src_index) {
-  constexpr bool is_dst_device = (direction != TransferDirection::DeviceToHost);
-  constexpr bool is_src_device = (direction != TransferDirection::HostToDevice);
-  constexpr auto dst_fn = is_dst_device ? get_pointer_gpu : get_pointer_cpu;
-  constexpr auto src_fn = is_src_device ? get_pointer_gpu : get_pointer_cpu;
-
-  const auto [dst_value_ptr, dst_scale_ptr] = dst_fn(dst_cache, dst_index);
-  const auto [src_value_ptr, src_scale_ptr] = src_fn(src_cache, src_index);
+  const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(dst_cache, dst_index);
+  const auto [src_value_ptr, src_scale_ptr] = get_pointer_paged(src_cache, src_index);
 
   int64_t local_items[2];
   const int64_t* tail_src_ptr;

@@ -210,5 +210,9 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
             w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
             w_s_kc = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
             w_s_vc = w_s_vc.contiguous().transpose(1, 2)
+        else:
+            raise ValueError(
+                f"Unexpected w.dtype: {w.dtype} (should be bfloat16 or uint8)"
+            )
 
         return w_kc, w_s_kc, w_vc, w_s_vc

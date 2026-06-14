@@ -12,7 +12,10 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
@@ -88,7 +91,14 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         spec_info = forward_batch.spec_info
 
         if forward_mode.is_decode_or_idle() and spec_info is None:
-            create_flashmla_kv_indices_triton[(bs,)](
+            create_flashmla_kv_indices_triton[
+                (
+                    bs,
+                    get_num_kv_index_blocks_flashmla(
+                        self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
+                    ),
+                )
+            ](
                 self.req_to_token,
                 forward_batch.req_pool_indices[:bs],
                 forward_batch.seq_lens[:bs],
@@ -124,7 +134,9 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     dtype=torch.int32,
                     device=forward_batch.seq_lens.device,
                 )
-                create_flashmla_kv_indices_triton[(bs,)](
+                create_flashmla_kv_indices_triton[
+                    (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
+                ](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,

@@ -18,7 +18,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -146,7 +146,6 @@ class AiterRunnerCore(MoeRunnerCore):
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
 
         from aiter.fused_moe import fused_moe
-        from aiter.ops.flydsl.moe_common import GateMode
 
         from sglang.srt.environ import envs
 
@@ -164,6 +163,12 @@ class AiterRunnerCore(MoeRunnerCore):
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
         if quant_info.swiglu_limit > 0:
+            # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
+            # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
+            # swiglu_limit==0) still run on aiter builds where this module
+            # lives elsewhere / is absent.
+            from aiter.ops.flydsl.moe_common import GateMode
+
             # Default (INTERLEAVE) preserves the pre-fix behavior for paths
             # that prepare weights in the gate/up-interleaved layout. Set
             # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
@@ -322,10 +327,25 @@ def _pre_permute_deepep_to_aiter(
         is_w4a4 = weight_quant == AiterQuantType.PER_1X32
         is_fp4_dispatch = hidden_states.dtype == torch.float4_e2m1fn_x2
 
+        # AITER fused_moe Clamped-SwiGLU is dispatched with
+        # gate_mode=INTERLEAVE, for which AITER picks a bf16/fp8 `q_dtype_a`
+        # Refer to https://github.com/ROCm/aiter/blob/a2617c366dc7271a1662ecda2023d19f6ccefcec/aiter/fused_moe.py#L406-L412
+        swiglu_interleave = quant_info.swiglu_limit > 0 and get_bool_env_var(
+            "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
+        )
+
         if is_w4a4 and a1_scale is not None and not is_fp4_dispatch:
             # W4A4 weights with FP8 dispatch: dequant FP8->BF16 first; the
             # FP4 per_1x32 path needs BF16 input.
             hidden_states = upscale(
+                hidden_states, a1_scale, num_local_tokens, output_dtype
+            )
+            a1_scale = None
+        elif is_w4a4 and is_fp4_dispatch and a1_scale is not None and swiglu_interleave:
+            # W4A4 weights + FP4 dispatch on the clamped-SwiGLU/INTERLEAVE
+            # path: AITER expects a bf16/fp8 activation here, not fp4x2.
+            # Dequant FP4->BF16 and let fused_moe re-quantize internally.
+            hidden_states = upscale_mxfp4(
                 hidden_states, a1_scale, num_local_tokens, output_dtype
             )
             a1_scale = None

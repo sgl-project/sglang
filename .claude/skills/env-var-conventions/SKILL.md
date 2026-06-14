@@ -137,7 +137,7 @@ The second token signals intent. Pick the right verb up front — renames requir
 
 | Verb | Meaning | Example |
 |---|---|---|
-| `ENABLE_FOO` | Knob that turns feature foo on/off. Default in the `EnvBool` encodes prod behavior. | `SGLANG_ENABLE_TORCH_COMPILE`, `SGLANG_ENABLE_SPEC_V2` |
+| `ENABLE_FOO` | Knob that turns feature foo on/off. Default in the `EnvBool` encodes prod behavior. | `SGLANG_ENABLE_TORCH_COMPILE`, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM` |
 | `DISABLE_FOO` | Kill-switch. `DISABLE_FOO=True` turns foo off. | `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP` |
 | `USE_FOO` | Selects which implementation / backend | `SGLANG_USE_AITER`, `SGLANG_USE_DEEPGEMM_BMM` |
 | `FORCE_FOO` | Overrides autodetection | `SGLANG_FORCE_FP8_MARLIN`, `SGLANG_FORCE_STREAM_INTERVAL` |

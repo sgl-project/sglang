@@ -205,6 +205,11 @@ def tf32_hc_prenorm_gemm(
 
 
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+    # deep_gemm.set_pdl can initialize CUDA state, so run it only after the
+    # scheduler/TP worker has been forked and assigned a GPU.
+    if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
+        deep_gemm.set_pdl(True)
+
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 

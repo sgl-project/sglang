@@ -97,7 +97,7 @@ class DecodeStagingHandler:
         return 1
 
     @classmethod
-    def create(cls, kv_manager, scheduler, tp_rank: int) -> "DecodeStagingHandler":
+    def create(cls, kv_manager, scheduler, tp_rank: int) -> DecodeStagingHandler:
         """Factory: create handler. Raises if staging infra is missing."""
         staging_allocator = kv_manager._staging_ctx.allocator
         if staging_allocator is None:
@@ -132,7 +132,7 @@ class DecodeStagingHandler:
     # Registration: called from main thread (DecodeTransferQueue)
     # ------------------------------------------------------------------
 
-    def register_decode_req(self, room: int, decode_req: "DecodeRequest") -> None:
+    def register_decode_req(self, room: int, decode_req: DecodeRequest) -> None:
         self._room_to_decode_req[room] = decode_req
 
     def unregister_decode_req(self, room: int) -> None:
@@ -251,13 +251,13 @@ class DecodeStagingHandler:
     # Event check + free: called from main thread (pop_transferred)
     # ------------------------------------------------------------------
 
-    def is_done(self, decode_req: "DecodeRequest") -> bool:
+    def is_done(self, decode_req: DecodeRequest) -> bool:
         """Return True if staging scatter is complete for this request."""
         if not getattr(decode_req, "_staging_scatter_done", False):
             return False
         return not getattr(decode_req, "_chunk_events", None)
 
-    def advance_scatter(self, decode_req: "DecodeRequest") -> None:
+    def advance_scatter(self, decode_req: DecodeRequest) -> None:
         """Check CUDA events and free completed staging allocations.
 
         Scatter kernels have already been submitted by the decode_thread
@@ -292,7 +292,7 @@ class DecodeStagingHandler:
         staging_offset: int,
         page_start: int,
         num_pages: int,
-        decode_req: "DecodeRequest",
+        decode_req: DecodeRequest,
     ) -> bool:
         """Submit scatter kernels for a staging region to scatter_stream.
 
@@ -347,7 +347,7 @@ class DecodeStagingHandler:
 
         return True
 
-    def _submit_last_scatter(self, decode_req: "DecodeRequest") -> int:
+    def _submit_last_scatter(self, decode_req: DecodeRequest) -> int:
         """Submit scatter for the last chunk. Returns alloc_id >= 0, or -1."""
         receiver = decode_req.kv_receiver
         chunk_infos = getattr(receiver, "chunk_staging_infos", [])
@@ -370,7 +370,7 @@ class DecodeStagingHandler:
         return alloc_id if ok else -1
 
     def _free_and_send_watermark(
-        self, alloc_id: int, decode_req: "DecodeRequest"
+        self, alloc_id: int, decode_req: DecodeRequest
     ) -> None:
         """Free a staging allocation and broadcast watermark to all prefills."""
         self.staging_allocator.free(alloc_id)
@@ -474,7 +474,7 @@ class StagingRegisterInfo:
     @classmethod
     def from_zmq_fields(
         cls, msg: list, msg_start_offset: int
-    ) -> Optional["StagingRegisterInfo"]:
+    ) -> Optional[StagingRegisterInfo]:
         i = msg_start_offset
         base_ptr = (
             struct.unpack("Q", msg[i])[0] if len(msg) > i and len(msg[i]) == 8 else 0
