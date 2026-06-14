@@ -61,11 +61,15 @@ class SglSamplingParams:
             self.json_schema,
         )
 
-    def to_openai_kwargs(self):
+    def to_openai_kwargs(self, model_name: Optional[str] = None):
         # OpenAI does not support top_k, so we drop it here
         if self.regex is not None:
             warnings.warn("Regular expression is not supported in the OpenAI backend.")
-        return {
+
+        if isinstance(self.stop, str):
+            self.stop = [self.stop]
+
+        kwargs = {
             "max_tokens": self.max_new_tokens,
             "max_completion_tokens": self.max_new_tokens,
             "n": self.n,
@@ -75,6 +79,17 @@ class SglSamplingParams:
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
         }
+
+        if (
+            model_name and (model_name.startswith("o1")
+            or model_name.startswith("o3")
+            or "o1" in model_name)
+        ):
+            kwargs.pop("max_tokens", None)
+        else:
+            kwargs.pop("max_completion_tokens", None)
+
+        return kwargs
 
     def to_vertexai_kwargs(self):
         if self.regex is not None:
@@ -314,6 +329,307 @@ class SglFunction:
         return cache_program(self, backend)
 
     def __call__(self, *args, **kwargs):
+        from sglang.lang.tracer import TracingScope
+
+        tracing_scope = TracingScope.get_current_scope()
+        if tracing_scope is None:
+            return self.run(*args, **kwargs)
+        else:
+            kwargs["backend"] = tracing_scope.tracer_state.backend
+            return self.trace(*args, **kwargs)
+
+
+class AsyncSglFunction:
+    """Asynchronous SGLang function wrapper"""
+
+    def __init__(self, func, num_api_spec_tokens=None, bind_arguments=None):
+        self.func = func
+        self.num_api_spec_tokens = num_api_spec_tokens
+        self.bind_arguments = bind_arguments or {}
+        self.pin_prefix_rid = None
+
+        # Parse arguments
+        argspec = inspect.getfullargspec(func)
+        assert argspec.args[0] == "s", 'The first argument must be "s"'
+        self.arg_names = argspec.args[1:]
+        self.arg_defaults = argspec.defaults if argspec.defaults is not None else []
+
+    def bind(self, **kwargs):
+        """Bind arguments for partial application"""
+        assert all(key in self.arg_names for key in kwargs)
+        new_bind_dict = {**self.bind_arguments, **kwargs}
+        return AsyncSglFunction(
+            self.func,
+            num_api_spec_tokens=self.num_api_spec_tokens,
+            bind_arguments=new_bind_dict,
+        )
+
+    async def run(
+        self,
+        *args,
+        max_new_tokens: int = 128,
+        n: int = 1,
+        stop: Optional[Union[str, List[str]]] = None,
+        stop_token_ids: Optional[List[int]] = None,
+        stop_regex: Optional[Union[str, List[str]]] = None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        min_p: float = 0.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        ignore_eos: bool = False,
+        return_logprob: Optional[bool] = None,
+        logprob_start_len: Optional[int] = None,
+        top_logprobs_num: Optional[int] = None,
+        return_text_in_logprobs: Optional[bool] = None,
+        stream: bool = False,
+        backend=None,
+        **kwargs,
+    ):
+        """Asynchronous execution"""
+        from sglang.lang.async_interpreter import async_run_program
+
+        if stop is None:
+            stop = []
+        if stop_token_ids is None:
+            stop_token_ids = []
+        if stop_regex is None:
+            stop_regex = []
+
+        default_sampling_para = SglSamplingParams(
+            max_new_tokens=max_new_tokens,
+            n=n,
+            stop=stop,
+            stop_token_ids=stop_token_ids,
+            stop_regex=stop_regex,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            ignore_eos=ignore_eos,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            return_text_in_logprobs=return_text_in_logprobs,
+        )
+        if backend is None:
+            raise ValueError(
+                "Async backend is required. Please pass backend parameter explicitly."
+            )
+
+        return await async_run_program(
+            self, backend, args, kwargs, default_sampling_para, stream
+        )
+
+    async def run_batch(
+        self,
+        batch_kwargs,
+        *,
+        max_new_tokens: int = 128,
+        n: int = 1,
+        stop: Optional[Union[str, List[str]]] = None,
+        stop_token_ids: Optional[List[int]] = None,
+        stop_regex: Optional[Union[str, List[str]]] = None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        min_p: float = 0.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        ignore_eos: bool = False,
+        return_logprob: Optional[bool] = None,
+        logprob_start_len: Optional[int] = None,
+        top_logprobs_num: Optional[int] = None,
+        return_text_in_logprobs: Optional[bool] = None,
+        backend=None,
+        max_concurrency: int = 10,
+        progress_bar: bool = False,
+    ):
+        """Asynchronous batch execution
+
+        Args:
+            batch_kwargs: List of argument dicts or tuples for each execution
+            max_concurrency: Maximum number of concurrent executions
+            progress_bar: Whether to show a progress bar (requires tqdm)
+            backend: Async backend to use
+            **kwargs: Sampling parameters
+
+        Returns:
+            List[AsyncProgramState]: Results in the same order as input
+        """
+        from sglang.lang.async_interpreter import async_run_program_batch
+
+        if stop is None:
+            stop = []
+        if stop_token_ids is None:
+            stop_token_ids = []
+        if stop_regex is None:
+            stop_regex = []
+
+        assert isinstance(batch_kwargs, (list, tuple))
+        if len(batch_kwargs) == 0:
+            return []
+        if not isinstance(batch_kwargs[0], dict):
+            num_programs = len(batch_kwargs)
+            batch_kwargs = [
+                {self.arg_names[i]: v for i, v in enumerate(arg_values)}
+                for arg_values in batch_kwargs
+                if isinstance(arg_values, (list, tuple))
+                and len(self.arg_names) - len(self.arg_defaults)
+                <= len(arg_values)
+                <= len(self.arg_names)
+            ]
+            if len(batch_kwargs) != num_programs:
+                raise Exception("Given arguments mismatch the SGL function signature")
+
+        default_sampling_para = SglSamplingParams(
+            max_new_tokens=max_new_tokens,
+            n=n,
+            stop=stop,
+            stop_token_ids=stop_token_ids,
+            stop_regex=stop_regex,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            ignore_eos=ignore_eos,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            return_text_in_logprobs=return_text_in_logprobs,
+        )
+        if backend is None:
+            raise ValueError(
+                "Async backend is required. Please pass backend parameter explicitly."
+            )
+
+        return await async_run_program_batch(
+            self, backend, batch_kwargs, default_sampling_para, max_concurrency, progress_bar
+        )
+
+    async def run_batch_streaming(
+        self,
+        batch_kwargs,
+        *,
+        max_new_tokens: int = 128,
+        n: int = 1,
+        stop: Optional[Union[str, List[str]]] = None,
+        stop_token_ids: Optional[List[int]] = None,
+        stop_regex: Optional[Union[str, List[str]]] = None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        min_p: float = 0.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        ignore_eos: bool = False,
+        return_logprob: Optional[bool] = None,
+        logprob_start_len: Optional[int] = None,
+        top_logprobs_num: Optional[int] = None,
+        return_text_in_logprobs: Optional[bool] = None,
+        backend=None,
+        max_concurrency: int = 10,
+    ):
+        """Generator-style batch execution that yields results as they complete
+
+        This allows processing results as soon as they're ready, without waiting
+        for the entire batch to complete. Results are yielded in completion order,
+        not input order.
+
+        Args:
+            batch_kwargs: List of argument dicts or tuples for each execution
+            max_concurrency: Maximum number of concurrent executions
+            backend: Async backend to use
+            **kwargs: Sampling parameters
+
+        Yields:
+            Tuple[int, AsyncProgramState]: (index, result) pairs as tasks complete
+
+        Example:
+            async for idx, result in func.run_batch_streaming(args, backend=backend):
+                answer = await result.get_var("answer")
+                print(f"Result {idx}: {answer}")
+        """
+        from sglang.lang.async_interpreter import async_run_program_batch_streaming
+
+        if stop is None:
+            stop = []
+        if stop_token_ids is None:
+            stop_token_ids = []
+        if stop_regex is None:
+            stop_regex = []
+
+        assert isinstance(batch_kwargs, (list, tuple))
+        if len(batch_kwargs) == 0:
+            return
+        if not isinstance(batch_kwargs[0], dict):
+            num_programs = len(batch_kwargs)
+            batch_kwargs = [
+                {self.arg_names[i]: v for i, v in enumerate(arg_values)}
+                for arg_values in batch_kwargs
+                if isinstance(arg_values, (list, tuple))
+                and len(self.arg_names) - len(self.arg_defaults)
+                <= len(arg_values)
+                <= len(self.arg_names)
+            ]
+            if len(batch_kwargs) != num_programs:
+                raise Exception("Given arguments mismatch the SGL function signature")
+
+        default_sampling_para = SglSamplingParams(
+            max_new_tokens=max_new_tokens,
+            n=n,
+            stop=stop,
+            stop_token_ids=stop_token_ids,
+            stop_regex=stop_regex,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            ignore_eos=ignore_eos,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            return_text_in_logprobs=return_text_in_logprobs,
+        )
+        if backend is None:
+            raise ValueError(
+                "Async backend is required. Please pass backend parameter explicitly."
+            )
+
+        async for idx, result in async_run_program_batch_streaming(
+            self, backend, batch_kwargs, default_sampling_para, max_concurrency
+        ):
+            yield idx, result
+
+    async def trace(self, *, backend=None, **kwargs):
+        """Async trace program for analysis"""
+        from sglang.lang.tracer import async_trace_program
+
+        if backend is None:
+            raise ValueError(
+                "Async backend is required. Please pass backend parameter explicitly."
+            )
+        return await async_trace_program(self, kwargs, backend)
+
+    async def cache(self, backend=None):
+        """Async cache program prefix"""
+        from sglang.lang.async_interpreter import async_cache_program
+
+        if backend is None:
+            raise ValueError(
+                "Async backend is required. Please pass backend parameter explicitly."
+            )
+        return await async_cache_program(self, backend)
+
+    def __call__(self, *args, **kwargs):
+        """Direct call - returns a coroutine"""
         from sglang.lang.tracer import TracingScope
 
         tracing_scope = TracingScope.get_current_scope()
