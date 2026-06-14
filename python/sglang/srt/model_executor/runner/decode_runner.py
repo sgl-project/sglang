@@ -855,39 +855,12 @@ class DecodeRunner(BaseRunner):
             def run_once():
                 # Must run inside the capture block: warmup mutations here are
                 # undone by on_after_cuda_graph_warmup so capture starts clean.
-                attn_backend.init_forward_metadata_in_graph(forward_batch)
-
-                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
-                    None
-                )
-                set_dp_buffer_len(
-                    forward_batch.global_dp_buffer_len,
-                    num_tokens,
-                    forward_batch.dp_padding_mode.is_max_len(),
-                    forward_batch.global_num_tokens_cpu,
-                )
-                set_is_extend_in_batch(False)
-
-                kwargs = {}
-                if (
-                    self.pp_size > 1
-                    and "pp_proxy_tensors" in inspect.signature(forward).parameters
-                ):
-                    kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                        {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                    )
-                if (
-                    self.model_runner.spec_algorithm.is_dflash()
-                    and self.model_runner.is_draft_worker
-                    and "input_embeds" in inspect.signature(forward).parameters
-                ):
-                    kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
-
-                return forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
+                return self._run_model_forward(
                     forward_batch,
-                    **kwargs,
+                    attn_backend,
+                    num_tokens,
+                    pp_proxy_tensors,
+                    forward,
                 )
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -908,6 +881,54 @@ class DecodeRunner(BaseRunner):
                         None,
                     ),
                 )
+
+    def _run_model_forward(
+        self,
+        forward_batch,
+        attn_backend,
+        num_tokens: int,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        forward: Callable,
+    ):
+        """Run the in-graph metadata op + the model forward over ``forward_batch``.
+
+        Shared by capture (recorded into the cuda graph by ``run_once``) and the
+        eager path (run live by ``EagerBackend.run``). The in-graph metadata op
+        runs here so it is recorded at capture time and executed live for eager
+        — same code, no branch on execution strategy.
+        """
+        attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+        set_dp_buffer_len(
+            forward_batch.global_dp_buffer_len,
+            num_tokens,
+            forward_batch.dp_padding_mode.is_max_len(),
+            forward_batch.global_num_tokens_cpu,
+        )
+        set_is_extend_in_batch(False)
+
+        kwargs = {}
+        if (
+            self.pp_size > 1
+            and "pp_proxy_tensors" in inspect.signature(forward).parameters
+        ):
+            kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+            )
+        if (
+            self.model_runner.spec_algorithm.is_dflash()
+            and self.model_runner.is_draft_worker
+            and "input_embeds" in inspect.signature(forward).parameters
+        ):
+            kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
+
+        return forward(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            **kwargs,
+        )
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 
