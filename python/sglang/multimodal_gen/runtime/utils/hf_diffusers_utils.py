@@ -543,25 +543,14 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
     return cast(dict[str, Any], config)
 
 
-def _resolve_remote_model_index_path(model_name_or_path: str) -> str:
-    """Return a local path to a remote repo's ``model_index.json``.
-
-    Prefer a cache-aware fetch from the Hub: this reuses the shared ``HF_HOME``
-    cache and only re-downloads when the remote copy changed, so remote updates
-    are still picked up. If the Hub cannot be reached or access is denied — e.g.
-    a gated repo with no token whose snapshot is already cached, or an offline
-    run — fall back to the locally cached copy (with a warning that it may be
-    stale) instead of failing outright. Hub-first keeps the common path fresh;
-    the local copy is only trusted when the Hub is genuinely unavailable.
-    """
+def _resolve_remote_repo_model_index_path(model_name_or_path: str) -> str:
+    """Return a local path to a remote repo's ``model_index.json`` """
     from huggingface_hub.errors import EntryNotFoundError
 
     try:
         # Cache-aware: no local_dir, so HF reuses the cache and revalidates the
         # ETag against the Hub, re-downloading only when the remote changed.
-        return hf_hub_download(
-            repo_id=model_name_or_path, filename="model_index.json"
-        )
+        return hf_hub_download(repo_id=model_name_or_path, filename="model_index.json")
     except EntryNotFoundError:
         # Repo exists but has no model_index.json (single-model repo); let the
         # caller fall through to the single-model path.
@@ -625,7 +614,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
 
     # For remote models, resolve model_index.json (Hub-first, cache fallback).
     try:
-        model_index_path = _resolve_remote_model_index_path(model_name_or_path)
+        model_index_path = _resolve_remote_repo_model_index_path(model_name_or_path)
 
         # Load the model_index.json
         with open(model_index_path) as f:
