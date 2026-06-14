@@ -120,7 +120,6 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_group,
-    get_attention_tp_size,
     initialize_dp_attention,
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -229,7 +228,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
-from sglang.srt.utils.common import ceil_align, next_power_of_2, require_mlp_sync
+from sglang.srt.utils.common import next_power_of_2
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -2512,8 +2511,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return True
 
-    def _flashinfer_autotune(self):
-        """Run flashinfer autotune."""
+    def _flashinfer_autotune(self, *, buffers, batch_size):
+        """Run flashinfer autotune.
+
+        buffers / batch_size: the decode runner's already-allocated static
+        buffers and its max captured bs, reused for the dummy forward instead
+        of allocating a throwaway set. Always supplied by BaseRunner.warmup
+        (which asserts a decode buffer is available before autotune).
+        """
         from flashinfer.autotuner import autotune
 
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
@@ -2544,7 +2549,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 autotune(True, cache=str(autotune_cache)),
                 autotune_dummy_run_mode(),
             ):
-                self._dummy_run(batch_size=self.req_to_token_pool.size)
+                self._dummy_run(batch_size=batch_size, buffers=buffers)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
 
@@ -2584,16 +2589,59 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             / f"rank_tp{self.tp_rank}_pp{self.pp_rank}_dp{self.dp_rank or 0}.json"
         )
 
+    def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_bs: int = 1):
+        """Allocate one static decode-buffer set for a dummy forward, sized to
+        (max_bs, max_bs * num_tokens_per_bs).
+
+        For callers that have no pre-allocated static buffers to reuse -- the
+        PP-parallel DeepGEMM warmup sweeps batch sizes far larger than the decode
+        runner's max_bs -- build one here and hand it to _dummy_run (reused
+        across the sweep; _dummy_run slices it per shape). The flashinfer
+        autotune instead reuses the decode runner's own buffers.
+        """
+        return _allocate_decode_buffers(
+            device=self.device,
+            max_bs=max_bs,
+            max_num_token=max_bs * num_tokens_per_bs,
+            hidden_size=self.model_config.hidden_size,
+            vocab_size=self.model_config.vocab_size,
+            dtype=self.model_config.dtype,
+            dp_size=self.server_args.dp_size,
+            pp_size=self.server_args.pp_size,
+            is_encoder_decoder=self.model_config.is_encoder_decoder,
+            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            seq_len_fill_value=self.attn_backend.get_cuda_graph_seq_len_fill_value(),
+            encoder_len_fill_value=(
+                getattr(self.model_config.hf_config, "max_source_positions", 0)
+                if self.model_config.is_encoder_decoder
+                else 0
+            ),
+            num_tokens_per_bs=num_tokens_per_bs,
+            cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
+            hc_hidden_size=getattr(self.model_config, "hc_hidden_size", None),
+        )
+
     def _dummy_run(
         self,
         batch_size: int,
         run_ctx=None,
         forward_mode_override: Optional[ForwardMode] = None,
+        *,
+        buffers,
     ):
         """Run a dummy forward pass for warmup/profiling.
 
         forward_mode_override forces EXTEND/DECODE regardless of
         is_generation (used by the PP-parallel DeepGEMM warmup).
+
+        buffers: a prepared static decode-buffer set, sized >= this dummy shape,
+        which _dummy_run slices to (batch_size, num_tokens). The caller owns the
+        shape and the allocation -- the flashinfer autotune reuses the decode
+        runner's buffers (at its captured max_bs); the PP-DeepGEMM warmup builds
+        one via _alloc_dummy_decode_buffers. _dummy_run never allocates and never
+        re-pads (autotune must run at the captured shape; the PP warmup pre-pads
+        and sizes its buffer to match).
         """
         if forward_mode_override is not None:
             capture_forward_mode = forward_mode_override
@@ -2619,12 +2667,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         num_tokens = batch_size * num_tokens_per_bs
 
-        # Keep warmup aligned with scheduler MLP-sync padding.
-        if require_mlp_sync(self.server_args):
-            attn_tp_size = get_attention_tp_size()
-            if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
-                num_tokens = ceil_align(num_tokens, attn_tp_size)
-                batch_size = num_tokens // num_tokens_per_bs
+        # The caller owns the shape: it passes a prepared static buffer sized
+        # >= this dummy shape, which we slice below. _dummy_run neither allocates
+        # nor re-pads -- autotune must run at the runner's captured shape (re-
+        # padding could overflow the reused buffers), and the PP-DeepGEMM warmup
+        # applies its own MLP-sync padding before sizing its buffer.
+        assert (
+            buffers is not None
+            and num_tokens <= buffers.input_ids.shape[0]
+            and batch_size <= buffers.seq_lens.shape[0]
+        ), (
+            f"_dummy_run needs a static buffer >= (num_tokens={num_tokens}, "
+            f"batch_size={batch_size}); got "
+            + (
+                "None"
+                if buffers is None
+                else f"(input_ids={buffers.input_ids.shape[0]}, "
+                f"seq_lens={buffers.seq_lens.shape[0]})"
+            )
+        )
 
         seq_len_fill_value = self.attn_backend.get_cuda_graph_seq_len_fill_value()
 
@@ -2648,28 +2709,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if require_gathered_buffer(self.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
-        buffers = _allocate_decode_buffers(
-            device=self.device,
-            max_bs=batch_size,
-            max_num_token=num_tokens,
-            hidden_size=self.model_config.hidden_size,
-            vocab_size=self.model_config.vocab_size,
-            dtype=self.model_config.dtype,
-            dp_size=self.server_args.dp_size,
-            pp_size=self.server_args.pp_size,
-            is_encoder_decoder=self.model_config.is_encoder_decoder,
-            require_mlp_tp_gather=require_mlp_tp_gather_,
-            seq_len_fill_value=seq_len_fill_value,
-            encoder_len_fill_value=(
-                getattr(self.model_config.hf_config, "max_source_positions", 0)
-                if self.model_config.is_encoder_decoder
-                else 0
-            ),
-            num_tokens_per_bs=num_tokens_per_bs,
-            cache_loc_dtype=torch.int64,
-            enable_mamba_track=False,
-            hc_hidden_size=getattr(self.model_config, "hc_hidden_size", None),
+        # Slice the (possibly larger, reused) static buffers to this dummy shape.
+        # The runner repopulates every field at capture/reserve, and the PP
+        # warmup discards its buffer, so the writes below (and the metadata init)
+        # are transient.
+        input_ids = buffers.input_ids[:num_tokens]
+        positions = buffers.positions[:num_tokens]
+        out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        req_pool_indices = buffers.req_pool_indices[:batch_size]
+        seq_lens = buffers.seq_lens[:batch_size]
+        seq_lens_cpu = buffers.seq_lens_cpu[:batch_size]
+        encoder_lens = (
+            buffers.encoder_lens[:batch_size]
+            if buffers.encoder_lens is not None
+            else None
         )
+
         buffers.num_token_non_padded[...] = num_tokens
 
         # For extend mode
@@ -2755,17 +2812,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
             batch_size=batch_size,
-            input_ids=buffers.input_ids,
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_cpu=buffers.seq_lens_cpu,
-            next_token_logits_buffer=buffers.next_token_logits_buffer,
-            orig_seq_lens=buffers.seq_lens,
-            out_cache_loc=buffers.out_cache_loc,
-            seq_lens_sum=buffers.seq_lens.sum().item(),
-            encoder_lens=buffers.encoder_lens,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens.sum().item(),
+            encoder_lens=encoder_lens,
             return_logprob=False,
-            positions=buffers.positions,
+            positions=positions,
             extend_num_tokens=extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -2777,7 +2834,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
-            mrope_positions=buffers.mrope_positions,
+            mrope_positions=mrope_positions,
             spec_algorithm=self.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=capture_hidden_mode,
@@ -2814,7 +2871,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 kwargs["get_embedding"] = True
 
             logits_output_or_pp_proxy_tensors = self.model.forward(
-                buffers.input_ids,
+                input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
