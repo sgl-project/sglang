@@ -33,4 +33,7 @@ exclude = [
 cmake.source-dir = "csrc/cpu"
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
-wheel.packages = ["python/sgl_kernel"]
+install.components = ["python"]
+
+[tool.scikit-build.cmake.define]
+HETERO_CPU_PACKAGE = {env = "HETERO_CPU_PACKAGE", default = "OFF"}
