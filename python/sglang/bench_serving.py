@@ -1931,7 +1931,20 @@ def run_benchmark(args_: argparse.Namespace):
     # Read dataset
     backend = args.backend
     model_id = args.served_model_name or args.model
-    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
+    tokenizer_id = args.tokenizer
+    if tokenizer_id is None:
+        try:
+            resp = requests.get(
+                base_url + "/model_info", headers=get_auth_headers(), timeout=5
+            )
+            if resp.status_code == 200:
+                info = resp.json()
+                tokenizer_id = info.get("tokenizer_path") or info.get("model_path")
+        except Exception:
+            pass
+    if tokenizer_id is None:
+        tokenizer_id = args.model
+
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
 
