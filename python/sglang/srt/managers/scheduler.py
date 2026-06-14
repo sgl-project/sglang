@@ -263,7 +263,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.nvtx_utils import nvtx_annotated_method
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -1586,7 +1586,7 @@ class Scheduler(
 
         return disable_overlap_for_batch or need_grammar_sync
 
-    @nvtx_annotated_method("scheduler.process_input_requests")
+    @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
@@ -2463,7 +2463,7 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
-    @nvtx_annotated_method("scheduler.get_next_batch_to_run")
+    @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -3051,7 +3051,7 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
-    @nvtx_annotated_method("scheduler.run_batch")
+    @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -3273,7 +3273,7 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
-    @nvtx_annotated_method("scheduler.process_batch_result")
+    @scheduler_nvtx_method("scheduler.process_batch_result")
     def process_batch_result(
         self,
         batch: ScheduleBatch,
