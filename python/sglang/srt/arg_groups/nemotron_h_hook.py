@@ -55,6 +55,23 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
         else:
             server_args.moe_runner_backend = "flashinfer_cutlass"
 
+    # NemotronH is MTP-centric. When speculative decoding and radix (prefix)
+    # cache are both enabled, the default no_buffer mamba scheduler strategy is
+    # incompatible (it raises in _handle_mamba_radix_cache), and
+    # extra_buffer_lazy is not yet supported with speculative decoding. Default
+    # to extra_buffer so MTP and prefix caching run together instead of forcing
+    # --disable-radix-cache (which re-prefills the shared context every request).
+    if (
+        server_args.speculative_algorithm is not None
+        and not server_args.disable_radix_cache
+        and server_args.mamba_scheduler_strategy == "no_buffer"
+    ):
+        server_args.mamba_scheduler_strategy = "extra_buffer"
+        logger.info(
+            f"Defaulting --mamba-scheduler-strategy to extra_buffer for {model_arch} "
+            "to enable speculative decoding (MTP) together with radix (prefix) cache."
+        )
+
     server_args._handle_mamba_radix_cache(
         model_arch=model_arch,
         sm100_default_attention_backend="flashinfer",
