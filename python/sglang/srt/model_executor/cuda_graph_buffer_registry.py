@@ -1,3 +1,16 @@
+# Copyright 2023-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """FB-shared slot registry for the CUDA graph forward paths.
 
 ``CudaGraphBufferRegistry`` is the ForwardBatch → graph-resident buffer mirror
@@ -162,12 +175,12 @@ class GraphSlot:
     pad_value: Optional[Any] = None
     enabled: bool = True
     copy_from_fb: bool = True
-    post_fill: Optional[
-        Callable[[torch.Tensor, "ForwardBatch", "FillContext"], None]
-    ] = None
+    post_fill: Optional[Callable[[torch.Tensor, ForwardBatch, FillContext], None]] = (
+        None
+    )
     slice_fn: Optional[Callable[[torch.Tensor, int], torch.Tensor]] = None
     source_fn: Optional[
-        Callable[["ForwardBatch", "FillContext"], Optional[torch.Tensor]]
+        Callable[[ForwardBatch, FillContext], Optional[torch.Tensor]]
     ] = None
 
     # runtime
@@ -365,7 +378,7 @@ class CudaGraphBufferRegistry:
 
     def fill_from(
         self,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         *,
         raw_bs: int,
         padded_bs: int,
@@ -460,8 +473,8 @@ class CudaGraphBufferRegistry:
         *,
         padded_bs: int,
         padded_num_tokens: int,
-        forward_batch_template: "ForwardBatch",
-    ) -> "ForwardBatch":
+        forward_batch_template: ForwardBatch,
+    ) -> ForwardBatch:
         """Return a FB view (``dataclasses.replace`` of ``forward_batch_template``)
         whose slot fields are buffer views and whose non-slot fields are carried
         from the template. A plain copy slot whose FB field is ``None`` this iter
@@ -511,15 +524,16 @@ def build_decode_registry(
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
-    buffers, with padding policies matching
-    ``DecodeInputBuffers.populate_from_forward_batch``:
+    buffers, with the per-slot padding policy that resets the padded tail on
+    each replay:
 
       - ``seq_lens`` / ``seq_lens_cpu`` -> FILL_SENTINEL(seq_len_fill_value)
       - ``req_pool_indices`` / ``out_cache_loc`` / ``mamba_track_*`` -> ZERO
-      - ``input_ids`` / ``positions`` / ``mrope_positions`` -> FOREACH_COPY
-        (head ``[:raw_n]`` is always overwritten by the copy; the old code's
-        full-buffer ``zero_()`` / ``fill_()`` on ``bs != raw_bs`` is therefore
-        equivalent to the tail-only reset the policies apply here).
+      - ``positions`` / ``mrope_positions`` -> ZERO: the flashinfer verify-path
+        plan reads the padded tail, so leaving stale out-of-range values there
+        triggers an illegal memory access (issue #24361).
+      - ``input_ids`` -> FOREACH_COPY: head ``[:raw_n]`` is overwritten by the
+        copy and the padded tail is not read.
 
     ``custom_mask`` / ``next_token_logits_buffer`` / ``input_embeds`` are not
     registered here — they are not per-replay FB copies (allocated and written
@@ -545,7 +559,13 @@ def build_decode_registry(
 
     slots = [
         GraphSlot("input_ids", _tokens, torch.int64, axis="tokens"),
-        GraphSlot("positions", _tokens, torch.int64, axis="tokens"),
+        GraphSlot(
+            "positions",
+            _tokens,
+            torch.int64,
+            axis="tokens",
+            padding_policy=PaddingPolicy.ZERO,
+        ),
         GraphSlot(
             "out_cache_loc",
             _tokens,
@@ -563,7 +583,7 @@ def build_decode_registry(
         GraphSlot(
             "seq_lens",
             _bs,
-            torch.int32,
+            torch.int64,
             axis="bs",
             padding_policy=PaddingPolicy.FILL_SENTINEL,
             pad_value=seq_len_fill_value,
@@ -571,7 +591,7 @@ def build_decode_registry(
         GraphSlot(
             "seq_lens_cpu",
             _bs,
-            torch.int32,
+            torch.int64,
             axis="bs",
             device=torch.device("cpu"),
             padding_policy=PaddingPolicy.FILL_SENTINEL,
@@ -583,6 +603,7 @@ def build_decode_registry(
             torch.int64,
             axis="tokens",
             slice_fn=lambda buf, n: buf[:, :n],
+            padding_policy=PaddingPolicy.ZERO,
         ),
     ]
     if enable_mamba_track:

@@ -52,7 +52,7 @@ class WritePlan:
         *,
         write_req_capacity: int,
         device: torch.device,
-    ) -> "WritePlan":
+    ) -> WritePlan:
         if write_req_capacity <= 0:
             raise ValueError(
                 f"kv-canary: WritePlan write_req_capacity must be positive, got {write_req_capacity}"
@@ -67,7 +67,7 @@ class WritePlan:
             write_num_valid_reqs=torch.empty(1, dtype=torch.int32, device=device),
         )
 
-    def zero_for_testing_(self) -> "WritePlan":
+    def zero_for_testing_(self) -> WritePlan:
         """WARN: ONLY use it when testing plan kernel. Do not use it when testing verify or
         write kernel to avoid hiding bugs."""
         self.write_offsets.zero_()
@@ -251,7 +251,7 @@ def launch_canary_write_kernel(
 
 
 @cache_once
-def _jit_canary_write_module() -> "Module":
+def _jit_canary_write_module() -> Module:
     return load_jit(
         "kv_canary_write",
         cuda_files=["kv_canary/canary_write.cuh"],
