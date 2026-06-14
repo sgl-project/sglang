@@ -641,6 +641,17 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+def compose_weight_version_namespace(weight_version: str) -> str:
+    """Compose the KV-cache extra_key prefix for a weight version.
+
+    Length-prefixed because weight_version is an arbitrary user string: with a
+    bare delimiter, version "a;b" + extra_key "c" and version "a" + extra_key
+    "b;c" would collapse into the same namespace and share KV entries across
+    weights. The trailing ";" is kept only for readability.
+    """
+    return f"wv{len(weight_version)}:{weight_version};"
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -751,7 +762,24 @@ class Req(ReqDllmMixin):
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
 
+        # Admission-time weight version stamp. Always set in a live
+        # scheduler; bare unit-test contexts may lack global server args.
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            server_args = None
+        self.weight_version_start = (
+            server_args.weight_version if server_args is not None else None
+        )
+
         # extra key for classifying the request (e.g. cache_salt)
+        if server_args is not None and server_args.enable_weight_version_kv_isolation:
+            # Weight-version KV namespace: a fixed-position, length-prefixed
+            # segment, so it stays unambiguous against any user extra_key and
+            # the delimiter-free lora_id suffix below.
+            extra_key = compose_weight_version_namespace(server_args.weight_version) + (
+                extra_key or ""
+            )
         if lora_id is not None:
             extra_key = (
                 extra_key or ""

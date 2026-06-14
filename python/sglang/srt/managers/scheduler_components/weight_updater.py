@@ -39,6 +39,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,11 @@ class SchedulerWeightUpdaterManager:
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
+    # Quiesces in-flight forwards before a weight mutation.
+    drain_forward_pipeline: Callable[[], None]
     scheduler: Optional[Any] = None
+    # Optional hook run after the scheduler-side weight version changes.
+    on_weight_version_bump: Optional[Callable[[], None]] = None
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
@@ -98,6 +103,26 @@ class SchedulerWeightUpdaterManager:
                     time.perf_counter() - t0, source
                 )
 
+    def after_weights_updated(self, recv_req) -> None:
+        """Bookkeeping shared by every successful update_weights_from_* call."""
+        # Content-hash keyed, so entries would alias across weight versions.
+        from sglang.srt.managers import mm_utils
+
+        if mm_utils.embedding_cache is not None:
+            mm_utils.embedding_cache.clear()
+        self.bump_weight_version(recv_req)
+
+    def bump_weight_version(self, recv_req) -> None:
+        """Adopt the request's weight_version as the scheduler-side current
+        version. Called only on full update success (target and draft), so
+        admission stamping in ``Req.__init__`` and the KV-isolation namespace
+        switch exactly when the new weights become live."""
+        version = getattr(recv_req, "weight_version", None)
+        if version is not None:
+            get_global_server_args().weight_version = version
+            if self.on_weight_version_bump is not None:
+                self.on_weight_version_bump()
+
     def flush_cache_after_weight_update(self, recv_req) -> None:
         if recv_req.flush_cache:
             flush_cache_success = self.flush_cache(
@@ -107,11 +132,14 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        self.drain_forward_pipeline()
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
             if success and self.draft_worker is not None:
                 success, message = self.draft_worker.update_weights_from_disk(recv_req)
+            if success:
+                self.after_weights_updated(recv_req)
             if tp_success:
                 self.flush_cache_after_weight_update(recv_req)
             if not success:
@@ -136,9 +164,11 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        self.drain_forward_pipeline()
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
+                self.after_weights_updated(recv_req)
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
@@ -146,6 +176,7 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        self.drain_forward_pipeline()
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
@@ -153,6 +184,7 @@ class SchedulerWeightUpdaterManager:
                 worker = self.draft_worker or self.tp_worker
             success, message = worker.update_weights_from_tensor(recv_req)
             if success:
+                self.after_weights_updated(recv_req)
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
@@ -161,11 +193,14 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        self.drain_forward_pipeline()
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success
             if success and self.draft_worker is not None:
                 success, message = self.draft_worker.update_weights_from_ipc(recv_req)
+            if success:
+                self.after_weights_updated(recv_req)
             if tp_success:
                 self.flush_cache_after_weight_update(recv_req)
             if not success:

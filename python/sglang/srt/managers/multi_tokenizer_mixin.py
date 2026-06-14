@@ -163,6 +163,10 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            weight_version_start=_extract_field_by_index(
+                output, "weight_version_start", i
+            ),
+            weight_version_end=output.weight_version_end,
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -253,6 +257,10 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            weight_version_start=_extract_field_by_index(
+                output, "weight_version_start", i
+            ),
+            weight_version_end=output.weight_version_end,
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -640,6 +648,12 @@ class TokenizerWorker(TokenizerManager):
         async with self.is_pause_cond:
             if obj.is_pause:
                 self.is_pause = True
+                # pause_generation() is overridden above and never sets the
+                # local gate, so the watchdog must be armed here instead.
+                # Every worker arms one; whichever fires first broadcasts the
+                # continue (via the override) and the rest see is_pause False.
+                self._pause_epoch = getattr(self, "_pause_epoch", 0) + 1
+                self._maybe_arm_pause_watchdog(self._pause_epoch)
             else:
                 self.is_pause = False
                 self.is_pause_cond.notify_all()

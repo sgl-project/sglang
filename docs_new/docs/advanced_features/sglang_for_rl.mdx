@@ -627,6 +627,26 @@ SGLang exposes explicit pause/resume APIs so you can pause slow requests and con
 
 **Endpoint:** `POST /continue_generation`
 
+### In-Place Weight Updates with KV Isolation
+
+With `--enable-weight-version-kv-isolation`, weights can be committed without aborting, retracting, or draining in-flight requests:
+
+```
+POST /pause_generation       {"mode": "in_place"}
+POST /update_weights_from_disk {..., "flush_cache": false, "weight_version": "<v+1>"}
+POST /continue_generation
+```
+
+Every request is stamped with the weight version current at admission, and its KV cache entries are namespaced by that version:
+
+- In-flight requests pause briefly during the commit, then resume decoding on their existing (now stale) KV — no abort, no retraction, no re-prefill.
+- Requests admitted after the commit structurally cannot reuse KV produced under older weights.
+- KV of an old version is evicted as soon as no live request can reach it, and by normal LRU eviction otherwise.
+
+Each response's `meta_info` carries `weight_version_start` (the version at admission) and `weight_version_end` (the version when its final batch was emitted). A request that decoded across a commit reports `start != end`, which RL buffers can use for per-sample policy-lag filtering.
+
+Set `SGLANG_ENGINE_PAUSE_TIMEOUT=<seconds>` to arm a watchdog that auto-continues (loudly) if the controller driving the pause dies between `pause_generation` and `continue_generation`, which would otherwise gate traffic forever while `/health` stays green.
+
 ## Deterministic Inference
 
 In many RL stacks, rollout and training are implemented with different kernels or batching behavior. Even when weights are identical, token probabilities can drift, silently breaking the on-policy assumption. This is the training–inference mismatch problem.

@@ -584,6 +584,47 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
+    def evict_dead_namespaces(self, is_live) -> int:
+        """Evict every unlocked node belonging to a dead ``extra_key`` namespace.
+
+        ``is_live`` is a predicate over a node's ``extra_key``. Children of the
+        root are namespace-disjoint by construction of ``RadixKey.child_key``
+        and every node within a subtree carries the same ``extra_key``, so a
+        dead namespace is a whole subtree under the root. Locked nodes (and
+        therefore their ancestors) survive and are reclaimed by a later sweep
+        or by normal LRU eviction once unlocked.
+
+        Returns the number of evicted tokens.
+        """
+        if self.disable:
+            return 0
+
+        start_time = time.perf_counter()
+        dead_roots = [
+            child
+            for child in self.root_node.children.values()
+            if not is_live(child.key.extra_key)
+        ]
+        num_evicted = 0
+        for subtree_root in dead_roots:
+            stack, postorder = [subtree_root], []
+            while stack:
+                node = stack.pop()
+                postorder.append(node)
+                stack.extend(node.children.values())
+            # Reverse order deletes children before parents, so an unlocked
+            # inner node becomes a deletable leaf within the same pass.
+            for node in reversed(postorder):
+                if node.children or node.lock_ref > 0 or node.evicted:
+                    continue
+                self.token_to_kv_pool_allocator.free(node.value)
+                num_evicted += len(node.value)
+                self._delete_leaf(node)
+                self._record_remove_event(node)
+
+        self.update_eviction_metrics(num_evicted, start_time)
+        return num_evicted
+
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)
