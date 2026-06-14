@@ -29,9 +29,7 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
 
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the serve command."""
-    # `sglang serve` defaults to server-based warmup (production), expressed via the
-    # canonical warmup_mode knob. _adjust_warmup still lets an explicit legacy
-    # `--warmup false` / `--server-warmup false` override this defaulted mode.
+    # use server-based warmup for production
     server_args = ServerArgs.from_cli_args(
         args, unknown_args, default_args={"warmup_mode": "server"}
     )
