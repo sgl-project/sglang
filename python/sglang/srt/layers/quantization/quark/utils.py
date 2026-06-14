@@ -13,7 +13,7 @@ except ImportError as err:
 
     def raise_aiter_import_error(*args, **kwargs):
         raise ImportError(
-            "Failed to import aiter. " "Make sure AITER is installed and accessible."
+            "Failed to import aiter. Make sure AITER is installed and accessible."
         )
 
     dynamic_mxfp4_quant = raise_aiter_import_error
@@ -161,16 +161,12 @@ def mxfp4_to_f32(x, is_3d):
 
 
 def e8m0_to_f32(x):
-    # Convert the input tensor `x` (assumed to be in e8m0 format) to float32.
-    # e8m0 is a custom 8-bit floating point format with 8 bits for exponent, 0 for mantissa.
-    # This means the value is essentially 2^(exponent - 127), similar to how IEEE-754 stores floats.
-
-    # Convert x to float32 for computation, and compute the power of 2 by subtracting the bias (127).
+    # Per OCP MX-format v1.0: encoded 0..254 -> 2^(x-127); encoded 255 -> NaN.
+    # Detect the sentinel on the raw integer encoding, not on the float result
+    # (in float32, 2^128 overflows to +inf, so the old `x_f32 == 128` predicate
+    # both missed x=255 and wrongly NaN'd legitimate scale 128.0 at x=134).
     x_f32 = 2 ** ((x.to(torch.float32)) - 127)
-
-    # If the exponent value was 255 (i.e., 2^(128)), this is a special case usually used to represent NaN or Inf.
-    # Since this custom format has no mantissa, treat 2^128 as NaN.
-    x_f32[x_f32 == 128] = float("nan")
+    x_f32[x == 255] = float("nan")
     return x_f32
 
 
