@@ -1,29 +1,28 @@
 #!/bin/bash
 set -euo pipefail
 
-# Start the Intel XPU CI container (ci_sglang_xpu) using the latest nightly
-# intel/sglang-dev image published by .github/workflows/release-docker-intel-xpu-nightly.yml.
+# Start the Intel XPU CI container (ci_sglang_xpu) using the intel/sglang-dev:latest
+# image published by .github/workflows/release-docker-intel-xpu-nightly.yml.
 #
-# Walks back N days through nightly date-stamped tags, pulls the first match,
-# then starts a long-running container that subsequent steps `docker exec` into.
+# Pulls the :latest tag and starts a long-running container that subsequent
+# steps `docker exec` into.
 
 CONTAINER_NAME="ci_sglang_xpu"
 IMAGE_REPO="intel/sglang-dev"
-TAG_PREFIX="nightly-dev-xpu-bmg"
-LOOKBACK_DAYS=7
+IMAGE_TAG="latest"
 CUSTOM_IMAGE=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
     --container-name) CONTAINER_NAME="$2"; shift 2;;
-    --lookback-days) LOOKBACK_DAYS="$2"; shift 2;;
+    --image-tag) IMAGE_TAG="$2"; shift 2;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo "Options:"
       echo "  --custom-image IMAGE     Use a specific Docker image directly"
       echo "  --container-name NAME    Override container name (default: ${CONTAINER_NAME})"
-      echo "  --lookback-days N        Days of nightly tags to scan (default: ${LOOKBACK_DAYS})"
+      echo "  --image-tag TAG          Tag of ${IMAGE_REPO} to pull (default: ${IMAGE_TAG})"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -64,64 +63,21 @@ if [[ -n "${DOCKERHUB_INTEL_USERNAME:-}" && -n "${DOCKERHUB_INTEL_TOKEN:-}" ]]; 
   fi
 fi
 
-# Locate the latest published nightly image. Walks back LOOKBACK_DAYS days of
-# date-stamped tags (commit-hash suffix is unknown, so we query Docker Hub).
-find_latest_image() {
-  local days_back target_date matched_tag
-
-  # Local cache first.
-  for (( days_back=0; days_back<LOOKBACK_DAYS; days_back++ )); do
-    target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    matched_tag=$(docker images --format '{{.Repository}}:{{.Tag}}' \
-      --filter "reference=${IMAGE_REPO}:${TAG_PREFIX}-${target_date}-*" \
-      | sort -r | head -n 1)
-    if [[ -n "${matched_tag}" ]]; then
-      echo "Found cached image locally: ${matched_tag}" >&2
-      echo "${matched_tag}"
-      return 0
-    fi
-  done
-
-  # Then query Docker Hub for any tag matching the date prefix.
-  for (( days_back=0; days_back<LOOKBACK_DAYS; days_back++ )); do
-    target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    echo "Checking Docker Hub for: ${IMAGE_REPO}:${TAG_PREFIX}-${target_date}-*" >&2
-    matched_tag=$(curl -fsSL \
-      "https://registry.hub.docker.com/v2/repositories/${IMAGE_REPO}/tags?page_size=100&name=${TAG_PREFIX}-${target_date}" \
-      2>/dev/null \
-      | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
-    if [[ -n "${matched_tag}" ]]; then
-      echo "Found published image: ${IMAGE_REPO}:${matched_tag}" >&2
-      echo "${IMAGE_REPO}:${matched_tag}"
-      return 0
-    fi
-  done
-
-  # Final fallback: any locally cached image matching the prefix.
-  matched_tag=$(docker images --format '{{.Repository}}:{{.Tag}}' \
-    --filter "reference=${IMAGE_REPO}:${TAG_PREFIX}-*" \
-    | sort -r | head -n 1)
-  if [[ -n "${matched_tag}" ]]; then
-    echo "Using cached fallback image: ${matched_tag}" >&2
-    echo "${matched_tag}"
-    return 0
-  fi
-
-  echo "Error: no ${IMAGE_REPO}:${TAG_PREFIX}-* image found in the last ${LOOKBACK_DAYS} days" >&2
-  return 1
-}
-
 if [[ -n "${CUSTOM_IMAGE}" ]]; then
   IMAGE="${CUSTOM_IMAGE}"
   echo "Using custom image: ${IMAGE}"
-  retry_with_backoff 6 docker pull "${IMAGE}"
 else
-  IMAGE=$(find_latest_image)
-  if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  else
-    echo "Image ${IMAGE} already present locally; skipping pull"
-  fi
+  IMAGE="${IMAGE_REPO}:${IMAGE_TAG}"
+  echo "Using image: ${IMAGE}"
+fi
+# Always pull so each stage runs the registry's current image; the cleanup
+# step removes the image after the stage so the runner doesn't accumulate
+# stale layers across runs.
+retry_with_backoff 6 docker pull "${IMAGE}"
+
+# Export the resolved image so the cleanup step can rmi the exact tag used.
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  echo "CI_SGLANG_XPU_IMAGE=${IMAGE}" >> "${GITHUB_ENV}"
 fi
 
 # Remove any stale container of the same name so re-runs are idempotent.

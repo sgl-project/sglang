@@ -250,7 +250,7 @@ class _Dumper:
     def __init__(self, *, config: DumperConfig):
         self._config = config
         self._state = _DumperState()
-        self._non_intrusives: list["_NonIntrusiveDumper"] = []
+        self._non_intrusives: list[_NonIntrusiveDumper] = []
         self._grafter = _Grafter(config=config)
 
     # ------------------------------- public :: core ---------------------------------
