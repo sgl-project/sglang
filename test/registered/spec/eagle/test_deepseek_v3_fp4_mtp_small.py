@@ -53,6 +53,7 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             cls.base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=other_args,
+            env={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
         )
 
     @classmethod
