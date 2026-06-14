@@ -186,25 +186,25 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         w13_weight_scale = Parameter(
-            torch.ones(
+            torch.zeros(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // fp4_block_k,
-                dtype=torch.float32,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
         w2_weight_scale = Parameter(
-            torch.ones(
+            torch.zeros(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // fp4_block_k,
-                dtype=torch.float32,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
-        w13_weight_scale.format_ue8m0 = False
-        w2_weight_scale.format_ue8m0 = False
+        w13_weight_scale.format_ue8m0 = True
+        w2_weight_scale.format_ue8m0 = True
         scale_attrs = dict(extra_weight_attrs)
         scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
         layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
@@ -238,7 +238,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         w2_scale = layer.w2_weight_scale_inv.data
         num_experts = w13.shape[0]
 
-        if w13_scale.dtype == torch.float32:
+        if w13_scale.dtype == torch.uint8:
+            w13_scale = w13_scale.view(torch.float8_e8m0fnu)
+            w2_scale = w2_scale.view(torch.float8_e8m0fnu)
+        elif w13_scale.dtype == torch.float32:
             w13_scale = w13_scale.to(torch.float8_e8m0fnu)
             w2_scale = w2_scale.to(torch.float8_e8m0fnu)
 

@@ -172,20 +172,21 @@ class Mxfp4FlashinferCutlassMoEMethod:
             f"(layer: {self.prefix})...",
         )
 
-        # FP8 base stores scales as fp32 numerical values (= 2**e). The
-        # FlashInfer SM90 helper reads raw E8M0 bytes (uint8 with the
-        # exponent + 127 bias). Cast through float8_e8m0fnu to extract the
-        # raw byte without losing the exponent.
-        w13_scale_u8 = (
-            layer.w13_weight_scale_inv.data.to(torch.float8_e8m0fnu)
-            .view(torch.uint8)
-            .contiguous()
-        )
-        w2_scale_u8 = (
-            layer.w2_weight_scale_inv.data.to(torch.float8_e8m0fnu)
-            .view(torch.uint8)
-            .contiguous()
-        )
+        # Scales may be stored as uint8 (raw E8M0 bytes) or float32
+        # (numerical 2**e values, legacy path). The FlashInfer SM90 helper
+        # reads raw E8M0 bytes.
+        w13_scale_data = layer.w13_weight_scale_inv.data
+        w2_scale_data = layer.w2_weight_scale_inv.data
+        if w13_scale_data.dtype == torch.uint8:
+            w13_scale_u8 = w13_scale_data.contiguous()
+            w2_scale_u8 = w2_scale_data.contiguous()
+        else:
+            w13_scale_u8 = (
+                w13_scale_data.to(torch.float8_e8m0fnu).view(torch.uint8).contiguous()
+            )
+            w2_scale_u8 = (
+                w2_scale_data.to(torch.float8_e8m0fnu).view(torch.uint8).contiguous()
+            )
 
         # C++ byte interleave on packed 4-bit weights.
         w13_il = interleave_moe_weights_for_sm90_mixed_gemm(
