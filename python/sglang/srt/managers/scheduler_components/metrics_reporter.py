@@ -496,7 +496,7 @@ class SchedulerMetricsReporter:
         self,
         batch: Optional[ScheduleBatch],
         prefill_stats: PrefillStats,
-        can_run_cuda_graph: bool,
+        can_run_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
         if (
@@ -549,7 +549,7 @@ class SchedulerMetricsReporter:
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
             )
 
-        msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
+        msg += f"{self._graph_backend_label}: {can_run_graph}, "
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
@@ -564,7 +564,7 @@ class SchedulerMetricsReporter:
             logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_prefill_cuda_graph_pass(
-                value=can_run_cuda_graph
+                value=can_run_graph
             )
             self.metrics_collector.increment_realtime_tokens(
                 prefill_compute_tokens=prefill_stats.log_input_tokens,
@@ -640,7 +640,7 @@ class SchedulerMetricsReporter:
 
     def report_decode_stats(
         self,
-        can_run_cuda_graph: bool,
+        can_run_graph: bool,
         running_batch: ScheduleBatch = None,
         num_correct_drafts: int = 0,
     ):
@@ -748,7 +748,7 @@ class SchedulerMetricsReporter:
             )
 
         msg += (
-            f"{self._graph_backend_label}: {can_run_cuda_graph}, "
+            f"{self._graph_backend_label}: {can_run_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )

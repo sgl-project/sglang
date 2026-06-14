@@ -174,9 +174,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker = object.__new__(EAGLEWorkerV2)
         worker._draft_worker = draft_worker
         worker._target_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(
-                attn_backend=object(), decode_cuda_graph_runner=object()
-            )
+            model_runner=SimpleNamespace(attn_backend=object(), decode_runner=object())
         )
         worker.speculative_num_steps = 2
         worker.speculative_num_draft_tokens = 3

@@ -25,27 +25,27 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_execution_backend import (
+    ExecutionBackend,
 )
 from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-        BaseCudaGraphRunner,
+    from sglang.srt.model_executor.runner.base_runner import (
+        BaseRunner,
     )
 
 
-class NPUCudaGraphBackend(BaseCudaGraphBackend):
+class NPUCudaGraphBackend(ExecutionBackend):
     """One torch.npu.NPUGraph per shape; attention metadata captured
     inside the graph. replay_with_input_update substitutes fresh
     seq_lens without re-recording."""
 
     def __init__(
         self,
-        cuda_graph_runner: BaseCudaGraphRunner,
+        cuda_graph_runner: BaseRunner,
         *,
         enable_memory_saver: bool = False,
     ) -> None:
@@ -122,7 +122,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
 
     @contextmanager

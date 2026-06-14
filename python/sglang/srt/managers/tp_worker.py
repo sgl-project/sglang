@@ -454,13 +454,13 @@ class TpModelWorker(BaseTpWorker):
     def _forward_batch_generation_dllm(
         self, forward_batch: ForwardBatch
     ) -> GenerationBatchResult:
-        logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
+        logits_output, next_token_ids, can_run_graph = self.dllm_algorithm.run(
             self.model_runner, forward_batch
         )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_graph=can_run_graph,
         )
 
     def forward_batch_generation(
@@ -492,10 +492,10 @@ class TpModelWorker(BaseTpWorker):
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            logits_output, can_run_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
-                can_run_cuda_graph=can_run_cuda_graph,
+                can_run_graph=can_run_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
@@ -548,10 +548,10 @@ class TpModelWorker(BaseTpWorker):
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            pp_proxy_tensors, can_run_graph = out.logits_output, out.can_run_graph
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
-                can_run_cuda_graph=can_run_cuda_graph,
+                can_run_graph=can_run_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
 
@@ -563,7 +563,7 @@ class TpModelWorker(BaseTpWorker):
         out = self.model_runner.forward(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
-        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+        logits_output, can_run_graph = out.logits_output, out.can_run_graph
         if logits_output:
             next_token_ids = self.model_runner.sample(
                 logits_output, batch.split_forward_batch
@@ -572,7 +572,7 @@ class TpModelWorker(BaseTpWorker):
             next_token_ids = None
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_graph=can_run_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
         )
         batch_result.next_token_ids = next_token_ids

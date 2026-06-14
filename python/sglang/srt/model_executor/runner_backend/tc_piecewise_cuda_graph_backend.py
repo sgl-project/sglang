@@ -41,8 +41,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_execution_backend import (
+    ExecutionBackend,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
@@ -51,8 +51,8 @@ from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-        BaseCudaGraphRunner,
+    from sglang.srt.model_executor.runner.base_runner import (
+        BaseRunner,
     )
     from sglang.srt.server_args import ServerArgs
 
@@ -75,12 +75,12 @@ def _toggle_multi_platform_ops(
             _toggle_multi_platform_ops(sub, reverse=reverse, num_tokens=num_tokens)
 
 
-class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
+class TcPiecewiseCudaGraphBackend(ExecutionBackend):
     """torch.compile-driven piecewise capture; attention metadata
     recomputed at replay outside the compiled callable's sub-graphs.
     """
 
-    def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
+    def __init__(self, cuda_graph_runner: BaseRunner) -> None:
         model_runner = cuda_graph_runner.model_runner
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
@@ -139,7 +139,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             graph_pool=graph_pool,
         )
 
-    def _run_compile_pass(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
+    def _run_compile_pass(self, cuda_graph_runner: BaseRunner) -> None:
         """JIT-activate kernels at the smallest shape, install
         torch.compile, then run one forward per shape inside
         enable_torch_compile_warmup to drive FX / inductor through
@@ -221,7 +221,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         # torch.compile manages its per-shape cache internally.
         # _run_compile_pass warms every shape in capture_num_tokens at __init__.
         return True

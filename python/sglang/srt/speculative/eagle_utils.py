@@ -336,22 +336,18 @@ def eagle_prepare_for_verify(
     verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
     # Run attention backend plan and cuda graph preparation
-    can_run_cuda_graph = bool(
-        target_worker.model_runner.decode_cuda_graph_runner
-        and target_worker.model_runner.decode_cuda_graph_runner.can_run(
-            verify_forward_batch
-        )
+    can_run_graph = bool(
+        target_worker.model_runner.decode_runner
+        and target_worker.model_runner.decode_runner.can_run_graph(verify_forward_batch)
     )
-    if can_run_cuda_graph:
-        target_worker.model_runner.decode_cuda_graph_runner.replay_prepare(
-            verify_forward_batch
-        )
+    if can_run_graph:
+        target_worker.model_runner.decode_runner.replay_prepare(verify_forward_batch)
         verify_forward_batch.mark_forward_metadata_ready()
     # Non-cuda-graph: defer init to forward_extend, which runs after
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
     # here would use pre-pad shapes and trip DSv4 indexer shape match.
 
-    return verify_forward_batch, can_run_cuda_graph
+    return verify_forward_batch, can_run_graph
 
 
 def eagle_sample(

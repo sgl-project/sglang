@@ -59,7 +59,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 
 @dataclass
 class PPBatchMetadata:
-    can_run_cuda_graph: bool
+    can_run_graph: bool
 
 
 class SchedulerPPMixin:
@@ -1071,9 +1071,7 @@ class SchedulerPPMixin:
             logits_output=None,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=placeholder,
-            can_run_cuda_graph=(
-                mb_metadata.can_run_cuda_graph if mb_metadata else False
-            ),
+            can_run_graph=(mb_metadata.can_run_graph if mb_metadata else False),
             skipped_output_comm=True,
         )
         d2h_event = self.device_module.Event()
@@ -1109,7 +1107,7 @@ class SchedulerPPMixin:
             next_token_ids=pp_outputs["next_token_ids"],
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-            can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            can_run_graph=mb_metadata.can_run_graph,
         )
         return output_result
 
@@ -1245,7 +1243,7 @@ class SchedulerPPMixin:
                     attrs={"pp_mb_id": mb_id},
                 )
                 mb_metadata[mb_id] = PPBatchMetadata(
-                    can_run_cuda_graph=result.can_run_cuda_graph,
+                    can_run_graph=result.can_run_graph,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())

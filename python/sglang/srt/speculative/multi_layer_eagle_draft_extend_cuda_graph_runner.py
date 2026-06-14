@@ -45,7 +45,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
-    DecodeCudaGraphRunner,
+    DecodeRunner,
     DeepEPCudaGraphRunnerAdapter,
     ShapeKey,
     get_batch_sizes_to_capture,
@@ -97,10 +97,10 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
-class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
+class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeRunner):
     """Per-step multi-layer EAGLE draft-extend runner.
 
-    Subclasses DecodeCudaGraphRunner. Shares buffers across steps
+    Subclasses DecodeRunner. Shares buffers across steps
     via the composite MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
     so initialization is split: __init__ does basic field setup,
     init_buffers_and_capture (called by the composite once shared
@@ -289,7 +289,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -300,7 +300,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, cuda_graph_bs)
+            self.backend.can_run_graph(forward_batch, cuda_graph_bs)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -617,7 +617,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
     """Composite orchestrator that owns speculative_num_steps per-step
     runners with shared input buffers. Not itself a
-    DecodeCudaGraphRunner — it only routes work to the per-step
+    DecodeRunner — it only routes work to the per-step
     runners.
     """
 
@@ -739,5 +739,5 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
     def get_last_runner(self):
         return self.runners[-1] if self.runners else None
 
-    def can_run(self, forward_batch):
-        return self.runners[0].can_run(forward_batch)
+    def can_run_graph(self, forward_batch):
+        return self.runners[0].can_run_graph(forward_batch)

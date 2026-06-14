@@ -61,7 +61,7 @@ class JointThreshold(DllmAlgorithm):
                 break
 
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            logits_output, can_run_graph = out.logits_output, out.can_run_graph
 
             any_changed_in_last_step = False
 
@@ -126,14 +126,14 @@ class JointThreshold(DllmAlgorithm):
 
         if any_changed_in_last_step:
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            logits_output, can_run_graph = out.logits_output, out.can_run_graph
 
         next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
 
-        return logits_output, next_token_ids_list, can_run_cuda_graph
+        return logits_output, next_token_ids_list, can_run_graph
 
 
 Algorithm = JointThreshold

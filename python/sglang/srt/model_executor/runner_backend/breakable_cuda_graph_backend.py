@@ -28,8 +28,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_execution_backend import (
+    ExecutionBackend,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
@@ -42,19 +42,19 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-        BaseCudaGraphRunner,
+    from sglang.srt.model_executor.runner.base_runner import (
+        BaseRunner,
     )
 
 
-class BreakableCudaGraphBackend(BaseCudaGraphBackend):
+class BreakableCudaGraphBackend(ExecutionBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
     """
 
     def __init__(
         self,
-        cuda_graph_runner: BaseCudaGraphRunner,
+        cuda_graph_runner: BaseRunner,
         *,
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
@@ -186,7 +186,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             f"{type(output)} vs {type(output_buffer)}"
         )
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
 
     @contextmanager

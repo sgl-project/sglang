@@ -36,8 +36,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-        BaseCudaGraphBackend,
+    from sglang.srt.model_executor.runner_backend.base_execution_backend import (
+        ExecutionBackend,
     )
 
 logger = logging.getLogger(__name__)
@@ -107,11 +107,11 @@ def get_batch_sizes_to_capture(
     return capture_bs, compile_bs
 
 
-class BaseCudaGraphRunner(ABC):
+class BaseRunner(ABC):
     """Abstract base for phase-specific cuda-graph runners.
 
-    A subclass (DecodeCudaGraphRunner / PrefillCudaGraphRunner) owns one
-    phase and plugs in a BaseCudaGraphBackend that handles the
+    A subclass (DecodeRunner / PrefillRunner) owns one
+    phase and plugs in a ExecutionBackend that handles the
     capture / replay mechanics. The runner orchestrates bucket
     selection, static buffer population, attention metadata init,
     replay dispatch, and output slicing.
@@ -137,7 +137,7 @@ class BaseCudaGraphRunner(ABC):
 
     # Subclasses populate before calling capture().
     buffers: ForwardInputBuffers
-    backend: BaseCudaGraphBackend
+    backend: ExecutionBackend
 
     def __init__(self, model_runner: ModelRunner) -> None:
         self.model_runner = model_runner
@@ -168,7 +168,7 @@ class BaseCudaGraphRunner(ABC):
         return buckets[index]
 
     @abstractmethod
-    def can_run(self, forward_batch: ForwardBatch) -> bool: ...
+    def can_run_graph(self, forward_batch: ForwardBatch) -> bool: ...
 
     @abstractmethod
     def capture_prepare(self, size: int, *args, **kwargs) -> Any: ...

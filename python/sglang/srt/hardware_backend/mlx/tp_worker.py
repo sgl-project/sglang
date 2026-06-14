@@ -144,7 +144,7 @@ class MlxTpModelWorker(TpModelWorker):
         if forward_mode.is_idle():
             return GenerationBatchResult(
                 logits_output=LogitsProcessorOutput(next_token_logits=None),
-                can_run_cuda_graph=False,
+                can_run_graph=False,
             )
 
         self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
@@ -231,7 +231,7 @@ class MlxTpModelWorker(TpModelWorker):
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=next_token_ids,
-            can_run_cuda_graph=False,
+            can_run_graph=False,
         )
 
     def async_forward_batch_generation_mlx(self, batch: ScheduleBatch) -> tuple[
@@ -458,7 +458,7 @@ class MlxTpModelWorker(TpModelWorker):
         if mode == "idle":
             return GenerationBatchResult(
                 logits_output=LogitsProcessorOutput(next_token_logits=None),
-                can_run_cuda_graph=False,
+                can_run_graph=False,
             )
 
         if mode == "decode":
@@ -501,5 +501,5 @@ class MlxTpModelWorker(TpModelWorker):
         return GenerationBatchResult(
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=next_token_ids,
-            can_run_cuda_graph=False,
+            can_run_graph=False,
         )
