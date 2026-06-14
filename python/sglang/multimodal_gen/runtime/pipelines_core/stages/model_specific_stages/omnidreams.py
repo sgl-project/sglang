@@ -659,8 +659,13 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # sequence shard; USPAttention handles all-to-all internally.
         # KV-cache and RoPE are sized per-rank via local chunk/window sizes.
         sp_size: int = 1
+        sp_rank: int = 0
         try:
             sp_size = max(1, get_sp_world_size())
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_sp_parallel_rank,
+            )
+            sp_rank = get_sp_parallel_rank()
         except (ImportError, AssertionError, RuntimeError):
             pass  # SP not initialized — single-GPU or CPU test.
 
@@ -808,6 +813,10 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         latent_chunks: list[torch.Tensor] = []
         for chunk_idx in range(num_chunks):
             rope_freqs = rope.shift_t(chunk_idx)
+            if sp_size > 1:
+                rope_freqs = rope_freqs[
+                    sp_rank * local_chunk_tokens : (sp_rank + 1) * local_chunk_tokens
+                ]
             is_first = chunk_idx == 0
             cond_mask = cond_mask_c0 if is_first else cond_mask_zero
             # HD-map is per-chunk: index this chunk's tokens (None -> zeros, i.e.
@@ -815,9 +824,12 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             if st["hdmap_tokens"] is None:
                 hdmap_chunk = hdmap_zero
             else:
-                hdmap_chunk = st["hdmap_tokens"][chunk_idx].to(
-                    device=device, dtype=dit_dtype
-                )
+                full_hdmap = st["hdmap_tokens"][chunk_idx]
+                if sp_size > 1:
+                    full_hdmap = full_hdmap[
+                        :, sp_rank * local_chunk_tokens : (sp_rank + 1) * local_chunk_tokens, :
+                    ]
+                hdmap_chunk = full_hdmap.to(device=device, dtype=dit_dtype)
             pin = is_first and image_full is not None
 
             def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
