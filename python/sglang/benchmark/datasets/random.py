@@ -1,7 +1,8 @@
-import json
+import os
 import random
 from argparse import Namespace
 from dataclasses import dataclass
+from json import JSONDecodeError
 from typing import List
 
 import numpy as np
@@ -14,7 +15,10 @@ from sglang.benchmark.datasets.common import (
     DatasetRow,
     compute_random_lens,
 )
-from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
+from sglang.benchmark.utils import (
+    download_and_cache_hf_file,
+    load_json_file,
+)
 
 
 @dataclass
@@ -85,15 +89,25 @@ def sample_random_requests(
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
         # Download sharegpt if necessary
-        if not is_file_valid_json(dataset_path):
+        if os.path.isfile(dataset_path):
+            try:
+                dataset = load_json_file(dataset_path)
+            except JSONDecodeError as e:
+                print(
+                    f"{dataset_path} exists but json loading fails ({e=}), "
+                    "thus treat as invalid file"
+                )
+                dataset_path = download_and_cache_hf_file(
+                    repo_id=SHAREGPT_REPO_ID,
+                    filename=SHAREGPT_FILENAME,
+                )
+                dataset = load_json_file(dataset_path)
+        else:
             dataset_path = download_and_cache_hf_file(
                 repo_id=SHAREGPT_REPO_ID,
                 filename=SHAREGPT_FILENAME,
             )
-
-        # Load the dataset.
-        with open(dataset_path) as f:
-            dataset = json.load(f)
+            dataset = load_json_file(dataset_path)
         # Filter out the conversations with less than 2 turns.
         dataset = [
             data
