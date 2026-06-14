@@ -704,14 +704,7 @@ class ServerArgs(DisaggServerArgsMixin):
         return None, None
 
     def _adjust_warmup(self):
-        # `warmup_mode` is the canonical knob (preferred internally and externally);
-        # `warmup` / `server_warmup` are kept as deprecated, derived projections.
-        # Precedence when resolving the booleans:
-        #   1. an explicitly-passed --warmup-mode wins over everything;
-        #   2. otherwise an explicitly-passed legacy --warmup/--server-warmup wins
-        #      over a *defaulted* warmup_mode (e.g. serve's default of "server"),
-        #      so `sglang serve --warmup false` still disables warmup;
-        #   3. otherwise warmup_mode (explicit or defaulted) drives the booleans.
+        #   --warmup-mode > --warmup/--server-warmup
         mode_explicit = self.is_arg_explicitly_set("warmup_mode")
         legacy_explicit = self.is_arg_explicitly_set(
             "warmup"
