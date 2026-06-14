@@ -532,3 +532,130 @@ def test_rope_to_cos_sin_cache_non_standard_head_dim():
         half = head_dim // 2
         identity_err = (cs[:, :half] ** 2 + cs[:, half:] ** 2 - 1.0).abs().max().item()
         assert identity_err < 1e-6, f"head_dim={head_dim}: cos^2+sin^2 != 1, error={identity_err}"
+
+
+# ============================================================================
+# SP (Sequence Parallelism) Tests -- TDD for attention split
+# ============================================================================
+
+def test_sp_self_attention_uses_usp_attention():
+    """OmniDreamsSelfAttention must use USPAttention (SP-compatible)."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
+        OmniDreamsSelfAttention,
+    )
+    attn = OmniDreamsSelfAttention(query_dim=2048, n_heads=16, head_dim=128)
+    from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+    msg = (
+        "OmniDreamsSelfAttention must contain a USPAttention for SP support. "
+        "If this fails, self-attention is using raw SDPA without SP communication."
+    )
+    found = isinstance(attn.attn, USPAttention)
+    assert found, msg
+
+
+def test_sp_cross_attention_uses_local_attention():
+    """OmniDreamsCrossAttention must use LocalAttention (no SP needed)."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
+        OmniDreamsCrossAttention,
+    )
+    attn = OmniDreamsCrossAttention(
+        query_dim=2048, context_dim=1024, n_heads=16, head_dim=128,
+    )
+    from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+    msg = (
+        "OmniDreamsCrossAttention must contain a LocalAttention. "
+        "Cross-attention text K/V is replicated across SP ranks; no all-to-all needed."
+    )
+    found = isinstance(attn.attn, LocalAttention)
+    assert found, msg
+
+
+def test_sp_block_init_uses_correct_attention_classes():
+    """OmniDreamsBlock.__init__ must use Self/Cross classes, not the old alias."""
+    import inspect, os
+    dit_path = os.path.join(
+        os.path.dirname(__file__), "..", "..",
+        "runtime", "models", "dits", "omnidreams.py",
+    )
+    with open(dit_path) as f:
+        source = f.read()
+    checks = [
+        ("self_attn init", "self.self_attn = OmniDreamsSelfAttention(x_dim, num_heads, head_dim)" in source),
+        ("cross_attn init", "self.cross_attn = OmniDreamsCrossAttention(x_dim, context_dim, num_heads, head_dim)" in source),
+        ("no old class name in init", "OmniDreamsAttention(x_dim, None" not in source),
+        ("no old class name in cross init", "OmniDreamsAttention(x_dim, context_dim" not in source),
+    ]
+    failed = [label for label, ok in checks if not ok]
+    assert not failed, (
+        "OmniDreamsBlock.__init__ still uses the old OmniDreamsAttention class name:\n"
+        + "\n".join(f"  - {f}" for f in failed)
+    )
+
+
+def test_sp_self_attention_no_context_arg_in_block_call():
+    """Block.forward must NOT pass 'context' to self_attn (self-attn has no context)."""
+    import inspect, os
+    dit_path = os.path.join(
+        os.path.dirname(__file__), "..", "..",
+        "runtime", "models", "dits", "omnidreams.py",
+    )
+    with open(dit_path) as f:
+        source = f.read()
+    # Extract the self-attn call line from Block.forward
+    block_forward = source.split("def forward(self,")[1].split("def _cross_view_attn_forward")[0]
+    self_call = [l for l in block_forward.split('\n') if 'self.self_attn(' in l and ' ' in l]
+    if self_call:
+        call_line = self_call[0].strip()
+        assert "context=context" not in call_line, (
+            "OmniDreamsSelfAttention.forward() should NOT accept a 'context' kwarg. "
+            "Self-attention context is always the same as x (implicit). "
+            f"Found in: {call_line}"
+        )
+        assert "rope_freqs=" in call_line, (
+            "OmniDreamsSelfAttention.forward() should accept 'rope_freqs' for RoPE. "
+            f"Found: {call_line}"
+        )
+
+
+def test_sp_cross_attention_no_rope_in_block_call():
+    """Block.forward must NOT pass rope_freqs to cross_attn (cross-attn has no RoPE)."""
+    import inspect, os
+    dit_path = os.path.join(
+        os.path.dirname(__file__), "..", "..",
+        "runtime", "models", "dits", "omnidreams.py",
+    )
+    with open(dit_path) as f:
+        source = f.read()
+    block_forward = source.split("def forward(self,")[1].split("def _cross_view_attn_forward")[0]
+    cross_call = [l for l in block_forward.split('\n') if 'self.cross_attn(' in l and 'context=context' in l]
+    if cross_call:
+        call_line = cross_call[0].strip()
+        assert "rope_freqs" not in call_line, (
+            "OmniDreamsCrossAttention.forward() should NOT accept 'rope_freqs'. "
+            "Cross-attention does not use RoPE (plan non-negotiable). "
+            f"Found in: {call_line}"
+        )
+
+
+def test_sp_precompute_cross_attn_kv_still_works():
+    """precompute_cross_attn_kv must iterate blocks and access cross_attn attributes."""
+    import inspect, os
+    dit_path = os.path.join(
+        os.path.dirname(__file__), "..", "..",
+        "runtime", "models", "dits", "omnidreams.py",
+    )
+    with open(dit_path) as f:
+        source = f.read()
+    precompute = source.split("def precompute_cross_attn_kv")[1].split("def patchify")[0]
+    checks = [
+        ("iterates blocks", "for block in self.blocks:" in precompute),
+        ("accesses cross_attn", "block.cross_attn" in precompute),
+        ("uses k_proj", "attn.k_proj(context)" in precompute or "k_proj" in precompute),
+        ("uses v_proj", "attn.v_proj(context)" in precompute or "v_proj" in precompute),
+        ("uses k_norm", "attn.k_norm" in precompute),
+        ("returns K,V tuples", "result.append((k, v))" in precompute),
+    ]
+    failed = [label for label, ok in checks if not ok]
+    assert not failed, (
+        "precompute_cross_attn_kv is broken:\n" + "\n".join(f"  - {f}" for f in failed)
+    )
