@@ -82,12 +82,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     ):
         # Parse args
         self.eagle_worker = eagle_worker
-        if not hasattr(eagle_worker, "model_runner"):
-            self.model_runner = model_runner = eagle_worker.draft_runner
-            self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
-        else:
-            self.model_runner = model_runner = eagle_worker.model_runner
-            self.forward_mode = ForwardMode.DRAFT_EXTEND
+        self.model_runner = model_runner = eagle_worker.draft_runner
+        self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         # Fields the parent's capture() reads:
         self.device = model_runner.device
@@ -211,11 +207,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             next_token_logits_buffer = torch.zeros(
                 (
-                    (
-                        self.max_bs * self.num_tokens_per_bs
-                        if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
-                        else self.max_bs
-                    ),
+                    self.max_bs * self.num_tokens_per_bs,
                     vocab_size,
                 ),
                 dtype=torch.float,
@@ -312,15 +304,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[
-            : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
-        ]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
 
-        # V1 (DRAFT_EXTEND): pruned_states = bs (last token per seq)
-        # V2 (DRAFT_EXTEND_V2): pruned_states = num_tokens (all tokens)
-        num_tokens_for_logprob = (
-            num_tokens if self.forward_mode.is_draft_extend_v2() else bs
-        )
+        # pruned_states = num_tokens (all tokens)
+        num_tokens_for_logprob = num_tokens
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
@@ -497,12 +484,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            if self.forward_mode.is_draft_extend_v2():
-                buffers.global_num_tokens_for_logprob_gpu.fill_(
-                    bs * self.num_tokens_per_bs
-                )
-            else:
-                buffers.global_num_tokens_for_logprob_gpu.fill_(bs)
+            buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
@@ -559,26 +541,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
 
-        if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
-            unpadding_bs = num_tokens
-        elif bs != raw_bs:
-            forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[
-                :raw_bs
-            ]
-            forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[
-                :raw_bs
-            ]
-            unpadding_bs = raw_bs
-        else:
-            unpadding_bs = None
-
-        if unpadding_bs is not None:
-            out_copy = out
-            out = LogitsProcessorOutput(
-                next_token_logits=out.next_token_logits[:unpadding_bs],
-                hidden_states=out.hidden_states[:unpadding_bs],
-            )
-            if self.forward_mode != ForwardMode.DRAFT_EXTEND_V2:
-                out.topk_p = out_copy.topk_p[:raw_bs]
-                out.topk_index = out_copy.topk_index[:raw_bs]
+        out = LogitsProcessorOutput(
+            next_token_logits=out.next_token_logits[:num_tokens],
+            hidden_states=out.hidden_states[:num_tokens],
+        )
         return out

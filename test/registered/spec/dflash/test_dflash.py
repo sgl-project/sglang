@@ -3,8 +3,8 @@ import unittest
 import openai
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import (
@@ -21,11 +21,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=302, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
     max_running_requests = 64
-    attention_backend = "flashinfer"
+    attention_backend = "triton" if is_hip() else "flashinfer"
     page_size = 1
     other_launch_args = []
     # Base classes exercise the non-overlap (synchronous) scheduling path.
