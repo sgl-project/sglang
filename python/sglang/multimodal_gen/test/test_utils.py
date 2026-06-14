@@ -36,11 +36,14 @@ logger = init_logger(__name__)
 
 SGL_TEST_FILES_CI_DATA_REVISION = "f0fd96eab85baed5256d142c7659e0634e7e4410"
 
+GITHUB_CONTENT_PROXY_URL = ""
+
 if current_platform.is_npu():
+    GITHUB_CONTENT_PROXY_URL = "https://gh-proxy.test.osinfra.cn/"
     SGL_TEST_FILES_CI_DATA_REVISION = "670d66a8a290b62c0c3c077b3e9b0f4a4d9a44e7"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
-    "https://raw.githubusercontent.com/"
+    f"{GITHUB_CONTENT_PROXY_URL}https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
     "diffusion-ci/consistency_gt"
 )
