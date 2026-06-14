@@ -119,6 +119,7 @@ class EmbeddingCacheController:
         enable_eviction: bool = True,
         max_eviction_batch: int = 100,
     ):
+        self.tp_rank = tp_rank
         self.tp_world_size = tp_size
         self.tp_group = tp_group
         self.tp_rank = tp_rank
@@ -448,7 +449,7 @@ class EmbeddingCacheController:
                 sizes.append(size_bytes)
                 new_count += 1
 
-            if keys:
+            if self.tp_rank == 0 and keys:
                 logger.info(
                     f"Global Cache: Inserting {len(keys)} embeddings into Mooncake cluster "
                     f"({new_count} new, {local_hit_count} existing for replication, "

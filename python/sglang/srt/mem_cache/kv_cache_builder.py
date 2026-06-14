@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache, init_mm_global_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -238,6 +238,67 @@ def build_kv_cache(
 
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+    def _infer_embedding_dims(model_config) -> dict:
+        """Infer per-modality embedding dimensions from hf_config."""
+        from sglang.srt.managers.schedule_batch import Modality
+
+        default = model_config.hidden_size
+        hf_cfg = model_config.hf_config
+        thinker_cfg = getattr(hf_cfg, "thinker_config", None)
+        dims = {
+            Modality.IMAGE: default,
+            Modality.VIDEO: default,
+            Modality.AUDIO: default,
+        }
+
+        vision_cfg = getattr(thinker_cfg, "vision_config", None) or getattr(
+            hf_cfg, "vision_config", None
+        )
+        if vision_cfg is not None:
+            out_hs = getattr(vision_cfg, "out_hidden_size", None)
+            if out_hs is not None:
+                ds = getattr(vision_cfg, "deepstack_visual_indexes", None)
+                vis_dim = (
+                    out_hs * (1 + len(ds))
+                    if isinstance(ds, (list, tuple)) and ds
+                    else out_hs
+                )
+                dims[Modality.IMAGE] = vis_dim
+                dims[Modality.VIDEO] = vis_dim
+
+        audio_cfg = getattr(thinker_cfg, "audio_config", None) or getattr(
+            hf_cfg, "audio_config", None
+        )
+        if audio_cfg is not None:
+            for attr in ("output_dim", "d_model"):
+                val = getattr(audio_cfg, attr, None)
+                if val and int(val) > 0:
+                    dims[Modality.AUDIO] = int(val)
+                    break
+
+        return dims
+
+    # Initialize global multimodal cache for L1->L2->Compute tiered caching
+    if server_args.enable_mm_global_cache:
+        from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
+            EmbeddingCacheController,
+        )
+
+        hidden_dims = _infer_embedding_dims(model_config)
+        global_cache = EmbeddingCacheController(
+            tp_rank=ps.tp_rank,
+            tp_size=ps.tp_size,
+            hidden_dims=hidden_dims,
+            tp_group=tp_cpu_group,
+            all_rank_get=False,
+        )
+        init_mm_global_cache(global_cache)
+        logger.info(
+            f"Initialized global multimodal cache for tiered caching (L1->L2->Compute)"
+        )
+    else:
+        init_mm_global_cache(None)
 
     return KVCacheBuildResult(
         is_hybrid_swa=is_hybrid_swa,
