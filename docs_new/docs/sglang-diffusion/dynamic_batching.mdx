@@ -10,7 +10,7 @@ Use it for concurrent T2I or T2V traffic with the same model and sampling shape.
 
 ## Enable
 
-Dynamic batching is disabled by default with `--batching-max-size 1`.
+Dynamic batching is disabled by default. Set `--batching-max-size` above `1` to enable it.
 
 ```bash Command
 sglang serve \
@@ -24,19 +24,28 @@ sglang serve \
 
 For request formats, see the [OpenAI-Compatible API](./api/openai_api).
 
-Use `--batching-config /path/to/batching_config.json` to load JSON rules when a model or resolution needs a lower cap than `--batching-max-size`:
+## Memory-Aware Admission
 
-```json Config
-{
-  "schema_version": 1,
-  "rules": [
-    {
-      "model_contains": "Qwen-Image",
-      "resolution": "1024x1024",
-      "max_batch_size": 1
-    }
-  ]
-}
+When dynamic batching is enabled, SGLang-Diffusion records peak GPU memory from completed batches and uses those measurements for future admission decisions.
+
+Profiles are keyed by runtime settings and request shape. By default, they are cached under `${SGLANG_DIFFUSION_BATCH_MEMORY_CACHE:-~/.cache/sglang/diffusion_batch_memory}`. Set `--batching-memory-profile-cache none` to disable persistence.
+
+For a new shape, admission starts with a singleton measurement. During cold start, SGLang-Diffusion uses that singleton as a rough estimate to reject candidates that appear too large. After enough successful batches are observed, it predicts candidate peak memory from measured peaks and rejects candidates that exceed the current safe GPU memory budget.
+
+`--batching-memory-reserve-fraction` controls the fraction of total device memory held back from memory-aware batching as allocator and workspace slack. The default is `0.02`. Increase it on shared or memory-volatile GPUs to reduce OOM risk; lower it only for dedicated, calibrated workloads when the reserve is the binding limit. If you override it, use the same value during calibration and serving.
+
+This is measured runtime prediction, not exact byte-level tensor accounting. It reduces OOM risk for repeated shapes, but first-time shapes and backend/runtime changes can still require calibration.
+
+## Calibration
+
+Production deployments can prefill the memory profile cache before serving traffic:
+
+```bash Command
+python -m sglang.multimodal_gen.tools.calibrate_batch_memory \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --shapes 1024x1024 \
+  --batch-sizes 1,2,4,8 \
+  --batching-memory-profile-cache /path/to/diffusion_batch_memory
 ```
 
 ## Compatibility
@@ -134,13 +143,15 @@ An initial implementation of dynamic batching for T2I and T2V models can be foun
 
 ## Notes
 
-- Requests batch only when model inputs, sampling parameters, output handling, and any configured rules are compatible.
-- There is no startup probing, runtime learning, OOM retry, or automatic fallback to singletons. If a merged batch fails or cannot be split, every request in that batch receives an error.
+- Requests batch only when model inputs, sampling parameters, and output handling are compatible.
+- `--batching-max-size` remains the hard user ceiling.
+- Memory-aware admission uses measured runtime profiles. It is not exact byte-level tensor accounting and cannot guarantee OOM-free execution for every unseen shape or backend change.
+- There is no automatic fallback to singletons. If a merged batch fails or cannot be split, every request in that batch receives an error.
 - Batch shape can change kernels, so singleton and dynamic outputs are not expected to be bit-exact.
 - Use `--enable-batching-metrics` to inspect realized batches:
 
 ```text
 Dynamic batch dispatch: size=2/8, user_max=8, queue_wait=5.12ms, stop_reason=delay
-Dynamic batch dispatch: size=1/8, user_max=8, queue_wait=0.04ms, stop_reason=config_cap:1
+Dynamic batch dispatch: size=1/8, user_max=8, queue_wait=0.04ms, stop_reason=memory_uncalibrated:allow=1
 Dynamic batch stats (last 5 dispatches): avg_size=2.80, merged_rate=60.0%, full_rate=20.0%, utilization=35.0%, wait_avg=3.21ms, wait_p95=5.12ms, top_rejects=none
 ```
