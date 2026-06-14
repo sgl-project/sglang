@@ -17,6 +17,7 @@ Reference: https://lmsys.org/blog/2024-02-05-compressed-fsm/
 """
 
 import dataclasses
+import functools
 import logging
 from collections import defaultdict
 from typing import Optional
@@ -37,9 +38,6 @@ except ImportError:
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 
-# Env var was set in sglang.srt.server_args.ServerArgs.__post_init__
-DISABLE_DISK_CACHE = get_bool_env_var("SGLANG_DISABLE_OUTLINES_DISK_CACHE", "true")
-
 logger = logging.getLogger(__name__)
 
 
@@ -52,10 +50,29 @@ class JumpEdge:
 
 
 def disk_cache(expire: Optional[float] = None, typed=False, ignore=()):
-    if not DISABLE_DISK_CACHE:
-        return cache(expire, typed, ignore)
-    else:
-        return lambda fn: None
+    """Decorator that optionally caches to disk via outlines.
+
+    The env var SGLANG_DISABLE_OUTLINES_DISK_CACHE is checked at each call
+    rather than at import time, so ServerArgs.__post_init__ can set it before
+    any cached function is first invoked (fixes high-concurrency IO errors).
+    """
+
+    def decorator(fn):
+        _cached_fn: list = []  # one-element list used as a mutable cell
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            # Read env var lazily so the value set by ServerArgs is respected
+            # even when this module was imported before ServerArgs initialised.
+            if get_bool_env_var("SGLANG_DISABLE_OUTLINES_DISK_CACHE", "true"):
+                return fn(*args, **kwargs)
+            if not _cached_fn:
+                _cached_fn.append(cache(expire, typed, ignore)(fn))
+            return _cached_fn[0](*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 @disk_cache()
