@@ -243,6 +243,7 @@ class Envs:
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
+    SGLANG_ENABLE_NVTX = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
@@ -480,6 +481,9 @@ class Envs:
     SGLANG_USE_MLX = EnvBool(False)
     SGLANG_MLX_USE_CUSTOM_ROPE = EnvBool(False)
     SGLANG_MLX_FUSE_SWIGLU = EnvBool(False)
+    # Number of decode steps between periodic mx.clear_cache() calls.
+    # Set to 0 to disable cache clearing entirely.
+    SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)

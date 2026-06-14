@@ -131,6 +131,7 @@ class MlxModelRunner:
         self._mem_fraction_static = mem_fraction_static
         # Counter used to trigger periodic mx.clear_cache() calls.
         self._decode_step_ct: int = 0
+        self._clear_steps = envs.SGLANG_MLX_CLEAR_CACHE_STEPS.get()
         # On-the-fly quantization preset (e.g. "mlx_q4"). None = no on-load quantization.
         # Pre-quantized HF repos load correctly regardless of this setting:
         # mlx_lm.load() detects the config and instantiates QuantizedLinear
@@ -1244,8 +1245,7 @@ class MlxModelRunner:
             self._req_token_ids[rid].append(next_tokens[i])
 
         self._decode_step_ct += 1
-        # TODO (changminbark): allow for flag configuration for clearing mx cache
-        if self._decode_step_ct % 256 == 0:
+        if self._clear_steps > 0 and self._decode_step_ct % self._clear_steps == 0:
             mx.clear_cache()
 
         return next_tokens

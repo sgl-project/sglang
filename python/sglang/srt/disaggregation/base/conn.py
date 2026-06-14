@@ -19,6 +19,9 @@ class StateType(str, enum.Enum):
     SWA = "swa"
     DSA = "dsa"
     MINIMAX_INDEX_K = "minimax_index_k"
+    # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
+    # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
+    SWA_RING = "swa_ring"
 
 
 @dataclasses.dataclass
