@@ -261,6 +261,10 @@ inputs/
 python/sglang/_version.py
 python/kernel.lock
 
+# Ascend Memcache
+python/sglang/srt/mem_cache/storage/ascend_memcache/localservice_config.json
+python/sglang/srt/mem_cache/storage/ascend_memcache/metaservice_config.json
+
 # MUSA section
 # Generated source files by torchada
 sgl-kernel/csrc_musa/
