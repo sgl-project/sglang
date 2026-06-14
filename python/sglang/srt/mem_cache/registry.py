@@ -88,6 +88,15 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return SWAChunkCache(params)
 
+    if server_args.enable_hisparse and not ctx.disable_radix_cache:
+        from sglang.srt.mem_cache.hisparse_unified_radix_cache import (
+            HiSparseUnifiedRadixCache,
+        )
+        from sglang.srt.mem_cache.unified_cache_components import ComponentType
+
+        params.tree_components = (ComponentType.FULL,)
+        return HiSparseUnifiedRadixCache(params)
+
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
         # lazy import to avoid JIT overhead
         from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
