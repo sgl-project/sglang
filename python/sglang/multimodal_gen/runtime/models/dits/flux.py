@@ -30,6 +30,7 @@ from torch.nn import LayerNorm as LayerNorm
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.fused_gelu import linear_gelu_tanh
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm_with_optional_rope,
@@ -39,7 +40,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.layers.fused_gelu import linear_gelu_tanh
 from sglang.multimodal_gen.runtime.layers.mlp import FeedForward
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
