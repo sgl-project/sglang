@@ -226,21 +226,6 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch, use_bound=use_bound, seq_lens_cpu=seq_lens_cpu
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # Converged body -- identical to init_forward_metadata_out_graph modulo
-        # the `in_capture or` in the seam and the in_capture guard on
-        # seq_lens_cpu (eager never captures). Merged into the shared helper /
-        # base wrapper next.
-        bs = forward_batch.batch_size
-        forward_mode = forward_batch.forward_mode
-        use_bound = self._use_cuda_graph_buffers(bs, forward_mode)
-        if not use_bound:
-            self._execute_deferred_mamba_cow_and_clear(forward_batch)
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        self.forward_metadata = self._compute_forward_metadata(
-            forward_batch, use_bound=use_bound, seq_lens_cpu=seq_lens_cpu
-        )
-
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
     ):
