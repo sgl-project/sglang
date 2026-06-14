@@ -71,7 +71,6 @@ class EagleDraftInputV2Mixin:
             nxt_kv_lens[i] = nxt
             num_needed_tokens += nxt - cur
             r.kv_allocated_len = nxt
-            r.decode_batch_idx += 1
             # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
             r.kv_committed_len += 1
 
