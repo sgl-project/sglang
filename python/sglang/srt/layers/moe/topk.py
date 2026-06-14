@@ -1114,15 +1114,16 @@ def is_power_of_two(n):
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
+    fill_value: int = -1,
 ) -> None:
     if num_token_non_padded is None:
         return
     # TODO: let the kernel support other dtypes
-    if _is_cuda and topk_ids.dtype == torch.int32:
+    if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
+        topk_ids[indices >= num_token_non_padded, :] = fill_value
 
 
 def _zero_topk_weights_padded_region(
@@ -1506,13 +1507,15 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_hip:
-        topk_ids = _biased_grouped_topk_postprocess(
-            topk_ids, expert_location_dispatch_info, num_token_non_padded
-        )
-        # On AMD HIP, the aiter MoE kernels do not handle topk_ids=-1 safely
-        # (negative indices cause illegal memory access). Instead, zero the
-        # routing weights for padded tokens so their MoE output contributes
-        # nothing to the hidden state after the weighted sum.
+        # The DP-attention padded region of topk_ids holds garbage expert ids.
+        # Mask it to a valid in-range id (0) BEFORE the logical->physical remap;
+        # otherwise the remap gather indexes the EPLB dispatch map out of bounds
+        # (illegal memory access on ROCm), which grows with uneven per-rank token
+        # counts (variable-length, high concurrency). Do not use -1 here: the
+        # aiter MoE kernels do not handle topk_ids=-1 safely, so padded tokens
+        # are neutralized via weight-zeroing below instead.
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     if recorder_topk_ids is None:
