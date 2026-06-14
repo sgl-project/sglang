@@ -28,6 +28,7 @@ from torch import Tensor
 from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_kvcache import BlockKVCache
 
 # RoPE primitives live in omnidreams_rope; re-exported here for callers/tests.
@@ -258,8 +259,8 @@ class FinalLayer(nn.Module):
         return self.linear(x)
 
 
-class OmniDreamsAttention(nn.Module):
-    """Multi-head attention block (self or cross), with optional TP support.
+class _OmniDreamsAttnBase(nn.Module):
+    """Shared projection + norm setup for OmniDreams self/cross attention.
 
     Submodules: ``q_proj``/``k_proj``/``v_proj``/``output_proj`` (all bias-free)
     and per-head ``q_norm``/``k_norm`` RMSNorms. The attention op itself carries
@@ -303,7 +304,6 @@ class OmniDreamsAttention(nn.Module):
     def _project_qkv(self, x: Tensor, ctx: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Project Q/K/V, handling the TP ColumnParallelLinear return convention."""
         if self._is_tp:
-            # TP linears (ColumnParallelLinear) return ``(out, bias)`` tuples.
             q_raw, _ = self.q_proj(x)
             k_raw, _ = self.k_proj(ctx)
             v_raw, _ = self.v_proj(ctx)
@@ -313,78 +313,156 @@ class OmniDreamsAttention(nn.Module):
             v_raw = self.v_proj(ctx)
         return q_raw, k_raw, v_raw
 
+
+class OmniDreamsSelfAttention(_OmniDreamsAttnBase):
+    """Self-attention with RoPE + KV-cache window + USPAttention (SP-compatible).
+
+    When SP is active (>1 rank), the input is the local sequence shard
+    ``[B, S_local, D]`` and ``USPAttention`` handles the all-to-all
+    communication internally.
+
+    When ``kv_cache`` (a :class:`BlockKVCache`) is given, this is an AR
+    self-attention step: the current chunk's post-RoPE K and V are written
+    into the cache and Q attends over the full cached window.
+    """
+
+    def __init__(
+        self,
+        query_dim: int,
+        n_heads: int,
+        head_dim: int,
+    ) -> None:
+        # Self-attention: context = query (same dim, same tensor).
+        super().__init__(query_dim, None, n_heads, head_dim)
+        n = _local_heads(n_heads)
+        self.attn = USPAttention(
+            num_heads=n,
+            head_size=head_dim,
+            causal=False,
+            softmax_scale=None,
+        )
+
     def forward(
         self,
         x: Tensor,
         rope_freqs: Tensor | None = None,
-        context: Tensor | None = None,
         kv_cache=None,
-        cross_kv: tuple[Tensor, Tensor] | None = None,
         rope_cos_sin: Tensor | None = None,
     ) -> Tensor:
-        """Attention with an optional KV-cache window (autoregressive self-attn)
-        and optional precomputed cross-attention K/V (Phase 6 caching).
+        """Self-attention on the input sequence.
 
-        Q/K are per-head RMSNorm'd, then (self-attn only) rotated by RoPE before
-        a full bidirectional SDPA (scale 1/sqrt(head_dim)). Cross-attention passes
-        ``context`` as K/V source and no RoPE.
+        Args:
+            x: ``[B, S_local, D]`` (SP-sharded when SP > 1).
+            rope_freqs: ``[S_local, 1, 1, head_dim]`` RoPE frequencies.
+            kv_cache: optional :class:`BlockKVCache` for AR rollout.
+            rope_cos_sin: optional ``[S_local, D]`` pre-computed cache.
 
-        When ``rope_cos_sin`` is provided, it dispatches to the fast framework
-        RoPE backend (FlashInfer on CUDA, Triton fallback) instead of computing
-        cos/sin eagerly per-chunk.  The cache format is ``[L, D]`` with the first
-        D/2 columns = cos and the second D/2 = sin.
-
-        When ``kv_cache`` (a :class:`BlockKVCache`) is given, this is an AR
-        self-attention step: the current chunk's post-RoPE K and V are written
-        into the cache (``seq_dim=1``) and Q attends over the full cached window
-        ``[sink | window]``. The cache's ``before_update``/``after_update`` (window
-        roll + bookkeeping) are driven by the denoising stage, not here -- here we
-        only ``update`` (write) and read ``cached_k``/``cached_v``. Cross-chunk
-        causality comes solely from the window (no causal mask); each chunk's K is
-        rotated by its absolute position via ``shift_t`` before being cached, so
-        cached K and current Q keep the correct relative rotation.
-
-        When ``cross_kv`` (a ``(K,V)`` tuple) is given, the K/V projections and
-        K-norm are skipped for the cross-attention path and the precomputed
-        tensors are used directly. The cached K already has ``k_norm`` applied.
-        This avoids redundant projection of the same text context in every AR
-        forward (28 blocks × num_chunks × 3 calls/chunk). ``context`` is still
-        required for the Q projection from ``x``.
+        Returns:
+            ``[B, S_local, D]`` output.
         """
-        ctx = x if context is None else context
         B, L, _ = x.shape
         n, d = self.local_num_heads, self.head_dim
 
-        if cross_kv is not None:
-            # Precomputed cross-attn K/V — skip k_proj/v_proj/k_norm.
-            # Q still needs projection since it depends on the current x.
-            q_raw = self.q_proj(x)[0] if self._is_tp else self.q_proj(x)
-            q = self.q_norm(q_raw.reshape(B, L, n, d))
-            k, v = cross_kv
-        else:
-            q_raw, k_raw, v_raw = self._project_qkv(x, ctx)
-            Lk = ctx.shape[1]
-            q = self.q_norm(q_raw.reshape(B, L, n, d))
-            k = self.k_norm(k_raw.reshape(B, Lk, n, d))
-            v = v_raw.reshape(B, Lk, n, d)
+        q_raw, k_raw, v_raw = self._project_qkv(x, x)
+        q = self.q_norm(q_raw.reshape(B, L, n, d))
+        k = self.k_norm(k_raw.reshape(B, L, n, d))
+        v = v_raw.reshape(B, L, n, d)
 
+        # RoPE on Q and K (NeoX-style, 3D RoPE).
         if rope_freqs is not None:
             q = apply_rope_freqs(q, rope_freqs, cos_sin_cache=rope_cos_sin)
             k = apply_rope_freqs(k, rope_freqs, cos_sin_cache=rope_cos_sin)
+
+        # AR rollout: write the chunk's post-RoPE K/V into the cache, then
+        # attend over the full cached window (sink + rolling window).
         if kv_cache is not None:
-            # Write this chunk's (post-RoPE) K/V, then attend over the window.
             kv_cache.update(k, v)
             k = kv_cache.cached_k()
             v = kv_cache.cached_v()
-        # SDPA expects [B, n, S, d]; default scale = 1/sqrt(d), no mask.
-        out = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        )
-        out = out.transpose(1, 2).reshape(B, L, n * d)
+
+        # USPAttention expects ``[B, S_local, H, D]`` and handles SP all-to-all
+        # internally. No causal mask; the KV-cache window provides causality.
+        out = self.attn(q, k, v)
+        out = out.reshape(B, L, n * d)
         if self._is_tp:
             out, _ = self.output_proj(out)
             return out
         return self.output_proj(out)
+
+
+class OmniDreamsCrossAttention(_OmniDreamsAttnBase):
+    """Cross-attention with precomputed K/V + LocalAttention (no SP comms needed).
+
+    Cross-attention does NOT require SP communication because:
+    - Query comes from the main sequence (SP-sharded when SP > 1).
+    - Key/Value come from text context, which is replicated across all ranks.
+
+    Uses ``LocalAttention`` instead of ``USPAttention`` -- each rank
+    computes attention independently on its local Q against the full
+    (replicated) K/V from text embeddings.
+
+    When ``cross_kv`` (Phase 6 precomputed K/V) is provided, ``k_proj``,
+    ``v_proj``, and ``k_norm`` are skipped.
+    """
+
+    def __init__(
+        self,
+        query_dim: int,
+        context_dim: int,
+        n_heads: int,
+        head_dim: int,
+    ) -> None:
+        super().__init__(query_dim, context_dim, n_heads, head_dim)
+        n = _local_heads(n_heads)
+        self.attn = LocalAttention(
+            num_heads=n,
+            head_size=head_dim,
+            causal=False,
+            softmax_scale=None,
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        context: Tensor,
+        cross_kv: tuple[Tensor, Tensor] | None = None,
+    ) -> Tensor:
+        """Cross-attention: Q from x, K/V from context (or precomputed cache).
+
+        Args:
+            x: ``[B, S_local, D]`` query (SP-sharded when SP > 1).
+            context: ``[B, S_ctx, D]`` text embedding (replicated across ranks).
+            cross_kv: optional ``(K, V)`` tuple from Phase 6 precompute.
+
+        Returns:
+            ``[B, S_local, D]`` output.
+        """
+        B, L, _ = x.shape
+        n, d = self.local_num_heads, self.head_dim
+
+        if cross_kv is not None:
+            # Phase 6: precomputed cross-attn K/V — skip k_proj/v_proj/k_norm.
+            q_raw = self.q_proj(x)[0] if self._is_tp else self.q_proj(x)
+            q = self.q_norm(q_raw.reshape(B, L, n, d))
+            k, v = cross_kv
+        else:
+            q_raw, k_raw, v_raw = self._project_qkv(x, context)
+            q = self.q_norm(q_raw.reshape(B, L, n, d))
+            k = self.k_norm(k_raw.reshape(context.shape[0], context.shape[1], n, d))
+            v = v_raw.reshape(context.shape[0], context.shape[1], n, d)
+
+        # LocalAttention — no SP communication, no RoPE, no KV-cache.
+        out = self.attn(q, k, v)
+        out = out.reshape(B, L, n * d)
+        if self._is_tp:
+            out, _ = self.output_proj(out)
+            return out
+        return self.output_proj(out)
+
+
+# Backward-compatible alias for tests and the precompute path.
+OmniDreamsAttention = OmniDreamsSelfAttention
+
 
 
 class OmniDreamsBlock(nn.Module):
@@ -417,21 +495,21 @@ class OmniDreamsBlock(nn.Module):
         self.layer_norm_self_attn = LayerNormScaleShift(
             x_dim, eps=1e-6
         )
-        self.self_attn = OmniDreamsAttention(x_dim, None, num_heads, head_dim)
+        self.self_attn = OmniDreamsSelfAttention(x_dim, num_heads, head_dim)
 
         # Cross-view attention (Phase 5) — learnable LayerNorm (unlike AdaLN).
         if enable_cross_view_attn:
             self.layer_norm_cross_view_attn = nn.LayerNorm(
                 x_dim, elementwise_affine=True, eps=1e-6
             )
-            self.cross_view_attn = OmniDreamsAttention(
-                x_dim, x_dim, num_heads, head_dim
+            self.cross_view_attn = OmniDreamsSelfAttention(
+                x_dim, num_heads, head_dim
             )
 
         self.layer_norm_cross_attn = LayerNormScaleShift(
             x_dim, eps=1e-6
         )
-        self.cross_attn = OmniDreamsAttention(x_dim, context_dim, num_heads, head_dim)
+        self.cross_attn = OmniDreamsCrossAttention(x_dim, context_dim, num_heads, head_dim)
 
         self.layer_norm_mlp = LayerNormScaleShift(x_dim, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
@@ -751,6 +829,11 @@ class OmniDreamsDiT(BaseDiT):
         already multiplied by the per-frame spatial token count). K/V are stored
         with ``seq_dim=1`` and shape ``[B, sink+window, local_heads, head_dim]``
         (TP-sharded heads when tensor parallelism is active).
+
+        When Sequence Parallelism (SP) is active, the caller must pre-divide
+        ``chunk_tokens``, ``window_tokens``, and ``sink_tokens`` by
+        ``sp_size`` so each rank creates only its local cache portion.
+        USPAttention handles the all-to-all communication across ranks.
         """
         n = _local_heads(self.arch.num_heads)
         d = self.arch.model_channels // self.arch.num_heads
@@ -889,13 +972,13 @@ class OmniDreamsDiT(BaseDiT):
             "loop + KV cache operations break fullgraph). Individual blocks are "
             "compiled via _compile_conditions."
         )
-        # Phase 6: SP (ulysses/ring sequence parallelism) is not yet supported
-        # for the autoregressive chunk loop. Guard with a clear error.
-        if self._sp_size > 1:
-            raise RuntimeError(
-                "Sequence parallelism (SP) is not yet supported for OmniDreams. "
-                "Run with --ulysses-degree 1 --ring-degree 1."
-            )
+        # Phase 6: SP (ulysses/ring sequence parallelism) support:
+        # - Self-attention uses USPAttention (SP-compatible, all-to-all internally).
+        # - Cross-attention uses LocalAttention (text K/V replicated, no SP needed).
+        # - KV-cache: caller pre-divides sizes by sp_size; per-rank local cache.
+        # - The outer AR loop and KV-cache lifecycle are orchestrated by the stage.
+        # When SP is active, the calling stage must pre-shard sequences before
+        # entering this forward and gather after the loop.
 
         timestep = timestep * self.arch.timestep_scale
 

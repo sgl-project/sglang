@@ -42,6 +42,12 @@ class BlockKVCache:
     are non-overlapping: each update appends one ``chunk_size``-token chunk at the
     next logical position.
 
+    Supports Sequence Parallelism (SP): when ``sp_size > 1``, each rank
+    manages only its local portion of the cache. ``chunk_size``, ``window_size``,
+    and ``sink_size`` are the *local* sizes (pre-divided by ``sp_size`` by the
+    caller).  The stage is responsible for computing local sizes and calling
+    :meth:`from_tensor` with the local K/V shard.
+
     ``chunk_idx`` (0, 1, 2, ...) is the chunk's index in the full sequence, not a
     cache offset. A ``chunk_idx`` of ``prev + 1`` appends (or, in steady-state,
     writes after a left-roll); a ``chunk_idx`` equal to ``prev`` overwrites the

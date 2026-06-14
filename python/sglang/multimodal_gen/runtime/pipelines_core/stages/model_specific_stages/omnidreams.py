@@ -34,6 +34,8 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
+    get_sp_world_size,
+    sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -572,7 +574,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         # raw_latent_shape lets SDPA-path attn metadata stay a no-op.
         batch.raw_latent_shape = (
             text_embeds.shape[0],
-            chunk_tokens,
+            local_chunk_tokens,
             arch.out_channels,
             latent_h,
             latent_w,
@@ -652,23 +654,20 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        # Phase 6 guard: TP is supported via column/row parallel layers in the
-        # DiT, but SP (ulysses/ring) is not yet supported for the AR chunk loop.
-        # Guarded with try/except since SP is not initialized in CPU tests.
+        # Phase 6: SP is supported via USPAttention (self-attn) and
+        # LocalAttention (cross-attn). Each rank processes its local
+        # sequence shard; USPAttention handles all-to-all internally.
+        # KV-cache and RoPE are sized per-rank via local chunk/window sizes.
+        sp_size: int = 1
+        sp_rank: int = 0
         try:
+            sp_size = max(1, get_sp_world_size())
             from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-                get_sp_world_size,
+                get_sp_parallel_rank,
             )
-
-            assert get_sp_world_size() <= 1, (
-                "Sequence parallelism (SP) is not yet supported for OmniDreams. "
-                "Run with --ulysses-degree 1 --ring-degree 1."
-            )
-        except AssertionError as e:
-            if "not initialized" in str(e):
-                pass  # SP not booted — single-GPU (or CPU test), safe.
-            else:
-                raise
+            sp_rank = get_sp_parallel_rank()
+        except (ImportError, AssertionError, RuntimeError):
+            pass  # SP not initialized — single-GPU or CPU test.
 
         # The downstream single-pass decode of the concatenated AR latents
         # relies on the Wan VAE's causal temporal feature cache flowing across
@@ -698,6 +697,12 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         st = batch.extra["omnidreams"]
 
         hp, wp, len_t = st["hp"], st["wp"], st["len_t"]
+        # SP: each rank processes a local sub-chunk of the full sequence.
+        # USPAttention handles all-to-all internally; the DiT forward
+        # expects the local shard [B, S_local, D].
+        local_chunk_tokens = st["chunk_tokens"] // sp_size
+        local_window_tokens = st["window_size_t"] * st["tokens_per_frame"] // sp_size
+        local_sink_tokens = st["sink_size_t"] * st["tokens_per_frame"] // sp_size
         tokens_per_frame = st["tokens_per_frame"]
         chunk_tokens = st["chunk_tokens"]
         num_chunks = st["num_chunks"]
@@ -734,40 +739,44 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # One BlockKVCache per transformer block (token counts = frames * hp*wp).
         caches = self.transformer.init_kv_caches(
             batch_size=B,
-            chunk_tokens=chunk_tokens,
-            window_tokens=st["window_size_t"] * tokens_per_frame,
-            sink_tokens=st["sink_size_t"] * tokens_per_frame,
+            chunk_tokens=local_chunk_tokens,
+            window_tokens=local_window_tokens,
+            sink_tokens=local_sink_tokens,
             device=device,
             dtype=dit_dtype,
         )
 
         # Frame-0 conditioning (i2v): channel mask (into the DiT) + inject mask
         # (pins the clean reference latent) + the reference token block.
-        frame0 = tokens_per_frame
+        frame0 = tokens_per_frame // sp_size
         image_token = st["image_token"]
         if image_token is not None:
             image_full = torch.zeros(
-                B, chunk_tokens, in_d, device=device, dtype=dit_dtype
+                B, local_chunk_tokens, in_d, device=device, dtype=dit_dtype
             )
-            image_full[:, :frame0, :] = image_token.to(device=device, dtype=dit_dtype)
+            # Image pin: the first frame is split across SP ranks.
+            # Each rank writes its local portion of the reference latent.
+            image_full[:, :frame0, :] = (
+                image_token[:, :frame0, :].to(device=device, dtype=dit_dtype)
+            )
             inject_mask = torch.zeros(
-                B, chunk_tokens, 1, device=device, dtype=dit_dtype
+                B, local_chunk_tokens, 1, device=device, dtype=dit_dtype
             )
             inject_mask[:, :frame0, :] = 1.0
             cond_mask_c0 = torch.zeros(
-                B, chunk_tokens, mask_d, device=device, dtype=dit_dtype
+                B, local_chunk_tokens, mask_d, device=device, dtype=dit_dtype
             )
             cond_mask_c0[:, :frame0, :] = 1.0
         else:
             image_full = inject_mask = None
             cond_mask_c0 = torch.zeros(
-                B, chunk_tokens, mask_d, device=device, dtype=dit_dtype
+                B, local_chunk_tokens, mask_d, device=device, dtype=dit_dtype
             )
         cond_mask_zero = torch.zeros(
-            B, chunk_tokens, mask_d, device=device, dtype=dit_dtype
+            B, local_chunk_tokens, mask_d, device=device, dtype=dit_dtype
         )
         hdmap_zero = torch.zeros(
-            B, chunk_tokens, hdmap_d, device=device, dtype=dit_dtype
+            B, local_chunk_tokens, hdmap_d, device=device, dtype=dit_dtype
         )
 
         # Phase 6: precompute cross-attn K/V once per prompt (text context is
@@ -804,6 +813,10 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         latent_chunks: list[torch.Tensor] = []
         for chunk_idx in range(num_chunks):
             rope_freqs = rope.shift_t(chunk_idx)
+            if sp_size > 1:
+                rope_freqs = rope_freqs[
+                    sp_rank * local_chunk_tokens : (sp_rank + 1) * local_chunk_tokens
+                ]
             is_first = chunk_idx == 0
             cond_mask = cond_mask_c0 if is_first else cond_mask_zero
             # HD-map is per-chunk: index this chunk's tokens (None -> zeros, i.e.
@@ -811,9 +824,12 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             if st["hdmap_tokens"] is None:
                 hdmap_chunk = hdmap_zero
             else:
-                hdmap_chunk = st["hdmap_tokens"][chunk_idx].to(
-                    device=device, dtype=dit_dtype
-                )
+                full_hdmap = st["hdmap_tokens"][chunk_idx]
+                if sp_size > 1:
+                    full_hdmap = full_hdmap[
+                        :, sp_rank * local_chunk_tokens : (sp_rank + 1) * local_chunk_tokens, :
+                    ]
+                hdmap_chunk = full_hdmap.to(device=device, dtype=dit_dtype)
             pin = is_first and image_full is not None
 
             def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -835,7 +851,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 c.before_update(chunk_idx)
 
             noise = torch.empty(
-                B, chunk_tokens, in_d, device=device, dtype=dit_dtype
+                B, local_chunk_tokens, in_d, device=device, dtype=dit_dtype
             ).normal_(generator=gen)
             clean = scheduler.sample(noise, predict_flow=predict_flow, rng=gen)
             if pin:
@@ -874,9 +890,14 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # continuity and FlashDreams frame counts.
         batch.latents = torch.cat(latent_chunks, dim=2)
 
-        # Phase 6: SP post-process — latents may need gathering when SP is
-        # eventually supported. Currently a no-op (SP is guarded at entry).
-        batch.latents = self._postprocess_sp_latents(batch, server_args)
+        # SP post-process: gather sharded latents from all ranks.
+        # Each rank produced its local portion of the AR rollout;
+        # all-gather along the time dimension so the downstream decode
+        # sees the full latent sequence.
+        if sp_size > 1:
+            batch.latents = sequence_model_parallel_all_gather(
+                batch.latents, dim=2
+            )
 
         _log_omnidreams_stats("ar_concat_latents", batch.latents)
 
