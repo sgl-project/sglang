@@ -731,6 +731,7 @@ class Envs:
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(False)
+    SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
