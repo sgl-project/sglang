@@ -151,8 +151,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
 
-        # whether lazy req-based warmup has already been scheduled
-        self.warmed_up = False
+        self.req_based_warmup_scheduled = False
         # warmup progress tracking
         self._warmup_total = 0
         self._warmup_processed = 0
