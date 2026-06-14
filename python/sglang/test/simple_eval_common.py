@@ -95,6 +95,7 @@ class ChatCompletionSampler(SamplerBase):
         reasoning_effort: Optional[str] = None,
         max_tokens: int = 2048,
         extra_body: Optional[Dict[str, Any]] = None,
+        stop: Optional[List[str]] = None,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
@@ -108,10 +109,11 @@ class ChatCompletionSampler(SamplerBase):
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
         self.extra_body = extra_body
+        self.stop = stop
         self.image_format = "url"
         self._completion_tokens: list[int] = []
         print(
-            f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=}"
+            f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=} {self.stop=}"
         )
 
     def _handle_image(
@@ -151,6 +153,7 @@ class ChatCompletionSampler(SamplerBase):
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
                     extra_body=self.extra_body,
+                    stop=self.stop,
                 )
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)

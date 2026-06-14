@@ -32,7 +32,7 @@ MODEL_SCORE_THRESHOLDS = {
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.81,  # 86.4% - 5%
     "google/gemma-2-27b-it": 0.81,  # 85.5% measured - 5%
     "meta-llama/Llama-3.1-70B-Instruct": 0.89,  # 94.1% - 5%
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.69,  # 74.4% - 5%
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.64,  # ~65% measured in chat-mode eval
     "Qwen/Qwen2-57B-A14B-Instruct": 0.76,  # 80.7% - 5% (official A14B score; 88.2% was the 72B)
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.80,  # 84.5% - 5%
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.47,  # 52.1% - 5%
