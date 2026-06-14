@@ -155,6 +155,22 @@ auto-round \
     --output_dir ./tmp_autoround
 ```
 
+- DeepSeek V4 Support
+
+    AutoRound/GPTQ-quantized DeepSeek V4 models (e.g., `Intel/DeepSeek-V4-Pro-W4A16-AutoRound`) are supported.
+    Several layers in DeepSeek V4 (such as `wo_a`, `compressor.wkv/wgate`, `indexer.weights_proj`) are constructed
+    without quantization config, so sglang automatically dequantizes their GPTQ-packed weights to dense bf16 at load time.
+    The `--quantization auto-round` flag is required when loading these models.
+
+    ```bash
+    python3 -m sglang.launch_server \
+        --model-path Intel/DeepSeek-V4-Pro-W4A16-AutoRound \
+        --quantization auto-round \
+        --trust-remote-code \
+        --tp 8 \
+        --port 30000 --host 0.0.0.0
+    ```
+
 - known issues
 
 Several limitations currently affect offline quantized model loading in sglang, These issues might be resolved in future updates of sglang. If you experience any problems, consider using Hugging Face Transformers as an alternative.
@@ -166,7 +182,7 @@ Several limitations currently affect offline quantized model loading in sglang, 
 
 2. Limited Support for Quantized MoE Models
 
-    Quantized MoE models may encounter inference issues due to kernel limitations (e.g., lack of support for mlp.gate layer quantization). please try to skip quantizing these layers to avoid such errors.
+    Some quantized MoE models may encounter inference issues due to kernel limitations (e.g., lack of support for mlp.gate layer quantization). DeepSeek V4 AutoRound/GPTQ models are supported with automatic dequantization of affected layers. For other MoE architectures, try skipping quantization on gate layers to avoid errors.
 
 
 3. Limited Support for Quantized VLMs
