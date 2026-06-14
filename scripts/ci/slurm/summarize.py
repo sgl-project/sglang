@@ -68,7 +68,7 @@ def main():
 
     results.sort(
         key=lambda r: (
-            r["infmax_model_prefix"],
+            r["model_prefix"],
             r["hw"],
             r["framework"],
             r["precision"],
@@ -84,7 +84,7 @@ def main():
 
     rows = [
         [
-            r["infmax_model_prefix"],
+            r["model_prefix"],
             r["model"],
             r["hw"].upper(),
             r["framework"].upper(),

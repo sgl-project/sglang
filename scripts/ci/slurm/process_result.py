@@ -79,7 +79,7 @@ data = {
     "hw": "gb200",
     "conc": int(raw["max_concurrency"]),
     "model": raw["model_id"],
-    "infmax_model_prefix": model_prefix,
+    "model_prefix": model_prefix,
     "framework": framework,
     "precision": precision,
     "isl": isl,

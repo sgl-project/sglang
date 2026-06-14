@@ -22,6 +22,11 @@
 #   S3_ENDPOINT_URL   - MinIO endpoint URL (e.g. https://minio.<host>.nip.io)
 #   AWS_ACCESS_KEY_ID - writer access key for S3_BUCKET (via GH secrets)
 #   AWS_SECRET_ACCESS_KEY - writer secret key for S3_BUCKET (via GH secrets)
+#
+# Optional eval env vars (used by the srt-slurm lm-eval runner):
+#   RUN_EVAL          - "true" to run lm-eval after the benchmark in the same job
+#   EVAL_ONLY         - "true" to skip the benchmark and run only lm-eval
+#   EVAL_CONC         - concurrency for the eval phase (defaults to max of benchmark conc-list)
 
 set -euo pipefail
 set -x
@@ -66,6 +71,18 @@ fi
 LUSTRE_WORKSPACE="/mnt/lustre01/users-public/sglang-ci/workspace/${RUNNER_NAME}"
 rm -rf "$LUSTRE_WORKSPACE"
 mkdir -p "$LUSTRE_WORKSPACE"
+
+# Eval mode — passed through to srt-slurm's do_sweep.py. srt-slurm's lm-eval
+# runner sources benchmark_lib.sh and reads utils/evals/*.yaml from the eval
+# workspace, which gets mounted into the Slurm container.
+RUN_EVAL="${RUN_EVAL:-false}"
+EVAL_ONLY="${EVAL_ONLY:-false}"
+EVAL_CONC="${EVAL_CONC:-}"
+EVAL_WORKSPACE_LUSTRE="$LUSTRE_WORKSPACE/eval-workspace"
+rm -rf "$EVAL_WORKSPACE_LUSTRE"
+cp -r "${GITHUB_WORKSPACE}/scripts/ci/slurm/eval-workspace" "$EVAL_WORKSPACE_LUSTRE"
+INFMAX_WORKSPACE="$EVAL_WORKSPACE_LUSTRE"
+export RUN_EVAL EVAL_ONLY EVAL_CONC INFMAX_WORKSPACE
 
 # ---------------------------------------------------------------------------
 # Clone and set up srt-slurm
@@ -220,33 +237,61 @@ fi
 cp -r "$LOGS_DIR" "$GITHUB_WORKSPACE/LOGS"
 tar czf "$GITHUB_WORKSPACE/multinode_server_logs.tar.gz" -C "$LOGS_DIR" .
 
-RESULT_SUBDIRS=$(find "$LOGS_DIR" -maxdepth 1 -type d -name "*isl*osl*" 2>/dev/null || true)
+if [[ "${EVAL_ONLY:-false}" != "true" ]]; then
+    RESULT_SUBDIRS=$(find "$LOGS_DIR" -maxdepth 1 -type d -name "*isl*osl*" 2>/dev/null || true)
 
-if [ -z "$RESULT_SUBDIRS" ]; then
-    echo "ERROR: No result subdirectories found in $LOGS_DIR — benchmark did not produce any output"
-    exit 1
-else
-    RESULT_COUNT=0
-    for result_subdir in $RESULT_SUBDIRS; do
-        CONFIG_NAME=$(basename "$result_subdir")
-        RESULT_FILES=$(find "$result_subdir" -name "results_concurrency_*.json" 2>/dev/null || true)
-        for result_file in $RESULT_FILES; do
-            if [ -f "$result_file" ]; then
-                filename=$(basename "$result_file")
-                concurrency=$(echo "$filename" | sed -n 's/results_concurrency_\([0-9]*\)_gpus_.*/\1/p')
-                gpus=$(echo "$filename" | sed -n 's/results_concurrency_[0-9]*_gpus_\([0-9]*\)_ctx_.*/\1/p')
-                ctx=$(echo "$filename" | sed -n 's/.*_ctx_\([0-9]*\)_gen_.*/\1/p')
-                gen=$(echo "$filename" | sed -n 's/.*_gen_\([0-9]*\)\.json/\1/p')
-                DEST="$GITHUB_WORKSPACE/${RESULT_FILENAME}_${CONFIG_NAME}_conc${concurrency}_gpus_${gpus}_ctx_${ctx}_gen_${gen}.json"
-                cp "$result_file" "$DEST"
-                echo "Saved: $DEST"
-                RESULT_COUNT=$((RESULT_COUNT + 1))
-            fi
-        done
-    done
-    if [ "$RESULT_COUNT" -eq 0 ]; then
-        echo "ERROR: Result subdirectories found but no result JSON files produced — benchmark failed"
+    if [ -z "$RESULT_SUBDIRS" ]; then
+        echo "ERROR: No result subdirectories found in $LOGS_DIR — benchmark did not produce any output"
         exit 1
+    else
+        RESULT_COUNT=0
+        for result_subdir in $RESULT_SUBDIRS; do
+            CONFIG_NAME=$(basename "$result_subdir")
+            RESULT_FILES=$(find "$result_subdir" -name "results_concurrency_*.json" 2>/dev/null || true)
+            for result_file in $RESULT_FILES; do
+                if [ -f "$result_file" ]; then
+                    filename=$(basename "$result_file")
+                    concurrency=$(echo "$filename" | sed -n 's/results_concurrency_\([0-9]*\)_gpus_.*/\1/p')
+                    gpus=$(echo "$filename" | sed -n 's/results_concurrency_[0-9]*_gpus_\([0-9]*\)_ctx_.*/\1/p')
+                    ctx=$(echo "$filename" | sed -n 's/.*_ctx_\([0-9]*\)_gen_.*/\1/p')
+                    gen=$(echo "$filename" | sed -n 's/.*_gen_\([0-9]*\)\.json/\1/p')
+                    DEST="$GITHUB_WORKSPACE/${RESULT_FILENAME}_${CONFIG_NAME}_conc${concurrency}_gpus_${gpus}_ctx_${ctx}_gen_${gen}.json"
+                    cp "$result_file" "$DEST"
+                    echo "Saved: $DEST"
+                    RESULT_COUNT=$((RESULT_COUNT + 1))
+                fi
+            done
+        done
+        if [ "$RESULT_COUNT" -eq 0 ]; then
+            echo "ERROR: Result subdirectories found but no result JSON files produced — benchmark failed"
+            exit 1
+        fi
+    fi
+else
+    echo "EVAL_ONLY=true: skipping benchmark result collection"
+fi
+
+# ---------------------------------------------------------------------------
+# Collect eval results (when RUN_EVAL or EVAL_ONLY is true). srt-slurm's
+# lm-eval bench.sh writes meta_env.json + results*.json + sample*.jsonl to
+# $LOGS_DIR/eval_results/.
+# ---------------------------------------------------------------------------
+if [[ "${RUN_EVAL:-false}" == "true" || "${EVAL_ONLY:-false}" == "true" ]]; then
+    EVAL_DIR="$LOGS_DIR/eval_results"
+    if [ -d "$EVAL_DIR" ]; then
+        echo "Extracting eval results from $EVAL_DIR"
+        shopt -s nullglob
+        for eval_file in "$EVAL_DIR"/*; do
+            [ -f "$eval_file" ] || continue
+            cp "$eval_file" "$GITHUB_WORKSPACE/"
+            echo "Copied eval artifact: $(basename "$eval_file")"
+        done
+        shopt -u nullglob
+    else
+        echo "WARNING: eval requested but no eval results found at $EVAL_DIR"
+        if [[ "${EVAL_ONLY:-false}" == "true" ]]; then
+            exit 1
+        fi
     fi
 fi
 

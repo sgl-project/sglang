@@ -22,12 +22,44 @@ import sys
 
 import yaml
 
+MIN_EVAL_CONC = 8
+
+# Only this (ISL, OSL) is eligible for eval auto-marking. 1k1k recipes have
+# context budgets too small for gsm8k's chain-of-thought outputs to fit; 8k1k
+# server context (~9600) gives comfortable headroom.
+EVAL_SEQ_LEN = (8192, 1024)
+
 
 def seq_len_str(isl, osl):
     def fmt(n):
         return f"{n // 1024}k" if n % 1024 == 0 else str(n)
 
     return f"{fmt(isl)}{fmt(osl)}"
+
+
+def _pick_eval_entry(search_space):
+    """Within a (precision, isl, osl) group, pick the entry with the highest
+    max-concurrency (eligible concs only) and compute its eval concurrency.
+
+    Returns (best_index, eval_conc) or (-1, None) if no entry is eligible.
+    eval_conc is the upper-median of the chosen entry's eligible conc list —
+    keeps eval-phase GPU memory comfortable without dropping concurrency so
+    low that the eval drags on.
+    """
+    best_idx = -1
+    best_max = -1
+    best_eligible: list[int] = []
+    for i, entry in enumerate(search_space):
+        eligible = sorted(c for c in entry.get("conc-list", []) if c >= MIN_EVAL_CONC)
+        if not eligible:
+            continue
+        if eligible[-1] > best_max:
+            best_max = eligible[-1]
+            best_idx = i
+            best_eligible = eligible
+    if best_idx < 0:
+        return -1, None
+    return best_idx, best_eligible[len(best_eligible) // 2]
 
 
 def main():
@@ -59,11 +91,22 @@ def main():
         for seq_cfg in exp["seq-len-configs"]:
             isl, osl = seq_cfg["isl"], seq_cfg["osl"]
             sl = seq_len_str(isl, osl)
+            search_space = seq_cfg["search-space"]
 
-            for entry in seq_cfg["search-space"]:
+            # Auto-select one entry per (exp, isl, osl) group to also run
+            # lm-eval after the perf sweep. Picks the recipe with the highest
+            # max-conc; lm-eval then runs at the upper-median of its concs.
+            # Only the 8k1k seq-len is eval-eligible.
+            if (isl, osl) == EVAL_SEQ_LEN:
+                eval_idx, eval_conc = _pick_eval_entry(search_space)
+            else:
+                eval_idx, eval_conc = -1, None
+
+            for i, entry in enumerate(search_space):
                 config_file = entry["config_file"]
                 topology = config_file.rsplit("/", 1)[-1].replace(".yaml", "")
 
+                is_eval_entry = i == eval_idx
                 matrix.append(
                     {
                         "name": f"{exp['model-prefix']}-{exp['precision']}-{sl}-{topology}",
@@ -74,6 +117,14 @@ def main():
                         "isl": str(isl),
                         "osl": str(osl),
                         "config_file": config_file,
+                        # Caps eval request size to fit the server's context.
+                        "max_model_len": str(isl + osl + 256),
+                        # Eval flags forwarded as env vars to srt-slurm's
+                        # do_sweep.py. Strings so the GH Actions env: block
+                        # copies them verbatim.
+                        "run_eval": "true" if is_eval_entry else "false",
+                        "eval_only": "false",
+                        "eval_conc": str(eval_conc) if is_eval_entry else "",
                     }
                 )
 

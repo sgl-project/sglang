@@ -24,6 +24,16 @@ on:
         description: 'Optional. Comma-separated names to run only a subset. Format: {model-prefix}-{precision}-{isl}{osl}-{recipe}. E.g. "dsr1-fp8-1k1k-max-tpt" or "dsr1-fp8-1k1k-max-tpt,dsr1-fp4-1k1k-mid-curve". Leave empty to run all. Available names are listed in the setup job log.'
         required: false
         default: ''
+      run_eval:
+        description: 'Optional. Run perf sweep and eval.'
+        type: boolean
+        required: false
+        default: false
+      eval_only:
+        description: 'Optional. Skip the perf sweep, just run eval.'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: nightly-test-gb200
@@ -67,6 +77,13 @@ jobs:
           fi
           if [ -n "$PR" ] && ! echo "$PR" | grep -Eq '^[0-9]+$'; then
             echo "::error::pr_number must be a positive integer, got '$PR'."
+            exit 1
+          fi
+          # run_eval and eval_only are mutually exclusive — they request opposite
+          # behaviors (perf+eval vs skip-perf). Cron defaults to neither set (uses
+          # per-entry auto-marking).
+          if [ "${{ inputs.run_eval }}" = "true" ] && [ "${{ inputs.eval_only }}" = "true" ]; then
+            echo "::error::run_eval and eval_only are mutually exclusive — pick one."
             exit 1
           fi
 
@@ -297,6 +314,16 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.NV_S3_SECRET_ACCESS_KEY }}
       S3_BUCKET: ${{ secrets.NV_S3_BUCKET }}
       S3_ENDPOINT_URL: ${{ secrets.NV_S3_ENDPOINT_URL }}
+      # Eval — passed through to srt-slurm's do_sweep.py. Per-entry defaults
+      # come from generate_matrix.py; workflow_dispatch inputs override them
+      # so a manual run can force eval on a non-marked recipe or switch to
+      # eval-only mode without editing the YAML. EVAL_CONC always uses the
+      # matrix-derived value (upper-median); for entries with no marker,
+      # srt-slurm falls back to max(conc-list).
+      RUN_EVAL: ${{ (inputs.run_eval || inputs.eval_only) && 'true' || matrix.config.run_eval }}
+      EVAL_ONLY: ${{ inputs.eval_only && 'true' || matrix.config.eval_only }}
+      EVAL_CONC: ${{ matrix.config.eval_conc }}
+      MAX_MODEL_LEN: ${{ matrix.config.max_model_len }}
 
     steps:
       - name: Checkout code
@@ -347,6 +374,34 @@ jobs:
             ${{ github.workspace }}/multinode_server_logs.tar.gz
           retention-days: 30
           if-no-files-found: warn
+
+      - name: Upload eval results
+        # Mirror the env block's override logic so workflow_dispatch force-eval
+        # on a non-marked entry still uploads its artifacts.
+        if: ${{ always() && (matrix.config.run_eval == 'true' || matrix.config.eval_only == 'true' || inputs.run_eval || inputs.eval_only) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gb200-eval-${{ matrix.config.name }}-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/meta_env.json
+            ${{ github.workspace }}/results*.json
+            ${{ github.workspace }}/sample*.jsonl
+          retention-days: 30
+          if-no-files-found: ${{ (matrix.config.eval_only == 'true' || inputs.eval_only) && 'error' || 'ignore' }}
+
+      - name: Verify eval scores
+        # Eval scores must meet thresholds.json on cron runs. For workflow_dispatch
+        # we still report results but don't gate the workflow on them — accuracy
+        # below threshold is "info" for a dev-triggered run, "failure" for nightly.
+        if: ${{ (success() || failure()) && (matrix.config.run_eval == 'true' || matrix.config.eval_only == 'true' || inputs.run_eval || inputs.eval_only) }}
+        continue-on-error: ${{ github.event_name != 'schedule' }}
+        run: |
+          if ls ${{ github.workspace }}/results*.json 1>/dev/null 2>&1; then
+            cd ${{ github.workspace }}
+            python3 scripts/ci/slurm/eval-workspace/utils/evals/validate_scores.py
+          else
+            echo "no eval results found; skipping validation"
+          fi
 
       - name: Analyze logs with AI on failure
         if: failure()
@@ -419,6 +474,19 @@ jobs:
         run: |
           pip install tabulate -q
           python3 scripts/ci/slurm/summarize.py results/ >> $GITHUB_STEP_SUMMARY
+
+      - name: Print eval summary
+        # Surface lm-eval task scores in the step summary whenever any eval
+        # artifact landed.
+        run: |
+          if compgen -G "results/gb200-eval-*/results*.json" > /dev/null; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## Eval Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            python3 scripts/ci/slurm/collect_eval_results.py results/ gb200-${{ github.run_id }} >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No eval results to summarize."
+          fi
 
   # ---------------------------------------------------------------------------
   # Prune old tags in the staging repo, keeping only the most recent N. Mirrors
