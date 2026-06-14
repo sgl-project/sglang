@@ -129,6 +129,14 @@ class Qwen3ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     NEW_LINE_TOKEN_ID: int = 198
 
 
+class Qwen35ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
+    """A logit processor that controls the length of thinking for Qwen3.5 models."""
+
+    THINKING_START_TOKEN_ID: int = 248068
+    THINKING_END_TOKEN_ID: int = 248069
+    NEW_LINE_TOKEN_ID: int = 198
+
+
 class DeepSeekR1ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     """A logit processor that controls the length of thinking for DeepSeek-R1 models."""
 
