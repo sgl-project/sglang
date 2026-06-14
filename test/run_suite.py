@@ -119,6 +119,8 @@ NIGHTLY_SUITES = {
         "nightly-perf-vlm-2-gpu",
         # GB300 (4x B200 NVL4) nightly suite
         "nightly-4-gpu-gb300",
+        # Nightly precision regression (per-layer hidden state comparison)
+        "nightly-precision-8-gpu-h200",
     ],
     HWBackend.AMD: [
         "nightly-amd",
