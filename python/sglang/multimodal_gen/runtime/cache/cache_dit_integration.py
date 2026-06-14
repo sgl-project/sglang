@@ -222,6 +222,39 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
+# Single-stream (ForwardPattern.Pattern_3) transformer models not registered in
+# cache-dit's BlockAdapterRegister, mapped to their block-list attribute name.
+# cache-dit auto-resolves check_forward_pattern and blocks_name, so only the
+# attribute name is model-specific here.
+_SINGLE_STREAM_PATTERN3_BLOCKS_ATTR: dict[str, str] = {
+    "ErnieImageTransformer2DModel": "layers",
+}
+
+
+def _build_custom_block_adapter(
+    transformer: torch.nn.Module,
+) -> Optional[BlockAdapter]:
+    """Build a manual BlockAdapter for a single-stream model absent from
+    cache-dit's registry, or None if the class is unknown."""
+    blocks_attr = _SINGLE_STREAM_PATTERN3_BLOCKS_ATTR.get(
+        transformer.__class__.__name__
+    )
+    if blocks_attr is None:
+        return None
+    blocks = getattr(transformer, blocks_attr, None)
+    if blocks is None:
+        raise ValueError(
+            f"Transformer {transformer.__class__.__name__} has no attribute "
+            f"{blocks_attr!r} for cache-dit blocks."
+        )
+    return BlockAdapter(
+        transformer=transformer,
+        blocks=blocks,
+        forward_pattern=ForwardPattern.Pattern_3,
+        has_separate_cfg=True,
+    )
+
+
 def enable_cache_on_transformer(
     transformer: torch.nn.Module,
     config: CacheDitConfig,
@@ -249,16 +282,21 @@ def enable_cache_on_transformer(
             "Please provide it in CacheDitConfig."
         )
 
-    # Check if the transformer is pre-registered in cache-dit
+    # Prefer the standard path (transformer pre-registered in cache-dit). For
+    # single-transformer models absent from the registry, fall back to a manual
+    # BlockAdapter (see _build_custom_block_adapter).
+    custom_adapter = None
     if not BlockAdapterRegister.is_supported(transformer):
-        transformer_cls_name = transformer.__class__.__name__
-        raise ValueError(
-            f"{transformer_cls_name} is not officially supported by cache-dit. "
-            "Supported cache-dit DiT families include Flux, QwenImage, HunyuanDiT, "
-            "HunyuanVideo, Wan, CogVideoX, Mochi, and others. "
-            "Please ensure your transformer belongs to one of these families or "
-            "define a custom BlockAdapter."
-        )
+        custom_adapter = _build_custom_block_adapter(transformer)
+        if custom_adapter is None:
+            transformer_cls_name = transformer.__class__.__name__
+            raise ValueError(
+                f"{transformer_cls_name} is not officially supported by cache-dit. "
+                "Supported cache-dit DiT families include Flux, QwenImage, HunyuanDiT, "
+                "HunyuanVideo, Wan, CogVideoX, Mochi, and others. "
+                "Please ensure your transformer belongs to one of these families or "
+                "define a custom BlockAdapter."
+            )
 
     # Build cache config (including SCM fields if provided)
     cache_config = DBCacheConfig(
@@ -312,12 +350,28 @@ def enable_cache_on_transformer(
 
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
 
-    cache_dit.enable_cache(
-        transformer,
-        cache_config=cache_config,
-        calibrator_config=calibrator_config,
-        parallelism_config=None,
-    )
+    if custom_adapter is not None:
+        # Custom path: pass a pre-built BlockAdapter, bypassing the registry.
+        logger.info(
+            "Enabling cache-dit on %s via custom BlockAdapter (%s).",
+            model_name,
+            custom_adapter.forward_pattern,
+        )
+        cache_dit.enable_cache(
+            custom_adapter,
+            cache_config=cache_config,
+            calibrator_config=calibrator_config,
+            parallelism_config=None,
+        )
+    else:
+        # Standard path: transformer is pre-registered in cache-dit's
+        # BlockAdapterRegister; let enable_cache discover the adapter.
+        cache_dit.enable_cache(
+            transformer,
+            cache_config=cache_config,
+            calibrator_config=calibrator_config,
+            parallelism_config=None,
+        )
 
     if parallelism_config is not None:
         context_manager = getattr(transformer, "_context_manager", None)
