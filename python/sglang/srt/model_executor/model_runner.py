@@ -2956,14 +2956,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         """Initialize piecewise CUDA graph runner."""
         self.prefill_runner = None
+        # Eager prefill runner (PrefillRunner + EagerBackend, no capture). Built
+        # when prefill cuda graph is disabled so eager prefill still flows
+        # through the unified Runner lifecycle (for the common GQA language-model
+        # case; other gates below fall back to the inline eager path).
+        self.eager_prefill_runner = None
 
+        prefill_eager = False
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
             logger.info(
-                "Disable prefill CUDA graph because cuda_graph_config "
-                "resolved prefill.backend='disabled' (e.g. via "
-                "--cuda-graph-backend-prefill=disabled or auto-disable rules)."
+                "Prefill CUDA graph disabled (cuda_graph_config resolved "
+                "prefill.backend='disabled'); eager prefill will run through "
+                "PrefillRunner + EagerBackend."
             )
-            return
+            # Fall through the gates below (they set attention_layers etc. the
+            # eager runner needs); build the eager runner at the construction
+            # site instead of returning here.
+            prefill_eager = True
 
         # Draft models skip here during __init__; the eagle worker calls
         # this method explicitly (force_for_draft_worker=True) after
@@ -2978,8 +2987,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Disable piecewise CUDA graph for non capture size
-        if not self.server_args.cuda_graph_config.prefill.bs:
+        # Disable piecewise CUDA graph for non capture size (eager needs no
+        # capture sizes — it runs at the raw token count).
+        if not prefill_eager and not self.server_args.cuda_graph_config.prefill.bs:
             logger.warning(
                 "Disable piecewise CUDA graph because the capture size is not set"
             )
@@ -3070,6 +3080,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger,
                 "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
             )
+            return
+
+        if prefill_eager:
+            # Eager prefill: build the runner with EagerBackend (no capture).
+            self.eager_prefill_runner = PrefillRunner(self, eager=True)
             return
 
         tic = time.perf_counter()
@@ -3336,6 +3351,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             with ctx:
                 ret = self.prefill_runner.execute(forward_batch, **kwargs)
             return (ret, can_run_graph)
+
+        # Unified eager prefill: PrefillRunner + EagerBackend (cuda graph
+        # disabled). Routes the common case through the runner lifecycle; the
+        # inline eager path below still handles input_embeds / replace_embeds /
+        # pdmux / oversize and the non-runner gates.
+        if (
+            self.eager_prefill_runner is not None
+            and not self.server_args.enable_pdmux
+            and forward_batch.input_embeds is None
+            and forward_batch.replace_embeds is None
+            and len(forward_batch.input_ids) <= self.eager_prefill_runner.max_num_tokens
+        ):
+            ctx = (
+                self.device_timer.wrap(metadata={"category": "extend"})
+                if self.device_timer
+                else contextlib.nullcontext()
+            )
+            with ctx:
+                ret = self.eager_prefill_runner.execute(forward_batch, **kwargs)
+            return (ret, False)
 
         if not self.server_args.enable_pdmux:
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)

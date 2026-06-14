@@ -62,6 +62,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.eager_backend import EagerBackend
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
@@ -114,8 +115,14 @@ class PrefillRunner(BaseRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: ModelRunner, *, eager: bool = False):
         super().__init__(model_runner)
+        # When True, plug in EagerBackend (no capture/compile): the model
+        # forward runs live each iteration over a static batch built at the raw
+        # token count (no bucket padding), through the same reserve/load/execute
+        # lifecycle the cuda-graph path uses. The eager dual of the cuda-graph
+        # PrefillRunner — see _resolve_backend / prepare / load_batch / execute.
+        self.eager = eager
         # --- core state ------------------------------------------------
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.is_multimodal
@@ -127,11 +134,25 @@ class PrefillRunner(BaseRunner):
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = model_runner.server_args.cuda_graph_config.prefill.bs
-        assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
-        self.capture_num_tokens = sorted(capture_tokens)
-        self.max_num_tokens = (
-            max(self.capture_num_tokens) if self.capture_num_tokens else 8192
-        )
+        if self.eager:
+            # Eager has no capture buckets: it runs at the raw token count.
+            # Size the static buffers to the largest possible prefill forward
+            # (chunked-prefill cap, else the KV-pool token capacity).
+            self.capture_num_tokens = []
+            cps = model_runner.server_args.chunked_prefill_size
+            self.max_num_tokens = (
+                cps
+                if (cps is not None and cps > 0)
+                else model_runner.max_total_num_tokens
+            )
+        else:
+            assert (
+                capture_tokens is not None
+            ), "cuda_graph_config[prefill].bs is not set"
+            self.capture_num_tokens = sorted(capture_tokens)
+            self.max_num_tokens = (
+                max(self.capture_num_tokens) if self.capture_num_tokens else 8192
+            )
         self.max_bs = model_runner.req_to_token_pool.size
 
         log_info_on_rank0(
@@ -203,7 +224,14 @@ class PrefillRunner(BaseRunner):
         # _run_compile_pass before backend resolution returns.
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
         self.layer_model = None
-        self.backend = resolve_prefill_backend(self)
+        # Eager plugs in EagerBackend (no capture/compile). The Breakable/BCG
+        # branches below all gate on isinstance(self.backend, Breakable...) and
+        # so are skipped for eager: _prefill_static_buffers stays None,
+        # use_captured_attn_metadata stays False, layer_model stays None — which
+        # routes execute() down the non-BCG (eager) path.
+        self.backend = (
+            EagerBackend(self) if self.eager else resolve_prefill_backend(self)
+        )
         if isinstance(self.backend, BreakableCudaGraphBackend):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
@@ -587,6 +615,12 @@ class PrefillRunner(BaseRunner):
         return forward_batch, self.model_runner.attn_backend
 
     def prepare(self) -> None:
+        if self.eager:
+            # No capture/compile and no per-shape reservation: eager builds the
+            # static batch fresh per iteration in load_batch at the raw token
+            # count (there are no token buckets to reserve against).
+            self.stream = None
+            return
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
                 self.stream = graph_capture_context.stream
@@ -654,7 +688,13 @@ class PrefillRunner(BaseRunner):
         """
         buffers = self.buffers
         num_tokens = len(forward_batch.input_ids)
-        static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        # Eager runs at the raw token count (no capture bucket to pad to);
+        # the cuda-graph path pads up to the nearest captured shape.
+        static_num_tokens = (
+            num_tokens
+            if self.eager
+            else self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        )
         self.raw_num_tokens = num_tokens
 
         bs = forward_batch.batch_size
@@ -790,7 +830,33 @@ class PrefillRunner(BaseRunner):
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
 
-            if self.layer_model is not None:
+            if self.eager:
+                # Eager path. No capture/compile and no piecewise context (which
+                # is for the compiled graph); run the model forward live over the
+                # static batch through EagerBackend.run — the eager dual of
+                # cuda-graph replay, mirroring forward_extend's inline eager
+                # fallback. dp-buffer / extend-in-batch state is set by the
+                # forward-prep pipeline up the stack (as for the inline fallback),
+                # so it is NOT re-set here — and the live batch's dp_padding_mode
+                # may be None (non-DP).
+                with forward_context(
+                    ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ):
+
+                    def _eager_forward(_passed_static_forward_batch):
+                        return self.model_runner.model.forward(
+                            static_forward_batch.input_ids,
+                            static_forward_batch.positions,
+                            static_forward_batch,
+                            **kwargs,
+                        )
+
+                    output = self.backend.run(
+                        ShapeKey(size=static_num_tokens),
+                        static_forward_batch,
+                        forward_fn=_eager_forward,
+                    )
+            elif self.layer_model is not None:
                 # BCG path. The captured graph is a bs=1 replay of
                 # layer_model.forward. Monkey-patch layer_model.forward to
                 # call backend.replay (which fires the captured graph and
