@@ -513,7 +513,7 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = False
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -2777,6 +2777,6 @@ class AscendAttnMultiStepDraftBackend:
 
         self.common_template(forward_batch, call_fn)
 
-    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+    def init_static_metadata_buffers(self, max_bs, max_num_tokens):
         for i in range(self.speculative_num_steps):
-            self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
+            self.attn_backends[i].init_static_metadata_buffers(max_bs, max_num_tokens)

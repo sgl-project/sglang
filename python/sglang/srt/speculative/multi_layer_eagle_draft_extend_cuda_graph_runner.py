@@ -158,7 +158,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeRunner):
 
         self.eagle_worker.draft_extend_attn_backend_list[
             self.step
-        ].init_cuda_graph_state(self.max_bs, self.max_num_token)
+        ].init_static_metadata_buffers(self.max_bs, self.max_num_token)
         self.seq_len_fill_value = self.eagle_worker.draft_extend_attn_backend_list[
             self.step
         ].get_cuda_graph_seq_len_fill_value()

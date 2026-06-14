@@ -131,7 +131,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeRunner):
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
-        self.draft_extend_attn_backend.init_cuda_graph_state(
+        self.draft_extend_attn_backend.init_static_metadata_buffers(
             self.max_bs, self.max_num_token
         )
         self.seq_len_fill_value = (

@@ -371,7 +371,7 @@ class MambaAttnBackendBase(AttentionBackend):
             bs, req_pool_indices, forward_mode, spec_info
         )
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         assert (
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
@@ -777,9 +777,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
-            attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+            attn_backend.init_static_metadata_buffers(max_bs, max_num_tokens)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

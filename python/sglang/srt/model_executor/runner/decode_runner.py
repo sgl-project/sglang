@@ -403,7 +403,7 @@ class DecodeRunner(BaseRunner):
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self.attn_backend.init_static_metadata_buffers(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -509,7 +509,9 @@ class DecodeRunner(BaseRunner):
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
             for attn_backend in self.model_runner.decode_attn_backend_group:
-                attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+                attn_backend.init_static_metadata_buffers(
+                    self.max_bs, self.max_num_token
+                )
 
     def _cache_loc_dtype(self):
         return torch.int64

@@ -287,7 +287,7 @@ def _check_decode_cuda_graph_case(case, capture_batch_size: int, *, allow_paddin
 
 
 def _init_cuda_graph_capture_metadata(backend, capture_batch_size: int, batch):
-    backend.init_cuda_graph_state(
+    backend.init_static_metadata_buffers(
         max_bs=capture_batch_size,
         max_num_tokens=batch.input_ids.numel(),
     )

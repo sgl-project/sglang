@@ -480,7 +480,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 self.prefill_wrapper_paged, use_ragged
             )
 
-    def init_cuda_graph_state(
+    def init_static_metadata_buffers(
         self,
         max_bs: int,
         max_num_tokens: int,
@@ -1014,7 +1014,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, kv_indices, call_fn)
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         # Row holds topk per-branch sequences (generate_draft_decode_kv_indices), so
         # it needs the topk factor, matching the eager init_forward_metadata.
         kv_indices_width = draft_kv_indices_buffer_width(
@@ -1027,7 +1027,7 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_cuda_graph_state(
+            self.attn_backends[i].init_static_metadata_buffers(
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
 

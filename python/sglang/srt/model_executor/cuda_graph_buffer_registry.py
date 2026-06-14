@@ -272,7 +272,7 @@ class CudaGraphBufferRegistry:
 
     Backend-private buffers (kernel workspace, derived page tables) are
     NOT managed here — backends keep them on ``self.cuda_graph_*`` and
-    allocate via ``AttentionBackend.init_cuda_graph_state(...)``.
+    allocate via ``AttentionBackend.init_static_metadata_buffers(...)``.
 
     Usage::
 

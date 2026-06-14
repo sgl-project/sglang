@@ -105,7 +105,7 @@ class FlashAttentionBackend(AttentionBackend):
     Note about CUDA Graph:
     - We only support CUDA Graph for Decode (Normal Decode and Draft Decode) and Target Verify.
     - We don't support CUDA Graph for Extend and Draft Extend.
-    - When server init, init_cuda_graph_state will be called first and then init_cuda_graph_capture will be called.
+    - When server init, init_static_metadata_buffers will be called first and then init_cuda_graph_capture will be called.
     - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
     """
 
@@ -1983,7 +1983,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
         Args:
@@ -2781,9 +2781,9 @@ class FlashAttentionMultiStepBackend:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
+            self.attn_backends[i].init_static_metadata_buffers(max_bs, max_num_tokens)
 
     def init_forward_metadata_out_graph(
         self,

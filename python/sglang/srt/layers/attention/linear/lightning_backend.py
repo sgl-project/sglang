@@ -32,7 +32,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
     Note about CUDA Graph:
     - We only support CUDA Graph for Decode (Normal Decode and Draft Decode) and Target Verify.
     - We don't support CUDA Graph for Extend and Draft Extend.
-    - When server init, init_cuda_graph_state will be called first and then init_cuda_graph_capture will be called.
+    - When server init, init_static_metadata_buffers will be called first and then init_cuda_graph_capture will be called.
     - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
     """
 

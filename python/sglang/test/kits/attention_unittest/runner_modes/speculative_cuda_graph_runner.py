@@ -165,7 +165,7 @@ def run_speculative_cuda_graph_case(
 
     if adapter.run_graph_eager:
         if adapter.max_num_tokens is not None:
-            backend.init_cuda_graph_state(
+            backend.init_static_metadata_buffers(
                 max_bs=capture_batch_size,
                 max_num_tokens=adapter.max_num_tokens(case, capture_batch_size),
             )

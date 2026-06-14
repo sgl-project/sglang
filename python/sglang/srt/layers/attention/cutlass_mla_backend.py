@@ -179,7 +179,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                 block_kv_indices,
             )
 
-    def init_cuda_graph_state(
+    def init_static_metadata_buffers(
         self,
         max_bs: int,
         max_num_tokens: int,

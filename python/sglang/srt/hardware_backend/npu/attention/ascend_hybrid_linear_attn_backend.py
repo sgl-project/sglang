@@ -28,7 +28,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         super().__init__(model_runner)
         self.state_indices_list_gdn = []
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         assert (
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"

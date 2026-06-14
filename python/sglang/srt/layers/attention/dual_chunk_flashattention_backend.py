@@ -185,7 +185,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         ``out_graph`` before the next ``graph.replay()``, so a transient eager
         write cannot leak into a later replay. Only decode/idle is ever captured
         (``_bind_metadata_buffers``). Returns False for pure-eager runs
-        (``init_cuda_graph_state`` never ran -> no ``decode_metadata``) and for
+        (``init_static_metadata_buffers`` never ran -> no ``decode_metadata``) and for
         prefill -> build a fresh metadata object. Never raises KeyError.
         """
         if not forward_mode.is_decode_or_idle():
@@ -642,7 +642,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         ).squeeze(1)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
         Args:

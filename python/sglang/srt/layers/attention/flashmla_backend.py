@@ -221,7 +221,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 block_kv_indices,
             )
 
-    def init_cuda_graph_state(
+    def init_static_metadata_buffers(
         self,
         max_bs: int,
         max_num_tokens: int,
@@ -456,9 +456,9 @@ class FlashMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, call_fn)
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_static_metadata_buffers(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_cuda_graph_state(
+            self.attn_backends[i].init_static_metadata_buffers(
                 max_bs, max_num_tokens, block_kv_indices=None
             )
 

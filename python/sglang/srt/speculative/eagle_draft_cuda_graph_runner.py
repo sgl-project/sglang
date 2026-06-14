@@ -141,7 +141,9 @@ class EAGLEDraftCudaGraphRunner(DecodeRunner):
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
         # Attention backend init
-        self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self.draft_attn_backend.init_static_metadata_buffers(
+            self.max_bs, self.max_num_token
+        )
         self.seq_len_fill_value = self.draft_attn_backend.attn_backends[
             0
         ].get_cuda_graph_seq_len_fill_value()
