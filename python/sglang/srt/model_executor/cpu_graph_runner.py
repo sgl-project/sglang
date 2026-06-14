@@ -664,7 +664,7 @@ class CPUGraphRunner:
                 model_capture_mode if self.is_encoder_decoder else empty_context
             )
             with capture_context():
-                self.capture()
+                self.prepare()
         except RuntimeError as e:
             raise Exception(
                 f"Capture CPU graph failed: {e}\n{CPU_GRAPH_CAPTURE_FAILED_MSG}"
@@ -705,7 +705,7 @@ class CPUGraphRunner:
 
         return is_bs_supported and capture_hidden_mode_matches
 
-    def capture(self) -> None:
+    def prepare(self) -> None:
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_bs)))
             if get_tensor_model_parallel_rank() == 0
@@ -885,7 +885,7 @@ class CPUGraphRunner:
         # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
         if self.capture_hidden_mode != required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
-            self.capture()
+            self.prepare()
 
     def prepare_replay(
         self,
@@ -952,7 +952,7 @@ class CPUGraphRunner:
         self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
         return captured_forward_batch
 
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,

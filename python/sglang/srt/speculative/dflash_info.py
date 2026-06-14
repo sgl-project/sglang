@@ -78,9 +78,7 @@ class DFlashVerifyInput(SpecInput):
             )
         )
         if can_run_graph:
-            target_worker.model_runner.decode_runner.replay_prepare(
-                verify_forward_batch
-            )
+            target_worker.model_runner.decode_runner.load_batch(verify_forward_batch)
         elif not batch.forward_mode.is_idle():
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch

@@ -574,7 +574,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
             if can_cuda_graph:
                 draft_logits_output = (
-                    self.cuda_graph_runner_for_draft_extend.get_runner(step).replay(
+                    self.cuda_graph_runner_for_draft_extend.get_runner(step).execute(
                         forward_batch, init_state=(step == 0)
                     )
                 )
@@ -840,7 +840,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 ),
             )
         # NOTE: metadata init is skipped here unconditionally, although
-        # eagle_prepare_for_verify only plans when cuda-graph replay_prepare ran.
+        # eagle_prepare_for_verify only plans when cuda-graph load_batch ran.
         # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
         # worker has not adopted that fix, so preserve its behavior verbatim.
         # On NPU with --disable-cuda-graph, non-graph verify needs metadata init

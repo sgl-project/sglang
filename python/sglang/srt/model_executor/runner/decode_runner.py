@@ -476,7 +476,7 @@ class DecodeRunner(BaseRunner):
         # --- capture --------------------------------------------------
         try:
             with model_capture_mode():
-                self.capture()
+                self.prepare()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
@@ -602,7 +602,7 @@ class DecodeRunner(BaseRunner):
         )
         logger.info(log_message)
 
-    def capture_prepare(
+    def reserve_batch(
         self,
         size: int,
         stream_idx: Optional[int] = None,
@@ -755,7 +755,7 @@ class DecodeRunner(BaseRunner):
 
         return forward_batch, attn_backend, pp_proxy_tensors
 
-    def capture(self) -> None:
+    def prepare(self) -> None:
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
@@ -767,7 +767,7 @@ class DecodeRunner(BaseRunner):
             if not self.enable_pdmux:
                 with graph_capture() as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
-                    with self.backend.capture_session(self.stream):
+                    with self.backend.record_session(self.stream):
                         self._capture_one_stream()
             else:
                 set_pdmux_status(False)
@@ -777,7 +777,7 @@ class DecodeRunner(BaseRunner):
                         profile_context as prof,
                     ):
                         self.stream = graph_capture_context.stream
-                        with self.backend.capture_session(self.stream):
+                        with self.backend.record_session(self.stream):
                             self._capture_one_stream(i)
 
         if self.enable_profile_cuda_graph:
@@ -819,9 +819,9 @@ class DecodeRunner(BaseRunner):
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    self._prepare_one(bs, forward, stream_idx, variant_label)
 
-    def capture_one_shape(
+    def _prepare_one(
         self,
         size: int,
         forward: Callable,
@@ -837,7 +837,7 @@ class DecodeRunner(BaseRunner):
                 self.backend, BreakableCudaGraphBackend
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
-        forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
+        forward_batch, attn_backend, pp_proxy_tensors = self.reserve_batch(
             size, stream_idx=stream_idx
         )
 
@@ -898,7 +898,7 @@ class DecodeRunner(BaseRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)
-                self.backend.capture_one(
+                self.backend.record(
                     shape_key,
                     run_once,
                     dummies=None,
@@ -940,9 +940,9 @@ class DecodeRunner(BaseRunner):
         if self.capture_hidden_mode != required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.backend.cleanup()
-            self.capture()
+            self.prepare()
 
-    def replay_prepare(
+    def load_batch(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -950,7 +950,7 @@ class DecodeRunner(BaseRunner):
         self.deepep_adapter.replay()
 
         if not forward_batch.needs_forward_metadata_init():
-            # Pre-planned (plan-stream replay_prepare already ran).
+            # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
@@ -1044,7 +1044,7 @@ class DecodeRunner(BaseRunner):
             self.bs, stream_idx, variant_label
         )
 
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -1056,9 +1056,9 @@ class DecodeRunner(BaseRunner):
             if self.model_runner.device_timer
             else contextlib.nullcontext()
         )
-        with timer_ctx, self.backend.replay_session():
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+        with timer_ctx, self.backend.run_session():
+            self.load_batch(forward_batch, pp_proxy_tensors)
+            output = self.backend.run(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

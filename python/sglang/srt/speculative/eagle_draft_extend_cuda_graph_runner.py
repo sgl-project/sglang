@@ -69,7 +69,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeRunner):
     """EAGLE draft-extend cuda-graph runner.
 
     Subclasses DecodeRunner to inherit the outer capture
-    loop + backend scaffolding. Overrides capture_one_shape,
+    loop + backend scaffolding. Overrides _prepare_one,
     replay, can_run for EAGLE-specific draft-extend semantics.
     """
 
@@ -239,14 +239,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeRunner):
 
         try:
             with model_capture_mode():
-                self.capture()
+                self.prepare()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        return self.backend.run(shape_key, forward_batch)
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -276,7 +276,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeRunner):
 
         return is_bs_supported
 
-    def capture_one_shape(
+    def _prepare_one(
         self,
         size: int,
         forward: Callable,
@@ -415,7 +415,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs)
-                self.backend.capture_one(
+                self.backend.record(
                     shape_key,
                     run_once,
                     dummies=None,
@@ -426,7 +426,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeRunner):
                     ),
                 )
 
-    def replay(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
