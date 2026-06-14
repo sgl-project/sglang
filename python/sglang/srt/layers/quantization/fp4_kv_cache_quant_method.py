@@ -306,10 +306,11 @@ class NVFP4KVMethod(FP4KVCacheQuantMethod):
 
 
 class BlockFP4KVMethod(FP4KVCacheQuantMethod):
-    """Block-wise FP4 single-level scaling (similar to MXFP4 but block_size=16)."""
+    """Block-wise FP4 single-level scaling."""
 
     name = "blockfp4"
-    SCALE_BLOCK_SIZE = 16
+    SCALE_BLOCK_SIZE = 32
+    HADAMARD_ROTATE = False
 
     def needs_dequant_workspace(self) -> bool:
         return True
@@ -377,8 +378,12 @@ class BlockFP4KVMethod(FP4KVCacheQuantMethod):
     ) -> None:
         from sglang.srt.layers.quantization.kvfp4_tensor import BlockFP4KVQuantizeUtil
 
-        cache_k_fp4, cache_k_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_k)
-        cache_v_fp4, cache_v_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_v)
+        cache_k_fp4, cache_k_sf = BlockFP4KVQuantizeUtil.batched_quantize(
+            cache_k, self.SCALE_BLOCK_SIZE, self.HADAMARD_ROTATE
+        )
+        cache_v_fp4, cache_v_sf = BlockFP4KVQuantizeUtil.batched_quantize(
+            cache_v, self.SCALE_BLOCK_SIZE, self.HADAMARD_ROTATE
+        )
         k_buffer[loc] = cache_k_fp4
         v_buffer[loc] = cache_v_fp4
         k_scale_buffer[loc] = cache_k_sf
@@ -394,8 +399,12 @@ class BlockFP4KVMethod(FP4KVCacheQuantMethod):
     ) -> tuple[Tensor, Tensor]:
         from sglang.srt.layers.quantization.kvfp4_tensor import BlockFP4KVQuantizeUtil
 
-        k_bf16 = BlockFP4KVQuantizeUtil.batched_dequantize(k_fp4, k_scales)
-        v_bf16 = BlockFP4KVQuantizeUtil.batched_dequantize(v_fp4, v_scales)
+        k_bf16 = BlockFP4KVQuantizeUtil.batched_dequantize(
+            k_fp4, k_scales, self.HADAMARD_ROTATE
+        )
+        v_bf16 = BlockFP4KVQuantizeUtil.batched_dequantize(
+            v_fp4, v_scales, self.HADAMARD_ROTATE
+        )
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
 
     def compute_cell_size(
