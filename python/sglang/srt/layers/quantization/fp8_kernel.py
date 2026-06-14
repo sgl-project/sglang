@@ -461,19 +461,46 @@ def create_per_token_group_quant_fp8_output_scale(
     column_major_scales: bool,
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
+    scale_outer_major: bool = False,
 ):
-    if scale_ue8m0:
-        assert column_major_scales and scale_tma_aligned
-        *x_batch, x_q_mn, x_q_k = x_shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
-        aligned_mn = ceil_align(x_s_mn, 4)
-        aligned_k = ceil_align(x_s_k, 4)
-        # TODO(FIXME): Fix cuda kernel and recover here to empty.
+    # TODO: replace the scale layout booleans with a single enum before adding
+    # more mutually exclusive scale layouts.
+    if scale_outer_major:
+        assert scale_ue8m0
+        assert not column_major_scales and not scale_tma_aligned
+        assert len(x_shape) == 3
+        *x_batch, x_s_mn, x_s_outer, x_q_k = x_shape
+        # Store the outer axis as the leading allocation dim (each outer slice
+        # stays contiguous); the returned view keeps the logical (mn, outer, K) shape.
         return torch.empty(
-            (*x_batch, aligned_k // 4, aligned_mn),
+            (*x_batch, x_s_outer, x_s_mn, x_q_k // group_size),
             device=device,
-            dtype=torch.int,
-        ).transpose(-1, -2)[..., :x_s_mn, :]
+            dtype=torch.float32,
+        ).transpose(-3, -2)
+
+    if scale_ue8m0:
+        if column_major_scales and scale_tma_aligned:
+            *x_batch, x_q_mn, x_q_k = x_shape
+            x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+            aligned_mn = ceil_align(x_s_mn, 4)
+            aligned_k = ceil_align(x_s_k, 4)
+            # TODO(FIXME): Fix cuda kernel and recover here to empty.
+            return torch.empty(
+                (*x_batch, aligned_k // 4, aligned_mn),
+                device=device,
+                dtype=torch.int,
+            ).transpose(-1, -2)[..., :x_s_mn, :]
+        else:
+            assert not column_major_scales, (
+                "column_major_scales requires scale_tma_aligned=True "
+                "when scale_ue8m0 is enabled"
+            )
+            # Row-major float32 scale with power-of-2 values
+            return torch.empty(
+                x_shape[:-1] + (x_shape[-1] // group_size,),
+                device=device,
+                dtype=torch.float32,
+            )
     elif column_major_scales:
         if scale_tma_aligned:
             # TODO extract "align" function
@@ -508,6 +535,7 @@ def sglang_per_token_group_quant_fp8(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
+    scale_outer_major: bool = False,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -524,6 +552,7 @@ def sglang_per_token_group_quant_fp8(
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
+        scale_outer_major=scale_outer_major,
     )
 
     # Enable v2 kernel by default on supported group sizes
@@ -694,6 +723,7 @@ def sglang_per_token_group_quant_8bit(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
+    scale_outer_major: bool = False,
 ):
     from sglang.srt.layers.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
@@ -722,6 +752,7 @@ def sglang_per_token_group_quant_8bit(
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
         enable_v2=enable_v2,
+        scale_outer_major=scale_outer_major,
     )
 
 
