@@ -16,6 +16,8 @@
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+import regex
+
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
 try:
     import re._parser as sre_parse
@@ -256,3 +258,18 @@ def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
             total += MAX_LEN
 
     return total
+
+
+# Wall-clock budget (seconds) for matching one user-supplied stop_regex against
+# the output tail; bounds the scheduler loop against catastrophic backtracking.
+STOP_REGEX_MATCH_TIMEOUT = 0.1
+
+
+# Match stop_regex with the `regex` engine under a time budget so an adversarial
+# (ReDoS) pattern cannot block the scheduler loop. Raises TimeoutError when the
+# budget is exceeded; the caller aborts only that request.
+def match_stop_regex(stop_regex_str: str, tail_str: str) -> bool:
+    return (
+        regex.search(stop_regex_str, tail_str, timeout=STOP_REGEX_MATCH_TIMEOUT)
+        is not None
+    )
