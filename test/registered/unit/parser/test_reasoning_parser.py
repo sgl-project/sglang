@@ -831,6 +831,12 @@ class TestReasoningParser(CustomTestCase):
         parser = ReasoningParser("kimi_k2")
         self.assertIsInstance(parser.detector, KimiK2Detector)
 
+        parser = ReasoningParser("kimi_k2.5")
+        self.assertIsInstance(parser.detector, KimiK2Detector)
+
+        parser = ReasoningParser("kimi_k2.6")
+        self.assertIsInstance(parser.detector, KimiK2Detector)
+
         parser = ReasoningParser("glm45")
         self.assertIsInstance(parser.detector, Glm45Detector)
 
@@ -839,6 +845,15 @@ class TestReasoningParser(CustomTestCase):
 
         parser = ReasoningParser("gemma4")
         self.assertIsInstance(parser.detector, Gemma4Detector)
+
+        parser = ReasoningParser("deepseek-v4")
+        self.assertIsInstance(parser.detector, Qwen3Detector)
+
+        parser = ReasoningParser("qwen3.5")
+        self.assertIsInstance(parser.detector, Qwen3Detector)
+
+        parser = ReasoningParser("qwen3_5")
+        self.assertIsInstance(parser.detector, Qwen3Detector)
 
     def test_init_invalid_model(self):
         """Test initialization with invalid model type."""
@@ -1121,6 +1136,50 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertIn("break it down", all_reasoning)
         self.assertIn("final answer", all_normal)
 
+    def test_deepseek_v4_complete_response(self):
+        """Test complete DeepSeek-V4 response parsing."""
+        parser = ReasoningParser("deepseek-v4")
+        text = "<think>Analyzing DSV4 multi-head attention optimizations.</think>Final answer for DSV4."
+        reasoning, normal = parser.parse_non_stream(text)
+        self.assertEqual(reasoning, "Analyzing DSV4 multi-head attention optimizations.")
+        self.assertEqual(normal, "Final answer for DSV4.")
+
+    def test_qwen3_5_streaming_scenario(self):
+        """Test Qwen3.5 streaming scenario."""
+        parser = ReasoningParser("qwen3.5")
+        chunks = [
+            "<think>",
+            "Decomposing Qwen3.5 MoE gating factors.",
+            "</think>",
+            "Qwen3.5 final solution.",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+        self.assertIn("Decomposing", all_reasoning)
+        self.assertIn("final solution", all_normal)
+
+    def test_kimi_k2_6_tool_interruption(self):
+        """Test Kimi K2.6 tool interruption streaming scenario."""
+        parser = ReasoningParser("kimi_k2.6")
+        chunks = [
+            "<think>",
+            "Kimi K2.6 calculating token stats.",
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+        self.assertEqual(all_reasoning, "Kimi K2.6 calculating token stats.")
+        self.assertEqual(all_normal, "<|tool_calls_section_begin|><|tool_call_begin|>")
+
 
 class TestBufferLossBugFix(CustomTestCase):
     """Test cases for the buffer loss bug fix in parse_streaming_increment."""
@@ -1343,6 +1402,13 @@ class TestReasoningParserAdvanced(CustomTestCase):
         # These are aliases that map to existing detector classes
         alias_tests = {
             "deepseek-v3": Qwen3Detector,
+            "deepseek-v4": Qwen3Detector,
+            "qwen3.5": Qwen3Detector,
+            "qwen3_5": Qwen3Detector,
+            "kimi_k2.5": KimiK2Detector,
+            "kimi_k25": KimiK2Detector,
+            "kimi_k2.6": KimiK2Detector,
+            "kimi_k26": KimiK2Detector,
             "step3": DeepSeekR1Detector,
             "step3p5": DeepSeekR1Detector,
             "interns1": Qwen3Detector,
