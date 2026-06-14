@@ -389,7 +389,7 @@ class _StackItem:
                 return None
 
 
-class MinimaxM3NomDetector(TagToolCallDetector):
+class MinimaxM3Detector(TagToolCallDetector):
     """Detector for the MiniMax M3 namespace-tagged tool-call format.
 
     Parsing is implemented by ``M3TextParser``; streaming bookkeeping comes

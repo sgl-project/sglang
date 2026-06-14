@@ -24,7 +24,7 @@ from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
-from sglang.srt.function_call.minimax_m3_nom import MinimaxM3NomDetector
+from sglang.srt.function_call.minimax_m3 import MinimaxM3Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -914,7 +914,7 @@ VALID_CASES: List[StreamingFuzzCase] = [
     ),
     StreamingFuzzCase(
         name="minimax-m3-multiple-invokes-nested",
-        detector_factory=MinimaxM3NomDetector,
+        detector_factory=MinimaxM3Detector,
         tools=COMMON_TOOLS,
         text=_m3_text(
             _m3_call(
@@ -941,7 +941,7 @@ VALID_CASES: List[StreamingFuzzCase] = [
     ),
     StreamingFuzzCase(
         name="minimax-m3-complex-schema-plan-trip",
-        detector_factory=MinimaxM3NomDetector,
+        detector_factory=MinimaxM3Detector,
         tools=COMMON_TOOLS,
         text=_m3_text(_m3_call("plan_trip", PLAN_TRIP_ARGS), leading="Lead. "),
         markers=[
@@ -1224,7 +1224,7 @@ def _registered_no_crash_cases() -> List[NoCrashFuzzCase]:
 NO_CRASH_CASES: List[NoCrashFuzzCase] = [
     NoCrashFuzzCase(
         name="minimax-m3-truncated-namespace",
-        detector_factory=MinimaxM3NomDetector,
+        detector_factory=MinimaxM3Detector,
         tools=COMMON_TOOLS,
         text=(
             "Lead. ]<]minimax[>[<tool_call>\n"

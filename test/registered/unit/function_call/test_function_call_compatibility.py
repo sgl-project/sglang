@@ -26,7 +26,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
-from sglang.srt.function_call.minimax_m3_nom import M3TextParser, MinimaxM3NomDetector
+from sglang.srt.function_call.minimax_m3 import M3TextParser, MinimaxM3Detector
 from sglang.srt.function_call.parsing import (
     GeneratorParser,
     default_tool_call_output_key,
@@ -137,7 +137,7 @@ PLAN_TRIP_TOOL = Tool(
 COMPLEX_TOOLS = TOOLS + [PLAN_TRIP_TOOL]
 
 
-def _make_parser(detector=None, name="minimax-m3-nom", enable_compatibility_mode=True):
+def _make_parser(detector=None, name="minimax-m3", enable_compatibility_mode=True):
     if detector is not None:
         return FunctionCallParser.with_detector(
             detector, TOOLS, enable_compatibility_mode=enable_compatibility_mode
@@ -273,10 +273,10 @@ class TestFailOpenLadder(CustomTestCase):
     def test_non_stream_error_falls_back_to_full_text(self):
         text = f"Hi {NS}<tool_call>\nnot a valid invoke"
         # Detectors are pure may-raise parsers; recovery is the boundary's.
-        detector = MinimaxM3NomDetector()
+        detector = MinimaxM3Detector()
         with self.assertRaises(Exception):
             detector.detect_and_parse(text, TOOLS)
-        parser = FunctionCallParser(TOOLS, "minimax-m3-nom")
+        parser = FunctionCallParser(TOOLS, "minimax-m3")
         normal_text, calls = parser.parse_non_stream(text)
         self.assertEqual(calls, [])
         self.assertEqual(normal_text, text)
@@ -292,7 +292,7 @@ class TestFailOpenLadder(CustomTestCase):
             f"{NS}</invoke>\n"
             f"{NS}</tool_call>TRAILING GARBAGE"
         )
-        parser = FunctionCallParser(TOOLS, "minimax-m3-nom")
+        parser = FunctionCallParser(TOOLS, "minimax-m3")
         normal_text, calls = parser.parse_non_stream(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, "get_weather")
@@ -407,7 +407,7 @@ class TestCompatibilityEvents(CustomTestCase):
         )
 
     def test_unconvertible_value_kept_raw_and_recorded(self):
-        detector = MinimaxM3NomDetector()
+        detector = MinimaxM3Detector()
         result = detector.detect_and_parse(
             f"{NS}<tool_call>\n"
             f'{NS}<invoke name="get_weather">'
@@ -619,7 +619,7 @@ class TestCompatibilityModeOption(CustomTestCase):
         text = TestCompatibilityEvents.DUPLICATE_TAG_TEXT
 
         compatible = FunctionCallParser(
-            TOOLS, "minimax-m3-nom", enable_compatibility_mode=True
+            TOOLS, "minimax-m3", enable_compatibility_mode=True
         )
         _, calls = compatible.parse_non_stream(text)
         self.assertEqual(len(calls), 1)
@@ -630,7 +630,7 @@ class TestCompatibilityModeOption(CustomTestCase):
         events = [r.event for r in compatible.detector.compatibility_records]
         self.assertEqual(events, [CompatibilityEvent.DUPLICATE_TAG_AS_LIST])
 
-        strict = FunctionCallParser(TOOLS, "minimax-m3-nom")
+        strict = FunctionCallParser(TOOLS, "minimax-m3")
         normal_text, calls = strict.parse_non_stream(text)
         self.assertEqual(calls, [])
         self.assertEqual(normal_text, text)
@@ -675,7 +675,7 @@ class TestRemainingCompatibilityEvents(CustomTestCase):
         self.assertIn(CompatibilityEvent.DROPPED_INVOKE_TAIL, self._events(parser))
 
         strict = _make_parser(
-            FunctionCallParser(TOOLS, "minimax-m3-nom").detector,
+            FunctionCallParser(TOOLS, "minimax-m3").detector,
             enable_compatibility_mode=False,
         )
         strict.detector.compatibility.strict = True
@@ -718,7 +718,7 @@ class TestRemainingCompatibilityEvents(CustomTestCase):
             f"{NS}</invoke>\n{NS}</tool_call>"
         )
         parser = FunctionCallParser(
-            ARRAY_TOOLS, "minimax-m3-nom", enable_compatibility_mode=True
+            ARRAY_TOOLS, "minimax-m3", enable_compatibility_mode=True
         )
         _, calls = parser.parse_non_stream(text)
         self.assertEqual(len(calls), 1)
@@ -852,7 +852,7 @@ class TestComplexSchemaCompatibility(CustomTestCase):
     def _parser(self, enable_compatibility_mode=True):
         return FunctionCallParser(
             COMPLEX_TOOLS,
-            "minimax-m3-nom",
+            "minimax-m3",
             enable_compatibility_mode=enable_compatibility_mode,
         )
 
