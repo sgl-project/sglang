@@ -20,7 +20,7 @@ import gc
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -168,7 +168,17 @@ class BaseRunner(ABC):
             return
 
         if model_runner._should_run_flashinfer_autotune():
-            model_runner._flashinfer_autotune()
+            # Autotune always reuses a prepared static decode buffer instead of
+            # allocating a throwaway set. The decode runner provides it; a
+            # prefill-only (embedding) runner does not -- its buffers lack the
+            # decode fields the dummy forward reads -- so we assert rather than
+            # silently fall back to a fresh allocation.
+            buffers, batch_size = self._autotune_buffers()
+            assert buffers is not None, (
+                "flashinfer autotune requires the decode runner's prepared "
+                "static buffers; none available (prefill-only / embedding model)"
+            )
+            model_runner._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
 
         from sglang.srt.environ import envs
         from sglang.srt.layers import deep_gemm_wrapper
@@ -184,6 +194,18 @@ class BaseRunner(ABC):
             )
 
             pp_parallel_deep_gemm_warmup(model_runner)
+
+    def _autotune_buffers(self) -> Tuple[Optional[Any], Optional[int]]:
+        """Static decode buffers + max captured bs for warmup() to hand the
+        flashinfer-autotune dummy forward, so it reuses this runner's already-
+        allocated buffers instead of allocating a throwaway set.
+
+        Returns (None, None) by default. Only the decode runner overrides this:
+        its buffers carry every field the dummy decode forward reads. Prefill
+        buffers deliberately do not (no seq_lens / req_pool_indices / logits
+        buffer), so warmup() asserts a decode buffer is present before autotune.
+        """
+        return None, None
 
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:

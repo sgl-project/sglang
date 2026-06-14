@@ -467,14 +467,31 @@ def pp_parallel_deep_gemm_warmup(model_runner) -> None:
     # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
+    from sglang.srt.layers.dp_attention import get_attention_tp_size
     from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+    from sglang.srt.utils.common import require_mlp_sync
 
     n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
     block_m = 64
     cp = max(get_cp_padding_align_size(), 1)
+
+    # Align each bs: CP padding (as before) plus the scheduler's MLP-sync
+    # padding to attn_tp_size. The MLP-sync part used to live in _dummy_run, but
+    # it now expects the caller to own the shape (and to size its buffer to it),
+    # so we apply it here. PP-DeepGEMM warmup is non-speculative => num_tokens_per_bs
+    # == 1, so bs == num_tokens.
+    attn_tp_size = get_attention_tp_size()
+    mlp_sync = require_mlp_sync(model_runner.server_args)
+
+    def _align(bs: int) -> int:
+        bs = ceil_align(bs, cp)
+        if mlp_sync and attn_tp_size > 1 and bs % attn_tp_size != 0:
+            bs = ceil_align(bs, attn_tp_size)
+        return bs
+
     batch_sizes = sorted(
         {
-            ceil_align(bs, cp)
+            _align(bs)
             for bs in (
                 1,
                 2 * block_m,
@@ -500,16 +517,26 @@ def pp_parallel_deep_gemm_warmup(model_runner) -> None:
         disagg_mode,
     )
 
+    # One static buffer sized to the largest shape, reused (sliced per bs by
+    # _dummy_run) across the whole sweep instead of allocating a throwaway set
+    # per call. The decode runner's own buffers are too small to reuse here
+    # (this sweep goes up to ~n_sms*block_m >> its max_bs).
+    dummy_buffers = model_runner._alloc_dummy_decode_buffers(max(batch_sizes))
+
     t0 = time.perf_counter()
     with torch.inference_mode():
         for bs in batch_sizes:
             if run_decode:
                 model_runner._dummy_run(
-                    batch_size=bs, forward_mode_override=ForwardMode.DECODE
+                    batch_size=bs,
+                    forward_mode_override=ForwardMode.DECODE,
+                    buffers=dummy_buffers,
                 )
             if run_extend:
                 model_runner._dummy_run(
-                    batch_size=bs, forward_mode_override=ForwardMode.EXTEND
+                    batch_size=bs,
+                    forward_mode_override=ForwardMode.EXTEND,
+                    buffers=dummy_buffers,
                 )
 
     logger.info(
