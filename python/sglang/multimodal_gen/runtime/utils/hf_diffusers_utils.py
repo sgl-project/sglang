@@ -544,7 +544,7 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
 
 
 def _resolve_remote_repo_model_index_path(model_name_or_path: str) -> str:
-    """Return a local path to a remote repo's ``model_index.json`` """
+    """Return a local path to a remote repo's ``model_index.json``"""
     from huggingface_hub.errors import EntryNotFoundError
 
     try:
