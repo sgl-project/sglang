@@ -647,12 +647,7 @@ class DiffusersPipeline(ComposedPipelineBase):
                         # Regional compilation: compile a single instance of each
                         # repeated transformer block and let inductor's cache reuse
                         # it for all repeats, instead of compiling the whole DiT as
-                        # one graph. This cuts cold-start compile from O(num_blocks)
-                        # to O(1) -- e.g. on H200, FLUX.1-dev full-model compile
-                        # ~50s -> ~8s and Qwen-Image warmup compile ~163s -> ~8s --
-                        # with the same steady-state speedup (verified no per-image
-                        # latency regression). See the PyTorch regional-compilation
-                        # recipe and diffusers' ModelMixin.compile_repeated_blocks.
+                        # one graph
                         component.compile_repeated_blocks()
                     elif isinstance(component, torch.nn.Module) and hasattr(
                         component, "compile"
