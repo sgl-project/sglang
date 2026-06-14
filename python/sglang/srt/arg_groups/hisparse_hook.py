@@ -6,18 +6,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-# Backend/dtype pairing: flashmla_sparse only takes BF16 KV;
-# flashmla_kv only supports FP8 (it always reads KV as FP8 via
-# is_fp8_kvcache=True, inline-quantizing BF16 would defeat HiSparse).
-_HISPARSE_ALLOWED_BACKENDS_BY_DTYPE = {
+HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
     "bfloat16": {"flashmla_sparse"},
     "fp8_e4m3": {"flashmla_kv"},
 }
+HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "aiter"}
+HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
+
+
+def _is_hip() -> bool:
+    from sglang.srt.server_args import is_hip
+
+    return is_hip()
 
 
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
+    if _is_hip():
+        return "tilelang"
     return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
+
+
+def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
+    if _is_hip():
+        return HISPARSE_ROCM_DSA_BACKENDS
+    return HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE.get(
+        kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"}
+    )
 
 
 def apply_hisparse_dsa_backend_defaults(
@@ -28,8 +42,8 @@ def apply_hisparse_dsa_backend_defaults(
 ) -> bool:
     """Pick DSA backends for --enable-hisparse based on KV dtype.
 
-    BF16 KV -> flashmla_sparse, FP8 KV -> flashmla_kv. Returns True if hisparse
-    handled backend selection (caller should skip its own default logic).
+    CUDA uses dtype-specific FlashMLA backends; ROCm uses TileLang. Returns
+    True if hisparse handled backend selection.
     """
     if not server_args.enable_hisparse:
         return False
@@ -44,6 +58,35 @@ def apply_hisparse_dsa_backend_defaults(
         f"prefill={server_args.dsa_prefill_backend}, decode={server_args.dsa_decode_backend}."
     )
     return True
+
+
+def validate_hisparse_dsa_backend(
+    server_args: "ServerArgs", attr: str, label: str
+) -> None:
+    backend = getattr(server_args, attr)
+    allowed_backends = _hisparse_allowed_backends(server_args.kv_cache_dtype)
+    if backend is not None and backend not in allowed_backends:
+        raise ValueError(
+            f"HiSparse supports DSA {label} backend(s) {sorted(allowed_backends)} "
+            f"on this platform with --kv-cache-dtype={server_args.kv_cache_dtype}, "
+            f"but got --dsa-{label}-backend={backend}. "
+            f"Please use --dsa-{label}-backend="
+            f"{_hisparse_default_backend(server_args.kv_cache_dtype)} "
+            "or omit it."
+        )
+
+
+def validate_hisparse_kv_cache_dtype(server_args: "ServerArgs") -> None:
+    if server_args.kv_cache_dtype in HISPARSE_KV_CACHE_DTYPES:
+        return
+
+    choices = " or ".join(
+        f"--kv-cache-dtype={dtype}" for dtype in HISPARSE_KV_CACHE_DTYPES
+    )
+    raise ValueError(
+        f"HiSparse requires one of {HISPARSE_KV_CACHE_DTYPES} KV cache dtypes, "
+        f"but got --kv-cache-dtype={server_args.kv_cache_dtype}. Please use {choices}."
+    )
 
 
 def validate_hisparse(server_args: "ServerArgs") -> None:
@@ -73,23 +116,10 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
         return
 
     if server_args.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
-        raise ValueError(
-            f"HiSparse requires bfloat16 or fp8_e4m3 KV cache, "
-            f"but got --kv-cache-dtype={server_args.kv_cache_dtype}. "
-            f"Please use --kv-cache-dtype=bfloat16 or fp8_e4m3."
-        )
+        validate_hisparse_kv_cache_dtype(server_args)
 
-    allowed_backends = _HISPARSE_ALLOWED_BACKENDS_BY_DTYPE.get(
-        server_args.kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"}
-    )
     for attr, label in [
         ("dsa_prefill_backend", "prefill"),
         ("dsa_decode_backend", "decode"),
     ]:
-        backend = getattr(server_args, attr)
-        if backend is not None and backend not in allowed_backends:
-            raise ValueError(
-                f"HiSparse with --kv-cache-dtype={server_args.kv_cache_dtype} requires "
-                f"--dsa-{label}-backend in {sorted(allowed_backends)}, "
-                f"but got {backend}."
-            )
+        validate_hisparse_dsa_backend(server_args, attr, label)
