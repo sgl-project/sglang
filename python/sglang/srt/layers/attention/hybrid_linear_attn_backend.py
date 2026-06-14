@@ -436,8 +436,16 @@ class MambaAttnBackendBase(AttentionBackend):
             num_padding = torch.count_nonzero(
                 seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
             )
-        # Make sure forward metadata is correctly handled for padding reqs
-        req_pool_indices[bs - num_padding :] = 0
+        # Make sure forward metadata is correctly handled for padding reqs.
+        # Zero the padding slots on a COPY: req_pool_indices is borrowed from the
+        # caller (the cuda-graph input buffer at replay, the ScheduleBatch tensor
+        # in eager), and the zeroing here only feeds the mamba-index lookup
+        # below. Mutating it in place would corrupt the caller's tensor for
+        # downstream layers -- this keeps the replay metadata builder
+        # side-effect-free (a prerequisite for routing eager through it).
+        if num_padding > 0:
+            req_pool_indices = req_pool_indices.clone()
+            req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
