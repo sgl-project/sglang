@@ -1663,9 +1663,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
@@ -1679,9 +1681,11 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_v_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_v_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_v_nope_fp4, cache_v_nope_fp4_sf
             )
             return cache_v_nope_fp4_dequant
@@ -1711,10 +1715,12 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             if v_scale is not None:
                 cache_v.div_(v_scale)
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
-            cache_v, cache_v_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
+            cache_k, cache_k_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_k)
+            cache_v, cache_v_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_v)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
@@ -2268,9 +2274,11 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+            cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
             return cache_k_nope_fp4_dequant
@@ -2290,9 +2298,13 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                BlockFP4KVQuantizeUtil,
+            )
 
-            cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
+            cache_k_fp4, cache_k_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(
+                cache_k
+            )
 
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
@@ -2326,14 +2338,14 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         else:
             if cache_k_nope.dtype != self.dtype:
                 from sglang.srt.layers.quantization.kvfp4_tensor import (
-                    KVFP4QuantizeUtil,
+                    BlockFP4KVQuantizeUtil,
                 )
 
                 cache_k_nope_fp4, cache_k_nope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
+                    BlockFP4KVQuantizeUtil.batched_quantize(cache_k_nope)
                 )
                 cache_k_rope_fp4, cache_k_rope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
+                    BlockFP4KVQuantizeUtil.batched_quantize(cache_k_rope)
                 )
 
             if self.store_dtype != self.dtype:
