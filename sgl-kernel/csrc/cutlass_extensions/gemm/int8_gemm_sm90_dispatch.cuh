@@ -266,6 +266,37 @@ struct sm90_int8_config_M128_smallN {
           EpilogueSchedule>>;
 };
 
+// Non-swap fallback for M in (16, 64] when N <= kNThreshold. At small N the
+// original non-swap tile is already efficient, while the swap M64_smallN tile
+// (<64,16,256>) regresses ~12% on H20 in this region, so fall back to non-swap.
+template <typename InType, typename OutType, bool EnableBias>
+struct sm90_int8_config_M64_smallN_noswap {
+  static_assert(std::is_same<InType, int8_t>());
+  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecialized;
+  using EpilogueSchedule = typename cutlass::epilogue::TmaWarpSpecialized;
+  using TileShape = Shape<_64, _64, _128>;
+  using ClusterShape = Shape<_1, _4, _1>;
+
+  using Cutlass3xGemm = conditional_t<
+      EnableBias,
+      cutlass_3x_gemm_sm90_int8<
+          InType,
+          OutType,
+          c3x::ScaledEpilogueBias,
+          TileShape,
+          ClusterShape,
+          KernelSchedule,
+          EpilogueSchedule>,
+      cutlass_3x_gemm_sm90_int8<
+          InType,
+          OutType,
+          c3x::ScaledEpilogue,
+          TileShape,
+          ClusterShape,
+          KernelSchedule,
+          EpilogueSchedule>>;
+};
+
 // Small-M swap buckets start with FP8 swap tile seeds.
 template <typename InType, typename OutType, bool EnableBias>
 struct sm90_int8_config_M64_smallN {
@@ -450,6 +481,8 @@ inline void cutlass_gemm_sm90_int8_dispatch(
   using Cutlass3xGemmM128_smallN = typename sm90_int8_config_M128_smallN<InType, OutType, EnableBias>::Cutlass3xGemm;
 
   using Cutlass3xGemmM64_smallN = typename sm90_int8_config_M64_smallN<InType, OutType, EnableBias>::Cutlass3xGemm;
+  using Cutlass3xGemmM64_smallN_noswap =
+      typename sm90_int8_config_M64_smallN_noswap<InType, OutType, EnableBias>::Cutlass3xGemm;
   using Cutlass3xGemmM64_largeN = typename sm90_int8_config_M64_largeN<InType, OutType, EnableBias>::Cutlass3xGemm;
   using Cutlass3xGemmM32_largeN = typename sm90_int8_config_M32_largeN<InType, OutType, EnableBias>::Cutlass3xGemm;
   using Cutlass3xGemmM16_smallN = typename sm90_int8_config_M16_smallN<InType, OutType, EnableBias>::Cutlass3xGemm;
@@ -482,9 +515,10 @@ inline void cutlass_gemm_sm90_int8_dispatch(
   } else if (m <= 64) {
     // m in (16, 64]
     if (n <= kNThreshold) {
-      // M64_smallN tile (kernel-N=16) fits M_orig in {17..64} with no padding
-      // (since 16 divides them), works well across the whole bucket.
-      return cutlass_gemm_caller_sm90_int8_scaled<Cutlass3xGemmM64_smallN>(
+      // Small N is already efficient with the original non-swap tile; the swap
+      // M64_smallN tile (<64,16,256>) regresses ~12% here on H20, so fall back
+      // to the non-swap config for (16, 64] x small-N. (M<=16 still swaps.)
+      return cutlass_gemm_caller_sm90_int8_scaled<Cutlass3xGemmM64_smallN_noswap>(
           out, a, b, a_scales, b_scales, std::forward<EpilogueArgs>(args)...);
     }
     if (m <= 32) {
