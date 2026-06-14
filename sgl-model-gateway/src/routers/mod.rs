@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use serde_json::{Map, Value};
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
@@ -88,6 +89,18 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Generate endpoint not implemented",
         )
             .into_response()
+    }
+
+    /// Route a generate request while preserving extra SGLang-native fields
+    /// that are not yet represented in openai-protocol's GenerateRequest.
+    async fn route_generate_with_extra(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        _extra_body: Option<&Map<String, Value>>,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_generate(headers, body, model_id).await
     }
 
     /// Route a chat completion request

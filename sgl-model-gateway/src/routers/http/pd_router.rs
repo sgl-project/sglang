@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
@@ -289,6 +289,7 @@ impl PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
+        extra_body: Option<&Map<String, Value>>,
         context: PDRequestContext<'_>,
     ) -> Response {
         let start_time = Instant::now();
@@ -342,6 +343,12 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+
+                        if let Err(message) =
+                            Self::merge_extra_body_fields(&mut json_request, extra_body)
+                        {
+                            return error::bad_request("extra_body_merge_failed", message);
+                        }
 
                         json_request = match Self::inject_bootstrap_into_value(
                             json_request,
@@ -1201,6 +1208,22 @@ impl PDRouter {
         request
     }
 
+    fn merge_extra_body_fields(
+        json_request: &mut Value,
+        extra_body: Option<&Map<String, Value>>,
+    ) -> Result<(), &'static str> {
+        let Some(extra_body) = extra_body else {
+            return Ok(());
+        };
+        let Some(map) = json_request.as_object_mut() else {
+            return Err("Failed to merge extra request fields into a non-object request body");
+        };
+        for (key, value) in extra_body {
+            map.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+
     // Helper to merge logprobs from prefill and decode responses
     // Optimized to avoid double cloning by taking ownership of decode array
     fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
@@ -1409,7 +1432,39 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, None, context).await
+    }
+
+    async fn route_generate_with_extra(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        extra_body: Option<&Map<String, Value>>,
+        model_id: Option<&str>,
+    ) -> Response {
+        let is_stream = body.stream;
+        let return_logprob = body.return_logprob.unwrap_or(false);
+
+        let request_text = if self.policies_need_request_text() {
+            body.text.as_deref().map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        let batch_size = Self::get_generate_batch_size(body);
+
+        let context = PDRequestContext {
+            route: "/generate",
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, extra_body, context)
+            .await
     }
 
     async fn route_chat(
@@ -1451,7 +1506,7 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, None, context).await
     }
 
     async fn route_completion(
@@ -1485,7 +1540,7 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, None, context).await
     }
 
     async fn route_rerank(
@@ -1511,7 +1566,7 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, None, context).await
     }
 
     async fn route_embeddings(

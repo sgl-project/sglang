@@ -67,6 +67,9 @@ class SamplingBatchInfo:
     # Used for deterministic sampling
     sampling_seed: Optional[torch.Tensor] = None
 
+    # Per-request flag for returning sparse sampling support metadata.
+    return_sampling_masks: Optional[List[bool]] = None
+
     # Device
     device: str = "cuda"
 
@@ -198,6 +201,7 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            return_sampling_masks=[r.return_sampling_mask for r in reqs],
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -301,6 +305,10 @@ class SamplingBatchInfo:
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
+        if self.return_sampling_masks is not None:
+            self.return_sampling_masks = [
+                self.return_sampling_masks[i] for i in keep_indices
+            ]
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
@@ -366,6 +374,8 @@ class SamplingBatchInfo:
 
     def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+        self_len = len(self)
+        other_len = len(other)
 
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
@@ -374,14 +384,14 @@ class SamplingBatchInfo:
                 SamplingBatchInfo.merge_custom_logit_processor(
                     self.custom_logit_processor,
                     other.custom_logit_processor,
-                    len(self),
-                    len(other),
+                    self_len,
+                    other_len,
                     self.device,
                 )
             )
             # Merge the custom params lists
-            self.custom_params = self.custom_params or [None] * len(self)
-            other.custom_params = other.custom_params or [None] * len(other)
+            self.custom_params = self.custom_params or [None] * self_len
+            other.custom_params = other.custom_params or [None] * other_len
             self.custom_params.extend(other.custom_params)
 
             # Set the flag to True if any of the two has custom logit processor
@@ -390,8 +400,15 @@ class SamplingBatchInfo:
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).
         self.logit_bias = merge_bias_tensor(
-            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
+            self.logit_bias, other.logit_bias, self_len, other_len, self.device, 0.0
         )
+        if (
+            self.return_sampling_masks is not None
+            or other.return_sampling_masks is not None
+        ):
+            self.return_sampling_masks = (
+                self.return_sampling_masks or [False] * self_len
+            ) + (other.return_sampling_masks or [False] * other_len)
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
