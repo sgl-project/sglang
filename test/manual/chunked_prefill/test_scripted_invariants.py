@@ -7,6 +7,8 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    chunked_req_of,
+    inflight_middle_chunks_of,
     run_until,
     run_until_all_finished,
     run_until_finished,
@@ -298,7 +300,7 @@ class TestInvariantsBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             yield
             req = r.req
-            cur = req.inflight_middle_chunks if req is not None else 0
+            cur = inflight_middle_chunks_of(req) if req is not None else 0
             running_max = max(running_max, cur)
             if r.finished:
                 running_max_post_finish = max(running_max_post_finish, cur)
@@ -393,16 +395,16 @@ class TestInvariantsBasic(ScriptedTestCase):
     def _script_chunked_in_flight_count_exactly_zero_after_finish(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 1, (
+        assert (1 if chunked_req_of(t.scheduler) is not None else 0) == 1, (
             f"chunked_in_flight_count should be 1 mid-chunk; got "
-            f"{(1 if t.scheduler.chunked_req is not None else 0)}"
+            f"{(1 if chunked_req_of(t.scheduler) is not None else 0)}"
         )
         yield from run_until_finished(r)
         for _ in range(3):
             yield
-            assert (1 if t.scheduler.chunked_req is not None else 0) == 0, (
+            assert (1 if chunked_req_of(t.scheduler) is not None else 0) == 0, (
                 f"chunked_in_flight_count must be 0 after finish; got "
-                f"{(1 if t.scheduler.chunked_req is not None else 0)}"
+                f"{(1 if chunked_req_of(t.scheduler) is not None else 0)}"
             )
 
     def test_extend_batch_idx_monotonic_invariant(self):
@@ -479,9 +481,9 @@ class TestInvariantsBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             s = t.scheduler
             req = t.find_req_by_rid(r.rid)
-            cur_inflight = req.inflight_middle_chunks if req is not None else 0
+            cur_inflight = inflight_middle_chunks_of(req) if req is not None else 0
             cur_is_chunked_slot = (
-                s.chunked_req is not None and s.chunked_req.rid == r.rid
+                chunked_req_of(s) is not None and chunked_req_of(s).rid == r.rid
             )
             cur_finished = req.finished() if req is not None else True
             if cur_inflight < prev_inflight:

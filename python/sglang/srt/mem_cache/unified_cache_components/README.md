@@ -222,14 +222,14 @@ Cache a completed request's KV data into the tree.
 
 ---
 
-### `cache_unfinished_req(req: Req, chunked=False)`
+### `cache_unfinished_req(req: Req, is_partially_extended=False)`
 
 Cache an in-progress request's partial KV data (chunked prefill).
 
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | During chunked prefill, insert partial results so the next chunk can match the prefix |
-| **Inputs** | `req` — the in-progress request |
+| **Inputs** | `req` — the in-progress request; `is_partially_extended` — True for a mid-chunked-prefill stash (skips hit-count updates to avoid self-referencing inflation) |
 | **Output** | `None` |
 | **Mutation** | Inserts partial KV → re-matches prefix → updates `req.prefix_indices`, `req.cache_protected_len`, `req.last_node`; transfers lock from old node to new node |
 | **Complexity** | **O(K + D·C)** — two tree traversals: insert O(K + D·C) + re-match O(K + D·C) + lock transfer O(D). Simplifies to **O(K)**. |
