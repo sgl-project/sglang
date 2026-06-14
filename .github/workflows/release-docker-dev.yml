@@ -16,7 +16,7 @@ on:
         required: false
         default: "lmsysorg/sglang"
       overlay_dockerfile:
-        description: "Optional extra Dockerfile lines appended after FROM <base> to build a layered image (e.g. 'RUN pip install ...'). Leave empty to skip overlay."
+        description: "Optional extra Dockerfile lines appended after FROM <base> to build a layered image (e.g. 'RUN pip install ...'). Note: this job has no repo checkout, so only FROM + RUN work — you cannot COPY files from this repo. Leave empty to skip overlay."
         required: false
         default: ""
       overlay_cudas:
@@ -91,6 +91,14 @@ jobs:
           # build one or more layered images on top of the just-built base.
           # SUFFIX was computed above from inputs.tag / inputs.pr_number.
           if [ -n "${OVERLAY_DOCKERFILE_INPUT}" ]; then
+            # Refuse to overlay without a tag/pr_number: SUFFIX would be empty,
+            # so base would point at the moving 'dev'/'dev-cu12'/'dev-cu13'
+            # latest tags and overwrite mode would clobber them.
+            if [ -z "${SUFFIX}" ]; then
+              echo "overlay_dockerfile is set but neither 'tag' nor 'pr_number' was given." >&2
+              echo "Set one so the overlay targets a specific tag, not the moving 'dev' latest." >&2
+              exit 1
+            fi
             CUDAS_INPUT="${OVERLAY_CUDAS_INPUT}"
             [ -z "${CUDAS_INPUT}" ] && CUDAS_INPUT="cu13"
             OVERLAY_TAGS='{}'
@@ -147,7 +155,7 @@ jobs:
 
   build-overlay:
     needs: [prepare, build-and-publish]
-    if: ${{ inputs.overlay_dockerfile != '' }}
+    if: ${{ inputs.overlay_dockerfile != '' && github.repository == 'sgl-project/sglang' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
