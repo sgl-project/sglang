@@ -83,14 +83,6 @@ def verify_single_backend_fused_metadata_copy(
         ref_page_table_1[:, : precomputed.max_seqlen_k].copy_(precomputed.page_indices)
         ref_dsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
         ref_dsa_cache_seqlens.copy_(precomputed.dsa_cache_seqlens)
-    elif forward_mode.is_draft_extend():
-        # Draft extend mode
-        rows = precomputed.page_indices.shape[0]
-        cols = precomputed.max_seqlen_k
-        ref_page_table_1[:rows, :cols].copy_(precomputed.page_indices)
-        size = precomputed.seqlens_expanded_size
-        ref_dsa_seqlens_expanded[:size].copy_(precomputed.seqlens_expanded)
-        ref_dsa_cache_seqlens[:size].copy_(precomputed.dsa_cache_seqlens)
 
     # Copy DSA cu_seqlens
     size = precomputed.seqlens_expanded_size
@@ -141,14 +133,6 @@ def verify_single_backend_fused_metadata_copy(
             fused_page_table_1[:, : precomputed.max_seqlen_k],
             ref_page_table_1[:, : precomputed.max_seqlen_k],
         )
-    elif forward_mode.is_draft_extend():
-        rows = precomputed.page_indices.shape[0]
-        cols = precomputed.max_seqlen_k
-        check_tensor_equal(
-            "page_table_1",
-            fused_page_table_1[:rows, :cols],
-            ref_page_table_1[:rows, :cols],
-        )
 
     # Compare dsa_cache_seqlens only for the region that was updated
     if forward_mode.is_decode_or_idle():
@@ -157,7 +141,7 @@ def verify_single_backend_fused_metadata_copy(
             fused_dsa_cache_seqlens,
             ref_dsa_cache_seqlens,
         )
-    else:  # TARGET_VERIFY or DRAFT_EXTEND
+    else:  # TARGET_VERIFY
         size = precomputed.seqlens_expanded_size
         check_tensor_equal(
             "dsa_cache_seqlens",
@@ -165,8 +149,8 @@ def verify_single_backend_fused_metadata_copy(
             ref_dsa_cache_seqlens[:size],
         )
 
-    # Compare dsa_seqlens_expanded only for TARGET_VERIFY and DRAFT_EXTEND
-    if forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+    # Compare dsa_seqlens_expanded only for TARGET_VERIFY
+    if forward_mode.is_target_verify():
         size = precomputed.seqlens_expanded_size
         check_tensor_equal(
             "dsa_seqlens_expanded",

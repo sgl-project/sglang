@@ -14,6 +14,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -43,6 +44,30 @@ class TestPrepareServerArgs(CustomTestCase):
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
+
+    def test_config_nested_dict_args_are_json(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("mm-process-config:\n  image:\n    resize: 128\n")
+            config_file = f.name
+
+        try:
+            parser = server_args_module.argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                [
+                    "--config",
+                    config_file,
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                ]
+            )
+            value = merged[merged.index("--mm-process-config") + 1]
+            parsed = parser.parse_args(merged)
+
+            self.assertEqual(json.loads(value), {"image": {"resize": 128}})
+            self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
+        finally:
+            os.unlink(config_file)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -93,7 +118,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
                 disaggregation_transfer_backend="fake",
             )
 
-        self.assertIn("('nixl', 'mooncake')", str(context.exception))
+        self.assertIn("('nixl', 'mooncake', 'mori')", str(context.exception))
         self.assertIn("'fake'", str(context.exception))
 
 

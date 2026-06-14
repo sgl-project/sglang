@@ -49,10 +49,10 @@ class DFlashVerifyInput(SpecInput):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
-    def prepare_for_v2_verify(
+    def prepare_for_verify(
         self,
         batch: ScheduleBatch,
-        target_worker: "TpModelWorker",
+        target_worker: TpModelWorker,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
