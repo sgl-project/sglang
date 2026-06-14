@@ -214,6 +214,15 @@ class Mxfp4MarlinMoEMethod:
             )
             return StandardCombineInput(hidden_states=output)
 
+        expert_map = None
+        global_num_experts = -1
+        if hasattr(layer, "dispatcher") and hasattr(
+            layer.dispatcher, "local_expert_mapping"
+        ):
+            expert_map = layer.dispatcher.local_expert_mapping
+            if expert_map is not None:
+                global_num_experts = self.runner.config.num_experts
+
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_weight,
             w2_qweight=layer.w2_weight,
@@ -223,6 +232,8 @@ class Mxfp4MarlinMoEMethod:
             w2_g_idx_sort_indices=None,
             weight_bits=4,
             is_k_full=True,
+            expert_map=expert_map,
+            global_num_experts=global_num_experts,
         )
         runner_output = self.runner.run(dispatch_output, quant_info=quant_info)
 
