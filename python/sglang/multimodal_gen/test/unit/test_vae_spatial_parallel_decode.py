@@ -105,7 +105,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
     def test_auto_parallel_decode_policy_is_conservative(self):
         self.assertFalse(is_spatial_shard_parallel_decode_mode("auto"))
         self.assertFalse(should_use_spatial_shard_parallel_decode(VAEConfig()))
-        self.assertTrue(should_use_spatial_shard_parallel_decode(QwenImageVAEConfig()))
+        self.assertFalse(should_use_spatial_shard_parallel_decode(QwenImageVAEConfig()))
         self.assertTrue(should_use_spatial_shard_parallel_decode(LTXVideoVAEConfig()))
         self.assertTrue(should_use_spatial_shard_parallel_decode(WanVAEConfig()))
 
@@ -116,6 +116,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertTrue(should_use_spatial_shard_parallel_decode(ltx23_config))
 
         config = QwenImageVAEConfig()
+        self.assertFalse(
+            should_use_spatial_shard_parallel_decode(
+                config, torch.empty(1, 16, 1, 128, 128), 2
+            )
+        )
         config.parallel_decode_mode = "spatial_shard"
         self.assertTrue(should_use_spatial_shard_parallel_decode(config))
 
