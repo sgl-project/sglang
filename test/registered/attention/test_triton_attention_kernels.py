@@ -865,6 +865,63 @@ class TestTritonAttention(CustomTestCase):
             unified_seq = unified_kv_indices[start_idx:end_idx]
             self.assertEqual(len(unified_seq), prefix_len + extend_len)
 
+    def _pick_kv_splits(self, seq_lens_list, cap):
+        import triton
+
+        from sglang.srt.layers.attention.triton_ops.metadata import (
+            get_num_kv_splits_triton,
+        )
+        from sglang.srt.utils import get_device_core_count
+
+        device = get_device()
+        bs = len(seq_lens_list)
+        seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64, device=device)
+        num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=device)
+        num_seq, num_group = bs, 1
+        num_head, num_kv_head = 32, 8  # Llama-3.1-8B GQA shape
+        sched_seq = 256 if num_seq < 256 else triton.next_power_of_2(num_seq)
+        get_num_kv_splits_triton[(1,)](
+            num_kv_splits,
+            seq_lens,
+            num_seq,
+            num_group,
+            num_head,
+            num_kv_head,
+            cap,
+            get_device_core_count(0),
+            MAX_NUM_SEQ=sched_seq,
+        )
+        return num_kv_splits.tolist()
+
+    def test_get_num_kv_splits_context_gating(self):
+        # The context-aware gate must keep short-context sequences bit-identical to the
+        # previous (cap=8) behavior -- including when a short request is co-scheduled with a
+        # long one under continuous batching -- while letting genuinely long sequences use
+        # the raised cap. The picked split count fully determines the flash-decode reduction
+        # order, so an unchanged split count means bit-identical output.
+        SHORT, LONG = (
+            2048,
+            32768,
+        )  # below / above the long-context split threshold (24576)
+
+        # 1) pure short batch: raising the cap must not change any pick.
+        self.assertEqual(
+            self._pick_kv_splits([SHORT, 1024, 1500], cap=8),
+            self._pick_kv_splits([SHORT, 1024, 1500], cap=64),
+            "short-context split counts changed when the cap was raised",
+        )
+
+        # 2) mixed batch: short members stay == their cap=8 picks; the long member opens up.
+        mixed = [1024, LONG, SHORT]
+        base = self._pick_kv_splits(mixed, cap=8)
+        gated = self._pick_kv_splits(mixed, cap=64)
+        self.assertEqual(gated[0], base[0], "short member drifted in a mixed batch")
+        self.assertEqual(gated[2], base[2], "short member drifted in a mixed batch")
+        self.assertGreater(gated[1], 8, "long member did not use the raised cap")
+        self.assertLessEqual(
+            gated[1], 64, "split count exceeded the cap (buffer overflow)"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
