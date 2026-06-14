@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     build_varlen_mask_meta,
 )
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.layers.fused_gelu import linear_gelu_tanh
 from sglang.multimodal_gen.runtime.layers.fused_scale_shift_gate import (
     FusedLayerNormScaleShiftGateSelect01,
     FusedResidualLayerNormScaleShiftGateSelect01,
@@ -34,7 +35,6 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualLayerNormScaleShift,
     apply_qk_norm_with_optional_rope,
 )
-from sglang.multimodal_gen.runtime.layers.fused_gelu import linear_gelu_tanh
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
