@@ -27,7 +27,10 @@ from torch import Tensor
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNormScaleShift,
+    apply_qk_norm_rope,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_kvcache import BlockKVCache
 
@@ -364,14 +367,28 @@ class OmniDreamsSelfAttention(_OmniDreamsAttnBase):
         n, d = self.local_num_heads, self.head_dim
 
         q_raw, k_raw, v_raw = self._project_qkv(x, x)
-        q = self.q_norm(q_raw.reshape(B, L, n, d))
-        k = self.k_norm(k_raw.reshape(B, L, n, d))
+        q_4d = q_raw.reshape(B, L, n, d)  # [B, L, H, D]
+        k_4d = k_raw.reshape(B, L, n, d)
         v = v_raw.reshape(B, L, n, d)
 
-        # RoPE on Q and K (NeoX-style, 3D RoPE).
-        if rope_freqs is not None:
-            q = apply_rope_freqs(q, rope_freqs, cos_sin_cache=rope_cos_sin)
-            k = apply_rope_freqs(k, rope_freqs, cos_sin_cache=rope_cos_sin)
+        # Fused QK Norm + RoPE on CUDA (NeoX-style, 3D RoPE).
+        # Falls back to separate norm+RoPE when cos_sin_cache is not available
+        # or the JIT kernel can't handle the shape.
+        if rope_freqs is not None and rope_cos_sin is not None:
+            q, k = apply_qk_norm_rope(
+                q_4d, k_4d,
+                self.q_norm, self.k_norm,
+                head_dim=d,
+                cos_sin_cache=rope_cos_sin,
+                is_neox=True,
+                allow_inplace=True,
+            )
+        else:
+            q = self.q_norm(q_4d)
+            k = self.k_norm(k_4d)
+            if rope_freqs is not None:
+                q = apply_rope_freqs(q, rope_freqs, cos_sin_cache=rope_cos_sin)
+                k = apply_rope_freqs(k, rope_freqs, cos_sin_cache=rope_cos_sin)
 
         # AR rollout: write the chunk's post-RoPE K/V into the cache, then
         # attend over the full cached window (sink + rolling window).
