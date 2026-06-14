@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.fused_gelu import linear_gelu_tanh
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -808,8 +809,9 @@ class LTX2FeedForward(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.proj_in(x)
-        x = self.act(x)
+        # Fuse proj_in GEMM with the tanh-GELU via the cublasLt epilogue
+        # (falls back to proj_in + F.gelu when unsupported).
+        x = linear_gelu_tanh(self.proj_in, x)
         x, _ = self.proj_out(x)
         return x
 
