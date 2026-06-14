@@ -142,13 +142,26 @@ class BlockKVCache:
         tokens_to_keep = self.window_size - self.chunk_size
         if tokens_to_keep > 0:
             src_start = self.sink_size + self.chunk_size
-            src_end = total_size
             dst_start = self.sink_size
-            dst_end = self.sink_size + tokens_to_keep
-            dst_slice = self._seq_slice(dst_start, dst_end)
-            src_slice = self._seq_slice(src_start, src_end)
-            self._k[dst_slice] = self._k[src_slice].clone()
-            self._v[dst_slice] = self._v[src_slice].clone()
+            # Split-copy to avoid the per-block .clone() allocation.
+            # When 2*chunk_size < window_size the src/dst ranges overlap,
+            # so we copy in two pieces: first up to chunk_size tokens
+            # (non-overlapping), then the remainder (also non-overlapping
+            # because the first piece wrote past the overlap zone).
+            copy1 = min(self.chunk_size, tokens_to_keep)
+            s1_dst = self._seq_slice(dst_start, dst_start + copy1)
+            s1_src = self._seq_slice(src_start, src_start + copy1)
+            self._k[s1_dst].copy_(self._k[s1_src])
+            self._v[s1_dst].copy_(self._v[s1_src])
+            if copy1 < tokens_to_keep:
+                s2_dst = self._seq_slice(
+                    dst_start + copy1, dst_start + tokens_to_keep
+                )
+                s2_src = self._seq_slice(
+                    src_start + copy1, src_start + tokens_to_keep
+                )
+                self._k[s2_dst].copy_(self._k[s2_src])
+                self._v[s2_dst].copy_(self._v[s2_src])
 
     def _current_chunk_overlaps_sink(self) -> bool:
         assert (

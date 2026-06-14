@@ -27,6 +27,7 @@ from torch import Tensor
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_kvcache import BlockKVCache
 
 # RoPE primitives live in omnidreams_rope; re-exported here for callers/tests.
@@ -319,6 +320,7 @@ class OmniDreamsAttention(nn.Module):
         context: Tensor | None = None,
         kv_cache=None,
         cross_kv: tuple[Tensor, Tensor] | None = None,
+        rope_cos_sin: Tensor | None = None,
     ) -> Tensor:
         """Attention with an optional KV-cache window (autoregressive self-attn)
         and optional precomputed cross-attention K/V (Phase 6 caching).
@@ -326,6 +328,11 @@ class OmniDreamsAttention(nn.Module):
         Q/K are per-head RMSNorm'd, then (self-attn only) rotated by RoPE before
         a full bidirectional SDPA (scale 1/sqrt(head_dim)). Cross-attention passes
         ``context`` as K/V source and no RoPE.
+
+        When ``rope_cos_sin`` is provided, it dispatches to the fast framework
+        RoPE backend (FlashInfer on CUDA, Triton fallback) instead of computing
+        cos/sin eagerly per-chunk.  The cache format is ``[L, D]`` with the first
+        D/2 columns = cos and the second D/2 = sin.
 
         When ``kv_cache`` (a :class:`BlockKVCache`) is given, this is an AR
         self-attention step: the current chunk's post-RoPE K and V are written
@@ -362,8 +369,8 @@ class OmniDreamsAttention(nn.Module):
             v = v_raw.reshape(B, Lk, n, d)
 
         if rope_freqs is not None:
-            q = apply_rope_freqs(q, rope_freqs)
-            k = apply_rope_freqs(k, rope_freqs)
+            q = apply_rope_freqs(q, rope_freqs, cos_sin_cache=rope_cos_sin)
+            k = apply_rope_freqs(k, rope_freqs, cos_sin_cache=rope_cos_sin)
         if kv_cache is not None:
             # Write this chunk's (post-RoPE) K/V, then attend over the window.
             kv_cache.update(k, v)
@@ -407,8 +414,8 @@ class OmniDreamsBlock(nn.Module):
         self.enable_cross_view_attn = enable_cross_view_attn
         head_dim = x_dim // num_heads
 
-        self.layer_norm_self_attn = nn.LayerNorm(
-            x_dim, elementwise_affine=False, eps=1e-6
+        self.layer_norm_self_attn = LayerNormScaleShift(
+            x_dim, eps=1e-6
         )
         self.self_attn = OmniDreamsAttention(x_dim, None, num_heads, head_dim)
 
@@ -421,12 +428,12 @@ class OmniDreamsBlock(nn.Module):
                 x_dim, x_dim, num_heads, head_dim
             )
 
-        self.layer_norm_cross_attn = nn.LayerNorm(
-            x_dim, elementwise_affine=False, eps=1e-6
+        self.layer_norm_cross_attn = LayerNormScaleShift(
+            x_dim, eps=1e-6
         )
         self.cross_attn = OmniDreamsAttention(x_dim, context_dim, num_heads, head_dim)
 
-        self.layer_norm_mlp = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
+        self.layer_norm_mlp = LayerNormScaleShift(x_dim, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
 
         def _make_adaln_mod() -> nn.Sequential:
@@ -457,6 +464,7 @@ class OmniDreamsBlock(nn.Module):
         self_attn_kv_cache=None,
         cross_attn_kv: tuple[Tensor, Tensor] | None = None,
         view_embedding_proj: Tensor | None = None,
+        rope_cos_sin: Tensor | None = None,
     ) -> Tensor:
         """One transformer block on a single chunk.
 
@@ -519,9 +527,10 @@ class OmniDreamsBlock(nn.Module):
             scale_m = scale_m + self._expand_view_mod(view_scale_m, B, V, D)
             gate_m = gate_m + self._expand_view_mod(view_gate_m, B, V, D)
 
-        normed = self.layer_norm_self_attn(x) * (1 + scale_s) + shift_s
+        normed = self.layer_norm_self_attn(x, shift_s, scale_s)
         x = x + gate_s * self.self_attn(
-            normed, rope_freqs=rope_freqs, kv_cache=self_attn_kv_cache
+            normed, rope_freqs=rope_freqs, kv_cache=self_attn_kv_cache,
+            rope_cos_sin=rope_cos_sin,
         )
 
         # Cross-view attention (Phase 5): each view attends over all views at
@@ -530,12 +539,12 @@ class OmniDreamsBlock(nn.Module):
             x_cv = self._cross_view_attn_forward(x, L, B, D)
             x = x + x_cv
 
-        normed = self.layer_norm_cross_attn(x) * (1 + scale_c) + shift_c
+        normed = self.layer_norm_cross_attn(x, shift_c, scale_c)
         x = x + gate_c * self.cross_attn(
             normed, context=context, cross_kv=cross_attn_kv
         )
 
-        normed = self.layer_norm_mlp(x) * (1 + scale_m) + shift_m
+        normed = self.layer_norm_mlp(x, shift_m, scale_m)
         x = x + gate_m * self.mlp(normed)
         return x
 
@@ -910,6 +919,16 @@ class OmniDreamsDiT(BaseDiT):
             view_embedding_proj = self.adaln_view_proj(view_emb)  # [B, V, 9D]
 
         context = self.crossattn_proj(encoder_hidden_states)
+        # Precompute cos/sin cache once per forward for the fast RoPE path.
+        # The cache stores cos in [:D/2] and sin in [D/2:] for the full
+        # ``[L, D]`` frequency grid, avoiding per-block cos/sin re-computation.
+        rope_cos_sin: Tensor | None = None
+        if rope_freqs is not None:
+            L, D_full = rope_freqs.shape[0], rope_freqs.shape[-1]
+            half = D_full // 2
+            f = rope_freqs[:, 0, 0, :half]  # [L, half]
+            rope_cos_sin = torch.cat([f.cos(), f.sin()], dim=-1)
+
         for i, block in enumerate(self.blocks):
             x = block(
                 x,
@@ -920,6 +939,7 @@ class OmniDreamsDiT(BaseDiT):
                 self_attn_kv_cache=None if kv_caches is None else kv_caches[i],
                 cross_attn_kv=None if cross_attn_kv is None else cross_attn_kv[i],
                 view_embedding_proj=view_embedding_proj,
+                rope_cos_sin=rope_cos_sin,
             )
         return self.final_layer(x, t_emb, adaln_lora)
 

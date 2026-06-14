@@ -27,6 +27,8 @@ A remaining HD-map VAE-encode numerics note is flagged inline with ``TODO(gpu)``
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import PIL.Image
 import torch
 
@@ -74,6 +76,9 @@ _TEXT_MAX_LENGTH = 512
 # length (and thus GPU memory/compute) against an unbounded ``num_frames`` from
 # the HTTP API. ~256 chunks * len_t(2) * 4 = ~2048 pixel frames.
 _MAX_AR_CHUNKS = 256
+# LRU cache for text embeddings (key = prompt string, value = [1, L, 100352] on CPU).
+# Avoids re-running the 14 GB Cosmos-Reason1-7B for repeated prompts in serving.
+_TEXT_EMBED_CACHE_MAX_SIZE = 32
 # HD-map inputs ending in one of these are decoded as a per-frame raster video;
 # any other single string is treated as one image (degenerate broadcast).
 _HDMAP_VIDEO_EXTS = (".mp4", ".gif", ".webm", ".mov", ".mkv", ".avi")
@@ -137,6 +142,8 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         self.tokenizer = tokenizer
         self.vae = vae
         self.config = config
+        # Per-instance LRU cache: prompt string -> text embedding on CPU.
+        self._text_embed_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -173,6 +180,13 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         producing washed-out / blurry rollouts. Message format and ``add_vision_id``
         mirror FlashDreams exactly so the token sequence is identical.
         """
+        # LRU cache: skip the 14 GB encoder for repeated prompts (serving).
+        cached = self._text_embed_cache.get(prompt)
+        if cached is not None:
+            # Move to front (LRU hit); return pinned tensor on device.
+            self._text_embed_cache.move_to_end(prompt)
+            return cached.to(device=device, non_blocking=True)
+
         messages = [
             {"role": "system", "content": [{"type": "text", "text": _SYSTEM_PROMPT}]},
             {"role": "user", "content": [{"type": "text", "text": prompt}]},
@@ -208,7 +222,12 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             output_hidden_states=True,
             return_dict=True,
         )
-        return full_concat_embeddings(out.hidden_states)
+        embeds = full_concat_embeddings(out.hidden_states)
+        # Store on CPU to avoid consuming GPU VRAM in the cache.
+        if len(self._text_embed_cache) >= _TEXT_EMBED_CACHE_MAX_SIZE:
+            self._text_embed_cache.popitem(last=False)
+        self._text_embed_cache[prompt] = embeds.detach().cpu()
+        return embeds
 
     @staticmethod
     def _resolve_input_image(batch: Req):

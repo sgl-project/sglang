@@ -21,6 +21,10 @@ import torch
 from einops import repeat
 from torch import Tensor
 
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
+    _apply_rotary_emb,
+)
+
 # OmniDreams uses non-interleaved (NeoX) rotation: the pair is (d, d + D/2).
 ROPE_IS_NEOX_STYLE = True
 
@@ -116,22 +120,62 @@ class RotaryPositionEmbedding3D:
         freqs_t = self.freqs_t + offset * self.raw_freqs_t
         return self._cat_freqs(freqs_t, self.freqs_h, self.freqs_w)
 
+    def to_cos_sin_cache(self, autoregressive_index: int = 0) -> Tensor:
+        """Return a 2-D ``[L, D]`` cos/sin cache for FlashInfer / Triton RoPE.
 
-def apply_rope_freqs(x: Tensor, freqs: Tensor) -> Tensor:
+        Layout: first D/2 columns = cos(theta), second D/2 columns = sin(theta),
+        matching the convention expected by
+        :func:`sglang.multimodal_gen.runtime.layers.rotary_embedding.utils.apply_flashinfer_rope_qk_inplace`.
+
+        Args:
+            autoregressive_index: AR chunk offset, forwarded to :meth:`shift_t`.
+        Returns:
+            ``[L, D]`` float32 tensor with cos in ``[:, :D/2]`` and sin in
+            ``[:, D/2:]``.
+        """
+        full = self.shift_t(autoregressive_index)  # [L, 1, 1, D]
+        L, D = full.shape[0], full.shape[-1]
+        half = D // 2
+        angles = full[:, 0, 0, :half]  # [L, half] -- RoPE angles
+        return torch.cat([angles.cos(), angles.sin()], dim=-1)  # [L, D]
+
+
+def apply_rope_freqs(
+    x: Tensor,
+    freqs: Tensor,
+    *,
+    cos_sin_cache: Tensor | None = None,
+) -> Tensor:
     """Apply NeoX 3D RoPE to ``x``.
 
-    Mirrors the FlashDreams fused kernel (non-interleaved branch):
-        out[a] = x[a] * cos(f) - x[b] * sin(f)
-        out[b] = x[b] * cos(f) + x[a] * sin(f)
-    with ``(a, b) = (d, d + D/2)`` and ``f`` the first-half angles of ``freqs``.
+    When ``cos_sin_cache`` is provided, delegates to the framework
+    RoPE backend (FlashInfer on CUDA, Triton fallback) via
+    :func:`_apply_rotary_emb`.  Otherwise uses the pure-PyTorch path
+    (original correctness-verified fallback).
 
     Args:
         x: ``[B, S, H, D]`` query or key.
-        freqs: ``[S, 1, 1, D]`` full-width frequencies from ``shift_t`` (the
-            first and second halves are identical by construction).
+        freqs: ``[S, 1, 1, D]`` full-width frequencies from ``shift_t``.
+        cos_sin_cache: optional ``[S, D]`` pre-computed cache from
+            :meth:`RotaryPositionEmbedding3D.to_cos_sin_cache`.
     Returns:
-        Rotated tensor of shape ``[B, S, H, D]`` (cos/sin computed in fp32).
+        Rotated tensor of shape ``[B, S, H, D]``.
     """
+    # Fast path: framework RoPE backend (FlashInfer or Triton).
+    if cos_sin_cache is not None:
+        B, S, H, D = x.shape
+        half_d = D // 2
+        cos = cos_sin_cache[:, :half_d].to(x.dtype)  # [S, D/2]
+        sin = cos_sin_cache[:, half_d:].to(x.dtype)  # [S, D/2]
+        return _apply_rotary_emb(
+            x.reshape(B * S, H, D),
+            cos.unsqueeze(1).expand(-1, H, -1).reshape(B * S, half_d),
+            sin.unsqueeze(1).expand(-1, H, -1).reshape(B * S, half_d),
+            is_neox_style=True,
+            interleaved=False,
+        ).reshape(B, S, H, D)
+
+    # Original correctness-verified fallback (pure PyTorch).
     seq_len = freqs.shape[0]
     half = x.shape[-1] // 2
     f = freqs[..., :half].reshape(seq_len, half).view(1, seq_len, 1, half)
