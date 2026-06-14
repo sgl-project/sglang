@@ -232,6 +232,10 @@ class DiffusionSamplingParams:
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
     image_path: Path | str | None = None  # input image/video for editing (Path or URL)
+    # OmniDreams-only: per-frame HD-map conditioning video (URL or list of URLs).
+    # When set, the video harness routes through the dedicated JSON-body helper —
+    # the multipart i2v path drops declared request fields like ``hdmap_path``.
+    hdmap_path: str | list[str] | None = None
 
     # duration
     seconds: int = 1  # for video: duration in seconds
@@ -480,6 +484,37 @@ IDEOGRAM4_CI_sampling_params = replace(
     output_size="1024x1024",
     output_format="png",
     extras={"preset": "V4_QUALITY_48", "seed": 0},
+)
+
+OMNIDREAMS_I2V_sampling_params = DiffusionSamplingParams(
+    prompt="A car drives down a sunny city street.",
+    image_path=(
+        "https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/"
+        "5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg"
+    ),
+    output_size="1280x704",
+    direct_url_test=True,
+    num_frames=13,
+    fps=30,
+    extras={"seed": 42},
+)
+
+# Online HD-map conditioning path (OmniDreams-only). HD-map + first-frame assets
+# are gated NVIDIA AV sample data, so they are supplied via env URLs and the case
+# self-skips when unset (see generate_hdmap_i2v). Point the env vars at any
+# reachable URLs, e.g. a `python -m http.server` over a local sample clip dir.
+OMNIDREAMS_I2V_HDMAP_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "Suburban environment with residential houses lining both sides of a "
+        "quiet street, double yellow line down the center, parked cars along the "
+        "curb, overcast sky."
+    ),
+    image_path=os.environ.get("SGLANG_OMNIDREAMS_FIRST_FRAME_URL"),
+    hdmap_path=os.environ.get("SGLANG_OMNIDREAMS_HDMAP_URL"),
+    output_size="1280x704",
+    num_frames=29,
+    fps=30,
+    extras={"seed": 42},
 )
 
 MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
