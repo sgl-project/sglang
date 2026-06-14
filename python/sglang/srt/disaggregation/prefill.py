@@ -61,7 +61,10 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
-from sglang.srt.utils.nvtx_utils import nvtx_annotated_method
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_SCHEDULER_ENABLED,
+    nvtx_annotated_method,
+)
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -406,7 +409,9 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
-    @nvtx_annotated_method("scheduler.get_next_batch_to_run")
+    @nvtx_annotated_method(
+        "scheduler.get_next_batch_to_run", enabled=NVTX_SCHEDULER_ENABLED
+    )
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
