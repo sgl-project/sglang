@@ -1596,10 +1596,18 @@ def _compute_chunked_req_next_prompt_token(
 ) -> Optional[int]:
     if chunked_req is None:
         return None
+    # The chunked-prefill fill sequence is full_untruncated_fill_ids
+    # (origin_input_ids + output_ids), not origin_input_ids alone. A retracted-
+    # then-resumed decode request re-prefills origin+output, so a non-final chunk
+    # boundary can land in the output region; indexing origin_input_ids would
+    # wrongly return None there, and the EAGLE tail-token rotation would fall back
+    # to the predicted token instead of the already-known fill token. Index the
+    # full fill sequence so the next prompt token is correct in that case.
     fill_len = chunked_req.fill_len
-    if fill_len >= len(chunked_req.origin_input_ids):
+    fill_ids = chunked_req.full_untruncated_fill_ids
+    if fill_len >= len(fill_ids):
         return None
-    return int(chunked_req.origin_input_ids[fill_len])
+    return int(fill_ids[fill_len])
 
 
 @dataclasses.dataclass
