@@ -8,6 +8,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import PauseGenerationReqInput
+from sglang.srt.managers.schedule_batch import ReqPhase
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 
@@ -104,15 +105,27 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertIsNone(scheduler.cur_batch)
 
     def test_retract_clears_running_batch(self):
-        """retract mode should retract all requests from running_batch."""
+        """retract mode retracts running_batch decode reqs AND active mid-chunk
+        (EXTEND_NON_LAST) reqs that never entered running_batch."""
         scheduler = self._new_scheduler()
         scheduler.last_batch = None
-        req_a = MagicMock(rid="req-a", phase=None)
-        req_b = MagicMock(rid="req-b", phase=None)
+        # Two decode reqs already merged into running_batch.
+        req_a = MagicMock(rid="req-a", phase=ReqPhase.DECODE)
+        req_b = MagicMock(rid="req-b", phase=ReqPhase.DECODE)
+        # A partially-extended (mid-chunk) req lives ONLY in active_reqs: the
+        # last_batch merge excludes it via skip_extend_intermediate, so when it
+        # is the single in-flight chunked-prefill req the retract path must still
+        # release it through partially_extended_reqs(). Dropping that term would
+        # leak req_c's KV / req-pool row across the pause.
+        req_c = MagicMock(rid="req-c", phase=ReqPhase.EXTEND_NON_LAST)
         scheduler.running_batch.reqs = [req_a, req_b]
         scheduler.running_batch.__len__ = lambda self: len(self.reqs)
         scheduler.running_batch.is_empty.return_value = False
-        scheduler.active_reqs = {req_a.rid: req_a, req_b.rid: req_b}
+        scheduler.active_reqs = {
+            req_a.rid: req_a,
+            req_b.rid: req_b,
+            req_c.rid: req_c,
+        }
         scheduler.waiting_queue = []
         scheduler._add_request_to_queue = MagicMock()
 
@@ -123,8 +136,10 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertTrue(scheduler._engine_paused)
-        self.assertEqual(mock_release_req.call_count, 2)
-        self.assertEqual(scheduler._add_request_to_queue.call_count, 2)
+        # All three reqs (2 from running_batch + 1 partially-extended) get
+        # released, deactivated, and re-queued.
+        self.assertEqual(mock_release_req.call_count, 3)
+        self.assertEqual(scheduler._add_request_to_queue.call_count, 3)
         self.assertEqual(scheduler.active_reqs, {})
 
     def test_abort_drains_overlap_queue(self):
