@@ -176,7 +176,11 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    device_loading_context,
+    get_model_loader,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
@@ -1752,7 +1756,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return iter
 
         def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
+            if weight_name_filter is not None:
+                # Partial reload (e.g. EPLB expert rebalancing): only load the
+                # filtered weights and run process_weights_after_loading on MoE
+                # modules whose weights were actually updated.  Running it on
+                # ALL modules would double-process unrelated layers (e.g. the
+                # FP8 linear transpose in attention) and corrupt their weights.
+                model.load_weights(iter)
+                for name, module in model.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None and weight_name_filter(name):
+                        with device_loading_context(module, target_device):
+                            quant_method.process_weights_after_loading(module)
+            else:
+                loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
