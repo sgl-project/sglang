@@ -358,6 +358,27 @@ class HybridCacheController(BaseHiCacheController):
                 release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
+    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
+        """Register draft pool into HostPoolGroup as a sidecar entry."""
+        super().set_draft_kv_pool(draft_device_pool, draft_host_pool)
+
+        draft_layer_num = draft_host_pool.layer_num
+        draft_entry = PoolEntry(
+            name=PoolName.DRAFT,
+            host_pool=draft_host_pool,
+            device_pool=draft_device_pool,
+            layer_mapper=lambda layer_id: (
+                layer_id if layer_id < draft_layer_num else None
+            ),
+        )
+        if PoolName.DRAFT in self.mem_pool_host.entry_map:
+            old_entry = self.mem_pool_host.entry_map[PoolName.DRAFT]
+            if old_entry in self.mem_pool_host.entries:
+                self.mem_pool_host.entries.remove(old_entry)
+        self.mem_pool_host.entries.append(draft_entry)
+        self.mem_pool_host.entry_map[PoolName.DRAFT] = draft_entry
+        self.extra_host_mem_release_queues[PoolName.DRAFT] = Queue()
+
     def write(
         self,
         device_indices: torch.Tensor,
