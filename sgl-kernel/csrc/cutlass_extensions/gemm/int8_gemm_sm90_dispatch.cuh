@@ -299,39 +299,6 @@ struct sm90_int8_config_M64_smallN_noswap {
 
 // Small-M swap buckets start with FP8 swap tile seeds.
 template <typename InType, typename OutType, bool EnableBias>
-struct sm90_int8_config_M64_smallN {
-  // M in (16, 64], N in [1, 1280]
-  // Swap-AB path with tile <64,16,256> seeded from FP8.
-  static_assert(std::is_same<InType, int8_t>());
-  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecialized;
-  using EpilogueSchedule = typename cutlass::epilogue::TmaWarpSpecialized;
-  using TileShape = Shape<_64, _16, _256>;
-  using ClusterShape = Shape<_1, _4, _1>;
-
-  // enable swap AB for M < 64
-  using Cutlass3xGemm = conditional_t<
-      EnableBias,
-      cutlass_3x_gemm_sm90_int8<
-          InType,
-          OutType,
-          c3x::ScaledEpilogueColumnBias,
-          TileShape,
-          ClusterShape,
-          KernelSchedule,
-          EpilogueSchedule,
-          true>,
-      cutlass_3x_gemm_sm90_int8<
-          InType,
-          OutType,
-          c3x::ScaledEpilogue,
-          TileShape,
-          ClusterShape,
-          KernelSchedule,
-          EpilogueSchedule,
-          true>>;
-};
-
-template <typename InType, typename OutType, bool EnableBias>
 struct sm90_int8_config_M64_largeN {
   // M in (32, 64], N > 1280
   // Swap-AB path with tile <64,64,256>.
@@ -480,7 +447,6 @@ inline void cutlass_gemm_sm90_int8_dispatch(
   using Cutlass3xGemmM128_largeN = typename sm90_int8_config_M128_largeN<InType, OutType, EnableBias>::Cutlass3xGemm;
   using Cutlass3xGemmM128_smallN = typename sm90_int8_config_M128_smallN<InType, OutType, EnableBias>::Cutlass3xGemm;
 
-  using Cutlass3xGemmM64_smallN = typename sm90_int8_config_M64_smallN<InType, OutType, EnableBias>::Cutlass3xGemm;
   using Cutlass3xGemmM64_smallN_noswap =
       typename sm90_int8_config_M64_smallN_noswap<InType, OutType, EnableBias>::Cutlass3xGemm;
   using Cutlass3xGemmM64_largeN = typename sm90_int8_config_M64_largeN<InType, OutType, EnableBias>::Cutlass3xGemm;
