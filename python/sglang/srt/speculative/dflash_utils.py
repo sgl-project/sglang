@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
@@ -323,6 +324,36 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
         int(round(start + (i * span) / (num_draft_layers - 1)))
         for i in range(num_draft_layers)
     ]
+
+
+def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
+    text_config = _get_text_config(config)
+    layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
+    if layer_types is None:
+        return None
+    if isinstance(layer_types, str) or not isinstance(layer_types, Sequence):
+        raise ValueError(
+            "DFLASH config.layer_types must be a sequence of attention type strings."
+        )
+    return layer_types
+
+
+def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return None
+
+    text_config = _get_text_config(config)
+    sliding_window = _cfg_get(
+        text_config, "sliding_window", _cfg_get(config, "sliding_window")
+    )
+    if sliding_window is None:
+        raise ValueError(
+            "DFLASH sliding_attention layers require config.sliding_window."
+        )
+
+    # HF sliding windows include the current token; SGLang stores window_left.
+    return int(sliding_window) - 1
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:

@@ -18,7 +18,6 @@ from typing import Dict
 
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.speculative.eagle_info import (
-    EagleDraftExtendInput,
     EagleDraftInput,
     EagleVerifyInput,
 )
@@ -51,14 +50,6 @@ class FrozenKVMTPDraftInput(EagleDraftInput):
 
     def __post_init__(self):
         SpecInput.__init__(self, SpecInputType.FROZEN_KV_MTP_DRAFT)
-
-
-@dataclass
-class FrozenKVMTPDraftExtendInput(EagleDraftExtendInput):
-    """Draft-extend input for Frozen-KV MTP. Tag-only subclass."""
-
-    def __post_init__(self):
-        SpecInput.__init__(self, SpecInputType.FROZEN_KV_MTP_DRAFT_EXTEND)
 
 
 @dataclass
