@@ -1,6 +1,18 @@
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+from sglang.srt.utils import get_compiler_backend, is_npu
+
+_is_npu = is_npu()
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def apply_scaling_penalties(logits, scaling_penalties):
+    logits[:] = torch.where(
+        logits < 0,
+        logits * scaling_penalties,
+        logits / scaling_penalties,
+    )
 
 
 class BatchedRepetitionPenalizer(_BatchedPenalizer):
@@ -11,6 +23,8 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
     - If logit < 0: logit *= penalty
     This reduces the probability of repeated tokens.
     """
+
+    is_multiplicative: bool = True
 
     def _is_required(self) -> bool:
         return any(
