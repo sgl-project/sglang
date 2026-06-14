@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import os
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
@@ -45,6 +46,76 @@ _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
 _is_default_tensor_transport = None
+
+
+# =====================================================================
+# [MM_PROBE] Temporary diagnostic probe (remove before merging to main).
+# ON BY DEFAULT so it works in AMD CI without setting any env var; set
+# SGLANG_MM_DEBUG_PROBE=0 to disable. Diagnoses whether the revert of
+# #25910 (+ residual #26117/#26167/#22587) leaves MiniCPM-V / MMMU with a
+# broken multimodal token<->embedding alignment, which makes the model
+# emit empty/degenerate output (HTTP 200 but ~2 tokens per answer) and
+# crashes lmms-eval's take_first filter.
+# =====================================================================
+_MM_DEBUG_PROBE = os.environ.get("SGLANG_MM_DEBUG_PROBE", "1").lower() not in (
+    "0",
+    "",
+    "false",
+    "no",
+)
+_mm_probe_ok_logged = 0
+_mm_probe_bad_logged = 0
+_MM_PROBE_OK_LIMIT = 50
+_MM_PROBE_BAD_LIMIT = 200
+
+
+def _mm_debug_probe(
+    *,
+    modality,
+    embedding,
+    mask,
+    placeholder_tensor,
+    embedding_items,
+    input_ids,
+):
+    """Gated diagnostic probe for multimodal token<->embedding alignment.
+
+    For each modality it reports how many placeholder positions were found in
+    input_ids (mask sum) versus how many rows the vision encoder produced
+    (embedding rows). If they differ -- or mask sum is 0 -- the image embeddings
+    are not scattered into the sequence, so the language model effectively sees
+    no image and emits empty/degenerate output.
+    """
+    if not _MM_DEBUG_PROBE:
+        return
+    global _mm_probe_ok_logged, _mm_probe_bad_logged
+    try:
+        mask_positions = int(mask.sum().item()) if mask is not None else 0
+        emb_rows = int(embedding.shape[0]) if embedding is not None else 0
+        emb_shape = tuple(embedding.shape) if embedding is not None else None
+        pad_values = (
+            placeholder_tensor.detach().to("cpu").tolist()
+            if placeholder_tensor is not None
+            else None
+        )
+        ok = embedding is not None and emb_rows > 0 and mask_positions == emb_rows
+        if ok:
+            _mm_probe_ok_logged += 1
+            if _mm_probe_ok_logged > _MM_PROBE_OK_LIMIT:
+                return
+        else:
+            _mm_probe_bad_logged += 1
+            if _mm_probe_bad_logged > _MM_PROBE_BAD_LIMIT:
+                return
+        logger.warning(
+            f"[MM_PROBE] modality={getattr(modality, 'name', modality)} "
+            f"status={'OK' if ok else 'MISMATCH'} "
+            f"mask_positions={mask_positions} emb_rows={emb_rows} "
+            f"emb_shape={emb_shape} num_items={len(embedding_items)} "
+            f"input_ids_len={int(input_ids.numel())} pad_values={pad_values}"
+        )
+    except Exception as e:  # never break inference because of the probe
+        logger.warning(f"[MM_PROBE] probe failed: {e}")
 
 
 def init_feature_buffer(device):
@@ -638,6 +709,16 @@ def _get_chunked_prefill_embedding(
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
+    # [MMMU FIX] The reconstructed per-image path (_get_chunked_embedding_by_item)
+    # produces embeddings with the right token count but WRONG values on ROCm
+    # (passes the count check -> [MM_PROBE] OK, but yields empty/degenerate output
+    # -> [RESP_PROBE] empty=True -> lmms-eval take_first IndexError). The earlier
+    # whole-batch gate only removed the mixed-path cases (89 -> 30 empties); the
+    # remainder come from the per-image path itself. Force the combined path
+    # (_get_chunked_embedding_full) for the whole batch, which also completes what
+    # the #25910 revert intended (drop the per-image batched encoding).
+    batch_is_per_image = False
+
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
@@ -655,7 +736,7 @@ def _get_chunked_prefill_embedding(
         # Use per-image path when all items have exactly one offset (already
         # split per-image) — this avoids encoding images not in this chunk.
         # Fall back to combined path for non-split items or EVS.
-        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
+        is_per_image = batch_is_per_image
 
         if is_per_image:
             chunk_embedding = _get_chunked_embedding_by_item(
@@ -860,6 +941,15 @@ def embed_mm_inputs(
                 prefix_length=extend_prefix_lens,
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
+            )
+
+            _mm_debug_probe(
+                modality=modality,
+                embedding=embedding,
+                mask=mask,
+                placeholder_tensor=placeholder_tensor,
+                embedding_items=items,
+                input_ids=input_ids,
             )
 
             if use_deepstack.get(modality, None) and embedding is not None:

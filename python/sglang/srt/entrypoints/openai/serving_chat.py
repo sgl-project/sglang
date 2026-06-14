@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from enum import Enum
@@ -74,6 +75,54 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+# =====================================================================
+# [RESP_PROBE] Temporary diagnostic probe (remove before merging to main).
+# ON BY DEFAULT (set SGLANG_MM_DEBUG_PROBE=0 to disable). Logs, per chat
+# completion choice, whether the model produced EMPTY output. Background:
+# the MMMU/MiniCPM-V failure is an lmms-eval `take_first` IndexError on an
+# empty `resps`; the [MM_PROBE] in mm_utils already proved image<->token
+# alignment is correct, so we now check whether the server returns empty
+# completions (text=="" -> content=None below) for some requests, which
+# would explain the empty resps downstream.
+# =====================================================================
+_RESP_DEBUG_PROBE = os.environ.get("SGLANG_MM_DEBUG_PROBE", "1").lower() not in (
+    "0",
+    "",
+    "false",
+    "no",
+)
+_resp_probe_nonempty_logged = 0
+_RESP_PROBE_NONEMPTY_LIMIT = 200
+
+
+def _resp_debug_probe(idx, text, finish_reason, ret_item):
+    if not _RESP_DEBUG_PROBE:
+        return
+    global _resp_probe_nonempty_logged
+    try:
+        is_empty = (text is None) or (isinstance(text, str) and text.strip() == "")
+        text_len = len(text) if isinstance(text, str) else -1
+        meta = ret_item.get("meta_info", {}) if isinstance(ret_item, dict) else {}
+        completion_tokens = meta.get("completion_tokens")
+        fr = (
+            finish_reason.get("type")
+            if isinstance(finish_reason, dict)
+            else finish_reason
+        )
+        # Always log empties (the signal we care about); cap non-empty logs.
+        if not is_empty:
+            _resp_probe_nonempty_logged += 1
+            if _resp_probe_nonempty_logged > _RESP_PROBE_NONEMPTY_LIMIT:
+                return
+        logger.warning(
+            f"[RESP_PROBE] idx={idx} empty={is_empty} text_len={text_len} "
+            f"completion_tokens={completion_tokens} finish_reason={fr} "
+            f"preview={text[:40]!r}"
+        )
+    except Exception as e:  # never break serving because of the probe
+        logger.warning(f"[RESP_PROBE] probe failed: {e}")
 
 
 def normalize_tool_content(role: str, content):
@@ -1303,6 +1352,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 meta_info=choice_meta_info,
             )
             choices.append(choice_data)
+
+            _resp_debug_probe(idx, text, finish_reason, ret_item)
 
         # Calculate usage
         usage = UsageProcessor.calculate_response_usage(
