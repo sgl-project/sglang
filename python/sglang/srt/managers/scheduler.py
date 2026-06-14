@@ -430,6 +430,7 @@ class Scheduler(
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+        self.validate_benchmark_target_batch_size()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
@@ -946,6 +947,28 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+    def validate_benchmark_target_batch_size(self):
+        target_bs = envs.SGLANG_BENCHMARK_TARGET_BATCH_SIZE.get()
+        if target_bs is None:
+            return
+        if target_bs <= 0:
+            raise ValueError("SGLANG_BENCHMARK_TARGET_BATCH_SIZE must be positive")
+
+        effective_max_running_requests = self.max_running_requests
+        if not self.server_args.enable_dp_attention:
+            effective_max_running_requests = (
+                effective_max_running_requests + self.ps.dp_size - 1
+            ) // self.ps.dp_size
+
+        if target_bs > effective_max_running_requests:
+            raise ValueError(
+                "SGLANG_BENCHMARK_TARGET_BATCH_SIZE must be less than or equal "
+                "to the effective max running requests per DP rank "
+                f"({effective_max_running_requests}), but got {target_bs}. "
+                "Increase --max-running-requests or lower "
+                "SGLANG_BENCHMARK_TARGET_BATCH_SIZE."
+            )
+
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
@@ -1023,7 +1046,7 @@ class Scheduler(
             else:
                 self.prefill_delayer = PrefillDelayer(
                     dp_size=self.ps.dp_size,
-                    attn_tp_size=self.ps.attn_tp_size,
+                    attn_tp_size=self.ps.attn_tp_size * self.ps.attn_cp_size,
                     cpu_group=self.tp_cpu_group,
                     device_group=self.tp_group.device_group,
                     server_args=self.server_args,
@@ -2564,16 +2587,19 @@ class Scheduler(
 
         if new_batch is not None:
             # Run prefill first if possible
+            # Keep the profile decode gate collective aligned across DP ranks.
+            self.maybe_prepare_decode_batch_for_profile(None)
             ret = new_batch
         else:
             # Run decode (skip for prefill-only batches)
-            if (
-                not self.running_batch.is_empty()
-                and not self.running_batch.is_prefill_only
-            ):
-                self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
+            if not self.running_batch.is_prefill_only:
+                if not self.running_batch.is_empty():
+                    self.running_batch = self.update_running_batch(
+                        self.running_batch, prepare_for_decode=False
+                    )
+                ret = self.maybe_prepare_decode_batch_for_profile(self.running_batch)
             else:
+                self.maybe_prepare_decode_batch_for_profile(None)
                 ret = None
 
         # Handle DP attention and log stats
@@ -2617,7 +2643,11 @@ class Scheduler(
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
             )
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
-                self.prefill_delayer, token_usage=max_pool_usage
+                self.prefill_delayer,
+                token_usage=max_pool_usage,
+                running_batch=len(self.running_batch.reqs),
+                max_running_requests=self.max_running_requests,
+                waiting_queue_len=len(self.waiting_queue),
             )
 
         ret = self._get_new_batch_prefill_raw(
@@ -2902,7 +2932,9 @@ class Scheduler(
                 new_lora_set
             )
 
-    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    def update_running_batch(
+        self, batch: ScheduleBatch, *, prepare_for_decode: bool = True
+    ) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
@@ -2989,8 +3021,58 @@ class Scheduler(
             return batch
 
         # Update batch tensors
+        if prepare_for_decode:
+            batch.prepare_for_decode()
+        return batch
+
+    def maybe_prepare_decode_batch_for_profile(
+        self, batch: Optional[ScheduleBatch]
+    ) -> Optional[ScheduleBatch]:
+        local_batch_size = batch.batch_size() if batch is not None else 0
+        target_bs = envs.SGLANG_BENCHMARK_TARGET_BATCH_SIZE.get()
+        if target_bs is not None:
+            if target_bs <= 0:
+                raise ValueError("SGLANG_BENCHMARK_TARGET_BATCH_SIZE must be positive")
+            if self._should_delay_decode_for_target_batch(
+                local_batch_size=local_batch_size,
+                target_batch_size=target_bs,
+            ):
+                return None
+
+        if local_batch_size == 0:
+            return None
         batch.prepare_for_decode()
         return batch
+
+    def _should_delay_decode_for_target_batch(
+        self, *, local_batch_size: int, target_batch_size: int
+    ) -> bool:
+        if not self.server_args.enable_dp_attention:
+            return 0 < local_batch_size < target_batch_size
+
+        group_width = self.ps.attn_tp_size * self.ps.attn_cp_size
+        expected_shape = (self.ps.dp_size, group_width)
+        if (
+            not hasattr(self, "_decode_target_batch_buffer")
+            or self._decode_target_batch_buffer.shape != expected_shape
+        ):
+            self._decode_target_batch_buffer = torch.empty(
+                expected_shape,
+                dtype=torch.int64,
+                device="cpu",
+            )
+
+        local_info = torch.tensor([local_batch_size], dtype=torch.int64, device="cpu")
+        torch.distributed.all_gather_into_tensor(
+            self._decode_target_batch_buffer.flatten(),
+            local_info,
+            group=self.tp_cpu_group,
+        )
+        global_batch_sizes = self._decode_target_batch_buffer[:, 0]
+        return (
+            int(global_batch_sizes.max().item()) > 0
+            and int(global_batch_sizes.min().item()) < target_batch_size
+        )
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC

@@ -1849,11 +1849,11 @@ class SchedulerDisaggregationDecodeMixin:
                     self.running_batch.merge_batch(new_prebuilt_batch)
 
         # Schedule decode batch
-        if self.running_batch.is_empty():
-            ret = None
-        else:
-            self.running_batch = self.update_running_batch(self.running_batch)
-            ret = self.running_batch if not self.running_batch.is_empty() else None
+        if not self.running_batch.is_empty():
+            self.running_batch = self.update_running_batch(
+                self.running_batch, prepare_for_decode=False
+            )
+        ret = self.maybe_prepare_decode_batch_for_profile(self.running_batch)
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
