@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     wrap_attention_impl_forward,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
+    async_a2a_communicate,
+)
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_output_all_to_all,
@@ -356,20 +359,28 @@ class LocalAttention(nn.Module):
                     mask = mask[:, None, :, :]
                 mask = (mask - 1.0) * torch.finfo(q_.dtype).max
 
+            if q_.shape[1] != k_.shape[1]:
+                repeat_factor = q_.shape[1] // k_.shape[1]
+                k_ = k_.repeat_interleave(repeat_factor, dim=1)
+                v_ = v_.repeat_interleave(repeat_factor, dim=1)
+
             sdpa_context = (
                 sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
                 if self.allow_cudnn_sdp and q_.device.type == "cuda"
                 else nullcontext()
             )
+            attn_kwargs = {
+                "attn_mask": mask,
+                "dropout_p": 0.0,
+                "is_causal": False,
+                "scale": self.softmax_scale,
+            }
             with sdpa_context:
                 return torch.nn.functional.scaled_dot_product_attention(
                     q_,
                     k_,
                     v_,
-                    attn_mask=mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=self.softmax_scale,
+                    **attn_kwargs,
                 ).transpose(1, 2)
 
         output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
@@ -384,6 +395,8 @@ class USPAttention(nn.Module):
     Ulysses-style all-to-all communication for sequence-head dimension sharding
     and Ring Attention for fine-grained sequence parallelism within subgroups.
     """
+
+    _usp_a2a_stream = None
 
     def __init__(
         self,
@@ -430,7 +443,7 @@ class USPAttention(nn.Module):
                     f"but got {backend_enum.name}. "
                     f"Please ensure your platform supports these backends."
                 )
-        impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
+        impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
         self.attn_impl = impl_cls(
             num_heads=num_heads,
@@ -451,6 +464,11 @@ class USPAttention(nn.Module):
         self.dropout_p = dropout_rate
 
         self.skip_sequence_parallel = skip_sequence_parallel
+
+    def _get_usp_a2a_stream(self):
+        if USPAttention._usp_a2a_stream is None:
+            USPAttention._usp_a2a_stream = torch.get_device_module().Stream()
+        return USPAttention._usp_a2a_stream
 
     def forward(
         self,
@@ -638,15 +656,9 @@ class USPAttention(nn.Module):
 
         sp_size = get_ulysses_parallel_world_size()
         if (
-            sum(
-                bool(n)
-                for n in (
-                    num_replicated_prefix,
-                    num_replicated_suffix,
-                    num_replicated_kv_prefix,
-                )
-            )
-            > 1
+            (num_replicated_prefix > 0 and num_replicated_suffix > 0)
+            or (num_replicated_prefix > 0 and num_replicated_kv_prefix > 0)
+            or (num_replicated_suffix > 0 and num_replicated_kv_prefix > 0)
         ):
             raise ValueError(
                 "USPAttention supports at most one replicated-token mode per call."
@@ -816,9 +828,21 @@ class USPAttention(nn.Module):
         """split form avoids materializing full K/V before Ulysses all-to-all"""
         sp_rank = get_sp_parallel_rank()
 
-        q = _usp_input_all_to_all(q, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        if q.device.type == "cuda":
+            q, k_shard, v_shard = async_a2a_communicate(
+                [q, k_shard, v_shard],
+                get_ulysses_parallel_world_size(),
+                get_sp_group().ulysses_group,
+                self._get_usp_a2a_stream(),
+                local_seq_2_local_head=True,
+            )
+            q = q.contiguous()
+            k_shard = k_shard.contiguous()
+            v_shard = v_shard.contiguous()
+        else:
+            q = _usp_input_all_to_all(q, head_dim=2)
+            k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
+            v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
 
         h_kv_local = k_shard.shape[2]
         h_start = sp_rank * h_kv_local

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 _PARAMS_BYTES = 2  # bf16 — Ascend's Dispatch & Combine does not support fp16
 
 
-def _get_fuseep_buffer(layer: "FusedMoE"):
+def _get_fuseep_buffer(layer: FusedMoE):
     DeepEPBuffer.set_dispatch_mode_as_low_latency()
     return DeepEPBuffer.get_deepep_buffer(
         get_tp_group().device_group,
@@ -39,9 +39,9 @@ def _get_fuseep_buffer(layer: "FusedMoE"):
 
 
 def forward_fuseep(
-    layer: "FusedMoE",
+    layer: FusedMoE,
     hidden_states: torch.Tensor,
-    topk_output: "TopKOutput",
+    topk_output: TopKOutput,
 ) -> torch.Tensor:
     buf = _get_fuseep_buffer(layer)
     hidden_states, _ = buf.fused_deep_moe(

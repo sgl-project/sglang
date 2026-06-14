@@ -189,7 +189,7 @@ class CudaPlatformBase(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
@@ -197,8 +197,8 @@ class CudaPlatformBase(Platform):
         if empty_cache:
             torch.cuda.empty_cache()
 
-        if torch.distributed.is_initialized():
-            device_id = torch.distributed.get_rank()
+        if device_id is None:
+            device_id = torch.cuda.current_device()
 
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
@@ -233,8 +233,6 @@ class CudaPlatformBase(Platform):
                     SlidingTileAttentionBackend,
                 )
 
-                logger.info("Using Sliding Tile Attention backend")
-
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
             except ImportError as e:
                 logger.error(
@@ -251,8 +249,6 @@ class CudaPlatformBase(Platform):
                     SageAttentionBackend,
                 )
 
-                logger.info("Using Sage Attention backend")
-
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
             except ImportError as e:
                 logger.info(e)
@@ -266,7 +262,6 @@ class CudaPlatformBase(Platform):
                     SageAttention3Backend,
                 )
 
-                logger.info("Using Sage Attention 3 backend")
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
             except ImportError as e:
                 logger.info(e)
@@ -281,8 +276,6 @@ class CudaPlatformBase(Platform):
                 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (  # noqa: F401
                     VideoSparseAttentionBackend,
                 )
-
-                logger.info("Using Video Sparse Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
             except ImportError as e:
@@ -309,7 +302,6 @@ class CudaPlatformBase(Platform):
                     SparseVideoGen2AttentionBackend,
                 )
 
-                logger.info("Using Sparse Video Gen 2 (SAP) Attention backend")
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
             except ImportError as e:
                 logger.error(
@@ -329,8 +321,6 @@ class CudaPlatformBase(Platform):
                     VMOBAAttentionBackend,
                 )
 
-                logger.info("Using Video MOBA Attention backend")
-
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
             except ImportError as e:
                 logger.error(
@@ -340,23 +330,18 @@ class CudaPlatformBase(Platform):
                     "Video MoBA Attention backend is not installed. "
                 ) from e
         elif selected_backend == AttentionBackendEnum.AITER:
-            logger.info("Using AITer backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
         elif selected_backend == AttentionBackendEnum.SLA_ATTN:
-            logger.info("Using Sparse Linear Attention backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
         elif selected_backend == AttentionBackendEnum.SAGE_SLA_ATTN:
-            logger.info("Using Sage Sparse Linear Attention backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
         elif selected_backend == AttentionBackendEnum.FA2:
             from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
                 FlashAttention2Backend,
             )
 
-            logger.info("Using FlashAttention2 backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
         elif selected_backend in [
             AttentionBackendEnum.FA,
@@ -438,11 +423,7 @@ class CudaPlatformBase(Platform):
                 target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if target_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info("Using Torch SDPA backend")
-
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-
-        logger.info("Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend")
 
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 

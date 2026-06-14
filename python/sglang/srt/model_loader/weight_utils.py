@@ -40,7 +40,7 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -261,6 +261,12 @@ def get_quant_config(
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        hf_quant_config["hf_config"] = model_config.hf_config
+
+        # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
+        if model_config.quantization in REQUANTIZATION_METHODS:
+            hf_quant_config["requantization_method"] = model_config.quantization
+
         return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
@@ -294,9 +300,15 @@ def get_quant_config(
     possible_config_filenames = quant_cls.get_config_filenames()
 
     # If the quantization config is not found, use the default config.
+    # TODO: standardize the handling of online quantization with custom handlenames (mxfp8, quark_mxfp4, etc.)
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+        if model_config.quantization == "quark_mxfp4":
+            return quant_cls(
+                online_scheme=model_config.quantization,
+                hf_config=model_config.hf_config,
+            )
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))

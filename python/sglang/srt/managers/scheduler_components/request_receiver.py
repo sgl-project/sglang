@@ -29,21 +29,26 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
 )
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.server_args import ServerArgs
+    from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
+    from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
+        ScriptedTokenizerRecvProxy,
+    )
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    recv_from_tokenizer: zmq.Socket
+    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
-    ps: "ParallelState"
+    ps: ParallelState
     tp_group: Any
     tp_cpu_group: Any
     attn_tp_group: Any
@@ -51,21 +56,26 @@ class SchedulerRequestReceiver:
     attn_cp_group: Any
     attn_cp_cpu_group: Any
     world_group: Any
-    server_args: "ServerArgs"
-    model_config: "ModelConfig"
+    server_args: ServerArgs
+    model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
+    scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    @scheduler_nvtx_method("scheduler.recv_requests")
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.step()
 
         if self.recv_skipper is not None:
             if not self.recv_skipper.handle(self.get_last_forward_mode()):
