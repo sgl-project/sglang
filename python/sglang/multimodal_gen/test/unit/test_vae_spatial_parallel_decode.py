@@ -109,6 +109,12 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertTrue(should_use_spatial_shard_parallel_decode(LTXVideoVAEConfig()))
         self.assertTrue(should_use_spatial_shard_parallel_decode(WanVAEConfig()))
 
+        ltx23_config = LTXVideoVAEConfig()
+        ltx23_config.arch_config.video_decoder_variant = "ltx_2_3"
+        self.assertFalse(should_use_spatial_shard_parallel_decode(ltx23_config))
+        ltx23_config.parallel_decode_mode = "spatial_shard"
+        self.assertTrue(should_use_spatial_shard_parallel_decode(ltx23_config))
+
         config = QwenImageVAEConfig()
         config.parallel_decode_mode = "spatial_shard"
         self.assertTrue(should_use_spatial_shard_parallel_decode(config))
