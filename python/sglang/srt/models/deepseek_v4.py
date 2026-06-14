@@ -43,7 +43,11 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
-from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    get_attn_tp_context,
+)
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
@@ -52,22 +56,20 @@ from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
     dp_gather_partial,
-    dp_scatter,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_dp_global_num_tokens,
     get_global_dp_buffer,
-    get_local_dp_buffer,
     is_dp_attention_enabled,
+    is_dsv4_moe_rs_to_next_attn_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.mhc import mhc_fused_post_pre
-from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -1076,6 +1078,28 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
+        # DeepSeek-V4 uses custom mHC attention/norm code, so it cannot reuse
+        # the full DeepSeek-V2 layer forward. The MoE output layout, however,
+        # matches V2's FULL -> TP_ATTN_FULL postprocess path under DP attention.
+        # Use LayerCommunicator only for the post-MoE reduce-scatter/scatter
+        # decision and execution, keeping all attention/mHC logic local to V4.
+        self.moe_post_layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=1 if is_nextn else config.num_hidden_layers,
+            is_layer_sparse=True,
+            is_previous_layer_sparse=True if layer_id > 0 else None,
+            is_next_layer_sparse=(
+                True if is_nextn or layer_id < config.num_hidden_layers - 1 else None
+            ),
+        )
+        self.moe_post_communicator = LayerCommunicator(
+            layer_scatter_modes=self.moe_post_layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=is_nextn or (layer_id == config.num_hidden_layers - 1),
+            qkv_latent_func=None,
+        )
 
     def refresh_mhc_norm_weight_cache(self):
         # Cache bf16 norm weights so the fused path does not allocate/cast per forward.
@@ -1467,6 +1491,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_attention_dp_size() > 1
             and get_moe_a2a_backend().is_none()
         )
+        _enable_moe_post_reduce_scatter = is_dsv4_moe_rs_to_next_attn_enabled()
+        use_reduce_scatter = (
+            _use_tp_moe_gather
+            and _enable_moe_post_reduce_scatter
+            and self.moe_post_communicator.should_use_reduce_scatter(forward_batch)
+        )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
             and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
@@ -1499,23 +1529,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
-            use_reduce_scatter=_use_cp,
+            use_reduce_scatter=_use_cp or use_reduce_scatter,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
-            hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+            hidden_states, residual = self.moe_post_communicator.postprocess_layer(
                 hidden_states,
+                residual,
+                forward_batch,
+                allow_reduce_scatter=use_reduce_scatter,
             )
-            if should_use_dp_reduce_scatterv():
-                get_tp_group().reduce_scatterv(
-                    global_hidden_states,
-                    output=hidden_states,
-                    sizes=get_dp_global_num_tokens(),
-                )
-            else:
-                dp_scatter(hidden_states, global_hidden_states, forward_batch)
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]

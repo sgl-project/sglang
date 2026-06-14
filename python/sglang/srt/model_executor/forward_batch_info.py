@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
+    is_dsv4_moe_rs_to_next_attn_enabled,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -1072,6 +1073,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+        if (
+            is_dsv4_moe_rs_to_next_attn_enabled()
+            and not self.is_extend_in_batch
+            and not self.forward_mode.is_target_verify()
+            and not self.forward_mode.is_draft_extend(include_v2=True)
+            and len(global_num_tokens) > 1
+        ):
+            from sglang.srt.server_args import get_global_server_args
+
+            if get_global_server_args().speculative_algorithm is None:
+                # Match LayerCommunicator's fixed-shape reduce-scatter path:
+                # non-extend batches need MAX_LEN padding so the post-MoE
+                # reduce-scatter has a stable input/output shape. Keep
+                # speculative decode/verify on the original padding policy.
+                dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():

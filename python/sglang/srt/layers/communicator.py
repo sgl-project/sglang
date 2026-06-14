@@ -64,6 +64,7 @@ from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_una
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
+    should_use_dsv4_dp_moe_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
@@ -708,13 +709,18 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
+        allow_reduce_scatter: Optional[bool] = None,
     ):
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
-            allow_reduce_scatter=self.allow_reduce_scatter,
+            allow_reduce_scatter=(
+                self.allow_reduce_scatter
+                if allow_reduce_scatter is None
+                else allow_reduce_scatter
+            ),
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
@@ -724,7 +730,10 @@ class LayerCommunicator:
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
         ):
-            if should_use_dp_reduce_scatterv():
+            if (
+                should_use_dp_reduce_scatterv()
+                or should_use_dsv4_dp_moe_reduce_scatterv()
+            ):
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
@@ -1291,7 +1300,7 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(group),
             hidden_states,
         )
-        if should_use_dp_reduce_scatterv():
+        if should_use_dp_reduce_scatterv() or should_use_dsv4_dp_moe_reduce_scatterv():
             get_tp_group().reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
