@@ -85,6 +85,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.utils import get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.nvtx_utils import nvtx_annotated_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -1824,6 +1825,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
+    @nvtx_annotated_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
