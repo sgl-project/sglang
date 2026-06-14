@@ -378,6 +378,129 @@ def test_causal_conv1d_varlen(
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
 
 
+# seqlen=4 with batch_size=4 gives per-sequence length 1 < state_len (width-1),
+# exercising the state_len > seqlen branch with mixed dtypes as well.
+@pytest.mark.parametrize("width", [4])
+@pytest.mark.parametrize("seqlen", [4, 8, 249])
+@pytest.mark.parametrize("dim", [64, 4096])
+def test_causal_conv1d_varlen_mixed_conv_state_dtype(dim, seqlen, width):
+    """Regression test for a Triton compile error in causal_conv1d_fn when the
+    conv_states cache dtype differs from the activation dtype.
+
+    This happens with AWQ hybrid linear-attention models (e.g. Qwen3.5/3.6):
+    AWQ dequant produces fp16 activations while the conv_states cache is
+    allocated in the model's bf16 dtype. The chunk_offset==0 init-state branch
+    of _causal_conv1d_fwd_kernel previously loaded columns in conv_states dtype
+    (bf16) while the else branch used the activation dtype (fp16), and Triton
+    requires both branches of an `if` to yield the same type:
+
+        Mismatched type for col0 between then block (bf16) and else block (fp16)
+
+    All sequences carry an initial state so the buggy branch is exercised.
+    """
+    x_dtype = torch.float16
+    conv_state_dtype = torch.bfloat16
+    device = get_device()
+    empty_gpu_cache()
+    torch.manual_seed(0)
+
+    batch_size = 4
+    seqlens = [seqlen // batch_size] * (batch_size - 1)
+    seqlens.append(seqlen - sum(seqlens))
+    cumsum = torch.cumsum(torch.tensor(seqlens), dim=0).to(torch.int32)
+    cumsum = torch.concat([torch.tensor([0], dtype=torch.int32), cumsum], dim=0)
+
+    total_entries = batch_size * 10
+    x = torch.randn(dim, seqlen, device=device, dtype=x_dtype)
+    weight = torch.randn(dim, width, device=device, dtype=x_dtype)
+    bias = torch.randn(dim, device=device, dtype=x_dtype)
+    activation = "silu"
+
+    # conv_states cache in a DIFFERENT dtype than the activations (the AWQ case)
+    conv_states = torch.randn(
+        total_entries, width - 1, dim, device=device, dtype=conv_state_dtype
+    ).transpose(1, 2)
+    # every sequence has an initial state -> forces the load_init_state branch
+    has_initial_states = torch.ones(batch_size, dtype=torch.bool, device=device)
+    state_indices = torch.randperm(total_entries, dtype=torch.int32, device=device)[
+        :batch_size
+    ]
+
+    # reference uses the conv_states values as the kernel sees them: the bf16
+    # cache loaded and cast to the activation dtype.
+    conv_states_ref = conv_states.to(x_dtype).clone()
+
+    # must not raise a Triton CompilationError
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=cumsum.to(device),
+        seq_lens_cpu=torch.tensor(seqlens),
+        cache_indices=state_indices,
+        has_initial_state=has_initial_states,
+        activation=activation,
+        pad_slot_id=PAD_SLOT_ID,
+    )
+
+    splits = torch.split(x, seqlens, dim=-1)
+    out_ref_b = []
+    for i in range(batch_size):
+        out_ref_b.append(
+            causal_conv1d_ref(
+                splits[i].unsqueeze(0),
+                weight,
+                bias,
+                activation=activation,
+                initial_states=conv_states_ref[state_indices[i]].unsqueeze(0),
+            )[0]
+        )
+    out_ref = torch.cat(out_ref_b, dim=2)
+
+    assert out.dtype == x_dtype
+    assert torch.allclose(out[:, : out_ref.shape[-1]], out_ref, rtol=1e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("dim", [64, 2048])
+@pytest.mark.parametrize("width", [4])
+def test_causal_conv1d_update_mixed_conv_state_dtype(dim, width):
+    """Decode-path coverage for the conv_states/activation dtype mismatch.
+
+    `causal_conv1d_update` (used during decoding) reads the conv_state cache
+    (bf16) and the activations x (fp16 under AWQ). Its `tl.where` performs type
+    promotion rather than a strict branch merge, so it does not raise the
+    compile error the prefill kernel did; this asserts it still computes the
+    correct result with mismatched dtypes.
+    """
+    x_dtype = torch.float16
+    conv_state_dtype = torch.bfloat16
+    device = get_device()
+    empty_gpu_cache()
+    torch.manual_seed(0)
+
+    batch, seqlen = 2, 1
+    x = torch.randn(batch, dim, seqlen, device=device, dtype=x_dtype)
+    conv_state = torch.randn(
+        batch, dim, width - 1, device=device, dtype=conv_state_dtype
+    )
+    weight = torch.randn(dim, width, device=device, dtype=x_dtype)
+    bias = torch.randn(dim, device=device, dtype=x_dtype)
+    activation = "silu"
+
+    # reference sees the bf16 cache as the kernel does: values cast to x dtype
+    conv_state_ref = conv_state.to(x_dtype).clone()
+
+    out = causal_conv1d_update(x, conv_state, weight, bias, activation=activation)
+    out_ref = causal_conv1d_update_ref(
+        x.clone(), conv_state_ref, weight, bias, activation=activation
+    )
+
+    assert out.dtype == x_dtype
+    assert torch.allclose(conv_state.to(x_dtype), conv_state_ref, rtol=1e-2, atol=5e-2)
+    assert torch.allclose(out, out_ref, rtol=1e-2, atol=5e-2)
+
+
 if __name__ == "__main__":
     import sys
 
