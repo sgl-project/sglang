@@ -6,6 +6,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
+    LTX2RefinementStage,
+)
 
 
 class TestDecodingStageParallelism(unittest.TestCase):
@@ -93,6 +96,46 @@ class TestDecodingStageParallelism(unittest.TestCase):
             self.assertEqual(
                 stage.parallelism_type,
                 StageParallelismType.REPLICATED,
+            )
+
+    def test_ltx2_refinement_broadcasts_when_decode_uses_all_ranks(self):
+        stage = object.__new__(LTX2RefinementStage)
+        stage.server_args = SimpleNamespace(enable_cfg_parallel=True)
+        stage.vae = SimpleNamespace(use_parallel_decode=True)
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av.model_parallel_is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av.get_decode_parallel_world_size",
+                return_value=2,
+            ),
+        ):
+            self.assertEqual(
+                stage.parallelism_type,
+                StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS,
+            )
+
+    def test_ltx2_refinement_stays_main_rank_only_without_parallel_decode(self):
+        stage = object.__new__(LTX2RefinementStage)
+        stage.server_args = SimpleNamespace(enable_cfg_parallel=True)
+        stage.vae = SimpleNamespace(use_parallel_decode=False)
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av.model_parallel_is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av.get_decode_parallel_world_size",
+                return_value=2,
+            ),
+        ):
+            self.assertEqual(
+                stage.parallelism_type,
+                StageParallelismType.MAIN_RANK_ONLY,
             )
 
 
