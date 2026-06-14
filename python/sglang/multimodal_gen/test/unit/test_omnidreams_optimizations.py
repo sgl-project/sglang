@@ -397,3 +397,138 @@ def test_text_cache_key_is_prompt_string():
     assert cache["a driving scene"].item() == 0.0
     assert cache["a rainy scene"].item() == 1.0
     assert len(cache) == 2
+
+
+# ============================================================================
+# Supplemental tests for critical edge cases
+# ============================================================================
+
+# --- T2: Cross-attention invariant ---
+
+def test_rope_cross_attn_does_not_receive_cos_sin_cache():
+    """Cross-attention call in Block.forward must NOT pass rope_cos_sin.
+
+    This is a correctness invariant: cross-attention does not use RoPE,
+    so rope_cos_sin should only go to self_attn, never to cross_attn.
+    """
+    # Read the source and verify cross_attn call does not contain rope_cos_sin
+    import inspect, os
+    dit_path = os.path.join(
+        os.path.dirname(__file__), "..", "..",
+        "runtime", "models", "dits", "omnidreams.py",
+    )
+    with open(dit_path) as f:
+        # Find the cross_attn call in Block.forward
+        block_forward = f.read().split("def forward(self,")[1]
+        block_forward = block_forward.split("def _cross_view_attn_forward")[0]
+        # The cross_attn call line
+        cross_call_lines = [l for l in block_forward.split('\n') if 'self.cross_attn(' in l and 'cross_attn' in l]
+        # There should be exactly one cross_attn call (the self-attn call also has cross_attn in the name)
+        # The cross_attn call is: x + gate_c * self.cross_attn(normed, context=context, cross_kv=cross_attn_kv)
+        # It should NOT contain rope_cos_sin
+        cross_attn_line = [l for l in cross_call_lines if 'context=context' in l]
+        if cross_attn_line:
+            assert "rope_cos_sin" not in cross_attn_line[0], (
+                "cross_attn must NOT receive rope_cos_sin. Found in line:\n"
+                + cross_attn_line[0]
+            )
+
+
+# --- T3: Sink + split-copy interaction ---
+
+def test_kv_cache_split_copy_with_sink_retention():
+    """Split-copy must preserve sink tokens when sink_size > 0."""
+    c = BlockKVCache(
+        k_shape=(1, 6, 2, 3), v_shape=(1, 6, 2, 3),
+        seq_dim=1, chunk_size=2, window_size=4, sink_size=2,
+    )
+    # Fill: sink=[1,1, 2,2], window=[3,3, 4,4] -> full cache
+    for idx, val in enumerate([1, 2, 3, 4, 5]):
+        c.before_update(idx)
+        k, v = _kv_chunk(1, 2, 2, 3, val)
+        c.update(k, v)
+        c.after_update(idx)
+
+    # After steady-state roll with chunk 5:
+    # sink tokens (0:2) should still be [1,1]
+    # window (2:6) should be [4,4, 5,5] (chunk 3 rolled out)
+    ck = c.cached_k().clone()
+    expected_sink = torch.full((1, 2, 2, 3), 1.0)
+    assert torch.allclose(ck[:, :2], expected_sink, atol=1e-6), (
+        f"Sink tokens were corrupted by split-copy roll. "
+        f"Got {ck[:, :2, 0, 0]}, expected all 1.0"
+    )
+    # Window region should contain chunks 4 and 5
+    assert bool((ck[:, 2:4] == 4).all()), "Window should contain chunk 4 after roll"
+    assert bool((ck[:, 4:6] == 5).all()), "Window should contain chunk 5 after roll"
+
+
+def test_kv_cache_split_copy_sink_not_rolled_into():
+    """split-copy dst_start must start after sink region to avoid overwriting it."""
+    c = BlockKVCache(
+        k_shape=(1, 8, 1, 1), v_shape=(1, 8, 1, 1),
+        seq_dim=1, chunk_size=2, window_size=6, sink_size=2,
+    )
+    # Fill with unique values: sink=[0, 1], window=[2,3,4,5,6,7]
+    for idx in range(4):  # 4 chunks of 2 = 8 total
+        c.before_update(idx)
+        c.update(
+            torch.tensor([[[[float(idx*2)]], [[float(idx*2+1)]]]]),
+            torch.tensor([[[[float(idx*2)]], [[float(idx*2+1)]]]]),
+        )
+        c.after_update(idx)
+
+    # Now roll: chunk 4 should shift window left by 2
+    # Expected: sink=[0, 1] (unchanged), window=[4,5,6,7,8,9]
+    c.before_update(4)
+    c.update(
+        torch.tensor([[[[8.0]], [[9.0]]]]),
+        torch.tensor([[[[8.0]], [[9.0]]]]),
+    )
+    ck = c.cached_k().clone()
+    c.after_update(4)
+
+    # Sink (indices 0, 1) must match original values 0, 1
+    assert ck[0, 0, 0, 0].item() == 0.0, f"Sink[0] corrupted: {ck[0,0,0,0]}"
+    assert ck[0, 1, 0, 0].item() == 1.0, f"Sink[1] corrupted: {ck[0,1,0,0]}"
+    # Window (indices 2..8) must have values 4..9
+    for i in range(6):
+        assert ck[0, 2+i, 0, 0].item() == float(4+i), (
+            f"Window[{i}] corrupted: expected {4+i}, got {ck[0,2+i,0,0]}"
+        )
+
+
+# --- T1: Edge case ---
+
+def test_adaln_fusion_zero_scale_shift():
+    """LayerNormScaleShift with scale=shift=0 should be equivalent to pure LayerNorm."""
+    torch.manual_seed(0)
+    fused = LayerNormScaleShift(2048, eps=1e-6)
+    x = torch.randn(2, 128, 2048)
+    zero_shift = torch.zeros(2, 1, 2048)
+    zero_scale = torch.zeros(2, 1, 2048)
+
+    out_fused = fused(x, zero_shift, zero_scale)
+    manual_norm = torch.nn.LayerNorm(2048, elementwise_affine=False, eps=1e-6)
+    out_manual = manual_norm(x)
+
+    diff = (out_fused - out_manual).abs().max().item()
+    assert diff < 1e-5, f"Zero scale/shift: fused vs norm mismatch: {diff}"
+
+
+# --- T2: head_dim edge case ---
+
+def test_rope_to_cos_sin_cache_non_standard_head_dim():
+    """to_cos_sin_cache works for head_dim != 128."""
+    for head_dim in [64, 192, 256]:
+        rope = RotaryPositionEmbedding3D(
+            head_dim=head_dim, len_h=2, len_w=3, len_t=1,
+            h_extrapolation_ratio=1.0, w_extrapolation_ratio=1.0,
+            t_extrapolation_ratio=1.0, device="cpu",
+        )
+        cs = rope.to_cos_sin_cache(0)
+        L = 1 * 2 * 3
+        assert cs.shape == (L, head_dim), f"head_dim={head_dim}: bad shape {cs.shape}"
+        half = head_dim // 2
+        identity_err = (cs[:, :half] ** 2 + cs[:, half:] ** 2 - 1.0).abs().max().item()
+        assert identity_err < 1e-6, f"head_dim={head_dim}: cos^2+sin^2 != 1, error={identity_err}"
