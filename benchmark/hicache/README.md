@@ -85,7 +85,51 @@ NExTVideo  --dataset-name nextqa --request-rate 10 --num-prompts 1 --disable-shu
 ```
 Note: for the server args, `tokenizer-path`, overriding architecture are necessary.
 
-## Supported Backend
-- sglang (oai)
-- vllm (oai)
-- lmdeploy (oai)
+## Warm Cache Benchmark
+`bench_warm_cache.py` measures cache-hit performance with exact control over
+shared-prefix ratio. For each shared-prefix percentage it flushes the KV cache,
+warms the shared prefix once, then benchmarks the full prompts.
+
+### Example Usage:
+```bash
+# Native SGLang /generate endpoint (default)
+python3 bench_warm_cache.py --model Qwen/Qwen2.5-14B-Instruct --backend sglang \
+  --total-tokens 70000 --num-prompts 64 --pcts 0,50,90,99
+
+# OpenAI-compatible chat/completions (e.g. via SGLang OAI frontend)
+python3 bench_warm_cache.py --model Qwen/Qwen2.5-14B-Instruct --backend sglang-oai-chat \
+  --total-tokens 70000 --num-prompts 64 --pcts 0,50,90,99
+
+# OpenAI-compatible completions
+python3 bench_warm_cache.py --model Qwen/Qwen2.5-14B-Instruct --backend sglang-oai \
+  --total-tokens 70000 --num-prompts 64 --pcts 0,50,90,99
+```
+
+Key arguments:
+- `--total-tokens`: total input length per request (prefix + suffix)
+- `--pcts`: comma-separated shared-prefix percentages to sweep
+- `--output-file results.jsonl`: append per-percentage results to a JSONL file
+
+Supports the same backends as `bench_serving.py` (see table below).
+
+### Backend performance note
+The `sglang`, `sglang-oai`, `vllm`, and `lmdeploy` backends send pre-tokenized
+IDs directly — the server skips tokenization and results are the most accurate
+for cache studies. The `*-chat` backends send text via `/v1/chat/completions`,
+so the server must tokenize every request; this adds per-request overhead that
+grows with `--total-tokens` and is unrelated to cache performance.
+
+## Supported Backends
+`bench_serving.py` supports `sglang`, `vllm`, and `lmdeploy`. `bench_warm_cache.py`
+additionally supports the `-oai` and `-chat` variants.
+Use `--base-url` when the server is not on the backend's default port.
+
+| Backend | Endpoint | Default port |
+| --- | --- | --- |
+| `sglang` | `/generate` (native, token-id level) | 30000 |
+| `sglang-oai` | `/v1/completions` | 30000 |
+| `sglang-oai-chat` | `/v1/chat/completions` | 30000 |
+| `vllm` | `/v1/completions` | 8000 |
+| `vllm-chat` | `/v1/chat/completions` | 8000 |
+| `lmdeploy` | `/v1/completions` | 23333 |
+| `lmdeploy-chat` | `/v1/chat/completions` | 23333 |
