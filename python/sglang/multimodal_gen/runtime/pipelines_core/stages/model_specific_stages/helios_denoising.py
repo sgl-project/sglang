@@ -137,9 +137,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         *,
         enable_bcg: bool = True,
     ):
-        if (
-            not enable_bcg
-            or not getattr(server_args, "enable_breakable_cuda_graph", False)
+        if not enable_bcg or not getattr(
+            server_args, "enable_breakable_cuda_graph", False
         ):
             return self.transformer(**kwargs)
         if self._bcg_runner is None:

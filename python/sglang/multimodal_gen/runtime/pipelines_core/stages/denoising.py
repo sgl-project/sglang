@@ -1928,7 +1928,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         runner = self._maybe_get_bcg_runner(current_model) if enable_bcg else None
         if runner is not None:
-            model_output = runner(**self._bcg_pad_prompt_kwargs(call_kwargs))
+            model_output = runner(
+                **self._bcg_pad_prompt_kwargs(call_kwargs, current_model=current_model)
+            )
         else:
             model_output = current_model(**call_kwargs)
         return _ensure_tensor_model_output(model_output)
@@ -1951,22 +1953,221 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
         )
 
-    def _bcg_pad_prompt_kwargs(self, call_kwargs: dict):
-        """Pad the prompt-conditioning inputs to a FIXED bucket length so the
-        breakable-CUDA-graph capture signature is invariant to prompt length —
-        different prompts then replay one captured graph instead of re-capturing.
+    @staticmethod
+    def _bcg_text_buckets() -> tuple[int, ...]:
+        buckets_env = os.environ.get("SGLANG_BCG_TEXT_BUCKETS")
+        if buckets_env is None:
+            buckets_env = os.environ.get("SGLANG_BCG_TEXT_BUCKET")
+        if buckets_env is None:
+            buckets_env = "256,512,1024,2048"
 
-        Pads ``encoder_hidden_states`` and every prompt-length mask
-        (``encoder_attention_mask`` / ``encoder_hidden_states_mask``, including
-        list-wrapped ones) along the sequence dim to ``SGLANG_BCG_TEXT_BUCKET``
-        (default 512). Masks are padded with 0 (== "ignore") so for any
-        cross-attention model the appended positions are masked out and the
-        result is bit-exact with the unpadded run (masked keys contribute zero).
+        buckets = []
+        for raw_bucket in buckets_env.replace(";", ",").split(","):
+            raw_bucket = raw_bucket.strip()
+            if not raw_bucket:
+                continue
+            try:
+                bucket = int(raw_bucket)
+            except ValueError:
+                logger.warning(
+                    "[Diffusion BCG] ignoring invalid text bucket %r",
+                    raw_bucket,
+                )
+                continue
+            if bucket <= 0:
+                logger.warning(
+                    "[Diffusion BCG] ignoring non-positive text bucket %d",
+                    bucket,
+                )
+                continue
+            buckets.append(bucket)
+        return tuple(sorted(set(buckets))) or (512,)
 
-        Gated on an ``encoder_attention_mask`` being present (so padding can be
-        masked); no-op when text already equals the bucket or exceeds it.
-        """
-        import os
+    @classmethod
+    def _bcg_select_text_bucket(cls, seq: int) -> int | None:
+        buckets = cls._bcg_text_buckets()
+        for bucket in buckets:
+            if seq <= bucket:
+                return bucket
+        logger.warning(
+            "[Diffusion BCG] text length %d exceeds max bucket %d; not padding "
+            "(this length captures its own graph). Raise SGLANG_BCG_TEXT_BUCKETS.",
+            seq,
+            buckets[-1],
+        )
+        return None
+
+    @staticmethod
+    def _bcg_first_tensor(obj):
+        if torch.is_tensor(obj):
+            return obj
+        if isinstance(obj, (list, tuple)):
+            for item in obj:
+                tensor = DenoisingStage._bcg_first_tensor(item)
+                if tensor is not None:
+                    return tensor
+        if isinstance(obj, dict):
+            for key in sorted(obj):
+                tensor = DenoisingStage._bcg_first_tensor(obj[key])
+                if tensor is not None:
+                    return tensor
+        return None
+
+    @staticmethod
+    def _bcg_pad_tensor_dim(tensor, dim: int, target: int, value: float = 0):
+        if not torch.is_tensor(tensor) or tensor.dim() <= dim:
+            return tensor
+        seq = tensor.shape[dim]
+        if seq >= target:
+            return tensor
+        pad = [0, 0] * tensor.dim()
+        pad_index = 2 * (tensor.dim() - dim - 1) + 1
+        pad[pad_index] = target - seq
+        return torch.nn.functional.pad(tensor, tuple(pad), value=value)
+
+    @classmethod
+    def _bcg_pad_nested_dim(
+        cls,
+        obj,
+        *,
+        dim: int,
+        source: int,
+        target: int,
+        value: float = 0,
+    ):
+        if torch.is_tensor(obj):
+            if obj.dim() > dim and obj.shape[dim] == source:
+                return cls._bcg_pad_tensor_dim(obj, dim, target, value)
+            return obj
+        if isinstance(obj, list):
+            return [
+                cls._bcg_pad_nested_dim(
+                    item, dim=dim, source=source, target=target, value=value
+                )
+                for item in obj
+            ]
+        if isinstance(obj, tuple):
+            return tuple(
+                cls._bcg_pad_nested_dim(
+                    item, dim=dim, source=source, target=target, value=value
+                )
+                for item in obj
+            )
+        return obj
+
+    @staticmethod
+    def _bcg_bucket_txt_seq_lens(txt_seq_lens, bucket: int):
+        if txt_seq_lens is None:
+            return txt_seq_lens
+        if torch.is_tensor(txt_seq_lens):
+            return torch.full_like(txt_seq_lens, bucket)
+        if isinstance(txt_seq_lens, list):
+            return [
+                DenoisingStage._bcg_bucket_txt_seq_lens(seq_len, bucket)
+                for seq_len in txt_seq_lens
+            ]
+        if isinstance(txt_seq_lens, tuple):
+            return tuple(
+                DenoisingStage._bcg_bucket_txt_seq_lens(seq_len, bucket)
+                for seq_len in txt_seq_lens
+            )
+        if isinstance(txt_seq_lens, int):
+            return bucket
+        return txt_seq_lens
+
+    @staticmethod
+    def _bcg_is_qwen_transformer(current_model) -> bool:
+        candidates = [current_model]
+        for attr in ("module", "_orig_mod"):
+            wrapped = getattr(current_model, attr, None)
+            if wrapped is not None:
+                candidates.append(wrapped)
+
+        for candidate in candidates:
+            cls = type(candidate)
+            name = f"{cls.__module__}.{cls.__qualname__}".lower()
+            if "qwen" in name:
+                return True
+        return False
+
+    @classmethod
+    def _bcg_pad_qwen_prompt_kwargs(cls, call_kwargs: dict):
+        ehs = call_kwargs.get("encoder_hidden_states")
+        ehs_tensor = cls._bcg_first_tensor(ehs)
+        if not torch.is_tensor(ehs_tensor) or ehs_tensor.dim() < 2:
+            return call_kwargs
+
+        seq = ehs_tensor.shape[1]
+        bucket = cls._bcg_select_text_bucket(seq)
+        if bucket is None:
+            return call_kwargs
+
+        out = dict(call_kwargs)
+        if seq < bucket:
+            out["encoder_hidden_states"] = cls._bcg_pad_nested_dim(
+                ehs, dim=1, source=seq, target=bucket
+            )
+            if (
+                "encoder_hidden_states_2" in out
+                and out["encoder_hidden_states_2"] is not None
+            ):
+                out["encoder_hidden_states_2"] = cls._bcg_pad_nested_dim(
+                    out["encoder_hidden_states_2"],
+                    dim=1,
+                    source=seq,
+                    target=bucket,
+                )
+
+        mask = out.get("encoder_hidden_states_mask")
+        if mask is None and seq < bucket:
+            mask = torch.ones(
+                ehs_tensor.shape[:2],
+                device=ehs_tensor.device,
+                dtype=torch.bool,
+            )
+        if mask is not None:
+            out["encoder_hidden_states_mask"] = cls._bcg_pad_nested_dim(
+                mask, dim=1, source=seq, target=bucket
+            )
+
+        if (
+            "encoder_attention_mask" in out
+            and out["encoder_attention_mask"] is not None
+        ):
+            out["encoder_attention_mask"] = cls._bcg_pad_nested_dim(
+                out["encoder_attention_mask"],
+                dim=1,
+                source=seq,
+                target=bucket,
+            )
+
+        freqs_cis = out.get("freqs_cis")
+        if isinstance(freqs_cis, tuple) and len(freqs_cis) == 2:
+            img_cache, txt_cache = freqs_cis
+            txt_cache = cls._bcg_pad_nested_dim(
+                txt_cache, dim=0, source=seq, target=bucket
+            )
+            out["freqs_cis"] = (img_cache, txt_cache)
+        elif isinstance(freqs_cis, list) and len(freqs_cis) == 2:
+            img_cache, txt_cache = freqs_cis
+            txt_cache = cls._bcg_pad_nested_dim(
+                txt_cache, dim=0, source=seq, target=bucket
+            )
+            out["freqs_cis"] = [img_cache, txt_cache]
+
+        out["txt_seq_lens"] = cls._bcg_bucket_txt_seq_lens(
+            out.get("txt_seq_lens"), bucket
+        )
+        return out
+
+    def _bcg_pad_prompt_kwargs(self, call_kwargs: dict, current_model=None):
+        """Bucket prompt-conditioning inputs so BCG signatures ignore prompt length."""
+        if (
+            self._bcg_is_qwen_transformer(current_model)
+            and "txt_seq_lens" in call_kwargs
+            and "freqs_cis" in call_kwargs
+        ):
+            return self._bcg_pad_qwen_prompt_kwargs(call_kwargs)
 
         ehs = call_kwargs.get("encoder_hidden_states")
         mask = call_kwargs.get("encoder_attention_mask")
@@ -1977,30 +2178,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if not torch.is_tensor(mask) or mask.dim() < 2:
             return call_kwargs
         seq = ehs.shape[1]
-        bucket = int(os.environ.get("SGLANG_BCG_TEXT_BUCKET", "512"))
-        if seq == bucket:
+        bucket = self._bcg_select_text_bucket(seq)
+        if bucket is None or seq == bucket:
             return call_kwargs
-        if seq > bucket:
-            logger.warning(
-                "[Diffusion BCG] text length %d exceeds bucket %d; not padding "
-                "(this length captures its own graph). Raise SGLANG_BCG_TEXT_BUCKET.",
-                seq,
-                bucket,
-            )
-            return call_kwargs
-        pad = bucket - seq
-
-        def _pad_seq(x):
-            # Pad dim-1 from seq -> bucket for tensors whose dim-1 == seq.
-            # Embeds keep zeros (masked out); masks get 0 (== ignore).
-            if torch.is_tensor(x) and x.dim() >= 2 and x.shape[1] == seq:
-                npad = (0, 0) * (x.dim() - 2) + (0, pad)
-                return torch.nn.functional.pad(x, npad)
-            if isinstance(x, list):
-                return [_pad_seq(e) for e in x]
-            if isinstance(x, tuple):
-                return tuple(_pad_seq(e) for e in x)
-            return x
 
         out = dict(call_kwargs)
         for key in (
@@ -2010,8 +2190,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             "encoder_hidden_states_mask",
         ):
             if key in out and out[key] is not None:
-                out[key] = _pad_seq(out[key])
+                out[key] = self._bcg_pad_nested_dim(
+                    out[key], dim=1, source=seq, target=bucket
+                )
         return out
+
     def _maybe_get_bcg_runner(self, current_model):
         """Return (lazily creating) the breakable CUDA graph runner for
         ``current_model``, or ``None`` if BCG is disabled / inapplicable.

@@ -143,7 +143,9 @@ class DiffusionBreakableCudaGraphRunner:
         self.device_module = torch.get_device_module(device)
         # One shared mempool across all captured graphs/segments so per-block
         # intermediates can be reclaimed and weak-ref'd safely.
-        self._pool = pool if pool is not None else self.device_module.graph_pool_handle()
+        self._pool = (
+            pool if pool is not None else self.device_module.graph_pool_handle()
+        )
         self._capture_stream = self.device_module.Stream(device=device)
         self.entries: dict[tuple, _CaptureEntry] = {}
         # Signatures we have given up capturing (capture raised); run eager.
