@@ -311,29 +311,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # Check if we are in TARGET_VERIFY mode
         is_target_verify = forward_batch.forward_mode.is_target_verify()
 
-        # Handle TARGET_VERIFY mode where extend_prefix_lens might not be set
-        if forward_batch.extend_prefix_lens is not None:
-            has_initial_state = forward_batch.extend_prefix_lens > 0
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-        else:
-            # TARGET_VERIFY mode: infer from spec_info
-            # In speculative decoding, prefix_len = seq_len - draft_token_num
-            if forward_batch.spec_info is not None and hasattr(
-                forward_batch.spec_info, "draft_token_num"
-            ):
-                bs = forward_batch.batch_size
-                draft_token_num = forward_batch.spec_info.draft_token_num
-                # All sequences have initial state in TARGET_VERIFY mode
-                has_initial_state = torch.ones(
-                    bs, dtype=torch.bool, device=mixed_qkv.device
-                )
-                extend_seq_lens_cpu = [draft_token_num] * bs
-            else:
-                raise RuntimeError(
-                    "extend_prefix_lens is None but cannot infer from spec_info. "
-                    "This should not happen in TARGET_VERIFY mode."
-                )
-
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
 
         if is_target_verify:
@@ -393,6 +370,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             q, k, v = mixed_qkv.split(splits, dim=-1)
         else:
             # Non-TARGET_VERIFY path: split mixed_qkv and process q, k, v separately
+            if forward_batch.extend_prefix_lens is None:
+                raise RuntimeError(
+                    "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
+                )
+            has_initial_state = forward_batch.extend_prefix_lens > 0
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+
             q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
             q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
                 splits, dim=0
