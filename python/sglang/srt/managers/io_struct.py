@@ -429,6 +429,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_extra_key(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -631,6 +632,15 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+    def _normalize_extra_key(self, num):
+        if self.extra_key is None or isinstance(self.extra_key, str):
+            return
+        if len(self.extra_key) != self.batch_size:
+            raise ValueError(
+                "The length of extra_key should be equal to the batch size."
+            )
+        self.extra_key = self.extra_key * self.parallel_sample_num
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -713,7 +723,11 @@ class GenerateReqInput(BaseReq):
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
-            extra_key=self.extra_key,
+            extra_key=(
+                self.extra_key[i]
+                if isinstance(self.extra_key, list)
+                else self.extra_key
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1409,9 +1423,7 @@ class PauseGenerationReqInput(BaseReq):
     def __post_init__(self):
         allowed = ["abort", "retract", "in_place"]
         if self.mode not in allowed:
-            raise ValueError(
-                f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}."
-            )
+            raise ValueError(f"Invalid mode: {self.mode!r}. Expected one of {allowed}.")
 
 
 @dataclass
