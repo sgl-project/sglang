@@ -74,6 +74,8 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     global_num_experts: int = -1
     w13_global_scale: Optional[torch.Tensor] = None
     w2_global_scale: Optional[torch.Tensor] = None
+    w13_bias: Optional[torch.Tensor] = None
+    w2_bias: Optional[torch.Tensor] = None
 
 
 @register_fused_func("none", "marlin")
@@ -142,12 +144,19 @@ def fused_experts_none_to_marlin(
         w2_zeros=quant_info.w2_qzeros,
         w1_global_scale=quant_info.w13_global_scale,
         w2_global_scale=quant_info.w2_global_scale,
+        w1_bias=quant_info.w13_bias,
+        w2_bias=quant_info.w2_bias,
         workspace=MARLIN_MOE_WORKSPACE,
         num_bits=quant_info.weight_bits,
         is_k_full=quant_info.is_k_full,
         inplace=marlin_inplace,
         routed_scaling_factor=runner_config.routed_scaling_factor,
-        clamp_limit=runner_config.swiglu_limit,
+        clamp_limit=(
+            runner_config.gemm1_clamp_limit
+            if runner_config.gemm1_alpha is not None
+            else runner_config.swiglu_limit
+        ),
+        gemm1_alpha=runner_config.gemm1_alpha,
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
     ).to(hidden_states.dtype)
