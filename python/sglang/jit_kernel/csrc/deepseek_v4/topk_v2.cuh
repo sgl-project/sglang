@@ -325,21 +325,55 @@ topk_fused_transform(const __grid_constant__ TopKParams params) {
   __shared__ int32_t s_topk_indices[K];
   const auto batch_id = blockIdx.x;
   const auto cluster_rank = blockIdx.y;
+  // PDLWaitPrimary at kernel entry: all 8 cluster CTAs wait for the primary
+  // kernel before reading params.seq_lens / scores. This both (1) ensures
+  // primary-produced data is visible and (2) gives every CTA a symmetric
+  // PDL state, sidestepping the SM100 cluster crash described below.
+  device::PDLWaitPrimary<true>();
   const auto seq_len = params.seq_lens[batch_id];
   const auto transform = params.get_transform(batch_id, s_topk_indices);
+  // This kernel is __cluster_dims__(1, kClusterSize, 1) + launched with
+  // enable_pdl(true). On SM100 (B300) with TP=8 + DP-attention, letting 7
+  // of 8 cluster CTAs early-return here -- while only rank 0 enters the
+  // body and (in the SMALL case) calls Small::run's PDLWaitPrimary -- ends
+  // in CUDA_ERROR_ILLEGAL_ADDRESS, surfaced at the next sync point
+  // (typically CUDA graph replay or a downstream deep_gemm call).
+  //
+  // Empirically, hoisting PDLWaitPrimary alone is NOT sufficient to fix the
+  // crash; what is load-bearing is forcing all 8 CTAs to meet at a
+  // cluster.sync() before any of them exits. So we keep cluster.sync() at
+  // each branch's tail and emit PDLTriggerSecondary just before it -- the
+  // trigger fires per-CTA, lets dependent kernels start earlier, and the
+  // barrier maintains the cluster invariant SM100 requires.
+  //
+  // We don't have a clean documented mechanism for why early-exit (which
+  // is normally legal per CUDA cluster semantics) fails specifically on
+  // SM100 + __cluster_dims__ + enable_pdl. Empirically validated against
+  // DSv4-Pro on 8x B300 at TP=8 + DP=8 + EP=8 + MegaMoE W4A4 (DSv4-Pro
+  // workload exclusively hits the SMALL branch since c4_seq_lens ~ 2304
+  // << Small::kMax1PassLength = 16384).
   if (seq_len <= K) {
-    if (cluster_rank != 0) return;  // only first rank work
-    impl::trivial_transform(transform, seq_len, K);
+    if (cluster_rank == 0) {
+      impl::trivial_transform(transform, seq_len, K);
+    }
+    device::PDLTriggerSecondary<true>();
+    cooperative_groups::this_cluster().sync();
   } else if (seq_len <= Small::kMax1PassLength) {
-    if (cluster_rank != 0) return;  // only first rank work
-    Small::run(params.get_scores(batch_id), s_topk_indices, seq_len, smem, /*use_pdl=*/true);
-    Small::transform(transform);
+    if (cluster_rank == 0) {
+      // use_pdl=false: PDLWaitPrimary is already hoisted to kernel entry.
+      Small::run(params.get_scores(batch_id), s_topk_indices, seq_len, smem, /*use_pdl=*/false);
+      Small::transform(transform);
+    }
+    device::PDLTriggerSecondary<true>();
+    cooperative_groups::this_cluster().sync();
   } else {
     const auto [offset, length] = partition_work(seq_len, cluster_rank);
     const auto ws = params.workspace + batch_id * params.workspace_stride;
     Large::stage1_init(smem);
-    device::PDLWaitPrimary<true>();
+    // PDLWaitPrimary hoisted to kernel entry; emit PDLTriggerSecondary after
+    // stage1_prologue so dependent kernels can overlap with stage1 work.
     Large::stage1_prologue(params.get_scores(batch_id) + offset, length, smem);
+    device::PDLTriggerSecondary<true>();
     Large::stage1(s_topk_indices, length, smem);
     Large::stage1_epilogue(transform, offset, ws, smem);
     cooperative_groups::this_cluster().sync();
