@@ -227,7 +227,7 @@ class TestTraceReqContextDisabled(unittest.TestCase):
         self.assertEqual(state, {"tracing_enable": False})
 
     def test_setstate_disabled(self):
-        ctx = TraceReqContext.__new__(TraceReqContext)
+        ctx = TraceReqContext(rid="req-1")
         ctx.__setstate__({"tracing_enable": True, "is_copy": False})
         # opentelemetry_initialized is False → tracing forced off
         self.assertFalse(ctx.tracing_enable)

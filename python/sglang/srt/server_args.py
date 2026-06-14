@@ -922,10 +922,16 @@ class ServerArgs:
     # For msProbe
     msprobe_dump_config: Optional[str] = None
 
+    # Whether the post-init processing has been completed
+    is_initialized: bool = False
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+        # Avoid re-initialization if already done
+        if self.is_initialized:
+            return
 
         self._maybe_download_model_for_runai()
 
@@ -1083,6 +1089,9 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+        # Finalize initialization.
+        self.is_initialized = True
 
     def _maybe_download_model_for_runai(self):
         if is_runai_obj_uri(self.model_path):
