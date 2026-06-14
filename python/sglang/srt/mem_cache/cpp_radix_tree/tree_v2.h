@@ -32,6 +32,15 @@ struct RadixTree {
   /// @brief Update new key-value pair and try to perform write-through.
   std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, std::size_t>
   writing_through(const token_vec_t& key, at::Tensor value);
+  /// @brief Perform writing_through and match_prefix combined for optimization.
+  std::tuple<
+      std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>,
+      std::size_t,
+      std::vector<at::Tensor>,
+      std::size_t,
+      NodeHandle,
+      NodeHandle>
+  insert_and_match(const token_vec_t& key, at::Tensor value);
   /// @brief Load to device from host within a range of nodes.
   std::tuple<IOTicket, std::vector<at::Tensor>> loading_onboard(NodeHandle host_id, at::Tensor indices);
   /// @brief Commit a transaction of write-through.

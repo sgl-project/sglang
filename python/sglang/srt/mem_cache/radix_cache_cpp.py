@@ -127,6 +127,28 @@ class RadixCacheCpp(BasePrefixCache):
 
         raise NotImplementedError("Host cache is not supported yet")
 
+    def _insert_and_match(self, key: RadixKey, value: torch.Tensor):
+        """
+        Insert a key-value pair and simultaneously return matched structures.
+        Note: The underlying C++ Tree returns a 6-element tuple including 'ongoing_write'
+        for hierarchical cache tasks. We currently drop it from the return of
+        this wrapper (returning 5 elements) because Host Cache is not yet supported.
+        """
+        (
+            ongoing_write,
+            length,
+            new_indices_vec,
+            host_hit_length,
+            device_node,
+            host_node,
+        ) = self.tree.insert_and_match(key.token_ids, value)
+
+        if self.cache_controller is None:
+            assert len(ongoing_write) == 0, "Implementation error"
+            return length, new_indices_vec, host_hit_length, device_node, host_node
+
+        raise NotImplementedError("Host cache is not supported yet")
+
     def dec_lock_ref(
         self, node: TreeNodeCpp, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
@@ -173,6 +195,14 @@ class RadixCacheCpp(BasePrefixCache):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
         kv_committed_len = req.pop_committed_kv_cache()
+
+        if self.disable:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
+            return
+
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
@@ -209,6 +239,9 @@ class RadixCacheCpp(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
+        if self.disable:
+            return
+
         assert req.req_pool_idx is not None
         token_ids = req.get_fill_ids()
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
@@ -219,16 +252,18 @@ class RadixCacheCpp(BasePrefixCache):
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        new_prefix_len = self._insert(RadixKey(token_ids, req.extra_key), kv_indices)
+        (
+            new_prefix_len,
+            new_indices_vec,
+            _,
+            new_last_node,
+            _,
+        ) = self._insert_and_match(RadixKey(token_ids, req.extra_key), kv_indices)
 
         # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
         assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
 
-        # TODO(dark): optimize the `insert` and `match` (e.g. merge into 1 function)
         # The prefix indices need to updated to reuse the kv indices in the pool
-        new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(
-            RadixKey(token_ids, req.extra_key).token_ids
-        )
         new_indices = self._merge_tensor(new_indices_vec)
         assert new_prefix_len <= len(new_indices)
 
