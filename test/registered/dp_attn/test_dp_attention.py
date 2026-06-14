@@ -96,6 +96,46 @@ class TestDPAttentionMixedChunk(
         kill_process_tree(cls.process.pid)
 
 
+class TestDPAttentionPrefixMatchLoadBalance(
+    CustomTestCase,
+    GSM8KMixin,
+):
+    """Smoke test for --load-balance-method prefix_match.
+
+    The new method routes by a stable hash of the leading input tokens, so
+    requests sharing a prefix land on the same DP rank. This test only
+    asserts that the server boots with the option and that GSM8K accuracy
+    stays above the same threshold the other DP-attention configs use; the
+    routing decision is a pure function and does not affect inference output.
+    """
+
+    gsm8k_accuracy_thres = 0.6
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "2",
+                "--enable-dp-attention",
+                "--dp",
+                "2",
+                "--load-balance-method",
+                "prefix_match",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+
 class TestDPRetract(
     CustomTestCase,
     JSONConstrainedMixin,
