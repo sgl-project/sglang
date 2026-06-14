@@ -965,7 +965,7 @@ _warn_deprecated_env_to_cli_flag(
 )
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_DFLASH_PREFILL_REFILL_TARGET",
-    "Please use '--enable-prefill-delayer --prefill-delayer-refill-target' instead.",
+    "Please use '--enable-prefill-delayer --prefill-delayer-min-allocatable-reqs' instead.",
 )
 
 # Import cuda_coredump to trigger auto-injection of CUDA env vars

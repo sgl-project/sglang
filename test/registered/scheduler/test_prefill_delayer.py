@@ -67,8 +67,8 @@ class NegotiateTestCase:
     # to exercise the legacy slot-only code paths.
     queue_min_ratio: Optional[float] = None
     max_delay_ms: Optional[float] = None
-    # Slot-refill trigger knob; None keeps the trigger disabled.
-    refill_target: Optional[int] = None
+    # Allocatable-slots trigger knob; None keeps the trigger disabled.
+    min_allocatable_reqs: Optional[int] = None
 
 
 def _run_negotiate_test(rank, test_cases):
@@ -89,7 +89,7 @@ def _run_negotiate_test(rank, test_cases):
             ),
             max_delay_passes=case.max_delay_passes,
             token_usage_low_watermark=case.token_usage_low_watermark,
-            refill_target=case.refill_target,
+            min_allocatable_reqs=case.min_allocatable_reqs,
         )
 
         for call in case.calls:
@@ -353,13 +353,13 @@ _NEGOTIATE_TEST_CASES = [
         expected_allow=True,
         expected_reason="wait_success",
     ),
-    # Slot-refill trigger: the most-constrained rank has 2 allocatable slots,
-    # below refill_target=4, so prefill must wait for more slots to free.
+    # Allocatable-slots trigger: the most-constrained rank has 2 allocatable
+    # slots, below min_allocatable_reqs=4, so prefill must wait for more to free.
     NegotiateTestCase(
-        name="refill_trigger_delay",
+        name="allocatable_trigger_delay",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        refill_target=4,
+        min_allocatable_reqs=4,
         max_delay_ms=5000,
         calls=[
             NegotiateCall(
@@ -382,12 +382,12 @@ _NEGOTIATE_TEST_CASES = [
         expected_allow=False,
         expected_reason="delay",
     ),
-    # Allocatable slots at the target on every rank: trigger must not fire.
+    # Allocatable slots at the threshold on every rank: trigger must not fire.
     NegotiateTestCase(
-        name="refill_trigger_enough_slots",
+        name="allocatable_trigger_enough_slots",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        refill_target=4,
+        min_allocatable_reqs=4,
         max_delay_ms=5000,
         calls=[
             NegotiateCall(
@@ -403,10 +403,10 @@ _NEGOTIATE_TEST_CASES = [
     ),
     # Nothing running: there is no decode batch to protect, prefill at once.
     NegotiateTestCase(
-        name="refill_trigger_idle_running_batch",
+        name="allocatable_trigger_idle_running_batch",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        refill_target=4,
+        min_allocatable_reqs=4,
         max_delay_ms=5000,
         calls=[
             NegotiateCall(
@@ -421,12 +421,12 @@ _NEGOTIATE_TEST_CASES = [
         expected_reason="no_wait",
     ),
     # Callers that do not provide the slot count (e.g. while a chunked
-    # prefill is in flight) must not be delayed by the refill trigger.
+    # prefill is in flight) must not be delayed by this trigger.
     NegotiateTestCase(
-        name="refill_trigger_na_when_not_provided",
+        name="allocatable_trigger_na_when_not_provided",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        refill_target=4,
+        min_allocatable_reqs=4,
         max_delay_ms=5000,
         calls=[
             NegotiateCall(
@@ -439,13 +439,13 @@ _NEGOTIATE_TEST_CASES = [
         expected_allow=True,
         expected_reason="no_wait",
     ),
-    # max_delay_ms wall-clock timeout applies to the refill trigger as well:
-    # same skip-first / delay / force-release sequence as the queue trigger.
+    # max_delay_ms wall-clock timeout applies to this trigger as well: same
+    # skip-first / delay / force-release sequence as the queue trigger.
     NegotiateTestCase(
-        name="refill_trigger_wall_clock_timeout",
+        name="allocatable_trigger_wall_clock_timeout",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        refill_target=4,
+        min_allocatable_reqs=4,
         max_delay_ms=50,
         calls=[
             NegotiateCall(

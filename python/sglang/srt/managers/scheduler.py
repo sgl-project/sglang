@@ -1024,11 +1024,11 @@ class Scheduler(
                     ),
                     max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
-                    # Cap at max_running_requests: a larger target could never
-                    # be reached and would always delay until the time cap.
-                    refill_target=(
+                    # Cap at max_running_requests: a larger threshold could
+                    # never be reached and would always delay until the time cap.
+                    min_allocatable_reqs=(
                         min(x, self.max_running_requests)
-                        if (x := self.server_args.prefill_delayer_refill_target)
+                        if (x := self.server_args.prefill_delayer_min_allocatable_reqs)
                         is not None
                         else None
                     ),
@@ -2683,9 +2683,9 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
-            # The refill trigger only batches fresh admissions; while a
-            # chunked prefill is in flight the pass must proceed regardless,
-            # so mark the slot count as not applicable.
+            # The allocatable-slots trigger only batches fresh admissions;
+            # while a chunked prefill is in flight the pass must proceed
+            # regardless, so mark the slot count as not applicable.
             num_allocatable_reqs=(
                 num_allocatable_reqs if self.chunked_req is None else None
             ),

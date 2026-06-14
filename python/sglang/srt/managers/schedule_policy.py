@@ -501,7 +501,7 @@ class PrefillAdder:
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
         # Snapshot of allocatable request slots; None when not applicable
-        # this pass. Used by PrefillDelayer's slot-refill trigger.
+        # this pass. Used by PrefillDelayer's allocatable-slots trigger.
         self.num_allocatable_reqs = num_allocatable_reqs
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):

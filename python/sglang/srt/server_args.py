@@ -457,7 +457,7 @@ class ServerArgs:
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
     prefill_delayer_queue_min_ratio: Optional[float] = None
-    prefill_delayer_refill_target: Optional[int] = None
+    prefill_delayer_min_allocatable_reqs: Optional[int] = None
     prefill_delayer_max_delay_ms: Optional[float] = None
 
     # Runtime options
@@ -5208,13 +5208,13 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--prefill-delayer-refill-target",
+            "--prefill-delayer-min-allocatable-reqs",
             type=int,
-            default=ServerArgs.prefill_delayer_refill_target,
+            default=ServerArgs.prefill_delayer_min_allocatable_reqs,
             help=(
-                "Opt-in slot-refill delay trigger: hold new prefills until at least N "
-                "request slots are allocatable, so freed slots refill in one batch instead "
-                "of one request at a time. Useful when each admission is disproportionately "
+                "Opt-in delay trigger: hold new prefills until at least N request slots "
+                "are allocatable, so freed slots are admitted in one batch instead of one "
+                "request at a time. Useful when each admission is disproportionately "
                 "expensive, e.g. speculative decoding with a separate draft prefill pass. "
                 "Bounded by --prefill-delayer-max-delay-ms. Unset (default) disables the "
                 "trigger."
@@ -5225,11 +5225,11 @@ class ServerArgs:
             type=float,
             default=None,
             help=(
-                "Wall-clock cap (ms) on a single queue-trigger or refill-trigger delay; "
-                "once exceeded, prefill is force-released to bound worst-case TTFT. Only "
-                "consulted when --prefill-delayer-queue-min-ratio or "
-                "--prefill-delayer-refill-target is set. Typical: 1000 ~ 5000; defaults to "
-                "5000 if unset."
+                "Wall-clock cap (ms) on a single queue-trigger or allocatable-slots-trigger "
+                "delay; once exceeded, prefill is force-released to bound worst-case TTFT. "
+                "Only consulted when --prefill-delayer-queue-min-ratio or "
+                "--prefill-delayer-min-allocatable-reqs is set. Typical: 1000 ~ 5000; "
+                "defaults to 5000 if unset."
             ),
         )
 
