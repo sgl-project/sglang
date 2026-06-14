@@ -42,8 +42,6 @@ def npu_fused_experts_fp8(
             **kwargs,
         )
 
-    del kwargs
-
     original_shape = hidden_states.shape
     original_dtype = hidden_states.dtype
     if len(original_shape) == 3:
@@ -123,8 +121,6 @@ def npu_fused_experts_fp8_decode(
     top_k: int,
     **kwargs,
 ):
-    del kwargs
-
     num_tokens = hidden_states.shape[:-1].numel()
     global_num_experts = w13.shape[0]
     original_shape = hidden_states.shape
