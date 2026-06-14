@@ -3,12 +3,8 @@
 from collections.abc import Iterable
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
-from sglang.multimodal_gen.configs.models.vaes.base import (
-    should_use_spatial_shard_parallel_decode,
-)
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
@@ -20,6 +16,9 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    can_install_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import (
     enable_diffusers_decoder_spatial_parallel,
@@ -88,17 +87,9 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
                 self._loaded_state_dict.clear()
 
         self._inner_model = self._inner_model.to(device)
-        if self._use_spatial_parallel_decode():
+        if can_install_spatial_shard_parallel_decode(self._config):
             enable_diffusers_decoder_spatial_parallel(self._inner_model.decoder)
             self._spatial_parallel_decode_enabled = True
-
-    def _use_spatial_parallel_decode(self) -> bool:
-        return (
-            self._config is not None
-            and should_use_spatial_shard_parallel_decode(self._config)
-            and dist.is_initialized()
-            and get_decode_parallel_world_size() > 1
-        )
 
     @property
     def config(self):

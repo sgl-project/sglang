@@ -19,15 +19,11 @@
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
-from sglang.multimodal_gen.configs.models.vaes.base import (
-    should_use_spatial_shard_parallel_decode,
-)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
@@ -41,7 +37,11 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     gather_variable_height,
     split_height_for_parallel_decode,
 )
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+    should_run_spatial_shard_parallel_decode,
+)
 
 
 def prepare_causal_attention_mask(
@@ -918,24 +918,15 @@ class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
                 config.latent_channels, config.latent_channels, kernel_size=1
             )
             self._spatial_parallel_decode_enabled = False
-            if self._use_spatial_parallel_decode():
+            if can_install_spatial_shard_parallel_decode(self.config):
                 _enable_hunyuan_decoder_spatial_parallel(self.decoder)
                 self._spatial_parallel_decode_enabled = True
 
-    def _use_spatial_parallel_decode(self) -> bool:
-        return (
-            should_use_spatial_shard_parallel_decode(self.config)
-            and dist.is_initialized()
-            and get_decode_parallel_world_size() > 1
-        )
-
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
-        if not self._spatial_parallel_decode_enabled or not dist.is_initialized():
-            return False
-        world_size = get_decode_parallel_world_size()
-        if world_size <= 1:
-            return False
-        return should_use_spatial_shard_parallel_decode(self.config, z, world_size)
+        return (
+            self._spatial_parallel_decode_enabled
+            and should_run_spatial_shard_parallel_decode(self.config, z)
+        )
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         x = self.encoder(x)

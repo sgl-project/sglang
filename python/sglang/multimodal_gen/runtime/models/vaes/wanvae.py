@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
     ParallelTiledVAE,
+    should_run_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -1477,12 +1478,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self._causal_decode_initialized = False
 
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
-        if not dist.is_initialized():
-            return False
-        world_size = get_decode_parallel_world_size()
-        if world_size <= 1:
-            return False
-        return should_use_spatial_shard_parallel_decode(self.config, z, world_size)
+        return should_run_spatial_shard_parallel_decode(self.config, z)
 
     def clear_cache(self) -> None:
 

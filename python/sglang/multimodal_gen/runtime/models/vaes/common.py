@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from math import isqrt, prod
 from typing import Optional, cast
 
@@ -18,6 +19,7 @@ from sglang.multimodal_gen.configs.models.vaes.base import (
     should_use_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_group_coordinator,
     get_decode_parallel_world_size,
     get_sp_parallel_rank,
     get_sp_world_size,
@@ -26,6 +28,51 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+
+
+@lru_cache(maxsize=1)
+def _cached_decode_parallel_world_size(
+    is_dist_initialized: bool, is_model_parallel_initialized: bool, group_id: int
+) -> int:
+    if not is_dist_initialized or not is_model_parallel_initialized:
+        return 1
+    return get_decode_parallel_world_size()
+
+
+def _decode_parallel_world_size() -> int:
+    is_dist_initialized = dist.is_initialized()
+    is_model_parallel_initialized = model_parallel_is_initialized()
+    if not is_dist_initialized or not is_model_parallel_initialized:
+        return _cached_decode_parallel_world_size(
+            is_dist_initialized, is_model_parallel_initialized, 0
+        )
+    return _cached_decode_parallel_world_size(
+        is_dist_initialized,
+        is_model_parallel_initialized,
+        id(get_decode_parallel_group_coordinator()),
+    )
+
+
+def has_decode_parallel_world() -> bool:
+    return _decode_parallel_world_size() > 1
+
+
+def can_install_spatial_shard_parallel_decode(config: VAEConfig | None) -> bool:
+    world_size = _decode_parallel_world_size()
+    return (
+        config is not None
+        and world_size > 1
+        and should_use_spatial_shard_parallel_decode(config, world_size=world_size)
+    )
+
+
+def should_run_spatial_shard_parallel_decode(
+    config: VAEConfig, z: torch.Tensor
+) -> bool:
+    world_size = _decode_parallel_world_size()
+    return world_size > 1 and should_use_spatial_shard_parallel_decode(
+        config, z, world_size
+    )
 
 
 class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
@@ -120,11 +167,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         )
         num_sample_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
 
-        if (
-            should_use_spatial_shard_parallel_decode(self.config)
-            and model_parallel_is_initialized()
-            and get_decode_parallel_world_size() > 1
-        ):
+        if should_run_spatial_shard_parallel_decode(self.config, z):
             return self._decode(z)[:, :, :num_sample_frames]
 
         if (

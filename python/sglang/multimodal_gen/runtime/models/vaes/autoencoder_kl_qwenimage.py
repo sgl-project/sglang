@@ -13,14 +13,12 @@ from diffusers.models.autoencoders.vae import (
 )
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
-from sglang.multimodal_gen.configs.models.vaes.base import (
-    should_use_spatial_shard_parallel_decode,
-)
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelCausalConv3d,
@@ -32,7 +30,12 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     gather_height_for_global_op,
     split_for_parallel_decode,
 )
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+    has_decode_parallel_world,
+    should_run_spatial_shard_parallel_decode,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -747,7 +750,7 @@ class QwenImageDecoder3d(nn.Module):
         self.upsample_count = 0
         self.world_size = 1
         self.rank = 0
-        if dist.is_initialized():
+        if dist.is_initialized() and model_parallel_is_initialized():
             self.world_size = get_decode_parallel_world_size()
             self.rank = get_decode_parallel_rank()
 
@@ -910,7 +913,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.config = config.arch_config
         self.use_parallel_decode = config.use_parallel_decode
         self._spatial_parallel_decode_enabled = (
-            should_use_spatial_shard_parallel_decode(config)
+            can_install_spatial_shard_parallel_decode(config)
         )
 
         self.encoder = QwenImageEncoder3d(
@@ -1088,15 +1091,11 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return (
             self._spatial_parallel_decode_enabled
-            and should_use_spatial_shard_parallel_decode(
-                self.vae_config,
-                z,
-                get_decode_parallel_world_size(),
-            )
+            and should_run_spatial_shard_parallel_decode(self.vae_config, z)
         )
 
     def _decode_with_parallel_dispatch(self, z: torch.Tensor) -> DecoderOutput:
-        if self.use_parallel_decode and get_decode_parallel_world_size() > 1:
+        if self.use_parallel_decode and has_decode_parallel_world():
             num_frame = z.shape[2]
             num_sample_frames = (num_frame - 1) * self.temporal_compression_ratio + 1
             mode = self.parallel_decode_mode

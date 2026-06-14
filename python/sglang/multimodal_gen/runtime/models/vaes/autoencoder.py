@@ -3,7 +3,6 @@
 from typing import Dict, Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 from diffusers.models.attention_processor import (
     ADDED_KV_ATTENTION_PROCESSORS,
     CROSS_ATTENTION_PROCESSORS,
@@ -22,15 +21,12 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torch import nn
 
-from sglang.multimodal_gen.configs.models.vaes.base import (
-    should_use_spatial_shard_parallel_decode,
-)
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_decode_parallel_world_size,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    can_install_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import (
     enable_diffusers_decoder_spatial_parallel,
@@ -142,7 +138,7 @@ class AutoencoderKL(nn.Module, LayerwiseOffloadableModuleMixin):
         self.parallel_decode_mode = config.parallel_decode_mode
         self._spatial_parallel_decode_enabled = False
         self._spatial_parallel_upsample_count = 0
-        if self._use_spatial_parallel_decode():
+        if can_install_spatial_shard_parallel_decode(self.config):
             self._spatial_parallel_upsample_count = (
                 enable_diffusers_decoder_spatial_parallel(self.decoder)
             )
@@ -342,13 +338,6 @@ class AutoencoderKL(nn.Module, LayerwiseOffloadableModuleMixin):
             return (dec,)
 
         return DecoderOutput(sample=dec)
-
-    def _use_spatial_parallel_decode(self) -> bool:
-        return (
-            should_use_spatial_shard_parallel_decode(self.config)
-            and dist.is_initialized()
-            and get_decode_parallel_world_size() > 1
-        )
 
     def decode(self, z: torch.FloatTensor) -> Union[DecoderOutput, torch.FloatTensor]:
         """

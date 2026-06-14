@@ -2,7 +2,6 @@ from functools import lru_cache
 from typing import Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from diffusers.models.activations import get_activation
 from diffusers.models.autoencoders.vae import (
@@ -12,9 +11,6 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbeddings
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
-from sglang.multimodal_gen.configs.models.vaes.base import (
-    should_use_spatial_shard_parallel_decode,
-)
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
@@ -26,7 +22,11 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     gather_and_trim_height,
     split_height_for_parallel_decode,
 )
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+    should_run_spatial_shard_parallel_decode,
+)
 
 
 @lru_cache(maxsize=128)
@@ -1721,7 +1721,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         self.register_buffer("latents_mean", latents_mean, persistent=True)
         self.register_buffer("latents_std", latents_std, persistent=True)
         self._spatial_parallel_decode_enabled = False
-        if self._use_spatial_parallel_decode():
+        if can_install_spatial_shard_parallel_decode(self.config):
             _enable_ltx_decoder_spatial_parallel(self.decoder)
             self._spatial_parallel_decode_enabled = True
 
@@ -1755,20 +1755,11 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         self.tile_sample_stride_width = 448
         self.tile_sample_stride_num_frames = 8
 
-    def _use_spatial_parallel_decode(self) -> bool:
-        return (
-            should_use_spatial_shard_parallel_decode(self.config)
-            and dist.is_initialized()
-            and get_decode_parallel_world_size() > 1
-        )
-
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
-        if not self._spatial_parallel_decode_enabled or not dist.is_initialized():
-            return False
-        world_size = get_decode_parallel_world_size()
-        if world_size <= 1:
-            return False
-        return should_use_spatial_shard_parallel_decode(self.config, z, world_size)
+        return (
+            self._spatial_parallel_decode_enabled
+            and should_run_spatial_shard_parallel_decode(self.config, z)
+        )
 
     def enable_tiling(
         self,

@@ -2,7 +2,6 @@ import math
 from typing import Dict, Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from diffusers.models.attention_processor import (
     ADDED_KV_ATTENTION_PROCESSORS,
@@ -19,14 +18,11 @@ from diffusers.models.autoencoders.vae import (
 )
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
-from sglang.multimodal_gen.configs.models.vaes.base import (
-    should_use_spatial_shard_parallel_decode,
-)
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_decode_parallel_world_size,
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
 )
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import (
     enable_diffusers_decoder_spatial_parallel,
     spatial_parallel_diffusers_decode,
@@ -123,7 +119,7 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
         self.use_tiling = False
         self._spatial_parallel_decode_enabled = False
         self._spatial_parallel_upsample_count = 0
-        if self._use_spatial_parallel_decode():
+        if can_install_spatial_shard_parallel_decode(self.config):
             self._spatial_parallel_upsample_count = (
                 enable_diffusers_decoder_spatial_parallel(self.decoder)
             )
@@ -295,13 +291,6 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
             return (dec,)
 
         return DecoderOutput(sample=dec)
-
-    def _use_spatial_parallel_decode(self) -> bool:
-        return (
-            should_use_spatial_shard_parallel_decode(self.config)
-            and dist.is_initialized()
-            and get_decode_parallel_world_size() > 1
-        )
 
     def decode(
         self, z: torch.FloatTensor, return_dict: bool = True, generator=None

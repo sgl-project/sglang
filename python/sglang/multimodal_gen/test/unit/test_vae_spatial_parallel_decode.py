@@ -187,8 +187,16 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
 
         with (
             patch(
+                "sglang.multimodal_gen.runtime.models.vaes.common.dist.is_initialized",
+                return_value=True,
+            ),
+            patch(
                 "sglang.multimodal_gen.runtime.models.vaes.common.model_parallel_is_initialized",
                 return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.vaes.common.get_decode_parallel_group_coordinator",
+                return_value=SimpleNamespace(),
             ),
             patch(
                 "sglang.multimodal_gen.runtime.models.vaes.common.get_decode_parallel_world_size",
@@ -286,6 +294,10 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         with (
             patch(
                 "sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage.dist.is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage.model_parallel_is_initialized",
                 return_value=True,
             ),
             patch(
@@ -387,11 +399,19 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
 
         with (
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.autoencoder.dist.is_initialized",
+                "sglang.multimodal_gen.runtime.models.vaes.common.dist.is_initialized",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.models.vaes.autoencoder.get_decode_parallel_world_size",
+                "sglang.multimodal_gen.runtime.models.vaes.common.model_parallel_is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.vaes.common.get_decode_parallel_group_coordinator",
+                return_value=SimpleNamespace(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.vaes.common.get_decode_parallel_world_size",
                 return_value=2,
             ),
             patch(
