@@ -1451,10 +1451,17 @@ class Indexer(MultiPlatformOp):
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return self._capture_and_return(layer_id, topk_result, raw_result)
 
+        # When weights_proj is LoRA-wrapped, use an eager module call so the
+        # wrapper owns base+delta and no LoRA kernel runs under torch.compile
+        weights_proj_lora = getattr(self.weights_proj, "set_lora", False)
+
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            weights = self._project_and_scale_head_gates(x)
+            if weights_proj_lora:
+                weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
+            else:
+                weights = self._project_and_scale_head_gates(x)
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
@@ -1541,6 +1548,11 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = x
 
             if is_in_piecewise_cuda_graph():
+                if weights_proj_lora:
+                    raise RuntimeError(
+                        "DSA indexer weights_proj LoRA is incompatible with piecewise CUDA graph; remove the explicit"
+                        " prefill cuda-graph backend override or drop indexer.weights_proj from the LoRA target modules."
+                    )
                 weights = logits_head_gate_pcg(
                     x_for_gate,
                     self.weights_proj.weight,
@@ -1548,6 +1560,9 @@ class Indexer(MultiPlatformOp):
                     self.softmax_scale,
                     q_scale,
                 )
+            elif weights_proj_lora:
+                weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
+                weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
