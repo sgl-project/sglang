@@ -97,6 +97,7 @@ class OpenAIServingBase(ABC):
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
+                adapted_request.prompt_render_finish_time = monotonic_time()
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:

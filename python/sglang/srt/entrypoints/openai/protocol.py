@@ -1685,6 +1685,8 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    chat_template_render_duration: Optional[float] = None
+    chat_template_encode_duration: Optional[float] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
