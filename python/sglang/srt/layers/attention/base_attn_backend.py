@@ -82,6 +82,43 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    # --- Unified metadata contract (reserve / load) -----------------------
+    # The create-once / fill-per-iter split the unified Runner drives. It
+    # mirrors the runner's reserve_batch / load_batch and is the seam that
+    # lets eager and cuda-graph share one metadata lifecycle (and that
+    # ultimately replaces the `use_bound` / `in_capture` branch). Defaults
+    # delegate to the 3-method init contract above so backends migrate one
+    # at a time; a migrated backend overrides reserve_metadata / load_metadata
+    # directly and drops its `init_forward_metadata` + use_bound seam.
+
+    def reserve_metadata(self, forward_batch: ForwardBatch):
+        """Reserve (allocate + bind) metadata buffers for a static batch.
+
+        The create-once half of the metadata lifecycle — called once per
+        static batch shape (per captured cuda-graph bucket, or once at
+        max_bs for eager). Mirrors the runner's ``reserve_batch``.
+
+        Default delegates to the capture pre-roll of
+        ``init_forward_metadata_out_graph(in_capture=True)``.
+        """
+        self.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+
+    def load_metadata(self, forward_batch: ForwardBatch):
+        """Refill the per-iteration dynamic parts of reserved metadata.
+
+        The fill-per-iter half — mirrors the runner's ``load_batch``.
+        Default delegates to ``init_forward_metadata_out_graph(in_capture=False)``.
+        """
+        self.init_forward_metadata_out_graph(forward_batch, in_capture=False)
+
+    def load_metadata_in_graph(self, forward_batch: ForwardBatch):
+        """Graph-recordable metadata op: recorded into the cuda graph during
+        ``prepare()``, run live each iteration for eager.
+
+        Default delegates to ``init_forward_metadata_in_graph``.
+        """
+        self.init_forward_metadata_in_graph(forward_batch)
+
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 

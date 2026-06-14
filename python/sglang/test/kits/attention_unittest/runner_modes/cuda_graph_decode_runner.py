@@ -291,8 +291,8 @@ def _init_cuda_graph_capture_metadata(backend, capture_batch_size: int, batch):
         max_bs=capture_batch_size,
         max_num_tokens=batch.input_ids.numel(),
     )
-    backend.init_forward_metadata_out_graph(batch, in_capture=True)
-    backend.init_forward_metadata_in_graph(batch)
+    backend.reserve_metadata(batch)
+    backend.load_metadata_in_graph(batch)
 
 
 def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
@@ -312,10 +312,10 @@ def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
         out_cache_loc=getattr(batch, "out_cache_loc", None),
         spec_info=batch.spec_info,
     )
-    backend.init_forward_metadata_out_graph(fb_view)
+    backend.load_metadata(fb_view)
     # No real cuda graph here, so run the in-graph step explicitly to produce
     # the Full metadata the forward path expects (no-op for non-DSV4).
-    backend.init_forward_metadata_in_graph(fb_view)
+    backend.load_metadata_in_graph(fb_view)
     # Best-effort metadata-shape sanity check — catches negative kv_lens and
     # non-monotonic indptr that would otherwise leave real-row output correct
     # but corrupt padded-row scratch state. See `metadata_invariants.py`.

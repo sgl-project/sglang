@@ -884,7 +884,7 @@ class DecodeRunner(BaseRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            attn_backend.reserve_metadata(forward_batch)
 
             def run_once():
                 # Must run inside the capture block: warmup mutations here are
@@ -941,7 +941,7 @@ class DecodeRunner(BaseRunner):
         runs here so it is recorded at capture time and executed live for eager
         — same code, no branch on execution strategy.
         """
-        attn_backend.init_forward_metadata_in_graph(forward_batch)
+        attn_backend.load_metadata_in_graph(forward_batch)
 
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(
@@ -1093,7 +1093,7 @@ class DecodeRunner(BaseRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_out_graph(fb_view)
+        attn_backend.load_metadata(fb_view)
 
         # Store fields
         self.raw_bs = raw_bs
