@@ -634,31 +634,31 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                 model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
             ), f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
 
-    def init_forward_metadata_out_graph(
+    def _compute_forward_metadata(
         self,
         forward_batch: ForwardBatch,
-        in_capture: bool = False,
-    ):
-        metadata = self._replay_metadata(
-            forward_batch.batch_size,
-            forward_batch.req_pool_indices,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-            forward_batch.seq_lens_cpu if not in_capture else None,
+        *,
+        use_bound: bool,
+        seq_lens_cpu: Optional[torch.Tensor],
+    ) -> Mamba2Metadata:
+        # Wrap the base raw ForwardMetadata in the Mamba2Metadata the kernels
+        # expect: prepare_decode for the bound decode/verify path (capture /
+        # replay / eager-at-captured-bs), prepare_mixed for the fresh eager path
+        # (handles prefill/extend). Eager + the deferred COW are driven by the
+        # inherited base out_graph / base init_forward_metadata wrapper.
+        metadata = super()._compute_forward_metadata(
+            forward_batch, use_bound=use_bound, seq_lens_cpu=seq_lens_cpu
         )
-        spec_info = forward_batch.spec_info
-        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
-        self.forward_metadata = Mamba2Metadata.prepare_decode(
-            metadata,
-            forward_batch.seq_lens,
-            is_target_verify=forward_batch.forward_mode.is_target_verify(),
-            draft_token_num=draft_token_num,
-        )
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self._execute_deferred_mamba_cow_and_clear(forward_batch)
-        metadata = self._forward_metadata(forward_batch)
-        self.forward_metadata = Mamba2Metadata.prepare_mixed(
+        if use_bound:
+            spec_info = forward_batch.spec_info
+            draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
+            return Mamba2Metadata.prepare_decode(
+                metadata,
+                forward_batch.seq_lens,
+                is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                draft_token_num=draft_token_num,
+            )
+        return Mamba2Metadata.prepare_mixed(
             metadata,
             self.mamba_chunk_size,
             forward_batch,
