@@ -86,6 +86,7 @@ class VideoResponse(BaseModel):
     num_outputs: Optional[int] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    action: Optional[Dict[str, Any]] = None
 
 
 class VideoGenerationsRequest(BaseModel):
