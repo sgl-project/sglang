@@ -112,8 +112,6 @@ class Backend(str, Enum):
         return [backend.value for backend in cls]
 
 
-#: Canonical warmup modes for `--warmup-mode`. The legacy `--warmup` /
-#: `--server-warmup` boolean flags map onto these (see ServerArgs._adjust_warmup).
 WARMUP_MODES = ("off", "request", "server")
 
 
@@ -231,19 +229,17 @@ class ServerArgs(DisaggServerArgsMixin):
     # `warmup_mode` is the canonical knob: one of WARMUP_MODES
     #   - "off":     no warmup.
     #   - "server":  server-based warmup — a synthetic request right after the
-    #                server is ready, before real traffic. This is the
-    #                production mode: it eagerly warms every cold path so the
-    #                first real request is already fast. Default for serving.
+    #                server is ready, before real traffic
     #   - "request": request-based warmup — warm on the first real request(s).
-    #                This is a BENCHMARK aid (it lets us exclude warmup from the
-    #                reported latency) and is NOT meant for production, where you
-    #                want cold paths warmed before traffic arrives.
-    # `warmup` / `server_warmup` are kept as DERIVED internal booleans (so all
+    #                This is a BENCHMARK aid
     # existing consumers keep working) and as deprecated CLI aliases. None means
     # "derive the mode from the legacy booleans"; _adjust_warmup resolves it.
     warmup_mode: str | None = None
+
+    # deprecated: warmup and server_warmup
     warmup: bool = False
     server_warmup: bool = False
+
     warmup_resolutions: list[str] = None
     warmup_steps: int = 1
 
@@ -708,13 +704,6 @@ class ServerArgs(DisaggServerArgsMixin):
         return None, None
 
     def _adjust_warmup(self):
-        # Resolve the canonical warmup mode, then derive the legacy booleans
-        # (`warmup` / `server_warmup`) that the rest of the codebase reads.
-        #
-        # Precedence: an explicit `--warmup-mode` wins; otherwise the mode is
-        # derived from the legacy `--warmup` / `--server-warmup` booleans (which
-        # may come from a CLI flag or an entrypoint default such as
-        # `sglang serve`'s server-warmup default), preserving prior behavior.
         if self.warmup_mode is not None:
             if self.warmup_mode not in WARMUP_MODES:
                 raise ValueError(
@@ -734,14 +723,12 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.warmup_resolutions is not None:
             self.warmup = True
 
-        # Server-based (synthetic) warmup only applies to a monolithic server.
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
 
         if not self.warmup:
             self.server_warmup = False
 
-        # Store the resolved canonical mode for reporting / downstream use.
         self.warmup_mode = (
             "off" if not self.warmup else "server" if self.server_warmup else "request"
         )

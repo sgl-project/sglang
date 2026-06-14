@@ -21,12 +21,8 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
 
 logger = init_logger(__name__)
 
-# Synthetic reference image for server (production) warmup of image-conditioned
-# (TI2I/TI2V) pipelines. Server warmup must exercise every cold path without
-# crashing, so this must satisfy each pipeline's input constraints. It is a
-# 64x64 image because some pipelines reject smaller inputs (e.g. FLUX.2's
-# diffusers image processor requires both dimensions >= 64px); the previous
-# 32x32 image aborted FLUX.2 server warmup. Keep it >= 64px on both sides.
+# a 64x64 image because some pipelines reject smaller inputs (e.g. FLUX.2's
+# diffusers image processor requires both dimensions >= 64px)
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PMQ0AAAwDoEqv9ErYvQQckD4XAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAYHLAB8+AWnmfUycAAAAAElFTkSuQmCC"
 
 
