@@ -163,19 +163,67 @@ class MambaAttnBackendBase(AttentionBackend):
             has_mamba_track_mask=has_mamba_track_mask,
         )
 
+    def _use_cuda_graph_buffers(self, bs: int, forward_mode: ForwardMode) -> bool:
+        """Eager/replay seam, resolved by backend STATE (no argument).
+
+        True when this ``(bs, forward_mode)`` has pre-bound per-bs static
+        buffers (``state_indices_list``/``query_start_loc_list``), i.e. at
+        cuda/cpu-graph replay (the runner always pads to a captured bucket) and
+        harmlessly at an eager forward landing on a captured bs+mode. Only
+        decode/idle and target_verify are ever captured; plain EXTEND and
+        draft_extend_v2 always build fresh. False for pure-eager runs (the lists
+        were never populated by init_{cuda,cpu}_graph_state).
+        """
+        if not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()):
+            return False
+        return len(self.state_indices_list) >= bs
+
+    def _compute_forward_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        use_bound: bool,
+        seq_lens_cpu: Optional[torch.Tensor],
+    ) -> ForwardMetadata:
+        """Single source of truth for mamba forward metadata, shared by eager,
+        capture, and replay.
+
+        ``use_bound`` selects the per-bs pre-bound static buffers (capture /
+        replay / eager-at-captured-bs) via ``_replay_metadata`` vs a freshly
+        built per-iter metadata via ``_forward_metadata``. The two builders are
+        genuinely different algorithms (static-buffer copy vs fresh tensors,
+        decode/verify-only vs all-modes), so the seam dispatches rather than
+        sharing a body. Plain EXTEND / draft_extend_v2 only ever run with
+        use_bound=False.
+        """
+        if use_bound:
+            return self._replay_metadata(
+                forward_batch.batch_size,
+                forward_batch.req_pool_indices,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu,
+            )
+        return self._forward_metadata(forward_batch)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # seq_lens_cpu is unused by _replay_metadata for the non-target-verify
-        # case but kept in the contract for compatibility.
-        self.forward_metadata = self._replay_metadata(
-            forward_batch.batch_size,
-            forward_batch.req_pool_indices,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-            forward_batch.seq_lens_cpu if not in_capture else None,
+        bs = forward_batch.batch_size
+        forward_mode = forward_batch.forward_mode
+        use_bound = in_capture or self._use_cuda_graph_buffers(bs, forward_mode)
+        if not use_bound:
+            # Genuine-eager path (incl. plain EXTEND, which is never captured):
+            # run the deferred mamba COW/clear on the forward stream before
+            # building fresh. No-op for decode/verify, so it never fires at
+            # capture/replay (use_bound=True there).
+            self._execute_deferred_mamba_cow_and_clear(forward_batch)
+        # Capture must not derive padding from the (all-fill) seq_lens.
+        seq_lens_cpu = forward_batch.seq_lens_cpu if not in_capture else None
+        self.forward_metadata = self._compute_forward_metadata(
+            forward_batch, use_bound=use_bound, seq_lens_cpu=seq_lens_cpu
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
