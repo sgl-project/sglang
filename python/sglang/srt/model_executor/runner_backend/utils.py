@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""runner_backend utilities — phase → BaseCudaGraphBackend resolution.
+"""runner_backend utilities — phase → ExecutionBackend resolution.
 
 Centralizes per-phase backend resolution so platform overrides (NPU,
 out-of-tree) and future backend additions can plug in without
@@ -25,8 +25,8 @@ import logging
 from typing import TYPE_CHECKING
 
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_execution_backend import (
+    ExecutionBackend,
 )
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -39,8 +39,8 @@ from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend im
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-        BaseCudaGraphRunner,
+    from sglang.srt.model_executor.runner.base_runner import (
+        BaseRunner,
     )
 
 logger = logging.getLogger(__name__)
@@ -50,8 +50,8 @@ _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = False
 
 
 def resolve_decode_backend(
-    cuda_graph_runner: BaseCudaGraphRunner,
-) -> BaseCudaGraphBackend:
+    cuda_graph_runner: BaseRunner,
+) -> ExecutionBackend:
     """Pick a backend instance from cuda_graph_config['decode']['backend'].
 
     NPU device returns NPUCudaGraphBackend regardless of mode (only
@@ -92,8 +92,8 @@ def resolve_decode_backend(
 
 
 def resolve_prefill_backend(
-    cuda_graph_runner: BaseCudaGraphRunner,
-) -> BaseCudaGraphBackend:
+    cuda_graph_runner: BaseRunner,
+) -> ExecutionBackend:
     """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
     model_runner = cuda_graph_runner.model_runner
     cfg = model_runner.server_args.cuda_graph_config

@@ -541,7 +541,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+            and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
         ret_topk_p_list = []
         ret_topk_index_list = []
@@ -812,7 +812,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+            verify_forward_batch, can_run_graph = eagle_prepare_for_verify(
                 verify_input,
                 self.req_to_token_pool,
                 batch,
@@ -834,8 +834,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 verify_input,
                 (
-                    self.target_worker.model_runner.decode_cuda_graph_runner.bs
-                    if can_run_cuda_graph
+                    self.target_worker.model_runner.decode_runner.bs
+                    if can_run_graph
                     else None
                 ),
             )
@@ -845,7 +845,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # worker has not adopted that fix, so preserve its behavior verbatim.
         # On NPU with --disable-cuda-graph, non-graph verify needs metadata init
         # in forward_extend (post-pad); only mark ready for the cuda-graph path.
-        if not _is_npu or can_run_cuda_graph:
+        if not _is_npu or can_run_graph:
             verify_forward_batch.mark_forward_metadata_ready()
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
@@ -890,7 +890,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_graph=can_run_graph,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,

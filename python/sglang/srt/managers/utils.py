@@ -29,7 +29,7 @@ class GenerationBatchResult:
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
-    can_run_cuda_graph: bool = False
+    can_run_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
@@ -123,7 +123,7 @@ class GenerationBatchResult:
 
     @classmethod
     def from_pp_proxy(
-        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
+        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_graph
     ):
         # TODO(lsyin): refactor PP and avoid using dict
         proxy_dict = next_pp_outputs.tensors
@@ -135,7 +135,7 @@ class GenerationBatchResult:
             extend_logprob_start_len_per_req=proxy_dict.get(
                 "extend_logprob_start_len_per_req", None
             ),
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_graph=can_run_graph,
         )
 
 
@@ -240,7 +240,7 @@ class EmbeddingBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
 
     @property
-    def can_run_cuda_graph(self) -> bool:
+    def can_run_graph(self) -> bool:
         return False
 
     def copy_to_cpu(self):

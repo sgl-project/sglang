@@ -430,19 +430,19 @@ def _capture_eagle_draft_graph_runner(
 ) -> EAGLEDraftCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.graph_capture",
+            "sglang.srt.model_executor.runner.decode_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.runner.decode_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
+            "sglang.srt.model_executor.runner.decode_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
         patch(
-            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
+            "sglang.srt.model_executor.runner.base_runner.get_attention_cp_size",
             lambda: 1,
         ),
     ):
@@ -459,19 +459,19 @@ def _capture_frozen_kv_mtp_graph_runner(
 ) -> FrozenKVMTPCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.graph_capture",
+            "sglang.srt.model_executor.runner.decode_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.runner.decode_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
+            "sglang.srt.model_executor.runner.decode_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
         patch(
-            "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
+            "sglang.srt.model_executor.runner.base_runner.get_attention_cp_size",
             lambda: 1,
         ),
     ):
@@ -540,7 +540,7 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
         actual = graph_runner.replay(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
@@ -586,7 +586,7 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         graph_runner = _capture_frozen_kv_mtp_graph_runner(graph_worker)
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
         actual = graph_runner.replay(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:

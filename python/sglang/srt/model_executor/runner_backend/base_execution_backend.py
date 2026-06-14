@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class BaseCudaGraphBackend(ABC):
+class ExecutionBackend(ABC):
     """Pure ABC: no state, no defaults. Each implementation owns its
     per-backend state and binds the handles it needs from the
     cuda_graph_runner passed to its __init__.
@@ -65,7 +65,9 @@ class BaseCudaGraphBackend(ABC):
     ) -> None: ...
 
     @abstractmethod
-    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool: ...
+    def can_run_graph(
+        self, forward_batch: ForwardBatch, shape_key: ShapeKey
+    ) -> bool: ...
 
     @abstractmethod
     def replay_session(self) -> Iterator[None]: ...

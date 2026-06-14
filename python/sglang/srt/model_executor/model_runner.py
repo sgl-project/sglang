@@ -167,9 +167,9 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
-    PrefillCudaGraphRunner,
+    PrefillRunner,
 )
-from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+from sglang.srt.model_executor.runner.decode_runner import (
     _allocate_decode_buffers,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -870,9 +870,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attn_backend = None
         self.decode_attn_backend = None
         self.decode_attn_backend_group = []
-        self.decode_cuda_graph_runner = None
+        self.decode_runner = None
         self.graph_mem_usage = 0
-        self.prefill_cuda_graph_runner = None
+        self.prefill_runner = None
 
     def init_backends(self, disable_cuda_graph: bool = False):
         """Initialize attention backends and capture cuda graphs."""
@@ -914,15 +914,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if current_platform.support_cuda_graph() and not disable_cuda_graph:
                 self.init_decode_cuda_graph()
             else:
-                self.decode_cuda_graph_runner = None
+                self.decode_runner = None
                 self.graph_mem_usage = 0
         else:
-            self.decode_cuda_graph_runner = None
+            self.decode_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
         if disable_cuda_graph:
-            self.decode_cuda_graph_runner = None
+            self.decode_runner = None
             self.graph_mem_usage = 0
 
         if server_args.forward_hooks:
@@ -2890,7 +2890,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_decode_cuda_graph(self):
         """Capture device graphs."""
-        self.decode_cuda_graph_runner = None
+        self.decode_runner = None
         self.graph_mem_usage = 0
 
         if not self.is_generation:
@@ -2924,20 +2924,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         if current_platform.is_out_of_tree():
             GraphRunnerCls = current_platform.get_graph_runner_cls()
-            self.decode_cuda_graph_runner = GraphRunnerCls(self)
+            self.decode_runner = GraphRunnerCls(self)
         else:
-            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-                DecodeCudaGraphRunner,
+            from sglang.srt.model_executor.runner.decode_runner import (
+                DecodeRunner,
             )
 
             graph_runners = defaultdict(
-                lambda: DecodeCudaGraphRunner,
+                lambda: DecodeRunner,
                 {
                     "cpu": CPUGraphRunner,
                     "npu": NPUGraphRunner,
                 },
             )
-            self.decode_cuda_graph_runner = graph_runners[self.device](self)
+            self.decode_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
@@ -2948,7 +2948,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         """Initialize piecewise CUDA graph runner."""
-        self.prefill_cuda_graph_runner = None
+        self.prefill_runner = None
 
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
             logger.info(
@@ -3071,7 +3071,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        self.prefill_cuda_graph_runner = PrefillCudaGraphRunner(self)
+        self.prefill_runner = PrefillRunner(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
@@ -3308,8 +3308,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Check piecewies cuda graph
         can_run_graph = (
-            self.prefill_cuda_graph_runner is not None
-            and self.prefill_cuda_graph_runner.can_run(forward_batch)
+            self.prefill_runner is not None
+            and self.prefill_runner.can_run_graph(forward_batch)
         )
         if can_run_graph:
             # TODO: device_timer.wrap is too broad here — it also includes
@@ -3321,7 +3321,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else contextlib.nullcontext()
             )
             with ctx:
-                ret = self.prefill_cuda_graph_runner.replay(forward_batch, **kwargs)
+                ret = self.prefill_runner.replay(forward_batch, **kwargs)
             return (ret, can_run_graph)
 
         if not self.server_args.enable_pdmux:
@@ -3341,7 +3341,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         with ctx:
-            if _is_hip and self.prefill_cuda_graph_runner is not None:
+            if _is_hip and self.prefill_runner is not None:
                 # AMD/HIP: when PCG is enabled but the batch exceeds max captured
                 # size, run eagerly under enable_tc_piecewise_cuda_graph() and
                 # set_tc_piecewise_forward_context() so that (a) Dynamo guards on
@@ -3498,7 +3498,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=getattr(self.decode_runner, "bs", None),
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -3506,7 +3506,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             output.indexer_topk_output = indexer_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=getattr(self.decode_runner, "bs", None),
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -3544,8 +3544,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             can_run_graph = bool(
                 mode_check()
-                and self.decode_cuda_graph_runner
-                and self.decode_cuda_graph_runner.can_run(forward_batch)
+                and self.decode_runner
+                and self.decode_runner.can_run_graph(forward_batch)
             )
 
             if (
@@ -3558,7 +3558,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Replay cuda graph if applicable
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.replay(
+                ret = self.decode_runner.replay(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )

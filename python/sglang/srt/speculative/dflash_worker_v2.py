@@ -1302,7 +1302,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 next_token_ids=empty_ids,
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
+                can_run_graph=False,
                 speculative_num_draft_tokens=int(self.block_size),
                 new_seq_lens=next_draft_input.new_seq_lens,
             )
@@ -1537,7 +1537,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             skip_attn_backend_init=True,
         )
         logits_output = target_out.logits_output
-        can_run_cuda_graph = target_out.can_run_cuda_graph
+        can_run_graph = target_out.can_run_graph
 
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
@@ -1676,7 +1676,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_graph=can_run_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.block_size),
             # The non-overlap (sync) scheduler path advances batch.seq_lens

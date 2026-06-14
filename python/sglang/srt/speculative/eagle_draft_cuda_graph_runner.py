@@ -21,7 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
-    DecodeCudaGraphRunner,
+    DecodeRunner,
     DeepEPCudaGraphRunnerAdapter,
     ShapeKey,
     get_batch_sizes_to_capture,
@@ -63,17 +63,17 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
-class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
+class EAGLEDraftCudaGraphRunner(DecodeRunner):
     """EAGLE draft cuda-graph runner.
 
-    Subclasses DecodeCudaGraphRunner to inherit the outer capture
+    Subclasses DecodeRunner to inherit the outer capture
     loop (capture()), bucket-padding helper (_pad_to_bucket),
     and the backend-driven capture/replay scaffolding. EAGLE-specific
     bits — buffer dataclass, dummy ForwardBatch construction in
     capture_one_shape, replay output unwrap, and can_run — are
     overridden.
 
-    EAGLE does not call DecodeCudaGraphRunner.__init__ (that init
+    EAGLE does not call DecodeRunner.__init__ (that init
     sets up many decode-only fields like SWA/encoder-decoder/MLA-aware
     state). Instead it sets up its own state directly while making sure
     the parent's capture() / backend contract is satisfied.
@@ -254,7 +254,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # can_run
     # -----------------------------------------------------------------
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -266,7 +266,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.batch_size
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, cuda_graph_bs)
+            self.backend.can_run_graph(forward_batch, cuda_graph_bs)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )

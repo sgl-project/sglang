@@ -396,9 +396,9 @@ class NGRAMWorker(BaseSpecWorker):
                 batch, is_verify=True
             )
 
-            logits_output, can_run_cuda_graph = (
+            logits_output, can_run_graph = (
                 batch_result.logits_output,
-                batch_result.can_run_cuda_graph,
+                batch_result.can_run_graph,
             )
 
             verify_input: NgramVerifyInput = batch.spec_info
@@ -483,10 +483,10 @@ class NGRAMWorker(BaseSpecWorker):
 
         else:
             batch_result = self.target_worker.forward_batch_generation(batch)
-            logits_output, predict, can_run_cuda_graph = (
+            logits_output, predict, can_run_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
-                batch_result.can_run_cuda_graph,
+                batch_result.can_run_graph,
             )
             new_seq_lens = batch.seq_lens.clone()
 
@@ -510,7 +510,7 @@ class NGRAMWorker(BaseSpecWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_graph=can_run_graph,
             accept_lens=accept_lens,
             # Consumed by the non-overlap V2 scheduler branch to advance
             # batch.seq_lens after the isolation restore; overlap mode relays

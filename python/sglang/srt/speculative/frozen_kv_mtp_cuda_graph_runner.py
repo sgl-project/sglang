@@ -19,7 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
-    DecodeCudaGraphRunner,
+    DecodeRunner,
     DeepEPCudaGraphRunnerAdapter,
     ShapeKey,
     get_batch_sizes_to_capture,
@@ -57,10 +57,10 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
-class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
+class FrozenKVMTPCudaGraphRunner(DecodeRunner):
     """CUDA graph runner for the Frozen-KV MTP recurrent draft-loop step.
 
-    Subclasses DecodeCudaGraphRunner to inherit the outer capture loop
+    Subclasses DecodeRunner to inherit the outer capture loop
     (capture() / _capture_one_stream()), the bucket-padding helper
     (_pad_to_bucket), and the backend-driven capture/replay scaffolding.
     Frozen-KV-MTP-specific bits — the buffer dataclass, the dummy
@@ -70,7 +70,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
     the 3-tuple replay output — are overridden.
 
     Like the EAGLE draft runner, it does NOT call
-    DecodeCudaGraphRunner.__init__ (that init sets up decode-only state);
+    DecodeRunner.__init__ (that init sets up decode-only state);
     it sets up its own fields directly while satisfying the parent's
     capture() / backend contract.
     """
@@ -192,7 +192,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = max(forward_batch.global_num_tokens_cpu) // (
                 self.topk * self.topk
@@ -205,7 +205,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
+            self.backend.can_run_graph(
+                forward_batch, self._make_graph_key(cuda_graph_bs)
+            )
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )

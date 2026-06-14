@@ -329,11 +329,11 @@ class SchedulerBatchResultProcessor:
             batch.reqs, batch.return_logprob, skip_stream_req
         )
 
-        can_run_cuda_graph = result.can_run_cuda_graph
+        can_run_graph = result.can_run_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_graph=can_run_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
@@ -606,10 +606,10 @@ class SchedulerBatchResultProcessor:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
 
-        logits_output, next_token_ids, can_run_cuda_graph = (
+        logits_output, next_token_ids, can_run_graph = (
             result.logits_output,
             result.next_token_ids,
-            result.can_run_cuda_graph,
+            result.can_run_graph,
         )
 
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
@@ -625,9 +625,7 @@ class SchedulerBatchResultProcessor:
                 batch.batch_size(), result.num_correct_drafts
             )
         if self.server_args.enable_metrics:
-            self.metrics_collector.increment_decode_cuda_graph_pass(
-                value=can_run_cuda_graph
-            )
+            self.metrics_collector.increment_decode_cuda_graph_pass(value=can_run_graph)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -684,7 +682,7 @@ class SchedulerBatchResultProcessor:
             self.metrics_reporter.forward_ct_decode + 1
         ) % (1 << 30)
         self.metrics_reporter.report_decode_stats(
-            can_run_cuda_graph,
+            can_run_graph,
             running_batch=batch,
             num_correct_drafts=result.num_correct_drafts,
         )

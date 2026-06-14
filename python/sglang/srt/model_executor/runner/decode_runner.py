@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""DecodeCudaGraphRunner — runs DECODE / TARGET_VERIFY / DLLM_EXTEND under
+"""DecodeRunner — runs DECODE / TARGET_VERIFY / DLLM_EXTEND under
 a pluggable backend.
 
 Backend selection comes from cuda_graph_config.decode:
@@ -68,8 +68,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-    BaseCudaGraphRunner,
+from sglang.srt.model_executor.runner.base_runner import (
+    BaseRunner,
     freeze_gc,
     get_batch_sizes_to_capture,
 )
@@ -286,7 +286,7 @@ def _allocate_decode_buffers(
     )
 
 
-class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+class DecodeRunner(BaseRunner):
     """Decode-phase CUDA graph runner.
 
     Owns: static input buffers (DecodeInputBuffers), capture-bs list,
@@ -507,7 +507,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return "lora"
         return "nolora"
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -527,7 +527,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, graph_key)
+            self.backend.can_run_graph(forward_batch, graph_key)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )

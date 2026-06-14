@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""PrefillCudaGraphRunner — runs the EXTEND phase under a pluggable backend.
+"""PrefillRunner — runs the EXTEND phase under a pluggable backend.
 
 Backend selection comes from cuda_graph_config.prefill:
   - "tc_piecewise"     — default, TcPiecewiseCudaGraphBackend: torch.compile
@@ -54,8 +54,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-    BaseCudaGraphRunner,
+from sglang.srt.model_executor.runner.base_runner import (
+    BaseRunner,
     freeze_gc,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
@@ -105,7 +105,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-class PrefillCudaGraphRunner(BaseCudaGraphRunner):
+class PrefillRunner(BaseRunner):
     """Prefill-phase CUDA graph runner.
 
     Owns: PrefillInputBuffers, capture-num-tokens list, attention layers
@@ -420,7 +420,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if forward_batch.input_embeds is not None:
             return False
         if forward_batch.replace_embeds is not None:
@@ -870,5 +870,5 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else:
                 assert isinstance(output, PPProxyTensors)
                 raise NotImplementedError(
-                    "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
+                    "PPProxyTensors is not supported in PrefillRunner yet."
                 )

@@ -41,7 +41,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.model_executor.runner import DecodeRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -750,7 +750,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+            and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
 
         canary_ctx = (
@@ -917,7 +917,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         draft_attn_backend=self._draft_worker.draft_attn_backend,
                         cuda_graph_runner=self._draft_worker.cuda_graph_runner,
                         target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
+                        target_graph_runner=self._target_worker.model_runner.decode_runner,
                         draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
@@ -1065,9 +1065,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             target_graph_runner = None
             if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
-                TargetGraphRunnerCls = (
-                    NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
-                )
+                TargetGraphRunnerCls = NPUGraphRunner if _is_npu else DecodeRunner
                 target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
@@ -1132,9 +1130,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Target side
         self._target_worker.model_runner.attn_backend = state.target_attn_backend
-        self._target_worker.model_runner.decode_cuda_graph_runner = (
-            state.target_graph_runner
-        )
+        self._target_worker.model_runner.decode_runner = state.target_graph_runner
 
         # Sync server_args
         self.server_args.speculative_num_steps = state.speculative_num_steps
@@ -1217,7 +1213,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+            verify_forward_batch, can_run_graph = eagle_prepare_for_verify(
                 verify_input,
                 self.req_to_token_pool,
                 batch,
@@ -1251,8 +1247,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 verify_input,
                 (
-                    self.target_worker.model_runner.decode_cuda_graph_runner.bs
-                    if can_run_cuda_graph
+                    self.target_worker.model_runner.decode_runner.bs
+                    if can_run_graph
                     else None
                 ),
             )
@@ -1351,7 +1347,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_graph=can_run_graph,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,

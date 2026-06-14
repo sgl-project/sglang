@@ -71,14 +71,14 @@ class DFlashVerifyInput(SpecInput):
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
-        can_run_cuda_graph = bool(
-            target_worker.model_runner.decode_cuda_graph_runner
-            and target_worker.model_runner.decode_cuda_graph_runner.can_run(
+        can_run_graph = bool(
+            target_worker.model_runner.decode_runner
+            and target_worker.model_runner.decode_runner.can_run_graph(
                 verify_forward_batch
             )
         )
-        if can_run_cuda_graph:
-            target_worker.model_runner.decode_cuda_graph_runner.replay_prepare(
+        if can_run_graph:
+            target_worker.model_runner.decode_runner.replay_prepare(
                 verify_forward_batch
             )
         elif not batch.forward_mode.is_idle():
@@ -86,7 +86,7 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
 
-        return verify_forward_batch, can_run_cuda_graph
+        return verify_forward_batch, can_run_graph
 
     def generate_attn_arg_prefill(
         self,

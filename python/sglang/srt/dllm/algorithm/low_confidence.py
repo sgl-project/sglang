@@ -34,10 +34,10 @@ class LowConfidence(DllmAlgorithm):
         # Fast path: if there is no mask token, forward and save kv cache
         if torch.sum(mask_index).item() == 0:
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            logits_output, can_run_graph = out.logits_output, out.can_run_graph
 
             next_token_ids = []
-            return logits_output, next_token_ids, can_run_cuda_graph
+            return logits_output, next_token_ids, can_run_graph
 
         # Calculate start positions for each block
         for block_id in range(batch_size):
@@ -54,7 +54,7 @@ class LowConfidence(DllmAlgorithm):
                 break
 
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            logits_output, can_run_graph = out.logits_output, out.can_run_graph
             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
             for batch_id in range(batch_size):
                 curr_block_start = batch_id * self.block_size
@@ -90,7 +90,7 @@ class LowConfidence(DllmAlgorithm):
                 block_input_ids[transfer_index] = x[transfer_index]
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+        logits_output, can_run_graph = out.logits_output, out.can_run_graph
         # Here next token ids is tricky to implement the dynamic lengths,
         # so we return a list of tensors
         next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
@@ -98,7 +98,7 @@ class LowConfidence(DllmAlgorithm):
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
 
-        return logits_output, next_token_ids_list, can_run_cuda_graph
+        return logits_output, next_token_ids_list, can_run_graph
 
 
 Algorithm = LowConfidence
