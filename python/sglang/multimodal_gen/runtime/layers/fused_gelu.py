@@ -12,6 +12,7 @@ half-precision inference.
 from typing import Any
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
@@ -38,7 +39,12 @@ def can_fuse_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
         quant_method, UnquantizedLinearMethod
     ):
         return False
-    if getattr(linear, "skip_bias_add", False) or getattr(linear, "gather_output", False):
+    if getattr(linear, "skip_bias_add", False):
+        return False
+    # A column-parallel layer that gathers its output across TP ranks would have
+    # the cross-rank gather skipped by the per-shard fused path. Allow it only
+    # when the gather is a no-op (single TP rank); otherwise fall back.
+    if getattr(linear, "gather_output", False) and getattr(linear, "tp_size", 1) > 1:
         return False
     weight = getattr(linear, "weight", None)
     bias = getattr(linear, "bias", None)
@@ -64,3 +70,18 @@ def linear_gelu_tanh(linear: Any, x: torch.Tensor) -> torch.Tensor:
     if isinstance(out, tuple):
         out = out[0]
     return F.gelu(out, approximate="tanh")
+
+
+class FusedTanhGELU(nn.Module):
+    """Drop-in replacement for the diffusers ``GELU(approximate="tanh")`` proj+act.
+
+    Holds the same ``proj`` linear (identical checkpoint keys) but fuses the
+    up-projection GEMM with the tanh-GELU via :func:`linear_gelu_tanh`.
+    """
+
+    def __init__(self, dim_in: int, dim_out: int, bias: bool = True):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out, bias=bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return linear_gelu_tanh(self.proj, hidden_states)
