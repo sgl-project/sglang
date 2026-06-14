@@ -21,7 +21,7 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 from einops import rearrange
 from torch import Tensor
 
@@ -1007,7 +1007,7 @@ class OmniDreamsDiT(BaseDiT):
         # ``[L, D]`` frequency grid, avoiding per-block cos/sin re-computation.
         rope_cos_sin: Tensor | None = None
         if rope_freqs is not None:
-            L, D_full = rope_freqs.shape[0], rope_freqs.shape[-1]
+            D_full = rope_freqs.shape[-1]
             half = D_full // 2
             f = rope_freqs[:, 0, 0, :half]  # [L, half]
             rope_cos_sin = torch.cat([f.cos(), f.sin()], dim=-1)
