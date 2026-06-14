@@ -422,6 +422,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         True,
                         shared_output,
                     )
+                elif _is_hip:
+                    from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                        sigmoid_gate_mul_broadcast,
+                    )
+
+                    gate = self.shared_expert_gate(hidden_states)
+                    shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
                 else:
                     shared_output = (
                         F.sigmoid(self.shared_expert_gate(hidden_states))
