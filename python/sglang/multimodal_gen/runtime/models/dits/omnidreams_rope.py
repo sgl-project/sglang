@@ -167,10 +167,14 @@ def apply_rope_freqs(
         half_d = D // 2
         cos = cos_sin_cache[:, :half_d].to(x.dtype)  # [S, D/2]
         sin = cos_sin_cache[:, half_d:].to(x.dtype)  # [S, D/2]
+        # Expand along batch dim: cos/sin are shared across B batches
+        # and across H heads (broadcast in _apply_rotary_emb via unsqueeze(-2)).
+        cos = cos.unsqueeze(0).expand(B, -1, -1).reshape(B * S, half_d)  # [B*S, D/2]
+        sin = sin.unsqueeze(0).expand(B, -1, -1).reshape(B * S, half_d)  # [B*S, D/2]
         return _apply_rotary_emb(
             x.reshape(B * S, H, D),
-            cos.unsqueeze(1).expand(-1, H, -1).reshape(B * S, half_d),
-            sin.unsqueeze(1).expand(-1, H, -1).reshape(B * S, half_d),
+            cos,
+            sin,
             is_neox_style=True,
             interleaved=False,
         ).reshape(B, S, H, D)
