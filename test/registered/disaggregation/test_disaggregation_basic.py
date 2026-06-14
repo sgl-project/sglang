@@ -9,6 +9,7 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
@@ -22,7 +23,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=560, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=750, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
@@ -253,6 +254,125 @@ class TestDisaggregationMooncakeSpec(JSONConstrainedMixin, PDDisaggregationServe
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.74)
+
+
+class TestDisaggregationSpecV2Grammar(PDDisaggregationServerBase):
+    """Regression for PR #24082: PD disagg + overlap + EAGLE Spec V2 (topk=1) +
+    grammar. Spec V2 (only supported with topk=1) proposes several tokens per
+    decode step; with a grammar constraint the request can complete partway
+    through that list, so:
+      * the decode result processor must accept proposed tokens one at a time
+        and stop at grammar completion (no tokens past the closing of the
+        grammar); and
+      * the disaggregated overlap decode loop must process the previous batch
+        result (advancing the grammar) before launching the next Spec V2
+        grammar decode batch.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE3
+        spec_args = [
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-draft-model-path",
+            DEFAULT_DRAFT_MODEL_EAGLE3,
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",  # Spec V2 only supports topk=1
+            "--speculative-num-draft-tokens",
+            "4",
+            "--grammar-backend",
+            "xgrammar",
+            "--cuda-graph-max-bs",
+            "8",
+            "--dtype=float16",
+            # Cap context to the EAGLE3 draft's native length so the target and
+            # draft ModelConfigs agree (the draft derives 2048 vs the Llama-3.1
+            # target's 131072, which the Spec V2 draft worker otherwise rejects).
+            # 2048 is far above this test's output length.
+            "--context-length",
+            "2048",
+        ]
+        cls.extra_prefill_args = spec_args
+        cls.extra_decode_args = spec_args
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+            cls.launch_all()
+
+    @staticmethod
+    def _json_schema() -> str:
+        return json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "pattern": "^[\\w]+$"},
+                    "population": {"type": "integer"},
+                    "country": {"type": "string", "pattern": "^[\\w ]+$"},
+                    "capital": {"type": "string", "pattern": "^[\\w ]+$"},
+                },
+                "required": ["name", "population", "country", "capital"],
+            }
+        )
+
+    def _generate(self, return_logprob: bool):
+        # max_new_tokens is generous so completion is driven by grammar
+        # termination, not the length cap, and the output spans multiple
+        # decode iterations.
+        response = requests.post(
+            f"{self.lb_url}/generate",
+            json={
+                "text": "Here is the information of the capital of France in the JSON format.\n",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 256,
+                    "json_schema": self._json_schema(),
+                },
+                "return_logprob": return_logprob,
+                "logprob_start_len": 0,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_structured_output_no_trailing_tokens(self):
+        """Output is valid JSON with nothing emitted past grammar completion."""
+        out = self._generate(return_logprob=False)
+        text = out["text"]
+        # json.loads rejects trailing non-whitespace content, so a clean parse
+        # of the raw text means no stray tokens leaked after grammar termination.
+        parsed = json.loads(text)
+        for key in ("name", "population", "country", "capital"):
+            self.assertIn(key, parsed)
+        # Belt and suspenders: text should end exactly at the JSON close.
+        self.assertTrue(
+            text.strip().endswith("}"), f"unexpected trailing tokens: {text!r}"
+        )
+
+    def test_spec_v2_actually_ran(self):
+        """The accepted-length stat confirms Spec V2 verification took place."""
+        out = self._generate(return_logprob=False)
+        spec_verify_ct = out["meta_info"]["spec_verify_ct"]
+        self.assertGreater(
+            spec_verify_ct,
+            0,
+            f"expected Spec V2 to run (spec_verify_ct > 0), got {spec_verify_ct}",
+        )
+
+    def test_logprob_count_matches_completion_tokens(self):
+        """Trimmed Spec V2 tokens keep logprob count == completion token count."""
+        out = self._generate(return_logprob=True)
+        meta = out["meta_info"]
+        completion_tokens = meta["completion_tokens"]
+        output_logprobs = meta["output_token_logprobs"]
+        self.assertEqual(
+            len(output_logprobs),
+            completion_tokens,
+            "output logprobs must align with retained (trimmed) tokens: "
+            f"got {len(output_logprobs)} logprobs vs {completion_tokens} completion tokens",
+        )
+        json.loads(out["text"])
 
 
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
