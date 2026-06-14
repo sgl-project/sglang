@@ -72,6 +72,8 @@ class TcPiecewiseForwardContext:
     moe_layers: Optional[List[Any]] = field(default=None)
     moe_fusions: Optional[List[Any]] = field(default=None)
     dsa_indexers: Optional[List[Any]] = field(default=None)
+    num_tokens: Optional[int] = None
+    raw_num_tokens: Optional[int] = None
 
 
 _tc_piecewise_forward_context: Optional[TcPiecewiseForwardContext] = None
@@ -89,6 +91,8 @@ def set_tc_piecewise_forward_context(
     moe_layers: List[Any],
     moe_fusions: List[Any],
     dsa_indexers: Optional[List[Any]] = None,
+    num_tokens: Optional[int] = None,
+    raw_num_tokens: Optional[int] = None,
 ):
     global _tc_piecewise_forward_context
     _tc_piecewise_forward_context = TcPiecewiseForwardContext(
@@ -98,6 +102,8 @@ def set_tc_piecewise_forward_context(
         moe_layers=moe_layers,
         moe_fusions=moe_fusions,
         dsa_indexers=dsa_indexers,
+        num_tokens=num_tokens,
+        raw_num_tokens=raw_num_tokens,
     )
     try:
         yield
@@ -106,7 +112,7 @@ def set_tc_piecewise_forward_context(
 
 
 TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
-    "Piecewise CUDA Graph is enabled by default as an experimental feature.\n"
-    "To work around this error, add --disable-piecewise-cuda-graph to your launch command.\n"
+    "Piecewise CUDA Graph capture failed.\n"
+    "To work around this error, add --cuda-graph-backend-prefill=disabled to your launch command.\n"
     "Please report this issue at https://github.com/sgl-project/sglang/issues/new/choose"
 )

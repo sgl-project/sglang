@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.elementwise import fused_sigmoid_mul
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -80,11 +81,18 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+from sglang.srt.models.qwen2_moe import (
+    Qwen2MoeMLP,
+    Qwen2MoeSparseMoeBlock,
+    can_fuse_shared_expert,
+)
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.models.utils import fused_qk_gemma_rmsnorm
+from sglang.srt.models.utils import (
+    fused_qk_gemma_rmsnorm,
+    fused_qk_gemma_rmsnorm_with_gate,
+)
 from sglang.srt.server_args import get_global_server_args
 
 # Utils
@@ -880,12 +888,39 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            # gate stays as 3D strided view; fused_sigmoid_mul handles it directly
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
 
         q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, gate
+
+    def forward_prepare_hip(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            seq_len = q_gate.shape[0]
+            q_flat, k_flat, gate_flat = fused_qk_gemma_rmsnorm_with_gate(
+                q_gate,
+                k,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.q_norm.variance_epsilon,
+                self.head_dim,
+                self.num_heads,
+            )
+            q = q_flat.view(seq_len, -1)
+            k = k_flat.view(seq_len, -1)
+            gate = gate_flat.view(seq_len, -1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
+            q, k = self._apply_qk_norm(q, k)
+
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
@@ -916,7 +951,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if (
+        if _is_hip and self.attn_output_gate:
+            q, k, v, gate = self.forward_prepare_hip(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        elif (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             or not self.attn_output_gate
@@ -935,8 +975,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -1075,6 +1114,21 @@ class Qwen3_5ForCausalLM(nn.Module):
                 f"get_hidden_dim not implemented for {module_name}"
             )
 
+    def _maybe_autodisable_shared_experts_fusion(self, config, quant_config):
+        # Auto-disable fusion when the checkpoint can't fuse (e.g. MXFP4 Qwen3.5)
+        # so the model still gets the #25885 multi-streaming path. ROCm-only.
+        server_args = get_global_server_args()
+        if (
+            config.model_type == "qwen3_5_moe_text"
+            and not server_args.disable_shared_experts_fusion
+            and not can_fuse_shared_expert(config, quant_config)
+        ):
+            server_args.disable_shared_experts_fusion = True
+            logger.info(
+                "Qwen3.5: shared-expert fusion not supported for this checkpoint; "
+                "auto-disabling (multi-streaming #25885 still applies)."
+            )
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1086,6 +1140,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+
+        if _is_hip:
+            self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
         alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
 
@@ -1512,7 +1569,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
-
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 

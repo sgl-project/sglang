@@ -85,6 +85,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.utils import get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.nvtx_utils import nvtx_annotated_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -146,7 +147,7 @@ class DecodeReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
+    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
@@ -170,7 +171,7 @@ class DecodeReqToTokenPool:
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
-    def free(self, req: "Req"):
+    def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
@@ -186,7 +187,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        cache_params: "Mamba2CacheParams",
+        cache_params: Mamba2CacheParams,
         mamba_layer_ids: List[int],
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
@@ -565,6 +566,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
 
+    def release_memory_occupation(self):
+        self.queue.clear()
+        self.retracted_queue.clear()
+        if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
+            self.kv_manager.deregister_buffer_to_engine()
+
+    def resume_memory_occupation(self):
+        if hasattr(self.kv_manager, "register_buffer_to_engine"):
+            self.kv_manager.register_buffer_to_engine()
+
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -805,6 +816,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -1011,6 +1024,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     kv_indices_full.cpu().numpy(), device_page_size
                 )
 
+            def _swa_ring_payload():
+                # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
+                # Same window positions and order -> positional match with prefill.
+                ring_stride = self.token_to_kv_pool.unified_swa_ring_size
+                window_size = self.token_to_kv_pool.unified_swa_window
+                window_start = max(0, seq_len - window_size)
+                positions = np.arange(window_start, seq_len, dtype=np.int64)
+                state_slot = int(decode_req.req.req_pool_idx)
+                ring_rows = state_slot * ring_stride + (positions % ring_stride)
+                return ring_rows.astype(np.int32)
+
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
             for st in state_types:
@@ -1020,6 +1044,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
+                elif st == StateType.SWA_RING:
+                    state_indices.append(_swa_ring_payload())
                 else:
                     state_indices.append(None)
 
@@ -1641,6 +1667,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -1698,6 +1726,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         return transferred_reqs
 
+    def release_memory_occupation(self):
+        """Clean up in-flight transfers before releasing GPU memory."""
+        self.queue.clear()
+
+    def resume_memory_occupation(self):
+        """Queues are already cleared on release; new transfers can be accepted."""
+        pass
+
 
 class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
@@ -1732,6 +1768,10 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
+        def pop_and_process():
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1747,6 +1787,11 @@ class SchedulerDisaggregationDecodeMixin:
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
+            # overlap + spec + grammar is unsupported (would desync DP ranks).
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            if disable_overlap_for_batch and self.last_batch:
+                pop_and_process()
 
             # Launch the current batch
             if batch:
@@ -1757,8 +1802,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not disable_overlap_for_batch:
+                    pop_and_process()
             elif batch is None:
                 self.on_idle()
 
@@ -1780,6 +1825,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
+    @nvtx_annotated_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:

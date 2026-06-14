@@ -182,6 +182,9 @@ def shard_rotary_emb_for_sp(emb):
 def maybe_unpad_latents(latents, batch):
     # If SP padding was applied, remove extra tokens before reshaping
     raw_shape = batch.raw_latent_shape
+    if len(raw_shape) == 5 and latents.dim() == 5:
+        return latents[:, :, : raw_shape[2], :, :]
+
     if len(raw_shape) == 3:
         # Sequence format [B, S, D]: use seq_len directly
         target_tokens = raw_shape[1]

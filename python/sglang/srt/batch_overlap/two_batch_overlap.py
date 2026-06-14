@@ -266,7 +266,7 @@ def split_spec_info(
 
 def compute_split_token_index(
     split_seq_index: int,
-    forward_mode: "ForwardMode",
+    forward_mode: ForwardMode,
     extend_seq_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> int:
@@ -680,6 +680,11 @@ class TboForwardBatchPreparer:
             ):
                 output_dict[key] = None
                 continue
+            elif key == "rids" and len(old_value) != num_seqs:
+                output_dict[key] = old_value[
+                    start_seq_index : min(end_seq_index, len(old_value))
+                ]
+                continue
             assert (
                 len(old_value) == num_seqs
             ), f"{key=} {old_value=} {num_seqs=} {batch=}"
@@ -757,6 +762,8 @@ class TboForwardBatchPreparer:
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
                 original_global_num_tokens_cpu=None,
+                _original_batch_size=None,
+                _original_forward_mode=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,

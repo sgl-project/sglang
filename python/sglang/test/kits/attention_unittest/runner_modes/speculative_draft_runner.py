@@ -459,12 +459,16 @@ def _capture_frozen_kv_mtp_graph_runner(
 ) -> FrozenKVMTPCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner.graph_capture",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
             lambda: 0,
+        ),
+        patch(
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
+            lambda *args, **kwargs: 0.0,
         ),
         patch(
             "sglang.srt.model_executor.runner.base_cuda_graph_runner.get_attention_cp_size",
@@ -1857,7 +1861,7 @@ def run_dsa_eagle_draft_cuda_graph_runner_case(
 #   1. Multi-query-per-request: `num_input_tokens = sum(input_lens)`.
 #   2. Routes through `forward_extend` rather than `forward_decode`.
 #      Production picks `dsa_decode_impl` (default `flashmla_kv`)
-#      because `is_draft_extend(include_v2=True)` is in the
+#      because `is_draft_extend_v2()` is in the
 #      decode-impl branch (`dsa_backend.py:1352-1358`).
 #   3. DraftBackendFactory returns a single `DeepseekSparseAttnBackend`
 #      (not a multi-step wrapper) via `_create_dsa_prefill_backend`.

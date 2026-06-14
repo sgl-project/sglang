@@ -398,7 +398,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
     def _realtime_causal_progress_bar(self, batch: Req, timesteps: torch.Tensor):
         if batch.session is not None:
             return nullcontext(None)
-        return self.progress_bar(total=len(timesteps))
+        return self.progress_bar(total=len(timesteps), batch=batch)
 
     def _denoise_realtime_causal_chunk(
         self,
@@ -1025,7 +1025,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
             return current_latents
 
         # DMD loop in causal blocks
-        with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
+        with self.progress_bar(
+            total=len(block_sizes) * len(timesteps), batch=batch
+        ) as progress_bar:
             for current_num_frames in block_sizes:
                 current_latents = latents[
                     :, :, start_index : start_index + current_num_frames, :, :

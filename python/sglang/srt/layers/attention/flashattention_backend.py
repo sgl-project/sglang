@@ -18,6 +18,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -61,6 +62,8 @@ class FlashAttentionMetadata:
     page_table: torch.Tensor = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
+    # full->SWA translated out_cache_loc (SWA KV-store write target)
+    swa_out_cache_loc: torch.Tensor = None
     # Precomputed FA3 scheduler metadata (avoids per-layer prepare_varlen_num_blocks)
     scheduler_metadata: torch.Tensor = None
 
@@ -349,7 +352,7 @@ class FlashAttentionBackend(AttentionBackend):
                         self._sched_meta_buf[n:] = 0
                         metadata.scheduler_metadata = self._sched_meta_buf[:n]
 
-            if forward_mode.is_draft_extend(include_v2=True):
+            if forward_mode.is_draft_extend_v2():
                 # CUDA graph bakes max_seq_len_q as a constant. replay() sets it to
                 # max(num_accept_tokens_cpu) which is None/empty at capture time,
                 # falling back to 1. Restore the correct upper bound so the kernel
@@ -642,9 +645,10 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if any(
-                forward_batch.extend_prefix_lens_cpu
-            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            if (
+                any(forward_batch.extend_prefix_lens_cpu)
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -698,6 +702,12 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table
                 ).to(torch.int32)
             )
+            if forward_batch.out_cache_loc is not None:
+                metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
+                )
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
@@ -798,11 +808,25 @@ class FlashAttentionBackend(AttentionBackend):
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
                     cp_allgather_and_save_kv_cache(
-                        forward_batch, layer, k, v, self.attn_cp_size
+                        forward_batch,
+                        layer,
+                        k,
+                        v,
+                        self.attn_cp_size,
+                        swa_loc=(
+                            self.forward_metadata.swa_out_cache_loc
+                            if self.use_sliding_window_kv_pool
+                            else None
+                        ),
                     )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
                     )
 
         # Use precomputed metadata across all layers
@@ -1033,7 +1057,7 @@ class FlashAttentionBackend(AttentionBackend):
             if (
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
@@ -1244,7 +1268,12 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
                     )
                 else:
                     self.token_to_kv_pool.set_mla_kv_buffer(
@@ -1588,6 +1617,13 @@ class FlashAttentionBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+            # SWA write-target buffer; metadata binds a [:num_tokens] view,
+            # refilled from the live out_cache_loc before each replay.
+            self.swa_out_cache_loc_buf = torch.zeros(
+                max_num_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
 
         # This is used by draft decode's first half of metadata when topk > 1
         if self.topk > 1:
@@ -1849,6 +1885,9 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.swa_page_table = self.decode_cuda_graph_metadata[
                             "swa_page_table"
                         ][:bs, :]
+                        metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[
+                            :num_tokens
+                        ]
                     self.decode_cuda_graph_metadata[bs] = metadata
                 else:
                     # Draft Decode topk>1: two metadata objects
@@ -1905,6 +1944,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_page_table = self.decode_cuda_graph_metadata[
                         "swa_page_table"
                     ][:bs, :]
+                    metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
                 self.decode_cuda_graph_metadata[bs] = metadata
 
         elif forward_mode.is_target_verify():
@@ -1924,6 +1964,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_page_table = self.target_verify_metadata[
                         "swa_page_table"
                     ][:bs, :]
+                    metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
                 self.target_verify_metadata[bs] = metadata
             else:
                 # Target Verify topk>1: two (or three with SWA) metadata objects
@@ -1959,6 +2000,10 @@ class FlashAttentionBackend(AttentionBackend):
 
                 self.target_verify_metadata_topk_normal[bs] = metadata
                 self.target_verify_metadata_topk_expand[bs] = metadata_expand
+                # topk>1 target-verify early-returns before _apply; bind the
+                # view here (buffer refilled at replay).
+                if self.use_sliding_window_kv_pool:
+                    metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
 
                 if self.has_swa:
                     metadata_swa = FlashAttentionMetadata()
@@ -1980,7 +2025,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.target_verify_metadata_topk_swa[bs] = metadata_swa
                     metadata.swa_spec_metadata = metadata_swa
 
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             num_tokens_per_bs = num_tokens // bs
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
@@ -1995,6 +2040,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.swa_page_table = self.draft_extend_metadata["swa_page_table"][
                     :bs, :
                 ]
+                metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
             self.draft_extend_metadata[bs] = metadata
 
         if encoder_lens is not None:
@@ -2036,6 +2082,15 @@ class FlashAttentionBackend(AttentionBackend):
         device = seq_lens.device
         metadata = None
         metadata_expand = None
+
+        # Refill the SWA write-target buffer (bound as a metadata view in
+        # _bind_metadata_buffers) from the live out_cache_loc before replay.
+        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
+            n = out_cache_loc.shape[0]
+            self.swa_out_cache_loc_buf[n:].zero_()
+            self.swa_out_cache_loc_buf[:n].copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
+            )
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -2300,40 +2355,6 @@ class FlashAttentionBackend(AttentionBackend):
                     self._init_sliding_window_attn_spec_metadata(
                         metadata, metadata_expand, metadata_swa
                     )
-
-        elif forward_mode.is_draft_extend():
-            metadata = self.draft_extend_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(seq_lens)
-
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
-            extend_lens = spec_info.num_accept_tokens[:bs]
-            if spec_info.num_accept_tokens_cpu:
-                metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
-            else:
-                metadata.max_seq_len_q = 1
-
-            metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
-            )
-
-            max_seq_pages = (
-                metadata.max_seq_len_k + self.page_size - 1
-            ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
-            ]
-            if self.use_sliding_window_kv_pool and metadata.swa_page_table is not None:
-                swa_page_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    page_indices
-                )
-                metadata.swa_page_table[:, :max_seq_pages].copy_(
-                    swa_page_indices // self.page_size
-                )
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
 
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
