@@ -263,13 +263,10 @@ class MistralModel(MistralPreTrainedModel):
             )
 
         padding_mask = attention_mask.to(device=device, dtype=torch.bool)
-        mask = (
+        return (
             causal_mask[None, None, :, :].expand(batch_size, 1, q_len, kv_len)
             & padding_mask[:, None, None, -kv_len:]
         )
-        return (mask.to(dtype=inputs_embeds.dtype) - 1.0) * torch.finfo(
-            inputs_embeds.dtype
-        ).max
 
     def forward(
         self,
