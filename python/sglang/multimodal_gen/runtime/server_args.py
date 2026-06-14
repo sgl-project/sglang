@@ -112,6 +112,11 @@ class Backend(str, Enum):
         return [backend.value for backend in cls]
 
 
+#: Canonical warmup modes for `--warmup-mode`. The legacy `--warmup` /
+#: `--server-warmup` boolean flags map onto these (see ServerArgs._adjust_warmup).
+WARMUP_MODES = ("off", "request", "server")
+
+
 @dataclasses.dataclass
 class ServerArgs(DisaggServerArgsMixin):
     # Model and path configuration (for convenience)
@@ -223,6 +228,20 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_layerwise_nvtx_marker: bool = False
 
     # warmup
+    # `warmup_mode` is the canonical knob: one of WARMUP_MODES
+    #   - "off":     no warmup.
+    #   - "server":  server-based warmup — a synthetic request right after the
+    #                server is ready, before real traffic. This is the
+    #                production mode: it eagerly warms every cold path so the
+    #                first real request is already fast. Default for serving.
+    #   - "request": request-based warmup — warm on the first real request(s).
+    #                This is a BENCHMARK aid (it lets us exclude warmup from the
+    #                reported latency) and is NOT meant for production, where you
+    #                want cold paths warmed before traffic arrives.
+    # `warmup` / `server_warmup` are kept as DERIVED internal booleans (so all
+    # existing consumers keep working) and as deprecated CLI aliases. None means
+    # "derive the mode from the legacy booleans"; _adjust_warmup resolves it.
+    warmup_mode: str | None = None
     warmup: bool = False
     server_warmup: bool = False
     warmup_resolutions: list[str] = None
@@ -689,14 +708,43 @@ class ServerArgs(DisaggServerArgsMixin):
         return None, None
 
     def _adjust_warmup(self):
+        # Resolve the canonical warmup mode, then derive the legacy booleans
+        # (`warmup` / `server_warmup`) that the rest of the codebase reads.
+        #
+        # Precedence: an explicit `--warmup-mode` wins; otherwise the mode is
+        # derived from the legacy `--warmup` / `--server-warmup` booleans (which
+        # may come from a CLI flag or an entrypoint default such as
+        # `sglang serve`'s server-warmup default), preserving prior behavior.
+        if self.warmup_mode is not None:
+            if self.warmup_mode not in WARMUP_MODES:
+                raise ValueError(
+                    f"Invalid --warmup-mode {self.warmup_mode!r}; "
+                    f"expected one of {WARMUP_MODES}."
+                )
+            if self.warmup or self.server_warmup:
+                logger.warning(
+                    "Both --warmup-mode and the deprecated --warmup/--server-warmup "
+                    "were set; --warmup-mode=%s takes precedence.",
+                    self.warmup_mode,
+                )
+            self.warmup = self.warmup_mode != "off"
+            self.server_warmup = self.warmup_mode == "server"
+
+        # Explicit resolutions imply warmup is on (request-based).
         if self.warmup_resolutions is not None:
             self.warmup = True
 
+        # Server-based (synthetic) warmup only applies to a monolithic server.
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
 
         if not self.warmup:
             self.server_warmup = False
+
+        # Store the resolved canonical mode for reporting / downstream use.
+        self.warmup_mode = (
+            "off" if not self.warmup else "server" if self.server_warmup else "request"
+        )
 
     @staticmethod
     def _require_port(port: int, name: str) -> None:
@@ -1252,18 +1300,31 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # warmup
         parser.add_argument(
+            "--warmup-mode",
+            type=str,
+            choices=list(WARMUP_MODES),
+            default=ServerArgs.warmup_mode,
+            help=(
+                "Warmup mode (canonical knob). One of: "
+                "`off` (no warmup); `request` (request-based: warm on real "
+                "incoming requests); `server` (server-based: a synthetic warmup "
+                "request right after the server is ready, before traffic). "
+                "Takes precedence over the deprecated --warmup/--server-warmup. "
+                "`sglang serve` defaults to `server`; other entrypoints default "
+                "to request-based when warmup is enabled. When enabled, look for "
+                "the line ending with `(with warmup excluded)` for actual "
+                "processing time."
+            ),
+        )
+        parser.add_argument(
             "--warmup",
             action=StoreBoolean,
             default=ServerArgs.warmup,
             help=(
-                "Perform warmup before normal traffic. `sglang serve` runs a "
-                "server warmup through the scheduler client after HTTP is ready. "
-                "Other client entrypoints run explicit `--warmup-resolutions` "
-                "through the scheduler client, otherwise they use request-based "
-                "warmup. Recommended to enable when benchmarking to ensure fair "
-                "comparison and best performance. When enabled, look for the "
-                "line ending with `(with warmup excluded)` for actual processing "
-                "time."
+                "[DEPRECATED: use --warmup-mode] Perform warmup before normal "
+                "traffic. Maps to --warmup-mode request (or server, combined "
+                "with --server-warmup). Recommended when benchmarking for fair "
+                "comparison and best performance."
             ),
         )
         parser.add_argument(
@@ -1283,7 +1344,10 @@ class ServerArgs(DisaggServerArgsMixin):
             "--server-warmup",
             action=StoreBoolean,
             default=ServerArgs.server_warmup,
-            help="Send a warmup request after server ready",
+            help=(
+                "[DEPRECATED: use --warmup-mode server] Send a synthetic warmup "
+                "request after the server is ready (server-based warmup)."
+            ),
         )
 
         # layerwise offload

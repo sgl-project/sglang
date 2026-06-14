@@ -21,7 +21,13 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
 
 logger = init_logger(__name__)
 
-MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+# Synthetic reference image for server (production) warmup of image-conditioned
+# (TI2I/TI2V) pipelines. Server warmup must exercise every cold path without
+# crashing, so this must satisfy each pipeline's input constraints. It is a
+# 64x64 image because some pipelines reject smaller inputs (e.g. FLUX.2's
+# diffusers image processor requires both dimensions >= 64px); the previous
+# 32x32 image aborted FLUX.2 server warmup. Keep it >= 64px on both sides.
+MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PMQ0AAAwDoEqv9ErYvQQckD4XAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAYHLAB8+AWnmfUycAAAAAElFTkSuQmCC"
 
 
 def get_first_generation_req(req_or_group: Any) -> Req | None:
