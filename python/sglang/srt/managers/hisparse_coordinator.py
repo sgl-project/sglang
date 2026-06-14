@@ -242,6 +242,8 @@ class HiSparseCoordinator:
             start_event.record()
             with device_module.stream(self.write_staging_stream):
                 start_event.wait(self.write_staging_stream)
+                if self.decode_producer_stream is not None:
+                    self.write_staging_stream.wait_stream(self.decode_producer_stream)
                 self.mem_pool_host.backup_from_device_all_layer(
                     self.mem_pool_device,
                     host_indices,
@@ -257,7 +259,7 @@ class HiSparseCoordinator:
             self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
             return
 
-        token_ids = list(req.fill_ids[:prefill_len])
+        token_ids = req.get_fill_ids()[:prefill_len]
 
         host_prefix, radix_prefix_len = self.radix_cache.match_and_lock_req_prefix(
             req.req_pool_idx,
@@ -291,6 +293,8 @@ class HiSparseCoordinator:
 
             with device_module.stream(self.write_staging_stream):
                 start_event.wait(self.write_staging_stream)
+                if self.decode_producer_stream is not None:
+                    self.write_staging_stream.wait_stream(self.decode_producer_stream)
                 self.radix_cache.backup_from_device_all_layer(
                     self.mem_pool_device,
                     suffix_host_indices,
@@ -483,8 +487,8 @@ class HiSparseCoordinator:
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
     def _insert_prefill_into_radix_cache(self, req: Req) -> None:
-        prefill_len = len(req.fill_ids)
-        token_ids = list(req.fill_ids[:prefill_len])
+        prefill_len = req.fill_len
+        token_ids = req.get_fill_ids()[:prefill_len]
         host_indices = self.req_to_host_pool[req.req_pool_idx, :prefill_len].cpu()
         old_prefix_len = self.radix_cache.req_prefix_len(req.req_pool_idx)
 
@@ -549,6 +553,11 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.detach().cpu()
+        if req_pool_indices_cpu is None:
+            req_pool_indices_cpu = req_pool_indices.detach().cpu()
+
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -666,7 +675,12 @@ class HiSparseCoordinator:
             )
             host_locs_list.append(host_locs)
             offload_end = start_pos + 1
-            if offload_end > 0 and offload_end % self.page_size == 0:
+            if (
+                self.radix_cache is not None
+                and offload_end > 0
+                and offload_end % self.page_size == 0
+                and offload_end > self.radix_cache.req_prefix_len(req_idx)
+            ):
                 non_sparse_pool_offload_ranges.append(
                     (req_idx, offload_end - self.page_size, offload_end)
                 )
@@ -856,8 +870,10 @@ class HiSparseCoordinator:
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
-        self.wait_for_pending_backup()
+            self.decode_producer_stream.synchronize()
+        if self._has_pending_backup:
+            self._backup_done_event.synchronize()
+            self._has_pending_backup = False
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those

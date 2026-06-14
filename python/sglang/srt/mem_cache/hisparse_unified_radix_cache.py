@@ -49,12 +49,14 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
         self._hisparse_req_to_token = None
         self._req_radix_node: dict[int, Optional[UnifiedTreeNode]] = {}
         self._req_radix_prefix_len: dict[int, int] = {}
+        self._next_load_ack_id = -1
         super().__init__(params)
 
     def _reset_full(self) -> None:
         super()._reset_full()
         self._req_radix_node.clear()
         self._req_radix_prefix_len.clear()
+        self._next_load_ack_id = -1
 
     def init_hisparse_radix_cache(
         self, host_pool, server_args: Optional[ServerArgs] = None
@@ -239,11 +241,11 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             req.req_pool_idx, :kv_committed_len
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
-        self.dec_lock_ref(req.last_node)
+        self.release_req_node(req.req_pool_idx)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, : req.fill_len
         ]
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
@@ -317,6 +319,20 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             ].to(dtype=torch.int64),
         )
 
+    def _record_transfer_indices_on_current_stream(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]],
+    ) -> None:
+        for indices in (host_indices, device_indices):
+            if indices is not None and indices.is_cuda:
+                indices.record_stream(torch.cuda.current_stream(indices.device))
+        for transfer in pool_transfers or []:
+            for indices in (transfer.host_indices, transfer.device_indices):
+                if indices is not None and indices.is_cuda:
+                    indices.record_stream(torch.cuda.current_stream(indices.device))
+
     def backup_from_device_all_layer(
         self,
         mem_pool_device,
@@ -341,6 +357,9 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
             device_indices,
             io_backend=getattr(self.cache_controller, "io_backend", "kernel"),
             pool_transfers=pool_transfers,
+        )
+        self._record_transfer_indices_on_current_stream(
+            host_indices, device_indices, pool_transfers
         )
 
     def insert_req_host_indices(
@@ -469,11 +488,13 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
 
         mapping[logical_indices] = hisparse_indices
 
+        ack_id = self._next_load_ack_id
+        self._next_load_ack_id -= 1
         self.cache_controller.load_queue.append(
             CacheOperation(
                 host_indices=host_indices,
                 device_indices=hisparse_indices,
-                node_id=best_match_node.id,
+                node_id=ack_id,
                 pool_transfers=[
                     PoolTransfer(
                         name=PoolName.INDEXER,
@@ -483,7 +504,7 @@ class HiSparseUnifiedRadixCache(UnifiedRadixCache):
                 ],
             )
         )
-        self.ongoing_load_back[best_match_node.id] = (
+        self.ongoing_load_back[ack_id] = (
             best_match_node,
             self.inc_lock_ref(best_match_node).to_dec_params(),
         )
