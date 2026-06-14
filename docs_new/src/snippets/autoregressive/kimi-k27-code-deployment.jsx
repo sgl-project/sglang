@@ -144,11 +144,13 @@ export const KimiK27CodeDeployment = () => {
       cmd += ' \\\n  --tool-call-parser kimi_k2';
     }
 
-    if (hardware === 'b300' || hardware === 'gb300') {
+    const usesTokenspeedMla = hardware === 'b300' || hardware === 'gb300';
+
+    if (usesTokenspeedMla) {
       cmd += ' \\\n  --attention-backend tokenspeed_mla';
     }
 
-    if (isAMD) {
+    if (isAMD || usesTokenspeedMla) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
     }
 
