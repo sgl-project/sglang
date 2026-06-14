@@ -574,7 +574,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         # raw_latent_shape lets SDPA-path attn metadata stay a no-op.
         batch.raw_latent_shape = (
             text_embeds.shape[0],
-            local_chunk_tokens,
+            chunk_tokens,
             arch.out_channels,
             latent_h,
             latent_w,
@@ -704,7 +704,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         local_window_tokens = st["window_size_t"] * st["tokens_per_frame"] // sp_size
         local_sink_tokens = st["sink_size_t"] * st["tokens_per_frame"] // sp_size
         tokens_per_frame = st["tokens_per_frame"]
-        chunk_tokens = st["chunk_tokens"]
         num_chunks = st["num_chunks"]
         context_noise = st["context_noise"]
         head_dim = arch.model_channels // arch.num_heads
