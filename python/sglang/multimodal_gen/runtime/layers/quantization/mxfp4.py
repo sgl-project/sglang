@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_hip, mxfp_supported
+from sglang.srt.utils.common import direct_register_custom_op
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
@@ -38,6 +39,36 @@ if _is_hip:
 # dimension (N) is smaller than its minimum tile size.
 # Layers with output_size falls below this threshold will stay unquantized
 _MXFP4_MIN_OUTPUT_DIM = 256
+
+
+if _is_hip and gemm_a4w4 is not None and dynamic_mxfp4_quant is not None:
+
+    def _mxfp4_quant_gemm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        x_fp4, x_scale = dynamic_mxfp4_quant(x, shuffle=True)
+        return gemm_a4w4(x_fp4, weight, x_scale, weight_scale)
+
+    def _mxfp4_quant_gemm_fake(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        # weight is [output_size_per_partition, ...]; gemm output is [M, N].
+        return torch.empty(
+            (x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
+        )
+
+    # Wrap the activation-quant + A4W4 gemm in a single functional custom op.
+    # This keeps the whole layer torch.compile compatible.
+    direct_register_custom_op(
+        op_name="mxfp4_diffusion_quant_gemm",
+        op_func=_mxfp4_quant_gemm,
+        mutates_args=[],
+        fake_impl=_mxfp4_quant_gemm_fake,
+    )
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -216,21 +247,17 @@ class Mxfp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
-        if not mxfp_supported():
-            raise RuntimeError(
-                "MXFP4 inference requires ROCm and MI350+ (gfx95x). "
-                "Current platform not supported."
-            )
+        # Platform support is validated once in process_weights_after_loading;
+        # the gemm runs through a functional custom op so this stays compilable.
 
         # Handle 3D input tensors [batch, seq, hidden]
         original_shape = x.shape
         if x.dim() == 3:
             x = x.view(-1, x.shape[-1])
 
-        x_fp4, x_scale = dynamic_mxfp4_quant(x, shuffle=True)
-
-        y = gemm_a4w4(x_fp4, layer.weight, x_scale, layer.weight_scale)
+        y = torch.ops.sglang.mxfp4_diffusion_quant_gemm(
+            x, layer.weight, layer.weight_scale
+        )
 
         if bias is not None:
             y = y + bias

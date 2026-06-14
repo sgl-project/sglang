@@ -133,6 +133,61 @@ class AITerImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
 
     @torch.compiler.disable
+    def _forward_fp8(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """
+        FP8 FMHA prefill path. Kept out of the compiled graph (the aiter FP8
+        quant + FMHA kernels are not torch.compile-safe); only invoked when
+        SGLANG_DIFFUSION_AITER_FP8_ATTN=1.
+
+        Returns the attention output, or None if the FP8 FMHA kernel does not
+        support the current shapes, in which case the caller falls back to the
+        (compilable) BF16 path.
+        """
+        if query.dtype != _fp8_dtype:
+            q_fp8, q_scale = aiter.per_tensor_quant(query, quant_dtype=_fp8_dtype)
+            k_fp8, k_scale = aiter.per_tensor_quant(key, quant_dtype=_fp8_dtype)
+            v_fp8, v_scale = aiter.per_tensor_quant(value, quant_dtype=_fp8_dtype)
+        else:
+            q_fp8, k_fp8, v_fp8 = query, key, value
+            one = torch.tensor(1.0, dtype=torch.float32, device=query.device)
+            q_scale = k_scale = v_scale = one
+
+        d_q = q_fp8.shape[-1]
+        d_k = k_fp8.shape[-1]
+        d_v = v_fp8.shape[-1]
+        h_q = q_fp8.shape[2]
+        h_kv = k_fp8.shape[2]
+
+        if _can_use_fmha_fp8_prefill(d_q, d_k, d_v, h_q, h_kv):
+            return _fmha_fp8_prefill_attention(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                softmax_scale=self.softmax_scale,
+                is_causal=self.causal,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+
+        logger.warning_once(
+            "FP8 FMHA prefill unsupported for this shape (need gfx950-class AITER, "
+            "full MHA, q/k/v head_dim=%d; got q=%d, k=%d, v=%d, num_heads=%d, "
+            "num_kv_heads=%d). Falling back to BF16.",
+            _FMHA_FP8_HEAD_DIM,
+            d_q,
+            d_k,
+            d_v,
+            h_q,
+            h_kv,
+        )
+        return None
+
     def forward(
         self,
         query: torch.Tensor,
@@ -155,44 +210,9 @@ class AITerImpl(AttentionImpl):
             Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
         """
         if _use_fp8_attn:
-            if query.dtype != _fp8_dtype:
-                q_fp8, q_scale = aiter.per_tensor_quant(query, quant_dtype=_fp8_dtype)
-                k_fp8, k_scale = aiter.per_tensor_quant(key, quant_dtype=_fp8_dtype)
-                v_fp8, v_scale = aiter.per_tensor_quant(value, quant_dtype=_fp8_dtype)
-            else:
-                q_fp8, k_fp8, v_fp8 = query, key, value
-                one = torch.tensor(1.0, dtype=torch.float32, device=query.device)
-                q_scale = k_scale = v_scale = one
-
-            d_q = q_fp8.shape[-1]
-            d_k = k_fp8.shape[-1]
-            d_v = v_fp8.shape[-1]
-            h_q = q_fp8.shape[2]
-            h_kv = k_fp8.shape[2]
-
-            if _can_use_fmha_fp8_prefill(d_q, d_k, d_v, h_q, h_kv):
-                return _fmha_fp8_prefill_attention(
-                    q_fp8,
-                    k_fp8,
-                    v_fp8,
-                    softmax_scale=self.softmax_scale,
-                    is_causal=self.causal,
-                    q_scale=q_scale,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                )
-
-            logger.warning_once(
-                "FP8 FMHA prefill unsupported for this shape (need gfx950-class AITER, "
-                "full MHA, q/k/v head_dim=%d; got q=%d, k=%d, v=%d, num_heads=%d, "
-                "num_kv_heads=%d). Falling back to BF16.",
-                _FMHA_FP8_HEAD_DIM,
-                d_q,
-                d_k,
-                d_v,
-                h_q,
-                h_kv,
-            )
+            output = self._forward_fp8(query, key, value)
+            if output is not None:
+                return output
 
         # BF16 path
         output, _ = aiter.flash_attn_func(
