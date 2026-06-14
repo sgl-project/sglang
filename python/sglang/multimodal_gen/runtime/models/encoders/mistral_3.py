@@ -481,9 +481,7 @@ class Mistral3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixi
                 or "lm_head" in name_lower
             ):
                 continue
-            final_name = name.replace(
-                "language_model.model.", "model.language_model."
-            )
+            final_name = name.replace("language_model.model.", "model.language_model.")
 
             loaded = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -493,9 +491,7 @@ class Mistral3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixi
                 if mapped_name not in params_dict:
                     continue
                 param = params_dict[mapped_name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(mapped_name)
                 loaded = True
@@ -505,15 +501,11 @@ class Mistral3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixi
 
             if final_name in params_dict:
                 param = params_dict[final_name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(final_name)
             else:
-                logger.warning(
-                    f"Param {name=} {final_name=} from weight is not loaded"
-                )
+                logger.warning(f"Param {name=} {final_name=} from weight is not loaded")
 
         return loaded_params
 
