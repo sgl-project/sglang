@@ -85,6 +85,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.utils import get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.nvtx_utils import nvtx_annotated_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -1023,6 +1024,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     kv_indices_full.cpu().numpy(), device_page_size
                 )
 
+            def _swa_ring_payload():
+                # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
+                # Same window positions and order -> positional match with prefill.
+                ring_stride = self.token_to_kv_pool.unified_swa_ring_size
+                window_size = self.token_to_kv_pool.unified_swa_window
+                window_start = max(0, seq_len - window_size)
+                positions = np.arange(window_start, seq_len, dtype=np.int64)
+                state_slot = int(decode_req.req.req_pool_idx)
+                ring_rows = state_slot * ring_stride + (positions % ring_stride)
+                return ring_rows.astype(np.int32)
+
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
             for st in state_types:
@@ -1032,6 +1044,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
                     state_indices.append(_dsa_payload())
+                elif st == StateType.SWA_RING:
+                    state_indices.append(_swa_ring_payload())
                 else:
                     state_indices.append(None)
 
@@ -1811,6 +1825,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
+    @nvtx_annotated_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
