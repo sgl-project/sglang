@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4A16Fp4,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
@@ -491,6 +492,17 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_symmetric
         )
 
+    def _is_nvfp4_w4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        if weight_quant is None or input_quant is not None:
+            return False
+        is_fp4 = (
+            weight_quant.num_bits == 4 and weight_quant.type == QuantizationType.FLOAT
+        )
+        is_symmetric = weight_quant.symmetric
+        is_static = not weight_quant.dynamic
+        is_tensor_group = weight_quant.strategy == QuantizationStrategy.TENSOR_GROUP
+        return is_fp4 and is_symmetric and is_static and is_tensor_group
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -562,6 +574,17 @@ class CompressedTensorsConfig(QuantizationConfig):
             else:
                 raise ImportError(
                     "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
+                )
+
+        if self._is_nvfp4_w4a16(weight_quant, input_quant):
+            is_supported = self._check_scheme_supported(
+                CompressedTensorsW4A16Fp4.get_min_capability(), error=False
+            )
+            if is_supported:
+                return CompressedTensorsW4A16Fp4()
+            else:
+                raise NotImplementedError(
+                    "Current platform does not support w4a16 nvfp4 quantization."
                 )
 
         if is_activation_quantization_format(self.quant_format):
