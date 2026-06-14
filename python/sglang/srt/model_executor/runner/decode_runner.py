@@ -779,6 +779,9 @@ class DecodeRunner(BaseRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def prepare(self) -> None:
+        # Warm up + autotune kernels once before capture/reserve (run-once
+        # across the decode + prefill runners; see BaseRunner.warmup).
+        self.warmup()
         if self.eager:
             # Eager one-time setup: reserve the per-shape static batches + bind
             # attention metadata (the same reserve path the cuda-graph runner

@@ -886,7 +886,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
-            self.kernel_warmup()
+            # Kernel warmup / autotune moved into the Runner lifecycle
+            # (BaseRunner.warmup, run-once, called from decode/prefill prepare()).
             self._pre_initialize_flashinfer_allreduce_workspace()
             if not disable_cuda_graph:
                 self.init_decode_cuda_graph()
@@ -2438,26 +2439,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = init_new_workspace
         full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
         return attn_backend_wrapper(self, full_attention_backend)
-
-    def kernel_warmup(self):
-        """Warmup and tune kernels before cuda graph capture."""
-        if self.device != "cuda":
-            return
-
-        if self._should_run_flashinfer_autotune():
-            self._flashinfer_autotune()
-
-        if (
-            envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
-            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and self.pp_size > 1
-            and not self.spec_algorithm.is_speculative()
-        ):
-            from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
-                pp_parallel_deep_gemm_warmup,
-            )
-
-            pp_parallel_deep_gemm_warmup(self)
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.

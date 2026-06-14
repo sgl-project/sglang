@@ -615,6 +615,9 @@ class PrefillRunner(BaseRunner):
         return forward_batch, self.model_runner.attn_backend
 
     def prepare(self) -> None:
+        # Warm up + autotune kernels once before capture/reserve (run-once
+        # across the decode + prefill runners; see BaseRunner.warmup).
+        self.warmup()
         if self.eager:
             # No capture/compile and no per-shape reservation: eager builds the
             # static batch fresh per iteration in load_batch at the raw token
