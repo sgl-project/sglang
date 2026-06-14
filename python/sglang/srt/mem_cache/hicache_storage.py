@@ -130,11 +130,9 @@ class PoolTransferResult:
         """Accumulate kv_hit_pages across batches (max = last successful batch)."""
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
-    def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
+    def update_extra_pool_hit_pages(self, results: dict[str, int]) -> None:
         """Record actual load/write success counts per extra pool."""
-        self.extra_pool_hit_pages.update(
-            {name: sum(rs) for name, rs in results.items()}
-        )
+        self.extra_pool_hit_pages.update(results)
 
 
 class HiCacheStorage(ABC):
