@@ -1,5 +1,6 @@
+import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 import torch
 
@@ -27,57 +28,20 @@ class FlattenedTensorBucket:
 
     def __init__(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]] = None,
-        flattened_tensor: torch.Tensor = None,
-        metadata: List[FlattenedTensorMetadata] = None,
+        flattened_tensor: torch.Tensor,
+        metadata: List[FlattenedTensorMetadata],
     ):
         """
-        Initialize a tensor bucket from a list of named tensors OR from pre-flattened data.
+        Initialize a tensor bucket from pre-flattened data.
         Args:
-            named_tensors: List of (name, tensor) tuples (for creating new bucket)
             flattened_tensor: Pre-flattened tensor (for reconstruction)
             metadata: Pre-computed metadata (for reconstruction)
         """
-        if named_tensors is not None:
-            # Create bucket from named tensors
-            self.metadata: List[FlattenedTensorMetadata] = [None] * len(named_tensors)
-            self.flattened_tensor: torch.Tensor = None
-
-            if not named_tensors:
-                raise ValueError("Cannot create empty tensor bucket")
-
-            # Collect metadata and flatten tensors
-            current_idx = 0
-            flattened_tensors: List[torch.Tensor] = [None] * len(named_tensors)
-
-            for i, (name, tensor) in enumerate(named_tensors):
-                flattened = tensor.flatten().view(torch.uint8)
-                flattened_tensors[i] = flattened
-
-                # Store metadata
-
-                numel = flattened.numel()
-                metadata_obj = FlattenedTensorMetadata(
-                    name=name,
-                    shape=tensor.shape,
-                    dtype=tensor.dtype,
-                    start_idx=current_idx,
-                    end_idx=current_idx + numel,
-                    numel=numel,
-                )
-                self.metadata[i] = metadata_obj
-                current_idx += numel
-
-            # Concatenate all flattened tensors
-            self.flattened_tensor = torch.cat(flattened_tensors, dim=0)
-        else:
-            # Initialize from pre-flattened data
-            if flattened_tensor is None or metadata is None:
-                raise ValueError(
-                    "Must provide either named_tensors or both flattened_tensor and metadata"
-                )
-            self.flattened_tensor = flattened_tensor
-            self.metadata = metadata
+        # Initialize from pre-flattened data
+        if flattened_tensor is None or metadata is None:
+            raise ValueError("Must provide both flattened_tensor and metadata")
+        self.flattened_tensor = flattened_tensor
+        self.metadata = metadata
 
     def get_flattened_tensor(self) -> torch.Tensor:
         """Get the flattened tensor containing all bucket tensors"""
@@ -105,3 +69,67 @@ class FlattenedTensorBucket:
             reconstructed[i] = (meta.name, tensor)
 
         return reconstructed
+
+    @classmethod
+    def from_tensors(cls, named_tensors: List[Tuple[str, torch.Tensor]]):
+        # Create bucket from named tensors
+        if not named_tensors:
+            raise ValueError("Cannot create empty tensor bucket")
+
+        current_idx = 0
+        metadata: List[FlattenedTensorMetadata] = [None] * len(named_tensors)
+        # Collect metadata and flatten tensors
+        flattened_tensors: List[torch.Tensor] = [None] * len(named_tensors)
+
+        for i, (name, tensor) in enumerate(named_tensors):
+            flattened = tensor.flatten().view(torch.uint8)
+            flattened_tensors[i] = flattened
+
+            # Store metadata
+            numel = flattened.numel()
+            metadata_obj = FlattenedTensorMetadata(
+                name=name,
+                shape=tensor.shape,
+                dtype=tensor.dtype,
+                start_idx=current_idx,
+                end_idx=current_idx + numel,
+                numel=numel,
+            )
+            metadata[i] = metadata_obj
+            current_idx += numel
+
+        # Concatenate all flattened tensors
+        flattened_tensor = torch.cat(flattened_tensors, dim=0)
+        return cls(flattened_tensor=flattened_tensor, metadata=metadata)
+
+    @classmethod
+    def from_specs(
+        cls,
+        names: List[str],
+        dtypes: List[Union[str, torch.dtype]],
+        shapes: List[torch.Size],
+        device: Union[torch.device, str],
+    ):
+        if not names or not (len(names) == len(dtypes) == len(shapes)):
+            raise ValueError("Cannot create empty specs")
+        current_idx = 0
+        metadata: List[FlattenedTensorMetadata] = [None] * len(names)
+        for i, (name, dtype, shape) in enumerate(zip(names, dtypes, shapes)):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            numel = math.prod(shape) * target_dtype.itemsize
+            metadata_obj = FlattenedTensorMetadata(
+                name=name,
+                shape=shape,
+                dtype=target_dtype,
+                start_idx=current_idx,
+                end_idx=current_idx + numel,
+                numel=numel,
+            )
+            metadata[i] = metadata_obj
+            current_idx += numel
+        flattened_tensor = torch.empty(
+            metadata[-1].end_idx, dtype=torch.uint8, device=device
+        )
+        return cls(flattened_tensor=flattened_tensor, metadata=metadata)
