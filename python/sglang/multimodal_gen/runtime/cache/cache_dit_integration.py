@@ -24,14 +24,15 @@ logger = init_logger(__name__)
 import cache_dit
 from cache_dit import (
     BlockAdapter,
+    BlockAdapterRegister,
     DBCacheConfig,
     ForwardPattern,
     ParamsModifier,
     TaylorSeerCalibratorConfig,
+    ParallelismBackend,
+    ParallelismConfig,
     steps_mask,
 )
-from cache_dit.caching.block_adapters import BlockAdapterRegister
-from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
