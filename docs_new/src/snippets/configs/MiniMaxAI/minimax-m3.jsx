@@ -64,11 +64,19 @@ sgl-eval run gsm8k \\
   --model {{MODEL_NAME}} \\
   --temperature 1.0 --top-p 0.95 \\
   --thinking`,
+      gpqa_pct:
+`pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gpqa \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
+  --model {{MODEL_NAME}} \\
+  --temperature 1.0 --top-p 0.95 \\
+  --thinking --n-repeats 4 --max-tokens 40960`,
     },
     numPromptsByConc: { 24: 24, 64: 128 },
   },
 
   accuracyLabels: [
+    ["gpqa_pct", "GPQA Diamond", "%"],
     ["gsm8k_pct", "GSM8K", "%"],
   ],
 
@@ -191,12 +199,12 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
-        "--tp 4",
+        "--tp 8",
         "--attention-backend fa4",
         "--page-size 128",
         "--moe-runner-backend deep_gemm",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.75",
+        "--mem-fraction-static 0.65",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
