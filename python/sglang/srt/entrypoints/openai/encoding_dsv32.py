@@ -62,7 +62,7 @@ tool_output_template: str = "\n<result>{content}</result>"
 def to_json(value: Any) -> str:
     try:
         return json.dumps(value, ensure_ascii=False)
-    except:
+    except Exception:
         return json.dumps(value, ensure_ascii=True)
 
 

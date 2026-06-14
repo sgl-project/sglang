@@ -146,9 +146,10 @@ class AsyncDynamicbatchTokenizer:
                         f"Consider using consistent tokenization parameters across requests."
                     )
 
-                encode_fn = lambda prompts=prompts, kwargs=kwargs_list: [
-                    self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs_list)
-                ]
+                def encode_fn(prompts=prompts, kwargs=kwargs_list):
+                    return [
+                                    self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs_list)
+                                ]
                 results = await asyncio.get_running_loop().run_in_executor(
                     self._executor, encode_fn
                 )

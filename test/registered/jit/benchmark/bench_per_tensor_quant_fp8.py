@@ -106,9 +106,11 @@ def benchmark(element_count, provider):
     x = torch.randn(element_count, 4096, device=device, dtype=dtype)
 
     if provider == "vllm":
-        fn = lambda: vllm_scaled_fp8_quant(x.clone())
+        def fn():
+            return vllm_scaled_fp8_quant(x.clone())
     elif provider == "sglang":
-        fn = lambda: sglang_scaled_fp8_quant(x.clone())
+        def fn():
+            return sglang_scaled_fp8_quant(x.clone())
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

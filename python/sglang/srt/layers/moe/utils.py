@@ -557,7 +557,8 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
 
     if is_aiter_moe:
         padding_size = get_moe_padding_size(True)
-        align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+        def align_aiter(n):
+            return ((n + padding_size - 1) // padding_size) * padding_size
         is_padded = (w2_down_dim % padding_size) > 0
         if is_padded:
             # w2_down_dim, padding & aligned, unit: parameter dtype

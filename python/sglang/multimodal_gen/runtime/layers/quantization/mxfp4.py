@@ -170,7 +170,7 @@ class Mxfp4LinearMethod(LinearMethodBase):
             if _is_hip:
                 try:
                     platform = torch.cuda.get_device_properties(0).gcnArchName
-                except:
+                except Exception:
                     platform = "ROCm (unknown arch)"
             raise RuntimeError(
                 f"MXFP4 quantization requires ROCm and MI350+ (gfx95x). "

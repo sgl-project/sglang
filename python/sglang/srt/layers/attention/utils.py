@@ -9,12 +9,6 @@ from sglang.srt.layers.attention.triton_ops.cache_ops import (
 from sglang.srt.layers.attention.triton_ops.cache_ops import (
     concat_and_cast_mha_k_triton as concat_and_cast_mha_k_triton,
 )
-from sglang.srt.layers.attention.triton_ops.cache_ops import (
-    launch_reshape_and_cache_flash as launch_reshape_and_cache_flash,
-)
-from sglang.srt.layers.attention.triton_ops.cache_ops import (
-    reshape_and_cache_flash as reshape_and_cache_flash,
-)
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashinfer_kv_indices_triton as create_flashinfer_kv_indices_triton,
 )
@@ -38,9 +32,6 @@ from sglang.srt.layers.attention.triton_ops.pad import (
 )
 from sglang.srt.layers.attention.triton_ops.pad import (
     seqlens_expand_triton as seqlens_expand_triton,
-)
-from sglang.srt.layers.attention.triton_ops.rope_cache import (
-    fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
 from sglang.srt.utils import is_cuda
 

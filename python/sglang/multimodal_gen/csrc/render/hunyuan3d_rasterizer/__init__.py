@@ -26,9 +26,9 @@ def _load_custom_rasterizer(
 
     if _custom_rasterizer_kernel is not None:
         return _custom_rasterizer_kernel
-    
+
     cuda_enabled_flag = ["-DCUDA_ENABLED"] if is_cuda else []
-    
+
     _custom_rasterizer_kernel = load_extension_with_recovery(
         name="custom_rasterizer_kernel",
         sources=[

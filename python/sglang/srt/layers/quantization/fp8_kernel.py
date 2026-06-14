@@ -25,7 +25,7 @@ import triton.language as tl
 
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
-except:
+except Exception:
     pass
 
 from sglang.srt.layers import deep_gemm_wrapper
@@ -1990,11 +1990,12 @@ def per_group_transpose(
     trans_a = torch.empty_like(a)
     num_experts = expert_offsets.size(0) - 1
 
-    grid = lambda META: (
-        num_experts,
-        triton.cdiv((m + num_experts - 1) // num_experts, META["BLOCK_SIZE_M"]),
-        triton.cdiv(k, META["BLOCK_SIZE_K"]),
-    )
+    def grid(META):
+        return (
+            num_experts,
+            triton.cdiv((m + num_experts - 1) // num_experts, META["BLOCK_SIZE_M"]),
+            triton.cdiv(k, META["BLOCK_SIZE_K"]),
+        )
     _per_group_transpose[grid](
         a, trans_a, expert_offsets, k, M_ALIGNMENT, BLOCK_SIZE_M=16, BLOCK_SIZE_K=8
     )
@@ -2175,13 +2176,15 @@ def triton_scaled_mm(
     assert is_weak_contiguous(input)
     assert is_weak_contiguous(weight)
 
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
 
     result = torch.empty((M, N), dtype=out_dtype, device=input.device)
 
-    has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
+    def has_scalar(x):
+        return x.shape[0] == 1 and x.shape[1] == 1
 
     if use_heuristic:
         is_small_N = N < 8192

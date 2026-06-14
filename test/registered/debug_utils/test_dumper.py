@@ -2932,49 +2932,6 @@ def _unit_grafter_config(**overrides) -> DumperConfig:
     return DumperConfig(**base)
 
 
-class TestLog:
-    def test_log_format(self):
-        with _capture_stdout() as captured:
-            _log("hello")
-        out = captured.getvalue()
-        assert "hello" in out, out
-        assert "[Dumper, rank=" in out, out
-        assert ", t=" in out, out
-
-
-class TestCompareTensorsQuick:
-    def test_identical(self):
-        a = torch.tensor([1.0, 2.0, 3.0])
-        s = _compare_tensors_quick(a, a.clone())
-        assert "rel_diff=0" in s, s
-        assert "max_abs=0" in s, s
-
-    def test_diverged(self):
-        a = torch.tensor([1.0, 2.0, 3.0])
-        b = torch.tensor([1.0, 2.0, 4.0])  # last element differs by 1
-        s = _compare_tensors_quick(a, b)
-        # rel_diff > 0 implies divergence; max_abs should equal 1.0
-        assert "max_abs=1" in s, s
-        assert "rel_diff=" in s, s
-
-    def test_shape_mismatch(self):
-        s = _compare_tensors_quick(torch.zeros(3), torch.zeros(4))
-        assert "shape mismatch" in s, s
-
-    def test_dtype_unified(self):
-        # Different dtypes should NOT error — both are cast to fp32 internally.
-        s = _compare_tensors_quick(
-            torch.zeros(3, dtype=torch.float32),
-            torch.zeros(3, dtype=torch.float64),
-        )
-        assert "rel_diff=" in s, s
-        assert "max_abs=" in s, s
-
-    def test_empty(self):
-        s = _compare_tensors_quick(torch.zeros(0), torch.zeros(0))
-        assert s == "empty"
-
-
 class TestGrafterFilterMatching:
     """Unit tests for the filter-matching short-circuit logic.
 

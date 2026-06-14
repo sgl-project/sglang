@@ -82,9 +82,11 @@ def bench_fused_norm_scale_shift(
         layer = RMSNormScaleShift(D, EPS, affine, dtype=DTYPE)
     layer = preprocess_layer(layer, affine, D, DTYPE)
     if provider == "native":
-        fn = lambda: layer.forward_native(x, shift, scale)
+        def fn():
+            return layer.forward_native(x, shift, scale)
     else:
-        fn = lambda: layer.forward_cuda(x, shift, scale)
+        def fn():
+            return layer.forward_cuda(x, shift, scale)
 
     return run_benchmark_no_cudagraph(fn)
 
@@ -119,9 +121,11 @@ def bench_fused_scale_residual_norm_scale_shift(
         layer = ScaleResidualRMSNormScaleShift(D, EPS, affine, dtype=DTYPE).to(DEVICE)
     layer = preprocess_layer(layer, affine, D, DTYPE)
     if provider == "native":
-        fn = lambda: layer.forward_native(residual, x, gate, shift, scale)
+        def fn():
+            return layer.forward_native(residual, x, gate, shift, scale)
     else:
-        fn = lambda: layer.forward_cuda(residual, x, gate, shift, scale)
+        def fn():
+            return layer.forward_cuda(residual, x, gate, shift, scale)
 
     return run_benchmark_no_cudagraph(fn)
 

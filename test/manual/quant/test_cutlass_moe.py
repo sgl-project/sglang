@@ -135,29 +135,30 @@ def run_test(tp_size, batch_size, model_config, check=False):
         enable_es = (True, True)
 
     # --- Lambdas for Benchmarking ---
-    cutlass_lambda = lambda: cutlass_fused_experts_fp8(
-        x,
-        w1.transpose(1, 2),  # Transposed
-        w2.transpose(1, 2),  # Transposed
-        w1_scale.transpose(1, 2),
-        w2_scale.transpose(1, 2),
-        topk_weights,
-        topk_ids,
-        a1_strides,
-        c1_strides,
-        a2_strides,
-        c2_strides,
-        workspace,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        enable_es=enable_es,
-    )
+    def cutlass_lambda():
+        return cutlass_fused_experts_fp8(
+            x,
+            w1.transpose(1, 2),  # Transposed
+            w2.transpose(1, 2),  # Transposed
+            w1_scale.transpose(1, 2),
+            w2_scale.transpose(1, 2),
+            topk_weights,
+            topk_ids,
+            a1_strides,
+            c1_strides,
+            a2_strides,
+            c2_strides,
+            workspace,
+            a_ptrs,
+            b_ptrs,
+            out_ptrs,
+            a_scales_ptrs,
+            b_scales_ptrs,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            enable_es=enable_es,
+        )
 
     topk_output = StandardTopKOutput(
         topk_weights=topk_weights,
@@ -178,17 +179,18 @@ def run_test(tp_size, batch_size, model_config, check=False):
     )
 
     # Note: Triton expects non-transposed weights
-    triton_lambda = lambda: fused_experts(
-        x,
-        w1,
-        w2,
-        topk_output,
-        moe_runner_config,
-        use_fp8_w8a8=True,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        block_shape=block_shape,
-    )
+    def triton_lambda():
+        return fused_experts(
+            x,
+            w1,
+            w2,
+            topk_output,
+            moe_runner_config,
+            use_fp8_w8a8=True,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            block_shape=block_shape,
+        )
 
     # --- Warmup ---
     print("Warming up...")

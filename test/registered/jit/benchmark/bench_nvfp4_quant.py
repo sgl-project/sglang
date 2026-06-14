@@ -163,19 +163,23 @@ def benchmark(m, n, provider):
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
     if provider == "jit":
-        fn = lambda: scaled_fp4_quant(x, global_scale)
+        def fn():
+            return scaled_fp4_quant(x, global_scale)
     elif provider == "flashinfer":
-        fn = lambda: flashinfer_fp4_quantize(
-            x,
-            global_scale,
-            BLOCK_SIZE,  # sf_vec_size
-            False,  # use_ue8m0
-            True,  # is_sf_swizzled_layout
-        )
+        def fn():
+            return flashinfer_fp4_quantize(
+                    x,
+                    global_scale,
+                    BLOCK_SIZE,  # sf_vec_size
+                    False,  # use_ue8m0
+                    True,  # is_sf_swizzled_layout
+                )
     elif provider == "aot_sgl_kernel":
-        fn = lambda: _aot_scaled_fp4_quant(x, global_scale)
+        def fn():
+            return _aot_scaled_fp4_quant(x, global_scale)
     elif provider == "torch_ref":
-        fn = lambda: _torch_ref_quant(x, global_scale)
+        def fn():
+            return _torch_ref_quant(x, global_scale)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

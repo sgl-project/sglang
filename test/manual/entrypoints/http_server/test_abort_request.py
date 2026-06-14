@@ -87,7 +87,7 @@ class TestAbortRequest(CustomTestCase):
         try:
             response = requests.get(self.health_url, timeout=5)
             return response.status_code == 200
-        except:
+        except Exception:
             return False
 
     def test_abort_during_non_streaming_generation(self):

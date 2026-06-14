@@ -108,9 +108,11 @@ def benchmark(qweight_row, qweight_col, provider):
     )
 
     if provider == "jit":
-        fn = lambda: jit_awq_dequantize(qweight, scales, qzeros)
+        def fn():
+            return jit_awq_dequantize(qweight, scales, qzeros)
     elif provider == "aot":
-        fn = lambda: aot_awq_dequantize(qweight, scales, qzeros)
+        def fn():
+            return aot_awq_dequantize(qweight, scales, qzeros)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

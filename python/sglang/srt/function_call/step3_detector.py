@@ -33,10 +33,10 @@ def parse_arguments(value: str) -> tuple[Any, bool]:
     try:
         try:
             parsed_value = json.loads(value)
-        except:
+        except Exception:
             parsed_value = ast.literal_eval(value)
         return parsed_value, True
-    except:
+    except Exception:
         return value, False
 
 

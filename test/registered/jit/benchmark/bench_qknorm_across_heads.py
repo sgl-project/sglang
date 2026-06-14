@@ -115,7 +115,8 @@ def benchmark(
         "flashinfer": flashinfer_qknorm_across_heads,
         "torch": torch_impl_qknorm_across_heads,
     }
-    fn = lambda: FN_MAP[provider](q, k, q_weight, k_weight)
+    def fn():
+        return FN_MAP[provider](q, k, q_weight, k_weight)
     return run_benchmark(fn)
 
 

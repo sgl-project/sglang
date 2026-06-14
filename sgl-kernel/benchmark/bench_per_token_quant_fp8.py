@@ -198,13 +198,16 @@ def benchmark_quantization(batch_size, seq_len, hidden_dim, provider):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "torch":
-        fn = lambda: torch_per_token_quant_fp8(x.clone())
+        def fn():
+            return torch_per_token_quant_fp8(x.clone())
     elif provider == "vllm":
         if not VLLM_AVAILABLE:
             return (0, 0, 0)
-        fn = lambda: vllm_per_token_quant_fp8(x.clone())
+        def fn():
+            return vllm_per_token_quant_fp8(x.clone())
     elif provider == "sglang":
-        fn = lambda: sglang_per_token_quant_fp8(x.clone())
+        def fn():
+            return sglang_per_token_quant_fp8(x.clone())
 
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
 

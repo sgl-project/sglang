@@ -100,9 +100,10 @@ class DotsOCRForCausalLM(nn.Module):
                 dummy_shape = [num_dummy_heads, head_dim]
             else:
                 raise RuntimeError(f"Unsupported weight with name={name}")
-            pad_func = lambda x: torch.cat(
-                [x.unflatten(0, (-1, head_dim)), x.new_zeros(dummy_shape)], dim=0
-            ).flatten(0, 1)
+            def pad_func(x):
+                return torch.cat(
+                            [x.unflatten(0, (-1, head_dim)), x.new_zeros(dummy_shape)], dim=0
+                        ).flatten(0, 1)
             wq, wk, wv = pad_func(wq), pad_func(wk), pad_func(wv)
             loaded_weight = torch.cat([wq, wk, wv], dim=0)
         if "attn.proj.weight" in name:

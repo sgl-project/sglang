@@ -53,7 +53,8 @@ def _build_mask(bs, s_txt, s_img, valid_txt_lens):
 
 def _ref_pack(q, k, v, indices):
     bs, seq = q.shape[:2]
-    flat = lambda t: t.reshape(bs * seq, *t.shape[2:])
+    def flat(t):
+        return t.reshape(bs * seq, *t.shape[2:])
     return (
         flat(q).index_select(0, indices),
         flat(k).index_select(0, indices),

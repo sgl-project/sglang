@@ -257,7 +257,8 @@ def check_moe(
     a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
     w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
     quant_blocksize = 16
-    round_up = lambda x, y: (x + y - 1) // y * y
+    def round_up(x, y):
+        return (x + y - 1) // y * y
     sf_w1_2n = round_up(2 * n, 128)
     sf_w1_k = round_up(k // quant_blocksize, 4)
     w1_blockscale = torch.empty(
