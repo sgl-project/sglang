@@ -232,6 +232,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, next_power_of_2, require_mlp_sync
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
+from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -3454,11 +3455,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = (
-            torch.profiler.record_function(_build_step_span_name(forward_batch))
-            if torch.autograd._profiler_enabled()
-            else contextlib.nullcontext()
-        )
+        step_span_ctx = profile_range(_build_step_span_name(forward_batch))
 
         canary_ctx = (
             context_tuple(
