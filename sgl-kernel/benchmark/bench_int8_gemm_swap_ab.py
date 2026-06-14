@@ -35,9 +35,9 @@ IS_CI = is_in_ci()
 # kernel constraints: K % 16 == 0 and N % 8 == 0 (validated below).
 NK_SHAPES = [
     (1024, 4096),
-    (1280, 4096),   # n == kNThreshold boundary
+    (1280, 4096),  # n == kNThreshold boundary
     (4096, 4096),
-    (4096, 8192),   # n == kM128NThreshold boundary
+    (4096, 8192),  # n == kM128NThreshold boundary
     (8192, 8192),
     (14336, 4096),
     (28672, 8192),  # Llama-3-70B MLP up_proj N

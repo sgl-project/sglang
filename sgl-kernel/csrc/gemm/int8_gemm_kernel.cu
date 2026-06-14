@@ -31,8 +31,8 @@ limitations under the License.
 #include "cutlass_extensions/epilogue/epilogue_per_row_per_col_scale.h"
 #include "cutlass_extensions/gemm/gemm_universal_base_compat.h"
 #include "cutlass_extensions/gemm/gemm_with_epilogue_visitor.h"
-#include "utils.h"
 #include "cutlass_extensions/gemm/int8_gemm_sm90_dispatch.cuh"
+#include "utils.h"
 
 using namespace cute;
 

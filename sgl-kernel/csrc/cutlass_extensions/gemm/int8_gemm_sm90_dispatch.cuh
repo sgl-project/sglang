@@ -4,6 +4,11 @@
 
 #pragma once
 
+// torch include first so this header is self-contained: the shared
+// scaled_mm_epilogues_c3x.hpp below references torch::Tensor, and clang-format
+// may sort this header's include ahead of the .cu's own torch includes.
+#include <torch/all.h>
+
 #include "cutlass_extensions/common.hpp"
 #include "cutlass_extensions/epilogue/scaled_mm_epilogues_c3x.hpp"
 #include "cutlass_extensions/gemm/cutlass_gemm_caller.cuh"
