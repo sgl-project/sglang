@@ -166,6 +166,9 @@ DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers
 # MOVA video generation models
 DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"
 
+# LongCat video generation models
+DEFAULT_LONGCAT_VIDEO_MODEL_NAME_FOR_TEST = "meituan-longcat/LongCat-Video"
+
 # SANA-WM world model (TI2V with optional camera conditioning)
 DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST = "Efficient-Large-Model/SANA-WM_bidirectional"
 DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST = (
