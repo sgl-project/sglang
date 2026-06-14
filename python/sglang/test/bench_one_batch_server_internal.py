@@ -26,6 +26,7 @@ from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 DEFAULT_TIMEOUT = 600
+multiprocessing.set_start_method("spawn", force=True)
 
 
 def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
