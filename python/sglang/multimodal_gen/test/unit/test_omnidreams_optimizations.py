@@ -10,7 +10,6 @@ Tests the correctness of:
 All tests are CPU-only; no checkpoint or GPU required.
 """
 
-import types
 from collections import OrderedDict
 
 import torch
@@ -230,7 +229,7 @@ def test_kv_cache_split_copy_no_clone_in_source():
     source = inspect.getsource(BlockKVCache._roll_local_window_left)
     # .clone() should not appear in the method body (only possibly in docstrings/comments)
     # Strip comments and check
-    lines = [l for l in source.split('\n') if not l.strip().startswith('#')]
+    lines = [ln for ln in source.split('\n') if not ln.strip().startswith('#')]
     code = '\n'.join(lines)
     # The word "clone" may appear in a comment but not as a .clone() call
     assert ".clone()" not in code, f".clone() call found in _roll_local_window_left:\n{code}"
@@ -412,7 +411,7 @@ def test_rope_cross_attn_does_not_receive_cos_sin_cache():
     so rope_cos_sin should only go to self_attn, never to cross_attn.
     """
     # Read the source and verify cross_attn call does not contain rope_cos_sin
-    import inspect, os
+    import os
     dit_path = os.path.join(
         os.path.dirname(__file__), "..", "..",
         "runtime", "models", "dits", "omnidreams.py",
@@ -422,11 +421,11 @@ def test_rope_cross_attn_does_not_receive_cos_sin_cache():
         block_forward = f.read().split("def forward(self,")[1]
         block_forward = block_forward.split("def _cross_view_attn_forward")[0]
         # The cross_attn call line
-        cross_call_lines = [l for l in block_forward.split('\n') if 'self.cross_attn(' in l and 'cross_attn' in l]
+        cross_call_lines = [ln for ln in block_forward.split('\n') if 'self.cross_attn(' in ln and 'cross_attn' in ln]
         # There should be exactly one cross_attn call (the self-attn call also has cross_attn in the name)
         # The cross_attn call is: x + gate_c * self.cross_attn(normed, context=context, cross_kv=cross_attn_kv)
         # It should NOT contain rope_cos_sin
-        cross_attn_line = [l for l in cross_call_lines if 'context=context' in l]
+        cross_attn_line = [ln for ln in cross_call_lines if 'context=context' in ln]
         if cross_attn_line:
             assert "rope_cos_sin" not in cross_attn_line[0], (
                 "cross_attn must NOT receive rope_cos_sin. Found in line:\n"
@@ -572,7 +571,7 @@ def test_sp_cross_attention_uses_local_attention():
 
 def test_sp_block_init_uses_correct_attention_classes():
     """OmniDreamsBlock.__init__ must use Self/Cross classes, not the old alias."""
-    import inspect, os
+    import os
     dit_path = os.path.join(
         os.path.dirname(__file__), "..", "..",
         "runtime", "models", "dits", "omnidreams.py",
@@ -594,7 +593,7 @@ def test_sp_block_init_uses_correct_attention_classes():
 
 def test_sp_self_attention_no_context_arg_in_block_call():
     """Block.forward must NOT pass 'context' to self_attn (self-attn has no context)."""
-    import inspect, os
+    import os
     dit_path = os.path.join(
         os.path.dirname(__file__), "..", "..",
         "runtime", "models", "dits", "omnidreams.py",
@@ -603,7 +602,7 @@ def test_sp_self_attention_no_context_arg_in_block_call():
         source = f.read()
     # Extract the self-attn call line from Block.forward
     block_forward = source.split("def forward(self,")[1].split("def _cross_view_attn_forward")[0]
-    self_call = [l for l in block_forward.split('\n') if 'self.self_attn(' in l and ' ' in l]
+    self_call = [ln for ln in block_forward.split('\n') if 'self.self_attn(' in ln and ' ' in ln]
     if self_call:
         call_line = self_call[0].strip()
         assert "context=context" not in call_line, (
@@ -619,7 +618,7 @@ def test_sp_self_attention_no_context_arg_in_block_call():
 
 def test_sp_cross_attention_no_rope_in_block_call():
     """Block.forward must NOT pass rope_freqs to cross_attn (cross-attn has no RoPE)."""
-    import inspect, os
+    import os
     dit_path = os.path.join(
         os.path.dirname(__file__), "..", "..",
         "runtime", "models", "dits", "omnidreams.py",
@@ -627,7 +626,7 @@ def test_sp_cross_attention_no_rope_in_block_call():
     with open(dit_path) as f:
         source = f.read()
     block_forward = source.split("def forward(self,")[1].split("def _cross_view_attn_forward")[0]
-    cross_call = [l for l in block_forward.split('\n') if 'self.cross_attn(' in l and 'context=context' in l]
+    cross_call = [ln for ln in block_forward.split('\n') if 'self.cross_attn(' in ln and 'context=context' in ln]
     if cross_call:
         call_line = cross_call[0].strip()
         assert "rope_freqs" not in call_line, (
@@ -639,7 +638,7 @@ def test_sp_cross_attention_no_rope_in_block_call():
 
 def test_sp_precompute_cross_attn_kv_still_works():
     """precompute_cross_attn_kv must iterate blocks and access cross_attn attributes."""
-    import inspect, os
+    import os
     dit_path = os.path.join(
         os.path.dirname(__file__), "..", "..",
         "runtime", "models", "dits", "omnidreams.py",
