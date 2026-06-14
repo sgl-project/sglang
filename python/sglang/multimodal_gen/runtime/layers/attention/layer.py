@@ -1,8 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import os
 import functools
+import os
 from contextlib import nullcontext
 from typing import Type
 

@@ -569,6 +569,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
                 DiffusionBreakableCudaGraphRunner,
             )
+
             runner = DiffusionBreakableCudaGraphRunner(
                 self.transformer, get_local_torch_device()
             )
