@@ -141,9 +141,7 @@ def _warmup_resolution_alignment(server_args: ServerArgs) -> int:
     vae_stride = getattr(pipeline_config, "vae_stride", None)
     if vae_stride is not None:
         spatial_stride = (
-            vae_stride[-2:]
-            if isinstance(vae_stride, (tuple, list))
-            else (vae_stride,)
+            vae_stride[-2:] if isinstance(vae_stride, (tuple, list)) else (vae_stride,)
         )
         for stride in spatial_stride:
             alignment = max(alignment, int(stride))
