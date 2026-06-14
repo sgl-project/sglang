@@ -2,9 +2,11 @@
 // minimax-m3.jsx cells. See _deployment.jsx for the speed/accuracy schema.
 //
 // SPEED — bench_serving --flush-cache, random isl2048/osl256, max_concurrency 64,
-// CUDA graph on. B200 (tp4, MXFP8, MSA fmha_sm100 path) and H200 (tp8, bf16,
-// built-in Triton sparse) are measured on PR #27944 — warm steady-state from a
-// 3-run sweep (the cold-start first run, ~2x slower, is excluded). B300 / GB300
+// CUDA graph on. B200 (tp8, MXFP8, MSA fmha_sm100 path; re-measured 2026-06-15
+// with piecewise CUDA graph default-on) and H200 (tp8, bf16, built-in Triton
+// sparse) are measured on PR #27944 — warm steady-state from a 3-run sweep (the
+// B200 3-run is identical; the H200 cold-start first run, ~2x slower, is
+// excluded). B300 / GB300
 // rows are the earlier sglang main (2026-06-11) tp4 MSA
 // numbers, pending a #27944 re-measure on their own boxes. GB200 is a bare-match
 // stub (inferred-supported, not benchmarked). AMD: MI355X at 8-GPU tp8 (native
@@ -13,15 +15,14 @@
 // (stubs). (sgl-eval does NOT measure serving throughput — TTFT/TPOT/tok-s come
 // from sglang.bench_serving.)
 //
-// GSM8K — unified on a SINGLE harness: sgl-eval (github.com/sgl-project/sgl-eval)
-// `run gsm8k`, full 1319-question test split, chat endpoint with --thinking
-// (M3's reasoning path) + M3's recommended sampling (temp 1.0 / top_p 0.95 /
-// top_k 40), symbolic grading. This is the config's Reproduce command. B200
-// (MSA path) and H200 (bf16, built-in Triton sparse) are measured on PR #27944.
-// 3-run results: H200 is stable at 97.04% (std 0.0); B200's fresh-server 94.4%
-// (= greedy) drifts down over sustained runs interleaved with bench (an
-// MSA-under-load serving issue under investigation), so it reports the
-// fresh-server value, not the drifted mean.
+// GSM8K / GPQA — unified on a SINGLE harness: sgl-eval (github.com/sgl-project/sgl-eval)
+// `run gsm8k` (full 1319) / `run gpqa` (GPQA Diamond 198, n-repeats 4), chat
+// endpoint with --thinking (M3's reasoning path) + M3's recommended sampling
+// (temp 1.0 / top_p 0.95), symbolic grading. This is the config's Reproduce command.
+// H200 is stable at GSM8K 97.04% (std 0.0). B200 was re-measured 2026-06-15 on
+// minimax-m3-upstream (piecewise + MSA decode fix): GSM8K 96.51% recommended /
+// 96.89% greedy (stable single-run), GPQA pass@1[avg-of-4] 89.14% — the merged
+// MSA decode fix resolves the earlier fresh-server-94.4%-then-drift under-load issue.
 // Per-platform re-measurement under sgl-eval is in progress; rows still pending
 // show `gsm8k_pct: null` (no GSM8K row rendered) with the legacy-harness number
 // kept in a comment. Legacy harnesses were NOT comparable across platforms
@@ -29,14 +30,18 @@
 // which is exactly why we re-measure on one harness.
 export const benchmarks = [
   {
+    // B200 re-measured 2026-06-15 at tp8 on minimax-m3-upstream (piecewise CUDA
+    // graph default-on + AR-fusion revert/off + MSA decode fix). The earlier
+    // #27944 tp4 speed + GSM8K drift were pre-fix; the merged MSA decode fix
+    // resolves the drift (stable single-run greedy 96.89% / recommended 96.51%).
     match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "PR #27944",
+    sglang_version: "PR #27944 (piecewise, 2026-06-15)",
     speed: [
-      // bench_serving --flush-cache, MSA path; warm steady-state (3-run, cold-start run-1 excluded).
+      // bench_serving --flush-cache, MSA path, tp8; warm steady-state (3-run, identical).
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
-        ttft_ms: 749, tpot_ms: 61.5, tokens_per_sec_per_gpu: 249 },
+        ttft_ms: 1580, tpot_ms: 24.1, tokens_per_sec_per_gpu: 265 },
     ],
-    accuracy: { gsm8k_pct: 94.4 }, // #27944, sgl-eval --thinking, full 1319, recommended sampling (temp 1.0/top_p 0.95/top_k 40), MSA path; fresh-server 94.4% (greedy 94.16%; --no-thinking 88.6%). NOTE: 3 sustained runs interleaved with bench drifted 94.4->89.2->86.2 — an MSA-under-load serving issue (under investigation), not the model accuracy.
+    accuracy: { gpqa_pct: 89.1, gsm8k_pct: 96.5 }, // 2026-06-15, sgl-eval --thinking, recommended sampling (temp 1.0/top_p 0.95), tp8. GSM8K full 1319 = 96.51% (greedy 96.89%). GPQA Diamond 198, n-repeats 4 = pass@1[avg-of-4] 89.14% +/-1.73% (pass@4 95.45%, majority@4 93.52%).
   },
   {
     // Hopper H200: bf16 build (MXFP8 is Blackwell-only) at tp8, built-in Triton
