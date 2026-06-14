@@ -17,11 +17,20 @@ namespace {
 constexpr int kThreadsPerGroup = 16;
 
 __device__ __forceinline__ float GroupReduceMax(float val) {
-  // Portable warp-reduce primitive: CUDA emits __shfl_xor_sync (width=32), HIP
-  // emits __shfl_xor with an explicit kThreadsPerGroup sub-group width. The
-  // previous hand-rolled __shfl_xor_sync used a 32-bit mask + warp==32 lane
-  // math, which fails to compile on ROCm/gfx942 (HIP requires a 64-bit mask).
+#ifdef USE_ROCM
+  // AMD implementation: the CUDA path below uses a 32-bit shuffle mask +
+  // warp==32 lane math, which fails to compile on ROCm/gfx942 (HIP warps are
+  // 64-wide and require a 64-bit mask). Use the portable warp-reduce primitive,
+  // which emits __shfl_xor with an explicit kThreadsPerGroup sub-group width.
   return device::warp::reduce_max<kThreadsPerGroup>(val);
+#else
+  unsigned mask = threadIdx.x % 32 >= 16 ? 0xffff0000 : 0x0000ffff;
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
+  return val;
+#endif
 }
 
 template <bool kScaleUE8M0>

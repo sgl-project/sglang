@@ -115,9 +115,7 @@ struct ActivationKernel {
   static constexpr auto kBlockSize = 256u;
 
   using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
-#ifdef USE_ROCM
   using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
-#endif
 
   template <ActivationKind kAct, bool kFilterExpert>
   static constexpr kernel_fn_t activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>;
@@ -209,14 +207,11 @@ struct ActivationKernel {
   template <ActivationKind kAct>
   static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL>;
 
-#ifdef USE_ROCM
-  // ROCm-only signature: decltype() of the `static constexpr auto unary_kernel`
-  // var deduces a const-qualified function-pointer type, which clang-HIP
-  // (gfx942) refuses to initialize from an lvalue / nullptr. Use the explicit
-  // non-const fn-pointer type instead (mirrors select_kernel's kernel_fn_t).
-  // The body is identical to the CUDA branch below; only the return type
-  // differs (kept as separate branches so each has balanced braces for
-  // clang-format).
+  // Use the explicit non-const function-pointer type (mirrors select_kernel's
+  // kernel_fn_t) rather than a trailing `decltype(unary_kernel<...>)` return,
+  // which deduces a const-qualified pointer that clang-HIP (gfx942) refuses to
+  // initialize from an lvalue / nullptr. nvcc accepts both; this form works for
+  // CUDA and ROCm alike.
   static unary_kernel_fn_t select_unary_kernel(const std::string& type) {
     using namespace host;
     if (type == "relu2") {
@@ -226,18 +221,6 @@ struct ActivationKernel {
     }
     return nullptr;
   }
-#else
-  static auto select_unary_kernel(const std::string& type)
-      -> decltype(ActivationKernel::template unary_kernel<ActivationKind::kReLU2>) {
-    using namespace host;
-    if (type == "relu2") {
-      return ActivationKernel::template unary_kernel<ActivationKind::kReLU2>;
-    } else {
-      Panic("unsupported unary activation type: ", type);
-    }
-    return nullptr;
-  }
-#endif
 
   static void run_unary_activation(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
     using namespace host;
