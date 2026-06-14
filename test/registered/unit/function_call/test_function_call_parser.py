@@ -3360,6 +3360,77 @@ class TestGlm47MoeDetector(unittest.TestCase):
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
 
+    def test_streaming_value_ending_with_less_than(self):
+        """Streaming: a value whose last character overlaps the start of </arg_value>.
+
+        When the value ends with '<', the next character emitted by the model
+        is the '<' that opens the closing tag. Without correct prefix-suffix
+        sliding, the buffer becomes '<<', fails the prefix check, and the
+        entire buffer is ejected as content — at which point the actual
+        closing tag is never matched and "</arg_value>" leaks into the
+        emitted JSON arguments.
+        """
+
+        def _stream(chunks):
+            detector = Glm47MoeDetector()
+            emitted = ""
+            for chunk in chunks:
+                result = detector.parse_streaming_increment(chunk, self.tools)
+                for call in result.calls:
+                    if call.parameters:
+                        emitted += call.parameters
+            return emitted
+
+        # Single chunk, value ending in '<'.
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>.<</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+        )
+        emitted = _stream([text])
+        self.assertEqual(json.loads(emitted), {"city": ".<", "date": "2024-06-27"})
+
+        # Realistic chunking: value and closing tag arrive in separate chunks.
+        emitted = _stream(
+            [
+                "<tool_call>get_weather<arg_key>city</arg_key><arg_value>",
+                ".<",
+                "</arg_value><arg_key>date</arg_key>"
+                "<arg_value>2024-06-27</arg_value></tool_call>",
+            ]
+        )
+        self.assertEqual(json.loads(emitted), {"city": ".<", "date": "2024-06-27"})
+
+        # Pathological chunking: every character on its own.
+        emitted = _stream(list(text))
+        self.assertEqual(json.loads(emitted), {"city": ".<", "date": "2024-06-27"})
+
+    def test_streaming_value_ending_with_closing_tag_prefix(self):
+        """Streaming: a value ending with a longer prefix of </arg_value>.
+
+        Same class of bug as the trailing-'<' case, but with a multi-char
+        overlap. The state machine must drop the smallest leading chunk such
+        that what remains is a prefix of "</arg_value>" — not eject the whole
+        buffer.
+        """
+        detector = Glm47MoeDetector()
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value></arg_va</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+        )
+        emitted = ""
+        for chunk in list(text):
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    emitted += call.parameters
+        self.assertEqual(
+            json.loads(emitted), {"city": "</arg_va", "date": "2024-06-27"}
+        )
+
 
 class TestJsonArrayParser(unittest.TestCase):
     def setUp(self):
