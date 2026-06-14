@@ -253,7 +253,6 @@ class MindSporeForCausalLM(torch.nn.Module):
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
-            and not forward_batch.forward_mode.is_draft_extend()
             and not forward_batch.forward_mode.is_target_verify()
         )
         if forward_batch.extend_prefix_lens is not None:

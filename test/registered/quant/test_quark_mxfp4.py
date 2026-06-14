@@ -1,4 +1,5 @@
 import io
+import os
 import re
 import unittest
 
@@ -10,6 +11,7 @@ import time
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import is_cuda_alike, mxfp_supported
@@ -18,15 +20,22 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
 
 class TestOnlineQuantizationMemoryLoad(CustomTestCase):
     runner_args = []
+    environment = {}
 
     @classmethod
     def setUpClass(cls):
+        if torch.cuda.device_count() < cls.tp:
+            raise unittest.SkipTest(
+                f"test requires {cls.tp} devices, only {torch.cuda.device_count()} are available."
+            )
+
         if not mxfp_supported():
             raise unittest.SkipTest(
                 "online MXFP4 quantization requires an AMD ROCm device with "
@@ -54,6 +63,14 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
+
+        cls.original_envs = {}
+        for env_name, env_value in cls.environment.items():
+            original_env = os.environ.get(env_name, None)
+            if original_env is not None:
+                cls.original_envs[env_name] = os.environ.get(env_name, None)
+
+            os.environ[env_name] = env_value
 
         url = cls.base_url + "/health"
         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
@@ -108,6 +125,9 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        for env_name, env_value in cls.original_envs.items():
+            os.environ[env_name] = env_value
+
         kill_process_tree(cls.process.pid)
         cls.stdout.close()
         cls.stderr.close()
@@ -153,6 +173,7 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
 class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
     model = "Qwen/Qwen3-8B"
+    tp = 1
 
     def test_peak_memory(self):
         # Original Qwen/Qwen3-8B BF16 model: 15.268 GiB
@@ -171,6 +192,7 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     # - ibm-granite/granite-3.0-3b-a800m-base: dtype issue with fp16 in AITER MOE MLP activation
     # so using a large model here.
     model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    tp = 1
     # TODO: test TP>=2 with an other model (Qwen/Qwen3-30B-A3B-Instruct-2507 crashes in this case as 768/2 = 384, and 384/32 = 12 not divisible by BLOCK_SIZE_N=8. in fused_dynamic_mxfp4_quant_moe_sort.
 
     def test_peak_memory(self):
@@ -182,6 +204,118 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 reference accuracy: 0.94
         self._test_gsm8k(accuracy_threshold=0.89)
+
+
+class TestFP8ToMXFP4DenseTP1(TestOnlineQuantizationMemoryLoad):
+    tp = 1
+    model = "Qwen/Qwen3-8B-FP8"
+
+    def test_peak_memory(self):
+        # Original Qwen/Qwen3-8B-FP8 model: 8.801 GiB (TP=1, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=6.5, test_start=False, add_peak_memory_before_load=True
+        )
+
+    def test_gsm8k(self):
+        # Original Qwen/Qwen3-8B-FP8 reference accuracy: ~0.92
+        self._test_gsm8k(accuracy_threshold=0.87)
+
+
+class TestFP8ToMXFP4DenseTP2(TestOnlineQuantizationMemoryLoad):
+    tp = 2
+    model = "Qwen/Qwen3-8B-FP8"
+
+    def test_peak_memory(self):
+        # Original Qwen/Qwen3-8B-FP8 model: 4.663 GiB (TP=2, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=4.2, test_start=False, add_peak_memory_before_load=True
+        )
+
+    def test_gsm8k(self):
+        # Original Qwen/Qwen3-8B-FP8 reference accuracy: ~0.92
+        self._test_gsm8k(accuracy_threshold=0.87)
+
+
+class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
+    model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"  # FP8 model
+    tp = 1
+
+    def test_peak_memory(self):
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 model: 29.103 GiB (TP=1, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=18.5, test_start=False, add_peak_memory_before_load=True
+        )
+
+    def test_gsm8k(self):
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948
+        self._test_gsm8k(accuracy_threshold=0.92)
+
+
+@unittest.skipIf(is_in_ci(), "local test only")
+class TestDeepSeekFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
+    # Loading should take ~51.65 seconds on TP=8 on MI355X.
+    # model = "deepseek-ai/DeepSeek-V3.2"  # FP8 model
+    model = "deepseek-ai/DeepSeek-V3.2"
+    tp = 8
+
+    def test_peak_memory(self):
+        # Original deepseek-ai/DeepSeek-V3.2 model: 80.366 GiB (TP=8, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=70, test_start=True, add_peak_memory_before_load=False
+        )  # TP=8
+
+    def test_gsm8k(self):
+        # Original deepseek-ai/DeepSeek-V3.2 reference accuracy: ~0.948
+        self._test_gsm8k(accuracy_threshold=0.94)
+
+
+@unittest.skipIf(is_in_ci(), "local test only")
+class TestKimiK2FP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
+    model = "moonshotai/Kimi-K2-Instruct-0905"  # FP8 model
+    tp = 8
+
+    # Same as in test/registered/amd/test_kimi_k2_instruct.py
+    runner_args = [
+        "--decode-attention-backend",
+        "triton",
+        "--prefill-attention-backend",
+        "aiter",
+        "--trust-remote-code",
+    ]
+
+    # Same as in test/registered/amd/test_kimi_k2_instruct.py, getting an error otherwise.
+    environment = {"SGLANG_ROCM_FUSED_DECODE_MLA": "0"}
+
+    def test_peak_memory(self):
+        # Original moonshotai/Kimi-K2-Instruct-0905 model: 121.020 GiB (TP=8, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=82, test_start=True, add_peak_memory_before_load=False
+        )  # TP=8
+
+    def test_gsm8k(self):
+        # Original moonshotai/Kimi-K2-Instruct-0905 reference accuracy: ~0.962
+        self._test_gsm8k(accuracy_threshold=0.96)
+
+
+@unittest.skipIf(is_in_ci(), "local test only")
+class TestMiniMaxFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
+    model = "MiniMaxAI/MiniMax-M2.1"  # FP8 model
+
+    tp = 2
+    # NOTE: this test is failing in FP16 (default dtype of the original MiniMax-M2.1 model).
+    # Hence the usage of `--dtype bfloat16`
+    # NOTE: this test requires the following fix for TP>1: https://github.com/sgl-project/sglang/pull/18310
+    runner_args = ["--trust-remote-code", "--dtype", "bfloat16"]
+
+    def test_peak_memory(self):
+        # Original MiniMaxAI/MiniMax-M2.1 model: 107.375 GiB (TP=2, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=72, test_start=True, add_peak_memory_before_load=False
+        )  # TP=2
+
+    def test_gsm8k(self):
+        # Original MiniMaxAI/MiniMax-M2.1 reference accuracy: 0.954
+        self._test_gsm8k(accuracy_threshold=0.92)
 
 
 if __name__ == "__main__":
