@@ -525,6 +525,10 @@ class C4IndexerBackendMixin:
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
                 fn = fp8_paged_mqa_logits_torch
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TRITON.get():
+            from .triton_fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
+
+            fn = fp8_paged_mqa_logits_triton
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 

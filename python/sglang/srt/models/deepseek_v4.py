@@ -66,7 +66,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.mhc import mhc_fused_post_pre
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
@@ -1013,6 +1012,127 @@ class MQALayer(nn.Module):
         return o
 
 
+# -----------------------------------------------------------------------------
+# Triton fallback for `hc_split_sinkhorn` (TileLang kernel in
+# sglang.srt.layers.mhc). Used on platforms / builds where TileLang is
+# unavailable. Functionally equivalent (numerically may differ within float
+# eps).
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _hc_split_sinkhorn_triton_kernel(
+    mixes_ptr,  # [N, (2 + HC) * HC] float32
+    hc_scale_ptr,  # [3]                float32
+    hc_base_ptr,  # [(2 + HC) * HC]    float32
+    pre_ptr,  # [N, HC]            float32
+    post_ptr,  # [N, HC]            float32
+    comb_ptr,  # [N, HC, HC]        float32
+    N,
+    HC: tl.constexpr,
+    SINKHORN_ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= N:
+        return
+
+    HC2: tl.constexpr = HC * HC
+    MIX_HC: tl.constexpr = (2 + HC) * HC
+
+    s0 = tl.load(hc_scale_ptr + 0)
+    s1 = tl.load(hc_scale_ptr + 1)
+    s2 = tl.load(hc_scale_ptr + 2)
+
+    h = tl.arange(0, HC)
+
+    pre_mix = tl.load(mixes_ptr + pid * MIX_HC + h)
+    pre_base = tl.load(hc_base_ptr + h)
+    pre = tl.sigmoid(pre_mix * s0 + pre_base) + EPS
+    tl.store(pre_ptr + pid * HC + h, pre)
+
+    post_mix = tl.load(mixes_ptr + pid * MIX_HC + HC + h)
+    post_base = tl.load(hc_base_ptr + HC + h)
+    post = 2.0 * tl.sigmoid(post_mix * s1 + post_base)
+    tl.store(post_ptr + pid * HC + h, post)
+
+    j = tl.arange(0, HC)[:, None]
+    k = tl.arange(0, HC)[None, :]
+    idx = j * HC + k
+    comb_mix = tl.load(mixes_ptr + pid * MIX_HC + 2 * HC + idx)
+    comb_base = tl.load(hc_base_ptr + 2 * HC + idx)
+    comb = comb_mix * s2 + comb_base
+
+    row_max = tl.max(comb, axis=1)[:, None]
+    comb = tl.exp(comb - row_max)
+    row_sum = tl.sum(comb, axis=1)[:, None]
+    comb = comb / row_sum + EPS
+
+    col_sum = tl.sum(comb, axis=0)[None, :]
+    comb = comb / (col_sum + EPS)
+
+    for _ in tl.static_range(SINKHORN_ITERS - 1):
+        row_sum = tl.sum(comb, axis=1)[:, None]
+        comb = comb / (row_sum + EPS)
+        col_sum = tl.sum(comb, axis=0)[None, :]
+        comb = comb / (col_sum + EPS)
+
+    tl.store(comb_ptr + pid * HC2 + idx, comb)
+
+
+def _hc_split_sinkhorn_triton(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+):
+    """Triton fallback for hc_split_sinkhorn.
+
+    Same outputs (``pre``, ``post``, ``comb``) as the TileLang kernel in
+    ``sglang.srt.layers.mhc``. ``hc_mult`` must be a power of two for
+    ``tl.arange`` to be valid (typical values are 4 / 8).
+    """
+    assert mixes.dtype == torch.float32, "mixes must be float32"
+    assert hc_scale.dtype == torch.float32 and hc_base.dtype == torch.float32
+    assert hc_mult & (hc_mult - 1) == 0, "hc_mult must be a power of two"
+    assert sinkhorn_iters >= 1
+
+    b, s, last = mixes.size()
+    assert last == (2 + hc_mult) * hc_mult
+
+    n = b * s
+    pre = mixes.new_empty(b, s, hc_mult)
+    post = mixes.new_empty(b, s, hc_mult)
+    comb = mixes.new_empty(b, s, hc_mult, hc_mult)
+
+    if n == 0:
+        return pre, post, comb
+
+    mixes_flat = mixes.reshape(n, (2 + hc_mult) * hc_mult).contiguous()
+    pre_flat = pre.view(n, hc_mult)
+    post_flat = post.view(n, hc_mult)
+    comb_flat = comb.view(n, hc_mult, hc_mult)
+    hc_base_c = hc_base.contiguous()
+    hc_scale_c = hc_scale.contiguous()
+
+    _hc_split_sinkhorn_triton_kernel[(n,)](
+        mixes_flat,
+        hc_scale_c,
+        hc_base_c,
+        pre_flat,
+        post_flat,
+        comb_flat,
+        n,
+        HC=hc_mult,
+        SINKHORN_ITERS=sinkhorn_iters,
+        EPS=eps,
+        num_warps=1,
+    )
+    return pre, post, comb
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1132,6 +1252,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
 
             if self.use_fused_mhc_post_pre:
+                from sglang.srt.layers.mhc import mhc_fused_post_pre
+
                 for num_tokens in token_counts:
                     for path_name, hc_fn, hc_scale, hc_base, norm in paths:
                         tic = time.perf_counter()
@@ -1288,16 +1410,26 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        from sglang.srt.layers.mhc import hc_split_sinkhorn
+        if _is_cuda:
+            from sglang.srt.layers.mhc import hc_split_sinkhorn
 
-        pre, post, comb = hc_split_sinkhorn(
-            mixes,
-            hc_scale,
-            hc_base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
-        )
+            pre, post, comb = hc_split_sinkhorn(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
+        else:
+            pre, post, comb = _hc_split_sinkhorn_triton(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
         return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
 
@@ -1358,6 +1490,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
+            from sglang.srt.layers.mhc import mhc_fused_post_pre
+
             residual, post, comb, hidden_states = mhc_fused_post_pre(
                 hidden_states,
                 prev_residual,
@@ -1427,6 +1561,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused_mhc is not None:
                 residual, hidden_states, post, comb, norm_fused = fused_mhc
             else:
+                from sglang.srt.layers.mhc import mhc_fused_post_pre
+
                 residual, post, comb, hidden_states = mhc_fused_post_pre(
                     hidden_states,
                     residual,
