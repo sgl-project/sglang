@@ -147,20 +147,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return OutputBatch(output={"released": released, "session_id": session_id})
 
     def _configure_persistent_torch_compile_cache(self) -> None:
-        """Persist torch.compile's Inductor/Triton cache across restarts.
-
-        By default Inductor caches to an ephemeral ``/tmp`` dir that is wiped on
-        every fresh container/pod, so each cold start recompiles the DiT from
-        scratch (tens of seconds to minutes for a large model). Point the cache
-        at the diffusion cache root instead; cache entries are content-hashed by
-        torch, so reuse is safe, and a warm restart -- or a copy of the dir to
-        another machine -- skips recompilation.
-
-        We override only when the var is unset or still points at torch's
-        ephemeral ``$TMPDIR/torchinductor_*`` default (torch sets it on import,
-        before this runs, so ``setdefault`` would be a no-op). An explicit
-        non-temp user path (e.g. shared storage) is left untouched.
-        """
+        """Persist torch.compile's Inductor/Triton cache across restarts"""
         compile_cache_root = os.path.join(
             envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
         )
@@ -177,7 +164,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             try:
                 os.makedirs(cache_path, exist_ok=True)
             except OSError as e:
-                logger.warning("Could not create torch.compile cache dir %s: %s", cache_path, e)
+                logger.warning(
+                    "Could not create torch.compile cache dir %s: %s", cache_path, e
+                )
                 continue
             os.environ[env_name] = cache_path
         logger.info(
