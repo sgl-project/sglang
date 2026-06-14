@@ -123,7 +123,7 @@ jobs:
               fi
               OVERLAY_TAGS="$(echo "${OVERLAY_TAGS}" | jq -c \
                 --arg c "${C}" --argjson b "${BASES}" --argjson o "${OUTS}" \
-                '.[$c] = {bases:$b, outs:$o}')'
+                '.[$c] = {bases:$b, outs:$o}')"
             done
             CUDAS_JSON="$(echo "${CUDAS_INPUT}" | jq -c -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')"
             echo "overlay_cudas_json=${CUDAS_JSON}" >> $GITHUB_OUTPUT
