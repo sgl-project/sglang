@@ -9,6 +9,7 @@ page sizes, and batch sizes.
 """
 
 import unittest
+from typing import Optional
 
 import torch
 
@@ -23,23 +24,42 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
-def _reference_gather(req_to_token, req_pool_indices, page_size, max_seq_pages):
-    """Legacy trtllm_mha build: strided gather of token slots, then // page_size."""
+def _build_page_table_reference(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    page_size: int,
+    max_num_pages: int,
+    full_to_swa: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Reference impl: host-side strided gather, then // page_size.
+
+    Sized to the batch max (uses a host-side ``.max()``, which the kernel path
+    avoids). Returns the same (page_table, swa_page_table) block-id tables as
+    ``_build_page_table_kernel`` for the columns each request uses.
+    """
+    max_len = int(cache_seqlens.max().item())
+    max_seq_pages = (max_len + page_size - 1) // page_size
     strided = torch.arange(
         0, req_to_token.shape[1], page_size, device=req_to_token.device
     )[:max_seq_pages]
-    page_indices = req_to_token[req_pool_indices[:, None], strided[None, :]]
-    return page_indices  # raw token slots at page boundaries
+    slots = req_to_token[req_pool_indices[:, None], strided[None, :]]  # token slots
+    page_table = slots // page_size
+    swa_page_table = (
+        full_to_swa[slots] // page_size if full_to_swa is not None else None
+    )
+    return page_table, swa_page_table
 
 
-def _kernel_build(
-    req_to_token,
-    req_pool_indices,
-    cache_seqlens,
-    page_size,
-    max_num_pages,
-    full_to_swa=None,
-):
+def _build_page_table_kernel(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    page_size: int,
+    max_num_pages: int,
+    full_to_swa: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Device-side impl."""
     dev = req_to_token.device
     bs = req_pool_indices.shape[0]
     page_table = torch.zeros((bs, max_num_pages), dtype=torch.int32, device=dev)
@@ -87,7 +107,7 @@ class TestTrtllmMhaPageTable(CustomTestCase):
                 0, n_slots, (n_slots,), dtype=torch.int32, device=dev
             )
 
-        pt_kernel, swa_kernel = _kernel_build(
+        pt_kernel, swa_kernel = _build_page_table_kernel(
             req_to_token,
             req_pool_indices,
             cache_seqlens,
@@ -95,14 +115,14 @@ class TestTrtllmMhaPageTable(CustomTestCase):
             max_num_pages,
             full_to_swa=full_to_swa,
         )
-
-        max_len = int(cache_seqlens.max().item())
-        max_seq_pages = (max_len + page_size - 1) // page_size
-        slots_ref = _reference_gather(
-            req_to_token, req_pool_indices, page_size, max_seq_pages
+        pt_ref, swa_ref = _build_page_table_reference(
+            req_to_token,
+            req_pool_indices,
+            cache_seqlens,
+            page_size,
+            max_num_pages,
+            full_to_swa=full_to_swa,
         )
-        pt_ref = slots_ref // page_size
-        swa_ref = (full_to_swa[slots_ref] // page_size) if swa else None
 
         for i in range(bs):
             npages = (int(cache_seqlens[i].item()) + page_size - 1) // page_size
