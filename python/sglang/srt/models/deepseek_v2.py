@@ -214,6 +214,43 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _zero_padded_token_tail(
+    hidden_states: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+) -> Optional[torch.Tensor]:
+    num_token_non_padded = forward_batch.num_token_non_padded
+    if hidden_states is None or num_token_non_padded is None:
+        return hidden_states
+    if not isinstance(hidden_states, torch.Tensor):
+        return hidden_states
+    # Decode/spec-decode CGs capture num_token_non_padded as 0; only EP>1
+    # ever writes it. Plain prefill still needs the zeroing.
+    if (
+        get_moe_expert_parallel_world_size() == 1
+        and not forward_batch.forward_mode.is_extend_without_speculative()
+    ):
+        return hidden_states
+
+    real = num_token_non_padded.view(())
+    token_idx = torch.arange(
+        hidden_states.shape[0],
+        dtype=real.dtype,
+        device=hidden_states.device,
+    )
+    view_shape = (hidden_states.shape[0],) + (1,) * (hidden_states.ndim - 1)
+    # In-place so any side-channel state on the tensor remains
+    hidden_states.masked_fill_(token_idx.reshape(view_shape) >= real, 0)
+    return hidden_states
+
+
+def _topk_num_token_non_padded(
+    forward_batch: Optional[ForwardBatch],
+) -> Optional[torch.Tensor]:
+    if forward_batch is None:
+        return None
+    return forward_batch.num_token_non_padded
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -856,6 +893,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    forward_batch=forward_batch,
                 )
             else:
                 return self.forward_normal(
@@ -865,6 +903,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    forward_batch=forward_batch,
                 )
         else:
             return self.forward_deepep(
@@ -879,6 +918,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
@@ -902,6 +942,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                num_token_non_padded=_topk_num_token_non_padded(forward_batch),
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
@@ -964,6 +1005,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -991,6 +1033,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                num_token_non_padded=_topk_num_token_non_padded(forward_batch),
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
@@ -1161,7 +1204,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=_topk_num_token_non_padded(forward_batch),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -1385,7 +1428,9 @@ class DeepseekV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=_topk_num_token_non_padded(
+                        state.forward_batch
+                    ),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -2121,6 +2166,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch,
             getattr(self, "_gfx95_quant_format", ""),
         )
+
+        # Zero the padded attention-input rows so they can't contaminate valid tokens.
+        hidden_states = _zero_padded_token_tail(hidden_states, forward_batch)
 
         hidden_states = self.self_attn(
             positions=positions,
