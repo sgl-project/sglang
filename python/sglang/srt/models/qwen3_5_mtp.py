@@ -14,6 +14,7 @@
 
 """Inference-only Qwen3_5 MTP model."""
 
+import copy
 import logging
 from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
@@ -53,6 +54,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if self.is_multimodal:
             config = config.text_config
 
+        # Deep-copy so MTP mutations below don't leak into the target's config.
+        config = copy.deepcopy(config)
+
         # The MTP model is unquantized in the nvfp4 checkpoint.
         if quant_config and quant_config.get_name() == "modelopt_fp4":
             quant_config = None
@@ -85,10 +89,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
-        config.num_hidden_layers = 1
-        config.full_attention_interval = 1
+        mtp_config = copy.deepcopy(config)
+        mtp_config.num_hidden_layers = 1
+        mtp_config.full_attention_interval = 1
         self.model = Qwen3_5ForCausalLM(
-            config,
+            mtp_config,
             quant_config,
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
@@ -150,39 +155,43 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
             )
 
-        assert input_embeds is None
-        input_embeds = forward_batch.mm_input_embeds
-        if (
-            forward_batch.forward_mode.is_extend()
-            and forward_batch.contains_mm_inputs()
-            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
-        ):
-            assert input_embeds is not None
-            input_embeds = torch.cat(
-                [input_embeds[:-1], self.model.embed_tokens(input_ids[-1].unsqueeze(0))]
-            )
+        try:
+            assert input_embeds is None
+            input_embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                assert input_embeds is not None
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                input_embeds[last_indices] = self.model.embed_tokens(
+                    input_ids[last_indices]
+                )
 
-        if input_embeds is None:
-            input_embeds = self.model.embed_tokens(input_ids)
+            if input_embeds is None:
+                input_embeds = self.model.embed_tokens(input_ids)
 
-        hidden_states = forward_batch.spec_info.hidden_states
+            hidden_states = forward_batch.spec_info.hidden_states
 
-        if not forward_batch.forward_mode.is_idle():
-            input_embeds = self.pre_fc_norm_embedding(input_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-        hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+            if not forward_batch.forward_mode.is_idle():
+                input_embeds = self.pre_fc_norm_embedding(input_embeds)
+                hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
-        hidden_states = self.fc(hidden_states)
+            hidden_states = self.fc(hidden_states)
 
-        with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states = self.model(
-                input_ids,
-                positions,
-                forward_batch,
-                hidden_states,
-            )
-
-        exit_stack.close()
+            with get_global_expert_distribution_recorder().disable_this_region():
+                hidden_states = self.model(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    hidden_states,
+                )
+        finally:
+            exit_stack.close()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

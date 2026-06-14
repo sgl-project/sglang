@@ -7,20 +7,21 @@ ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
 ARG HOPPER_SBO=0
 
-ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.2
+ARG SGL_KERNEL_VERSION=0.4.3
 ARG SGL_VERSION
+ARG SGL_DEEP_GEMM_VERSION=0.1.2
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.8.post1
-ARG MOONCAKE_VERSION=0.3.10.post2
+ARG FLASHINFER_VERSION=0.6.12
+ARG MOONCAKE_VERSION=0.3.11.post1
+ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -244,6 +245,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                torch torchvision torchaudio --force-reinstall; \
+           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
@@ -257,7 +259,6 @@ FROM torch_deps AS deepep_builder
 ARG CUDA_VERSION
 ARG BUILD_AND_DOWNLOAD_PARALLEL
 ARG GRACE_BLACKWELL
-ARG GRACE_BLACKWELL_DEEPEP_BRANCH
 ARG HOPPER_SBO
 ARG HOPPER_SBO_DEEPEP_COMMIT
 ARG DEEPEP_COMMIT
@@ -268,12 +269,21 @@ WORKDIR /build
 # Clone DeepEP
 RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
-      git clone https://github.com/fzyzcjy/DeepEP.git && \
-      cd DeepEP && \
-      git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
-      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-      sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
-      cd .. ; \
+      if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+        git clone https://github.com/fzyzcjy/DeepEP.git && \
+        cd DeepEP && \
+        git checkout gb200_blog_part_2 && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
+        cd .. ; \
+      else \
+        git clone https://github.com/deepseek-ai/DeepEP.git -b hybrid-ep && \
+        cd DeepEP && \
+        git checkout d28bd676c2120573c9f1425f0c16c39faa4117e6 && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
+        cd .. ; \
+      fi; \
     elif [ "$HOPPER_SBO" = "1" ]; then \
       git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
       cd DeepEP && \
@@ -434,6 +444,7 @@ ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MOONCAKE_COMPILE_ARG
+ARG MSCCLPP_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -513,6 +524,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     else \
         python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
     fi
+
+# Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
+    && case "${CUDA_VERSION}" in \
+           12.*) \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               python3 -m pip install "/tmp/mscclpp[cuda12]"; \
+               ;; \
+           13.*) \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               python3 -m pip install "/tmp/mscclpp[cuda13]"; \
+               ;; \
+           *) \
+               echo "Unsupported CUDA version for MSCCL++: ${CUDA_VERSION}" && exit 1; \
+               ;; \
+       esac \
+    && rm -rf /tmp/mscclpp
 
 # Install essential Python packages (use constraints to prevent conflicts)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -775,6 +804,9 @@ COPY --from=framework_final /sgl-workspace /sgl-workspace
 
 # Copy sgl-model-gateway binary
 COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway
+
+# Copy sglang binary
+COPY --from=framework_final /usr/local/bin/sglang /usr/local/bin/sglang
 
 # Copy py-spy binary
 COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
@@ -11,8 +13,11 @@ import itertools
 import json
 import logging
 import os
+import re
+import struct
 import tempfile
 from collections import defaultdict
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -35,7 +40,7 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -70,6 +75,60 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
+
+# Matches routed-expert weight keys in both HF-style layouts
+# (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
+# layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
+# excluded because the index segment requires a digit after ``.experts.``.
+_ROUTED_EXPERT_KEY_RE = re.compile(
+    r"\.experts\.\d+\.(?:w[123]|down_proj|up_proj|gate_proj)\.weight$"
+)
+
+
+def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
+    """Return the safetensors dtype string (e.g. ``F8_E4M3``, ``U8``) of one
+    routed-expert weight tensor, or ``None`` if the checkpoint is remote or has
+    no matching key. Reads only the safetensors header of the relevant shard.
+    """
+    if not os.path.isdir(model_path):
+        return None
+
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    target_key = None
+    target_shard_path = None
+
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {}) or {}
+        for k, shard in weight_map.items():
+            if _ROUTED_EXPERT_KEY_RE.search(k):
+                target_key = k
+                target_shard_path = os.path.join(model_path, shard)
+                break
+        if target_key is None:
+            return None
+    else:
+        shards = sorted(Path(model_path).glob("*.safetensors"))
+        if not shards:
+            return None
+        target_shard_path = str(shards[0])
+
+    with open(target_shard_path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+
+    if target_key is not None:
+        meta = header.get(target_key)
+        return meta.get("dtype") if meta else None
+
+    for k, meta in header.items():
+        if k == "__metadata__" or not isinstance(meta, dict):
+            continue
+        if _ROUTED_EXPERT_KEY_RE.search(k):
+            return meta.get("dtype")
+    return None
+
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
@@ -202,6 +261,12 @@ def get_quant_config(
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        hf_quant_config["hf_config"] = model_config.hf_config
+
+        # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
+        if model_config.quantization in REQUANTIZATION_METHODS:
+            hf_quant_config["requantization_method"] = model_config.quantization
+
         return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
@@ -235,9 +300,15 @@ def get_quant_config(
     possible_config_filenames = quant_cls.get_config_filenames()
 
     # If the quantization config is not found, use the default config.
+    # TODO: standardize the handling of online quantization with custom handlenames (mxfp8, quark_mxfp4, etc.)
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+        if model_config.quantization == "quark_mxfp4":
+            return quant_cls(
+                online_scheme=model_config.quantization,
+                hf_config=model_config.hf_config,
+            )
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
@@ -626,7 +697,13 @@ def maybe_add_mtp_safetensors(
         getattr(hf_config, "num_nextn_predict_layers", 0),
     )
     if not (
-        arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]
+        arch
+        in [
+            "Glm4MoeForCausalLM",
+            "Glm4MoeForCausalLMNextN",
+            "Glm4MoeLiteForCausalLM",
+            "Glm4MoeLiteForCausalLMNextN",
+        ]
         and num_nextn_layers > 0
     ):
         return hf_weights_files
@@ -818,24 +895,43 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def _drop_file_cache_after_load(path: str) -> None:
+    """Release of checkpoint pages after weights have been copied out. Used to avoid CPU OOM in RL."""
+    posix_fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if posix_fadvise is None or dontneed is None:
+        return
+
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        posix_fadvise(fd, 0, 0, dontneed)
+    except OSError as e:
+        logger.debug("Failed to drop file cache for %s: %s", path, e)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
-    sorted_files = sorted(hf_weights_files)
-
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
 
     for st_file in tqdm(
-        sorted_files,
+        hf_weights_files,
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
         bar_format=BAR_FORMAT,
@@ -850,6 +946,8 @@ def safetensors_weights_iterator(
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
                     yield name, f.get_tensor(name)
+        if drop_cache_after_load:
+            _drop_file_cache_after_load(st_file)
 
 
 def fastsafetensors_weights_iterator(
@@ -911,6 +1009,7 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
     disable_mmap: bool = False,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -920,8 +1019,12 @@ def multi_thread_safetensors_weights_iterator(
     def _load_file(st_file: str):
         if disable_mmap:
             with open(st_file, "rb") as f:
-                return safetensors.torch.load(f.read())
-        return safetensors.torch.load_file(st_file, device="cpu")
+                result = safetensors.torch.load(f.read())
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
+
+        return st_file, result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
@@ -938,9 +1041,12 @@ def multi_thread_safetensors_weights_iterator(
             futures_iter = concurrent.futures.as_completed(futures)
 
         for future in futures_iter:
-            state_dict = future.result()
+            st_file, state_dict = future.result()
             for name, param in state_dict.items():
                 yield name, param
+            del state_dict
+            if drop_cache_after_load:
+                _drop_file_cache_after_load(st_file)
 
 
 def buffered_multi_thread_safetensors_weights_iterator(
@@ -949,6 +1055,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -956,9 +1063,10 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
-    sorted_files = sorted(hf_weights_files)
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -976,7 +1084,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     buffer_size = max_workers + 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        file_iter = iter(sorted_files)
+        file_iter = iter(hf_weights_files)
         pending: collections.deque = collections.deque()
 
         # Seed the buffer.

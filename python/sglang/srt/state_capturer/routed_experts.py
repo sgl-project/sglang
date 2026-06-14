@@ -7,9 +7,8 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
-    get_attention_dp_rank,
     get_attention_tp_size,
-    get_dp_local_info,
+    get_dp_local_slice_cpu,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -60,12 +59,14 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         num_layers = model_config.hf_text_config.num_hidden_layers
 
         server_args = get_global_server_args()
-        # FIXME: spec decoding is not accounted for here. The device buffer can
-        # overflow when max_running_requests * num_verify_tokens exceeds
-        # chunked_prefill_size * dp_size.
+        # Scale by dp_size so the buffer covers the full DP-concatenated batch.
+        # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
+        # and otherwise overflows on dp_rank > 0 when max_running_requests >
+        # chunked_prefill_size.
+        # FIXME: spec decoding's num_verify_tokens is still not accounted for.
         max_batch_size = max(
             server_args.chunked_prefill_size * server_args.dp_size,
-            max_running_requests,
+            max_running_requests * server_args.dp_size,
         )
 
         super().__init__(
@@ -112,9 +113,10 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # the per-rank buffer, so the local DP rank's data lives at [0:N_local]
         # rather than at the global [start_pos:end_pos] offset.
         if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
-            local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
-            if can_run_graph:
-                local_start_pos = get_attention_dp_rank() * cuda_graph_batch
+            # GPU->CPU sync would break overlap; operate on CPU directly.
+            local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
+                forward_batch, can_run_graph, cuda_graph_batch
+            )
             local_end_pos = local_start_pos + local_num_tokens
         else:
             local_start_pos, local_end_pos = 0, forward_batch.out_cache_loc.shape[0]

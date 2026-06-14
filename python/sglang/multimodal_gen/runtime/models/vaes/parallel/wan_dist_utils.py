@@ -6,9 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_sp_group,
-    get_sp_parallel_rank,
-    get_sp_world_size,
+    get_decode_parallel_group_coordinator,
+    get_decode_parallel_rank,
+    get_decode_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import (
@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import 
     WanRMS_norm,
     WanUpsample,
     attention_block_forward,
+    match_conv3d_input_format,
     mid_block_forward,
     resample_forward,
     residual_block_forward,
@@ -91,10 +92,32 @@ def split_for_parallel_decode(
     return x, expected_height
 
 
+def _maybe_contiguous_for_sp_gather(x: torch.Tensor) -> torch.Tensor:
+    if (
+        x.dim() == 5
+        and hasattr(torch, "channels_last_3d")
+        and x.is_contiguous(memory_format=torch.channels_last_3d)
+        and not x.is_contiguous()
+    ):
+        return x.contiguous()
+    return x
+
+
+def _halo_memory_format(reference: torch.Tensor) -> torch.memory_format:
+    if reference.dim() > 1 and reference.stride(1) == 1:
+        if reference.dim() == 5 and hasattr(torch, "channels_last_3d"):
+            return torch.channels_last_3d
+        if reference.dim() == 4:
+            return torch.channels_last
+    return torch.contiguous_format
+
+
 def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
     if expected_height is None:
         return x
-    x = get_sp_group().all_gather(x, dim=-2)
+    x = get_decode_parallel_group_coordinator().all_gather(
+        _maybe_contiguous_for_sp_gather(x), dim=-2
+    )
     if x.shape[-2] != expected_height:
         x = x[..., :expected_height, :].contiguous()
     return x
@@ -103,13 +126,20 @@ def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
 def _ensure_recv_buf(
     recv_buf: torch.Tensor | None, reference: torch.Tensor
 ) -> torch.Tensor:
+    memory_format = _halo_memory_format(reference)
     if (
         recv_buf is None
         or recv_buf.shape != reference.shape
         or recv_buf.dtype != reference.dtype
         or recv_buf.device != reference.device
+        or not recv_buf.is_contiguous(memory_format=memory_format)
     ):
-        return torch.empty_like(reference)
+        return torch.empty(
+            reference.shape,
+            dtype=reference.dtype,
+            device=reference.device,
+            memory_format=memory_format,
+        )
     return recv_buf
 
 
@@ -122,17 +152,17 @@ def halo_exchange(
     if height_halo_size == 0:
         return x, recv_top_buf, recv_bottom_buf
 
-    sp_group = get_sp_group()
-    rank = get_sp_parallel_rank()
-    world_size = get_sp_world_size()
-    group = sp_group.device_group
-    group_ranks = sp_group.ranks
+    decode_group = get_decode_parallel_group_coordinator()
+    rank = get_decode_parallel_rank()
+    world_size = get_decode_parallel_world_size()
+    group = decode_group.device_group
+    group_ranks = decode_group.ranks
 
-    top_row = x[..., :height_halo_size, :].contiguous()
-    bottom_row = x[..., -height_halo_size:, :].contiguous()
+    top_row_ref = x[..., :height_halo_size, :]
+    bottom_row_ref = x[..., -height_halo_size:, :]
 
-    recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row)
-    recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row)
+    recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row_ref)
+    recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row_ref)
 
     # use batched P2P operations
     p2p_ops = []
@@ -140,11 +170,15 @@ def halo_exchange(
     if rank > 0:
         # has previous neighbor, recv previous rank's data to recv_top_buf and send top_row to it.
         prev_rank = group_ranks[rank - 1]
+        top_row = top_row_ref.contiguous(memory_format=_halo_memory_format(top_row_ref))
         p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
         p2p_ops.append(dist.P2POp(dist.isend, top_row, prev_rank, group))
     if rank < world_size - 1:
         # has next neighbor, send bottom_row to next rank and recv next rank's data to recv_bottom_buf.
         next_rank = group_ranks[rank + 1]
+        bottom_row = bottom_row_ref.contiguous(
+            memory_format=_halo_memory_format(bottom_row_ref)
+        )
         p2p_ops.append(dist.P2POp(dist.isend, bottom_row, next_rank, group))
         p2p_ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, next_rank, group))
 
@@ -190,23 +224,24 @@ class WanDistConv2d(nn.Conv2d):
 
         self.padding: tuple[int, int]
         if self.height_halo_size > 0:
-            self._padding = (self.padding[1], self.padding[1], 0, 0)
+            self._padding = (0, 0, 0, 0)
         else:
             self._padding = (
-                self.padding[1],
-                self.padding[1],
+                0,
+                0,
                 self.padding[0],
                 self.padding[0],
             )
 
-        self.padding = (0, 0)
+        self.padding = (0, self.padding[1])
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
-        self.rank = get_sp_parallel_rank()
-        self.world_size = get_sp_world_size()
+        self.rank = get_decode_parallel_rank()
+        self.world_size = get_decode_parallel_world_size()
 
     def forward(self, x):
-        x = F.pad(x, self._padding)
+        if any(self._padding):
+            x = F.pad(x, self._padding)
 
         x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
             x,
@@ -291,8 +326,8 @@ class WanDistCausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
-        self.rank = get_sp_parallel_rank()
-        self.world_size = get_sp_world_size()
+        self.rank = get_decode_parallel_rank()
+        self.world_size = get_decode_parallel_world_size()
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
@@ -323,6 +358,7 @@ class WanDistCausalConv3d(nn.Conv3d):
                 x_padded = x_padded[..., shift:, :]
                 global_start += shift
 
+        x_padded = match_conv3d_input_format(x_padded, self.weight)
         out = super().forward(x_padded)
 
         if self.height_halo_size == 0:
@@ -352,8 +388,8 @@ class WanDistZeroPad2d(nn.Module):
     def __init__(self, padding: tuple[int, int, int, int]) -> None:
         super().__init__()
         self.padding = padding  # (left, right, top, bottom)
-        self.rank = get_sp_parallel_rank()
-        self.world_size = get_sp_world_size()
+        self.rank = get_decode_parallel_rank()
+        self.world_size = get_decode_parallel_world_size()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         left, right, top, bottom = self.padding
@@ -478,13 +514,13 @@ class WanDistAttentionBlock(nn.Module):
         self.norm = WanRMS_norm(dim)
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
-        self.rank = get_sp_parallel_rank()
-        self.world_size = get_sp_world_size()
-        self.sp_group = get_sp_group()
+        self.rank = get_decode_parallel_rank()
+        self.world_size = get_decode_parallel_world_size()
+        self.decode_group = get_decode_parallel_group_coordinator()
 
     def forward(self, x):
         if self.world_size > 1:
-            x = self.sp_group.all_gather(x, dim=-2)
+            x = self.decode_group.all_gather(_maybe_contiguous_for_sp_gather(x), dim=-2)
             x = x.contiguous()
         x = attention_block_forward(self, x)
         if self.world_size > 1:
