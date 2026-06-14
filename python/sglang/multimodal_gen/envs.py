@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_NVFP4_FA4: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
@@ -258,6 +259,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Blackwell-only diffusion attention path: quantize Q/K to NVFP4 and run
+    # block-scaled FlashAttention-4.
+    "SGLANG_DIFFUSION_NVFP4_FA4": _lazy_bool("SGLANG_DIFFUSION_NVFP4_FA4", "false"),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
