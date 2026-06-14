@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.fused_gelu import linear_gelu_tanh
 from sglang.multimodal_gen.runtime.layers.mlp import FeedForward
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -232,8 +233,9 @@ class FluxGELU(nn.Module):
         self.gelu = nn.GELU(approximate="tanh")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.proj(hidden_states)
-        return self.gelu(hidden_states)
+        # Fuse the up-projection GEMM with the tanh-GELU activation via the
+        # cublasLt GELU epilogue (falls back to proj + F.gelu when unsupported).
+        return linear_gelu_tanh(self.proj, hidden_states)
 
 
 class FluxParallelFeedForward(nn.Module):
@@ -699,8 +701,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
         else:
-            proj_hidden_states, _ = self.proj_mlp(norm_hidden_states)
-            mlp_hidden_states = self.act_mlp(proj_hidden_states)
+            mlp_hidden_states = linear_gelu_tanh(self.proj_mlp, norm_hidden_states)
 
             attn_output = self.attn(
                 x=norm_hidden_states,
