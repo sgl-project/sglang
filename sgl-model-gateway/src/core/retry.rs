@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use axum::{http::StatusCode, response::Response};
+use axum::http::StatusCode;
 use rand::Rng;
 use tracing::debug;
 
@@ -44,10 +44,9 @@ impl BackoffCalculator {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum RetryError {
-    #[error("maximum retry attempts exceeded")]
-    MaxRetriesExceeded,
+#[derive(Debug)]
+pub struct MaxRetriesExceeded<T> {
+    pub last: T,
 }
 
 /// A thin async retry executor for generic operations.
@@ -55,61 +54,42 @@ pub enum RetryError {
 pub struct RetryExecutor;
 
 impl RetryExecutor {
-    /// Execute an operation that returns an HTTP Response with retries and backoff.
+    /// Execute an async operation with retries and backoff.
     ///
-    /// Usage pattern:
-    /// - `operation(attempt)`: perform one attempt (0-based). Construct and send the request,
-    ///   then return the `Response`. Do any per-attempt bookkeeping (e.g., load tracking,
-    ///   circuit-breaker outcome recording) inside this closure.
-    /// - `should_retry(&response, attempt)`: decide if the given response should be retried
-    ///   (e.g., based on HTTP status). Returning false short-circuits and returns the response.
-    /// - `on_backoff(delay, next_attempt)`: called before sleeping between attempts.
-    ///   Use this to record metrics.
-    /// - `on_exhausted()`: called when the executor has exhausted all retry attempts.
+    /// Returns `Ok(T)` on success, or `Err(MaxRetriesExceeded { last: T })` when exhausted.
     ///
-    /// Example:
-    /// ```ignore
-    /// let resp = RetryExecutor::execute_response_with_retry(
-    ///     &retry_cfg,
-    ///     |attempt| async move {
-    ///         let worker = select_cb_aware_worker()?;
-    ///         let resp = send_request(worker).await;
-    ///         worker.record_outcome(resp.status().is_success());
-    ///         resp
-    ///     },
-    ///     |res, _| matches!(res.status(), StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS | StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT),
-    ///     |delay, _attempt| { /* record backoff metrics */ },
-    ///     || { /* record retries exhausted */ },
-    /// ).await;
-    /// ```
-    pub async fn execute_response_with_retry<Op, Fut, ShouldRetry, OnBackoff, OnExhausted>(
+    /// - `operation(attempt)`: perform one attempt (0-based), return the output.
+    /// - `should_retry(&output, attempt)`: return true to retry, false to accept.
+    /// - `on_backoff(&output, delay, next_attempt)`: called before sleeping between attempts.
+    /// - `on_exhausted()`: called when retries are exhausted.
+    pub async fn execute_with_retry<Op, Fut, T, ShouldRetry, OnBackoff, OnExhausted>(
         config: &RetryConfig,
         mut operation: Op,
         should_retry: ShouldRetry,
         on_backoff: OnBackoff,
         mut on_exhausted: OnExhausted,
-    ) -> Response
+    ) -> Result<T, MaxRetriesExceeded<T>>
     where
         Op: FnMut(u32) -> Fut,
-        Fut: std::future::Future<Output = Response>,
-        ShouldRetry: Fn(&Response, u32) -> bool,
-        OnBackoff: Fn(Duration, u32),
+        Fut: std::future::Future<Output = T>,
+        ShouldRetry: Fn(&T, u32) -> bool,
+        OnBackoff: Fn(&T, Duration, u32),
         OnExhausted: FnMut(),
     {
         let max = config.max_retries.max(1);
-
         let mut attempt: u32 = 0;
+
         loop {
-            let response = operation(attempt).await;
+            let output = operation(attempt).await;
             let is_last = attempt + 1 >= max;
 
-            if !should_retry(&response, attempt) {
-                return response;
+            if !should_retry(&output, attempt) {
+                return Ok(output);
             }
 
             if is_last {
                 on_exhausted();
-                return response;
+                return Err(MaxRetriesExceeded { last: output });
             }
 
             let next_attempt = attempt + 1;
@@ -120,11 +100,33 @@ impl RetryExecutor {
                 delay_ms = delay.as_millis() as u64,
                 "Retry backoff"
             );
-            on_backoff(delay, next_attempt);
+            on_backoff(&output, delay, next_attempt);
             tokio::time::sleep(delay).await;
 
             attempt = next_attempt;
         }
+    }
+
+    /// Like `execute_with_retry`, but returns the last output directly when exhausted.
+    ///
+    /// Useful for HTTP responses where you always need to return something.
+    pub async fn execute_with_retry_or_last<Op, Fut, T, ShouldRetry, OnBackoff, OnExhausted>(
+        config: &RetryConfig,
+        operation: Op,
+        should_retry: ShouldRetry,
+        on_backoff: OnBackoff,
+        on_exhausted: OnExhausted,
+    ) -> T
+    where
+        Op: FnMut(u32) -> Fut,
+        Fut: std::future::Future<Output = T>,
+        ShouldRetry: Fn(&T, u32) -> bool,
+        OnBackoff: Fn(&T, Duration, u32),
+        OnExhausted: FnMut(),
+    {
+        Self::execute_with_retry(config, operation, should_retry, on_backoff, on_exhausted)
+            .await
+            .unwrap_or_else(|MaxRetriesExceeded { last }| last)
     }
 }
 
@@ -193,14 +195,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_response_with_retry_success_path_and_hooks() {
+    async fn test_execute_with_retry_success_after_failures() {
+        let cfg = base_retry_config();
+        let remaining = Arc::new(AtomicU32::new(2));
+        let calls = Arc::new(AtomicU32::new(0));
+        let backoffs = Arc::new(AtomicU32::new(0));
+
+        let res = RetryExecutor::execute_with_retry(
+            &cfg,
+            {
+                let remaining = remaining.clone();
+                let calls = calls.clone();
+                move |_attempt| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let remaining = remaining.clone();
+                    async move {
+                        if remaining
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+                            .is_ok()
+                        {
+                            None
+                        } else {
+                            Some(42u32)
+                        }
+                    }
+                }
+            },
+            |output, _attempt| output.is_none(),
+            {
+                let backoffs = backoffs.clone();
+                move |_output, _delay, _next_attempt| {
+                    backoffs.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            || {},
+        )
+        .await;
+
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), Some(42));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(backoffs.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_retry_exhausted() {
+        let cfg = base_retry_config();
+        let calls = Arc::new(AtomicU32::new(0));
+        let exhausted = Arc::new(AtomicU32::new(0));
+
+        let res = RetryExecutor::execute_with_retry(
+            &cfg,
+            {
+                let calls = calls.clone();
+                move |_attempt| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    async move { None::<u32> }
+                }
+            },
+            |output, _attempt| output.is_none(),
+            |_output, _delay, _next_attempt| {},
+            {
+                let exhausted = exhausted.clone();
+                move || {
+                    exhausted.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(res, Err(MaxRetriesExceeded { last: None })));
+        assert_eq!(calls.load(Ordering::Relaxed), cfg.max_retries);
+        assert_eq!(exhausted.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_retry_or_last_success_path_and_hooks() {
         let cfg = base_retry_config();
         let remaining = Arc::new(AtomicU32::new(2));
         let calls = Arc::new(AtomicU32::new(0));
         let backoffs = Arc::new(AtomicU32::new(0));
         let exhausted = Arc::new(AtomicU32::new(0));
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &cfg,
             {
                 let remaining = remaining.clone();
@@ -223,7 +300,7 @@ mod tests {
             |res, _attempt| !res.status().is_success(),
             {
                 let backoffs = backoffs.clone();
-                move |_delay, _next_attempt| {
+                move |_output, _delay, _next_attempt| {
                     backoffs.fetch_add(1, Ordering::Relaxed);
                 }
             },
@@ -243,13 +320,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_response_with_retry_non_retryable_short_circuit() {
+    async fn test_execute_with_retry_or_last_non_retryable_short_circuit() {
         let cfg = base_retry_config();
         let calls = Arc::new(AtomicU32::new(0));
         let backoffs = Arc::new(AtomicU32::new(0));
         let exhausted = Arc::new(AtomicU32::new(0));
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &cfg,
             {
                 let calls = calls.clone();
@@ -261,7 +338,7 @@ mod tests {
             |_res, _attempt| false,
             {
                 let backoffs = backoffs.clone();
-                move |_delay, _next_attempt| {
+                move |_output, _delay, _next_attempt| {
                     backoffs.fetch_add(1, Ordering::Relaxed);
                 }
             },
@@ -281,13 +358,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_response_with_retry_exhausted_hooks() {
+    async fn test_execute_with_retry_or_last_exhausted_hooks() {
         let cfg = base_retry_config();
         let calls = Arc::new(AtomicU32::new(0));
         let backoffs = Arc::new(AtomicU32::new(0));
         let exhausted = Arc::new(AtomicU32::new(0));
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &cfg,
             {
                 let calls = calls.clone();
@@ -299,7 +376,7 @@ mod tests {
             |_res, _attempt| true,
             {
                 let backoffs = backoffs.clone();
-                move |_delay, _next_attempt| {
+                move |_output, _delay, _next_attempt| {
                     backoffs.fetch_add(1, Ordering::Relaxed);
                 }
             },
