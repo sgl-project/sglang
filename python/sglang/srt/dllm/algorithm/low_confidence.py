@@ -2,9 +2,9 @@ from typing import List, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
+from sglang.srt.dllm.algorithm.sampling import sample_block_tokens
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -69,15 +69,18 @@ class LowConfidence(DllmAlgorithm):
                     curr_block_start:curr_block_end,
                 ]
 
-                x = torch.argmax(curr_logits, dim=-1)
-                p = torch.squeeze(
-                    torch.gather(
-                        F.softmax(curr_logits, dim=-1),
-                        dim=-1,
-                        index=torch.unsqueeze(x, -1),
-                    ),
-                    -1,
+                positions = (
+                    forward_batch.positions[curr_block_start:curr_block_end]
+                    if forward_batch.positions is not None
+                    else None
                 )
+                x, p = sample_block_tokens(
+                    curr_logits,
+                    forward_batch.sampling_info,
+                    batch_id,
+                    positions,
+                )
+                x = x.to(dtype=block_input_ids.dtype)
                 x = torch.where(block_mask_index, x, block_input_ids)
                 confidence = torch.where(block_mask_index, p, -np.inf)
 
