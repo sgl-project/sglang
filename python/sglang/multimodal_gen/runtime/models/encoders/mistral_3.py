@@ -26,7 +26,6 @@ from transformers.masking_utils import (
     create_sliding_window_causal_mask,
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3CausalLMOutputWithPast,
     Mistral3ModelOutputWithPast,
@@ -37,14 +36,21 @@ from transformers.models.mistral.modeling_mistral import (
     MistralRMSNorm,
     MistralRotaryEmbedding,
     apply_rotary_pos_emb,
-    eager_attention_forward,
 )
 
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.linear import (
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -55,25 +61,10 @@ _CREATE_CAUSAL_MASK_ARG = (
 )
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
-    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim) to
-    (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
 class MistralAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: MistralConfig, layer_idx: int):
+    def __init__(self, config: MistralConfig, layer_idx: int, prefix: str = ""):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -81,26 +72,40 @@ class MistralAttention(nn.Module):
             getattr(config, "head_dim", None)
             or config.hidden_size // config.num_attention_heads
         )
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
+        self.total_num_heads = config.num_attention_heads
+        self.total_num_key_value_heads = config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=config.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_key_value_heads,
+            bias=False,
+            prefix=f"{prefix}.qkv_proj",
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False
+        self.num_heads = self.qkv_proj.num_heads
+        self.num_key_value_heads = self.qkv_proj.num_kv_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_key_value_heads * self.head_dim
+
+        self.o_proj = RowParallelLinear(
+            input_size=self.total_num_heads * self.head_dim,
+            output_size=config.hidden_size,
+            bias=False,
+            prefix=f"{prefix}.o_proj",
         )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
+        self.attn = LocalAttention(
+            self.num_heads,
+            self.head_dim,
+            self.num_key_value_heads,
+            softmax_scale=self.scaling,
+            causal=True,
+            supported_attention_backends={AttentionBackendEnum.TORCH_SDPA},
         )
         self.is_causal = True
-        self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
 
     def forward(
         self,
@@ -112,11 +117,21 @@ class MistralAttention(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        qkv_states, _ = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = qkv_states.split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
+
+        query_states = query_states.view(
+            *input_shape, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            *input_shape, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            *input_shape, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
@@ -130,39 +145,25 @@ class MistralAttention(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attn_implementation = getattr(self.config, "_attn_implementation", None)
-        attention_interface = eager_attention_forward
-        if attn_implementation and attn_implementation != "eager":
-            if hasattr(ALL_ATTENTION_FUNCTIONS, "get_interface"):
-                attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-                    attn_implementation, eager_attention_forward
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[attn_implementation]
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0,
-            scaling=self.scaling,
-            sliding_window=getattr(
-                self.config, "sliding_window", None
-            ),  # main diff with Llama
-            **kwargs,
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        attn_output = self.attn(
+            query_states, key_states, value_states, attn_mask=attention_mask
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        attn_output, _ = self.o_proj(attn_output)
+        return attn_output, None
 
 
 class MistralDecoderLayer(nn.Module):
-    def __init__(self, config: MistralConfig, layer_idx: int):
+    def __init__(self, config: MistralConfig, layer_idx: int, prefix: str = ""):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = MistralAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = MistralAttention(
+            config=config, layer_idx=layer_idx, prefix=f"{prefix}.self_attn"
+        )
         self.mlp = MistralMLP(config)
         self.input_layernorm = MistralRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -218,7 +219,7 @@ class MistralModel(MistralPreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                MistralDecoderLayer(config, layer_idx)
+                MistralDecoderLayer(config, layer_idx, prefix=f"layers.{layer_idx}")
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -380,12 +381,13 @@ class Mistral3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixi
         "^language_model.lm_head": "lm_head",
     }
     _tied_weights_keys = ["lm_head.weight"]
-    uses_sglang_forward_context = False
+    uses_sglang_forward_context = True
     layerwise_offload_dit_group_enabled = False
     layer_names = ["model.language_model.layers"]
 
     def __init__(self, config: LlavaConfig):
         super().__init__()
+        self.config = config
         self.model = Mistral3Model(config.arch_config)
 
     def get_input_embeddings(self):
@@ -459,9 +461,18 @@ class Mistral3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixi
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Define mapping for stacked parameters
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        stacked_params_mapping = getattr(
+            getattr(self.config, "arch_config", None),
+            "stacked_params_mapping",
+            [
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+            ],
+        )
+
         for name, loaded_weight in weights:
             name_lower = name.lower()
             if (
@@ -470,15 +481,39 @@ class Mistral3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixi
                 or "lm_head" in name_lower
             ):
                 continue
-            final_name = name.replace("language_model.model.", "model.language_model.")
+            final_name = name.replace(
+                "language_model.model.", "model.language_model."
+            )
+
+            loaded = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in final_name:
+                    continue
+                mapped_name = final_name.replace(weight_name, param_name)
+                if mapped_name not in params_dict:
+                    continue
+                param = params_dict[mapped_name]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(mapped_name)
+                loaded = True
+                break
+            if loaded:
+                continue
 
             if final_name in params_dict:
                 param = params_dict[final_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
                 weight_loader(param, loaded_weight)
                 loaded_params.add(final_name)
             else:
-                logger.warning(f"Param {name=} {final_name=} from weight is not loaded")
+                logger.warning(
+                    f"Param {name=} {final_name=} from weight is not loaded"
+                )
 
         return loaded_params
 
