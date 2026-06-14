@@ -17,11 +17,7 @@ def apply_scaling_penalties(logits, scaling_penalties):
 
 class BatchedRepetitionPenalizer(_BatchedPenalizer):
     """
-    Repetition penalizer applies a penalty to tokens that have appeared in the output.
-    Implementation follows the standard repetition_penalty logic (e.g., HuggingFace):
-    - If logit > 0: logit /= penalty
-    - If logit < 0: logit *= penalty
-    This reduces the probability of repeated tokens.
+    Repetition penalizer penalizes tokens based on their presence in the generated output.
     """
 
     is_multiplicative: bool = True
@@ -33,6 +29,11 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
         )
 
     def _prepare(self):
+        self.cumulated_repetition_penalties = torch.ones(
+            (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
+            dtype=torch.float32,
+            device=self.orchestrator.device,
+        )
         self.repetition_penalties = (
             torch.tensor(
                 data=[
@@ -44,43 +45,36 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
             )
         ).unsqueeze_(1)
 
-        self.seen_tokens = torch.zeros(
-            (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
-            dtype=torch.bool,
-            device=self.orchestrator.device,
-        )
-
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
-        if output_ids.dim() == 1:
-            indices = output_ids
-        else:
-            indices = output_ids.squeeze(-1)
-
-        self.seen_tokens.scatter_(
+        self.cumulated_repetition_penalties.scatter_(
             dim=1,
-            index=indices.unsqueeze(1),
-            src=torch.ones_like(indices, dtype=torch.bool, device=self.orchestrator.device).unsqueeze(1),
+            index=output_ids.unsqueeze(1),
+            src=self.repetition_penalties,
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
-        penalties = self.repetition_penalties  # (batch, 1)
-        factors = torch.where(logits > 0, 1.0 / penalties, penalties)
-        mask = self.seen_tokens
-        multiplier = torch.where(mask, factors, 1.0)
-        logits.mul_(multiplier)
+        apply_scaling_penalties(logits, self.cumulated_repetition_penalties)
         return logits
+
+    def get_scaling_penalties(self) -> torch.Tensor:
+        return self.cumulated_repetition_penalties
 
     def _filter(self, keep_indices: torch.Tensor):
         self.repetition_penalties = self.repetition_penalties[keep_indices]
-        self.seen_tokens = self.seen_tokens[keep_indices]
+        self.cumulated_repetition_penalties = self.cumulated_repetition_penalties[
+            keep_indices
+        ]
 
     def _merge(self, their: "BatchedRepetitionPenalizer"):
         self.repetition_penalties = torch.cat(
             [self.repetition_penalties, their.repetition_penalties], dim=0
         )
-        self.seen_tokens = torch.cat([self.seen_tokens, their.seen_tokens], dim=0)
+        self.cumulated_repetition_penalties = torch.cat(
+            [self.cumulated_repetition_penalties, their.cumulated_repetition_penalties],
+            dim=0,
+        )
 
     def _teardown(self) -> None:
-        for name in ("repetition_penalties", "seen_tokens"):
+        for name in ("repetition_penalties", "cumulated_repetition_penalties"):
             if hasattr(self, name):
                 delattr(self, name)
