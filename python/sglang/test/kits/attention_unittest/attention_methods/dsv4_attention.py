@@ -313,8 +313,9 @@ class MockDSV4ModelRunner:
         # case's per-request input length (target_verify uses the draft count
         # directly; draft_extend uses the accepted-token count). Non-spec cases
         # leave it at 0 so the backend skips the speculative branches.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             speculative_num_draft_tokens = case.input_lens[0] if case.input_lens else 0
             speculative_eagle_topk = 1
@@ -1492,8 +1493,8 @@ def run_dsv4_draft_extend_attention_case(
         "`deepseek_v4_backend.py:636-663` and the 'Production-Unsupported' "
         "section in dsv4/README.md."
     )
-    assert case.forward_mode.is_draft_extend(
-        include_v2=True
+    assert (
+        case.forward_mode.is_draft_extend_v2()
     ), f"run_dsv4_draft_extend_attention_case requires DRAFT_EXTEND; got {case.forward_mode}"
     from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
         _make_eagle_draft_extend_input,

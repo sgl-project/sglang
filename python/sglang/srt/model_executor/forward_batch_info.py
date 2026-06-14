@@ -94,8 +94,6 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: verify a batch in the target model.
     TARGET_VERIFY = auto()
     # Used in speculative decoding: extend a batch in the draft model.
-    DRAFT_EXTEND = auto()
-
     DRAFT_EXTEND_V2 = auto()
 
     # Used in disaggregated decode worker
@@ -115,7 +113,6 @@ class ForwardMode(IntEnum):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
-            or self == ForwardMode.DRAFT_EXTEND
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
@@ -148,11 +145,6 @@ class ForwardMode(IntEnum):
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
-    def is_draft_extend(self, include_v2: bool = False):
-        return self == ForwardMode.DRAFT_EXTEND or (
-            include_v2 and self == ForwardMode.DRAFT_EXTEND_V2
-        )
-
     def is_draft_extend_v2(self):
         # For fixed shape logits output in eagle v2 worker
         return self == ForwardMode.DRAFT_EXTEND_V2
@@ -160,7 +152,6 @@ class ForwardMode(IntEnum):
     def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND
-            or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.SPLIT_PREFILL
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
@@ -181,11 +172,7 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.SPLIT_PREFILL
 
     def is_extend_without_speculative(self):
-        return (
-            self.is_extend()
-            and not self.is_target_verify()
-            and not self.is_draft_extend()
-        )
+        return self.is_extend() and not self.is_target_verify()
 
     def is_prebuilt(self):
         return self == ForwardMode.PREBUILT
@@ -943,47 +930,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         device = model_runner.device
         mm_inputs = batch.multimodal_inputs
 
-        if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
-            mrope_deltas = []
-            extend_lens = []
-            for batch_idx in range(batch_size):
-                extend_seq_len = batch.extend_lens[batch_idx]
-                extend_lens.append(extend_seq_len)
-                mrope_delta = (
+        # target_verify or draft_decode
+        seq_positions = batch.spec_info.positions.view(batch_size, -1)
+        # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
+        if all(mm_input is None for mm_input in mm_inputs):
+            mrope_delta_tensor = torch.zeros(
+                (batch_size, 1), dtype=torch.int64, device=device
+            )
+        else:
+            mrope_deltas = [
+                (
                     torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[batch_idx] is None
-                    else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
+                    if mm_inputs[i] is None
+                    else mm_inputs[i].mrope_position_delta.squeeze(0)
                 )
-                mrope_deltas.append(mrope_delta.to(device=device))
-            position_chunks = torch.split(batch.spec_info.positions, extend_lens)
-            mrope_positions_list = [
-                pos_chunk + delta
-                for pos_chunk, delta in zip(position_chunks, mrope_deltas)
+                for i in range(batch_size)
             ]
-            next_input_positions = (
-                torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
-            )
-
-        else:  # target_verify or draft_decode
-            seq_positions = batch.spec_info.positions.view(batch_size, -1)
-            # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
-            if all(mm_input is None for mm_input in mm_inputs):
-                mrope_delta_tensor = torch.zeros(
-                    (batch_size, 1), dtype=torch.int64, device=device
-                )
-            else:
-                mrope_deltas = [
-                    (
-                        torch.zeros(1, dtype=torch.int64)
-                        if mm_inputs[i] is None
-                        else mm_inputs[i].mrope_position_delta.squeeze(0)
-                    )
-                    for i in range(batch_size)
-                ]
-                mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-            next_input_positions = (
-                (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
-            )
+            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+        next_input_positions = (
+            (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+        )
 
         self.mrope_positions = next_input_positions
 
@@ -1135,7 +1101,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if (
             self.forward_mode.is_decode()
             or self.forward_mode.is_target_verify()
-            or self.forward_mode.is_draft_extend(include_v2=True)
+            or self.forward_mode.is_draft_extend_v2()
             or self.forward_mode.is_idle()
         ):
             # Mamba-hybrid families need the fabricated-row idle conversion
@@ -1352,13 +1318,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     :num_tokens
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
-            elif self.forward_mode.is_draft_extend():  # draft extend
-                self.spec_info.num_correct_drafts = self.spec_info.num_correct_drafts[
-                    :bs
-                ]
-                self.spec_info.num_accept_tokens = self.spec_info.num_accept_tokens[:bs]
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
-                logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
