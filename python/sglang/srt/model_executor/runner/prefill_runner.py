@@ -195,7 +195,7 @@ class PrefillRunner(BaseRunner):
         # serving inputs below. Other backends don't need this.
         # Initialize the slot to None BEFORE constructing the backend:
         # TcPiecewise runs its compile pass during __init__ which calls
-        # _run_dummy_forward -> capture_prepare, and capture_prepare reads
+        # _run_dummy_forward -> reserve_batch, and reserve_batch reads
         # self._prefill_static_buffers. self.layer_model has the same
         # ordering requirement: _run_forward checks `self.layer_model is
         # not None` to decide whether to call the inner stack or outer
@@ -259,7 +259,7 @@ class PrefillRunner(BaseRunner):
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
-        self.capture()
+        self.prepare()
 
         self.raw_num_tokens = 0
 
@@ -366,7 +366,7 @@ class PrefillRunner(BaseRunner):
         torch.compile install) and the compile-loop pass (every shape,
         inside enable_torch_compile_warmup).
         """
-        fb, attn_backend = self.capture_prepare(num_tokens)
+        fb, attn_backend = self.reserve_batch(num_tokens)
         attn_backend.init_forward_metadata(fb)
         self._run_forward(fb, num_tokens)
 
@@ -451,7 +451,7 @@ class PrefillRunner(BaseRunner):
                     return False
         if num_tokens > self.max_num_tokens:
             return False
-        # No backend-level shape check here: replay_prepare bucket-pads
+        # No backend-level shape check here: load_batch bucket-pads
         # num_tokens up to the nearest captured shape, so eligibility is
         # bounded by num_tokens <= self.max_num_tokens (already
         # checked above), not by exact shape membership.
@@ -462,7 +462,7 @@ class PrefillRunner(BaseRunner):
         # logits_processor eagerly on top with live multi-req metadata.
         return True
 
-    def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
+    def reserve_batch(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
         Default tensor inputs are fresh literals; under a Breakable
@@ -470,7 +470,7 @@ class PrefillRunner(BaseRunner):
         segments read from stable addresses.
 
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
-        capture_prepare signature.
+        reserve_batch signature.
         """
         buffers = self.buffers
         bs = 1
@@ -586,11 +586,11 @@ class PrefillRunner(BaseRunner):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
-    def capture(self) -> None:
+    def prepare(self) -> None:
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
                 self.stream = graph_capture_context.stream
-                with self.backend.capture_session(self.stream):
+                with self.backend.record_session(self.stream):
                     self._capture_one_stream()
 
     def _capture_one_stream(self) -> None:
@@ -614,14 +614,14 @@ class PrefillRunner(BaseRunner):
                 capture_range.set_description(
                     f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
-            self.capture_one_shape(num_tokens)
+            self._prepare_one(num_tokens)
 
-    def capture_one_shape(self, size: int) -> None:
+    def _prepare_one(self, size: int) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
-        forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        forward_batch, attn_backend = self.reserve_batch(num_tokens)
         self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
@@ -641,14 +641,14 @@ class PrefillRunner(BaseRunner):
             post_warmup_hook = None
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
-        self.backend.capture_one(
+        self.backend.record(
             ShapeKey(size=num_tokens),
             run_once,
             dummies=None,
             post_warmup_hook=post_warmup_hook,
         )
 
-    def replay_prepare(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
+    def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
         """
@@ -782,11 +782,11 @@ class PrefillRunner(BaseRunner):
         self._static_num_tokens = static_num_tokens
         return static_forward_batch
 
-    def replay(
+    def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        with self.backend.replay_session():
-            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+        with self.backend.run_session():
+            static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
 
@@ -801,9 +801,7 @@ class PrefillRunner(BaseRunner):
                 shape_key = ShapeKey(size=self._static_num_tokens)
 
                 def replay_layer_forward(*args, **layer_kwargs):
-                    return self.backend.replay(
-                        shape_key, static_forward_batch, **kwargs
-                    )
+                    return self.backend.run(shape_key, static_forward_batch, **kwargs)
 
                 original_layer_forward = self.layer_model.forward
                 self.layer_model.forward = replay_layer_forward
@@ -844,7 +842,7 @@ class PrefillRunner(BaseRunner):
                     num_tokens=static_num_tokens,
                     raw_num_tokens=raw_num_tokens,
                 ):
-                    output = self.backend.replay(
+                    output = self.backend.run(
                         self._static_num_tokens, static_forward_batch, **kwargs
                     )
 

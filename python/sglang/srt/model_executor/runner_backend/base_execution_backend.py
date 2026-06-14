@@ -32,31 +32,31 @@ class ExecutionBackend(ABC):
     cuda_graph_runner passed to its __init__.
 
     Methods:
-      - capture_session(stream) — context wrapping the runner's outer
-        capture loop; backends bind stream / pool and open per-backend
+      - record_session(stream) — context wrapping the runner's outer
+        prepare loop; backends bind stream / pool and open per-backend
         capture flags here.
-      - capture_one(shape_key, forward_fn, dummies, post_warmup_hook)
-        — record the replayable artifact for shape_key; one call per
-        shape inside capture_session.
-      - can_run(forward_batch, shape_key) — can this backend replay
+      - record(shape_key, forward_fn, dummies, post_warmup_hook)
+        — record the runnable artifact for shape_key; one call per
+        shape inside record_session.
+      - can_run_graph(forward_batch, shape_key) — can this backend run
         for the given batch at the given shape.
-      - replay_session() — context wrapping replay-time model code;
+      - run_session() — context wrapping run-time model code;
         backends open the "we are replaying" flag here when they have
         one.
-      - replay(shape_key, static_forward_batch, **kwargs) — invoke
-        the captured artifact.
-      - cleanup() — release pool and drop captured artifacts.
+      - run(shape_key, static_forward_batch, **kwargs) — invoke
+        the recorded artifact (graph replay; eager runs forward live).
+      - cleanup() — release pool and drop recorded artifacts.
 
     Notes:
-      - The outer capture loop is runner-specific; it lives on the
+      - The outer prepare loop is runner-specific; it lives on the
         runner, not here.
     """
 
     @abstractmethod
-    def capture_session(self, stream: torch.cuda.Stream) -> Iterator[None]: ...
+    def record_session(self, stream: torch.cuda.Stream) -> Iterator[None]: ...
 
     @abstractmethod
-    def capture_one(
+    def record(
         self,
         shape_key: ShapeKey,
         forward_fn,
@@ -70,10 +70,10 @@ class ExecutionBackend(ABC):
     ) -> bool: ...
 
     @abstractmethod
-    def replay_session(self) -> Iterator[None]: ...
+    def run_session(self) -> Iterator[None]: ...
 
     @abstractmethod
-    def replay(
+    def run(
         self,
         shape_key: ShapeKey,
         static_forward_batch: ForwardBatch,

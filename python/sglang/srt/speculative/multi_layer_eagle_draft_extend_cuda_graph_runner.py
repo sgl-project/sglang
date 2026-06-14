@@ -277,14 +277,14 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeRunner):
 
         try:
             with model_capture_mode():
-                self.capture()
+                self.prepare()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        return self.backend.run(shape_key, forward_batch)
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
@@ -403,7 +403,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeRunner):
         )
         return forward_batch
 
-    def capture_one_shape(
+    def _prepare_one(
         self,
         size: int,
         forward: Callable,
@@ -492,7 +492,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
             self.deepep_adapter.capture(is_extend_in_batch=True)
             shape_key = self._make_graph_key(bs)
-            self.backend.capture_one(
+            self.backend.record(
                 shape_key,
                 run_once,
                 dummies=None,
@@ -536,7 +536,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeRunner):
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
 
-    def replay(self, forward_batch: ForwardBatch, init_state: bool = True):
+    def execute(self, forward_batch: ForwardBatch, init_state: bool = True):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers

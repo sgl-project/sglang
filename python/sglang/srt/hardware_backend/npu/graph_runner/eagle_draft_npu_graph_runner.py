@@ -66,4 +66,4 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 shape_key, seq_lens=None, cpu_update_input=cpu_update_input
             )
         else:
-            return self.backend.replay(shape_key, forward_batch)
+            return self.backend.run(shape_key, forward_batch)

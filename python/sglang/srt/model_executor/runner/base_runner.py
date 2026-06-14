@@ -117,25 +117,25 @@ class BaseRunner(ABC):
     replay dispatch, and output slicing.
 
     Methods:
-      - can_run(forward_batch) — should forward_batch go through cuda
+      - can_run_graph(forward_batch) — should forward_batch go through cuda
         graph replay (vs eager fallback)?
-      - capture_prepare(size, ...) — build the dummy ForwardBatch and
-        per-capture local state needed by capture_one_shape.
-      - capture() — outer capture loop; iterates over shapes and calls
-        capture_one_shape for each.
-      - capture_one_shape(size, ...) — drive one model forward at this
-        shape into the backend's captured artifact.
-      - replay_prepare(forward_batch, ...) — pad to the nearest captured
+      - reserve_batch(size, ...) — build the dummy ForwardBatch and
+        per-shape local state needed by _prepare_one.
+      - prepare() — one-time setup; iterates over shapes and calls
+        _prepare_one for each.
+      - _prepare_one(size, ...) — drive one model forward at this
+        shape into the backend's recorded artifact.
+      - load_batch(forward_batch, ...) — pad to the nearest captured
         bucket, populate static input buffers, init attention metadata.
-      - replay(forward_batch, ...) — dispatch one batch through cuda
-        graph replay.
+      - execute(forward_batch, ...) — dispatch one batch through the
+        backend (graph replay for cuda graph; model.forward for eager).
 
     Notes:
       - buffers and backend are populated by the subclass before
-        capture(); the base only declares them.
+        prepare(); the base only declares them.
     """
 
-    # Subclasses populate before calling capture().
+    # Subclasses populate before calling prepare().
     buffers: ForwardInputBuffers
     backend: ExecutionBackend
 
@@ -155,7 +155,7 @@ class BaseRunner(ABC):
         """Return the smallest buckets[i] >= raw_size.
 
         Caller's can_run must reject raw_size > max(buckets) before
-        reaching replay_prepare; this assertion makes the contract
+        reaching load_batch; this assertion makes the contract
         explicit (bisect_left returns len(buckets) when the value
         exceeds all buckets, which would otherwise IndexError below
         with no diagnostic).
@@ -171,23 +171,23 @@ class BaseRunner(ABC):
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool: ...
 
     @abstractmethod
-    def capture_prepare(self, size: int, *args, **kwargs) -> Any: ...
+    def reserve_batch(self, size: int, *args, **kwargs) -> Any: ...
 
     @abstractmethod
-    def capture(self) -> None: ...
+    def prepare(self) -> None: ...
 
     @abstractmethod
-    def capture_one_shape(self, size: int, *args, **kwargs) -> Any: ...
+    def _prepare_one(self, size: int, *args, **kwargs) -> Any: ...
 
     @abstractmethod
-    def replay_prepare(
+    def load_batch(
         self,
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any: ...
 
     @abstractmethod
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
         **kwargs,

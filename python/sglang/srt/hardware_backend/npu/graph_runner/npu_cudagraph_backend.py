@@ -64,7 +64,7 @@ class NPUCudaGraphBackend(ExecutionBackend):
         )
 
     @contextmanager
-    def capture_session(self, stream):
+    def record_session(self, stream):
         if self._pool is None:
             self._pool = self._device_module.graph_pool_handle()
         set_graph_pool_id(self._pool)
@@ -74,7 +74,7 @@ class NPUCudaGraphBackend(ExecutionBackend):
         finally:
             self._capture_stream = None
 
-    def capture_one(
+    def record(
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
@@ -126,10 +126,10 @@ class NPUCudaGraphBackend(ExecutionBackend):
         return shape_key in self._graphs
 
     @contextmanager
-    def replay_session(self):
+    def run_session(self):
         yield
 
-    def replay(
+    def run(
         self,
         shape_key: ShapeKey,
         static_forward_batch: ForwardBatch,
