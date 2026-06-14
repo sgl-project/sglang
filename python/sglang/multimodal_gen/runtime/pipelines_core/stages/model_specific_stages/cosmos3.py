@@ -1460,5 +1460,8 @@ class Cosmos3DecodingStage(PipelineStage):
             audio=audio,
             audio_sample_rate=audio_sample_rate,
             action_pred=action_pred,
+            action_mode=getattr(batch.sampling_params, "action_mode", None),
+            action_domain_id=getattr(batch.sampling_params, "domain_id", None),
+            action_raw_action_dim=batch.extra.get("raw_action_dim") if getattr(batch, "extra", None) else None,
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
         )

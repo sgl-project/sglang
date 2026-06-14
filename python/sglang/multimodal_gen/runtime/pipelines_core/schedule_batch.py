@@ -420,6 +420,9 @@ class OutputBatch:
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     action_pred: torch.Tensor | None = None
+    action_mode: str | None = None
+    action_domain_id: int | None = None
+    action_raw_action_dim: int | None = None
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
