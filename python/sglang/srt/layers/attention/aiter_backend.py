@@ -1895,7 +1895,7 @@ class AiterAttnBackend(AttentionBackend):
         v_descale = None
         if self.kv_cache_dtype == fp8_dtype:
             k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
-            v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
+            v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
 
         if k is not None:
             assert v is not None
@@ -1947,6 +1947,25 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 elif self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                elif self.kv_cache_dtype == fp8_dtype:
+                    # FP8: fuse bf16->fp8 cast + paged write in one kernel instead
+                    # of the separate div/cast + store in set_kv_buffer.
+                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    launch_reshape_and_cache_flash(
+                        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        cache_loc,
+                        k_scale=k_descale,
+                        v_scale=v_descale,
+                    )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
@@ -2369,7 +2388,7 @@ class AiterAttnBackend(AttentionBackend):
         v_descale = None
         if self.kv_cache_dtype == fp8_dtype:
             k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
-            v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
+            v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
 
         if save_kv_cache:
             # SHUFFLE 5D pool path — see forward_extend for rationale.
@@ -2409,10 +2428,9 @@ class AiterAttnBackend(AttentionBackend):
                     k_scale=k_descale,
                     v_scale=v_descale,
                 )
-            elif self.use_triton_unified_attention and self.kv_cache_dtype == fp8_dtype:
-                # [PATCH] FP8 non-SWA: use launch_reshape_and_cache_flash to
-                # fuse bf16→fp8 cast + paged write in one Triton kernel,
-                # eliminating separate float8_copy + store_kvcache overhead.
+            elif self.kv_cache_dtype == fp8_dtype and not self.use_mla:
+                # FP8: fuse bf16->fp8 cast + paged write in one kernel. Works for
+                # both unified and standard (paged_attention_ragged) read paths.
                 token_to_kv_pool = self.token_to_kv_pool
                 k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 launch_reshape_and_cache_flash(
@@ -2425,6 +2443,8 @@ class AiterAttnBackend(AttentionBackend):
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     ),
                     forward_batch.out_cache_loc,
+                    k_scale=k_descale,
+                    v_scale=v_descale,
                 )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
