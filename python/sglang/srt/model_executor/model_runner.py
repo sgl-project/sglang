@@ -1507,13 +1507,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             getattr(self.model, "quant_config", None), "quantized_layers", None
         )
         if (
-            self.server_args.quantization is not None
-            and isinstance(quantized_layers, tuple)
-            and len(quantized_layers) == 2
+            hasattr(self.model, "quant_config")
+            and hasattr(self.model.quant_config, "quantized_layers")
+            and self.server_args.quantization is not None
         ):
-            layer_types, quantized_layers_count = quantized_layers
+            type_counts, quantized_layers_count = (
+                self.model.quant_config.quantized_layers
+            )
+            type_summary = ", ".join(f"{t}: {c}" for t, c in type_counts.items())
             logger.info(
-                f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
+                f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers in total ({type_summary})."
             )
 
         if self.server_args.debug_tensor_dump_output_folder is not None:

@@ -108,7 +108,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.if_use_v2 = any(
-            arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+            arch
+            in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
 

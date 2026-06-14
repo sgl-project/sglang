@@ -161,7 +161,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if (
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 assert input_embeds is not None
                 last_indices = (

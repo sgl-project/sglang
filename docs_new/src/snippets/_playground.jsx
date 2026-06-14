@@ -13,6 +13,8 @@
 //   pdDisagg     — role + transfer backend + IB device + optional router
 //   hicache     — enable + backend + write policy
 //   hisparse    — enable + host ratio (decode-only)
+//   flagSelects — generic: a config-declared LIST of single-selects, each with
+//                 its own title + strip-prefixes + options (no per-feature code)
 //
 // Adding an axis = one entry in AXIS_HANDLERS below; nothing else switches on
 // an axis id. Each handler implements initState / revertHidden / apply /
@@ -912,6 +914,107 @@ export const Playground = ({ config }) => {
             </div>
           </div>
         );
+      },
+    },
+
+    // ---- Axis: Flag Selects (generic, config-declared) ----------------------
+    // A LIST of single-selects, each declared entirely in config:
+    //   { id, title, stripPrefixes: [...], options: [{ id, label, flags? }] }
+    // Same shape as `speculative` minus its hardcoded title + strip list: pick
+    // an option → strip the family, splice the option's flags. A flagless
+    // option is the "none" / accuracy-safe choice (matches a base carrying none
+    // of the family). Model-specific controls (KV-cache dtype, mamba scheduler
+    // strategy, …) live here as DATA — no per-feature engine code. Supports
+    // multiple selects per page. State: { [selectId]: optionId | null }
+    // (null = inherit base).
+    flagSelects: {
+      initState: (fc) => {
+        const out = {};
+        for (const spec of (fc || [])) out[spec.id] = null;
+        return out;
+      },
+
+      // Per select: match base's family flags (first token ∈ stripPrefixes)
+      // against each option's flags. A flagless option matches an empty family.
+      deriveFromBase: (cell, fc) => {
+        const flags = (cell && cell.flags) || [];
+        const out = {};
+        for (const spec of (fc || [])) {
+          const prefixes = spec.stripPrefixes || [];
+          const fam = flags.filter((f) => prefixes.includes(f.split(/[\s=]/)[0]));
+          let hit = null;
+          for (const opt of (spec.options || [])) {
+            const of = opt.flags || [];
+            if (of.length === fam.length && of.every((x) => fam.includes(x))) {
+              hit = opt.id; break;
+            }
+          }
+          out[spec.id] = hit;
+        }
+        return out;
+      },
+
+      revertHidden: (value, fc, base, h) => {
+        let changed = false;
+        const next = { ...value };
+        for (const spec of (fc || [])) {
+          const cur = next[spec.id];
+          if (cur !== null && cur !== undefined
+              && h.isHidden(spec.options, cur, base)) {
+            next[spec.id] = null; changed = true;
+          }
+        }
+        return changed ? next : value;
+      },
+
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
+        const evalBase = {
+          ...(sel || {}),
+          dpAttnOn: h.hasFlag(flags, "--enable-dp-attention"),
+          pdMode: h.findFlagArg(flags, "--disaggregation-mode") || "off",
+        };
+        for (const spec of (fc || [])) {
+          const v = value ? value[spec.id] : null;
+          if (v === null || v === undefined) continue;          // inherit base
+          const d = derived ? derived[spec.id] : null;
+          if (v === d) continue;                                // already == base
+          const opt = (spec.options || []).find((o) => o.id === v);
+          if (!opt) continue;
+          if (h.evaluateChip(opt, evalBase).disabled) continue;
+          flags = h.stripFlagsByFirstToken(flags, spec.stripPrefixes || []);
+          if (opt.flags && opt.flags.length) {
+            flags = h.insertBeforeTail(flags, opt.flags);
+          }
+        }
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip, derived }) => {
+        const cards = [];
+        for (const spec of (fc || [])) {
+          const opts = (spec.options || [])
+            .map((o) => h.evaluateChip(o, base))
+            .filter((c) => !c.hidden);
+          if (!opts.length) continue;
+          const explicit = value ? value[spec.id] : null;
+          const display = (explicit !== null && explicit !== undefined)
+            ? explicit : (derived ? derived[spec.id] : null);
+          cards.push(
+            <div key={`${axisId}-${spec.id}`} style={s.card}>
+              <div style={s.compactRow}>
+                <span style={s.axisTitle}>{spec.title}</span>
+                {opts.map((c) => (
+                  <span key={c.value} style={s.field}>
+                    {renderChip(c.label, display, c.value,
+                      () => setValue({ ...value, [spec.id]: c.value }),
+                      { disabled: c.disabled, disabledReason: c.disableReason })}
+                  </span>
+                ))}
+              </div>
+            </div>
+          );
+        }
+        return cards.length ? cards : null;
       },
     },
 

@@ -812,6 +812,22 @@ def get_vae_parallel_rank() -> int:
     return torch.distributed.get_rank(group=get_vae_parallel_group())
 
 
+def get_decode_parallel_group_coordinator() -> GroupCoordinator:
+    sp_group = get_sp_group()
+    cfg_group = get_cfg_group()
+    if sp_group.world_size == 1 and cfg_group.world_size > 1:
+        return cfg_group
+    return sp_group
+
+
+def get_decode_parallel_world_size() -> int:
+    return get_decode_parallel_group_coordinator().world_size
+
+
+def get_decode_parallel_rank() -> int:
+    return get_decode_parallel_group_coordinator().rank_in_group
+
+
 def init_dit_group(
     dit_parallel_size: int,
     backend: str,

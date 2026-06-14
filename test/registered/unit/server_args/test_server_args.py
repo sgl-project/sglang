@@ -118,7 +118,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
                 disaggregation_transfer_backend="fake",
             )
 
-        self.assertIn("('nixl', 'mooncake')", str(context.exception))
+        self.assertIn("('nixl', 'mooncake', 'mori')", str(context.exception))
         self.assertIn("'fake'", str(context.exception))
 
 
