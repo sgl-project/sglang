@@ -29,10 +29,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
 )
-from sglang.srt.utils.nvtx_utils import (
-    NVTX_SCHEDULER_ENABLED,
-    nvtx_annotated_method,
-)
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -71,7 +68,7 @@ class SchedulerRequestReceiver:
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
-    @nvtx_annotated_method("scheduler.recv_requests", enabled=NVTX_SCHEDULER_ENABLED)
+    @scheduler_nvtx_method("scheduler.recv_requests")
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:

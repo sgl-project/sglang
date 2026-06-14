@@ -19,7 +19,7 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_forward_context,
 )
-from sglang.srt.utils.nvtx_utils import NVTX_OPERATIONS_ENABLED, nvtx_range
+from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -150,17 +150,15 @@ class _StageExecutor:
             if self._child_ctx is not None
             else nullcontext()
         )
-        stage_range = nvtx_range(
+        stage_range = operations_nvtx_range(
             debug_name=f"{self._debug_name}{self._index}",
             color="orange",
-            enabled=NVTX_OPERATIONS_ENABLED,
         )
         with ctx_mgr, stage_range:
             for op in stage:
-                with nvtx_range(
+                with operations_nvtx_range(
                     debug_name=op.debug_name,
                     color="yellow",
-                    enabled=NVTX_OPERATIONS_ENABLED,
                 ):
                     self._stage_output = op.fn(
                         state=self._stage_state,

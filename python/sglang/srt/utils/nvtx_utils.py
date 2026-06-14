@@ -28,7 +28,7 @@ decoration time, not per call.
 
 import logging
 from contextlib import contextmanager, nullcontext
-from functools import wraps
+from functools import partial, wraps
 from typing import Optional
 
 import torch
@@ -130,3 +130,10 @@ def nvtx_annotated_method(
         return wrapper
 
     return decorator
+
+
+# Pre-bound per-subsystem helpers so call sites don't repeat the gate: each
+# binds its subsystem's resolved enable flag, leaving callers to pass only the
+# span name (and optional color).
+scheduler_nvtx_method = partial(nvtx_annotated_method, enabled=NVTX_SCHEDULER_ENABLED)
+operations_nvtx_range = partial(nvtx_range, enabled=NVTX_OPERATIONS_ENABLED)
