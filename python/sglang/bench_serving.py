@@ -1243,6 +1243,7 @@ async def benchmark(
     profile: bool,
     pd_separated: bool = False,
     flush_cache: bool = False,
+    flush_cache_empty_cache: bool = False,
     warmup_requests: int = 1,
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
@@ -1347,7 +1348,12 @@ async def benchmark(
 
     # Flush cache
     if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
-        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+        await asyncio.to_thread(
+            requests.post,
+            base_url + "/flush_cache",
+            headers=get_auth_headers(),
+            params={"empty_cache": flush_cache_empty_cache},
+        )
 
     time.sleep(1.0)
 
@@ -1938,6 +1944,8 @@ def run_benchmark(args_: argparse.Namespace):
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
+    if not hasattr(args, "flush_cache_empty_cache"):
+        args.flush_cache_empty_cache = False
 
     # Prepare LoRA arguments
     lora_request_distribution = (
@@ -1968,6 +1976,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
+            flush_cache_empty_cache=args.flush_cache_empty_cache,
             warmup_requests=args.warmup_requests,
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
@@ -2391,7 +2400,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--flush-cache",
         action="store_true",
-        help="Flush the cache before running the benchmark",
+        help="Flush server-side caches before running the benchmark.",
+    )
+    parser.add_argument(
+        "--flush-cache-empty-cache",
+        action="store_true",
+        help=(
+            "Also empty the device allocator cache while flushing. This is off "
+            "by default so the benchmark does not include allocator cold-start latency."
+        ),
     )
     parser.add_argument(
         "--warmup-requests",
