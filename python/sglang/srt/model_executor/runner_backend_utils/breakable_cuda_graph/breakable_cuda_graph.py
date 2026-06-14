@@ -29,15 +29,6 @@ from typing import Any, Callable
 
 import torch
 
-try:
-    from cuda.bindings import runtime as rt
-except ImportError:
-    rt = None
-
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
-    checkCudaErrors,
-)
-
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -46,14 +37,6 @@ __all__ = [
     "BreakableCUDAGraphCapture",
     "break_graph",
 ]
-
-
-def _check_cuda_bindings():
-    if rt is None:
-        raise ImportError(
-            "Breakable CUDA graph requires the 'cuda-python' package. "
-            "Install it with: pip install cuda-python"
-        )
 
 
 # Active BreakableCUDAGraphCapture context for the currently-capturing thread.
@@ -77,18 +60,9 @@ def get_current_stream(device: torch.device | None = None) -> torch.cuda.Stream:
     return stream
 
 
-def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
-    _check_cuda_bindings()
-    status, *_ = checkCudaErrors(rt.cudaStreamGetCaptureInfo(stream_ptr))
-    return status
-
-
-def _is_capturing(stream_ptr: int) -> bool:
-    _check_cuda_bindings()
-    return (
-        _capture_status(stream_ptr)
-        == rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
-    )
+def _is_stream_capturing(stream: torch.cuda.Stream) -> bool:
+    with torch.cuda.stream(stream):
+        return torch.cuda.is_current_stream_capturing()
 
 
 # Hook torch.cuda.Stream.wait_stream to track side-stream forks/joins that happen
@@ -116,10 +90,7 @@ def _hooked_wait_stream(self: torch.cuda.Stream, other: torch.cuda.Stream):
     is_other_cap = other is capturing or other.cuda_stream == cap_ptr
 
     if is_self_cap and not is_other_cap:
-        if (
-            _capture_status(other.cuda_stream)
-            != rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
-        ):
+        if not _is_stream_capturing(other):
             return
         _original_wait_stream(self, other)
         forked.discard(other)
@@ -155,9 +126,9 @@ def _weak_ref_if_tensor(x):
     mempool reclaim per-layer intermediates between segments — storage stays
     alive for each segment CUDAGraph's lifetime via its pool use_count.
 
-    weak_ref_tensors is imported lazily: the module hard-raises on
-    non-CUDA/NPU platforms, and we only reach this code during an active
-    Breakable capture (which can't happen on CPU-only runners anyway)."""
+    weak_ref_tensors is imported lazily because it hard-raises on
+    platforms without a CUDA/HIP/NPU backend; we only reach this code during
+    an active Breakable capture, which runs only on those backends."""
     if torch.is_tensor(x):
         from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
@@ -329,7 +300,7 @@ class BreakableCUDAGraphCapture:
         if forked:
             assert _original_wait_stream is not None
             for side in list(forked):
-                if _is_capturing(side.cuda_stream):
+                if _is_stream_capturing(side):
                     _original_wait_stream(main_stream, side)
             forked.clear()
         self.cuda_graph._segments[-1].capture_end()
