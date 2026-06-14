@@ -71,6 +71,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
+    PostProcessWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -1108,6 +1109,20 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_ipc(obj, None)
+        )
+
+    def post_process_weights(
+        self,
+        restore_weights_before_load: bool = False,
+        post_process_quantization: bool = False,
+    ):
+        """Run optional post-processing for updated weights."""
+        obj = PostProcessWeightsReqInput(
+            restore_weights_before_load=restore_weights_before_load,
+            post_process_quantization=post_process_quantization,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.post_process_weights(obj, None)
         )
 
     def get_weights_by_name(self, name: str, truncate_size: int = 100):
