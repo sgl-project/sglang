@@ -1307,7 +1307,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
-        # Update mamba state for hybrid GDN models after verification
+        # Update mamba state for hybrid linear-attention models after verification
         commit_mamba_states_after_verify(
             self.target_worker,
             batch,

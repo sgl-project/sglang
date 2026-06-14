@@ -255,7 +255,15 @@ def post_load_weights(model: nn.Module, model_config: ModelConfig):
     # 2. Post-processing of weights, including assigning specific member variables.
     # For `dummy_init`, only the second stage is required.
     if hasattr(model, "post_load_weights"):
-        if model_config.hf_config.architectures[0] == "DeepseekV3ForCausalLMNextN":
+        # List of NextN model architectures that need is_nextn=True
+        nextn_architectures = [
+            "DeepseekV3ForCausalLMNextN",
+            "BailingMoeV2_5ForCausalLMNextN",
+            "BailingMoeForCausalLMNextN",
+            "Glm4MoeForCausalLMNextN",
+            "LongcatFlashForCausalLMNextN",
+        ]
+        if model_config.hf_config.architectures[0] in nextn_architectures:
             model.post_load_weights(is_nextn=True)
         else:
             model.post_load_weights()
