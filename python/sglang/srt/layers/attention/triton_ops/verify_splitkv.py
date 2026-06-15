@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Split-KV (flash-decode) attention for EAGLE speculative *verify*.
 
 Only valid when speculative ``topk == 1`` (the EAGLE tree reduces to a pure
