@@ -467,6 +467,10 @@ class PrefillAdder:
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
+        self.log_l1_hit_tokens = 0
+        self.log_l2_hit_tokens = 0
+        self.log_l3_hit_tokens = 0
+        self.log_miss_tokens = 0
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -637,6 +641,14 @@ class PrefillAdder:
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
+
+    def _accumulate_per_tier_hits(
+        self, l1: int, l2: int, l3: int, miss: int
+    ) -> None:
+        self.log_l1_hit_tokens += l1
+        self.log_l2_hit_tokens += l2
+        self.log_l3_hit_tokens += l3
+        self.log_miss_tokens += miss
 
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
@@ -895,6 +907,7 @@ class PrefillAdder:
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
+        l1_hit = prefix_len  # L1 GPU device hits before host load-back
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
@@ -928,6 +941,7 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
+            loaded_back = 0
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
@@ -942,6 +956,10 @@ class PrefillAdder:
                 )
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                loaded_back = len(new_indices)
+
+            l3_hit = min(getattr(req, "storage_hit_length", 0), loaded_back)
+            l2_hit = loaded_back - l3_hit
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
@@ -965,6 +983,7 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
+                self._accumulate_per_tier_hits(l1_hit, l2_hit, l3_hit, req.extend_input_len)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.fill_len = len(req.full_untruncated_fill_ids)
@@ -983,6 +1002,7 @@ class PrefillAdder:
                     ),
                     req.retracted_stain,
                 )
+                self._accumulate_per_tier_hits(l1_hit, l2_hit, l3_hit, req.extend_input_len)
             else:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
@@ -1019,6 +1039,7 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len, trunc_len, 0, req.retracted_stain
                 )
+                self._accumulate_per_tier_hits(l1_hit, l2_hit, l3_hit, trunc_len)
 
         return self.budget_state()
 

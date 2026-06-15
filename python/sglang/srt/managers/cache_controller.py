@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -525,7 +526,7 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -622,7 +623,7 @@ class HiCacheController:
         else:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
-            self.dp_rank = 0
+            self.dp_rank = int(os.environ.get("SGLANG_DP_RANK", "0"))
 
         self.pp_rank = get_pipeline_model_parallel_rank()
         self.pp_size = get_pipeline_model_parallel_world_size()
