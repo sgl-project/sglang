@@ -10,11 +10,6 @@ Registry: nightly-amd-8-gpu-mi35x suite
 
 import ast
 import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -81,7 +76,7 @@ MI35X_GPT_OSS_MODELS = [
         # to INTERLEAVE, so opt out explicitly here.
         env_vars={
             "SGLANG_USE_AITER": "1",
-            "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
         },
     ),
     ModelConfig(
@@ -102,7 +97,7 @@ MI35X_GPT_OSS_MODELS = [
         ],
         env_vars={
             "SGLANG_USE_AITER": "1",
-            "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
         },
     ),
 ]
