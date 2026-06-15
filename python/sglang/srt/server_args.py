@@ -4354,6 +4354,11 @@ class ServerArgs:
                 )
                 self.enable_dynamic_batch_tokenizer = False
 
+            logger.info(
+                "skip_tokenizer_init=True: string-based stop conditions (stop, stop_regex) "
+                "and min_new_tokens are unavailable."
+            )
+
     def _handle_environment_variables(self):
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
         if self.mamba_ssm_dtype is not None:
@@ -4680,6 +4685,14 @@ class ServerArgs:
                 self.preferred_sampling_params = json.loads(
                     self.preferred_sampling_params
                 )
+
+            # Validate preferred_sampling_params doesn't use tokenizer-dependent features
+            if self.skip_tokenizer_init:
+                from sglang.srt.sampling.sampling_params import SamplingParams
+
+                test_params = SamplingParams(**self.preferred_sampling_params)
+                # raises if tokenizer-dependent features used
+                test_params.normalize(None)
 
     def _handle_crash_dump_env(self):
         if not self.crash_dump_folder:
