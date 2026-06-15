@@ -347,4 +347,3 @@ if __name__ == "__main__":
         _run_residual_accuracy_check()
     else:
         unittest.main()
-
