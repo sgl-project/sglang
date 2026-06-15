@@ -1484,6 +1484,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         _use_gatherv_pair = (
             _use_tp_moe_gather
             and is_dp_gatherv_active()
+            and forward_batch.dp_padding_mode is not None
             and not forward_batch.dp_padding_mode.is_max_len()
         )
         if _use_cp:

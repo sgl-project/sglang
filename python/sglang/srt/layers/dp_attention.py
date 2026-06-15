@@ -554,7 +554,7 @@ def _dp_gatherv_sizes(forward_batch) -> Optional[List[int]]:
         return None
     try:
         return [int(x) for x in sizes]
-    except TypeError:
+    except (TypeError, ValueError):
         return None
 
 
@@ -582,7 +582,9 @@ def _dp_gather_via_all_gatherv(
         local_real[: local_tokens.shape[0]].copy_(local_tokens)
     gathered = get_tp_group().all_gatherv(local_real, sizes=sizes)
     if isinstance(gathered, list):
-        gathered = gathered[0]
+        # all_gatherv may return a list of per-rank tensors; concatenate them
+        # along the token dim (taking [0] would drop all but rank 0's tokens).
+        gathered = torch.cat(gathered, dim=0)
     # gathered rows == sum(sizes); must equal the buffer length.
     global_tokens[: gathered.shape[0]].copy_(gathered)
 
@@ -593,7 +595,11 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if is_dp_gatherv_active() and not forward_batch.dp_padding_mode.is_max_len():
+    if (
+        is_dp_gatherv_active()
+        and forward_batch.dp_padding_mode is not None
+        and not forward_batch.dp_padding_mode.is_max_len()
+    ):
         _gatherv_sizes = _dp_gatherv_sizes(forward_batch)
         # Only take the gatherv path when the per-rank sizes EXACTLY fill the
         # pre-allocated global buffer (the MoE runs on the whole buffer, so any
@@ -654,10 +660,12 @@ def dp_scatter(
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     if is_dp_gatherv_active():
         # Variable-length combine matching all_gatherv dispatch: scatter the
-        # global (sum_len) tensor back to per-rank token counts.
+        # global (sum_len) tensor back to per-rank token counts. Fall through to
+        # the default reduce-scatter path if per-rank sizes are unavailable.
         sizes = get_dp_global_num_tokens()
-        get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
-        return
+        if sizes is not None:
+            get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
+            return
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
         get_tp_group().reduce_scatter_tensor(output, input)
     else:
