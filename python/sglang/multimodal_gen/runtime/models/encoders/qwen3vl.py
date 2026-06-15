@@ -98,8 +98,11 @@ def _make_text_linear(
                 out_features,
                 bias=bias,
                 gather_output=gather_output,
+                enable_fused_w8a8=False,
             )
-        return WeightOnlyFP8Linear(in_features, out_features, bias=bias)
+        return WeightOnlyFP8Linear(
+            in_features, out_features, bias=bias, enable_fused_w8a8=False
+        )
     if quant_config is not None:
         if use_column_parallel:
             return Qwen3VLColumnParallelLinear(

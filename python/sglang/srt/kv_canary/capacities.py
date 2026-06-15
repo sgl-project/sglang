@@ -43,11 +43,11 @@ class CanaryLaunchCapacities:
     def from_args(
         cls,
         *,
-        server_args: "ServerArgs",
+        server_args: ServerArgs,
         req_to_token_pool_size: int,
         max_seq_len_per_req: int,
         pool_slot_count: int,
-    ) -> "CanaryLaunchCapacities":
+    ) -> CanaryLaunchCapacities:
         if req_to_token_pool_size <= 0:
             raise ValueError(
                 "kv-canary: req_to_token_pool_size must be positive, "

@@ -22,7 +22,7 @@ class RadixCacheWalkResult:
 
 def walk_radix_cache_for_canary(
     *,
-    radix_cache: "BasePrefixCache",
+    radix_cache: BasePrefixCache,
     unlocked_only: bool = False,
     swa_resident_only: bool = False,
 ) -> RadixCacheWalkResult:
@@ -68,8 +68,8 @@ def walk_radix_cache_for_canary(
 
 def _walk_radix_subtree(
     *,
-    node: "TreeNode",
-    radix_cache: "BasePrefixCache",
+    node: TreeNode,
+    radix_cache: BasePrefixCache,
     depth: int,
     parent_last_slot: int,
     slot_buf: list[int],
@@ -123,8 +123,8 @@ def _walk_radix_subtree(
 
 def _node_is_unlocked_for_canary(
     *,
-    node: "TreeNode",
-    radix_cache: "BasePrefixCache",
+    node: TreeNode,
+    radix_cache: BasePrefixCache,
 ) -> bool:
     if type(radix_cache) is RadixCache:
         return node.lock_ref == 0
@@ -139,8 +139,8 @@ def _node_is_unlocked_for_canary(
 
 def _node_is_swa_resident_for_canary(
     *,
-    node: "TreeNode",
-    radix_cache: "BasePrefixCache",
+    node: TreeNode,
+    radix_cache: BasePrefixCache,
 ) -> bool:
     if type(radix_cache) is not SWARadixCache:
         return True
