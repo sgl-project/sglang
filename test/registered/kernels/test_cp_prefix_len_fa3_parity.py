@@ -18,7 +18,7 @@ from sglang.srt.utils.common import ceil_align
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=8, stage="extra-a", runner_config="1-gpu-large")
 
 _DSA_UTILS = "sglang.srt.layers.attention.dsa.utils"
 _DEVICE = "cuda"
