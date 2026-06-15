@@ -321,7 +321,16 @@ def initialize_dp_attention(
 
 
 def is_dp_attention_enabled() -> bool:
-    return _ENABLE_DP_ATTENTION_FLAG
+    # Backing moved to the container (Global Context P1e): the value source is
+    # server_args.enable_dp_attention (set into _ENABLE_DP_ATTENTION_FLAG by
+    # initialize_dp_attention), read here via the identity-preserving shim. The
+    # module global above is kept as a vestigial dual-write (removed in P8). Every
+    # real caller runs after initialize_dp_attention, so this is value-equivalent.
+    # Local import matches the existing pattern (this file avoids a module-level
+    # server_args import to dodge an early-import cycle).
+    from sglang.srt.server_args import get_global_server_args
+
+    return get_global_server_args().enable_dp_attention
 
 
 def is_allocation_symmetric() -> bool:

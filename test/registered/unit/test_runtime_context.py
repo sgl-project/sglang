@@ -614,5 +614,42 @@ class TestConfigOnlyPublish(unittest.TestCase):
         self.assertIs(get_global_server_args(), second)
 
 
+class TestDpAttentionEnableFlag(unittest.TestCase):
+    """P1e: is_dp_attention_enabled() backing moved to the container — it reads
+    server_args.enable_dp_attention via the identity-preserving shim."""
+
+    def setUp(self):
+        reset_context()
+        self._clear_legacy()
+
+    def tearDown(self):
+        reset_context()
+        self._clear_legacy()
+
+    @staticmethod
+    def _clear_legacy():
+        import sglang.srt.server_args as sa
+
+        sa._global_server_args = None
+
+    def test_reads_enable_dp_attention_from_context(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        set_context(
+            build_config_only_context(
+                server_args=SimpleNamespace(enable_dp_attention=True)
+            )
+        )
+        self.assertTrue(is_dp_attention_enabled())
+        set_context(
+            build_config_only_context(
+                server_args=SimpleNamespace(enable_dp_attention=False)
+            )
+        )
+        self.assertFalse(is_dp_attention_enabled())
+
+
 if __name__ == "__main__":
     unittest.main()
