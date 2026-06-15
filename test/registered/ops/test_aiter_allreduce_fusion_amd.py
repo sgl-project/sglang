@@ -34,7 +34,6 @@ def _run_residual_accuracy_check():
     import torch.distributed as dist
 
     from sglang.srt.distributed.communication_op import (
-        tensor_model_parallel_all_reduce,
         tensor_model_parallel_fused_allreduce_rmsnorm,
     )
     from sglang.srt.distributed.parallel_state import (
@@ -142,12 +141,15 @@ def _run_residual_accuracy_check():
     if rank == 0:
         print()
         if all_pass:
-            print("ALL PASSED: fused residual output within 1 bf16 ULP of unfused path.")
+            print(
+                "ALL PASSED: fused residual output within 1 bf16 ULP of unfused path."
+            )
         else:
             print(
                 "FAILED: fused residual output diverges beyond 1 ULP from unfused path."
             )
         sys.exit(0 if all_pass else 1)
+
 
 class TestAiterAllreduceFusionAmd(unittest.TestCase):
 
