@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_xpu_ci(est_time=120, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=120, suite="stage-a-test-1-gpu-xpu")
 
 
 class TestXPUEmbedding(CustomTestCase):

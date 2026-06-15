@@ -75,7 +75,7 @@ suite_xeon = {
 
 # XPU tests migrated to test/registered/xpu/ using register_xpu_ci().
 # The legacy per-commit-xpu suite is replaced by stage-a-test-1-gpu-xpu
-# and stage-b-test-1-gpu-xpu in test/run_suite.py (registry-based).
+# in test/run_suite.py (registry-based).
 suite_xpu = {}
 
 suites.update(suite_amd)
