@@ -149,21 +149,19 @@ def flash_compress128_decode(
 
     seq_len, write_loc, _rp0, rp1 = decode_plan_d(plan_d_u8)
 
-    for b in range(B):
-        loc = int(write_loc[b].item())
-        kv_flat[loc].copy_(kv_input[b])
+    # Scatter every token's write in one shot (each token writes a distinct slot).
+    kv_flat.index_copy_(0, write_loc, kv_input.to(kv_flat.dtype))
 
-        if loc % 128 != 127:
-            continue
+    # A compress event fires for tokens that just filled the last slot of a page.
+    # Each active token compresses its own (distinct) completed page, so reading
+    # the pages after all writes is equivalent to the per-token write-then-read.
+    active = (write_loc % 128 == 127).nonzero(as_tuple=True)[0]
+    if active.numel() == 0:
+        return
 
-        page = int(rp1[b].item())
-        kv_buf_page = _page_slice_128(kv_flat, page)
-
-        c128_forward_torch(
-            kv_buf_page=kv_buf_page,
-            kv_input=kv_input,
-            ragged_id=b,  # decode kv_src points at row b
-            kv_out=kv_output[b],
-            ape=ape,
-            buffer_len=128,  # constant in flash_c128_decode
-        )
+    # buffer_len is constant 128 in decode, so the window is the whole page.
+    windows = kv_buffer[rp1[active]]  # [A, 128, head_dim*2]
+    kv = windows[:, :, :head_dim]
+    sc = windows[:, :, head_dim : 2 * head_dim] + ape  # ape [128, head_dim] broadcasts
+    w = torch.softmax(sc, dim=1)
+    kv_output[active] = (kv * w).sum(dim=1).to(kv_output.dtype)
