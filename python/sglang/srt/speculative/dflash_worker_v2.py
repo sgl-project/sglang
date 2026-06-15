@@ -25,6 +25,7 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
+    apply_graph_safe_scaling_penalties,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -602,19 +603,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         return int(resolved_id)
-
     def _greedy_sample_from_vocab_parallel_head(
         self,
         *,
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
+        penalties: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Greedy argmax over the target LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
         TP>1 each rank only owns a shard of the LM head weight. This computes the
         per-rank max, gathers candidates across TP ranks, and selects the global max.
+        
+        Args:
+            penalties: Optional tensor of shape [num_tokens, vocab_size] containing scaling penalties.
+                       Applied element-wise before argmax to align draft distribution with target.
         """
 
         if hidden_states.numel() == 0:
@@ -688,6 +693,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
+                    
+                    # Apply penalties if provided (e.g., repetition_penalty)
                     local_max, local_arg = _ensure_local_reduce_buffers(
                         end - start, base_logits.dtype, hs.device
                     )
@@ -706,6 +713,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Base vocab logits.
             if num_org > 0:
                 base_logits = torch.matmul(hs, weight[:num_org].T)
+                
+                # Apply penalties if provided
                 local_max, local_arg = _ensure_local_reduce_buffers(
                     chunk_len, base_logits.dtype, hs.device
                 )
@@ -1483,9 +1492,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+
+        # Prepare penalties for draft sampling to align distribution with target.
+        # acc_scaling_penalties: [B, V] -> expand to [B*(K-1), V] for flattened draft tokens.
         draft_next = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
+            penalties=draft_sampling_penalties,
         ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]

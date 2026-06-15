@@ -145,6 +145,21 @@ class DFlashDraftInputV2(SpecInput):
         bs = batch.batch_size()
         if bs == 0:
             return
+
+        # Accumulate penalty for repetition_penalty etc.
+        # Optimized: Use direct tensor indexing to avoid Python loop overhead & syncs.
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            # Safely extract last generated token per request without Python iteration
+            seq_lens = batch.seq_lens_cpu[:bs]
+            valid_mask = seq_lens > 0
+            if valid_mask.any():
+                # Map request indices to their last position in the KV pool
+                last_pos = seq_lens[valid_mask] - 1
+                req_idx = batch.req_pool_indices.cpu()[valid_mask]
+                # Gather token IDs directly from the pool (zero-copy where possible)
+                output_ids = batch.req_to_token_pool.req_to_token[req_idx, last_pos].to(batch.device, non_blocking=True)
+                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(output_ids)
+
         self._ensure_prepare_length_buffers(bs, batch.device)
         assert self._prepare_committed_kv_lens_cpu_buf is not None
         assert self._prepare_planning_kv_lens_cpu_buf is not None
