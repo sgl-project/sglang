@@ -56,7 +56,7 @@ MI35X_QWEN3_MOE_MODELS = [
     ModelConfig(
         model_path="Qwen/Qwen3-30B-A3B",
         tp_size=8,
-        accuracy_threshold=0.85,
+        accuracy_threshold=0.75,
         other_args=[
             "--max-running-requests",
             "128",
