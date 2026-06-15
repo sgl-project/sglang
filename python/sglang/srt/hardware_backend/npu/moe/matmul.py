@@ -36,7 +36,7 @@ class GroupedMatmul(BaseMatmul):
                 f"Weight attribute '{weight_prefix}_weight' not found in layer"
             )
         print(hidden_states.shape)
-        print(scale_args.antiquant_scale.shape)
+        print(scale_args['antiquant_scale'].shape)
         return torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[weight],
