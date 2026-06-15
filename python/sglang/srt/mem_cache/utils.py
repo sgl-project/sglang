@@ -14,6 +14,8 @@
 """Common utilities."""
 
 import hashlib
+import sys
+from array import array
 from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.srt.environ import envs
@@ -103,22 +105,65 @@ def maybe_init_custom_mem_pool(
         return False, None, None
 
 
-def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
-    hasher = hashlib.sha256()
+def _token_bytes_and_width(token_ids: List[int]) -> tuple[memoryview, int]:
+    logical_len = len(token_ids)
+    if logical_len == 0:
+        return memoryview(b""), 1
 
-    if prior_hash:
-        hasher.update(bytes.fromhex(prior_hash))
+    is_bigram = getattr(token_ids, "is_bigram", False)
+    raw_token_ids = getattr(token_ids, "raw_token_ids", None)
+    raw = (
+        raw_token_ids()
+        if raw_token_ids is not None
+        else getattr(token_ids, "token_ids", token_ids)
+    )
 
-    for t in token_ids:
-        if isinstance(t, tuple):
-            # EAGLE bigram mode: hash both elements to uniquely identify the bigram
-            for elem in t:
-                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
+    if is_bigram:
+        unit_width = 2
+        tokens = array("I", [0]) * (logical_len * unit_width)
+        tokens[0::2] = array("I", raw[:logical_len])
+        tokens[1::2] = array("I", raw[1 : logical_len + 1])
+    else:
+        first_token = raw[0]
+        if isinstance(first_token, tuple):
+            unit_width = len(first_token)
+            tokens = array("I", (elem for token in raw[:logical_len] for elem in token))
         else:
-            # Regular mode: single integer token
-            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
+            unit_width = 1
+            tokens = array("I", raw[:logical_len])
 
-    return hasher.hexdigest()
+    assert tokens.itemsize == 4
+    if sys.byteorder != "little":
+        tokens.byteswap()
+
+    return memoryview(tokens).cast("B"), unit_width
+
+
+def get_hash_str(
+    token_ids: List[int],
+    prior_hash: Optional[str] = None,
+    page_size: Optional[int] = None,
+) -> str | List[str]:
+    prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
+    token_bytes, unit_width = _token_bytes_and_width(token_ids)
+    if page_size is None:
+        hasher = hashlib.sha256()
+        if prior_digest is not None:
+            hasher.update(prior_digest)
+        hasher.update(token_bytes)
+        return hasher.hexdigest()
+
+    hashes = []
+    bytes_per_page = page_size * unit_width * 4
+    for byte_start in range(0, len(token_bytes), bytes_per_page):
+        hasher = hashlib.sha256()
+        if prior_digest is not None:
+            hasher.update(prior_digest)
+        hasher.update(token_bytes[byte_start : byte_start + bytes_per_page])
+        prior_digest = hasher.digest()
+        hashes.append(prior_digest.hex())
+
+    return hashes
 
 
 def hash_str_to_int64(hash_str: str) -> int:

@@ -1,7 +1,10 @@
 """Unit tests for mem_cache/utils.py — no server, no model loading."""
 
 import hashlib
+import sys
+import types
 import unittest
+from array import array
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.evict_policy import (
@@ -22,12 +25,61 @@ from sglang.srt.mem_cache.utils import (
     split_node_hash_value,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
-class TestGetEvictionStrategy(CustomTestCase):
+def _legacy_get_hash_str(token_ids, prior_hash=None):
+    hasher = hashlib.sha256()
+    if prior_hash:
+        hasher.update(bytes.fromhex(prior_hash))
+    for t in token_ids:
+        if isinstance(t, tuple):
+            for elem in t:
+                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
+        else:
+            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
+    return hasher.hexdigest()
+
+
+def _legacy_page_hashes(key, page_size, prior_hash=None):
+    hashes = []
+    running_hash = prior_hash
+    for start in range(0, len(key), page_size):
+        running_hash = _legacy_get_hash_str(
+            key[start : start + page_size], running_hash
+        )
+        hashes.append(running_hash)
+    return hashes
+
+
+class _HashKey:
+    def __init__(self, token_ids, is_bigram=False):
+        self.token_ids = token_ids
+        self.is_bigram = is_bigram
+
+    def __len__(self):
+        return len(self.token_ids) - 1 if self.is_bigram else len(self.token_ids)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start = index.start or 0
+            stop = index.stop if index.stop is not None else len(self)
+            if self.is_bigram:
+                return _HashKey(self.token_ids[start : stop + 1], is_bigram=True)
+            return _HashKey(self.token_ids[start:stop])
+        if self.is_bigram:
+            return (self.token_ids[index], self.token_ids[index + 1])
+        return self.token_ids[index]
+
+    def raw_token_ids(self):
+        return self.token_ids
+
+    def hash_page(self, start, end, prior_hash=None):
+        return _legacy_get_hash_str(self[start:end], prior_hash)
+
+
+class TestGetEvictionStrategy(unittest.TestCase):
     def test_lru(self):
         self.assertIsInstance(get_eviction_strategy("lru"), LRUStrategy)
 
@@ -73,7 +125,7 @@ class TestGetEvictionStrategy(CustomTestCase):
         self.assertIsNot(s1, s2)
 
 
-class TestMaybeInitCustomMemPool(CustomTestCase):
+class TestMaybeInitCustomMemPool(unittest.TestCase):
     @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
     def test_disabled_by_default(self, mock_env_get):
         mock_env_get.return_value = None
@@ -83,19 +135,29 @@ class TestMaybeInitCustomMemPool(CustomTestCase):
         self.assertIsNone(pool_type)
 
     @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
-    @patch("sglang.srt.disaggregation.mooncake.utils.init_mooncake_custom_mem_pool")
-    def test_enabled_via_env(self, mock_init, mock_env_get):
+    def test_enabled_via_env(self, mock_env_get):
         mock_env_get.return_value = "enabled"
+        mock_init = MagicMock()
         mock_init.return_value = (True, "mock_pool_instance", "mooncake")
 
-        enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
+        mooncake_pkg = types.ModuleType("sglang.srt.disaggregation.mooncake")
+        mooncake_utils = types.ModuleType("sglang.srt.disaggregation.mooncake.utils")
+        mooncake_utils.init_mooncake_custom_mem_pool = mock_init
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.mooncake": mooncake_pkg,
+                "sglang.srt.disaggregation.mooncake.utils": mooncake_utils,
+            },
+        ):
+            enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
         self.assertTrue(enabled)
         self.assertEqual(pool, "mock_pool_instance")
         self.assertEqual(pool_type, "mooncake")
         mock_init.assert_called_once_with("cuda:0")
 
 
-class TestGetHashStr(CustomTestCase):
+class TestGetHashStr(unittest.TestCase):
     def test_empty_list(self):
         result = get_hash_str([])
         self.assertIsInstance(result, str)
@@ -144,8 +206,68 @@ class TestGetHashStr(CustomTestCase):
             result = get_hash_str(tokens)
             self.assertRegex(result, r"^[0-9a-f]{64}$")
 
+    def test_hash_key_matches_legacy_loop(self):
+        prior_hash = get_hash_str([7, 8, 9])
+        cases = [
+            ("unigram", _HashKey(array("q", range(1, 34))), None),
+            (
+                "bigram",
+                _HashKey(array("q", [10, 20, 30, 40, 50, 60, 70]), is_bigram=True),
+                None,
+            ),
+            (
+                "prior_hash",
+                _HashKey(array("q", [101, 102, 103, 104, 105])),
+                prior_hash,
+            ),
+        ]
 
-class TestHashStrToInt64(CustomTestCase):
+        for name, key, prior_hash in cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    get_hash_str(key, prior_hash),
+                    _legacy_get_hash_str(key, prior_hash),
+                )
+
+    def test_hash_key_hash_page_matches_get_hash_str(self):
+        key = _HashKey(array("q", [1, 2, 3, 4, 5, 6]), is_bigram=True)
+        prior_hash = get_hash_str([(9, 10)])
+
+        self.assertEqual(
+            key.hash_page(1, 4, prior_hash),
+            get_hash_str(key[1:4], prior_hash),
+        )
+
+
+class TestGetHashStrPageMode(unittest.TestCase):
+    def test_page_mode_matches_legacy_loop(self):
+        prior_hash = get_hash_str([7, 8, 9])
+        cases = [
+            ("empty", [], 8, None),
+            ("unigram", _HashKey(array("q", range(1, 34))), 8, None),
+            (
+                "bigram",
+                _HashKey(array("q", [10, 20, 30, 40, 50, 60, 70]), is_bigram=True),
+                2,
+                None,
+            ),
+            (
+                "prior_hash",
+                _HashKey(array("q", [101, 102, 103, 104, 105])),
+                2,
+                prior_hash,
+            ),
+        ]
+
+        for name, key, page_size, prior_hash in cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    get_hash_str(key, prior_hash, page_size=page_size),
+                    _legacy_page_hashes(key, page_size, prior_hash),
+                )
+
+
+class TestHashStrToInt64(unittest.TestCase):
     def test_zero_hash(self):
         result = hash_str_to_int64("0" * 64)
         self.assertEqual(result, 0)
@@ -178,7 +300,7 @@ class TestHashStrToInt64(CustomTestCase):
         self.assertTrue(-(2**63) <= int64_val < 2**63)
 
 
-class TestComputeNodeHashValues(CustomTestCase):
+class TestComputeNodeHashValues(unittest.TestCase):
     def setUp(self):
         def mock_hash_page(start, end, parent_hash):
             parts = [f"p{start}-{end}"]
@@ -267,7 +389,7 @@ class TestComputeNodeHashValues(CustomTestCase):
         self.assertEqual(result, ["p0-8"])
 
 
-class TestSplitNodeHashValue(CustomTestCase):
+class TestSplitNodeHashValue(unittest.TestCase):
     def test_none_input_returns_none_tuple(self):
         result = split_node_hash_value(None, 10, 4)
         self.assertEqual(result, (None, None))
