@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -88,7 +87,7 @@ class GPTQLinearAscendKernel:
 
         # for 4bit case we need to pack 4bit weight to int32 to save memory
         layer.qweight = torch.nn.Parameter(
-            torch_npu.npu_convert_weight_to_int4pack(qweight_tmp.to(torch.int32)),
+            torch.ops.npu.npu_convert_weight_to_int4pack(qweight_tmp.to(torch.int32)),
             requires_grad=False,
         )
 
@@ -113,7 +112,7 @@ class GPTQLinearAscendKernel:
         else:
             out_shape = x.shape[:-1] + (qweight.shape[-1],)
 
-        out = torch_npu.npu_weight_quant_batchmatmul(
+        out = torch.ops.npu.npu_weight_quant_batchmatmul(
             reshaped_x,
             qweight,
             antiquant_scale=scales,
@@ -188,24 +187,22 @@ class GPTQMoEAscendKernel:
 
                 layer.w13_scales.data.abs_()
 
+            w13_qweight_tmp = npu_format_cast(w13_qweight_tmp)
             layer.w13_qweight = torch.nn.Parameter(
-                npu_format_cast(
-                    torch_npu.npu_convert_weight_to_int4pack(
-                        w13_qweight_tmp.reshape(
-                            layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
-                        )
-                        .transpose(-1, -2)
-                        .contiguous()
-                        .reshape(-1, layer.w13_qweight.shape[2])
-                        .to(torch.int32)
+                torch.ops.npu.npu_convert_weight_to_int4pack(
+                    w13_qweight_tmp.reshape(
+                        layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
                     )
-                    .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
-                    .contiguous(),
-                    requires_grad=False,
+                    .transpose(-1, -2)
+                    .contiguous()
+                    .reshape(-1, layer.w13_qweight.shape[2])
+                    .to(torch.int32)
                 )
+                .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
+                .contiguous(),
+                requires_grad=False,
             )
-            import torch_npu
-            print(torch_npu.get_npu_fromat_cast(layer.w13_qweight))
+            print(torch.ops.npu.get_npu_fromat_cast(layer.w13_qweight))
         # use int8 to store weight by default
         else:
             layer.w13_qweight = torch.nn.Parameter(
@@ -243,7 +240,7 @@ class GPTQMoEAscendKernel:
                 layer.w2_scales.data.abs_()
 
             layer.w2_qweight = torch.nn.Parameter(
-                torch_npu.npu_convert_weight_to_int4pack(
+                torch.ops.npu.npu_convert_weight_to_int4pack(
                     w2_qweight_tmp.reshape(
                         layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
                     )
