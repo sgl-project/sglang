@@ -1546,9 +1546,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     timestep=timestep,
                     target_dtype=target_dtype,
                     guidance=guidance,
-                    enable_bcg=not self._should_skip_bcg_warmup_capture(
-                        batch, server_args
-                    ),
                     **branch.kwargs,
                 )
             pred_t = _wrap(raw)
@@ -1807,7 +1804,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         timestep,
         target_dtype,
         guidance: torch.Tensor,
-        enable_bcg: bool = True,
         **kwargs,
     ):
         guidance_kwargs = self.prepare_extra_func_kwargs(
@@ -1820,30 +1816,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             **guidance_kwargs,
             **kwargs,
         )
-        runner = self._maybe_get_bcg_runner(current_model) if enable_bcg else None
+        runner = self._maybe_get_bcg_runner(current_model)
         if runner is not None:
             return runner(
                 **self._bcg_pad_prompt_kwargs(call_kwargs, current_model=current_model)
             )
         return current_model(**call_kwargs)
-
-    def _should_skip_bcg_warmup_capture(
-        self, batch: Req, server_args: ServerArgs
-    ) -> bool:
-        if (
-            not getattr(batch, "is_warmup", False)
-            or not server_args.enable_breakable_cuda_graph
-        ):
-            return False
-
-        model_path = (server_args.model_path or "").lower()
-        return any(
-            name in model_path
-            for name in (
-                "firered-image-edit",
-                "joyai-image-edit",
-            )
-        )
 
     @staticmethod
     def _bcg_text_buckets() -> tuple[int, ...]:
