@@ -34,18 +34,14 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 
 # Both audio and video DiT use the same sinusoidal_embedding_1d function
 # Import from mova_video_dit where it's defined (mova_audio_dit re-exports it)
 from sglang.multimodal_gen.runtime.models.dits.mova_video_dit import (
     sinusoidal_embedding_1d,
-)
-
-# Create aliases for backward compatibility
-video_sinusoidal_embedding_1d = sinusoidal_embedding_1d
-audio_sinusoidal_embedding_1d = sinusoidal_embedding_1d
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -71,6 +67,10 @@ from sglang.srt.utils.common import get_compiler_backend
 
 _is_npu = current_platform.is_npu()
 logger = init_logger(__name__)
+
+# Create aliases for backward compatibility
+video_sinusoidal_embedding_1d = sinusoidal_embedding_1d
+audio_sinusoidal_embedding_1d = sinusoidal_embedding_1d
 
 
 class MOVALatentPreparationStage(PipelineStage):
