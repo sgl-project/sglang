@@ -153,6 +153,12 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
     def test_device_to_host_indexer_kernel(self):
         self._run_device_to_host_indexer_copy(io_backend="kernel")
 
+    @unittest.skipIf(
+        is_hip(),
+        "DSATokenToKVPool with page_size=1 (used on HIP) trips the ROCm 7.2.0 "
+        "HIP-preshuffle assert `page_size % 16 == 0` during pool construction "
+        "(seen on pr-test-amd-rocm720). The rest of this file passes on AMD.",
+    )
     def test_device_to_host_indexer_direct(self):
         self._run_device_to_host_indexer_copy(io_backend="direct")
 

@@ -108,7 +108,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.if_use_v2 = any(
-            arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+            arch
+            in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
 
@@ -241,8 +242,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,
-                attr_name=self.attr_name[AttentionArch.MLA],
-                attr_type=self.attr_type[AttentionArch.MLA],
+                attr_name=self._get_update_attr_name(),
+                attr_type=self._get_update_attr_type(),
             )
         else:
             output = self.backend.replay(graph_key, forward_batch)
