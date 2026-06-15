@@ -286,7 +286,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             and forward_batch.seq_lens_cpu is not None
         ):
             seq_lens_cpu = forward_batch.seq_lens_cpu[: forward_batch.batch_size]
-            if ((seq_lens_cpu // self.page_size) == 0).all().item():
+            if (seq_lens_cpu < self.page_size).all().item():
                 is_bs_supported = False
 
         return is_bs_supported
