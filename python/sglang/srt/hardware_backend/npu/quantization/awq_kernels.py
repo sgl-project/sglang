@@ -29,11 +29,12 @@ class AWQAscendLinearKernel:
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # ---------- unpack qweight and qzeros ----------
+        # Keep scales in original layout (groups, N)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
-        qweight_tmp = torch.zeros_like(layer.qweight.data)   # (K, N//pack)
-        qzeros_tmp = layer.qzeros.data                        # (groups, N//pack)
+        # Unpack weight – apply XOR to convert unsigned → signed
+        qweight_tmp = torch.zeros_like(layer.qweight.data)   # (K, N // pack)
+        qzeros_tmp = layer.qzeros.data                        # (groups, N // pack)
         qzeros_list = []
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
 
@@ -44,60 +45,53 @@ class AWQAscendLinearKernel:
                 ((layer.qweight.data >> shift_num) & 0xF) << (4 * i)
             )
 
-        qweight_tmp.bitwise_xor_(0x88888888)
+        qweight_tmp.bitwise_xor_(0x88888888)          # now signed int4 in int8 container
 
+        # Zeros are unpacked but NOT used – delete them later
         qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(layer.qzeros.shape[0], -1)
-        qzeros_tmp = -(qzeros_tmp - 8)
-        qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
 
         # ---------- decide NPU vs fallback ----------
         pack_factor = self.quant_config.pack_factor
-        K = qweight_tmp.shape[0]                # input features
-        N = qweight_tmp.shape[1] * pack_factor  # output features
+        K = qweight_tmp.shape[0]
+        N = qweight_tmp.shape[1] * pack_factor
         num_groups = layer.scales.shape[0]
 
         if K % num_groups != 0:
             raise RuntimeError(f"K={K} not divisible by scale groups {num_groups}")
         group_size = K // num_groups
 
-        # NPU constraint: group_size == 0 (per-channel) or multiple of 32 in [32, K-1]
+        # NPU constraint
         npu_ok = (group_size == 0) or (group_size % 32 == 0 and 32 <= group_size < K)
 
         if npu_ok:
-            # keep int4 packed weight, store group_size for runtime
+            # keep int4 packed weight + scales, no zeros needed
             layer.register_parameter("weight", torch.nn.Parameter(qweight_tmp, requires_grad=False))
-            layer.register_parameter("zeros", torch.nn.Parameter(qzeros_tmp, requires_grad=False))
-            # keep scales as is
             layer.use_npu_matmul = True
             layer.npu_group_size = group_size
-            # delete unused original parameters
-            for attr in ("qweight", "qzeros"):
-                if hasattr(layer, attr):
-                    delattr(layer, attr)
         else:
-            # fallback: dequantize to bfloat16 weight once
+            # fallback – dequantize to bfloat16
+            # unpack signed int4 → int8
             weight_int8 = torch.zeros((K, N), dtype=torch.int8, device=qweight_tmp.device)
             for i in range(pack_factor):
                 weight_int8[:, i::pack_factor] = ((qweight_tmp >> (4 * i)) & 0xF).to(torch.int8)
-            
-            # expand per-group scales/zeros
+
+            # expand scales if per-group
             if group_size > 0:
                 scales_exp = layer.scales.data.repeat_interleave(group_size, dim=0)  # (K, N)
-                zeros_exp = qzeros_tmp.repeat_interleave(group_size, dim=0)
             else:
                 scales_exp = layer.scales.data
-                zeros_exp = qzeros_tmp
-            
-            # Compute in float32, then cast to bfloat16 to save memory
-            weight_float = (weight_int8.float() - zeros_exp.float()) * scales_exp.float()
-            weight_float = weight_float.t().contiguous().to(torch.bfloat16)  # (N, K) in bf16
-            
+
+            # weight already signed → just multiply by scale
+            weight_float = weight_int8.float() * scales_exp.float()
+            weight_float = weight_float.t().contiguous().to(torch.bfloat16)  # (N, K)
+
             layer.register_parameter("weight", torch.nn.Parameter(weight_float, requires_grad=False))
-            # delete unused attributes
-            for attr in ("scales", "zeros", "qweight", "qzeros"):
-                if hasattr(layer, attr):
-                    delattr(layer, attr)
             layer.use_npu_matmul = False
+
+        # remove all original parameters we no longer need
+        for attr in ("qweight", "qzeros", "zeros", "scales"):
+            if hasattr(layer, attr):
+                delattr(layer, attr)
 
     def apply(
         self,
@@ -108,10 +102,10 @@ class AWQAscendLinearKernel:
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         if layer.use_npu_matmul:
-            qweight = layer.weight          # (K, N//pack) int32
+            qweight = layer.weight          # (K, N//pack) int32, XORed signed
             scales = layer.scales           # (groups, N)
-            qzeros = layer.zeros
-            out_shape = x.shape[:-1] + (qweight.shape[1] * self.quant_config.pack_factor,)
+            pack_factor = self.quant_config.pack_factor
+            out_shape = x.shape[:-1] + (qweight.shape[1] * pack_factor,)
 
             if bias is not None and bias.dtype == torch.bfloat16:
                 bias = bias.float()
@@ -120,15 +114,19 @@ class AWQAscendLinearKernel:
                 reshaped_x,
                 qweight,
                 antiquant_scale=scales,
-                antiquant_offset=qzeros,
+                antiquant_offset=None,                # ← NO offset!
                 antiquant_group_size=layer.npu_group_size,
                 bias=bias,
             )
             return out.reshape(out_shape)
         else:
-            # fallback: weight is (N, K) float
-            out = F.linear(x, layer.weight, bias)
-            return out
+            # fallback: weight is (N, K) bfloat16
+            weight = layer.weight   # (N, K)
+            out_shape = x.shape[:-1] + (weight.shape[0],)
+            out = torch.matmul(reshaped_x, weight.t())
+            if bias is not None:
+                out = out + bias.to(out.dtype)
+            return out.reshape(out_shape)
 
 
 class AWQAscendMoEKernel:
