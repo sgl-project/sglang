@@ -544,9 +544,8 @@ class CompressorBackendMixin:
                 layer_id=layer_id,
                 compressor=compressor,
                 kv_score_input=kv_score_input,
-                logical_forward_mode=getattr(
-                    forward_batch, "_original_forward_mode", forward_batch.forward_mode
-                ),
+                logical_forward_mode=getattr(forward_batch, "_original_forward_mode", None)
+                or forward_batch.forward_mode,
             )
 
     def _forward_unified_hip(

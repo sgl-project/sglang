@@ -97,7 +97,7 @@ class OnlineC128MTPController:
         if not self.enabled():
             self.clear()
             return 0
-        if logical_forward_mode.is_idle():
+        if logical_forward_mode is None or logical_forward_mode.is_idle():
             self.clear()
             return 0
 
@@ -134,6 +134,7 @@ class OnlineC128MTPController:
     ) -> None:
         if (
             not self.enabled()
+            or logical_forward_mode is None
             or not logical_forward_mode.is_target_verify()
             or compressor.is_in_indexer
             or compressor.ratio != 128
