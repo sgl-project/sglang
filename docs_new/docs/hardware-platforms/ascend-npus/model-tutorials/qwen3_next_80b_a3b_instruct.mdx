@@ -1,34 +1,37 @@
 ---
-title: "Qwen3.5-27B"
+title: "Qwen3-Next-80B-A3B-Instruct"
 metatags:
-  description: "Deploy Qwen3.5-27B model with SGLang on Ascend NPUs, including single-node deployment modes."
+  description: "Deploy Qwen3-Next-80B-A3B-Instruct model with SGLang on Ascend NPUs, including single-node deployment modes."
 ---
 
 ## Introduction
 
-Qwen3.5-27B is a dense model in the Qwen3.5 series developed by Alibaba, featuring 27B parameters with a hybrid
-architecture combining Gated Delta Networks (linear, O(n) complexity) with full attention every 4th layer. It supports
-multimodal inputs (text, image, video) with native context lengths of up to 262,144 tokens, and includes built-in
-multi-token prediction (MTP) for speculative decoding. The model delivers strong performance in instruction following,
-reasoning, text comprehension, and tool usage.
+Qwen3-Next-80B-A3B-Instruct is a hybrid Gated DeltaNet-Transformer Mixture-of-Experts (MoE) model developed by Alibaba,
+featuring 80B total parameters with 3B active parameters. It combines Gated DeltaNet SSM layers with attention layers in a
+sparse MoE architecture, enabling efficient long-sequence modeling with linear complexity in the SSM layers. The model
+supports multi-token prediction (NEXTN) for speculative decoding, delivering strong performance in instruction
+following, reasoning, and text generation tasks.
 
-This document demonstrates the deployment of Qwen3.5-27B on Ascend NPUs using SGLang, including single-node PD mixed
-mode, feature configuration, and performance optimization.
+This document demonstrates the deployment of Qwen3-Next-80B-A3B-Instruct on Ascend NPUs using SGLang, including
+single-node PD mixed mode, feature configuration, and performance optimization.
 
-This document is validated and written based on **SGLang v0.5.10**. The current model (Qwen3.5-27B) is fully supported
-in this version. To use the latest features (e.g., speculative decoding, multimodal), it is recommended to use
+This document is validated and written based on **SGLang v0.5.10**. The current model (Qwen3-Next-80B-A3B-Instruct) is
+fully supported in this version. To use the latest features (e.g., speculative decoding), it is recommended to use
 v0.5.10 or a later version.
 
 ## Supported features
 
 | Feature                       | Usage                                                                                         |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
-| Tensor Parallelism            | `--tp-size 2`                                                                                 |
+| Tensor Parallelism            | `--tp-size 4`                                                                                 |
+| Data Parallelism              | `--enable-dp-attention --dp-size 2`                                                           |
+| Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 60000`                                        |
-| NPU Graph                     | `--cuda-graph-bs 2 8 16 32 48`                                                                |
-| Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` |
-| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0`                          |
+| Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 14080`                                        |
+| NPU Graph                     | `--cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150` |
+| Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant --speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct` |
+| Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
+| DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
@@ -41,10 +44,11 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_opti
 If you need to download model weights, check the model size before downloading to reserve enough space.
 </Warning>
 
-- [Eco-Tech/Qwen3.5-27B-w8a8-mtp](https://www.modelscope.cn/models/Eco-Tech/Qwen3.5-27B-w8a8-mtp) (W8A8 quantized version with MTP)
+- [Qwen3-Next-80B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) (BF16)
+- [Qwen3-Next-80B-A3B-Instruct-W8A8](https://huggingface.co/RedHatAI/Qwen3-Next-80B-A3B-Instruct-quantized.w8a8) (W8A8 quantized version)
 
 Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
-refer to the [best practice configurations](#best-practices) which may require additional cards.
+refer to the [best practice configurations](#best-practices) which may require additional nodes or cards.
 
 It is recommended to download the model weights to a shared directory across multiple nodes.
 
@@ -136,58 +140,76 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the **W8A8** quantized model.
+with limited hardware resources. The following command is based on the **W8A8** quantized model with 2 Atlas 800I A3 cards.
 
 ```bash Launch server
 #============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   SPECULATIVE_DRAFT_MODEL_PATH: path to the draft model weights (BF16)
 #============================================================
 
-# high performance cpu
+export cann_path=/usr/local/Ascend/ascend-toolkit/latest
+source /usr/local/Ascend/driver/bin/setenv.bash
+source ${cann_path}/../set_env.sh
+source ${cann_path}/../../nnal/atb/set_env.sh
+source ${cann_path}/opp/vendors/customize/bin/set_env.bash
+export ASCEND_HOME_PATH=${cann_path}
+source /usr/local/Ascend/8.5.0/bisheng_toolkit/set_env.sh
+
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
-# bind cpu
+
 export SGLANG_SET_CPU_AFFINITY=1
-
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-
-# cann
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
+export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.0/opp/vendors/custom_transformer/op_api/lib:${LD_LIBRARY_PATH}
 
 export STREAMS_PER_DEVICE=32
-export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
+
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_ALGO="level0:NA;level1:ring"
+
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
+export ASCEND_USE_FIA=1
+export SGLANG_NPU_USE_MULTI_STREAM=0
+export SGLANG_WARMUP_TIMEOUT=3600
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export FORCE_DRAFT_MODEL_NON_QUANT=1
 
-MODEL_PATH=/path/to/model-weights
+ZBAL_HCCL_OP="allreduce,_allgather_base,allgather,broadcast,scatter,reduce_scatter,_reduce_scatter_base,alltoall_base"
+export HCCL_BUFFSIZE=64
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
 
-python -m sglang.launch_server --model-path ${MODEL_PATH} \
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+export ZBAL_ENABLE_GRAPH=1
+MODEL_PATH=/path/to/Qwen3-Next-80B-A3B-Instruct-W8A8
+
+python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
+    --page-size 128 \
+    --tp-size 4 \
+    --trust-remote-code \
     --attention-backend ascend \
     --device npu \
-    --tp-size 2 --nnodes 1 --node-rank 0 \
-    --chunked-prefill-size -1 --max-prefill-tokens 60000 \
-    --disable-radix-cache \
-    --trust-remote-code \
-    --host 127.0.0.1 --max-running-requests 48 --max-mamba-cache-size 60 \
-    --mem-fraction-static 0.7 \
-    --port 6699 \
-    --cuda-graph-bs 2 8 16 32 48 \
-    --enable-multimodal \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port 6699 \
+    --mem-fraction-static 0.75 \
+    --disable-radix-cache --max-prefill-tokens 14080 --context-length 26384 \
+    --chunked-prefill-size -1 --max-running-requests 300 \
+    --mamba-ssm-dtype bfloat16 \
     --quantization modelslim \
-    --mm-attention-backend ascend_attn \
-    --dtype bfloat16 --mamba-ssm-dtype bfloat16 \
-    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant \
+    --speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct \
+    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150
 ```
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
@@ -227,19 +249,15 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 ### Best practice configuration reference
 
 For complete optimal configurations with deployment scripts and benchmark commands, see the
-[Qwen Series Models](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#qwen-series-models) section
-on the Best Practice page.
+[Qwen3-Next-80B-A3B-Instruct Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_next_80b_a3b_instruct) page.
 
 #### Scenario overview
 
 | Scenario                      | Deployment mode | Total NPUs | Weight version |
 |-------------------------------|-----------------|------------|----------------|
-| Low latency (3.5K+1.5K)       | PD mixed        | 2 (A3)     | W8A8      |
-| Low latency (16K+1K)          | PD mixed        | 1 (A3)     | W8A8      |
-| Low latency (64K+1K)          | PD mixed        | 1 (A3)     | W8A8      |
-| High throughput (3.5K+1.5K)   | PD mixed        | 1 (A3)     | W8A8      |
-| High throughput (16K+1K)      | PD mixed        | 2 (A3)     | W8A8      |
-| High throughput (64K+1K)      | PD mixed        | 2 (A3)     | W8A8      |
+| Low latency (3.5K+1.5K)       | PD mixed        | 2 (A3)     | W8A8           |
+| Low latency (6K+1.5K)         | PD mixed        | 2 (A3)     | W8A8           |
+| High throughput (3.5K+1.5K)   | PD mixed        | 2 (A3)     | W8A8           |
 
 `Total NPUs` indicates the total number of NPUs used across all nodes.
 

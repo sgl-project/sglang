@@ -1,35 +1,38 @@
 ---
-title: "Qwen3-30B-A3B"
+title: "Kimi-K2.6"
 metatags:
-  description: "Deploy Qwen3-30B-A3B model with SGLang on Ascend NPUs, including single-node deployment modes."
+  description: "Deploy Kimi-K2.6 model with SGLang on Ascend NPUs, including single-node deployment modes."
 ---
 
 ## Introduction
 
-Qwen3-30B-A3B is a Mixture-of-Experts (MoE) large language model developed by Alibaba, featuring 30B total
-parameters with 3B active parameters. It employs Grouped-Query Attention (GQA) and Qwen3MoE architecture, with
-support for EAGLE3 speculative decoding for accelerated inference. The model excels at instruction following,
-logical reasoning, text comprehension, mathematics, science, coding, and tool usage, available in both standard
-and thinking/reasoning-enhanced editions.
+Kimi-K2.6 is an open-source, native multimodal agentic model developed by Moonshot AI, built through continual
+pretraining on approximately 15 trillion mixed visual and text tokens atop Kimi-K2-Base. It is a Mixture-of-Experts
+(MoE) model featuring Multi-head Latent Attention (MLA) and MoE architecture, with 1T total parameters and 32B
+active parameters. The model seamlessly integrates vision and language understanding with advanced agentic
+capabilities, supporting both instant and thinking modes as well as conversational and agentic paradigms.
 
-This document demonstrates the deployment of Qwen3-30B-A3B on Ascend NPUs using SGLang, including single-node PD mixed
+This document demonstrates the deployment of Kimi-K2.6 on Ascend NPUs using SGLang, including single-node PD mixed
 mode, feature configuration, and performance optimization.
 
-This document is validated and written based on **SGLang v0.5.10**. The current model (Qwen3-30B-A3B) is fully supported in
-this version. To use the latest features (e.g., speculative decoding), it is recommended to use
+This document is validated and written based on **SGLang v0.5.10**. The current model (Kimi-K2.6) is fully supported in
+this version. To use the latest features (e.g., speculative decoding, multimodal), it is recommended to use
 v0.5.10 or a later version.
 
 ## Supported features
 
 | Feature                       | Usage                                                                                         |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
-| Tensor Parallelism            | `--tp-size 2`                                                                                 |
+| Tensor Parallelism            | `--tp-size 16`                                                                                |
+| Data Parallelism              | `--enable-dp-attention --dp-size 16`                                                          |
+| Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 35000`                                        |
-| NPU Graph                     | `--cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162`                    |
-| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path /path/to/draft-model-weights --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
+| Chunked Prefill               | `--chunked-prefill-size 32768 --max-prefill-tokens 16384`                                     |
+| NPU Graph                     | `--cuda-graph-bs 1 2 4 8 12 16 24 32 48 64 96 120`                                            |
+| Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
-| Disable Radix Cache           | `--disable-radix-cache`                                                                       |
+| MLAPO                         | `export SGLANG_NPU_USE_MLAPO=1`                                                               |
+| Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                                        |
 
 For feature compatibility and conflict information between features,
 see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
@@ -39,11 +42,13 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_opti
 ### Model weights
 
 <Warning>
-Before downloading model weights, check the model size to reserve enough disk space.
+If you need to download model weights, check the model size before downloading to reserve enough space.
 </Warning>
 
-- [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) (BF16)
-- [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) (BF16, recommended)
+- [Kimi-K2.6](https://modelers.cn/models/moonshotai/Kimi-K2.6) (BF16)
+- [Kimi-K2.6-w4a8](https://www.modelscope.cn/models/Eco-Tech/Kimi-K2.6-w4a8) (W4A8 quantized version)
+
+You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize `Kimi-K2.6-w4a8` from `Kimi-K2.6`.
 
 Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
 refer to the [best practice configurations](#best-practices) which may require additional cards.
@@ -53,7 +58,7 @@ It is recommended to download the model weights to a shared directory across mul
 ## Installation
 
 <Warning>
-The Docker image requires at least **30 GB** of free space. Ensure sufficient disk space before pulling images.
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
 </Warning>
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
@@ -138,30 +143,61 @@ quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The following command is based on the **BF16** model with 4 NPUs on a single Atlas 800I A3 node.
+with limited hardware resources. The following command is based on the **W4A8** quantized model.
 
 ```bash Launch server
 #============================================================
-# Before running, update the following variable:
+# Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   DRAFT_PATH: path to the EAGLE3 draft model directory
 #============================================================
 
-MODEL_PATH=/path/to/model-weights
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
 
-export SGLANG_SET_CPU_AFFINITY=1
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
 export STREAMS_PER_DEVICE=32
-export HCCL_BUFFSIZE=1536
-export HCCL_OP_EXPANSION_MODE=AIV
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
+export HCCL_BUFFSIZE=1200
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 
-python -m sglang.launch_server \
-   --device npu \
-   --attention-backend ascend \
-   --trust-remote-code \
-   --tp-size 4 \
-   --model-path $MODEL_PATH \
-   --mem-fraction-static 0.8
+MODEL_PATH=/path/to/model-weights
+DRAFT_PATH=/path/to/draft-model
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH --quantization modelslim --dtype bfloat16 \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
+    --host 0.0.0.0 --port 6699 \
+    --trust-remote-code --device npu --attention-backend ascend \
+    --tp-size 16 --base-gpu-id 0 --mem-fraction-static 0.7 --max-running-requests 120 \
+    --chunked-prefill-size 32768 --context-length 8192 --max-prefill-tokens 16384 \
+    --enable-multimodal --mm-attention-backend ascend_attn --sampling-backend ascend \
+    --enable-dp-attention --dp-size 16 \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --cuda-graph-bs 1 2 4 8 12 16 24 32 48 64 96 120 --disable-radix-cache \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_PATH \
+    --speculative-num-steps 4 --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5 \
+    --speculative-draft-model-quantization unquant
 ```
 
 For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq) for troubleshooting.
@@ -171,7 +207,7 @@ For common issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms
 After the service is started, you can invoke the model by sending a prompt:
 
 ```shell
-curl http://localhost:7239/generate \
+curl http://localhost:6699/generate \
     -H "Content-Type: application/json" \
     -d '{
         "text": "What is the capital of France?",
@@ -201,15 +237,23 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 ### Best practice configuration reference
 
 For complete optimal configurations with deployment scripts and benchmark commands, see the
-[Qwen3-30B-A3B Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_30b_a3b) page.
+[Kimi-K2.6 Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6) page.
 
 #### Scenario overview
 
-| Scenario                      | Deployment mode | Total NPUs | Weight version |
-|-------------------------------|-----------------|------------|----------------|
-| Low latency (6K+1.5K)         | PD mixed        | 1 (A3)     | W8A8      |
-| Low latency (1K+0.3K)         | PD mixed        | 1 (A3)     | W8A8      |
-| High throughput (3.5K+1.5K)   | PD mixed        | 1 (A3)     | W8A8      |
+| Scenario                                              | Deployment mode   | Total NPUs | Weight version |
+|-------------------------------------------------------|-------------------|------------|----------------|
+| Low latency (3.5K+1.5K)                               | PD mixed          | 8 (A3)     | W4A8           |
+| High throughput (64K+1K)                              | PD mixed          | 16 (A3)    | W4A8           |
+| High throughput (128K+1K)                             | PD disaggregation | 16 (A3)    | W4A8           |
+| High throughput (128K+1K (90% prefix cache hit rate)) | PD disaggregation | 16 (A3)    | W4A8           |
+| High throughput (64K+1.5K)                            | PD disaggregation | 16 (A3)    | W4A8           |
+| High throughput (64K+1.5K (90% prefix cache hit rate))| PD disaggregation | 16 (A3)    | W4A8           |
+| High throughput (128K+1K (90% prefix cache hit rate)) | PD disaggregation | 24 (A3)    | W4A8           |
+| High throughput (64K+1.5K (90% prefix cache hit rate))| PD disaggregation | 24 (A3)    | W4A8           |
+| High throughput (1024x1024 (30)+1024)                 | PD mixed          | 8 (A3)     | W4A8           |
+| High throughput (1080p_30+256)                        | PD mixed          | 8 (A3)     | W4A8           |
+| High throughput (3.5K+1.5K)                           | PD mixed          | 8 (A3)     | W4A8           |
 
 `Total NPUs` indicates the total number of NPUs used across all nodes.
 
