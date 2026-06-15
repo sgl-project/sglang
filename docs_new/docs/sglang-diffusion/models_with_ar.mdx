@@ -47,7 +47,7 @@ export HCCL_NPU_SOCKET_PORT_RANGE="23200-23399"
 sglang serve --model-path /path/to/zai-org/GLM-Image/vision_language_encoder/ \
 --tokenizer-path /path/to/zai-org/GLM-Image/processor/ --enable-multimodal \
 --cuda-graph-bs 1 --device npu --attention-backend ascend --disable-fast-image-processor \
---tp-size 4 --port ${PORT} --mem-fraction-static 0.8
+--tp-size 4 --port ${PORT} --mem-fraction-static 0.4
 ```
 Second terminal with diffusion server:
 ```bash
