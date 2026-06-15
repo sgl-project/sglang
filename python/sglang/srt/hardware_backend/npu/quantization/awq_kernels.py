@@ -47,8 +47,9 @@ class AWQAscendLinearKernel:
 
         qweight_tmp.bitwise_xor_(0x88888888)   # signed int4 now
 
-        # Unpack zeros – not needed beyond shape calculations, but compute anyway
-        qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(layer.qzeros.shape[0], -1)
+        qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
+        qzeros_tmp = -(qzeros_tmp - 8)
+        qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
 
         pack_factor = self.quant_config.pack_factor
         K = qweight_tmp.shape[0]
@@ -65,6 +66,7 @@ class AWQAscendLinearKernel:
         if npu_ok:
             # Use NPU kernel – keep weight, scales, and precomputed group_size
             layer.register_parameter("weight", torch.nn.Parameter(qweight_tmp, requires_grad=False))
+            layer.register_parameter("zeros", torch.nn.Parameter(qzeros_tmp, requires_grad=False))
             layer.use_npu_matmul = True
             layer.npu_group_size = group_size
             # scales already a parameter, do not delete
@@ -91,11 +93,6 @@ class AWQAscendLinearKernel:
             delattr(layer, "scales")
             layer.use_npu_matmul = False
 
-        # Always delete original packed tensors – no longer needed
-        for attr in ("qweight", "qzeros"):
-            if hasattr(layer, attr):
-                delattr(layer, attr)
-
     def apply(
         self,
         layer: torch.nn.Module,
@@ -107,6 +104,7 @@ class AWQAscendLinearKernel:
         if layer.use_npu_matmul:
             qweight = layer.weight          # (K, N//pack) int32, XORed signed
             scales = layer.scales           # (groups, N) – must exist
+            qzeros = layer.qzeros  
             pack_factor = self.quant_config.pack_factor
             out_shape = x.shape[:-1] + (qweight.shape[1] * pack_factor,)
 
