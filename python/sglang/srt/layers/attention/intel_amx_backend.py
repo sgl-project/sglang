@@ -137,6 +137,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             )
 
         _, max_extend_len = self.forward_metadata
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.dtype != torch.int64:
+            seq_lens = seq_lens.to(torch.int64)
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -146,7 +149,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
             self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
+            seq_lens,
             forward_batch.extend_seq_lens,
             forward_batch.extend_start_loc,
             max_extend_len,
@@ -172,6 +175,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         attn_logits, _ = self.forward_metadata
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.dtype != torch.int64:
+            seq_lens = seq_lens.to(torch.int64)
 
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -193,7 +199,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             attn_logits,
             self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
+            seq_lens,
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
