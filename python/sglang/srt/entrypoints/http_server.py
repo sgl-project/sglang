@@ -19,14 +19,20 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import errno
+import http.client
+import json
 import logging
 import os
+import socket
+import stat
 import tempfile
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from pathlib import Path
 from typing import (
     Any,
     AsyncGenerator,
@@ -1991,9 +1997,116 @@ def _admin_api_key_missing_response(
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
+class _UDSResponseShim:
+    """Minimal ``requests.Response``-compatible shim for UDS warmup calls.
+
+    The warmup code uses ``.status_code``, ``.text``, and ``.json()`` only --
+    those are what this shim covers, so we don't pull in
+    ``requests-unixsocket`` just to do a few self-loopback requests.
+    """
+
+    def __init__(self, status_code: int, raw: bytes):
+        self.status_code = status_code
+        self._raw = raw
+
+    def __repr__(self) -> str:
+        return f"<_UDSResponseShim [{self.status_code}]>"
+
+    @property
+    def text(self) -> str:
+        return self._raw.decode("utf-8", errors="replace")
+
+    def json(self):
+        return json.loads(self._raw.decode("utf-8"))
+
+
+def _uds_request(
+    method: str,
+    uds_path: str,
+    path: str,
+    headers: dict,
+    timeout: float,
+    json_data: Optional[dict] = None,
+) -> "_UDSResponseShim":
+    """Make an HTTP request over an AF_UNIX socket using stdlib ``http.client``.
+
+    ``OSError`` (transport) and ``http.client.HTTPException`` (protocol) may
+    propagate; callers should treat these as equivalent to
+    ``requests.exceptions.RequestException``.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(uds_path)
+    except BaseException:
+        # Failure before HTTPConnection takes ownership of the fd.
+        sock.close()
+        raise
+    conn = http.client.HTTPConnection("localhost", timeout=timeout)
+    conn.sock = sock
+    try:
+        merged_headers = dict(headers)
+        body = None
+        if json_data is not None:
+            body = json.dumps(json_data).encode("utf-8")
+            merged_headers.setdefault("Content-Type", "application/json; charset=utf-8")
+        conn.request(method, path, body=body, headers=merged_headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        return _UDSResponseShim(resp.status, raw)
+    finally:
+        conn.close()
+
+
+def _server_http_get(
+    server_args: ServerArgs,
+    path: str,
+    *,
+    headers: dict,
+    timeout: float,
+    ssl_verify,
+):
+    """GET ``path`` on the running server, transparently handling UDS vs TCP."""
+    if server_args.uds:
+        return _uds_request("GET", server_args.uds, path, headers, timeout)
+    return requests.get(
+        server_args.url() + path,
+        timeout=timeout,
+        headers=headers,
+        verify=ssl_verify,
+    )
+
+
+def _server_http_post(
+    server_args: ServerArgs,
+    path: str,
+    *,
+    json_data: dict,
+    headers: dict,
+    timeout: float,
+    ssl_verify,
+):
+    """POST ``json_data`` to ``path`` on the server, handling UDS vs TCP."""
+    if server_args.uds:
+        return _uds_request(
+            "POST",
+            server_args.uds,
+            path,
+            headers,
+            timeout,
+            json_data=json_data,
+        )
+    return requests.post(
+        server_args.url() + path,
+        json=json_data,
+        headers=headers,
+        timeout=timeout,
+        verify=ssl_verify,
+    )
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
-    url = server_args.url()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
@@ -2004,13 +2117,22 @@ def _execute_server_warmup(server_args: ServerArgs):
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(
-                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+            res = _server_http_get(
+                server_args,
+                "/model_info",
+                headers=headers,
+                timeout=5,
+                ssl_verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
-        except (AssertionError, requests.exceptions.RequestException):
+        except (
+            AssertionError,
+            OSError,
+            http.client.HTTPException,
+            requests.exceptions.RequestException,
+        ):
             last_traceback = get_exception_traceback()
             pass
 
@@ -2090,12 +2212,13 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if server_args.disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
+            res = _server_http_post(
+                server_args,
+                request_name,
+                json_data=json_data,
                 headers=headers,
                 timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
+                ssl_verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
@@ -2118,14 +2241,15 @@ def _execute_server_warmup(server_args: ServerArgs):
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
-            res = requests.post(
-                url + request_name,
-                json=json_data,
+            res = _server_http_post(
+                server_args,
+                request_name,
+                json_data=json_data,
                 headers=headers,
                 timeout=(
                     warmup_timeout if warmup_timeout > 0 else 1800
                 ),  # because of deep gemm precache is very long if not precache.
-                verify=ssl_verify,
+                ssl_verify=ssl_verify,
             )
             if res.status_code == 200:
                 logger.info(
@@ -2223,21 +2347,125 @@ def _close_main_process_sockets():
         setattr(tm, attr, None)
 
 
+def _uvicorn_bind_kwargs(server_args: ServerArgs) -> dict:
+    """Return the bind kwargs for uvicorn.Config / uvicorn.run.
+
+    UDS and host/port are mutually exclusive (enforced in ServerArgs); we
+    only ever return one shape or the other.
+    """
+    if server_args.uds:
+        return {"uds": server_args.uds}
+    return {"host": server_args.host, "port": server_args.port}
+
+
+def _format_listen_addr(server_args: ServerArgs) -> str:
+    """Human-readable listener address for startup logs."""
+    if server_args.uds:
+        return f"unix:{server_args.uds}"
+    return f"{server_args.host}:{server_args.port}"
+
+
+def _prepare_uds_path(path: str) -> None:
+    """Make ``path`` safe to ``bind()`` against.
+
+    Behavior, in order:
+
+    - No-op if nothing exists at ``path``.
+    - If a non-socket file (including a symlink, which ``lstat`` reports as
+      ``S_IFLNK`` rather than ``S_IFSOCK``) exists, refuse with
+      ``FileExistsError``. We refuse to follow symlinks to avoid being tricked
+      into unlinking arbitrary files via a hostile path.
+    - Otherwise probe with a short non-blocking connect (100 ms timeout --
+      much shorter than any reasonable server startup pause, long enough that
+      a routine kernel queue blip on CI hardware rarely exceeds it).
+      * On ``ConnectionRefusedError`` / ``FileNotFoundError``: nobody is
+        bound; treat as stale.
+      * On ``TimeoutError``: probe inconclusive; treat as live (conservative
+        refuse) rather than risk unlinking a slow-but-running listener.
+      * On ``PermissionError``: surface the error so the operator can fix
+        ownership / mode rather than have us silently clobber or refuse.
+      * On any other ``OSError``: treat as live for the same conservative
+        reason as ``TimeoutError``.
+    - Live → raise ``OSError(EADDRINUSE)``.
+    - Stale → ``os.unlink`` and log a warning. A concurrent unlink that
+      already removed the file is tolerated; any other ``OSError`` during
+      unlink is re-raised with the path context preserved.
+
+    Known TOCTOU races: between ``lstat`` and ``connect``, between
+    ``connect`` and ``unlink``, and between ``unlink`` and the caller's
+    subsequent ``bind()``, a concurrent process could change the state at
+    ``path``. Callers are expected to serialize UDS-path allocation per
+    orchestrator. The worst case is a noisier-than-necessary error from
+    ``bind()`` and never a silent compromise of an unrelated file.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(st.st_mode):
+        raise FileExistsError(
+            f"{path} exists and is not a socket; refusing to overwrite"
+        )
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.1)
+    is_live = False
+    try:
+        probe.connect(path)
+        is_live = True
+    except (ConnectionRefusedError, FileNotFoundError):
+        # Nobody bound; stale or missing file.
+        pass
+    except TimeoutError:
+        # Probe took too long; refuse rather than risk clobbering a live
+        # listener whose accept queue is temporarily saturated.
+        is_live = True
+    except PermissionError:
+        # Surface to the operator -- a chmod/chown is the real fix.
+        raise
+    except OSError:
+        # Any other transient probe-time error gets the conservative
+        # treatment too.
+        is_live = True
+    finally:
+        probe.close()
+    if is_live:
+        raise OSError(
+            errno.EADDRINUSE,
+            f"UDS {path} is already in use by another process",
+        )
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        # Raced with another process that already cleaned up the stale file.
+        return
+    except OSError as e:
+        raise OSError(
+            e.errno,
+            f"Detected stale UDS file at {path} but failed to remove it: "
+            f"{e.strerror}",
+        ) from e
+    logger.warning("Removed stale UDS file at %s", path)
+
+
 def _run_granian_server(server_args: ServerArgs):
-    """Launch Granian with HTTP/2 support"""
+    """Launch Granian with HTTP/2 support."""
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
 
     granian_kwargs = dict(
         target="sglang.srt.entrypoints.http_server:app",
-        address=server_args.host,
-        port=server_args.port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
         loop=Loops.uvloop,
         log_level=server_args.log_level_http or server_args.log_level or "info",
         workers=1,
     )
+
+    if server_args.uds:
+        granian_kwargs["uds"] = Path(server_args.uds)
+    else:
+        granian_kwargs["address"] = server_args.host
+        granian_kwargs["port"] = server_args.port
 
     ssl_enabled = server_args.ssl_certfile and server_args.ssl_keyfile
     if ssl_enabled:
@@ -2278,6 +2506,13 @@ def _setup_and_run_http_server(
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
 
+    # Pre-bind UDS cleanup must run for BOTH the uvicorn path (below) and the
+    # Granian --enable-http2 path. Granian's underlying Rust listener
+    # (UnixListenerSpec::as_socket in src/net.rs) calls socket.bind() directly
+    # without removing a stale socket file, so we must do it here.
+    if server_args.uds:
+        _prepare_uds_path(server_args.uds)
+
     # Use Granian for HTTP/2 server
     if server_args.enable_http2:
         # Reuse the multi-tokenizer shared memory mechanism to pass
@@ -2294,7 +2529,7 @@ def _setup_and_run_http_server(
                 )
             logger.info(
                 f"Starting Granian HTTP/2 server on "
-                f"{server_args.host}:{server_args.port}"
+                f"{_format_listen_addr(server_args)}"
             )
             # Propagate the main process PID via os.environ so Granian
             # workers (forked or spawned) can locate the shared memory
@@ -2350,6 +2585,10 @@ def _setup_and_run_http_server(
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
 
+        if server_args.uds:
+            # Logged BEFORE bind, so the wording avoids implying success.
+            logger.info(f"Preparing to bind on {_format_listen_addr(server_args)}")
+
         if server_args.ssl_certfile:
             logger.info(
                 f"SSL enabled: certfile={server_args.ssl_certfile}, "
@@ -2362,8 +2601,7 @@ def _setup_and_run_http_server(
                 # Use Config/Server API for access to the SSLContext.
                 config = uvicorn.Config(
                     app,
-                    host=server_args.host,
-                    port=server_args.port,
+                    **_uvicorn_bind_kwargs(server_args),
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
@@ -2399,8 +2637,7 @@ def _setup_and_run_http_server(
                 # Default case, one tokenizer process
                 uvicorn.run(
                     app,
-                    host=server_args.host,
-                    port=server_args.port,
+                    **_uvicorn_bind_kwargs(server_args),
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
@@ -2429,8 +2666,7 @@ def _setup_and_run_http_server(
 
             uvicorn.run(
                 "sglang.srt.entrypoints.http_server:app",
-                host=server_args.host,
-                port=server_args.port,
+                **_uvicorn_bind_kwargs(server_args),
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
