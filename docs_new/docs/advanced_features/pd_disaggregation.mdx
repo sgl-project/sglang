@@ -458,7 +458,7 @@ export ASCEND_NPU_PHY_ID=xxx
 ```
 
 
-### Llama Single Node
+### Mimo Single Node
 
 ```bash
 python -m sglang.launch_server \
@@ -478,28 +478,5 @@ python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0
 ### DeepSeek Multi-Node
 
 ```bash
-# prefill 0
-python -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V3-0324 \
-  --disaggregation-transfer-backend ascend \
-  --disaggregation-mode prefill \
-  --host ${local_ip} \
-  --port 30000 \
-  --trust-remote-code \
-  --dist-init-addr ${prefill_master_ip}:5000 \
-  --nnodes 1 \
-  --node-rank 0 \
-  --tp-size 16
-# decode 0
-python -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V3-0324 \
-  --disaggregation-transfer-backend ascend \
-  --disaggregation-mode decode \
-  --host ${local_ip} \
-  --port 30001 \
-  --trust-remote-code \
-  --dist-init-addr ${decode_master_ip}:5000 \
-  --nnodes 1 \
-  --node-rank 0 \
-  --tp-size 16
+
 ```
