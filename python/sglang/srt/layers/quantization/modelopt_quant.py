@@ -1950,11 +1950,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # weights, block scales, and per-tensor scales as serialized ModelOpt
         # NVFP4 checkpoints. Reuse this layout and swap only the weight loader.
         if is_nvfp4_online:
-            if not self.enable_flashinfer_trtllm_moe:
+            if not (
+                self.enable_flashinfer_trtllm_moe
+                or (
+                    self.enable_flashinfer_cutedsl_moe
+                    and not self._is_cutedsl_v1_deepep
+                )
+            ):
                 raise ValueError(
                     "--quantization nvfp4_online supports only "
                     "--moe-runner-backend flashinfer_trtllm or "
-                    "flashinfer_trtllm_routed."
+                    "flashinfer_trtllm_routed, or flashinfer_cutedsl "
+                    "with moe_a2a_backend='none'/'flashinfer'."
                 )
 
         # TODO(ch-wan): check if this is needed
@@ -2216,15 +2223,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
+        dispatcher_input_global_scale = (
+            layer.w13_input_scale_quant
+            if MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
+            else None
+        )
+        if (
+            self.enable_flashinfer_cutedsl_moe
+            and self.quant_config.use_per_token_activation
+        ):
+            # FlashInfer A2A can pre-quantize with only a scalar scale. Keep the
+            # payload in BF16 so the CuteDSL runner can compute and forward the
+            # per-token row scale required by FlashInfer's per-token contract.
+            dispatcher_input_global_scale = None
+
         layer.dispatcher.set_quant_config(
-            {
-                "input_global_scale": (
-                    layer.w13_input_scale_quant
-                    if MOE_NVFP4_DISPATCH
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else None
-                )
-            }
+            {"input_global_scale": dispatcher_input_global_scale}
         )
         block_size = 16
         # Validate weight scales
@@ -2524,6 +2538,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     a1_scale=layer.w13_input_scale_quant,
                     a2_scale=layer.w2_input_scale_quant,
                     use_nvfp4_dispatch=MOE_NVFP4_DISPATCH,
+                    use_per_token_activation=self.quant_config.use_per_token_activation,
                     down_gemm_overlap_args=getattr(
                         self.runner, "down_gemm_overlap_args", None
                     ),
@@ -2548,6 +2563,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 a1_scale=layer._cutedsl_input_scale,
                 a2_scale=fc2_input_scale,
                 wrapper=layer._cutedsl_wrapper,
+                use_per_token_activation=self.quant_config.use_per_token_activation,
             )
             return self.runner.run(dispatch_output, quant_info)
 
