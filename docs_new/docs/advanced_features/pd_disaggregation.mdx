@@ -12,7 +12,7 @@ Large Language Model (LLM) inference comprises two distinct phases: **Prefill** 
 The conventional unified engine, which processes prefill and decode batches together, results in two significant problems:
 
 1. **Prefill Interruption**: Incoming prefill batches frequently interrupt ongoing decode batches, causing substantial delays in token generation.
-2. **DP Attention Imbalance**: In data-parallel (DP) attention, one DP worker may process a prefill batch while another handles a decode batch simultaneously, leading to increased decode latency.
+2. **DP Attention Imbalance**: In data-parallel (DP) attention, one DP worker may process a prefill batch while another handles a decode batch simultaneously, leading to increased decode latency.JIED
 
 PD Disaggregation resolves these by separating the two stages, enabling tailored optimizations for each.
 
@@ -654,7 +654,6 @@ do
         export HCCL_BUFFSIZE=2600
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
-        # P节点
         python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
         --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --trust-remote-code --nnodes 1 --node-rank 0 \
         --tp-size 16 --mem-fraction-static 0.7 --attention-backend ascend --device npu --quantization modelslim \
