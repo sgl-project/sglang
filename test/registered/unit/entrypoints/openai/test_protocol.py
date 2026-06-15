@@ -32,7 +32,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestModelCard(unittest.TestCase):
@@ -179,6 +179,20 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.stream_reasoning)
         self.assertEqual(request.chat_template_kwargs, {"custom_param": "value"})
 
+    def test_chat_completion_tito_extensions(self):
+        """Test chat completion with pre-tokenized prompt extensions."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            input_ids=[101, 102, 103],
+            return_prompt_token_ids=True,
+            return_meta_info=True,
+        )
+        self.assertEqual(request.input_ids, [101, 102, 103])
+        self.assertTrue(request.return_prompt_token_ids)
+        self.assertTrue(request.return_meta_info)
+
     def test_chat_completion_reasoning_effort(self):
         """Test chat completion with reasoning effort"""
         messages = [{"role": "user", "content": "Hello"}]
@@ -191,7 +205,10 @@ class TestChatCompletionRequest(unittest.TestCase):
             },
         )
         self.assertEqual(request.reasoning_effort, "high")
-        self.assertEqual(request.chat_template_kwargs, {"thinking": True})
+        self.assertEqual(
+            request.chat_template_kwargs,
+            {"thinking": True, "enable_thinking": True},
+        )
 
     def test_chat_completion_reasoning_effort_none(self):
         """Test reasoning_effort='none' disables thinking"""
@@ -216,6 +233,37 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.reasoning_effort, "none")
         self.assertFalse(request.chat_template_kwargs.get("thinking"))
         self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_reasoning_effort_max(self):
+        """`max` is an sglang extension on chat completion's top-level
+        `reasoning_effort` only; the Responses-API-style nested
+        `reasoning.effort` path stays aligned with OpenAI's three levels."""
+        from pydantic import ValidationError
+
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning_effort="max",
+        )
+        self.assertEqual(request.reasoning_effort, "max")
+
+        # Unknown values still rejected.
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=messages,
+                reasoning_effort="ultra",
+            )
+
+        # Nested reasoning.effort=max is NOT promoted by normalize_reasoning_inputs:
+        # the Responses API path keeps the OpenAI low/medium/high contract.
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={"effort": "max"},
+        )
+        self.assertNotEqual(request.reasoning_effort, "max")
 
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""
@@ -337,6 +385,28 @@ class TestModelSerialization(unittest.TestCase):
         self.assertIn("hidden_states", data["choices"][0])
         self.assertEqual(data["choices"][0]["hidden_states"], [0.1, 0.2, 0.3])
 
+    def test_prompt_token_ids_and_meta_info_serialization(self):
+        """Test that prompt_token_ids and meta_info serialize only when set."""
+        default_choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="Hello"),
+            finish_reason="stop",
+        )
+        default_data = default_choice.model_dump()
+        self.assertNotIn("prompt_token_ids", default_data)
+        self.assertNotIn("meta_info", default_data)
+
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="Hello"),
+            finish_reason="stop",
+            prompt_token_ids=[1, 2, 3],
+            meta_info={"prompt_tokens": 3},
+        )
+        data = choice.model_dump()
+        self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
+        self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
+
 
 class TestFunctionDeferLoading(unittest.TestCase):
     """Test defer_loading field behavior on Function/Tool."""
@@ -439,6 +509,21 @@ class TestValidationEdgeCases(unittest.TestCase):
         self.assertEqual(restored_request.temperature, original_request.temperature)
         self.assertEqual(restored_request.max_tokens, original_request.max_tokens)
         self.assertEqual(len(restored_request.messages), len(original_request.messages))
+
+
+class TestParsedResponseFieldsProtocol(unittest.TestCase):
+    """Test ParsedResponseFields protocol."""
+
+    def test_parsed_response_fields_protocol(self):
+        """ParsedResponseFields protocol works with isinstance."""
+        from sglang.srt.entrypoints.openai.protocol import ParsedResponseFields
+
+        class MockFields:
+            content = "hello"
+            tool_calls = None
+            reasoning_content = None
+
+        self.assertIsInstance(MockFields(), ParsedResponseFields)
 
 
 if __name__ == "__main__":

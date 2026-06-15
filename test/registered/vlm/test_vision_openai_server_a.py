@@ -19,7 +19,7 @@ from sglang.test.vlm_utils import (
     VideoOpenAITestMixin,
 )
 
-register_cuda_ci(est_time=780, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
@@ -146,6 +146,7 @@ class TestKimiVLServer(ImageOpenAITestMixin):
     extra_args = [
         "--context-length=8192",
         "--dtype=bfloat16",
+        "--mem-fraction-static=0.40",
     ]
 
     def test_video_images_chat_completion(self):

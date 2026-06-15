@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/parameter.py"""
 
 import logging
@@ -34,6 +36,7 @@ def _dtype_rank(dtype: torch.dtype) -> Optional[int]:
         torch.float8_e4m3fnuz,
         torch.float8_e5m2,
         torch.float8_e5m2fnuz,
+        torch.float8_e8m0fnu,
     ):
         return 0
     if dtype in (torch.float16, torch.bfloat16):
@@ -70,6 +73,8 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
         raise ValueError(
             f"Downcasting not allowed: {target.dtype=}, {loaded_weight.dtype=}"
         )
+    if loaded_rank == torch.float8_e8m0fnu:
+        assert target_rank in {torch.float8_e8m0fnu, torch.float32}
 
     target.copy_(loaded_weight)
 

@@ -447,6 +447,16 @@ def _get_precomputed_embedding(
             raise NotImplementedError(
                 "MM inputs where only some items are precomputed."
             )
+
+        # Normalize device across chunks before concat.
+        target_device = next(
+            (t.device for t in precomputed_embeddings if t.is_cuda),
+            precomputed_embeddings[0].device,
+        )
+        precomputed_embeddings = [
+            t if t.device == target_device else t.to(target_device, non_blocking=True)
+            for t in precomputed_embeddings
+        ]
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
@@ -457,6 +467,28 @@ def _get_precomputed_embedding(
 DataEmbeddingFunc = Callable[
     [List[MultimodalDataItem]], torch.Tensor | EVSEmbeddingResult
 ]
+
+
+def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
+    """qwen-vl visual forward already moves batched features to the target device.
+
+    instead of performing multiple H2D for each mm feature from all mm_items (followed by concatenation on device),
+    for some models which internally performs H2D on concated mm feature, these small H2D calls could be replaced with a single big H2D
+    """
+    owner = getattr(data_embedding_func, "__self__", None)
+    if owner is None:
+        return False
+    if getattr(data_embedding_func, "__name__", None) not in (
+        "get_image_feature",
+        "get_video_feature",
+    ):
+        return False
+    return owner.__class__.__name__ in {
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
 
 
 def _move_items_to_device(
@@ -486,7 +518,8 @@ def _get_chunked_embedding_full(
     embedding_per_req = embedding_cache.get(item_hashes)
 
     if embedding_per_req is None:
-        _move_items_to_device(embedding_items_per_req, device)
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
         embedding_per_req = (
             EmbeddingResult(embedding=embedding)
@@ -805,19 +838,18 @@ def embed_mm_inputs(
                 device=input_ids.device,
             )
             # calculate per request items length offset
-            items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
+            items_size = [0]
             items_offsets = []
-            for i, mm_inputs in enumerate(mm_inputs_list):
+            for mm_inputs in mm_inputs_list:
                 mm_items = [
                     item
                     for item in mm_inputs.mm_items
                     if item.is_modality(modality=modality)
                 ]
-                items_size[i + 1] = len(mm_items)
+                items_size.append(items_size[-1] + len(mm_items))
                 items_offsets.append(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
-            items_size = torch.cumsum(items_size, dim=0).tolist()
 
             embedding, mask, input_ids = get_embedding_and_mask(
                 data_embedding_func=embedder,
@@ -867,18 +899,18 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
+    # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
+    def _scatter(dest, mask, src):
+        dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
+
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
     ):
         if embedding is None or mask is None:
             continue
-        # in-place update
-        indices = torch.where(mask.squeeze(dim=-1))[0]
-        input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
+        _scatter(input_embeds, mask, embedding)
         if use_deepstack.get(modality, None):
-            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                input_embeds.device, input_embeds.dtype
-            )
+            _scatter(input_deepstack_embeds, mask, deepstack_embeddings[i])
 
     return input_embeds, other_info
 
@@ -1195,7 +1227,7 @@ def tensor_hash(tensor_list) -> int:
         hasher = hashlib.sha256()
         for t in tensors:
             t = t.detach().contiguous()
-            hasher.update(memoryview(t.view(torch.uint8).numpy()))
+            hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
         hash_bytes = hasher.digest()[:8]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
@@ -1204,14 +1236,16 @@ def tensor_hash(tensor_list) -> int:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
     hasher = hashlib.sha256()
-    hasher.update(memoryview(tensor.view(torch.uint8).numpy()))
+    hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
     hash_bytes = hasher.digest()[:8]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
 def hash_feature(f):
     if isinstance(f, list):
-        if isinstance(f[0], torch.Tensor):
+        if len(f) > 0 and isinstance(f[0], ShmPointerMMData):
+            return tensor_hash([x.tensor for x in f])
+        if len(f) > 0 and isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
@@ -1225,6 +1259,10 @@ def hash_feature(f):
     elif isinstance(f, CudaIpcTensorTransportProxy):
         reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
         return tensor_hash([reconstruct_t])
+    elif isinstance(f, ShmPointerMMData):
+        if f.precomputed_hash is not None:
+            return f.precomputed_hash
+        return tensor_hash([f.tensor])
     return data_hash(f)
 
 
@@ -1382,10 +1420,12 @@ def get_new_expanded_mm_items(original_mm_items):
                         expanded_mm_items.append(item)
                     continue
 
-                patches_per_item = []
-                for grid in image_grid_thw:
-                    grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                    patches_per_item.append(int(torch.prod(grid_tensor).item()))
+                if isinstance(image_grid_thw, torch.Tensor):
+                    patches_per_item = (
+                        torch.prod(image_grid_thw, dim=-1).long().tolist()
+                    )
+                else:
+                    patches_per_item = [int(np.prod(grid)) for grid in image_grid_thw]
 
                 cumulative = torch.cumsum(
                     torch.tensor(patches_per_item, dtype=torch.long), dim=0
@@ -1435,17 +1475,11 @@ def get_new_expanded_mm_items(original_mm_items):
                 num_videos = grid_len
 
                 # Calculate total frames and frames per video
-                frames_per_video = []
-                total_frames = 0
-                for i in range(num_videos):
-                    grid = video_grid_thw[i]
-                    if isinstance(grid, torch.Tensor):
-                        T = int(grid[0].item())  # T is the first element [T, H, W]
-                    else:
-                        grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                        T = int(grid_tensor[0].item())
-                    frames_per_video.append(T)
-                    total_frames += T
+                if isinstance(video_grid_thw, torch.Tensor):
+                    frames_per_video = video_grid_thw[:, 0].long().tolist()
+                else:
+                    frames_per_video = [int(grid[0]) for grid in video_grid_thw]
+                total_frames = sum(frames_per_video)
 
                 # num_items should equal total_frames when T > 1
                 if num_items != total_frames:
@@ -1453,14 +1487,12 @@ def get_new_expanded_mm_items(original_mm_items):
                     continue
 
                 # Calculate patches per video: T * H * W for each video
-                patches_per_video = []
-                for i in range(num_videos):
-                    grid = video_grid_thw[i]
-                    if isinstance(grid, torch.Tensor):
-                        patches_per_video.append(int(torch.prod(grid).item()))
-                    else:
-                        grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                        patches_per_video.append(int(torch.prod(grid_tensor).item()))
+                if isinstance(video_grid_thw, torch.Tensor):
+                    patches_per_video = (
+                        torch.prod(video_grid_thw, dim=-1).long().tolist()
+                    )
+                else:
+                    patches_per_video = [int(np.prod(grid)) for grid in video_grid_thw]
 
                 # Calculate cumulative patches to get slice indices for each video
                 cumulative = torch.cumsum(
@@ -1529,13 +1561,14 @@ class ShmPointerMMData:
     This acts as a "pointer" to the tensor data across process boundaries.
     """
 
-    def __init__(self, tensor: torch.Tensor):
+    def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
         if not tensor.is_cpu:
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
         self.shape = tensor.shape
         self.dtype = tensor.dtype
+        self.precomputed_hash = precomputed_hash
         nbytes = tensor.numel() * tensor.element_size()
         shm = shared_memory.SharedMemory(create=True, size=nbytes)
         try:
@@ -1554,13 +1587,14 @@ class ShmPointerMMData:
             "shm_name": self.shm_name,
             "shape": self.shape,
             "dtype": self.dtype,
+            "precomputed_hash": self.precomputed_hash,
         }
 
     def __setstate__(self, state):
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
-        self.shm = None
+        self.precomputed_hash = state.get("precomputed_hash")
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
@@ -1599,6 +1633,24 @@ def _get_is_default_transport():
     return _is_default_tensor_transport
 
 
+def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
+    """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData.
+
+    ``precomputed_hash`` is only forwarded for the single-tensor case.
+    For list features the item-level hash covers all elements jointly,
+    so per-element hashes are not applicable.
+    """
+    if isinstance(value, torch.Tensor) and value.is_cpu:
+        return ShmPointerMMData(value, precomputed_hash=precomputed_hash)
+    elif isinstance(value, (list, tuple)):
+        wrapped = [
+            (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
+            for t in value
+        ]
+        return type(value)(wrapped) if isinstance(value, tuple) else wrapped
+    return value
+
+
 def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
@@ -1608,22 +1660,17 @@ def wrap_shm_features(obj):
 
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:
-            if not hasattr(item, "feature"):
-                continue
-            feat = item.feature
-            if isinstance(feat, torch.Tensor) and feat.is_cpu:
-                item.feature = ShmPointerMMData(feat)
-            elif isinstance(feat, (list, tuple)):
-                wrapped = [
-                    (
-                        ShmPointerMMData(t)
-                        if isinstance(t, torch.Tensor) and t.is_cpu
-                        else t
-                    )
-                    for t in feat
-                ]
-                item.feature = (
-                    type(feat)(wrapped) if isinstance(feat, tuple) else wrapped
+            item_hash = getattr(item, "hash", None)
+            if hasattr(item, "feature") and item.feature is not None:
+                item.feature = _wrap_tensor_or_list(
+                    item.feature, precomputed_hash=item_hash
+                )
+            if (
+                hasattr(item, "precomputed_embeddings")
+                and item.precomputed_embeddings is not None
+            ):
+                item.precomputed_embeddings = _wrap_tensor_or_list(
+                    item.precomputed_embeddings, precomputed_hash=item_hash
                 )
     return obj
 
@@ -1647,7 +1694,21 @@ def has_shm_features(recv_reqs):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
                     return True
+                if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
+                    return True
     return False
+
+
+def _unwrap_tensor_or_list(value):
+    """Restore ShmPointerMMData wrappers back into standard torch.Tensors."""
+    if isinstance(value, ShmPointerMMData):
+        return value.materialize()
+    elif isinstance(value, (list, tuple)):
+        unwrapped = [
+            t.materialize() if isinstance(t, ShmPointerMMData) else t for t in value
+        ]
+        return type(value)(unwrapped) if isinstance(value, tuple) else unwrapped
+    return value
 
 
 def unwrap_shm_features(obj):
@@ -1664,17 +1725,14 @@ def unwrap_shm_features(obj):
         return obj
     # Handle single requests
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
-        mm_items = obj.mm_inputs.mm_items
-        for item in mm_items:
-            feat = item.feature
-            if isinstance(feat, ShmPointerMMData):
-                item.feature = feat.materialize()
-            elif isinstance(feat, (list, tuple)):
-                unwrapped = [
-                    t.materialize() if isinstance(t, ShmPointerMMData) else t
-                    for t in feat
-                ]
-                item.feature = (
-                    type(feat)(unwrapped) if isinstance(feat, tuple) else unwrapped
+        for item in obj.mm_inputs.mm_items:
+            if hasattr(item, "feature") and item.feature is not None:
+                item.feature = _unwrap_tensor_or_list(item.feature)
+            if (
+                hasattr(item, "precomputed_embeddings")
+                and item.precomputed_embeddings is not None
+            ):
+                item.precomputed_embeddings = _unwrap_tensor_or_list(
+                    item.precomputed_embeddings
                 )
     return obj

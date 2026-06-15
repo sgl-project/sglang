@@ -1,6 +1,5 @@
-import contextlib
+import inspect
 import logging
-import platform
 from typing import Optional, Tuple
 
 import torch
@@ -17,7 +16,6 @@ from sglang.srt.distributed import (
     get_moe_tp_group,
     get_tp_group,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
@@ -30,72 +28,9 @@ logger = logging.getLogger(__name__)
 _flashinfer_comm = None
 _TorchDistBackend = None
 _flashinfer_allreduce_unavailable = False
-_posix_transport_override_logged = False
-
-
-def _should_force_posix_fd_transport() -> bool:
-    force_posix_env = envs.SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT.get()
-    if force_posix_env is not None:
-        return force_posix_env
-
-    machine = platform.machine().lower()
-    if machine not in ("aarch64", "arm64"):
-        return False
-
-    if not torch.cuda.is_available():
-        return False
-
-    try:
-        major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    except Exception as e:
-        logger.debug("Failed to get CUDA device capability: %s", e)
-        return False
-
-    return major == 10
-
-
-@contextlib.contextmanager
-def _flashinfer_posix_fd_transport_override_if_needed():
-    # TODO(mmangkad): Remove this temporary override once the
-    # FlashInfer unified allreduce-fusion transport issue on
-    # GB200/GB300 platforms is fixed and verified resolved.
-    global _posix_transport_override_logged
-
-    if not _should_force_posix_fd_transport():
-        yield
-        return
-
-    try:
-        import flashinfer.comm.mnnvl as flashinfer_mnnvl
-    except Exception as e:
-        logger.debug(
-            "Failed to import flashinfer.comm.mnnvl for transport override: %s", e
-        )
-        yield
-        return
-
-    original_checker = getattr(flashinfer_mnnvl, "is_mnnvl_fabric_supported", None)
-    if original_checker is None:
-        yield
-        return
-
-    if not _posix_transport_override_logged:
-        logger.warning(
-            "Applying FlashInfer transport workaround: forcing PosixFD "
-            "symmetric-memory handle exchange on aarch64 + sm10x to avoid "
-            "known data corruption with Fabric handle exchange on GB systems. "
-            "Set SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT=0 to disable."
-        )
-        _posix_transport_override_logged = True
-
-    def _always_disable_fabric(_device_idx: int) -> bool:
-        return False
-
-    flashinfer_mnnvl.is_mnnvl_fabric_supported = _always_disable_fabric
-    try:
-        yield
-    finally:
-        flashinfer_mnnvl.is_mnnvl_fabric_supported = original_checker
+_flashinfer_create_workspace_supports_group = False
+_flashinfer_create_workspace_supports_comm_backend = False
+_flashinfer_allreduce_supports_trigger_completion = False
 
 
 if is_flashinfer_available():
@@ -106,6 +41,17 @@ if is_flashinfer_available():
             comm, "create_allreduce_fusion_workspace"
         ):
             _flashinfer_comm = comm
+            workspace_params = inspect.signature(
+                comm.create_allreduce_fusion_workspace
+            ).parameters
+            allreduce_params = inspect.signature(comm.allreduce_fusion).parameters
+            _flashinfer_create_workspace_supports_group = "group" in workspace_params
+            _flashinfer_create_workspace_supports_comm_backend = (
+                "comm_backend" in workspace_params
+            )
+            _flashinfer_allreduce_supports_trigger_completion = (
+                "trigger_completion_at_end" in allreduce_params
+            )
         else:
             _flashinfer_allreduce_unavailable = True
             logger.warning(
@@ -162,21 +108,13 @@ def is_flashinfer_allreduce_unavailable() -> bool:
 
 
 def _make_flashinfer_workspace_allocation_prop(cuda_driver):
-    if _should_force_posix_fd_transport():
-        handle_type = (
-            cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        )
-    else:
-        from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
+    from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
-        if is_mnnvl_fabric_supported(torch.cuda.current_device()):
-            handle_type = (
-                cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-            )
-        else:
-            handle_type = (
-                cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-            )
+    handle_types = cuda_driver.CUmemAllocationHandleType
+    if is_mnnvl_fabric_supported(torch.cuda.current_device()):
+        handle_type = handle_types.CU_MEM_HANDLE_TYPE_FABRIC
+    else:
+        handle_type = handle_types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
 
     prop = cuda_driver.CUmemAllocationProp()
     prop.requestedHandleTypes = handle_type
@@ -384,18 +322,21 @@ class FlashInferWorkspaceManager:
                 dtype=dtype,
                 force_oneshot_support=bool(use_oneshot),
             )
+            create_workspace = _flashinfer_comm.create_allreduce_fusion_workspace
+            if _flashinfer_create_workspace_supports_group:
+                # Pin the symmetric-memory rendezvous to the actual subgroup.
+                # Older FlashInfer releases only support comm_backend.
+                kwargs["group"] = device_group
             if (
                 _TorchDistBackend is not None
+                and _flashinfer_create_workspace_supports_comm_backend
                 and device_group is not None
                 and cpu_group is not None
             ):
                 kwargs["comm_backend"] = _TorchDistBackend(
                     device_group=device_group, cpu_group=cpu_group
                 )
-            with _flashinfer_posix_fd_transport_override_if_needed():
-                self.workspace = _flashinfer_comm.create_allreduce_fusion_workspace(
-                    **kwargs
-                )
+            self.workspace = create_workspace(**kwargs)
         except Exception as e:
             _flashinfer_allreduce_unavailable = True
             logger.warning(
@@ -417,7 +358,8 @@ class FlashInferWorkspaceManager:
         backend = getattr(self.workspace, "backend", "unknown")
         logger.info(
             f"FlashInfer workspace initialized for rank {rank}, "
-            f"world_size {world_size}, backend {backend}"
+            f"world_size {world_size}, backend {backend}, "
+            f"max_token_num {max_token_num}, hidden_dim {hidden_dim}"
         )
 
     def is_buffer_size_sufficient(
@@ -515,8 +457,6 @@ def ensure_workspace_initialized(
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
-    tp_coordinator = get_tp_group()
-
     if use_attn_tp_group:
         world_size = get_attn_tensor_model_parallel_world_size()
         rank = get_attn_tensor_model_parallel_rank()
@@ -531,17 +471,12 @@ def ensure_workspace_initialized(
             rank = get_moe_tensor_parallel_rank()
             coordinator = get_moe_tp_group()
 
-    # When the sub-group IS the full TP group, pass None so the workspace
-    # uses the default process group directly (no TorchDistBackend needed).
-    # For true sub-groups, use NCCL device_group for GPU/device mapping and
-    # GLOO cpu_group for metadata broadcasts (avoids NCCL collectives that
-    # interfere with CUDA graph capture).
-    if coordinator.device_group is tp_coordinator.device_group:
-        device_group = None
-        cpu_group = None
-    else:
-        device_group = coordinator.device_group
-        cpu_group = coordinator.cpu_group
+    # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
+    # rendezvous group from `group=...` (falling back to WORLD when None),
+    # so leaving it None silently rendezvouses on WORLD and the kernel ends
+    # up addressing the wrong peers in TP/EP/CP subgroup setups.
+    device_group = coordinator.device_group
+    cpu_group = coordinator.cpu_group
 
     if world_size <= 1:
         return False
@@ -671,7 +606,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     norm_out = torch.empty_like(input_tensor)
 
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
-    _flashinfer_comm.allreduce_fusion(
+    kwargs = dict(
         input=input_tensor,
         workspace=workspace_manager.workspace,
         pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
@@ -684,6 +619,9 @@ def flashinfer_allreduce_residual_rmsnorm(
         use_oneshot=use_oneshot,
         fp32_acc=fp32_acc,
     )
+    if _flashinfer_allreduce_supports_trigger_completion:
+        kwargs["trigger_completion_at_end"] = trigger_completion_at_end
+    _flashinfer_comm.allreduce_fusion(**kwargs)
 
     return norm_out, residual_out
 

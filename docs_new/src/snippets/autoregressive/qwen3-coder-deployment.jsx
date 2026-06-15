@@ -8,7 +8,8 @@ export const Qwen3CoderDeployment = () => {
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
         { id: 'b200', label: 'B200', default: false },
-        { id: 'gb200', label: 'GB200', default: false }
+        { id: 'gb200', label: 'GB200', default: false },
+        { id: 'xeon', label: 'Xeon', default: false }
       ]
     },
     modelSize: {
@@ -22,11 +23,14 @@ export const Qwen3CoderDeployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      items: [
-        { id: 'bf16', label: 'BF16', default: true },
-        { id: 'fp8', label: 'FP8', default: false },
-        { id: 'nvfp4', label: 'NVFP4', default: false }
-      ]
+      getDynamicItems: (values) => {
+        const isXeon = values.hardware === 'xeon';
+        return [
+          { id: 'bf16', label: 'BF16', default: true },
+          { id: 'fp8', label: 'FP8', default: false, disabled: false, disabledReason: '' },
+          { id: 'nvfp4', label: 'NVFP4', default: false, disabled: isXeon, disabledReason: isXeon ? 'FP4 is not supported on Xeon' : '' }
+        ];
+      }
     },
     toolcall: {
       name: 'toolcall',
@@ -45,14 +49,16 @@ export const Qwen3CoderDeployment = () => {
       mi300x: { tp: 8 },
       mi325x: { tp: 8 },
       mi355x: { tp: 8 },
-      b200: { tp: 8 },
-      gb200: { tp: 8 }
+      b200: { tp: 8, ep: 8 },
+      gb200: { tp: 4, ep: 4 },
+      xeon: { tp: 6 }
     },
     '30b': {
       baseName: '30B-A3B',
       mi300x: { tp: 1 },
       mi325x: { tp: 1 },
-      mi355x: { tp: 1 }
+      mi355x: { tp: 1 },
+      xeon: { tp: 3 }
     }
   };
 
@@ -60,6 +66,7 @@ export const Qwen3CoderDeployment = () => {
     const { hardware, modelSize, quantization } = values;
 
     const isNvidia = hardware === 'b200' || hardware === 'gb200';
+    const isXeon = hardware === 'xeon';
 
     const modelConfig = modelConfigs[modelSize];
     const hwConfig = modelConfig[hardware];
@@ -88,33 +95,39 @@ export const Qwen3CoderDeployment = () => {
     }
 
     let cmd = '';
-    if (!isNvidia) {
+    if (!isNvidia && !isXeon) {
       cmd += 'SGLANG_USE_AITER=0 ';
     }
     cmd += 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
 
+    if (isXeon) {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
+
     // TP setting
     cmd += ` \\\n  --tp ${hwConfig.tp}`;
 
-    // EP and DP attention settings
-    if (quantization === 'nvfp4') {
-      cmd += ` \\\n  --ep 1`;
-      cmd += ` \\\n  --enable-dp-attention`;
-    } else if (modelSize === '480b' && quantization === 'fp8') {
+    // EP settings
+    const ep = hwConfig.ep || (quantization === 'nvfp4' ? 1 : null);
+    if (ep) {
+      cmd += ` \\\n  --ep ${ep}`;
+    } else if (modelSize === '480b' && quantization === 'fp8' && !isXeon) {
       // FP8 requires EP=2 for 480B model due to MoE dimension alignment
       // moe_intermediate_size=2560, with tp=8 ep=1: 2560/8=320, 320%128!=0
-      // with tp=8 ep=2: 2560/4=640, 640%128=0 ✓
+      // with tp=8 ep=2: 2560/4=640, 640%128=0
       cmd += ` \\\n  --ep 2`;
+    }
+
+    // DP attention setting
+    if (quantization === 'nvfp4') {
+      cmd += ` \\\n  --enable-dp-attention`;
     }
 
     // MOE runner backend for NVIDIA
     if (isNvidia) {
       if (quantization === 'nvfp4') {
-        cmd += ` \\\n  --moe-runner-backend flashinfer_cutlass`;
         cmd += ` \\\n  --quantization modelopt_fp4`;
-      } else if (quantization === 'fp8') {
-        cmd += ` \\\n  --moe-runner-backend triton`;
       }
     }
 
@@ -130,7 +143,7 @@ export const Qwen3CoderDeployment = () => {
     });
 
     // AMD-specific flags
-    if (!isNvidia) {
+    if (!isNvidia && !isXeon) {
       // Context length verified on MI300X/MI325X/MI355X
       cmd += ` \\\n  --context-length 8192`;
 
