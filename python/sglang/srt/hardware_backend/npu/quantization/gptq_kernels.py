@@ -156,38 +156,40 @@ class GPTQMoEAscendKernel:
         w13_qweight_2d = (
             layer.w13_qweight.data.transpose(-1, -2)
             .contiguous()
-            .reshape(-1, layer.w13_qweight.shape[-2])   # (E * K, N_packed)
+            .reshape(-1, layer.w13_qweight.shape[-2])
         )
         w13_qweight_tmp = unpack_from_int32(w13_qweight_2d, self.quant_config.weight_bits, packed_dim=1)
-        # w13_qweight_tmp shape: (E * K, N) where N = full output features
+        # w13_qweight_tmp shape: (E * K, N)   where K = input features, N = output features
     
-        E_w13 = layer.w13_qweight.shape[0]            # num experts
-        K_w13 = layer.w13_qweight.shape[1]            # input features (full K)
-        N_w13 = w13_qweight_tmp.shape[1]              # output features (full N)
+        E_w13 = layer.w13_qweight.shape[0]          # num experts
+        # Derive K and N from the 2D unpacked tensor – robust to layout changes
+        N_w13 = w13_qweight_tmp.shape[1]            # output features (N)
+        K_w13 = w13_qweight_tmp.shape[0] // E_w13   # input features (K)
     
         # 1) Reshape to [E, K, N] then permute to [E, N, K]
         w13_weight = w13_qweight_tmp.reshape(E_w13, K_w13, N_w13)   # [E, K, N]
-        w13_weight = w13_weight.permute(0, 2, 1)                     # [E, N, K]
+        w13_weight = w13_weight.permute(0, 2, 1)                     # [E, N, K] (int8)
     
-        # 2) Handle negative scales (sign flip) – scales stay per‑group
+        # 2) Sign flip for negative scales (4‑bit only) – scales remain per‑group
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
-            # layer.w13_scales shape: [E, groups, N]   groups = K // group_size
+            # layer.w13_scales shape: [E, groups, N]   where groups = K // group_size
             scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)  # [E, K, N]
             scale_expanded = scale_expanded.transpose(-1, -2)                            # [E, N, K]
             neg_mask = scale_expanded < 0
             if neg_mask.any():
                 w13_weight[neg_mask] = -w13_weight[neg_mask]
-                w13_weight.clamp_(max=7)  # 4‑bit max
-            layer.w13_scales.data.abs_()  # scales stay per‑group
+                w13_weight.clamp_(max=7)  # 4‑bit maximum
+            layer.w13_scales.data.abs_()  # keep original per‑group shape
     
-        # 3) NPU NZ format conversion
+        # 3) Convert to NPU NZ format (required by npu_grouped_matmul)
         w13_weight = npu_format_cast(w13_weight)
     
-        # 4) Pack 4 int8 values into int32 along last dim (K)
+        # 4) Pack 4 int8 values into int32 along the K dimension
         if self.quant_config.weight_bits == 4:
-            assert w13_weight.shape[-1] % 4 == 0
+            assert w13_weight.shape[-1] % 4 == 0, "K must be divisible by 4 for int8->int32 packing"
             w13_weight = self._pack_to_int32(w13_weight)   # [E, N, K//4] int32
+        # else: keep int8 (8‑bit case)
     
         layer.w13_qweight = torch.nn.Parameter(w13_weight, requires_grad=False)
     
@@ -210,11 +212,11 @@ class GPTQMoEAscendKernel:
         w2_qweight_tmp = unpack_from_int32(w2_qweight_2d, self.quant_config.weight_bits, packed_dim=1)
     
         E_w2 = layer.w2_qweight.shape[0]
-        K_w2 = layer.w2_qweight.shape[1]         # intermediate_size (K)
-        N_w2 = w2_qweight_tmp.shape[1]           # output features (N)
+        N_w2 = w2_qweight_tmp.shape[1]
+        K_w2 = w2_qweight_tmp.shape[0] // E_w2
     
-        w2_weight = w2_qweight_tmp.reshape(E_w2, K_w2, N_w2)   # [E, K, N]
-        w2_weight = w2_weight.permute(0, 2, 1)                  # [E, N, K]
+        w2_weight = w2_qweight_tmp.reshape(E_w2, K_w2, N_w2)
+        w2_weight = w2_weight.permute(0, 2, 1)   # [E, N, K]
     
         if self.quant_config.weight_bits == 4:
             scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)
