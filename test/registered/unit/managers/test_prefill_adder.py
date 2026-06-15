@@ -72,13 +72,26 @@ class TestPrefillAdder(CustomTestCase):
         )
         return server_args
 
-    def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
+    def create_mock_req(
+        self,
+        rid,
+        priority,
+        max_new_tokens,
+        output_len=0,
+        wait_time=0,
+        prompt_len=0,
+    ):
         req = MagicMock(spec=Req)
         req.rid = str(rid)
         req.priority = priority
         req.extend_input_len = 0
         req.extend_logprob_start_len = 0
         req.output_ids = [0] * output_len
+        # preempt_to_schedule derives the prefill demand from seqlen and
+        # prefix_indices (not the not-yet-populated extend_input_len). Default
+        # prompt_len=0 keeps the existing preemption tests unchanged.
+        req.seqlen = prompt_len
+        req.prefix_indices = []
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
@@ -244,6 +257,35 @@ class TestPrefillAdder(CustomTestCase):
             new_req_fail_by_priority_check, mock_server_args
         )
         self.assertFalse(success_by_capacity_check)
+
+    def test_preempt_budget_includes_unprefilled_prompt_tokens(self):
+        # A freshly arrived request reaches preempt_to_schedule before
+        # init_next_round_input populates extend_input_len, so the budget must be
+        # derived from seqlen - len(prefix_indices). Here a single eligible
+        # victim frees only 50 tokens, far less than the incoming 1000-token
+        # prompt, so preemption cannot fit the request and must be refused. The
+        # old code seeded the budget from extend_input_len (== 0 at this point),
+        # dropping the prompt tokens, and would wrongly preempt the victim.
+        running_reqs = [self.create_mock_req("run1", priority=0, max_new_tokens=50)]
+        mock_server_args = self.create_server_args(
+            schedule_low_priority_values_first=False
+        )
+        running_batch = self.create_running_batch(running_reqs)
+        adder = self.create_adder(running_batch)
+
+        self.assertEqual(adder.rem_total_token_offset, 50)
+        self.mock_token_allocator.available_size.return_value = 50
+        self.assertEqual(adder.rem_total_tokens, 0)
+
+        new_req = self.create_mock_req(
+            "new1", priority=1, max_new_tokens=10, prompt_len=1000
+        )
+
+        success = adder.preempt_to_schedule(new_req, mock_server_args)
+
+        self.assertFalse(success)
+        self.assertEqual(adder.preempt_list, [])
+        running_batch.release_req.assert_not_called()
 
     def test_preempt_skip_already_preempted_request(self):
         params = [
