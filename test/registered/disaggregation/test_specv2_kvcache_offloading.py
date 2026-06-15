@@ -2,7 +2,8 @@
 Unit tests for _release_finished_req in DecodeKVCacheOffloadManager.
 
 Verifies that over-allocated KV cache slots (from speculative decoding v2)
-are correctly freed when a request finishes, preventing GPU memory leaks.
+are correctly freed and prefix-cache locks are released through the cache API
+when a request finishes, preventing GPU memory leaks and accounting corruption.
 
 Requires: torch, sglang (run in an environment with sglang installed)
 """
@@ -28,6 +29,7 @@ def _make_mock_req(
     kv_allocated_len: int,
     prefix_indices_len: int = 0,
     rid: int = 0,
+    cache_protected_len: int = 0,
 ):
     """Create a mock Req with the KV cache state needed for testing."""
     req = MagicMock()
@@ -38,6 +40,8 @@ def _make_mock_req(
     req.kv_committed_freed = False
     req.kv_overallocated_freed = False
     req.prefix_indices = list(range(prefix_indices_len))
+    req.last_node = MagicMock(name=f"last_node_{rid}")
+    req.cache_protected_len = cache_protected_len
 
     def pop_committed():
         assert not req.kv_committed_freed
@@ -171,8 +175,8 @@ class TestReleaseFinishedReq(unittest.TestCase):
         expected_committed = torch.arange(4, 10, dtype=torch.int64)
         self.assertTrue(torch.equal(freed[0], expected_committed))
 
-    def test_prefix_indices_decremented(self):
-        """protected_size_ is decremented by len(req.prefix_indices)."""
+    def test_prefix_lock_released_via_cache_api(self):
+        """Release the matched prefix node instead of mutating cache counters."""
         manager, _ = _make_manager(pool_size=32)
         manager.tree_cache.protected_size_ = 10
         req = _make_mock_req(
@@ -182,9 +186,27 @@ class TestReleaseFinishedReq(unittest.TestCase):
             prefix_indices_len=5,
         )
 
+        last_node = req.last_node
         manager._release_finished_req(req, start_offset=0)
 
-        self.assertEqual(manager.tree_cache.protected_size_, 5)
+        manager.tree_cache.dec_lock_ref.assert_called_once_with(last_node)
+        # The manager must not reach into cache implementation details.
+        self.assertEqual(manager.tree_cache.protected_size_, 10)
+
+    def test_no_prefix_node_skips_lock_release(self):
+        """Requests without a matched radix node have no lock to release."""
+        manager, _ = _make_manager(pool_size=32)
+        req = _make_mock_req(
+            req_pool_idx=0,
+            kv_committed_len=20,
+            kv_allocated_len=20,
+            prefix_indices_len=5,
+        )
+        req.last_node = None
+
+        manager._release_finished_req(req, start_offset=0)
+
+        manager.tree_cache.dec_lock_ref.assert_not_called()
 
     def test_release_finished_req_frees_prefill_when_state_present(self):
         """
@@ -217,6 +239,53 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertTrue(torch.equal(freed[1], expected_committed))
         # State entry is removed at the end of _release_finished_req.
         self.assertNotIn(rid, manager.offloaded_state)
+
+    def test_radix_owned_prefix_is_not_returned_to_allocator(self):
+        """A restored/cached prefix remains allocated while the tree owns it."""
+        manager, freed = _make_manager(pool_size=32)
+        rid = "req-protected-prefix"
+        req = _make_mock_req(
+            req_pool_idx=0,
+            kv_committed_len=20,
+            kv_allocated_len=20,
+            rid=rid,
+            cache_protected_len=12,
+        )
+        manager.offloaded_state[rid] = OffloadedState(
+            prefill_len=8, inc_len=4, last_hash=None
+        )
+
+        last_node = req.last_node
+        manager._release_finished_req(req, start_offset=8)
+
+        # [0:12] is still owned by the radix tree. Only the uncached tail is
+        # returned; dec_lock_ref makes the retained prefix evictable.
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], torch.arange(12, 20, dtype=torch.int64)))
+        manager.tree_cache.dec_lock_ref.assert_called_once_with(last_node)
+
+    def test_partially_protected_prefill_only_frees_unowned_ranges(self):
+        """Free around a radix-owned prefix without double-freeing any slot."""
+        manager, freed = _make_manager(pool_size=32)
+        rid = "req-partial-protected-prefix"
+        req = _make_mock_req(
+            req_pool_idx=0,
+            kv_committed_len=20,
+            kv_allocated_len=20,
+            rid=rid,
+            cache_protected_len=4,
+        )
+        manager.offloaded_state[rid] = OffloadedState(
+            prefill_len=8, inc_len=0, last_hash=None
+        )
+
+        manager._release_finished_req(req, start_offset=8)
+
+        # [0:4] belongs to the tree. The rest is released in two disjoint
+        # ranges split at the prefill/incremental boundary.
+        self.assertEqual(len(freed), 2)
+        self.assertTrue(torch.equal(freed[0], torch.arange(4, 8, dtype=torch.int64)))
+        self.assertTrue(torch.equal(freed[1], torch.arange(8, 20, dtype=torch.int64)))
 
     def test_release_finished_req_skips_prefill_free_when_prefill_len_zero(self):
         """
