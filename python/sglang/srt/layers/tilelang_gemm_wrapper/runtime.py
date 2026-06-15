@@ -134,6 +134,8 @@ def _get_kernel(
     c_scale_local: bool,
     a_scale_shm: bool,
     b_scale_shm: bool,
+    swizzle_panel: int,
+    swizzle_order: str,
 ):
     assert_available()
 
@@ -158,7 +160,12 @@ def _get_kernel(
     }
 
     if kernel_type == "base":
-        return fp8_blockwise_gemm_base_kernel(**common, a_scale_shm=a_scale_shm)
+        return fp8_blockwise_gemm_base_kernel(
+            **common,
+            a_scale_shm=a_scale_shm,
+            swizzle_panel=swizzle_panel,
+            swizzle_order=swizzle_order,
+        )
     if kernel_type == "swapAB":
         return fp8_blockwise_gemm_swap_ab_kernel(**common, b_scale_shm=b_scale_shm)
     if kernel_type == "splitK":
@@ -189,6 +196,8 @@ def _compile_from_config(config: dict):
         config["c_scale_local"],
         config["a_scale_shm"],
         config["b_scale_shm"],
+        config.get("swizzle_panel", 0),
+        config.get("swizzle_order", "row"),
     )
 
 

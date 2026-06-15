@@ -36,6 +36,8 @@ def fp8_blockwise_gemm_base_kernel(
     accum_dtype: str = FP32_DTYPE,
     c_scale_local: bool = False,
     a_scale_shm: bool = False,
+    swizzle_panel: int = 0,
+    swizzle_order: str = "row",
 ):
     M = T.symbolic("M")
     c_scale_alloc = T.alloc_fragment if c_scale_local else T.alloc_shared
@@ -53,6 +55,9 @@ def fp8_blockwise_gemm_base_kernel(
         with T.Kernel(
             T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
         ) as (pid_n, pid_m):
+            if swizzle_panel > 0:
+                T.use_swizzle(swizzle_panel, order=swizzle_order)
+
             A_shared = T.alloc_shared((block_M, block_K), FP8_DTYPE)
             B_shared = T.alloc_shared((block_N, block_K), FP8_DTYPE)
             C_shared = T.alloc_shared((block_M, block_N), out_dtype)

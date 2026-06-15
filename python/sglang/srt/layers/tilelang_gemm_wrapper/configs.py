@@ -20,6 +20,7 @@ _THREAD_VALUES = (128, 256)
 _MATMUL_STAGE_VALUES = (1, 2, 3, 4)
 _SPLIT_K_STAGE_VALUES = (0, 1, 2)
 _SPLIT_K_VALUES = (2, 4, 8)
+_SWIZZLE_PANEL = 8
 
 DEFAULT_M_VALUES = [
     1,
@@ -55,6 +56,8 @@ _BASE_CONFIG = {
     "c_scale_local": False,
     "a_scale_shm": False,
     "b_scale_shm": False,
+    "swizzle_panel": 0,
+    "swizzle_order": "row",
 }
 
 
@@ -67,6 +70,8 @@ def normalize_config(config: dict, M: int, N: int, K: int) -> dict:
         normalized[key] = int(normalized[key])
     for key in ("c_scale_local", "a_scale_shm", "b_scale_shm"):
         normalized[key] = bool(normalized[key])
+    normalized["swizzle_panel"] = int(normalized["swizzle_panel"])
+    normalized["swizzle_order"] = str(normalized["swizzle_order"])
 
     return normalized
 
@@ -216,6 +221,15 @@ def config_compatibility_error(config: dict, M: int, N: int, K: int) -> Optional
         return f"out_dtype must be bfloat16; got {config['out_dtype']}"
     if config["accum_dtype"] != "float32":
         return f"accum_dtype must be float32; got {config['accum_dtype']}"
+    if config["swizzle_panel"] < 0:
+        return f"swizzle_panel must be non-negative; got {config['swizzle_panel']}"
+    if config["swizzle_order"] not in ("row", "column"):
+        return (
+            "swizzle_order must be one of ('row', 'column'); "
+            f"got {config['swizzle_order']}"
+        )
+    if config["swizzle_panel"] > 0 and kernel_type != "base":
+        return "swizzle_panel is currently supported only by the base kernel"
 
     split_k = config["split_k"]
     if kernel_type in SPLIT_K_KERNEL_TYPES:
@@ -268,16 +282,60 @@ def _is_large_base_shape(M: int, N: int, K: int) -> bool:
     return M >= 48 and (N >= 4096 or K >= 3584)
 
 
+def _is_large_n_k5120_base_shape(M: int, N: int, K: int) -> bool:
+    return M >= 256 and N >= 6144 and K == 5120
+
+
+def _uses_stage1_large_k_candidate(M: int, N: int, K: int) -> bool:
+    if K == 9216 and N <= 2560 and M >= 2048:
+        return True
+    return K >= 16384 and N <= 5120 and M <= 1024
+
+
+def _base_swizzle_options(
+    M: int,
+    N: int,
+    K: int,
+    base: dict,
+    c_scale_local: bool,
+    scale_shm: bool,
+) -> Tuple[Tuple[int, str], ...]:
+    options = [(0, "row")]
+    if (
+        _is_large_n_k5120_base_shape(M, N, K)
+        and base["block_M"] == 64
+        and base["block_N"] == 64
+        and base["num_stages"] == 2
+        and base["threads"] == 128
+        and c_scale_local
+        and not scale_shm
+    ):
+        options.append((_SWIZZLE_PANEL, "column"))
+    return tuple(options)
+
+
 def _fast_sm90_candidate_filter(config: dict, M: int, N: int, K: int) -> bool:
     """Aggressive SM90 shortlist learned from H20 TileLang tuning runs."""
 
     kernel_type = config["kernel_type"]
     if config["block_K"] != 128:
         return False
-    if config["threads"] != 128 or not config["c_scale_local"]:
+    if config["threads"] != 128:
         return False
 
     if kernel_type == "base":
+        large_k_stage1 = (
+            config["block_M"] == 64
+            and config["block_N"] == 32
+            and config["num_stages"] == 1
+            and not config["c_scale_local"]
+            and not config["a_scale_shm"]
+            and config["swizzle_panel"] == 0
+        )
+        if _uses_stage1_large_k_candidate(M, N, K):
+            return large_k_stage1
+        if not config["c_scale_local"]:
+            return False
         if _is_large_base_shape(M, N, K):
             return (
                 not config["a_scale_shm"]
@@ -290,6 +348,8 @@ def _fast_sm90_candidate_filter(config: dict, M: int, N: int, K: int) -> bool:
         return config["block_N"] in (16, 32, 64) and config["num_stages"] in (2, 4)
 
     if config["block_M"] != 64:
+        return False
+    if not config["c_scale_local"]:
         return False
     if kernel_type == "swapAB":
         return config["block_N"] == 16 and config["num_stages"] in (2, 4)
@@ -342,15 +402,25 @@ def generate_candidate_configs(
         for base in base_configs:
             for c_scale_local in (False, True):
                 for scale_shm in (False, True):
-                    candidate = {
-                        **base,
-                        "kernel_type": kernel_type,
-                        "c_scale_local": c_scale_local,
-                        scale_key: scale_shm,
-                        "out_dtype": "bfloat16",
-                        "accum_dtype": "float32",
-                    }
-                    configs.append(normalize_config(candidate, M, N, K))
+                    swizzle_options = (
+                        _base_swizzle_options(
+                            M, N, K, base, c_scale_local, scale_shm
+                        )
+                        if kernel_type == "base"
+                        else ((0, "row"),)
+                    )
+                    for swizzle_panel, swizzle_order in swizzle_options:
+                        candidate = {
+                            **base,
+                            "kernel_type": kernel_type,
+                            "c_scale_local": c_scale_local,
+                            scale_key: scale_shm,
+                            "out_dtype": "bfloat16",
+                            "accum_dtype": "float32",
+                            "swizzle_panel": swizzle_panel,
+                            "swizzle_order": swizzle_order,
+                        }
+                        configs.append(normalize_config(candidate, M, N, K))
 
     if search_policy == "fast_sm90":
         configs = [
