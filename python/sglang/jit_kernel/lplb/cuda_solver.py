@@ -43,7 +43,7 @@ def _sm_ver() -> int:
 @cache_once
 def _ipm_module(
     nc: int, nv: int, block_dim: int, num_iters: int, sm_ver: int
-) -> "Module":
+) -> Module:
     """JIT-compile the IPM kernel for one shape. Cached for the process lifetime."""
     args = make_cpp_args(nc, nv, block_dim, sm_ver, num_iters)
     # The kernel uses cuBLASDx (header-only) for the GEMMs and a hand-written
@@ -83,7 +83,7 @@ def solve_ipm(
     b: torch.Tensor,
     c: torch.Tensor,
     num_iters: int = DEFAULT_NUM_ITERS,
-    result: "torch.Tensor | None" = None,
+    result: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the fused single-SM IPM kernel.
 
@@ -125,7 +125,7 @@ def _prep_module(
     num_red_log: int,
     num_gpus: int,
     block_dim: int,
-) -> "Module":
+) -> Module:
     args = make_cpp_args(nc, nv, num_single, num_red_log, num_gpus, block_dim)
     return load_jit(
         "lplb_lp_prep",
@@ -169,7 +169,7 @@ def _post_module(
     num_single: int,
     num_red_phy: int,
     block_dim: int,
-) -> "Module":
+) -> Module:
     args = make_cpp_args(num_logical, max_copies, num_single, num_red_phy, block_dim)
     return load_jit(
         "lplb_lp_post",
@@ -201,7 +201,7 @@ def extract_log2phy_prob(
 
 
 @cache_once
-def _dispatch_module(max_copies: int, block_dim: int) -> "Module":
+def _dispatch_module(max_copies: int, block_dim: int) -> Module:
     args = make_cpp_args(max_copies, block_dim)
     return load_jit(
         "lplb_dispatch_probability",
