@@ -1,3 +1,4 @@
+import deep_gemm
 import pytest
 import torch
 from sgl_kernel import sgl_per_token_group_quant_8bit  # AOT v2 reference op
@@ -10,6 +11,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
     fp8_min,
+    sglang_per_token_group_quant_fp8,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -80,6 +82,24 @@ def test_v2_jit_matches_aot(dtype, num_tokens, hidden, fuse_silu_and_mul, scale_
 
     assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "fp8 codes differ"
     assert torch.equal(x_s, s_ref), "scales differ"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [1, 33, 128])
+@pytest.mark.parametrize("hidden", [128, 512, 4096, 7168])
+def test_sglang_per_token_group_quant_fp8_row_major_ue8m0_matches_ceil(
+    dtype, num_tokens, hidden
+):
+    torch.manual_seed(num_tokens * 1000 + hidden)
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
+
+    q_ref, s_ref = sglang_per_token_group_quant_fp8(x, G, scale_ue8m0=False)
+    s_ref = deep_gemm.ceil_to_ue8m0(s_ref)
+    x_q, x_s = sglang_per_token_group_quant_fp8(x, G, scale_ue8m0=True)
+    torch.cuda.synchronize()
+
+    assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "fp8 codes differ"
+    assert torch.equal(x_s, s_ref), "row-major ue8m0 scales differ"
 
 
 # Masked (EP-MoE) path: the v2 op only has a masked scheduler for the
