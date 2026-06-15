@@ -22,6 +22,21 @@ if TYPE_CHECKING:
 __all__ = ["AWQMoEScheme", "AWQAscendMoEScheme"]
 
 
+from sglang.srt.layers.moe.moe_runner.torch_npu import (
+    TorchNpuQuantInfo,
+)
+
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A16Int4MoEMethod,
+)
+
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
+
 class AWQMoEScheme(AWQMoESchemeBase):
     def __init__(self, quant_config: AWQMarlinConfig):
         self.quant_config = quant_config
@@ -157,8 +172,8 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         **extra_weight_attrs,
     ):
         self.moe_runner_config = moe_runner_config
-        layer.w13_kernel = self.w13_kernel
-        layer.w2_kernel = self.w2_kernel
+        layer.w13_kernel = NPUW4A16Int8MoEMethod()
+        layer.w2_kernel = NPUW4A16Int8MoEMethod()
         moe_runner_config.layer = layer
         backend = get_moe_runner_backend()
         if backend.is_auto():
