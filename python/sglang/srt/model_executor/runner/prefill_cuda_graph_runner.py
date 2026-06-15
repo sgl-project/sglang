@@ -27,6 +27,7 @@ Backend selection comes from cuda_graph_config.prefill:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import warnings
 from typing import TYPE_CHECKING, Dict, Optional, Union
@@ -62,7 +63,6 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
-from sglang.srt.model_executor.runner_backend.eager_backend import EagerBackend
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
@@ -117,11 +117,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def __init__(self, model_runner: ModelRunner, *, eager: bool = False):
         super().__init__(model_runner)
-        # When True, plug in EagerBackend (no capture/compile): the model
-        # forward runs live each iteration over a static batch built at the raw
-        # token count (no bucket padding), through the same reserve/load/execute
-        # lifecycle the cuda-graph path uses. The eager dual of the cuda-graph
-        # PrefillCudaGraphRunner — see _resolve_backend / prepare / load_batch / execute.
+        # When True, run in eager mode (no capture/compile, no ExecutionBackend):
+        # the model forward runs live each iteration over a static batch built at
+        # the raw token count (no bucket padding), through the same
+        # reserve/load/execute lifecycle the cuda-graph path uses. The eager dual
+        # of the cuda-graph PrefillCudaGraphRunner — see prepare / load_batch /
+        # execute. This mode is driven by EagerRunner, which constructs this class
+        # with eager=True and dispatches its prefill-side load_batch/execute here.
         self.eager = eager
         # --- core state ------------------------------------------------
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
@@ -224,14 +226,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # _run_compile_pass before backend resolution returns.
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
         self.layer_model = None
-        # Eager plugs in EagerBackend (no capture/compile). The Breakable/BCG
-        # branches below all gate on isinstance(self.backend, Breakable...) and
-        # so are skipped for eager: _prefill_static_buffers stays None,
+        # Eager runs the model forward live (no capture/compile, no
+        # ExecutionBackend). The Breakable/BCG branches below all gate on
+        # isinstance(self.backend, Breakable...) and so are skipped for eager
+        # (self.backend is None): _prefill_static_buffers stays None,
         # use_captured_attn_metadata stays False, layer_model stays None — which
         # routes execute() down the non-BCG (eager) path.
-        self.backend = (
-            EagerBackend(self) if self.eager else resolve_prefill_backend(self)
-        )
+        self.backend = None if self.eager else resolve_prefill_backend(self)
         if isinstance(self.backend, BreakableCudaGraphBackend):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
@@ -828,7 +829,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        with self.backend.run_session():
+        run_session = (
+            contextlib.nullcontext() if self.eager else self.backend.run_session()
+        )
+        with run_session:
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
@@ -836,28 +840,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self.eager:
                 # Eager path. No capture/compile and no piecewise context (which
                 # is for the compiled graph); run the model forward live over the
-                # static batch through EagerBackend.run — the eager dual of
-                # cuda-graph replay, mirroring forward_extend's inline eager
-                # fallback. dp-buffer / extend-in-batch state is set by the
-                # forward-prep pipeline up the stack (as for the inline fallback),
-                # so it is NOT re-set here — and the live batch's dp_padding_mode
-                # may be None (non-DP).
+                # static batch — the eager dual of cuda-graph replay, mirroring
+                # forward_extend's inline eager fallback. dp-buffer /
+                # extend-in-batch state is set by the forward-prep pipeline up the
+                # stack (as for the inline fallback), so it is NOT re-set here —
+                # and the live batch's dp_padding_mode may be None (non-DP).
                 with forward_context(
                     ForwardContext(attn_backend=self.model_runner.attn_backend)
                 ):
-
-                    def _eager_forward(_passed_static_forward_batch):
-                        return self.model_runner.model.forward(
-                            static_forward_batch.input_ids,
-                            static_forward_batch.positions,
-                            static_forward_batch,
-                            **kwargs,
-                        )
-
-                    output = self.backend.run(
-                        ShapeKey(size=static_num_tokens),
+                    output = self.model_runner.model.forward(
+                        static_forward_batch.input_ids,
+                        static_forward_batch.positions,
                         static_forward_batch,
-                        forward_fn=_eager_forward,
+                        **kwargs,
                     )
             elif self.layer_model is not None:
                 # BCG path. The captured graph is a bs=1 replay of
