@@ -38,7 +38,7 @@ class TestBCGGlm5Fp8TP8(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--disable-flashinfer-autotune",
-                "--enable-breakable-cuda-graph",
+                "--cuda-graph-backend-prefill=breakable",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
