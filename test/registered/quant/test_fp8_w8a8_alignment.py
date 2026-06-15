@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensor
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small")
 
 
 def _make_fp8_weight(out_dim: int, in_dim: int) -> torch.Tensor:
