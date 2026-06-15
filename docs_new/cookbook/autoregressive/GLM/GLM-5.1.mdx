@@ -1,214 +1,156 @@
 ---
 title: GLM-5.1
-metatags:
-    description: "Deploy GLM-5.1 with SGLang on NVIDIA H100/H200/B300/GB300 and AMD MI300X/MI325X/MI355X."
-tag: NEW
+description: "Deploy GLM-5.1 with SGLang — launch commands, tuning, and benchmarks for the DeepSeek Sparse Attention MoE model on NVIDIA H100/H200/B300/GB300 and AMD MI300X/MI325X/MI355X."
 ---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+`lmsysorg/sglang:dev` (nightly) covers the **NVIDIA Hopper** GPUs (H100 / H200). **B300 and GB300 require the CUDA 13 image variant** `lmsysorg/sglang:dev-cu130`. **AMD** GPUs use the ROCm images (`lmsysorg/sglang:dev-rocm720-mi30x` for MI300X/MI325X, `lmsysorg/sglang:dev-rocm720-mi35x` for MI355X).
+
+```bash Command
+docker pull lmsysorg/sglang:dev
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the command generator below produces):
+
+```bash Command
+docker run --gpus all \
+    --shm-size 32g \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<your-hf-token>" \
+    --ipc=host \
+    lmsysorg/sglang:dev \
+    sglang serve <use args below>
+```
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + recipe to generate the launch command. The two serving strategies cover the common operating points:
+
+- **Low-Latency** — fastest reply for a single user. Pick for chat. DP-Attention is off.
+- **High-Throughput** — most tokens per second across many concurrent users. Best for batch jobs. Enables data-parallel attention (`--dp N --enable-dp-attention`).
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/zai-org/glm-5.1.jsx";
+import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.1-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li style={{marginBottom: "0.2rem"}}><strong>Python / Docker</strong> — bare <code>sglang serve …</code> for an existing SGLang env, or a <code>docker run … sglang serve …</code> wrap against the per-hardware image from the <a href="#install">Install SGLang</a> panel above.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the current command (with whichever framing is active) to your clipboard.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>$ cURL</strong> — a sample request against <code>localhost:30000</code> to confirm the server is up.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>HOST_IP</code>, <code>PORT</code>, <code>HF_TOKEN</code>) the command and cURL share. Persists in localStorage across cookbooks.</li>
+    <li><strong>Verified / Not Verified</strong> badge — green when the <code>(hw, variant, quant, strategy, nodes)</code> combo has been run end-to-end on real hardware; yellow when ported from the legacy command generator and not yet re-checked.</li>
+  </ul>
+</div>
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the matrix**. The Deploy panel above only emits the recipes ported from the GLM-5.1 command generator; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection — only your overrides change.
+
+The knobs are **built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention — DP-Attention's value is the DP degree, with `off` to disable), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets (EAGLE — not available on AMD), prefill/decode disaggregation, HiCache tiers, and HiSparse hierarchical sparse attention (decode-role only — the card appears once PD-Disagg mode is set to decode; GLM-5.1 uses DeepSeek Sparse Attention).
+
+Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the base but stripped by an override. Any change flips the badge to **Not Verified** until the new configuration is run end-to-end and submitted back.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> reuse <strong>Python / Docker</strong> · <strong>⧉ Copy</strong> · <strong>$ cURL</strong> · <strong>⚙ Env</strong> from the Deploy panel, plus one extra:</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li><strong>Submit ↗</strong> — opens a pre-filled GitHub issue so you can land your override combo as a new verified cookbook cell. Shown only while the badge says <strong>Not Verified</strong>; click it once you've actually run the command on your hardware and confirmed it works.</li>
+  </ul>
+</div>
 
 ## 1. Model Introduction
 
-**Available Models:**
-
-- **BF16 (Full precision)**: [zai-org/GLM-5.1](https://huggingface.co/zai-org/GLM-5.1)
-- **FP8 (8-bit quantized)**: [zai-org/GLM-5.1-FP8](https://huggingface.co/zai-org/GLM-5.1-FP8)
-- **NVFP4 (4-bit quantized)**: [nvidia/GLM-5.1-NVFP4](https://huggingface.co/nvidia/GLM-5.1-NVFP4)
-
-**License:** MIT
-
-## 2. SGLang Installation
-
-Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
-
-## 3. Model Deployment
-
-This section provides deployment configurations optimized for different hardware platforms and use cases.
-
-### 3.1 Basic Configuration
-
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and capabilities. SGLang supports serving GLM-5.1 on NVIDIA H100, H200, B300, GB300, and AMD MI300X/MI325X/MI355X GPUs.
-
-import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.jsx'
-
-<GLM51Deployment />
-
-### 3.2 Configuration Tips
-
-- Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
-- **DP Attention**: Enables data parallel attention for higher throughput under high concurrency. Note that DP attention trades off low-concurrency latency for high-concurrency throughput — disable it if your workload is latency-sensitive with few concurrent requests.
-- The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
+**GLM-5.1** is a Mixture-of-Experts model from Z.ai that uses **DeepSeek Sparse Attention (DSA)** — it shares the same model structure as DeepSeek-V3.2, so the two pages' optimization techniques (MTP, DSA kernels, Context Parallel, HiSparse, NVFP4, Index Cache) are common. It ships in three precisions:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "28%"}} />
+    <col style={{width: "32%"}} />
+    <col style={{width: "40%"}} />
+  </colgroup>
   <thead>
     <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>NVFP4</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Precision</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Target hardware</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H100</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=16</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>BF16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/zai-org/GLM-5.1">zai-org/GLM-5.1</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI300X / MI325X / MI355X</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H200</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>FP8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/zai-org/GLM-5.1-FP8">zai-org/GLM-5.1-FP8</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NVIDIA H100 / H200</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B300</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GB300</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI300X/MI325X</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI355X</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVFP4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/nvidia/GLM-5.1-NVFP4">nvidia/GLM-5.1-NVFP4</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA B300 / GB300</td>
     </tr>
   </tbody>
 </table>
 
-- **H100 and H200**: FP8 is the recommended deployment path.
-- **B300 and GB300**: NVFP4 is the recommended deployment path. Use `nvidia/GLM-5.1-NVFP4` with `--quantization modelopt_fp4`. Use `tp=8` on B300 and `tp=4` on GB300. The CUDA 13 image variant is required for B300 and GB300.
-- **AMD GPUs**: Both BF16 and FP8 checkpoints are supported on MI300X/MI325X/MI355X at tp=8. Use `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang` for the DSA attention backend. Add `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). FP8 uses approximately half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). EAGLE speculative decoding is not currently supported on AMD for GLM-5.1.
-- For other configuration tips (MTP, DSA kernel, Context Parallel, HiSparse, NVFP4, Index Cache), see the [DeepSeek-V3.2 cookbook page](../DeepSeek/DeepSeek-V3_2). GLM-5.1 and DeepSeek-V3.2 share the same model structure, so the optimization techniques are common.
-- Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to enable the [IndexCache](https://github.com/THUDM/IndexCache) method for GLM-5.1. This can improve serving efficiency with only a small accuracy loss. If you are running rigorous accuracy evaluations, do not enable this feature.
+**License:** MIT
 
-## 4. Model Invocation
+**Resources:** [HuggingFace (BF16)](https://huggingface.co/zai-org/GLM-5.1) · [FP8](https://huggingface.co/zai-org/GLM-5.1-FP8) · [NVFP4](https://huggingface.co/nvidia/GLM-5.1-NVFP4).
 
-Deploy GLM-5.1 with the following command (FP8 on H200, all features enabled):
+## 2. Configuration Tips
 
-```shell Command
-sglang serve \
-  --model-path zai-org/GLM-5.1-FP8 \
-  --tp 8 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --mem-fraction-static 0.85 \
-  --host 0.0.0.0 \
-  --port 30000
-```
+- **Speculative decoding (MTP / EAGLE)** can significantly reduce latency for interactive use cases. It is on by default on NVIDIA in both serving strategies above; toggle it in the **Speculative Decoding** card of the [Playground](#playground). EAGLE speculative decoding is **not currently supported on AMD** for GLM-5.1.
+- **DP Attention** (the **High-Throughput** strategy) enables data-parallel attention for higher throughput under high concurrency. It trades off low-concurrency latency for high-concurrency throughput — pick **Low-Latency** if your workload is latency-sensitive with few concurrent requests.
+- **`--mem-fraction-static`** is recommended for optimal memory utilization; adjust it based on your hardware and workload.
+- **H100 / H200**: FP8 is the recommended deployment path (`tp=16` on H100, `tp=8` on H200).
+- **B300 / GB300**: NVFP4 is the recommended path — `nvidia/GLM-5.1-NVFP4` with `--quantization modelopt_fp4` (`tp=8` on B300, `tp=4` on GB300). These require the CUDA 13 Docker image variant.
+- **AMD GPUs (MI300X / MI325X / MI355X)**: BF16 at `tp=8`. Use `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang` for the DSA attention backend, plus `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). The FP8 checkpoint also runs on AMD at `tp=8` and uses roughly half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU).
+- GLM-5.1 and DeepSeek-V3.2 share the same model structure. For deeper tuning notes (MTP, DSA kernel, Context Parallel, HiSparse, NVFP4, Index Cache), see the [DeepSeek-V3.2 cookbook page](../DeepSeek/DeepSeek-V3_2).
+- **IndexCache**: pass `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to enable the [IndexCache](https://github.com/THUDM/IndexCache) method. This can improve serving efficiency with a small accuracy loss — do **not** enable it for rigorous accuracy evaluations.
 
-### 4.1 B300/GB300 (NVFP4) Server Command
+## 3. Advanced Usage
 
-#### B300
+GLM-5.1 supports **Thinking mode by default**. Enable the `glm45` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate the thinking process (returned via `reasoning_content`) from the final answer. To disable thinking and use Instruct mode, pass `{"enable_thinking": false}` via `chat_template_kwargs` at request time.
 
-```shell Command
-sglang serve \
-  --model-path nvidia/GLM-5.1-NVFP4 \
-  --tp 8 \
-  --quantization modelopt_fp4 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --trust-remote-code \
-  --mem-fraction-static 0.80 \
-  --host 0.0.0.0 \
-  --port 30000
-```
+### 3.1 Reasoning
 
-#### GB300
-
-```shell Command
-sglang serve \
-  --model-path nvidia/GLM-5.1-NVFP4 \
-  --tp 4 \
-  --quantization modelopt_fp4 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --trust-remote-code \
-  --mem-fraction-static 0.80 \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-### 4.2 MI300X/MI325X/MI355X (ROCm) Server Command
-
-The following ROCm commands are additional options for AMD GPUs and do not replace the NVIDIA instructions above.
-
-#### FP8 (Recommended)
-
-```shell Command
-sglang serve \
-  --model-path zai-org/GLM-5.1-FP8 \
-  --tp 8 \
-  --trust-remote-code \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --dsa-prefill-backend tilelang \
-  --dsa-decode-backend tilelang \
-  --chunked-prefill-size 131072 \
-  --mem-fraction-static 0.80 \
-  --watchdog-timeout 1200 \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-#### BF16
-
-```shell Command
-sglang serve \
-  --model-path zai-org/GLM-5.1 \
-  --tp 8 \
-  --trust-remote-code \
-  --dsa-prefill-backend tilelang \
-  --dsa-decode-backend tilelang \
-  --chunked-prefill-size 131072 \
-  --mem-fraction-static 0.80 \
-  --watchdog-timeout 1200 \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-### 4.3 Basic Usage
-
-For basic API usage and request examples, please refer to:
-
-- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
-
-### 4.4 Advanced Usage
-
-#### 4.4.1 Reasoning Parser
-
-GLM-5.1 supports Thinking mode **by default**. Enable the reasoning parser during deployment to separate the thinking and content sections. The thinking process is returned via `reasoning_content` in the streaming response.
-
-To disable thinking and use Instruct mode, pass `chat_template_kwargs` at request time:
-
-- **Thinking mode** (default): The model performs step-by-step reasoning before answering. No extra parameters needed.
-- **Instruct mode** (`{"enable_thinking": false}`): The model responds directly without a thinking process.
-
-**Example 1: Thinking Mode (Default)**
-
-Thinking mode is enabled by default. The model will reason step-by-step before answering, and the thinking process is returned via `reasoning_content`:
+<Accordion title="Thinking Mode — Default (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -256,7 +198,9 @@ for chunk in response:
 print()
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 =============== Thinking =================
@@ -277,25 +221,6 @@ print()
             *   $240 \times 15 = 3600$
             *   Move decimal two places left -> $36$
     *   *Step 4: State the final answer clearly.*
-
-4.  **Draft the Response (incorporating the steps clearly):**
-    *   *Introduction:* State the problem clearly.
-    *   *Step 1:* Explain how to convert 15% to a decimal.
-    *   *Step 2:* Explain the multiplication step.
-    *   *Step 3:* Show the actual math (I'll provide the standard multiplication and the "mental math" trick as it adds value).
-    *   *Conclusion:* Give the final answer.
-
-5.  **Refine the Output (Self-Correction/Polishing during drafting):**
-    *   *Drafting Step 1:* To find 15% of 240, first convert 15% into a decimal. Since percent means "per hundred," you divide 15 by 100. 15 ÷ 100 = 0.15.
-    *   *Drafting Step 2:* Next, multiply this decimal by the number you are finding the percentage of (which is 240). So, calculate 0.15 × 240.
-    *   *Drafting Step 3 (Standard way):* 0.15 × 240 = 36.
-    *   *Adding the alternative mental math way:* It's often helpful to break it down into 10% and 5%.
-        *   10% of 240 = 24 (move the decimal point one place to the left)
-        *   5% is half of 10%, so half of 24 = 12
-        *   Add them together: 24 + 12 = 36.
-    *   *Final Answer:* 15% of 240 is 36.
-
-6.  **Final Review against User Prompt:** Does it solve the problem? Yes. Is it step-by-step? Yes. Is it clear? Yes. (Proceed to generate output).
 =============== Content =================
 Here is the step-by-step solution to find 15% of 240:
 
@@ -317,9 +242,11 @@ If you don't want to multiply by 0.15 directly, you can break 15% down into 10% 
 15% of 240 is **36**.
 ```
 
-**Example 2: Instruct Mode (Thinking Off)**
+</Accordion>
 
 To disable thinking and get a direct response, pass `{"enable_thinking": false}` via `chat_template_kwargs`:
+
+<Accordion title="Instruct Mode — Thinking Off (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -350,7 +277,9 @@ for chunk in response:
 print()
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 15% of 240 is 36.
@@ -360,11 +289,13 @@ Here is how to calculate it:
 2. Multiply the decimal by the number: 0.15 × 240 = 36
 ```
 
-#### 4.4.2 Tool Calling
+</Accordion>
 
-GLM-5.1 supports tool calling capabilities. Enable the tool call parser during deployment. Thinking mode is on by default; to disable it for tool calling requests, pass `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
+### 3.2 Tool Calling
 
-**Python Example (with Thinking Process):**
+GLM-5.1 supports tool calling. Enable the `glm47` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. Thinking mode is on by default; to disable it for tool-calling requests, pass `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
+
+<Accordion title="Tool Calling — with Thinking (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -445,7 +376,9 @@ for chunk in response:
 print()
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
 =============== Thinking =================
@@ -463,231 +396,8 @@ Tool Call: None
    Arguments: }
 ```
 
-## 5. Benchmark
+</Accordion>
 
-### 5.1 Speed Benchmark
+### 3.3 Basic Usage
 
-**Test Environment:**
-
-- Hardware: H200 (8x)
-- Model: GLM-5.1-FP8
-- Tensor Parallelism: 8
-- SGLang Version: commit 947927bdb
-
-#### 5.1.1 Latency Benchmark
-
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model zai-org/GLM-5.1-FP8 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 1000 \
-  --num-prompts 10 \
-  --max-concurrency 1 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 1
-Successful requests:                     10
-Benchmark duration (s):                  35.78
-Total input tokens:                      6101
-Total input text tokens:                 6101
-Total generated tokens:                  4220
-Total generated tokens (retokenized):    4213
-Request throughput (req/s):              0.28
-Input token throughput (tok/s):          170.54
-Output token throughput (tok/s):         117.96
-Peak output token throughput (tok/s):    148.00
-Peak concurrent requests:                2
-Total token throughput (tok/s):          288.50
-Concurrency:                             1.00
-Accept length:                           3.48
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   3576.31
-Median E2E Latency (ms):                 2935.97
-P90 E2E Latency (ms):                    5908.97
-P99 E2E Latency (ms):                    8588.08
----------------Time to First Token----------------
-Mean TTFT (ms):                          290.88
-Median TTFT (ms):                        282.34
-P99 TTFT (ms):                           332.27
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          7.54
-Median TPOT (ms):                        6.97
-P99 TPOT (ms):                           9.04
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           7.80
-Median ITL (ms):                         6.81
-P95 ITL (ms):                            13.51
-P99 ITL (ms):                            26.99
-Max ITL (ms):                            29.50
-==================================================
-```
-
-#### 5.1.2 Throughput Benchmark
-
-```bash Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --model zai-org/GLM-5.1-FP8 \
-  --dataset-name random \
-  --random-input-len 1000 \
-  --random-output-len 1000 \
-  --num-prompts 1000 \
-  --max-concurrency 100 \
-  --request-rate inf
-```
-
-```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 100
-Successful requests:                     1000
-Benchmark duration (s):                  411.74
-Total input tokens:                      502493
-Total input text tokens:                 502493
-Total generated tokens:                  500251
-Total generated tokens (retokenized):    499614
-Request throughput (req/s):              2.43
-Input token throughput (tok/s):          1220.41
-Output token throughput (tok/s):         1214.97
-Peak output token throughput (tok/s):    2648.00
-Peak concurrent requests:                105
-Total token throughput (tok/s):          2435.38
-Concurrency:                             96.30
-Accept length:                           3.50
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   39648.76
-Median E2E Latency (ms):                 39058.12
-P90 E2E Latency (ms):                    57009.82
-P99 E2E Latency (ms):                    68880.33
----------------Time to First Token----------------
-Mean TTFT (ms):                          20613.80
-Median TTFT (ms):                        21429.21
-P99 TTFT (ms):                           29543.17
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          38.73
-Median TPOT (ms):                        36.52
-P99 TPOT (ms):                           67.09
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           38.13
-Median ITL (ms):                         16.57
-P95 ITL (ms):                            86.01
-P99 ITL (ms):                            164.88
-Max ITL (ms):                            1307.02
-==================================================
-```
-
-### 5.2 Accuracy Benchmark
-
-<Note>
-The accuracy benchmark results below are shared with GLM-5, as GLM-5.1 was not independently benchmarked at the time of this writing. A separate benchmark run is planned.
-</Note>
-
-#### 5.2.1 GSM8K Benchmark
-
-- Benchmark Command
-```bash Command
-python3 benchmark/gsm8k/bench_sglang.py --port 30000
-```
-
-- Test Result
-```text Output
-Accuracy: 0.955
-Invalid: 0.000
-Latency: 32.470 s
-Output throughput: 642.044 token/s
-```
-
-#### 5.2.2 MMLU Benchmark
-
-- Benchmark Command
-```bash Command
-python3 benchmark/mmlu/bench_sglang.py --port 30000
-```
-
-- Test Result
-```text Output
-subject: abstract_algebra, #q:100, acc: 0.860
-subject: anatomy, #q:135, acc: 0.874
-subject: astronomy, #q:152, acc: 0.941
-subject: business_ethics, #q:100, acc: 0.880
-subject: clinical_knowledge, #q:265, acc: 0.932
-subject: college_biology, #q:144, acc: 0.972
-subject: college_chemistry, #q:100, acc: 0.640
-subject: college_computer_science, #q:100, acc: 0.900
-subject: college_mathematics, #q:100, acc: 0.810
-subject: college_medicine, #q:173, acc: 0.873
-subject: college_physics, #q:102, acc: 0.912
-subject: computer_security, #q:100, acc: 0.880
-subject: conceptual_physics, #q:235, acc: 0.928
-subject: econometrics, #q:114, acc: 0.807
-subject: electrical_engineering, #q:145, acc: 0.897
-subject: elementary_mathematics, #q:378, acc: 0.937
-subject: formal_logic, #q:126, acc: 0.778
-subject: global_facts, #q:100, acc: 0.710
-subject: high_school_biology, #q:310, acc: 0.961
-subject: high_school_chemistry, #q:203, acc: 0.847
-subject: high_school_computer_science, #q:100, acc: 0.960
-subject: high_school_european_history, #q:165, acc: 0.891
-subject: high_school_geography, #q:198, acc: 0.960
-subject: high_school_government_and_politics, #q:193, acc: 0.984
-subject: high_school_macroeconomics, #q:390, acc: 0.923
-subject: high_school_mathematics, #q:270, acc: 0.696
-subject: high_school_microeconomics, #q:238, acc: 0.962
-subject: high_school_physics, #q:151, acc: 0.821
-subject: high_school_psychology, #q:545, acc: 0.956
-subject: high_school_statistics, #q:216, acc: 0.889
-subject: high_school_us_history, #q:204, acc: 0.941
-subject: high_school_world_history, #q:237, acc: 0.945
-subject: human_aging, #q:223, acc: 0.857
-subject: human_sexuality, #q:131, acc: 0.908
-subject: international_law, #q:121, acc: 0.934
-subject: jurisprudence, #q:108, acc: 0.907
-subject: logical_fallacies, #q:163, acc: 0.933
-subject: machine_learning, #q:112, acc: 0.830
-subject: management, #q:103, acc: 0.942
-subject: marketing, #q:234, acc: 0.940
-subject: medical_genetics, #q:100, acc: 0.990
-subject: miscellaneous, #q:783, acc: 0.959
-subject: moral_disputes, #q:346, acc: 0.873
-subject: moral_scenarios, #q:895, acc: 0.837
-subject: nutrition, #q:306, acc: 0.922
-subject: philosophy, #q:311, acc: 0.897
-subject: prehistory, #q:324, acc: 0.929
-subject: professional_accounting, #q:282, acc: 0.844
-subject: professional_law, #q:1534, acc: 0.714
-subject: professional_medicine, #q:272, acc: 0.941
-subject: professional_psychology, #q:612, acc: 0.913
-subject: public_relations, #q:110, acc: 0.791
-subject: security_studies, #q:245, acc: 0.878
-subject: sociology, #q:201, acc: 0.940
-subject: us_foreign_policy, #q:100, acc: 0.920
-subject: virology, #q:166, acc: 0.596
-subject: world_religions, #q:171, acc: 0.936
-Total latency: 165.275
-Average accuracy: 0.877
-```
-
-### 5.3 AMD GPU Benchmarks
-
-#### 5.3.1 GSM8K Benchmark (MI325/MI35x)
-
-- MI325/MI35x Test (GLM-5.1 BF16, `tp=8`, TileLang DSA backends)
-
-```bash Command
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 200
-```
-
-```text Output
-Accuracy: 0.970
-Invalid: 0.000
-```
-
-Results from [AMD nightly CI](https://github.com/sgl-project/sglang/actions/runs/22556197510/attempts/2#summary-65346783629). See also [sglang#18911](https://github.com/sgl-project/sglang/pull/18911).
+For basic API usage and request examples, see the [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request).
