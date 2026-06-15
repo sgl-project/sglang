@@ -4,9 +4,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A16Int4MoEMethod,
-)
 from sglang.srt.layers.moe.moe_runner.torch_npu import (
     TorchNpuQuantInfo,
 )
@@ -22,12 +19,6 @@ if TYPE_CHECKING:
 
 import torch_npu
 
-from sglang.srt.layers.moe import (
-    MoeRunner,
-    MoeRunnerBackend,
-    MoeRunnerConfig,
-    get_moe_runner_backend,
-)
 
 class AWQAscendLinearKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
@@ -87,8 +78,6 @@ class AWQAscendLinearKernel:
 class AWQAscendMoEKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
-        self.w13_kernel = NPUW4A16Int4MoEMethod()
-        self.w2_kernel = NPUW4A16Int4MoEMethod()
 
     @staticmethod
     def _register_or_replace_parameter(
