@@ -460,9 +460,9 @@ export ASCEND_NPU_PHY_ID=xxx
 
 ### Mimo Single Node
 
-```bash
-# prefill
+#### prefill
 
+```bash
 # high performance cpu
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
@@ -515,10 +515,11 @@ python3 -m sglang.launch_server \
         --disable-cuda-graph \
         --moe-a2a-backend deepep --deepep-mode normal \
         # 2>&1 | tee $SGLANG_LOG_PATH
+```
 
+#### decode
 
-# decode
-
+``` bash
 # high performance cpu
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
@@ -579,10 +580,12 @@ python3 -m sglang.launch_server \
         --enable-multi-layer-eagle \
         --moe-a2a-backend deepep --deepep-mode low_latency \
         # 2>&1 | tee $SGLANG_LOG_PATH
+```
 
 
-# router
+#### router
 
+```bash
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --prefill http://127.0.0.1:10000 \
@@ -591,11 +594,11 @@ python -m sglang_router.launch_router \
     --port 9903 \
     --health-check-interval-secs 3600 \
     --mini-lb \
-
 ```
 
 ### DeepSeek Multi-Node
 
+#### Environment
 ```bash
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
@@ -626,7 +629,6 @@ P_IP=('141.61.39.231')
 D_IP=('141.61.39.232')
 
 
-
 # enable mlapo
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
@@ -637,9 +639,12 @@ LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
+```
 
-# prefill
 
+#### prefill
+
+```bash
 MODEL_PATH=/path/to/deepseekr1_w4a8_pertoken
 for i in "${!P_IP[@]}";
 do
@@ -661,10 +666,11 @@ do
         break
     fi
 done
+```
 
+#### decode
 
-# decode
-
+```bash
 MODEL_PATH=/path/to/deepseekr1_w4a8_pertoken
 
 for i in "${!D_IP[@]}";
@@ -691,16 +697,15 @@ do
         break
     fi
 done
-
-exit 1
-
-# router
+```
 
 
+#### router
+
+```bash
 python -m  sglang_router.launch_router --prefill ${P_IP}:8000 \
 --decode ${D_IP}:8001 \
 --host ${D_IP} --port 6688 \
 --pd-disaggregation \
 --health-check-interval-secs 3600 \
-
 ```
