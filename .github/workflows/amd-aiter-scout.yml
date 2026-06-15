@@ -11,11 +11,6 @@ on:
         required: false
         type: string
         default: 'main'
-      sglang_ref:
-        description: 'SGLang git ref (branch, tag, or SHA) to test. Default: amd/aiter-ci'
-        required: false
-        type: string
-        default: 'amd/aiter-ci'
       job_filter:
         description: 'Comma-separated workflows to run: nightly-amd, nightly-amd-rocm720, pr-test-amd, pr-test-amd-rocm720. Default: all'
         required: false
@@ -93,7 +88,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-amd.yml
     secrets: inherit
     with:
-      ref: ${{ inputs.sglang_ref || 'amd/aiter-ci' }}
+      ref: amd/aiter-ci
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -104,7 +99,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     secrets: inherit
     with:
-      ref: ${{ inputs.sglang_ref || 'amd/aiter-ci' }}
+      ref: amd/aiter-ci
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -115,7 +110,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd.yml
     secrets: inherit
     with:
-      ref: ${{ inputs.sglang_ref || 'amd/aiter-ci' }}
+      ref: amd/aiter-ci
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -126,7 +121,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd-rocm720.yml
     secrets: inherit
     with:
-      ref: ${{ inputs.sglang_ref || 'amd/aiter-ci' }}
+      ref: amd/aiter-ci
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -145,7 +140,7 @@ jobs:
         run: |
           echo "## AMD AITER Scout Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **SGLang ref:** \`${{ inputs.sglang_ref || 'amd/aiter-ci' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **SGLang ref:** \`amd/aiter-ci\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER SHA:** \`${{ needs.resolve-aiter.outputs.aiter_sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${{ needs.resolve-aiter.outputs.aiter_sha }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
