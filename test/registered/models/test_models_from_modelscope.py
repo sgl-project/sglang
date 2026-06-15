@@ -1,11 +1,28 @@
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=60, suite="stage-a-test-cpu")
+
 import os
 import shutil
 import subprocess
 import unittest
 from unittest import mock
 
-from sglang.srt.utils import prepare_model_and_tokenizer
+from sglang.srt.utils.common import get_bool_env_var
 from sglang.test.test_utils import CustomTestCase
+
+
+def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+        from modelscope import snapshot_download
+
+        if not os.path.exists(model_path):
+            model_path = snapshot_download(model_path)
+        if not os.path.exists(tokenizer_path):
+            tokenizer_path = snapshot_download(
+                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+            )
+    return model_path, tokenizer_path
 
 
 class TestDownloadFromModelScope(CustomTestCase):
