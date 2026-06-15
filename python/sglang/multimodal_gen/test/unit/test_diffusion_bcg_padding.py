@@ -36,12 +36,17 @@ class ZImageFakeTransformer2DModel(torch.nn.Module):
         )
 
 
+class HunyuanVideoTransformer3DModel(torch.nn.Module):
+    pass
+
+
 class TestDiffusionBCGPadding(unittest.TestCase):
     def setUp(self):
         self.stage = DenoisingStage.__new__(DenoisingStage)
         self.qwen_model = QwenImageTransformer2DModel()
         self.flux_model = FluxTransformer2DModel()
         self.zimage_model = ZImageFakeTransformer2DModel()
+        self.hunyuanvideo_model = HunyuanVideoTransformer3DModel()
 
     def _qwen_kwargs(self, seq_len: int, *, fill: float = 1.0):
         return {
@@ -119,6 +124,13 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertIsNone(out["encoder_hidden_states_mask"])
         self.assertEqual(out["encoder_hidden_states"][0].shape[1], 47)
         self.assertEqual(out["txt_seq_lens"], [47])
+
+    def test_hunyuanvideo_does_not_create_bcg_runner(self):
+        self.stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+        self.stage._bcg_runners = {}
+
+        self.assertIsNone(self.stage._maybe_get_bcg_runner(self.hunyuanvideo_model))
+        self.assertEqual(self.stage._bcg_runners, {})
 
     def test_generic_prompt_padding_keeps_single_bucket_env_compatibility(self):
         kwargs = {

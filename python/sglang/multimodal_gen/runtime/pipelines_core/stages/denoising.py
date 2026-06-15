@@ -2247,6 +2247,21 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return False
 
     @staticmethod
+    def _bcg_is_hunyuanvideo_transformer(current_model) -> bool:
+        candidates = [current_model]
+        for attr in ("module", "_orig_mod"):
+            wrapped = getattr(current_model, attr, None)
+            if wrapped is not None:
+                candidates.append(wrapped)
+
+        for candidate in candidates:
+            cls = type(candidate)
+            name = f"{cls.__module__}.{cls.__qualname__}".lower()
+            if "hunyuanvideo" in name:
+                return True
+        return False
+
+    @staticmethod
     def _bcg_build_zimage_cap_freqs(current_model, target: int, device):
         rotary_emb = getattr(current_model, "rotary_emb", None)
         if rotary_emb is None:
@@ -2397,6 +2412,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if not self.server_args.enable_breakable_cuda_graph:
             return None
         if not isinstance(current_model, nn.Module):
+            return None
+        if self._bcg_is_hunyuanvideo_transformer(current_model):
+            # HunyuanVideo's text stream can replay stale prompt conditioning
+            # through BCG attention break points. Keep --enable-bcg correct by
+            # running this transformer eagerly until that path is fixed.
             return None
         key = id(current_model)
         runner = self._bcg_runners.get(key)
