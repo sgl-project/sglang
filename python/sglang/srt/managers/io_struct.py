@@ -1775,6 +1775,8 @@ class ProfileReqInput(BaseReq):
     profile_prefix: Optional[str] = None
     # Only profile these stages and ignore others
     profile_stages: Optional[List[str]] = None
+    # Add iteration-level annotations (KV / request aggregates) for roofline-style analysis
+    roofline_annotations: bool = False
 
 
 class ProfileReqType(Enum):
@@ -1796,6 +1798,7 @@ class ProfileReq(BaseReq):
     merge_profiles: bool = False
     profile_prefix: Optional[str] = None
     profile_stages: Optional[List[str]] = None
+    roofline_annotations: bool = False
 
 
 @dataclass
