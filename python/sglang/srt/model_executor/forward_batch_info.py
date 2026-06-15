@@ -501,9 +501,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
-                device, non_blocking=True
-            )
+            ret.num_token_non_padded = torch.tensor(
+                num_tokens, dtype=torch.int32, pin_memory=_pin
+            ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
         # For MLP sync
