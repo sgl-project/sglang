@@ -1,5 +1,4 @@
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from sgl_kernel_npu.fla.fused_gdn_gating import (
