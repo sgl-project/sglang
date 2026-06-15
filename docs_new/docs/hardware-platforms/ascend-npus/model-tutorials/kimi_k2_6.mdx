@@ -239,24 +239,6 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 For complete optimal configurations with deployment scripts and benchmark commands, see the
 [Kimi-K2.6 Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6) page.
 
-#### Scenario overview
-
-| Scenario                                              | Deployment mode   | Total NPUs | Weight version |
-|-------------------------------------------------------|-------------------|------------|----------------|
-| Low latency (3.5K+1.5K)                               | PD mixed          | 8 (A3)     | W4A8           |
-| High throughput (64K+1K)                              | PD mixed          | 16 (A3)    | W4A8           |
-| High throughput (128K+1K)                             | PD disaggregation | 16 (A3)    | W4A8           |
-| High throughput (128K+1K (90% prefix cache hit rate)) | PD disaggregation | 16 (A3)    | W4A8           |
-| High throughput (64K+1.5K)                            | PD disaggregation | 16 (A3)    | W4A8           |
-| High throughput (64K+1.5K (90% prefix cache hit rate))| PD disaggregation | 16 (A3)    | W4A8           |
-| High throughput (128K+1K (90% prefix cache hit rate)) | PD disaggregation | 24 (A3)    | W4A8           |
-| High throughput (64K+1.5K (90% prefix cache hit rate))| PD disaggregation | 24 (A3)    | W4A8           |
-| High throughput (1024x1024 (30)+1024)                 | PD mixed          | 8 (A3)     | W4A8           |
-| High throughput (1080p_30+256)                        | PD mixed          | 8 (A3)     | W4A8           |
-| High throughput (3.5K+1.5K)                           | PD mixed          | 8 (A3)     | W4A8           |
-
-`Total NPUs` indicates the total number of NPUs used across all nodes.
-
 ## Performance tuning
 
 For the full list of supported features, see [Supported features](#supported-features). For detailed optimization

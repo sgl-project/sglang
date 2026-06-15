@@ -240,22 +240,6 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 For complete optimal configurations with deployment scripts and benchmark commands, see the
 [Qwen3.6-35B-A3B Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_6_35b_a3b) page.
 
-#### Scenario overview
-
-| Scenario                                            | Deployment mode | Total NPUs | Weight version |
-|-----------------------------------------------------|-----------------|------------|----------------|
-| Low latency (254K+1K)                               | PD mixed        | 1 (A3)     | W8A8           |
-| High throughput (1024x1024 (30)+1024)               | PD mixed        | 1 (A3)     | W8A8           |
-| High throughput (1080p_30+256)                      | PD mixed        | 1 (A3)     | W8A8           |
-| High throughput (128K+1K)                           | PD mixed        | 1 (A3)     | W8A8           |
-| High throughput (128K+1K (90% prefix cache hit rate)) | PD mixed      | 1 (A3)     | W8A8           |
-| High throughput (3.5K+1.5K)                         | PD mixed        | 1 (A3)     | W8A8           |
-| High throughput (64K+1K)                            | PD mixed        | 1 (A3)     | W8A8           |
-| High throughput (64K+1K (90% prefix cache hit rate)) | PD mixed       | 1 (A3)     | W8A8           |
-| High throughput (984K+1K)                           | PD mixed        | 2 (A3)     | W8A8           |
-
-`Total NPUs` indicates the total number of NPUs used across all nodes.
-
 ## Performance tuning
 
 For the full list of supported features, see [Supported features](#supported-features). For detailed optimization

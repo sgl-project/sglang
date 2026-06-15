@@ -464,18 +464,6 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 For complete optimal configurations with deployment scripts and benchmark commands, see the
 [GLM-5.1 Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/glm5_1) page.
 
-#### Scenario overview
-
-| Scenario | Deployment mode | Total NPUs | Weight version |
-|----------|----------------|-------------|----------------|
-| High throughput (3.5K+1.5K) | PD mixed (single-node) | 16 (A3) | W4A8 |
-| High throughput (3.5K+1.5K) | PD mixed (multi-node) | 32 (A3) | W4A8 |
-| High throughput (16K+1K) | PD disaggregation | 32 (A3) | W4A8 |
-| High throughput (64K+1K, 90% cache hit) | PD disaggregation | 48 (A3) | W4A8 |
-| High throughput (128K+1K, 90% cache hit) | PD disaggregation | 48 (A3) | W4A8 |
-
-`Total NPUs` indicates the total number of NPUs used across all nodes.
-
 ## Performance tuning
 
 For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
