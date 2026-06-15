@@ -1,3 +1,4 @@
+import asyncio
 import math
 import os
 import re
@@ -175,6 +176,26 @@ def smart_nframes(
 
 # process video, qwen-specific
 async def preprocess_video(
+    vr,
+    image_factor: int = IMAGE_FACTOR,
+    video_config: dict = {},
+) -> torch.Tensor:
+    """Async wrapper around the CPU-bound video preprocessing.
+
+    The actual work (frame decode/sample, resize, tensor build) is fully
+    synchronous and previously ran inline on the asyncio event loop, stalling
+    the API server while a request's video was decoded. Offload it to a worker
+    thread so the loop stays responsive. See issue #28247.
+    """
+    return await asyncio.to_thread(
+        _preprocess_video_impl,
+        vr,
+        image_factor=image_factor,
+        video_config=video_config,
+    )
+
+
+def _preprocess_video_impl(
     vr,
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
@@ -690,10 +711,12 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         video_metadata = None
         if base_output.videos and not isinstance(base_output.videos[0], dict):
-            videos_processed = [
-                await preprocess_video(video, video_config=self.video_config)
-                for video in base_output.videos
-            ]
+            videos_processed = await asyncio.gather(
+                *(
+                    preprocess_video(video, video_config=self.video_config)
+                    for video in base_output.videos
+                )
+            )
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
         preprocess_time = time.perf_counter()
@@ -706,15 +729,16 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
         ):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            mm_items, input_ids, ret = await asyncio.to_thread(
+                self.process_and_combine_mm_data,
                 base_output,
                 self.mm_tokens,
                 video_metadata=video_metadata,
                 do_sample_frames=False,
             )
         else:
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+            mm_items, input_ids, ret = await asyncio.to_thread(
+                self.process_and_combine_mm_data, base_output, self.mm_tokens
             )
 
         audio_feature_lengths = None
