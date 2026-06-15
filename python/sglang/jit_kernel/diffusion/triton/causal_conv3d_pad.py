@@ -10,18 +10,18 @@ def _fused_cat_pad_5d_kernel(
     x_ptr,
     cache_ptr,
     out_ptr,
-    total: tl.constexpr,
-    channels: tl.constexpr,
-    t_size: tl.constexpr,
-    h_size: tl.constexpr,
-    w_size: tl.constexpr,
-    cache_t: tl.constexpr,
-    out_t: tl.constexpr,
-    out_h: tl.constexpr,
-    out_w: tl.constexpr,
-    pad_d_left: tl.constexpr,
-    pad_h_top: tl.constexpr,
-    pad_w_left: tl.constexpr,
+    total,
+    channels,
+    t_size,
+    h_size,
+    w_size,
+    cache_t,
+    out_t,
+    out_h,
+    out_w,
+    pad_d_left,
+    pad_h_top,
+    pad_w_left,
     block_size: tl.constexpr,
 ):
     offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
@@ -52,10 +52,17 @@ def _fused_cat_pad_5d_kernel(
     from_cache = src_t < cache_t
 
     x_t = src_t - cache_t
-    x_offsets = (((ob * channels + oc) * t_size + x_t) * h_size + ih) * w_size + iw
+    clamped_iw = tl.minimum(tl.maximum(iw, 0), w_size - 1)
+    clamped_ih = tl.minimum(tl.maximum(ih, 0), h_size - 1)
+    clamped_x_t = tl.minimum(tl.maximum(x_t, 0), t_size - 1)
+    clamped_src_t = tl.minimum(tl.maximum(src_t, 0), cache_t - 1)
+
+    x_offsets = (
+        ((ob * channels + oc) * t_size + clamped_x_t) * h_size + clamped_ih
+    ) * w_size + clamped_iw
     cache_offsets = (
-        ((ob * channels + oc) * cache_t + src_t) * h_size + ih
-    ) * w_size + iw
+        ((ob * channels + oc) * cache_t + clamped_src_t) * h_size + clamped_ih
+    ) * w_size + clamped_iw
 
     x_vals = tl.load(x_ptr + x_offsets, mask=valid & ~from_cache, other=0.0)
     cache_vals = tl.load(cache_ptr + cache_offsets, mask=valid & from_cache, other=0.0)
