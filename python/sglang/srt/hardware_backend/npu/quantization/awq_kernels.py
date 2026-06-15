@@ -60,7 +60,7 @@ class AWQAscendLinearKernel:
         group_size = K // num_groups
 
         # NPU constraint
-        npu_ok = (group_size == 0) or (group_size % 32 == 0 and 32 <= group_size < K)
+        npu_ok = False #(group_size == 0) or (group_size % 32 == 0 and 32 <= group_size < K)
 
         if npu_ok:
             # Use NPU kernel – keep weight, scales, and precomputed group_size
@@ -72,7 +72,10 @@ class AWQAscendLinearKernel:
             # Fallback: dequantize to bfloat16
             weight_int8 = torch.zeros((K, N), dtype=torch.int8, device=qweight_tmp.device)
             for i in range(pack_factor):
-                weight_int8[:, i::pack_factor] = ((qweight_tmp >> (4 * i)) & 0xF).to(torch.int8)
+                nibbles = (qweight_tmp >> (4 * i)) & 0xF          # unsigned 0..15
+                # sign‑extend: values >= 8 are negative
+                signed_nibbles = torch.where(nibbles >= 8, nibbles - 16, nibbles)
+                weight_int8[:, i::pack_factor] = signed_nibbles.to(torch.int8)
 
             if group_size > 0:
                 scales_exp = layer.scales.data.repeat_interleave(group_size, dim=0)   # (K, N)
