@@ -15,20 +15,174 @@
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import inspect
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
+from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    set_dp_buffer_len,
+    set_is_extend_in_batch,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+    NgramEmbeddingInfo,
+    PPProxyTensors,
+)
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.spec_info import create_dummy_verify_input
+from sglang.srt.utils import (
+    empty_context,
+    log_info_on_rank0,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_tp_gather,
+)
+from sglang.srt.utils.common import ceil_align, require_mlp_sync
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _allocate_decode_buffers(
+    *,
+    device: torch.device,
+    max_bs: int,
+    max_num_token: int,
+    hidden_size: int,
+    vocab_size: int,
+    dtype: torch.dtype,
+    dp_size: int,
+    pp_size: int,
+    is_encoder_decoder: bool,
+    require_mlp_tp_gather: bool,
+    seq_len_fill_value: int,
+    encoder_len_fill_value: int,
+    num_tokens_per_bs: int,
+    cache_loc_dtype: torch.dtype,
+    enable_mamba_track: bool,
+    ne_token_table: Optional[torch.Tensor] = None,
+    hc_hidden_size: Optional[int] = None,
+) -> SimpleNamespace:
+    """Allocate the FB-shared decode buffers."""
+    with torch.device(device):
+        input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
+        input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
+        req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
+        seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
+        out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+        positions = torch.zeros((max_num_token,), dtype=torch.int64)
+        mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
+        num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+        custom_mask = torch.ones(
+            (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+            dtype=torch.bool,
+        )
+        next_token_logits_buffer = torch.zeros(
+            (max_num_token, vocab_size),
+            dtype=torch.float,
+        )
+        mamba_track_indices = (
+            torch.zeros((max_bs,), dtype=torch.int64) if enable_mamba_track else None
+        )
+        mamba_track_mask = (
+            torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
+        )
+
+        if pp_size > 1:
+            # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
+            is_mhc = hc_hidden_size is not None
+            hs = hc_hidden_size if is_mhc else hidden_size
+            pp_proxy_tensors = {
+                "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+            }
+            if not is_mhc:
+                pp_proxy_tensors["residual"] = torch.zeros(
+                    (max_bs, hidden_size), dtype=dtype
+                )
+        else:
+            pp_proxy_tensors = None
+
+        if is_encoder_decoder:
+            encoder_lens = torch.full(
+                (max_bs,), encoder_len_fill_value, dtype=torch.int32
+            )
+        else:
+            encoder_lens = None
+
+        if require_mlp_tp_gather:
+            global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+            global_num_tokens_for_logprob_gpu = torch.zeros(
+                (dp_size,), dtype=torch.int32
+            )
+        else:
+            global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+            global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
+
+        ngram_embedding_info = (
+            NgramEmbeddingInfo(
+                token_table=ne_token_table,
+                column_starts=torch.zeros([max_bs], dtype=torch.int32),
+                req_lens=torch.ones([max_bs], dtype=torch.int32),
+                out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
+                out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+            )
+            if ne_token_table is not None
+            else None
+        )
+
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            rids_int = torch.zeros((max_bs,), dtype=torch.int64)
+            bootstrap_room_ids_int = torch.full((max_bs,), -1, dtype=torch.int64)
+        else:
+            rids_int = None
+            bootstrap_room_ids_int = None
+
+    seq_lens_cpu = torch.full(
+        (max_bs,),
+        seq_len_fill_value,
+        dtype=torch.int64,
+        device="cpu",
+    )
+
+    return SimpleNamespace(
+        input_ids=input_ids,
+        input_embeds=input_embeds,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        out_cache_loc=out_cache_loc,
+        positions=positions,
+        mrope_positions=mrope_positions,
+        num_token_non_padded=num_token_non_padded,
+        custom_mask=custom_mask,
+        next_token_logits_buffer=next_token_logits_buffer,
+        mamba_track_indices=mamba_track_indices,
+        mamba_track_mask=mamba_track_mask,
+        encoder_lens=encoder_lens,
+        global_num_tokens_gpu=global_num_tokens_gpu,
+        global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+        pp_proxy_tensors=pp_proxy_tensors,
+        ngram_embedding_info=ngram_embedding_info,
+        rids_int=rids_int,
+        bootstrap_room_ids_int=bootstrap_room_ids_int,
+    )
 
 
 class BaseRunner(ABC):
@@ -42,6 +196,438 @@ class BaseRunner(ABC):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
+
+    def warmup(self) -> None:
+        """Run kernel warmup + autotune once, gated by mr._kernel_warmed_up."""
+        mr = self.model_runner
+        if getattr(mr, "_kernel_warmed_up", False):
+            return
+        mr._kernel_warmed_up = True
+
+        if mr.device != "cuda":
+            return
+
+        self._pre_initialize_flashinfer_allreduce_workspace()
+
+        if self._should_run_flashinfer_autotune():
+            self._flashinfer_autotune()
+
+        if (
+            envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and mr.pp_size > 1
+            and not mr.spec_algorithm.is_speculative()
+        ):
+            from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
+                pp_parallel_deep_gemm_warmup,
+            )
+
+            pp_parallel_deep_gemm_warmup(self)
+
+    def _pre_initialize_flashinfer_allreduce_workspace(self):
+        """Allocate flashinfer allreduce workspaces; must run before CG capture
+        to keep broadcasts/barriers outside the capture context (else deadlock
+        with custom_all_reduce.register_graph_buffers).
+        """
+        mr = self.model_runner
+        if mr.server_args.flashinfer_allreduce_fusion_backend is None:
+            return
+
+        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
+        from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
+
+        pre_initialize_workspaces(
+            max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+            hidden_dim=mr.model_config.hidden_size,
+            dtype=mr.dtype,
+        )
+
+    def _should_run_flashinfer_autotune(self) -> bool:
+        """Check if flashinfer autotune should be run."""
+        mr = self.model_runner
+        if mr.server_args.disable_flashinfer_autotune:
+            return False
+
+        # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
+        # be autotuned -- its _dummy_run would dispatch more tokens per rank than
+        # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, tripping a DeepEP assert.
+        # Read server_args directly to avoid depending on initialize_moe_config()
+        # having already populated the MoE backend globals.
+        if (
+            mr.server_args.moe_runner_backend == "flashinfer_cutedsl"
+            and mr.server_args.moe_a2a_backend == "deepep"
+        ):
+            return False
+
+        backend_str = mr.server_args.moe_runner_backend
+
+        # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
+
+        moe_needs_autotune = backend_str in [
+            "flashinfer_trtllm",
+            "flashinfer_trtllm_routed",
+            "flashinfer_mxfp4",
+            "flashinfer_cutedsl",
+            "flashinfer_cutlass",
+        ]
+
+        from sglang.srt.layers.quantization.fp4_utils import (
+            get_fp4_gemm_runner_backend,
+        )
+
+        model_uses_fp4 = mr.model_config.quantization in (
+            "modelopt_fp4",
+            "modelopt_mixed",
+        )
+        fp4_gemm_needs_autotune = model_uses_fp4 and (
+            get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
+            or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+        )
+
+        from sglang.srt.layers.quantization.fp8_utils import (
+            get_fp8_gemm_runner_backend,
+        )
+        from sglang.srt.utils import is_sm100_supported
+
+        model_uses_modelopt_fp8 = mr.model_config.quantization in (
+            "modelopt",
+            "modelopt_fp8",
+            "modelopt_mixed",
+        )
+        fp8_gemm_needs_autotune = (
+            get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
+            or (model_uses_modelopt_fp8 and is_sm100_supported())
+        )
+
+        if not (
+            moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
+        ):
+            return False
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 9:
+            return False
+
+        if mr.spec_algorithm.is_speculative():
+            return not mr.is_draft_worker
+
+        return True
+
+    def _flashinfer_autotune(self):
+        """Run flashinfer autotune."""
+        from flashinfer.autotuner import autotune
+
+        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+
+        mr = self.model_runner
+        cache_path = self._flashinfer_autotune_cache_path()
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+            autotune_cache = cache_path
+            logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
+        else:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            runs_dir = cache_path.parent / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            autotune_cache = (
+                runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+            )
+            logger.info(
+                "Running FlashInfer autotune (cache reuse DISABLED via "
+                "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
+                autotune_cache,
+            )
+
+        # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
+        # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
+        mr.forward_stream.wait_stream(torch.cuda.current_stream())
+        with torch.get_device_module(mr.device).stream(mr.forward_stream):
+            with (
+                torch.inference_mode(),
+                autotune(True, cache=str(autotune_cache)),
+                autotune_dummy_run_mode(),
+            ):
+                self._dummy_run(batch_size=mr.req_to_token_pool.size)
+        torch.cuda.current_stream().wait_stream(mr.forward_stream)
+        logger.info("FlashInfer autotune completed.")
+
+    def _flashinfer_autotune_cache_path(self) -> Path:
+        import flashinfer
+
+        mr = self.model_runner
+        major, minor = torch.cuda.get_device_capability(mr.device)
+        arch = f"sm{major}{minor}"
+        flashinfer_version = getattr(flashinfer, "__version__", "unknown")
+
+        server_args = mr.server_args
+        model_key = "|".join(
+            [
+                str(server_args.model_path),
+                str(mr.dtype),
+                str(server_args.quantization),
+                str(server_args.moe_runner_backend),
+                str(mr.tp_size),
+                str(mr.pp_size),
+                str(mr.dp_size),
+                str(mr.moe_ep_size),
+                str(mr.model_config.hf_config.__class__.__name__),
+            ]
+        )
+        cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
+        cache_dir = (
+            Path(envs.SGLANG_CACHE_DIR.get())
+            / "flashinfer"
+            / "autotune"
+            / flashinfer_version
+            / arch
+            / cache_key
+        )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return (
+            cache_dir / f"rank_tp{mr.tp_rank}_pp{mr.pp_rank}_dp{mr.dp_rank or 0}.json"
+        )
+
+    def _dummy_run(
+        self,
+        batch_size: int,
+        run_ctx=None,
+        forward_mode_override: Optional[ForwardMode] = None,
+    ):
+        """Run a dummy forward pass for warmup/profiling.
+
+        forward_mode_override forces EXTEND/DECODE regardless of
+        is_generation (used by the PP-parallel DeepGEMM warmup).
+        """
+        mr = self.model_runner
+        if forward_mode_override is not None:
+            capture_forward_mode = forward_mode_override
+        elif mr.is_generation:
+            capture_forward_mode = ForwardMode.DECODE
+        else:
+            capture_forward_mode = ForwardMode.EXTEND
+        capture_hidden_mode = CaptureHiddenMode.NULL
+        num_tokens_per_bs = 1
+        if mr.spec_algorithm.is_speculative():
+            if mr.is_draft_worker:
+                if not mr.spec_algorithm.supports_target_verify_for_draft():
+                    raise RuntimeError("This should not happen")
+            capture_forward_mode = ForwardMode.TARGET_VERIFY
+            num_tokens_per_bs = (
+                mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
+                )
+            )
+
+        if mr.server_args.enable_return_hidden_states:
+            capture_hidden_mode = CaptureHiddenMode.FULL
+
+        num_tokens = batch_size * num_tokens_per_bs
+
+        # Keep warmup aligned with scheduler MLP-sync padding.
+        if require_mlp_sync(mr.server_args):
+            attn_tp_size = get_parallel().attn_tp_size
+            if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
+                num_tokens = ceil_align(num_tokens, attn_tp_size)
+                batch_size = num_tokens // num_tokens_per_bs
+
+        seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
+
+        if mr.server_args.enable_torch_compile:
+            set_torch_compile_config()
+            should_disable_torch_compile = not getattr(
+                mr.model, "_can_torch_compile", True
+            )
+            if should_disable_torch_compile:
+                log_info_on_rank0(
+                    logger,
+                    "Transformers backend model reports it is not torch.compile "
+                    "compatible (e.g. dynamic rope scaling). Disabling torch.compile.",
+                )
+                mr.server_args.enable_torch_compile = False
+
+        # NOTE: aux hidden state capture (eagle3/dflash) is already
+        # configured by init_aux_hidden_state_capture() in initialize().
+
+        require_mlp_tp_gather_ = require_mlp_tp_gather(mr.server_args)
+        if require_gathered_buffer(mr.server_args):
+            assert require_mlp_tp_gather_ or require_attn_tp_gather(mr.server_args)
+
+        buffers = _allocate_decode_buffers(
+            device=mr.device,
+            max_bs=batch_size,
+            max_num_token=num_tokens,
+            hidden_size=mr.model_config.hidden_size,
+            vocab_size=mr.model_config.vocab_size,
+            dtype=mr.model_config.dtype,
+            dp_size=mr.server_args.dp_size,
+            pp_size=mr.server_args.pp_size,
+            is_encoder_decoder=mr.model_config.is_encoder_decoder,
+            require_mlp_tp_gather=require_mlp_tp_gather_,
+            seq_len_fill_value=seq_len_fill_value,
+            encoder_len_fill_value=(
+                getattr(mr.model_config.hf_config, "max_source_positions", 0)
+                if mr.model_config.is_encoder_decoder
+                else 0
+            ),
+            num_tokens_per_bs=num_tokens_per_bs,
+            cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
+            hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
+        )
+        buffers.num_token_non_padded[...] = num_tokens
+
+        # For extend mode
+        if capture_forward_mode == ForwardMode.EXTEND:
+            extend_prefix_lens_cpu = [0] * batch_size
+            extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
+            extend_num_tokens = num_tokens
+            extend_seq_lens = torch.full(
+                (batch_size,), seq_len_fill_value, dtype=torch.int32, device=mr.device
+            )
+            extend_prefix_lens = torch.zeros(
+                (batch_size,), dtype=torch.int32, device=mr.device
+            )
+            extend_start_loc = torch.arange(
+                0, num_tokens, num_tokens_per_bs, dtype=torch.int32, device=mr.device
+            )
+        else:
+            extend_prefix_lens_cpu = None
+            extend_seq_lens_cpu = None
+            extend_num_tokens = None
+            extend_seq_lens = None
+            extend_prefix_lens = None
+            extend_start_loc = None
+
+        if mr.server_args.pp_size > 1:
+            # PP0 already cp-split hidden_states before send.
+            pp_hidden_tokens = num_tokens
+            if (
+                capture_forward_mode == ForwardMode.EXTEND
+                and mr.pp_rank != 0
+                and mr.attn_cp_size > 1
+            ):
+                pp_hidden_tokens = num_tokens // mr.attn_cp_size
+            pp_proxy_tensors = PPProxyTensors(
+                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+            )
+
+        if require_mlp_tp_gather_:
+            global_num_tokens_cpu = [num_tokens] * mr.server_args.dp_size
+        elif require_attn_tp_gather(mr.server_args):
+            global_num_tokens_cpu = [num_tokens]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int32, device=mr.device
+            )
+            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
+        else:
+            global_dp_buffer_len = None
+            global_num_tokens_cpu = None
+
+        spec_info = create_dummy_verify_input(
+            mr.spec_algorithm,
+            mr.server_args,
+            buffers.custom_mask,
+            num_tokens_per_bs,
+            mr.is_draft_worker,
+        )
+        if spec_info is not None and (
+            mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
+        ):
+            # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
+            # during forward; provide a dummy so warmup doesn't crash.
+            spec_info.hidden_states = torch.zeros(
+                (num_tokens, mr.model_config.hidden_size),
+                dtype=mr.dtype,
+                device=mr.device,
+            )
+        if capture_hidden_mode != CaptureHiddenMode.FULL:
+            capture_hidden_mode = (
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            )
+
+        if mr.server_args.enable_lora:
+            lora_ids = [None] * batch_size
+        else:
+            lora_ids = None
+
+        forward_batch = ForwardBatch(
+            forward_mode=capture_forward_mode,
+            batch_size=batch_size,
+            input_ids=buffers.input_ids,
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
+            seq_lens_cpu=buffers.seq_lens_cpu,
+            next_token_logits_buffer=buffers.next_token_logits_buffer,
+            orig_seq_lens=buffers.seq_lens,
+            out_cache_loc=buffers.out_cache_loc,
+            seq_lens_sum=buffers.seq_lens.sum().item(),
+            encoder_lens=buffers.encoder_lens,
+            return_logprob=False,
+            positions=buffers.positions,
+            extend_num_tokens=extend_num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_cpu=global_num_tokens_cpu,
+            global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
+            mrope_positions=buffers.mrope_positions,
+            spec_algorithm=mr.spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=capture_hidden_mode,
+            num_token_non_padded=buffers.num_token_non_padded,
+            global_forward_mode=capture_forward_mode,
+            lora_ids=lora_ids,
+        )
+
+        if lora_ids is not None:
+            mr.lora_manager.prepare_lora_batch(forward_batch)
+
+        mr.attn_backend.init_forward_metadata(forward_batch)
+
+        def run_once():
+            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(
+                global_dp_buffer_len,
+                num_tokens,
+                forward_batch.dp_padding_mode.is_max_len(),
+                global_num_tokens_cpu,
+            )
+            set_is_extend_in_batch(False)
+
+            kwargs = {}
+            if (
+                mr.server_args.pp_size > 1
+                and "pp_proxy_tensors" in inspect.signature(mr.model.forward).parameters
+            ):
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                )
+            if not mr.is_generation:
+                kwargs["get_embedding"] = True
+
+            logits_output_or_pp_proxy_tensors = mr.model.forward(
+                buffers.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
+            return logits_output_or_pp_proxy_tensors
+
+        torch.get_device_module(mr.device).synchronize()
+        mr.tp_group.barrier()
+        with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
+            with torch.inference_mode(), run_ctx or empty_context():
+                run_once()
 
     @abstractmethod
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool: ...

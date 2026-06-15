@@ -116,6 +116,8 @@ class EagerRunner(BaseRunner):
             ),
             dp_size=sa.dp_size,
         )
+        # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
+        self.warmup()
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         # Eager never runs a cuda graph; callers dispatch on isinstance(...,

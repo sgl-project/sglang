@@ -7,7 +7,7 @@ BaseCudaGraphBackend chosen via cuda_graph_config.
 
 Public API:
   - BaseRunner — minimal abstract base shared by the cuda-graph runners
-    and the eager runner (shared __init__ + abstract
+    and the eager runner (shared __init__ + warmup + abstract
     can_run_graph/load_batch/execute).
   - BaseCudaGraphRunner — abstract cuda-graph base; bucket padding +
     capture-loop scaffolding on top of BaseRunner.
