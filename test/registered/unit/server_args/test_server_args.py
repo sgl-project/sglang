@@ -109,7 +109,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
 
-    def test_pd_decode_radix_cache_rejects_unknown_backend(self):
+    def test_pd_decode_radix_cache_rejects_fake_backend(self):
         with self.assertRaises(ValueError) as context:
             ServerArgs(
                 model_path="dummy",
@@ -118,8 +118,32 @@ class TestLoadBalanceMethod(unittest.TestCase):
                 disaggregation_transfer_backend="fake",
             )
 
-        self.assertIn("('nixl', 'mooncake')", str(context.exception))
-        self.assertIn("'fake'", str(context.exception))
+        self.assertIn(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with --disaggregation-transfer-backend fake",
+            str(context.exception),
+        )
+
+    def test_pd_decode_radix_cache_allows_ascend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="ascend",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake_tcp",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+        self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
 
 class TestContextParallelServerArgs(CustomTestCase):

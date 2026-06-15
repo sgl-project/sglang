@@ -406,6 +406,9 @@ class ModelRunnerKVCacheMixin:
                 compression_ratios = self.model_config.compress_ratios
             self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
                 max_num_reqs=self.max_running_requests,
+                # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
+                # past max_running_requests (pre-alloc), so size to the real capacity.
+                num_req_slots=self.req_to_token_pool.req_to_token.shape[0],
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
                 c128_size=self.c128_max_total_num_tokens,

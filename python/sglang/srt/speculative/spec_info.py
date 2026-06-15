@@ -226,7 +226,6 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT_EXTEND = auto()
     EAGLE_VERIFY = auto()
     FROZEN_KV_MTP_DRAFT = auto()
-    FROZEN_KV_MTP_DRAFT_EXTEND = auto()
     FROZEN_KV_MTP_VERIFY = auto()
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
@@ -246,7 +245,6 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_DRAFT,
             SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
-            SpecInputType.FROZEN_KV_MTP_DRAFT_EXTEND,
             SpecInputType.DFLASH_DRAFT,
         }
 

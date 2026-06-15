@@ -1726,7 +1726,7 @@ class DeepseekV2AttentionMLA(
             attention_backend = get_global_server_args().decode_attention_backend
         elif (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             # Use the specified backend for speculative operations (both verify and draft extend)
             if get_global_server_args().speculative_attention_mode == "decode":
