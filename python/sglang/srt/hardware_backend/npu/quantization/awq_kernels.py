@@ -53,22 +53,23 @@ class AWQAscendLinearKernel:
             # ----- NPU path (unsigned weight + raw zero point) -----
             # 1) Pack weight as unsigned nibbles (NO XOR)
             qweight_tmp = torch.zeros_like(raw_qweight)
+            qzeros_list = []
             for i in range(pack_factor):
                 shift_num = shifts[i] * 4
+                qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
                 qweight_tmp.bitwise_or_(
-                    ((raw_qweight >> shift_num) & 0xF) << (4 * i)
+                    ((layer.qweight.data >> shift_num) & 0xF) << (4 * i)
                 )
+
+            qweight_tmp.bitwise_xor_(0x88888888)
         
-            # 2) Compute offset = zero_point (unsigned)
-            zeros_u8 = torch.zeros((num_groups, N), dtype=torch.int8, device=raw_qzeros.device)
-            for i in range(pack_factor):
-                shift = shifts[i] * 4
-                nib_z = (raw_qzeros >> shift) & 0xF
-                zeros_u8[:, i::pack_factor] = nib_z.to(torch.int8)
-            offset = zeros_u8.float().to(layer.scales.dtype)   # (groups, N)
-        
-            layer.register_parameter("weight", torch.nn.Parameter(qweight_tmp, requires_grad=False))
-            layer.register_parameter("zeros", torch.nn.Parameter(offset, requires_grad=False))
+            qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
+            qzeros_tmp = -(qzeros_tmp - 8)
+            qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
+    
+            layer.zeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
+            layer.weight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
+            
             layer.use_npu_matmul = True
             layer.npu_group_size = group_size
         else:
