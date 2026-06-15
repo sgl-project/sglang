@@ -109,6 +109,7 @@ from sglang.srt.layers.moe.utils import (
     is_deepep_class_backend,
     is_sbo_enabled,
     is_tbo_enabled,
+    uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -542,18 +543,18 @@ class DeepseekV2MoE(nn.Module):
         # mlp.shared_experts → mlp.experts.256 when > 0.
         self.num_fused_shared_experts = 0 if _fusion_disabled else n_shared_experts
 
-        # DeepEP shared expert fusion: shared expert is fused into the same MoE kernel
-        # as a local expert at the home EP rank. Expert layout is expanded from 256
-        # routed to 256+EP_size (e.g. 272 for EP=16). TopK handles interleaving.
-        _is_deepep_fusion = (
-            is_deepep_class_backend() and self.num_fused_shared_experts > 0
+        # DeepEP and MegaMOE shared expert fusion: shared expert is fused into
+        # the same MoE kernel as a local expert at each EP rank. Expert layout
+        # is expanded from 256 routed to 256+EP_size (e.g. 272 for EP=16).
+        _uses_per_rank_shared_slots = (
+            self.num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
         )
 
-        if _is_deepep_fusion:
+        if _uses_per_rank_shared_slots:
             # 256 routed + EP_size shared slots = 272 experts total (for EP=16)
             num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
             top_k_for_moe = config.num_experts_per_tok + 1  # 8 routed + 1 shared
-            # Interleaving for DeepEP dispatch is handled by TopK internally.
+            # Interleaving for A2A dispatch is handled by TopK internally.
         else:
             num_experts_for_moe = (
                 config.n_routed_experts + self.num_fused_shared_experts
@@ -591,14 +592,14 @@ class DeepseekV2MoE(nn.Module):
             mla_enable_prefill_cp=mla_enable_prefill_cp,
         )
 
-        # scaling factor for fused shared experts on AMD-platform.
-        # DeepEP doesn't need this: shared expert is only computed on home rank
-        # (not all-reduced), so no 1/ep_size correction is needed.
+        # scaling factor for fused shared experts on AMD/standard platforms.
+        # Per-rank shared-slot layouts do not need this: the shared expert is
+        # only computed on its home rank, so no 1/ep_size correction is needed.
         fused_shared_experts_scaling_factor = None
         if (
             self.moe_ep_size > 1
             and self.num_fused_shared_experts > 0
-            and not _is_deepep_fusion
+            and not _uses_per_rank_shared_slots
         ):
             # if enable_ep_moe tp_szie == ep_size, every gpu get shared experts gemm output
             # so we scale with 1 / self.moe_ep_size in ep mode which will make it equalation as in tp mode
@@ -674,13 +675,13 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
         self._shared_expert_tp1 = False
-        # Shared experts: skip when fused into MoE kernel (self.num_fused_shared_experts > 0)
-        # or when DeepEP fusion is enabled (shared expert is local slot 16 in FusedMoE, no separate MLP).
+        # Shared experts: skip when fused into the MoE kernel. In per-rank
+        # shared-slot layouts, the shared expert is a local slot in FusedMoE.
         if (
             config.n_shared_experts is not None
             and config.n_shared_experts > 0
             and self.num_fused_shared_experts == 0
-            and not _is_deepep_fusion
+            and not _uses_per_rank_shared_slots
         ):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # Disable TP for shared experts for A2A/FP4 allgather paths, or when
@@ -2621,7 +2622,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return
 
         disable_reason = None
-        if server_args.enforce_shared_experts_fusion:
+        if get_moe_a2a_backend().is_megamoe():
+            disable_reason = "Config does not support fused shared expert(s)."
+        elif server_args.enforce_shared_experts_fusion:
             pass
         elif is_sbo_enabled() or is_tbo_enabled():
             disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."

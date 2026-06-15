@@ -7,18 +7,19 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
+    TopKConfig,
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
+    remap_topk_for_per_rank_shared_slots,
 )
+from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -85,10 +86,18 @@ class HashTopK(nn.Module):
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
-        return self._apply_deepep_waterfill(
-            StandardTopKOutput(topk_weights, topk_ids, router_logits),
-            num_tokens=0,
-        )
+        topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
+        if self.num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+            n = self.num_fused_shared_experts
+            topk_output = topk_output._replace(
+                topk_ids=topk_output.topk_ids.new_empty(
+                    (0, topk_output.topk_ids.shape[-1] + n)
+                ),
+                topk_weights=topk_output.topk_weights.new_empty(
+                    (0, topk_output.topk_weights.shape[-1] + n)
+                ),
+            )
+        return self._apply_deepep_waterfill(topk_output, num_tokens=0)
 
     def _apply_deepep_waterfill(
         self, topk_output: StandardTopKOutput, num_tokens: int
@@ -175,7 +184,35 @@ class HashTopK(nn.Module):
         if is_hip():
             topk_weights = topk_weights.to(torch.float32)
 
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+        num_fused_shared_experts = self.num_fused_shared_experts
+        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+            shared_cols = topk_ids[:, -num_fused_shared_experts:]
+            routed_cols = topk_ids[:, :-num_fused_shared_experts]
+            routed_cols = topk_ids_logical_to_physical(
+                routed_cols, expert_location_dispatch_info
+            )
+            topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+
+            num_physical_routed_experts = (
+                expert_location_dispatch_info.num_physical_experts
+                if expert_location_dispatch_info is not None
+                else self.num_experts
+            )
+            topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
+                topk_ids,
+                topk_weights,
+                num_fused_shared_experts,
+                num_physical_routed_experts,
+                TopKConfig(
+                    top_k=self.topk,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                ),
+            )
+        else:
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info
+            )
         if is_hip():
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
         else:
