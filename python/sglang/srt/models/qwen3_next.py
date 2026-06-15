@@ -152,12 +152,11 @@ class Qwen3GatedDeltaNet(nn.Module):
         )
 
         # Override weight_loader for packed checkpoint format.
-        # Must capture original_loader BEFORE overwriting.
-        self._override_weight_loader(
-            self.in_proj_qkvz, self._make_packed_weight_loader(self.in_proj_qkvz)
+        self.in_proj_qkvz.weight.weight_loader = self._make_packed_weight_loader(
+            self.in_proj_qkvz
         )
-        self._override_weight_loader(
-            self.in_proj_ba, self._make_packed_weight_loader(self.in_proj_ba)
+        self.in_proj_ba.weight.weight_loader = self._make_packed_weight_loader(
+            self.in_proj_ba
         )
 
         # Conv1d weight loader setup
@@ -242,28 +241,6 @@ class Qwen3GatedDeltaNet(nn.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
         )
-
-    @staticmethod
-    def _override_weight_loader(module, new_loader):
-        """Override weight_loader on a module's weight parameter.
-
-        ModelWeightParameter exposes weight_loader as a read-only property
-        backed by _weight_loader, while plain parameters store it as a
-        regular attribute.  This helper handles both cases."""
-        for attr_name in (
-            "weight",
-            "weight_scale_inv",
-            "weight_scale",
-            "input_scale",
-            "weight_offset",
-        ):
-            param = getattr(module, attr_name, None)
-            if param is None:
-                continue
-            if hasattr(param, "_weight_loader"):
-                param._weight_loader = new_loader
-            else:
-                param.weight_loader = new_loader
 
     @staticmethod
     def _make_packed_weight_loader(module):
