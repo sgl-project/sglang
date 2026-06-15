@@ -90,7 +90,7 @@ class RayPrometheusMetric:
                 "RayPrometheusMetric requires Ray to be installed. "
                 "Install with: pip install 'ray[serve]'"
             )
-        self.metric: Optional["Metric"] = None
+        self.metric: Optional[Metric] = None
         self._tags: dict = {"ReplicaId": _get_replica_id() or ""}
 
     @staticmethod
@@ -113,7 +113,7 @@ class RayPrometheusMetric:
         labelskwargs["ReplicaId"] = _get_replica_id() or ""
         return {k: v if isinstance(v, str) else str(v) for k, v in labelskwargs.items()}
 
-    def labels(self, *labels: str, **labelskwargs: str) -> "RayPrometheusMetric":
+    def labels(self, *labels: str, **labelskwargs: str) -> RayPrometheusMetric:
         if self._is_labeled:
             raise ValueError("labels() cannot be called on an already-labeled metric.")
         clone = copy.copy(self)
