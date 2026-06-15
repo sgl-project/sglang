@@ -3588,6 +3588,7 @@ class ServerArgs:
                 "modelopt_fp4",
                 "modelopt_fp8",
                 "modelopt_mixed",
+                "fp8",  # plain fp8 block-scale checkpoints
                 None,
             ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
             assert self.ep_size in [
