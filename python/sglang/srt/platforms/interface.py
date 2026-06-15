@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Type
 
+import torch
+
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
@@ -105,6 +107,23 @@ class SRTPlatform(DeviceMixin):
 
     def is_pin_memory_available(self) -> bool:
         """Whether pinned memory is available on this platform."""
+        return True
+
+    def has_custom_pin_memory_availability(self) -> bool:
+        """Whether this platform overrides the default pin-memory availability."""
+        return (
+            type(self).is_pin_memory_available
+            is not SRTPlatform.is_pin_memory_available
+        )
+
+    def is_pin_memory_available_for_device(self, device=None) -> bool:
+        """Whether pinned memory should be requested for a target device."""
+        if device is not None and str(device) == "cpu":
+            return False
+        if self.is_out_of_tree() and self.has_custom_pin_memory_availability():
+            return self.is_pin_memory_available()
+        if not torch.cuda.is_available():
+            return False
         return True
 
     def support_cuda_graph(self) -> bool:
