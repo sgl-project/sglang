@@ -515,9 +515,34 @@ class C4IndexerBackendMixin:
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import (
-                tilelang_fp8_paged_mqa_logits as fn,
-            )
+            if is_sm120_supported():
+                # SM120: the dsa/ kernel allocs k_smem as 1-D ((B*D,) uint8 +
+                # view), which CUDA-graph capture rejects. Use the dsv4/ kernel
+                # that allocs 2-D shared K directly.
+                if envs.SGLANG_SM120_INDEXER_SPLIT.get() and (
+                    weights.shape[0] <= envs.SGLANG_SM120_INDEXER_SPLIT_MAX_BS.get()
+                ):
+                    # Split-KV: shard each row's scan across (batch, num_splits)
+                    # CTAs (bit-exact, big win at long ctx); MAX_BS caps it at
+                    # the graph ceiling. See the kernel for why it always wins.
+                    import functools
+
+                    from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
+                        tilelang_fp8_paged_mqa_logits_split,
+                    )
+
+                    fn = functools.partial(
+                        tilelang_fp8_paged_mqa_logits_split,
+                        num_splits=envs.SGLANG_SM120_INDEXER_SPLIT_COUNT.get(),
+                    )
+                else:
+                    from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
+                        tilelang_fp8_paged_mqa_logits as fn,
+                    )
+            else:
+                from sglang.srt.layers.attention.dsa.tilelang_kernel import (
+                    tilelang_fp8_paged_mqa_logits as fn,
+                )
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():

@@ -1,10 +1,12 @@
 """SM120 FlashMLA sparse decode implementation.
 
 On SM120 (Blackwell Desktop / RTX PRO 6000) the flash_mla CUDA kernel
-is not available, so this module provides alternative implementations:
+is not available, so this module provides alternative implementations,
+selected by ``SGLANG_SM120_SPARSE_DECODE`` (default ``triton``):
 
-- A fused Triton kernel (default, ``SGLANG_SM120_TRITON_FLASHMLA=1``)
-- A pure-PyTorch fallback (``SGLANG_SM120_TRITON_FLASHMLA=0``)
+- ``hmma``   -- custom SM120 sparse-decode kernel (``deepseek_v4_kernel.ops.sparse_decode_fwd``)
+- ``triton`` -- in-tree Triton kernel (default)
+- ``torch``  -- pure-PyTorch fallback
 
 The FP8 KV cache uses a page-internal layout where NOPE+ROPE data has
 stride (nope_dim + rope_dim*2) per token, and scales are stored in a
@@ -15,6 +17,8 @@ import logging
 import os
 
 import torch
+
+from sglang.srt.utils.common import is_deepseek_v4_kernel_available
 
 logger = logging.getLogger(__name__)
 
@@ -193,17 +197,33 @@ def _sm120_sparse_decode_fwd(
     return out.to(torch.bfloat16), lse.permute(0, 2, 1)
 
 
-# Default SM120 FlashMLA backend: "triton" (optimized) or "torch" (pure-PyTorch fallback).
-# Controlled by SGLANG_SM120_TRITON_FLASHMLA env var (1=triton, 0=torch).
-_sm120_default_backend = (
-    "triton" if os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1" else "torch"
-)
+# SM120 sparse-decode backend (SGLANG_SM120_SPARSE_DECODE, default "triton"):
+#   hmma   -> custom SM120 kernel; downgraded to "triton" if not installed.
+#   triton -> in-tree Triton kernel.  torch -> pure-PyTorch fallback.
+def _resolve_sm120_sparse_decode_backend() -> str:
+    backend = os.environ.get("SGLANG_SM120_SPARSE_DECODE", "triton").lower()
+    if backend not in ("hmma", "triton", "torch"):
+        raise ValueError(
+            "SGLANG_SM120_SPARSE_DECODE must be 'hmma', 'triton', or 'torch' "
+            f"(got {backend!r})."
+        )
+    if backend == "hmma" and not is_deepseek_v4_kernel_available():
+        logger.info(
+            "SGLANG_SM120_SPARSE_DECODE=hmma but deepseek_v4_kernel is not "
+            "installed; using the in-tree Triton sparse-decode kernel."
+        )
+        backend = "triton"
+    return backend
+
+
+_sm120_sparse_decode_backend = _resolve_sm120_sparse_decode_backend()
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
     """SM120 FlashMLA sparse decode entry point.
 
-    Dispatches to the Triton kernel (default) or PyTorch fallback.
+    Dispatches to the resolved backend (see _sm120_sparse_decode_backend): the
+    HMMA tensor-core kernel, the in-tree Triton kernel, or the PyTorch fallback.
     """
     q = kwargs["q"]
     k_cache = kwargs["k_cache"]
@@ -218,7 +238,26 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
 
-    if _sm120_default_backend == "triton":
+    if _sm120_sparse_decode_backend == "hmma" and indices is not None:
+        from deepseek_v4_kernel.ops import sparse_decode_fwd
+
+        out, lse, _, _ = sparse_decode_fwd(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            None,  # tile_scheduler_metadata
+            None,  # num_splits
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+            head_dim_v,
+            float(softmax_scale),
+        )
+        return (out, lse)
+
+    if _sm120_sparse_decode_backend == "triton":
         from sglang.srt.layers.attention.flash_mla_sm120_triton import (
             flash_mla_sparse_decode_triton,
         )
