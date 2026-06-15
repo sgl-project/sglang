@@ -1,6 +1,7 @@
 ---
 title: "Inference Batching"
 description: "Batch compatible native SGLang-Diffusion requests during serving."
+tag: "preserve"
 mode: wide
 ---
 Dynamic batching is an opt-in SGLang-Diffusion serving mode that merges compatible queued requests into one native pipeline batch. It is separate from LLM continuous batching and tokenizer batching.
@@ -40,7 +41,7 @@ Use `--batching-config /path/to/batching_config.json` to load JSON rules when a 
 
 ## Compatibility
 
-An initial implementation of dynamic batching for T2I and T2V models can be found in [#18764](https://github.com/sgl-project/sglang/pull/18764). The current compatibility grid is below and will be updated as more coverage is added. See [Supported Models](./compatibility_matrix) for full model IDs.
+An initial implementation of dynamic batching for T2I and T2V models can be found in [#18764](https://github.com/sgl-project/sglang/pull/18764). The current compatibility grid is below and will be updated as more coverage is added. See [Supported Models and Optimization Compatibility](./compatibility_matrix) for common model IDs and optimization support.
 
 `✅` means supported, `❌` means not currently supported, `?` means untested, and `-` means not applicable.
 

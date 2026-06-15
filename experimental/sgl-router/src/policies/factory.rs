@@ -6,14 +6,45 @@ use crate::discovery::ModelId;
 use crate::policies::{
     cache_aware_zmq::CacheAwareZmqPolicy,
     kv_events::{BlockSizeOracle, HashTree},
+    load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
+    sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
 use crate::tokenizer::TokenizerRegistry;
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Build a dependency-free policy for use as the sticky-session fallback
+/// (keyless requests + initial pin of a new key). `Cli::into_config`
+/// validates `--sticky-fallback-policy` to one of these four, so the
+/// `CacheAwareZmq`/`Sticky` arms are never reached in practice.
+fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
+    match kind {
+        PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
+        PolicyKind::Random => Arc::new(RandomPolicy::new()),
+        PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        PolicyKind::CacheAwareZmq | PolicyKind::Sticky => {
+            unreachable!("sticky fallback is validated to be dependency-free in Cli::into_config")
+        }
+    }
+}
+
+/// Construct a [`StickyPolicy`] from a model's `sticky` config (or
+/// defaults). Shared by `build_policy` and the test shim so the duration
+/// conversion + fallback wiring live in one place.
+fn build_sticky(model: &ModelConfig) -> Arc<dyn Policy> {
+    let s = model.sticky.clone().unwrap_or_default();
+    Arc::new(StickyPolicy::new(
+        Duration::from_secs(s.idle_secs),
+        Duration::from_secs(s.eviction_interval_secs),
+        build_sticky_fallback(s.fallback_policy),
+    ))
+}
 
 /// Construct a policy for a single model from its [`ModelConfig`] and the
 /// process-shared `HashTree` + `TokenizerRegistry` + `BlockSizeOracle`.
@@ -32,6 +63,7 @@ pub fn build_policy(
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             let cache_cfg = model.cache_aware.unwrap_or_default();
             Arc::new(CacheAwareZmqPolicy::new(
@@ -41,6 +73,7 @@ pub fn build_policy(
                 block_size_oracle,
             ))
         }
+        PolicyKind::Sticky => build_sticky(model),
     }
 }
 
@@ -54,6 +87,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             // Provide an empty tree + empty tokenizer registry + fresh
             // oracle so the test policy is constructible. Production
@@ -64,6 +98,14 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
                 Arc::new(HashTree::new()),
                 Arc::new(TokenizerRegistry::default()),
                 BlockSizeOracle::new(),
+            ))
+        }
+        PolicyKind::Sticky => {
+            let s = crate::config::StickyConfig::default();
+            Arc::new(StickyPolicy::new(
+                Duration::from_secs(s.idle_secs),
+                Duration::from_secs(s.eviction_interval_secs),
+                build_sticky_fallback(s.fallback_policy),
             ))
         }
     }
@@ -129,6 +171,7 @@ mod tests {
                 policy,
                 circuit_breaker: None,
                 cache_aware: None,
+                sticky: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
@@ -144,7 +187,9 @@ mod tests {
         let _ = build_policy_kind_only(PolicyKind::RoundRobin);
         let _ = build_policy_kind_only(PolicyKind::Random);
         let _ = build_policy_kind_only(PolicyKind::PowerOfTwo);
+        let _ = build_policy_kind_only(PolicyKind::LoadBased);
         let _ = build_policy_kind_only(PolicyKind::CacheAwareZmq);
+        let _ = build_policy_kind_only(PolicyKind::Sticky);
     }
 
     #[test]
@@ -171,6 +216,34 @@ mod tests {
         assert!(
             dbg.contains("CacheAwareZmqPolicy"),
             "expected CacheAwareZmqPolicy debug repr, got: {dbg}",
+        );
+    }
+
+    #[test]
+    fn load_based_builds_via_factory() {
+        let cfg = cfg_with_model("modelA", PolicyKind::LoadBased);
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let p = reg.get(&ModelId("modelA".into())).unwrap();
+        let dbg = format!("{p:?}");
+        assert!(
+            dbg.contains("LoadBasedPolicy"),
+            "expected LoadBasedPolicy debug repr, got: {dbg}",
+        );
+    }
+
+    #[test]
+    fn sticky_builds_via_factory() {
+        let cfg = cfg_with_model("modelA", PolicyKind::Sticky);
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let p = reg.get(&ModelId("modelA".into())).unwrap();
+        let dbg = format!("{p:?}");
+        assert!(
+            dbg.contains("StickyPolicy"),
+            "expected StickyPolicy debug repr, got: {dbg}",
         );
     }
 }

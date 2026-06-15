@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: "20"
+      grace_blackwell:
+        description: "Set GRACE_BLACKWELL for the install step (cuda only)"
+        required: false
+        type: string
+        default: "0"
       rdma_devices:
         description: "SGLANG_CI_RDMA_ALL_DEVICES csv (cuda only; empty = unset)"
         required: false
@@ -54,6 +59,7 @@ on:
 
 env:
   SGLANG_IS_IN_CI: true
+  SGLANG_ENABLE_ASYNC_ASSERT: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
@@ -100,6 +106,8 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
+        env:
+          GRACE_BLACKWELL: ${{ inputs.grace_blackwell }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh

@@ -7,7 +7,8 @@ export const DeepSeekOCRDeployment = () => {
       items: [
         { id: 'mi300x', label: 'MI300X', default: true },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     quantization: {
@@ -23,8 +24,8 @@ export const DeepSeekOCRDeployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false },
-        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false }
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' },
+        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' }
       ]
     }
   };
@@ -63,7 +64,20 @@ export const DeepSeekOCRDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware') {
+        const strategyItems = options.strategy.items || [];
+        const current = Array.isArray(next.strategy) ? next.strategy : [];
+        next.strategy = current.filter(id => {
+          const item = strategyItems.find(s => s.id === id);
+          if (!item) return false;
+          if (typeof item.disabledWhen === 'function' && item.disabledWhen(next)) return false;
+          return true;
+        });
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -93,6 +107,9 @@ export const DeepSeekOCRDeployment = () => {
 
     let cmd = 'python3 -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelPath}`;
+    if (hardware === 'xeon') {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
     cmd += ` \\\n  --dtype float16`;
 
     // TP strategy
@@ -110,7 +127,9 @@ export const DeepSeekOCRDeployment = () => {
       cmd += ` \\\n  --ep 1`;
     }
 
-    cmd += ` \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable`;
+    if (hardware !== 'xeon') {
+      cmd += ` \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable`;
+    }
 
     return cmd;
   };
@@ -135,10 +154,11 @@ export const DeepSeekOCRDeployment = () => {
             {option.type === 'checkbox' ? (
               option.items.map(item => {
                 const isChecked = (values[option.name] || []).includes(item.id);
-                const isDisabled = item.required;
-                return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
+                const dynDisabled = typeof item.disabledWhen === 'function' && item.disabledWhen(values);
+                const isDisabled = item.required || dynDisabled;
+		return (
+                  <label key={item.id} title={item.disabledReason || (dynDisabled ? 'Not supported on the selected hardware' : '')} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => !dynDisabled && handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>

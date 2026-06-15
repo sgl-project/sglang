@@ -24,12 +24,13 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, get_compiler_backend, is_cuda, make_layers
 
@@ -249,9 +250,19 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         if self.expert_selection_fn == "sigmoid":
             custom_routing_function = cohere2_sigmoid_topk
             scoring_func = "sigmoid"
+            routing_method_type = (
+                RoutingMethodType.SigmoidRenorm
+                if self.norm_topk_prob
+                else RoutingMethodType.Sigmoid
+            )
         else:
             custom_routing_function = None
             scoring_func = "softmax"
+            routing_method_type = (
+                RoutingMethodType.RenormalizeNaive
+                if self.norm_topk_prob
+                else RoutingMethodType.Default
+            )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -278,6 +289,7 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             layer_id=layer_id,
             prefix=add_prefix("experts", prefix),
+            routing_method_type=routing_method_type,
         )
 
         num_shared_experts = getattr(config, "num_shared_experts", 0)

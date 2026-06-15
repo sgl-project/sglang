@@ -33,7 +33,7 @@ This mode is intended for debugging only — it eliminates the performance benef
 For production use, you can mark specific functions as "non-graphable" using the `@eager_on_graph` decorator. During CUDA graph capture, these functions run eagerly between captured graph segments. Outside of capture, they behave normally.
 
 ```python
-from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import eager_on_graph
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import eager_on_graph
 
 @eager_on_graph(enable=True)
 def my_dynamic_op(x):
@@ -44,7 +44,7 @@ def my_dynamic_op(x):
 You can also insert a bare graph break (no computation) using the `break_graph()` helper:
 
 ```python
-from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import break_graph
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import break_graph
 
 def forward(self, x):
     x = self.layer1(x)
@@ -169,16 +169,16 @@ For typical use cases with a small number of graph breaks, the overhead is negli
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Core implementation: <code>eager_on_graph</code>, <code>BreakableCUDAGraph</code>, <code>BreakableCUDAGraphCapture</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/breakable_cuda_graph/cuda_utils.py</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/cuda_utils.py</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA runtime binding utilities</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/cuda_graph_runner.py</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Integration with the main CUDA graph runner</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Integration with CUDA graph runner backends</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/server_args.py</code></td>
