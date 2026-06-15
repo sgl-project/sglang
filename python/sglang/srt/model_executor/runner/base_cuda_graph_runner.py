@@ -20,7 +20,7 @@ import gc
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -159,8 +159,28 @@ class BaseCudaGraphRunner(ABC):
         is a no-op. The logic lives on ModelRunner (it uses _dummy_run /
         _flashinfer_autotune); the eager path (no graph runner) warms up via the
         same run-once helper called from init_backends.
+
+        The flashinfer-autotune dummy forward reuses this runner's already-
+        allocated static decode buffers (via _autotune_buffers) instead of
+        allocating a throwaway set; a prefill-only runner returns (None, None)
+        and kernel_warmup falls back to a freshly-allocated dummy set.
         """
-        self.model_runner.kernel_warmup()
+        buffers, batch_size = self._autotune_buffers()
+        self.model_runner.kernel_warmup(
+            autotune_buffers=buffers, autotune_batch_size=batch_size
+        )
+
+    def _autotune_buffers(self) -> Tuple[Optional[Any], Optional[int]]:
+        """Static decode buffers + max captured bs for warmup() to hand the
+        flashinfer-autotune dummy forward, so it reuses this runner's already-
+        allocated buffers instead of allocating a throwaway set.
+
+        Returns (None, None) by default. Only the decode runner overrides this:
+        its buffers carry every field the dummy decode forward reads. Prefill
+        buffers deliberately do not (no seq_lens / req_pool_indices / logits
+        buffer), so kernel_warmup allocates a dummy decode set instead.
+        """
+        return None, None
 
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
