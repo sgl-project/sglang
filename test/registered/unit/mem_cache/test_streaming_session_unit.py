@@ -88,6 +88,9 @@ class _FakeReq:
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 
+    def truncate_output_ids(self, length):
+        self.output_ids = self.output_ids[:length]
+
 
 def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from

@@ -60,7 +60,7 @@ def _make_req(output_ids, stop=None, stop_regex=None):
         vocab_size=10_000,
     )
     req.tokenizer = _FakeTokenizer()
-    req.output_ids = array("q", output_ids)
+    req.token_buf.extend(array("q", output_ids))
     return req
 
 

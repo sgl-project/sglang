@@ -35,6 +35,15 @@ class _DummyReq:
     def pop_committed_kv_cache(self):
         return self._kv_committed_len
 
+    def get_full_untruncated_fill_ids(self):
+        return self.origin_input_ids + self.output_ids
+
+    def get_full_untruncated_fill_len(self):
+        return len(self.origin_input_ids) + len(self.output_ids)
+
+    def fill_ids_upto(self, length):
+        return (self.origin_input_ids + self.output_ids)[:length]
+
 
 def _build_swa_tree(
     is_eagle: bool,
