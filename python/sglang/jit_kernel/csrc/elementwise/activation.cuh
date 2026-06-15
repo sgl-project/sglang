@@ -203,11 +203,12 @@ struct ActivationKernel {
     launch(input, out, type, static_cast<const int32_t*>(expert_ids.data_ptr()), static_cast<uint32_t>(expert_step));
   }
 
-  template <ActivationKind kAct>
-  static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL>;
+  using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
 
-  static auto select_unary_kernel(const std::string& type)
-      -> decltype(ActivationKernel::template unary_kernel<ActivationKind::kReLU2>) {
+  template <ActivationKind kAct>
+  static constexpr unary_kernel_fn_t unary_kernel = act_kernel<T, kAct, kUsePDL>;
+
+  static unary_kernel_fn_t select_unary_kernel(const std::string& type) {
     using namespace host;
     if (type == "relu2") {
       return ActivationKernel::template unary_kernel<ActivationKind::kReLU2>;
