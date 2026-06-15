@@ -616,7 +616,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             enumerate(timesteps),
             total=len(timesteps),
             desc="Denoising",
-            disable=batch.is_warmup,
+            batch=batch,
         )
 
         for i, t in progress_bar:
