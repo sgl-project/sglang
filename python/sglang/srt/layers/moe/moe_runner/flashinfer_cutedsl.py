@@ -11,6 +11,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
@@ -221,16 +222,8 @@ def resolve_cutedsl_standard_scales(
     return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
-def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_tokens: int = 0) -> None:
+def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
-
-    Args:
-        layer: The FusedMoE layer module.
-        num_tokens: Current token count entering the MoE layer.  Used as
-            the buffer size for the non-a2a (allgather) path, where the
-            autotune dummy run passes req_to_token_pool.size * dp_size —
-            the worst-case post-allgather batch.  For the a2a path this
-            is ignored in favour of the dispatcher's workspace limit.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
     it depends on final weight shapes and EP configuration.  The wrapper's
@@ -259,20 +252,20 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_tokens: int = 0) -> None:
     )
 
     server_args = get_global_server_args()
-    use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
+    # CuteDSL wrapper preallocates CG buffers used by any captured graph
+    # that routes through this MoE — decode and prefill alike.
+    use_cuda_graph = not cuda_graph_fully_disabled()
 
-    # Buffer size must cover the worst-case token count the MoE layer can see.
-    # - A2A path: dispatch returns tensors flattened from
-    #   [ep_size, max_tokens_per_rank, ...].
-    # - Standard allgather path: dp_size * max local tokens per rank.
+    # Size the wrapper's CUDA-graph buffers for the largest number of tokens a
+    # single forward can route through this layer.
     dispatcher = getattr(layer, "dispatcher", None)
     if hasattr(dispatcher, "max_num_tokens"):
+        # A2A path: bounded by the dispatcher's own workspace limit.
         max_num_tokens = dispatcher.max_num_tokens * getattr(dispatcher, "ep_size", 1)
     else:
-        # Standard allgather path: num_tokens from the first forward is
-        # req_to_token_pool.size * dp_size (the autotune dummy run's batch),
-        # which is the worst-case post-allgather token count.
-        max_num_tokens = max(num_tokens, 1)
+        # Standard allgather path: the MoE sees up to dp_size local forwards
+        # gathered together, so scale the per-rank forward bound by dp_size.
+        max_num_tokens = server_args.dp_size * server_args.cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
@@ -311,17 +304,17 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
 
     Shared by the two CuteDSL runner entries:
 
-    * "v2" standard path (a2a=``none``/``flashinfer``): consumed by the
-      ``@register_fused_func("none", "flashinfer_cutedsl")`` entry, which
-      drives ``CuteDslMoEWrapper.run``. Weights are ``[Up, Gate]``
-      interleaved with MMA-layout blockscales. ``wrapper`` is set;
-      ``w*_scale`` are scalarized.
+    * "v2" standard path (a2a=none/flashinfer): consumed by the
+      @register_fused_func("none", "flashinfer_cutedsl") entry, which
+      drives CuteDslMoEWrapper.run. Weights are [Up, Gate]
+      interleaved with MMA-layout blockscales. wrapper is set;
+      w*_scale are scalarized.
 
-    * "v1" DeepEP low-latency path (a2a=``deepep``): consumed by the
-      ``@register_fused_func("deepep", "flashinfer_cutedsl")`` entry,
-      which drives ``flashinfer_cutedsl_moe_masked``. Weights are
-      ``[Gate, Up]`` non-interleaved with swizzled blockscales.
-      ``wrapper`` is ``None``; ``w*_scale`` are per-expert.
+    * "v1" DeepEP low-latency path (a2a=deepep): consumed by the
+      @register_fused_func("deepep", "flashinfer_cutedsl") entry,
+      which drives flashinfer_cutedsl_moe_masked. Weights are
+      [Gate, Up] non-interleaved with swizzled blockscales.
+      wrapper is None; w*_scale are per-expert.
     """
 
     # FP4 packed weights (uint8)
@@ -342,14 +335,14 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     a1_scale: torch.Tensor
     a2_scale: torch.Tensor
 
-    # v2 only: lazily-created CuteDslMoEWrapper (``None`` on the v1 path).
+    # v2 only: lazily-created CuteDslMoEWrapper (None on the v1 path).
     wrapper: Optional[Any] = None
 
-    # v1 only: ``True`` when DeepEP pre-quantizes activations to NVFP4.
+    # v1 only: True when DeepEP pre-quantizes activations to NVFP4.
     use_nvfp4_dispatch: bool = False
 
     # v1 only: SBO down-GEMM overlap args.
-    down_gemm_overlap_args: Optional["DownGemmOverlapArgs"] = None
+    down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
 
 @register_fused_func("none", "flashinfer_cutedsl")

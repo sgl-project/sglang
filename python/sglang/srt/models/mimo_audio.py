@@ -8,7 +8,7 @@ import os
 import typing as tp
 from dataclasses import dataclass
 from functools import wraps
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1141,72 +1141,89 @@ class MiMoV2AudioConfig:
         return config
 
 
-class MiMoAudioEncoder(nn.Module):
-    config: MiMoAudioEncoderConfig
+class AudioEncoderMixin:
+    """LM model mixin that adds MiMo audio encoder components.
 
-    def __init__(self, config):
-        super().__init__()
+    Components are attached as top-level attributes (no ``audio_encoder.``
+    prefix), matching the checkpoint state_dict layout. Inner naming
+    variations are normalized via ``AUDIO_WEIGHT_REMAP``.
+
+    Hot config fields are cached as direct ``self.audio_*`` attributes at
+    build time so helper methods can stay short and uniform (no
+    ``self.audio_config.foo`` indirection inside hot paths).
+
+    Subclasses call ``self.build_audio_encoder(audio_config)`` from their
+    ``__init__`` after the language model is constructed; the mixin's
+    ``get_audio_feature`` then handles audio item batching end-to-end.
+    """
+
+    AUDIO_WEIGHT_REMAP: tuple[tuple[str, str], ...] = (
+        ("audio_projection", "projection"),
+        ("speech_group_downcast", "projection"),
+        ("audio_input_local_transformer", "input_local_transformer"),
+    )
+
+    def build_audio_encoder(self, config) -> None:
         if not isinstance(config, MiMoV2AudioConfig):
-            config_dict = (
-                vars(config) if hasattr(config, "__dict__") else config.__dict__
-            )
-            config = MiMoV2AudioConfig(**config_dict)
-        self.config = config
-        self.server_args = get_global_server_args()
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
-        self.speech_empty_ids = self.parsed_speech_empty_ids()
+            cfg_dict = vars(config) if hasattr(config, "__dict__") else config.__dict__
+            config = MiMoV2AudioConfig(**cfg_dict)
+
         self.audio_channels = config.audio_channels
         self.audio_group_size = config.group_size
         self.audio_segment_size = config.audio_segment_size
-        speech_vocab_size = self._parse_maybe_list(
-            self.config.speech_vocab_size, self.config.audio_channels
+        self.audio_input_local_dim = config.input_local_dim
+        self.audio_input_full_attention = config.input_full_attention
+        self.audio_out_hidden_size = config.out_hidden_size
+
+        speech_vocab_size = config._parse_maybe_list(
+            config.speech_vocab_size, self.audio_channels
         )
+        speech_empty_ids = config._parse_maybe_list(
+            config.speech_zeroemb_idx, self.audio_channels
+        )
+
         input_local_config = Qwen2Config(
-            hidden_size=self.config.input_local_dim,
-            num_hidden_layers=self.config.input_local_layers,
-            num_attention_heads=self.config.input_local_attn_heads,
-            num_key_value_heads=self.config.input_local_attn_heads,
-            intermediate_size=self.config.input_local_intermediate_size,
-            attention_dropout=self.config.input_local_hidden_dropout,
-            rope_theta=self.config.rope_theta,
-            partial_rotary_factor=self.config.partial_rotary_factor,
+            hidden_size=self.audio_input_local_dim,
+            num_hidden_layers=config.input_local_layers,
+            num_attention_heads=config.input_local_attn_heads,
+            num_key_value_heads=config.input_local_attn_heads,
+            intermediate_size=config.input_local_intermediate_size,
+            attention_dropout=config.input_local_hidden_dropout,
+            rope_theta=config.rope_theta,
+            partial_rotary_factor=config.partial_rotary_factor,
         )
-        input_local_config.head_dim = self.config.input_local_head_dim
-
+        input_local_config.head_dim = config.input_local_head_dim
         self.input_local_transformer = Qwen2Model(input_local_config)
-
-        if not self.config.add_post_norm:
+        if not config.add_post_norm:
             self.input_local_transformer.norm = nn.Identity()
 
         self.speech_embeddings = nn.ModuleList(
             [
                 nn.Embedding(
                     speech_vocab_size[i],
-                    self.config.input_local_dim,
-                    padding_idx=self.speech_empty_ids[i],
+                    self.audio_input_local_dim,
+                    padding_idx=speech_empty_ids[i],
                 )
-                for i in range(self.config.audio_channels)
+                for i in range(self.audio_channels)
             ]
         )
 
-        if self.config.projection_layers == 1:
+        if config.projection_layers == 1:
             self.projection = nn.Linear(
-                self.config.input_local_dim * self.config.group_size,
-                self.config.out_hidden_size,
+                self.audio_input_local_dim * self.audio_group_size,
+                self.audio_out_hidden_size,
                 bias=False,
             )
-        elif self.config.projection_layers == 2:
+        elif config.projection_layers == 2:
             self.projection = AudioProjection(
-                self.config.input_local_dim * self.config.group_size,
-                self.config.input_local_dim * self.config.group_size * 4,
-                self.config.out_hidden_size,
+                self.audio_input_local_dim * self.audio_group_size,
+                self.audio_input_local_dim * self.audio_group_size * 4,
+                self.audio_out_hidden_size,
             )
         else:
-            raise ValueError(
-                f"Invalid projection layers: {self.config.projection_layers}"
-            )
+            raise ValueError(f"Invalid projection layers: {config.projection_layers}")
 
-        model_path = self.server_args.model_path
+        model_path = get_global_server_args().model_path
         if not os.path.isdir(model_path):
             from huggingface_hub import snapshot_download
 
@@ -1216,13 +1233,16 @@ class MiMoAudioEncoder(nn.Module):
             )
         audio_tokenizer_path = os.path.join(model_path, "audio_tokenizer")
         dev = torch.device(f"cuda:{torch.cuda.current_device()}")
-        self.audio_tokenizer = self._load_audio_tokenizer(audio_tokenizer_path, dev)
+        self.audio_tokenizer = self._load_mimo_audio_tokenizer(
+            audio_tokenizer_path, dev
+        )
 
     @staticmethod
-    def _load_audio_tokenizer(path: str, device: torch.device) -> MiMoAudioTokenizer:
+    def _load_mimo_audio_tokenizer(
+        path: str, device: torch.device
+    ) -> MiMoAudioTokenizer:
         """Load MiMoAudioTokenizer manually to avoid new-transformers compat issues."""
         import json
-        import os
 
         from safetensors.torch import load_file
 
@@ -1231,7 +1251,6 @@ class MiMoAudioEncoder(nn.Module):
             config_dict = json.load(f)
         config = MiMoAudioTokenizer.config_class(**config_dict)
         model = MiMoAudioTokenizer(config)
-        # Load weights from safetensors or pytorch bin
         safetensors_path = os.path.join(path, "model.safetensors")
         bin_path = os.path.join(path, "pytorch_model.bin")
         if os.path.exists(safetensors_path):
@@ -1243,43 +1262,34 @@ class MiMoAudioEncoder(nn.Module):
                 f"No model weights found in {path} "
                 "(expected model.safetensors or pytorch_model.bin)"
             )
+        # strict=False: upstream ckpt also carries decoder/vocoder weights
+        # that this encoder-only MiMoAudioTokenizer doesn't materialize.
         model.load_state_dict(state_dict, strict=False)
         model = model.to(device=device, dtype=torch.bfloat16)
         model.eval()
         model.requires_grad_(False)
         return model
 
-    def parsed_speech_empty_ids(self):
-        return self._parse_maybe_list(
-            self.config.speech_zeroemb_idx, self.config.audio_channels
-        )
-
-    def _parse_maybe_list(self, value: str | int, length: int) -> List[int]:
-        if isinstance(value, str) and "-" in value:
-            return [int(s) for s in value.split("-")]
-        return [int(value)] * length
-
-    # adapted from mimo-audio
-    def apply_input_local_transformer(self, speech_embeddings: torch.Tensor):
-        output = self.input_local_transformer(
+    def apply_input_local_transformer(
+        self, speech_embeddings: torch.Tensor
+    ) -> torch.Tensor:
+        return self.input_local_transformer(
             inputs_embeds=speech_embeddings,
             return_dict=True,
-            is_causal=not self.config.input_full_attention,  # for SDPA
-        )
-        return output.last_hidden_state  # [T//group_size, group_size, input_local_dim]
+            is_causal=not self.audio_input_full_attention,  # for SDPA
+        ).last_hidden_state  # [T//group_size, group_size, input_local_dim]
 
     def apply_speech_embeddings(self, audio_codes: torch.Tensor) -> torch.Tensor:
-        num_segments = audio_codes.shape[0]
-        _audio_embeddings = torch.zeros(
-            (num_segments, self.config.group_size, self.config.input_local_dim),
+        embeds = torch.zeros(
+            (audio_codes.shape[0], self.audio_group_size, self.audio_input_local_dim),
             dtype=next(self.speech_embeddings[0].parameters()).dtype,
             device=audio_codes.device,
         )
-        for i in range(self.config.audio_channels):
-            _audio_embeddings.add_(self.speech_embeddings[i](audio_codes[:, :, i]))
-        return _audio_embeddings
+        for i in range(self.audio_channels):
+            embeds.add_(self.speech_embeddings[i](audio_codes[:, :, i]))
+        return embeds
 
-    def process_audio(self, audio):
+    def pad_audio_codes(self, audio: torch.Tensor) -> torch.Tensor:
         T = audio.shape[0]
         audio = audio[:, : self.audio_channels]
         padded_T = (
@@ -1299,17 +1309,19 @@ class MiMoAudioEncoder(nn.Module):
                 + audio[-1, :],
             ],
             dim=0,
-        )  # pad using the last embedding
-        padded_audio = padded_audio.reshape(
+        )
+        return padded_audio.reshape(
             padded_T // self.audio_group_size,
             self.audio_group_size,
             self.audio_channels,
         )
-        return padded_audio
 
     def get_audio_feature(self, items) -> torch.Tensor:
-        # items: already audio-only MultimodalDataItem list from caller.
-        # Each item.feature is either one mel tensor or a list of mel tensors (e.g. long audio split into chunks).
+        """Compute audio features for a list of audio MultimodalDataItem.
+
+        Each item.feature is either a mel tensor or a list of mel tensors
+        (long audio split into chunks).
+        """
         all_mels = []
         for item in items:
             f = item.feature
@@ -1321,9 +1333,8 @@ class MiMoAudioEncoder(nn.Module):
             device = next(self.projection.parameters()).device
             dtype = next(self.projection.parameters()).dtype
             return torch.empty(
-                0, self.config.out_hidden_size, device=device, dtype=dtype
+                0, self.audio_out_hidden_size, device=device, dtype=dtype
             )
-        # Batch tokenize: one encode_batch call for all mels
         device = next(self.audio_tokenizer.encoder.parameters()).device
         code_list = tokenize_audio_batch(
             all_mels,
@@ -1331,20 +1342,16 @@ class MiMoAudioEncoder(nn.Module):
             segment_size=self.audio_segment_size,
             device=device,
         )
-        codecs_to_concat = []
-        for codecs in code_list:
-            padded_codes = self.process_audio(
-                codecs
-            )  # [T//group_size, group_size, audio_channels]
-            codecs_to_concat.append(padded_codes)
-        audio_codes = torch.cat(
-            codecs_to_concat, dim=0
-        )  # [T//group_size, group_size, audio_channels]
+        audio_codes = torch.cat([self.pad_audio_codes(c) for c in code_list], dim=0)
+        embeds = self.apply_input_local_transformer(
+            self.apply_speech_embeddings(audio_codes)
+        )
+        return self.projection(embeds.reshape(embeds.shape[0], -1))
 
-        _audio_embeddings = self.apply_speech_embeddings(audio_codes)
-        audio_embeds = self.apply_input_local_transformer(
-            _audio_embeddings
-        )  #  [T//group_size,  group_size, input_local_dim]
-        B = audio_embeds.shape[0]
-        audio_embeds = self.projection(audio_embeds.reshape(B, -1))
-        return audio_embeds
+    @classmethod
+    def remap_audio_weight_name(cls, name: str) -> str:
+        """Normalize inner audio weight name variations to canonical form."""
+        for src, dst in cls.AUDIO_WEIGHT_REMAP:
+            if src in name:
+                return name.replace(src, dst)
+        return name

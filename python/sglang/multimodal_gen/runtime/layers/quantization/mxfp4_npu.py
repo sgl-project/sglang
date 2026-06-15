@@ -63,7 +63,7 @@ class NPUMXFP4Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "NPUMXFP4Config":
+    def from_config(cls, config: Dict[str, Any]) -> NPUMXFP4Config:
         return cls()
 
     def get_quant_method(

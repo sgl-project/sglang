@@ -26,6 +26,8 @@ For more details, please refer to the [official DeepSeek-OCR repository](https:/
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -38,10 +40,6 @@ import { DeepSeekOCRDeployment } from "/src/snippets/autoregressive/deepseek-ocr
 
 <DeepSeekOCRDeployment />
 
-### 3.2 Configuration Tips
-
-For more detailed configuration tips, please refer to [DeepSeek V3/V3.1/R1 Usage](../../../docs/basic_usage/deepseek_v3).
-
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
@@ -50,6 +48,50 @@ For basic API usage and request examples, please refer to:
 
 - [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
 
+### 4.2 OCR-Specific Prompts
+
+DeepSeek-OCR accepts recommended prompts from the model card:
+
+```text
+<image>
+<|grounding|>Convert the document to markdown.
+```
+
+```text
+<image>
+Free OCR.
+```
+
+**OpenAI-compatible image request example:**
+
+```python Example
+import requests
+
+url = "http://localhost:30000/v1/chat/completions"
+
+data = {
+    "model": "deepseek-ai/DeepSeek-OCR",
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<image>\n<|grounding|>Convert the document to markdown."
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/your_image.jpg"}
+                },
+            ],
+        }
+    ],
+    "max_tokens": 512,
+}
+
+response = requests.post(url, json=data)
+print(response.text)
+```
 
 ## 5. Benchmark
 
@@ -73,6 +115,7 @@ python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-OCR \
   --tp 1 \
   --dtype float16 \
+  --trust-remote-code \
   --host 0.0.0.0 \
   --port 8000
 ```

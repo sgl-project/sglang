@@ -12,7 +12,7 @@ Usage:
     # Tag the run for later compare_perf.py usage
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --label tuned
 
-    # All 20 preset models
+    # All preset models
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --all
 
     # Show preset order, model path, and nightly mapping
@@ -56,13 +56,18 @@ ASSET_DIR = ensure_dir(get_assets_dir(REPO_ROOT))
 NIGHTLY_CONFIG_PATH = (
     REPO_ROOT / "scripts" / "ci" / "utils" / "diffusion" / "comparison_configs.json"
 )
-GATED_MODELS = {"flux", "flux2"}
+GATED_MODELS = {
+    "flux",
+    "flux2",
+    "flux2-klein",
+    "flux2-klein-base",
+}
 DIFFUSERS_FALLBACK_SIGNALS = (
     "falling back to diffusers backend",
     "using diffusers backend",
     "loaded diffusers pipeline",
 )
-CATALOG_TABLE_WIDTH = 105
+CATALOG_TABLE_WIDTH = 140
 RESULTS_TABLE_WIDTH = 105
 NIGHTLY_PRESET_ORDER = (
     "flux",
@@ -80,7 +85,7 @@ NIGHTLY_PRESET_ORDER = (
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with benchmark-and-profile.md
 # Nightly-aligned presets mirror scripts/ci/utils/diffusion/comparison_configs.json
-# first, followed by skill-only extras.
+# first, followed by current-source extras and skill-only stress / coverage presets.
 # Each entry produces the same `sglang generate` command as shown in that doc.
 # ---------------------------------------------------------------------------
 MODELS = {
@@ -217,7 +222,137 @@ MODELS = {
             "--pin-cpu-memory",
         ],
     },
-    # 11. Skill-only extra preset
+    # Source-tracked extras from current registry / GPU test coverage.
+    "qwen-image": {
+        "path": "Qwen/Qwen-Image",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "qwen-edit-2509": {
+        "path": "Qwen/Qwen-Image-Edit-2509",
+        "prompt": "Make the cat wear a red hat",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "zimage-base": {
+        "path": "Tongyi-MAI/Z-Image",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "flux2-klein": {
+        "path": "black-forest-labs/FLUX.2-klein-4B",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--dit-layerwise-offload",
+            "false",
+        ],
+    },
+    "flux2-klein-base": {
+        "path": "black-forest-labs/FLUX.2-klein-base-4B",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--dit-layerwise-offload",
+            "false",
+        ],
+    },
+    "cosmos3-nano-t2i": {
+        "path": "nvidia/Cosmos3-Nano",
+        "prompt": "A red cube on a white table, product photo.",
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-frames=1",
+            "--num-inference-steps=35",
+        ],
+    },
+    "cosmos3-nano-t2v": {
+        "path": "nvidia/Cosmos3-Nano",
+        "prompt": "A blue box slides across a clean warehouse floor.",
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=9",
+            "--num-inference-steps=4",
+        ],
+    },
+    "ideogram4-fp8": {
+        "path": "ideogram-ai/ideogram-4-fp8",
+        "prompt": "A clean product poster for a new open-source inference engine",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "ernie-image-turbo": {
+        "path": "baidu/ERNIE-Image-Turbo",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "glm-image": {
+        "path": "zai-org/GLM-Image",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "sana-1.5-1.6b": {
+        "path": "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "fastwan22-ti2v-5b": {
+        "path": "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=81",
+        ],
+    },
+    "ltx23-hq-two-stage": {
+        "path": "Lightricks/LTX-2.3",
+        "prompt": "A beautiful sunset over the ocean",
+        "env": {
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
+        },
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStageHQPipeline",
+            "--ltx2-two-stage-device-mode=snapshot",
+            "--width=1920",
+            "--height=1088",
+            "--num-frames=121",
+        ],
+    },
+    # Skill-only extra preset
     "ltx23-one-stage": {
         "path": "Lightricks/LTX-2.3",
         "prompt": "A beautiful sunset over the ocean",
@@ -233,7 +368,7 @@ MODELS = {
             "--num-gpus=2",
         ],
     },
-    # 12. Skill-only extra preset
+    # Skill-only extra preset
     "ltx23-two-stage": {
         "path": "Lightricks/LTX-2.3",
         "prompt": "A beautiful sunset over the ocean",
@@ -250,7 +385,7 @@ MODELS = {
             "--num-gpus=2",
         ],
     },
-    # 13. Skill-only extra preset
+    # Skill-only extra preset
     "ltx23-two-stage-cfg-parallel": {
         "path": "Lightricks/LTX-2.3",
         "prompt": "A beautiful sunset over the ocean",
@@ -268,7 +403,7 @@ MODELS = {
             "--cfg-parallel-size=2",
         ],
     },
-    # 14. Skill-only extra preset
+    # Skill-only extra preset
     "hunyuanvideo": {
         "path": "hunyuanvideo-community/HunyuanVideo",
         "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
@@ -281,7 +416,7 @@ MODELS = {
             "--num-inference-steps=30",
         ],
     },
-    # 15. Skill-only extra preset
+    # Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
     "mova-720p": {
         "path": "OpenMOSS-Team/MOVA-720p",
@@ -297,7 +432,7 @@ MODELS = {
             "--num-inference-steps=2",
         ],
     },
-    # 16. Skill-only extra preset
+    # Skill-only extra preset
     "helios": {
         "path": "BestWishYsh/Helios-Base",
         "prompt": "A curious raccoon",
@@ -315,14 +450,13 @@ MODELS = {
             "false",
         ],
     },
-    # 16. Skill-only extra preset
+    # Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "joyai-edit": {
         "path": "jdopensource/JoyAI-Image-Edit-Diffusers",
         "prompt": "Make the cat wear a red hat",
         "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
-            "--backend=sglang",
             "--width=1024",
             "--height=1024",
             "--num-inference-steps=40",
@@ -336,14 +470,13 @@ MODELS = {
             "--ulysses-degree=1",
         ],
     },
-    # 17. Skill-only extra preset
+    # Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "firered-edit-1.0": {
         "path": "FireRedTeam/FireRed-Image-Edit-1.0",
         "prompt": "Make the cat wear a red hat",
         "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
-            "--backend=sglang",
             "--width=1024",
             "--height=1024",
             "--num-inference-steps=40",
@@ -357,14 +490,13 @@ MODELS = {
             "--ulysses-degree=1",
         ],
     },
-    # 18. Skill-only extra preset
+    # Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "firered-edit-1.1": {
         "path": "FireRedTeam/FireRed-Image-Edit-1.1",
         "prompt": "Make the cat wear a red hat",
         "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
-            "--backend=sglang",
             "--width=1024",
             "--height=1024",
             "--num-inference-steps=40",
@@ -378,7 +510,7 @@ MODELS = {
             "--ulysses-degree=1",
         ],
     },
-    # 19. Skill-only extra preset
+    # Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "hunyuan3d-shape": {
         "path": "tencent/Hunyuan3D-2",
@@ -388,7 +520,6 @@ MODELS = {
             "paint_enable": False,
         },
         "extra_args": [
-            "--backend=sglang",
             "--num-inference-steps=50",
             "--guidance-scale=5.0",
             "--dit-layerwise-offload",
@@ -544,17 +675,17 @@ def print_model_catalog():
     """Print preset order, model path, and whether each preset maps to nightly."""
     print()
     print("=" * CATALOG_TABLE_WIDTH)
-    print("MODEL PRESETS — Nightly-aligned first, skill-only extras after")
+    print("MODEL PRESETS — Nightly-aligned, then current-source and skill-only extras")
     print("=" * CATALOG_TABLE_WIDTH)
-    print(f"{'Preset':<24} {'Nightly':<28} {'Model Path':<46} {'GPUs':>4}")
+    print(f"{'Preset':<32} {'Nightly':<30} {'Model Path':<66} {'GPUs':>4}")
     print("-" * CATALOG_TABLE_WIDTH)
     for model_key, cfg in MODELS.items():
         print(
-            f"{model_key:<24} {model_nightly_case_id(model_key):<28} {cfg['path']:<46} {required_gpus_for_model(model_key):>4}"
+            f"{model_key:<32} {model_nightly_case_id(model_key):<30} {cfg['path']:<66} {required_gpus_for_model(model_key):>4}"
         )
     print("-" * CATALOG_TABLE_WIDTH)
     print(
-        "Nightly column shows the comparison_configs.json case id; '-' means skill-only."
+        "Nightly column shows the comparison_configs.json case id; '-' means no nightly mapping."
     )
 
 
@@ -575,6 +706,7 @@ def build_sglang_cmd(
     cmd = [
         "sglang",
         "generate",
+        "--backend=sglang",
         f"--model-path={cfg['path']}",
         f"--prompt={cfg['prompt']}",
     ]
@@ -631,6 +763,9 @@ def run_benchmark_once(
 
     env = os.environ.copy()
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    cfg = MODELS[model_key]
+    for key, value in cfg.get("env", {}).items():
+        env.setdefault(key, str(value))
     if env.get("HF_TOKEN") and not env.get("HUGGINGFACE_HUB_TOKEN"):
         env["HUGGINGFACE_HUB_TOKEN"] = env["HF_TOKEN"]
 

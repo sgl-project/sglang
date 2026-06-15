@@ -13,14 +13,14 @@ class TestStandaloneSpeculativeDecodingBase(StandaloneServerBase, CustomTestCase
     attention_backend = "fa3"
     speculative_eagle_topk = 2
     speculative_num_draft_tokens = 7
-    enable_spec_v2 = False
+    disable_overlap = True
 
 
 class TestStandaloneSpeculativeDecodingTriton(StandaloneServerBase, CustomTestCase):
     attention_backend = "triton"
     speculative_eagle_topk = 2
     speculative_num_draft_tokens = 7
-    enable_spec_v2 = False
+    disable_overlap = True
     enable_deterministic_inference = True
 
 
@@ -28,7 +28,7 @@ class TestStandaloneSpeculativeDecodingFlashinfer(StandaloneServerBase, CustomTe
     attention_backend = "flashinfer"
     speculative_eagle_topk = 2
     speculative_num_draft_tokens = 7
-    enable_spec_v2 = False
+    disable_overlap = True
 
 
 if __name__ == "__main__":

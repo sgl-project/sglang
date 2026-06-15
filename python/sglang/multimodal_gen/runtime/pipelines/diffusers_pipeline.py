@@ -638,10 +638,18 @@ class DiffusersPipeline(ComposedPipelineBase):
             if hasattr(pipe, comp):
                 try:
                     component = getattr(pipe, comp)
-                    # TODO(DefTruth): Add support for 'compile_repeated_blocks' for 'transformer'
-                    # modules which can significantly reduce compilation time for large models
-                    # with repeated blocks.
-                    if isinstance(component, torch.nn.Module) and hasattr(
+                    repeated_blocks = getattr(component, "_repeated_blocks", None)
+                    if (
+                        isinstance(component, torch.nn.Module)
+                        and repeated_blocks
+                        and hasattr(component, "compile_repeated_blocks")
+                    ):
+                        # Regional compilation: compile a single instance of each
+                        # repeated transformer block and let inductor's cache reuse
+                        # it for all repeats, instead of compiling the whole DiT as
+                        # one graph
+                        component.compile_repeated_blocks()
+                    elif isinstance(component, torch.nn.Module) and hasattr(
                         component, "compile"
                     ):
                         # Prefer in-place compilation if supported. According to PyTorch documentation:

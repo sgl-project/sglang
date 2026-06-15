@@ -83,12 +83,14 @@ class WanVAEConfig(VAEConfig):
     use_parallel_tiling: bool = False
 
     use_parallel_encode: bool = True
-    use_parallel_decode: bool = True
 
     def __post_init__(self):
         self.blend_num_frames = (
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         ) * 2
+
+    def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
+        return True
 
     def get_vae_scale_factor(self):
         # Wan VAE does not expose block_out_channels like SD-style VAEs.

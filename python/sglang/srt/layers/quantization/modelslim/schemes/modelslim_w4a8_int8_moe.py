@@ -186,15 +186,15 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         )
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
 
     def apply_weights(
         self,
         layer,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         # FIXME W4A8 without EP can give 0 accuracy
         return self.kernel.apply(layer, dispatch_output)
 

@@ -11,11 +11,12 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
     make_gdn_cases,
@@ -23,9 +24,6 @@ from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import 
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_gdn_cuda_graph_decode_case,
-)
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
-    run_gdn_eagle_draft_extend_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     run_gdn_eagle_verify_case,
@@ -37,6 +35,7 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -261,6 +260,11 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_gdn_cuda_graph_decode_case(self, case)
 
+    @unittest.skipIf(
+        is_hip(),
+        "split-op extend runner exercises the piecewise-CUDA-graph path "
+        "(TcPiecewiseForwardContext.num_tokens), which is not wired on ROCm.",
+    )
     def test_runner_mode_split_op_extend_cases(self):
         for case, static_num_tokens in self.SPLIT_OP_CASES:
             for breakable in (False, True):
@@ -298,48 +302,6 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 run_gdn_eagle_verify_cuda_graph_case(
                     self, case, topk=topk, spec_kind=spec_kind
                 )
-
-    # EAGLE / Frozen-KV MTP DRAFT_EXTEND eager — `HybridLinearAttnBackend`
-    # raises `ValueError("Invalid forward mode")` for DRAFT_EXTEND CG
-    # capture (`hybrid_linear_attn_backend.py:509,572`), so CG is
-    # structurally blocked across the family (GDN/KDA/Lightning/Mamba2).
-    # The EXTEND-style gated-delta recurrence reference doubles as the
-    # DRAFT_EXTEND reference across both spec kinds.
-    EAGLE_DRAFT_EXTEND_CASES = (
-        (
-            GDNAttentionCase(
-                name="runner_eagle_draft_extend_gdn",
-                backend="triton",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_k_heads=2,
-                num_v_heads=2,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "eagle",
-        ),
-        (
-            GDNAttentionCase(
-                name="runner_frozen_kv_mtp_draft_extend_gdn",
-                backend="triton",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_k_heads=2,
-                num_v_heads=2,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "frozen_kv_mtp",
-        ),
-    )
-
-    def test_runner_mode_eagle_draft_extend_cases(self):
-        for case, spec_kind in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(
-                case=case.name, backend=case.backend, spec_kind=spec_kind
-            ):
-                run_gdn_eagle_draft_extend_case(self, case, spec_kind=spec_kind)
 
     # Spy directly on each sub-backend's `init_forward_metadata*` so
     # dispatch-layer slice mutations show up as a missing call, which
@@ -399,38 +361,35 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             linear_attn_backend.init_forward_metadata, sentinel_forward_batch
         )
 
+    def _make_sentinel_fb(self):
+        return SimpleNamespace(
+            batch_size=3,
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=object(),
+            seq_lens=object(),
+            seq_lens_cpu=object(),
+            seq_lens_sum=42,
+            spec_info=object(),
+            encoder_lens=None,
+            positions=object(),
+            input_ids=object(),
+            out_cache_loc=None,
+        )
+
     def test_hybrid_dispatch_replay_init_forward_metadata_fan_out(self):
         backend, full_attn_backend, linear_attn_backend = (
             self._make_dispatch_spy_backend()
         )
 
-        sentinel_req_pool = object()
-        sentinel_seq_lens = object()
-        sentinel_seq_lens_cpu = object()
-        sentinel_spec_info = object()
-
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=3,
-            req_pool_indices=sentinel_req_pool,
-            seq_lens=sentinel_seq_lens,
-            seq_lens_sum=42,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=sentinel_spec_info,
-            seq_lens_cpu=sentinel_seq_lens_cpu,
-        )
+        fb = self._make_sentinel_fb()
+        backend.init_forward_metadata_out_graph(fb)
 
         # We assert sentinel identity rather than exact (args, kwargs) shape
         # so a positional↔keyword refactor inside `HybridLinearAttnBackend`
-        # doesn't trip the test as long as the values still flow through.
+        # doesn't trip the test as long as the fb still flows through.
         for sub_backend in (full_attn_backend, linear_attn_backend):
             self._assert_fanout_forwarded(
-                sub_backend.init_forward_metadata_replay_cuda_graph,
-                sentinel_req_pool,
-                sentinel_seq_lens,
-                sentinel_seq_lens_cpu,
-                sentinel_spec_info,
-                ForwardMode.DECODE,
+                sub_backend.init_forward_metadata_out_graph, fb
             )
 
     def test_hybrid_dispatch_capture_init_forward_metadata_fan_out(self):
@@ -439,27 +398,12 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
         backend, full_attn_backend, linear_attn_backend = (
             self._make_dispatch_spy_backend()
         )
-        sentinel_req_pool = object()
-        sentinel_seq_lens = object()
-        sentinel_spec_info = object()
-
-        backend.init_forward_metadata_capture_cuda_graph(
-            bs=3,
-            num_tokens=3,
-            req_pool_indices=sentinel_req_pool,
-            seq_lens=sentinel_seq_lens,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=sentinel_spec_info,
-        )
+        fb = self._make_sentinel_fb()
+        backend.init_forward_metadata_out_graph(fb, in_capture=True)
 
         for sub_backend in (full_attn_backend, linear_attn_backend):
             self._assert_fanout_forwarded(
-                sub_backend.init_forward_metadata_capture_cuda_graph,
-                sentinel_req_pool,
-                sentinel_seq_lens,
-                sentinel_spec_info,
-                ForwardMode.DECODE,
+                sub_backend.init_forward_metadata_out_graph, fb
             )
 
 

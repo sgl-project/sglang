@@ -29,6 +29,7 @@ class GSM8KAscendMixin(ABC):
     server_cmd = ""
     gsm8k_num_shots = 5
     num_questions = 200
+    gsm8k_parallel = 128
 
     env = {
         **os.environ,
@@ -82,13 +83,14 @@ class GSM8KAscendMixin(ABC):
                 data_path=None,
                 num_questions=self.num_questions,
                 max_new_tokens=512,
-                parallel=128,
+                parallel=self.gsm8k_parallel,
                 host="http://127.0.0.1",
                 port=int(self.base_url.split(":")[-1]),
             )
             metrics = run_eval(args)
             model_metrics["accuracy"] = metrics["accuracy"]
             model_metrics["output_throughput"] = metrics["output_throughput"]
+            model_metrics["latency"] = metrics["latency"]
             self.assertGreaterEqual(
                 metrics["accuracy"],
                 accuracy_threshold,

@@ -69,6 +69,26 @@ class HfModelConfigParser(ModelConfigParserBase):
 
         if (
             config.architectures is not None
+            and config.architectures[0] == "GlmMoeDsaForCausalLM"
+        ):
+            # GlmMoeDsaConfig drops/clobbers raw checkpoint fields the DSA path
+            # needs, so re-read them from config.json and restore. Fixed upstream
+            # by https://github.com/huggingface/transformers/pull/46338; remove
+            # this block once SGLang requires transformers >= 5.10.
+            from transformers import PretrainedConfig
+
+            raw_config, _ = PretrainedConfig.get_config_dict(model, revision=revision)
+            for key in (
+                "qk_rope_head_dim",
+                "index_topk_freq",
+            ):
+                if key in raw_config:
+                    setattr(config, key, raw_config[key])
+            if hasattr(config, "qk_head_dim") and hasattr(config, "qk_nope_head_dim"):
+                config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+
+        if (
+            config.architectures is not None
             and config.architectures[0] == "Phi4MMForCausalLM"
         ):
             from transformers import SiglipVisionConfig
@@ -133,7 +153,12 @@ class HfModelConfigParser(ModelConfigParserBase):
         if config.model_type == "multi_modality":
             _set_architectures(config, "MultiModalityCausalLM")
 
-        if config.model_type in ("gemma4", "gemma4_assistant"):
+        if config.model_type in (
+            "gemma4",
+            "gemma4_assistant",
+            "gemma4_unified",
+            "gemma4_unified_assistant",
+        ):
             # Gemma4 configs use base attributes for SWA layers and `global_*`
             # variants for full-attention layers.  SGLang expects the opposite:
             # base = full-attention, `swa_*` = sliding-window overrides.
@@ -157,6 +182,13 @@ class HfModelConfigParser(ModelConfigParserBase):
                 text_config.v_head_dim = text_config.head_dim
             if not hasattr(text_config, "swa_v_head_dim"):
                 text_config.swa_v_head_dim = text_config.swa_head_dim
+
+            # Unified Gemma4 names the end-of-audio token `eoa_token_index`,
+            # but the multimodal processor expects `eoa_token_id`.
+            if not hasattr(config, "eoa_token_id") and hasattr(
+                config, "eoa_token_index"
+            ):
+                config.eoa_token_id = config.eoa_token_index
 
         if config.model_type == "longcat_flash":
             _set_architectures(config, "LongcatFlashForCausalLM")

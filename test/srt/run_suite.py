@@ -45,20 +45,6 @@ suite_amd = {
 }
 
 # Keep the Arm64 bootstrap suite limited to hosted-runner-safe unit kernels.
-# `test_extend.py`, `test_mamba.py`, and `test_mla.py` still hit the
-# x86-specific BF16 BRGEMM/VNNI path on Arm and need dedicated fallbacks.
-suite_arm64 = {
-    "per-commit-cpu-arm64": [
-        TestFile("cpu/test_activation.py"),
-        TestFile("cpu/test_decode.py"),
-        TestFile("cpu/test_norm.py"),
-        TestFile("cpu/test_qwen3.py"),
-        TestFile("cpu/test_rope.py"),
-        TestFile("cpu/test_server_args_backend.py"),
-        TestFile("cpu/test_topk.py"),
-    ],
-}
-
 # Add Intel Xeon tests
 suite_xeon = {
     "per-commit-cpu": [
@@ -93,7 +79,6 @@ suite_xeon = {
 suite_xpu = {}
 
 suites.update(suite_amd)
-suites.update(suite_arm64)
 suites.update(suite_xeon)
 suites.update(suite_xpu)
 

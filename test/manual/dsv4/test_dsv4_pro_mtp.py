@@ -40,7 +40,6 @@ HONGLOUMENG_PATH = os.environ.get(
 )
 
 DSV4_PRO_BASE_ENV = {
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "1",
 }
 

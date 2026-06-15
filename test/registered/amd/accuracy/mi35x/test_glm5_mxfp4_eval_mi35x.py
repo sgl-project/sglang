@@ -11,10 +11,6 @@ Registry: nightly-amd-8-gpu-mi35x-glm5-mxfp4 suite
 
 import ast
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -41,19 +37,6 @@ register_amd_ci(
 )
 
 INVALID = -9999999
-
-GLM5_MXFP4_LOCAL_PATH = "/data2/models/amd-GLM-5-MXFP4"
-GLM5_MXFP4_HF_MODEL_ID = "amd/GLM-5-MXFP4"
-
-
-def get_model_path() -> str:
-    """Get effective model path: env var > local path > HF model ID."""
-    env_path = os.environ.get("GLM5_MXFP4_MODEL_PATH")
-    if env_path:
-        return env_path
-    if os.path.exists(GLM5_MXFP4_LOCAL_PATH):
-        return GLM5_MXFP4_LOCAL_PATH
-    return GLM5_MXFP4_HF_MODEL_ID
 
 
 @dataclass
@@ -82,10 +65,9 @@ class ModelConfig:
 
 def get_glm5_mxfp4_models() -> List[ModelConfig]:
     """Get GLM-5-MXFP4 model configurations for MI35x."""
-    model_path = get_model_path()
     return [
         ModelConfig(
-            model_path=model_path,
+            model_path="amd/GLM-5-MXFP4",
             tp_size=8,
             accuracy_threshold=0.90,
             timeout=5400,
@@ -195,18 +177,6 @@ class TestGLM5MXFP4EvalMI35x(unittest.TestCase):
 
     def test_glm5_mxfp4_accuracy(self):
         """Test GLM-5-MXFP4 with GSM8K completion benchmark."""
-        model_path = get_model_path()
-        is_local_path = model_path.startswith("/")
-        if is_local_path and not os.path.exists(model_path):
-            print(f"\nSKIPPING: Local model not found at {model_path}")
-            self.skipTest(f"Local model not found at {model_path}")
-            return
-
-        if is_local_path:
-            print(f"Using local model: {model_path}")
-        else:
-            print(f"Using HuggingFace model: {model_path}")
-
         all_results = []
         summary = "### GLM-5-MXFP4 Models (MI35x)\n\n"
         summary += "| Model | Variant | TP | Accuracy | Threshold | Status |\n"

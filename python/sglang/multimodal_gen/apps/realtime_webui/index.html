@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sglang-diffusion Realtime Studio</title>
+    <link rel="stylesheet" href="./styles.css?v=realtime-record-v49" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel controls" aria-label="Session controls">
+        <div class="brand">
+          <span>sglang-diffusion</span>
+          <strong>Realtime Studio</strong>
+        </div>
+        <label>Server<input id="serverUrl" value="ws://127.0.0.1:30000/v1/realtime_video/generate" /></label>
+        <label>Model<input id="model" value="" placeholder="auto from /v1/models" /></label>
+        <div class="section-title">Reference</div>
+        <label class="reference-upload">
+          <input id="firstFrame" type="file" accept="image/*" />
+          <canvas id="referencePreview" width="320" height="180"></canvas>
+          <span id="referenceName">Preset reference</span>
+        </label>
+        <div class="section-title">Generate the scene</div>
+        <label>Prompt<textarea id="prompt" rows="4">A cinematic handheld shot of a quiet city street at dusk, soft reflections, natural motion.</textarea></label>
+        <button id="enhanceBtn" class="wide">Enhance</button>
+        <div class="split">
+          <label>Size<input id="size" value="832x480" /></label>
+          <label>FPS<input id="fps" type="number" value="25" min="1" max="60" /></label>
+        </div>
+        <div class="split">
+          <label>Frames<input id="numFrames" type="number" value="9" min="5" step="4" /></label>
+          <label>Seed<input id="seed" type="number" value="42" /></label>
+        </div>
+        <div class="split">
+          <label>Steps<input id="steps" type="number" value="4" min="1" /></label>
+          <label>Guidance<input id="guidance" type="number" value="1" step="0.1" /></label>
+        </div>
+        <div class="split">
+          <label>Sink<input id="sinkSize" type="number" value="9" min="0" /></label>
+          <label>Window<input id="windowFrames" type="number" value="18" min="1" /></label>
+        </div>
+        <div class="split">
+          <label>Transport
+            <select id="transportFormat">
+              <option value="webp" selected>WebP preview</option>
+              <option value="jpeg">JPEG preview</option>
+              <option value="">Lossless delta</option>
+              <option value="raw">Raw RGB</option>
+            </select>
+          </label>
+          <label>Quality<input id="transportQuality" type="number" value="95" min="1" max="100" /></label>
+        </div>
+        <div class="split output-options">
+          <label class="toggle-row"><input id="superResolution" type="checkbox" />Super resolution</label>
+          <label>Scale
+            <select id="upscalingScale">
+              <option value="2" selected>2x</option>
+              <option value="4">4x</option>
+            </select>
+          </label>
+        </div>
+        <label>SR model
+          <select id="upscalingModel">
+            <option value="">Quality x2</option>
+            <option
+              value="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
+              selected
+            >
+              Fast general
+            </option>
+            <option value="/scratch/realesr-animevideov3.pth">Fast anime</option>
+          </select>
+        </label>
+        <label class="toggle-row"><input id="frameInterpolation" type="checkbox" />Smooth 2x frames</label>
+        <label class="toggle-row"><input id="continuous" type="checkbox" checked />Continuous session</label>
+        <div class="actions">
+          <button id="connectBtn" class="primary">Generate</button>
+          <button id="stopBtn">Close session</button>
+        </div>
+        <button id="sendPromptBtn" class="wide">Send prompt update</button>
+      </section>
+
+      <section class="workspace" aria-label="Realtime workspace">
+        <section class="stage" aria-label="Realtime preview">
+          <div class="topbar">
+            <span id="statusDot" class="dot"></span>
+            <span id="statusText">Idle</span>
+            <span id="chunkText">chunk -</span>
+            <button id="recordBtn" class="record-button" type="button" aria-pressed="false" title="Record preview">
+              <span class="record-button-icon" aria-hidden="true"></span>
+              <span id="recordLabel">Record</span>
+              <span id="recordDuration" class="record-button-duration">00:00</span>
+            </button>
+            <span class="topbar-spacer"></span>
+            <label class="preview-scale-control">Preview
+              <input id="previewScale" type="range" min="80" max="170" value="120" />
+              <b id="previewScaleText">120%</b>
+            </label>
+            <span class="stage-stat">output <b id="outputSizeText">832x480</b></span>
+            <span class="stage-stat">render <b id="renderFps">0</b> fps</span>
+            <span class="stage-stat">source <b id="theoreticalFpsText">-</b></span>
+            <span class="stage-stat">buffer <b id="stageLatencyText">-</b></span>
+          </div>
+          <div class="preview-frame">
+            <canvas id="viewport" width="1280" height="720"></canvas>
+            <div id="previewOverlay" class="preview-overlay" aria-hidden="true">
+              <span class="preview-loader"></span>
+            </div>
+          </div>
+          <div class="stage-controls" aria-label="Camera controls">
+            <div class="control-cluster" aria-label="Move camera">
+              <span class="control-title">Move</span>
+              <div class="camera-pad move-pad">
+                <span></span>
+                <button data-action="w" data-key="W">Forward</button>
+                <span></span>
+                <button data-action="a" data-key="A">Left</button>
+                <button data-action="s" data-key="S">Back</button>
+                <button data-action="d" data-key="D">Right</button>
+              </div>
+            </div>
+            <div class="control-cluster" aria-label="Look around">
+              <span class="control-title">Look</span>
+              <div class="camera-pad look-pad">
+                <span></span>
+                <button data-action="i" data-key="↑">Pitch +</button>
+                <span></span>
+                <button data-action="j" data-key="←">Yaw -</button>
+                <button data-action="k" data-key="↓">Pitch -</button>
+                <button data-action="l" data-key="→">Yaw +</button>
+              </div>
+            </div>
+          </div>
+          <div class="timeline">
+            <span id="queueText">queue 0</span>
+            <span id="frameText">frames 0</span>
+            <span id="byteText">0 MB</span>
+          </div>
+          <div class="telemetry stage-telemetry">
+            <span>Payload<b id="payloadMode">webp</b></span>
+            <span>Server send<b id="serverSendText">-</b></span>
+            <span>Chunk bytes<b id="chunkPayloadText">-</b></span>
+            <span>Chunk wait<b id="latencyText">-</b></span>
+            <span>Decode<b id="decodeText">-</b></span>
+            <span>Display lag<b id="displayLagText">-</b></span>
+          </div>
+        </section>
+
+        <section class="panel presets" aria-label="Presets and camera">
+          <div class="section-title">LingBot</div>
+          <div class="spec-grid">
+            <span><b>25 fps</b> target</span>
+            <span><b>chunked</b> stream</span>
+            <span><b>480p/720p</b></span>
+            <span><b>Cam + Act</b></span>
+          </div>
+          <div class="section-title">Presets</div>
+          <div id="presetList" class="preset-list"></div>
+          <div class="section-title">History</div>
+          <div id="historyList" class="history-list"></div>
+        </section>
+      </section>
+    </main>
+  <script src="./playback_controller.js?v=realtime-playback-v13"></script>
+  <script src="./app.js?v=realtime-record-v75"></script>
+</body>
+</html>

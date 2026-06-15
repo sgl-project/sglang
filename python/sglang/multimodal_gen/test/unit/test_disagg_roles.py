@@ -39,19 +39,19 @@ from sglang.multimodal_gen.runtime.pipelines.wan_i2v_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
-    LTX2RefinementStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_shape import (
-    Hunyuan3DShapeBeforeDenoisingStage,
-    Hunyuan3DShapeExportStage,
-    Hunyuan3DShapeSaveStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.helios_denoising import (
     HeliosChunkedDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.shape import (
+    Hunyuan3DShapeBeforeDenoisingStage,
+    Hunyuan3DShapeExportStage,
+    Hunyuan3DShapeSaveStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
+    LTX2RefinementStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.mova import (
     MOVADecodingStage,
@@ -628,7 +628,7 @@ class TestHunyuan3DShapeStageRuntimeDtype(_GlobalStageArgsMixin, unittest.TestCa
         )
 
         with patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_shape.logger.warning"
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.shape.logger.warning"
         ) as mock_warning:
             dtype = stage._resolve_runtime_dtype(torch.zeros(1, dtype=torch.float16))
 

@@ -233,20 +233,45 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
             self.assertIs(result, fake_module.HiRadixCache.return_value)
 
-    def test_hi_mamba_radix_cache_when_hierarchical_and_hybrid_ssm(self):
+    def test_unified_radix_cache_when_hierarchical_and_hybrid_ssm(self):
         ctx = _make_ctx(enable_hierarchical_cache=True, is_hybrid_ssm=True)
-        # `hi_mamba_radix_cache` imports `hicache_storage`, which
-        # transitively loads `sgl_kernel`; inject a stand-in module.
-        fake_module = MagicMock()
+        # Hybrid SSM with hierarchical cache now uses UnifiedRadixCache.
+        fake_components = MagicMock()
+        fake_radix = MagicMock()
         with patch.dict(
             "sys.modules",
-            {"sglang.srt.mem_cache.hi_mamba_radix_cache": fake_module},
+            {
+                "sglang.srt.mem_cache.unified_cache_components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
         ):
             result = default_radix_cache_factory(ctx)
-            fake_module.HiMambaRadixCache.assert_called_once_with(
-                params=ctx.params, server_args=ctx.server_args
+            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+            fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
+                ctx.server_args, ctx.params
             )
-            self.assertIs(result, fake_module.HiMambaRadixCache.return_value)
+            ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
+            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
+
+    def test_unified_radix_cache_when_hierarchical_and_hybrid_swa(self):
+        ctx = _make_ctx(enable_hierarchical_cache=True, is_hybrid_swa=True)
+        # Hybrid SWA with hierarchical cache also uses UnifiedRadixCache.
+        fake_components = MagicMock()
+        fake_radix = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.unified_cache_components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
+        ):
+            result = default_radix_cache_factory(ctx)
+            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+            fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
+                ctx.server_args, ctx.params
+            )
+            ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
+            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
     def test_swa_radix_cache_when_hybrid_swa(self):
         ctx = _make_ctx(is_hybrid_swa=True)

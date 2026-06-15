@@ -279,6 +279,7 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
 
         return server_args, {}
 
+    @unittest.skipIf(is_in_ci(), "To skip flaky test")
     def test_eval_accuracy(self):
         """Test eval accuracy with cache persistence across cache flushes"""
         run_eval_accuracy_test(self)

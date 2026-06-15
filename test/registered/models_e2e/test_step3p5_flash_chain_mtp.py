@@ -3,7 +3,6 @@ import unittest
 import numpy as np
 import requests
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
@@ -50,11 +49,6 @@ class TestStep3p5FlashChainMTP(GSM8KMixin, DefaultServerBase):
 
     gsm8k_accuracy_thres = 0.83
     gsm8k_accept_length_thres = 2.6
-
-    @classmethod
-    def setUpClass(cls):
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
-            super().setUpClass()
 
     def test_logprob_spec_v2_match(self):
         """Verify spec v2 decode logprobs match prefill scoring logprobs.

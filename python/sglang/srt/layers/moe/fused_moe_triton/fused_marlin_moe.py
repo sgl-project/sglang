@@ -15,14 +15,19 @@ if _is_cuda:
     from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
-def get_scalar_type(num_bits: int, has_zp: bool, scales: Optional[torch.Tensor] = None):
+def get_scalar_type(
+    num_bits: int,
+    has_zp: bool,
+    scales: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
+):
     from sgl_kernel.scalar_type import scalar_types
 
     if (
         not has_zp
         and num_bits == 4
         and scales is not None
-        and scales.dtype == torch.float8_e8m0fnu
+        and (scales.dtype == torch.float8_e8m0fnu or global_scale is not None)
     ):
         return scalar_types.float4_e2m1f
     if has_zp:
@@ -66,12 +71,16 @@ def fused_marlin_moe(
     sort_indices2: Optional[torch.Tensor] = None,
     w1_zeros: Optional[torch.Tensor] = None,
     w2_zeros: Optional[torch.Tensor] = None,
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
     clamp_limit: Optional[float] = None,
+    activation: str = "silu",
+    is_gated: bool = True,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -118,12 +127,19 @@ def fused_marlin_moe(
         and w1_scale.dtype == torch.float8_e8m0fnu
         and w2_scale.dtype == torch.float8_e8m0fnu
     )
+    is_nvfp4_marlin = (
+        num_bits == 4
+        and w1_zeros is None
+        and w2_zeros is None
+        and w1_global_scale is not None
+        and w2_global_scale is not None
+    )
     if is_mxfp4_marlin:
         assert hidden_states.dtype == torch.bfloat16, (
             "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 "
             f"activations, got {hidden_states.dtype}"
         )
-    else:
+    elif not is_nvfp4_marlin:
         assert (
             hidden_states.dtype == w1_scale.dtype
         ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
@@ -136,6 +152,7 @@ def fused_marlin_moe(
     E = w1.shape[0]
     N = w2.shape[1] * 16
     topk = topk_ids.shape[1]
+    gemm1_n = 2 * N if is_gated else N
 
     # M block size selection logic
     # TODO: tune this further for specific models
@@ -160,8 +177,12 @@ def fused_marlin_moe(
             max_workspace_size, dtype=torch.int, device=device, requires_grad=False
         )
 
-    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None, w1_scale)
-    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None, w2_scale)
+    scalar_type1 = get_scalar_type(
+        num_bits, w1_zeros is not None, w1_scale, w1_global_scale
+    )
+    scalar_type2 = get_scalar_type(
+        num_bits, w2_zeros is not None, w2_scale, w2_global_scale
+    )
 
     intermediate_cache2 = torch.empty(
         (M * topk_ids.shape[1], N),
@@ -169,12 +190,12 @@ def fused_marlin_moe(
         dtype=hidden_states.dtype,
     )
     intermediate_cache13 = torch.empty(
-        (M * topk_ids.shape[1] * max(2 * N, K),),
+        (M * topk_ids.shape[1] * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * 2 * N]
-    intermediate_cache1 = intermediate_cache1.view(-1, 2 * N)
+    intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * gemm1_n]
+    intermediate_cache1 = intermediate_cache1.view(-1, gemm1_n)
     intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
@@ -189,7 +210,7 @@ def fused_marlin_moe(
         w1,
         None,  # b_bias_or_none
         w1_scale,
-        None,  # global_scale_or_none
+        w1_global_scale,
         w1_zeros,
         g_idx1,
         sort_indices1,
@@ -204,7 +225,7 @@ def fused_marlin_moe(
         is_ep=expert_map is not None,
         b_q_type=scalar_type1,
         size_m=M,
-        size_n=2 * N,
+        size_n=gemm1_n,
         size_k=K,
         is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
@@ -212,14 +233,20 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if clamp_limit is not None:
+    if activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(
             intermediate_cache2,
-            intermediate_cache1.view(-1, 2 * N),
+            intermediate_cache1.view(-1, gemm1_n),
             clamp_limit,
         )
+    elif activation == "silu" and is_gated:
+        silu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
+    elif activation == "silu" and not is_gated:
+        intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
+    elif activation == "relu2" and not is_gated:
+        intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
     else:
-        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+        raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
     if expert_map is not None:
         intermediate_cache3.zero_()
@@ -230,7 +257,7 @@ def fused_marlin_moe(
         w2,
         None,  # b_bias_or_none
         w2_scale,
-        None,  # global_scale_or_none
+        w2_global_scale,
         w2_zeros,
         g_idx2,
         sort_indices2,

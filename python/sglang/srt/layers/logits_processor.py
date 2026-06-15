@@ -15,13 +15,11 @@
 
 import dataclasses
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-import triton
-import triton.language as tl
 from torch import nn
-from triton.language.extra import libdevice
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -41,6 +39,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     get_token_ids_logprobs_chunk,
@@ -66,6 +65,27 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+# When set, LogitsProcessor.forward returns an empty output and skips the
+# LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
+# attention/MoE/GEMM kernels, so the LM-head all-gather is wasted work --
+# and its [batch * dp_size, vocab] output OOMs under DP attention with a
+# tight mem_fraction_static.
+_in_autotune_dummy_run = False
+
+
+def get_in_autotune_dummy_run() -> bool:
+    return _in_autotune_dummy_run
+
+
+@contextmanager
+def autotune_dummy_run_mode():
+    global _in_autotune_dummy_run
+    _in_autotune_dummy_run = True
+    try:
+        yield
+    finally:
+        _in_autotune_dummy_run = False
 
 
 @dataclasses.dataclass
@@ -208,7 +228,6 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
         if dp_rank == 0:
@@ -299,6 +318,12 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+
+        # Autotune dummy run discards this output; see _in_autotune_dummy_run.
+        # Placed before the MIS / DLLM / common dispatch so all three LM-head
+        # paths are skipped.
+        if _in_autotune_dummy_run:
+            return LogitsProcessorOutput(next_token_logits=None)
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
@@ -1073,55 +1098,3 @@ class LogitsProcessor(nn.Module):
             # They should be moved to GenerationBatchResult to keep this class clean.
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
-
-
-@triton.jit
-def fused_softcap_kernel(
-    full_logits_ptr,
-    softcapping_value,
-    ncols,
-    row_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row = tl.program_id(1).to(tl.int64)
-    pid = tl.program_id(0).to(tl.int64)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < ncols
-
-    # Load values
-    row_ptr = full_logits_ptr + row * row_stride
-    x = tl.load(row_ptr + offsets, mask=mask)
-
-    # Perform operations in-place
-    x = x / softcapping_value
-    x = libdevice.tanh(x)
-    x = x * softcapping_value
-
-    # Store result
-    tl.store(row_ptr + offsets, x, mask=mask)
-
-
-def fused_softcap(full_logits, final_logit_softcapping):
-    if full_logits.is_contiguous():
-        nrows, ncols = 1, full_logits.numel()
-        row_stride = ncols
-    else:
-        assert full_logits.ndim == 2, "non-contiguous softcap requires 2D tensor"
-        assert (
-            full_logits.stride(1) == 1
-        ), "non-contiguous softcap requires contiguous columns"
-        nrows, ncols = full_logits.shape
-        row_stride = full_logits.stride(0)
-
-    BLOCK_SIZE = 1024
-    grid = ((ncols + BLOCK_SIZE - 1) // BLOCK_SIZE, nrows)
-
-    fused_softcap_kernel[grid](
-        full_logits_ptr=full_logits,
-        softcapping_value=final_logit_softcapping,
-        ncols=ncols,
-        row_stride=row_stride,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return full_logits

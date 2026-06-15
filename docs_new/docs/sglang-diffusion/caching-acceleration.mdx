@@ -1,6 +1,7 @@
 ---
 title: "Caching Acceleration"
 description: "Compare caching acceleration strategies for diffusion models."
+tag: "approx"
 ---
 SGLang provides two complementary caching strategies for Diffusion Transformer (DiT) models. Both reduce denoising cost by skipping redundant computation, but they operate at different levels.
 
@@ -70,13 +71,14 @@ See [teacache.md](./teacache) for detailed documentation.
 
 - Tracks L1 distance between modulated inputs across timesteps
 - When accumulated distance is below threshold, reuses cached residual
-- Supports CFG with separate positive/negative caches
+- Uses separate positive/negative caches for supported CFG model families
 
 ### Supported Models
 
-- Wan (wan2.1, wan2.2)
-- Hunyuan (HunyuanVideo)
+- Wan2.1
 - Z-Image
+- Wan2.2: coefficients are not calibrated yet; enabling TeaCache is accepted but currently no-ops
+- HunyuanVideo: not supported yet
 
 For Flux and Qwen models, TeaCache is automatically disabled when CFG is enabled.
 

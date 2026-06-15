@@ -3,7 +3,7 @@
 Guards the hybrid linear / full attention dispatcher: Ling-2.5/2.6
 has 32 layers with `layer_group_size=8`, so layers {7, 15, 23, 31}
 are full attention (MLA) and the rest are linear (Lightning seg_la).
-Runs on the 8-GPU H200 runner with TP=4.
+Runs nightly on the 8-GPU H200 runner with TP=4.
 """
 
 import unittest
@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=600, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=600, suite="nightly-8-gpu-common", nightly=True)
 
 
 class TestLing26Flash(GSM8KMixin, DefaultServerBase):

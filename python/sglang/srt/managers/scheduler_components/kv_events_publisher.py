@@ -40,13 +40,13 @@ class KvMetrics:
 @dataclass(kw_only=True, slots=True)
 class SchedulerKvEventsPublisher:
     kv_events_config: Optional[str]
-    ps: "ParallelState"
+    ps: ParallelState
     attn_tp_rank: int
     attn_cp_rank: int
     attn_dp_rank: int
     dp_rank: Optional[int]
-    tree_cache: "BasePrefixCache"
-    send_metrics_from_scheduler: Optional["zmq.Socket"]
+    tree_cache: BasePrefixCache
+    send_metrics_from_scheduler: Optional[zmq.Socket]
     max_running_requests: int
     max_total_num_tokens: int
     get_stats: Callable

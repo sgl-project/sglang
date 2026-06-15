@@ -170,3 +170,47 @@ def awq_marlin_quantize(w: torch.Tensor, quant_type: ScalarType, group_size: int
         res_list[i] = res_list[i].to(w.device)
 
     return res_list
+
+
+def make_nvfp4_weight_and_ref(
+    size_n: int,
+    size_k: int,
+    dtype: torch.dtype,
+    group_size: int = 16,
+    device: str = "cuda",
+):
+    """Build a random NVFP4-quantized weight and its FP dequantized reference.
+
+    Returns:
+        fp4_weight: (size_n, size_k // 2) uint8, two packed FP4 (E2M1) values per byte
+        scales: (size_n, size_k // group_size) FP8 E4M3 per-group scales
+        global_scale: scalar in `dtype`, the FP16/BF16 outer scale
+        weight_ref: (size_n, size_k) tensor in `dtype` = dequantized weight
+    """
+    fp4_weight = torch.randint(
+        0, 256, (size_n, size_k // 2), dtype=torch.uint8, device=device
+    )
+    scale_source = torch.randn((size_n, size_k), dtype=dtype, device=device)
+    # /6 = FP4 (E2M1) max; /448 = FP8 (E4M3) max — sets each level to its dtype's full range.
+    scales = scale_source.view(size_n, -1, group_size).abs().max(-1)[0] / 6
+    global_scale = scales.max() / 448
+    scales = (scales / global_scale).to(torch.float8_e4m3fn)
+
+    def _unpack(byte_view: torch.Tensor) -> torch.Tensor:
+        # Convert 4-bit E2M1 nibble (in upper bits of a uint8) to FP8 E4M3 bit pattern.
+        unpacked = (byte_view & 0b10000000) | ((byte_view & 0b01110000) >> 2)
+        return unpacked.view(torch.float8_e4m3fn).to(dtype) * (2**6)
+
+    part_low = _unpack(fp4_weight)
+    part_high = _unpack(fp4_weight << 4)
+
+    weight_ref = torch.cat([part_high.unsqueeze(2), part_low.unsqueeze(2)], 2).view(
+        size_n, size_k
+    )
+    weight_ref = (
+        weight_ref
+        * global_scale.to(dtype)
+        * scales.repeat_interleave(group_size, 1).to(dtype)
+    )
+
+    return fp4_weight, scales, global_scale, weight_ref

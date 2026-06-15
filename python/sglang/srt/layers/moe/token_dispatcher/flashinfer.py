@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils.common import require_mlp_tp_gather
 
 try:
     from flashinfer import nvfp4_block_scale_interleave
@@ -100,13 +101,23 @@ class FlashinferDispatcher(BaseDispatcher):
         # TODO: Can other moe runners use payload_in_workspace too?
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
 
-        # TODO: Can this be a server arg and shared with deepep/mooncakeep?
         # FlashInfer sizes the workspace from the maximum dispatched tokens per
         # EP rank. See FlashInfer's moe_a2a_get_workspace_size_per_rank(),
         # which reserves ep_size * max_num_tokens * payload bytes, and the C++
         # dispatch op's epSize * runtimeMaxTokensPerRank payload buffer.
+        #
+        # The workspace must fit both:
+        #  (a) the fattest prefill batch (bounded by chunked_prefill_size), and
+        #  (b) the largest decode batch (bounded by max_running_requests, which
+        #      _resolve_max_num_reqs caps at 4096 per DP worker).
+        # max_running_requests is not yet resolved at model-construction time,
+        # so we use 4096 as a floor to cover decode batches and _dummy_run
+        # (which warms up at batch_size = req_to_token_pool.size).
+        cps = get_global_server_args().chunked_prefill_size
+        default_max_tokens = max(cps if cps and cps > 0 else 4096, 4096)
         self.max_num_tokens = get_int_env_var(
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK",
+            default_max_tokens,
         )
 
         # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
@@ -200,6 +211,12 @@ class FlashinferDispatcher(BaseDispatcher):
             # DP attention: multiple DP ranks with different token counts.
             # Use the max across ranks so the A2A workspace fits the fattest.
             self.runtime_max_tokens_per_rank = max(dp_global)
+        elif self.ep_size > 1 and not require_mlp_tp_gather(get_global_server_args()):
+            # require_mlp_tp_gather is False, so the scheduler collapsed
+            # global_num_tokens to the local count; x.shape[0] then differs
+            # across EP ranks and breaks the fixed-geometry MoeAlltoAll. Use
+            # the static all-rank capacity instead.
+            self.runtime_max_tokens_per_rank = self.max_num_tokens
         else:
             # dp_size=1 or SP: use the actual input tensor size (post-scatter
             # in SP mode, full batch otherwise).  Avoids the pre-scatter

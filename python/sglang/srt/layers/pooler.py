@@ -107,7 +107,7 @@ def pool_at_delimiter_positions(
 
 def score_and_pool(
     score_head: nn.Module,
-    pooler: "Pooler",
+    pooler: Pooler,
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
     input_ids: torch.Tensor,

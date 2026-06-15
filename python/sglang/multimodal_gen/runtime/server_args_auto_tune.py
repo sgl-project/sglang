@@ -36,7 +36,7 @@ DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
 class ServerArgsAutoTuner:
     """Auto-tunes the server-arg for the given performance-mode, based on practical deployment experience with different model architectures"""
 
-    def __init__(self, server_args: "ServerArgs"):
+    def __init__(self, server_args: ServerArgs):
         self.server_args = server_args
         self._explicit_memory_policy = self._has_explicit_memory_policy()
         self._explicit_layerwise_replacement_policy = (
@@ -490,8 +490,10 @@ class ServerArgsAutoTuner:
 
     def _enable_cfg_parallel_if_supported(self) -> None:
         args = self.server_args
+        deployment_config = self._deployment_config()
         if (
-            args.enable_cfg_parallel is None
+            deployment_config.auto_enable_cfg_parallel
+            and args.enable_cfg_parallel is None
             and not self._has_explicit_parallel_policy()
             and args._model_default_uses_cfg()
         ):

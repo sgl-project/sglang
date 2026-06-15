@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
@@ -143,7 +144,10 @@ def pred_noise_to_pred_video(
     pred_noise = pred_noise.double().to(device)
     noise_input_latent = noise_input_latent.double().to(device)
     sigmas = scheduler.sigmas.double().to(device)
-    timesteps = scheduler.timesteps.double().to(device)
+    high_dtype = (
+        torch.float64 if current_platform.is_float64_supported() else torch.float32
+    )
+    timesteps = scheduler.timesteps.to(high_dtype).to(device)
     timestep_id = torch.argmin(
         (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
     )

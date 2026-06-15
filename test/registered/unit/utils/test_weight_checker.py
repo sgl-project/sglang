@@ -491,6 +491,7 @@ class TestHandle(_WeightCheckerTestBase):
         out = self.checker.handle("checksum")
         self.assertIsInstance(out, dict)
         self.assertIn("checksums", out)
+        self.assertIn("per_gpu_checksum", out)
         self.assertIn("parallelism_info", out)
 
     def test_unknown_action_raises(self):
@@ -582,7 +583,9 @@ class TestComputeChecksum(_ChecksumTestBase):
 
     def test_returns_dict_with_expected_top_level_keys(self):
         out = self.checker._compute_checksum()
-        self.assertEqual(set(out.keys()), {"checksums", "parallelism_info"})
+        self.assertEqual(
+            set(out.keys()), {"checksums", "per_gpu_checksum", "parallelism_info"}
+        )
 
     def test_skips_non_persistent_buffers(self):
         out = self.checker._compute_checksum()

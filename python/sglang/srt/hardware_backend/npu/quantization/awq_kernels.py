@@ -17,7 +17,7 @@ import torch_npu
 
 
 class AWQAscendLinearKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -72,7 +72,7 @@ class AWQAscendLinearKernel:
 
 
 class AWQAscendMoEKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
         self.kernel = NPUW4A16Int4DynamicMoEMethod()
 
@@ -151,7 +151,7 @@ class AWQAscendMoEKernel:
     def apply(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         return self.kernel.apply(layer, dispatch_output)
 
