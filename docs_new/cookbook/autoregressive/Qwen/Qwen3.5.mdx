@@ -62,7 +62,7 @@ import { benchmarks } from "/src/snippets/configs/qwen/qwen3.5-benchmarks.jsx";
 
 ## Playground
 
-The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits the recipes carried over from the legacy cookbook; the Playground lets you turn knobs on top of whichever cell the Deploy panel is currently showing — parallelism overrides (TP / CP / DP-Attention), MoE backend + EP (MoE variants only), the speculative-decoding presets (NEXTN ↔ EAGLE, or off), the reasoning / tool-call parsers, prefill/decode disaggregation, and HiCache tiers.
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits the recipes carried over from the legacy cookbook; the Playground lets you turn knobs on top of whichever cell the Deploy panel is currently showing — parallelism overrides (TP / CP / DP-Attention), MoE backend + EP (MoE variants only), the speculative-decoding preset (EAGLE / MTP, or off), the reasoning / tool-call parsers, prefill/decode disaggregation, and HiCache tiers.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -160,7 +160,7 @@ Qwen3.5 features a Gated Delta Networks combined with sparse Mixture-of-Experts 
 **Speculative decoding (MTP)**
 
 - The **Low-Latency** strategy bakes in the MTP speculative-decoding preset; it significantly reduces latency for interactive use cases. The **High-Throughput** strategy is the same recipe with speculative decoding off — on H100 a few combos also change TP (35B/27B BF16 run TP=2 with MTP vs TP=1 without; 122B FP8 runs TP=4 with MTP vs TP=2 without), which is why this lives in the Deploy matrix rather than only in the Playground.
-- Two MTP algorithms appear on this page: the **H200 / 397B / BF16 recipe was benchmarked with `NEXTN`** (see the Benchmark card), while the other cells carry the legacy generator's `EAGLE` preset. Use the **Speculative Decoding** card in the [Playground above](#playground) to swap one for the other on any cell, and submit your results.
+- MTP (speculative decoding) uses **EAGLE**. The verified H200 / 397B / BF16 recipe was benchmarked with `NEXTN`, which is an alias of EAGLE (same algorithm) — the page normalizes it to `EAGLE`. Use the **Speculative Decoding** card in the [Playground above](#playground) to toggle MTP on/off on any cell, and submit your results.
 
 **Mamba Radix Cache**
 

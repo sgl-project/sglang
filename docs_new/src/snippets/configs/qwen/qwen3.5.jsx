@@ -10,8 +10,8 @@
 // generator's output verbatim (token-level audited), whose recipes were
 // validated end-to-end by the cookbook owner. The H200 / 397B / BF16 /
 // low-latency cell additionally mirrors the command benchmarked on the old
-// page (NEXTN + CUDA IPC env, sglang "main branch") instead of the generator
-// default (EAGLE). Parser flags are deliberately absent from every cell —
+// page (CUDA IPC env, sglang "main branch"; the bench reported NEXTN, an
+// alias of EAGLE — normalized to EAGLE here). Parser flags are deliberately absent from every cell —
 // reasoning/tool-call parsers are a Playground feature, never part of
 // Deployment commands (DSv4 convention).
 
@@ -202,16 +202,13 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
 
-    // Both MTP algorithms appear on this page: the verified H200 recipe was
-    // benchmarked with NEXTN, while the legacy generator emitted EAGLE
-    // everywhere else. The presets let you swap one for the other on any cell.
+    // MTP via EAGLE. The verified H200 recipe was benchmarked with NEXTN, which
+    // is an alias of EAGLE (same algorithm) — normalized to EAGLE here so a
+    // single preset covers it. Toggle MTP on/off on any cell.
     speculative: {
       options: [
         { id: "current", label: "Inherited from base" },
         { id: "off",     label: "Off (greedy)" },
-        { id: "nextn",   label: "NEXTN / MTP",
-          flags: ["--speculative-algorithm NEXTN", "--speculative-num-steps 3",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
         { id: "eagle",   label: "EAGLE / MTP",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
@@ -263,8 +260,8 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
     // hardware; V2 emits `--mamba-scheduler-strategy extra_buffer`, V1 emits no
     // flag. Cells already bake each combo's value (V2 on most NVIDIA
     // low-latency cells, where MTP defaults to it; V1/no flag elsewhere —
-    // including the verified H200/397B/BF16 flagship, whose measured NEXTN
-    // command runs V1, so V1 is NOT force-disabled on low-latency: the page's
+    // including the verified H200/397B/BF16 flagship, whose measured command
+    // (NEXTN, an EAGLE alias) runs V1, so V1 is NOT force-disabled on low-latency: the page's
     // own verified cell proves MTP+V1 is valid). deriveFromBase recovers the
     // per-cell default; this axis lets users flip it. Gating faithful to cells:
     //   - hidden on dense variants (legacy showed it MoE-only);
@@ -308,7 +305,7 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
