@@ -516,5 +516,57 @@ class TestCaptureFlags(unittest.TestCase):
         self.assertEqual(get_flags().capture.enable_torch_compile, False)
 
 
+class TestB2DeclarativeRouting(unittest.TestCase):
+    """P2b: the B2 writes route through apply_model_overrides, use_mla projects into
+    flags.attn, and the flipped reader (get_flags().attn.use_mla_backend) equals the
+    legacy reader (get_global_server_args().use_mla_backend) — the equivalence the 6
+    draft_utils reader-flips rely on."""
+
+    def setUp(self):
+        reset_context()
+        self._clear_legacy()
+
+    def tearDown(self):
+        reset_context()
+        self._clear_legacy()
+
+    @staticmethod
+    def _clear_legacy():
+        import sglang.srt.server_args as sa
+
+        sa._global_server_args = None
+
+    def test_use_mla_flip_equivalence(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.server_args import get_global_server_args
+
+        sa = SimpleNamespace(use_mla_backend=False)
+        # B2 routing writes the legacy server_args field (the @555 dual-write) ...
+        apply_model_overrides(sa, {"use_mla_backend": True})
+        # ... and build_context projects the SAME value into flags.attn (P1c).
+        set_context(
+            build_context(
+                server_args=sa, parallel=ParallelContext(), use_mla_backend=True
+            )
+        )
+        # flip equivalence: the flipped reader == the legacy reader.
+        self.assertEqual(
+            get_flags().attn.use_mla_backend,
+            get_global_server_args().use_mla_backend,
+        )
+        self.assertTrue(get_flags().attn.use_mla_backend)
+
+    def test_b2_overrides_route_through_whitelist(self):
+        from types import SimpleNamespace
+
+        sa = SimpleNamespace(chunked_prefill_size=8192, disable_chunked_prefix_cache=False)
+        apply_model_overrides(
+            sa, {"chunked_prefill_size": -1, "disable_chunked_prefix_cache": True}
+        )
+        self.assertEqual(sa.chunked_prefill_size, -1)
+        self.assertTrue(sa.disable_chunked_prefix_cache)
+
+
 if __name__ == "__main__":
     unittest.main()

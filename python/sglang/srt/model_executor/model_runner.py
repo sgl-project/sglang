@@ -186,6 +186,7 @@ from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    apply_model_overrides,
     build_context,
     get_context,
     resolve_parallel_context,
@@ -557,8 +558,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         set_global_server_args_for_scheduler(server_args)
         global_server_args = get_global_server_args()
 
-        # FIXME: hacky set `use_mla_backend`
-        global_server_args.use_mla_backend = self.use_mla_backend
+        # Route the model-driven use_mla_backend write through the bounded override
+        # contract (Global Context P2b, bucket B2). Behaviour-identical to the old
+        # `global_server_args.use_mla_backend = ...` plus a whitelist check; kept as a
+        # POST-HOC dual-write (build_context projects use_mla into flags.attn, which
+        # the flipped readers now read). NB: use_mla_backend is also a method on
+        # ServerArgs (server_args.py:7714) — the flag lives in flags.attn, not here.
+        apply_model_overrides(
+            global_server_args, {"use_mla_backend": self.use_mla_backend}
+        )
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -1117,9 +1125,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def model_specific_adjustment(self):
         server_args = self.server_args
 
+        # Collect the model-driven B2 config overrides and route them through the
+        # bounded override contract in one call (Global Context P2b). The gating is
+        # preserved exactly; apply_model_overrides is a whitelist-checked setattr, so
+        # this is behaviour-identical to the old in-place `server_args.X = ...`.
+        b2_overrides = {}
+
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
-                server_args.chunked_prefill_size = -1
+                b2_overrides["chunked_prefill_size"] = -1
                 logger.info(
                     f"Automatically turn off --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"
@@ -1130,7 +1144,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or server_args.attention_backend
             not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
         ):
-            server_args.disable_chunked_prefix_cache = True
+            b2_overrides["disable_chunked_prefix_cache"] = True
+
+        if b2_overrides:
+            apply_model_overrides(server_args, b2_overrides)
 
         if not server_args.disable_chunked_prefix_cache:
             log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
