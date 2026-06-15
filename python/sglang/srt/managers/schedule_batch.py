@@ -70,10 +70,10 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.viewable_array import ViewableArray
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.managers.viewable_array import ViewableArray
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -713,9 +713,7 @@ class Req(ReqDllmMixin):
         self.token_buf = ViewableArray(origin_input_ids)
         self.origin_input_len: int = len(origin_input_ids)
         self.origin_input_ids_unpadded = (
-            origin_input_ids_unpadded
-            if origin_input_ids_unpadded
-            else origin_input_ids
+            origin_input_ids_unpadded if origin_input_ids_unpadded else origin_input_ids
         )  # Before image padding
         self.fill_len: int = 0
 

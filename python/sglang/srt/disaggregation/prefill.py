@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from array import array
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
