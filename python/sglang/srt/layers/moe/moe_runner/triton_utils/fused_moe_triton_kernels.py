@@ -673,7 +673,7 @@ def _set_triton_tma_allocator():
 
 # --- B TensorDescriptor cache (LRU) ---
 _B_DESC_CACHE_MAX = 64
-_B_DESC_CACHE: "OrderedDict[tuple, TensorDescriptor]" = OrderedDict()
+_B_DESC_CACHE: OrderedDict[tuple, TensorDescriptor] = OrderedDict()
 
 
 def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
