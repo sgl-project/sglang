@@ -42,6 +42,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
+    zero_attn_tp_scatter_padding,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
@@ -582,6 +583,9 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        attn_output = zero_attn_tp_scatter_padding(
+            attn_output, forward_batch.extend_num_tokens
+        )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None

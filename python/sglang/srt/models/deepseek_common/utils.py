@@ -18,6 +18,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.moe.fused_moe_triton.layer import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -69,6 +70,28 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "ascend",
     "intel_xpu",
 ]
+
+
+def zero_attn_tp_scatter_padding(
+    attn_output: torch.Tensor, extend_num_tokens: Optional[int]
+) -> torch.Tensor:
+    """Zero TP-scatter padding rows that attention kernels may leave dirty.
+
+    When `input_scattered` is enabled, `prepare_attn_tp_scatter_input` pads the
+    token count to be divisible by the TP world size. Attention backends only
+    compute the valid rows described by `qo_indptr`, so the trailing padded rows
+    may retain uninitialized `torch.empty` data. Those garbage values can then
+    flow into later collectives / projections and corrupt valid tokens. This is
+    especially harmful with FP8 KV cache because stale uint8 pool contents can
+    be reinterpreted as NaN/Inf.
+    """
+    if not get_attn_tp_context().input_scattered:
+        return attn_output
+
+    if extend_num_tokens is not None and extend_num_tokens < attn_output.shape[0]:
+        attn_output[extend_num_tokens:] = 0
+
+    return attn_output
 
 
 def awq_dequantize_func():
