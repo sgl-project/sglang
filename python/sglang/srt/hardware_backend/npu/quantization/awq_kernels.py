@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4MoEMethod,
 )
 import torch_npu
+import torch.nn.functional as F
 
 
 class AWQAscendLinearKernel:
@@ -126,12 +127,8 @@ class AWQAscendLinearKernel:
             return out.reshape(out_shape)
         else:
             # fallback: weight is (N, K) float
-            weight = layer.weight   # (N, K)
-            out_shape = x.shape[:-1] + (weight.shape[0],)
-            out = torch.matmul(reshaped_x, weight.t())   # x (..., K) @ weight.t() (K, N)
-            if bias is not None:
-                out = out + bias.to(out.dtype)
-            return out.reshape(out_shape)
+            out = F.linear(x, layer.weight, bias)
+            return out
 
 
 class AWQAscendMoEKernel:
