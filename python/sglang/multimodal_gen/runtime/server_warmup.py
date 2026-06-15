@@ -100,14 +100,14 @@ def _resolve_default_warmup_resolution(
     server_args: ServerArgs,
     sampling_defaults: SamplingParams,
 ) -> tuple[int, int]:
-    supported_resolutions = sampling_defaults.supported_resolutions
-    if supported_resolutions:
-        return min(supported_resolutions, key=lambda size: size[0] * size[1])
-
     width = sampling_defaults.width
     height = sampling_defaults.height
     if width is not None and height is not None:
         return width, height
+
+    supported_resolutions = sampling_defaults.supported_resolutions
+    if supported_resolutions:
+        return min(supported_resolutions, key=lambda size: size[0] * size[1])
 
     if server_args.pipeline_config.task_type.is_image_gen():
         return DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION

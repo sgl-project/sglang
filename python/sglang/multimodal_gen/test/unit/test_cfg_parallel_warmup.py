@@ -171,6 +171,35 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(req.width, 640)
         self.assertEqual(req.height, 640)
 
+    def test_server_based_warmup_prefers_explicit_model_default_resolution(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+
+        task_type = MagicMock()
+        task_type.requires_image_input.return_value = False
+        task_type.accepts_image_input.return_value = False
+        task_type.is_image_gen.return_value = False
+        task_type.data_type.return_value = ModelTaskType.T2V.data_type()
+        server_args.pipeline_config.task_type = task_type
+
+        sampling_defaults = SamplingParams(width=1280, height=720)
+        sampling_defaults.supported_resolutions = [(720, 1280), (1280, 720)]
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        req = reqs[0]
+        self.assertEqual(req.width, 1280)
+        self.assertEqual(req.height, 720)
+
     def test_server_based_warmup_keeps_lightweight_image_fallback(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
