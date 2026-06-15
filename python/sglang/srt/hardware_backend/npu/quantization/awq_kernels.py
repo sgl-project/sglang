@@ -56,28 +56,31 @@ class AWQAscendLinearKernel:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qweight = layer.weight          # shape: (K, N // pack_factor)
-        scales = layer.scales           # shape: (N, 1) or (N, num_groups)
+        qweight = layer.weight          # shape: (N, K // pack_factor)
+        scales = layer.scales           # shape: (N, 1) or (N, K // group_size)
         qzeros = layer.zeros
-        pack_factor = self.quant_config.pack_factor   # 8 for 4‑bit
-        out_shape = x.shape[:-1] + (qweight.shape[1] * pack_factor,)
+        pack_factor = self.quant_config.pack_factor
+        out_shape = x.shape[:-1] + (qweight.shape[0],)   # N = qweight.shape[0]
         reshaped_x = x.reshape(-1, x.shape[-1])
     
-        # Input features (K) from the first dimension of the weight
-        K = qweight.shape[0]
-        # Output features (N) from the second dimension * pack_factor
-        # N = qweight.shape[1] * pack_factor   # not needed directly
+        # Input features K (derived from packed weight)
+        K = qweight.shape[1] * pack_factor
     
-        # Derive group_size from the scale tensor
+        # Derive group_size from the scale tensor shape
         if scales.ndim == 2 and scales.shape[1] == 1:
-            group_size = 0                     # per‑channel
+            group_size = 0              # per‑channel
         elif scales.ndim == 2:
-            num_groups = scales.shape[1]
+            num_groups = scales.shape[1]      # = K // group_size
             if K % num_groups != 0:
                 raise RuntimeError(
-                    f"Input features {K} not divisible by scale groups {num_groups}"
+                    f"K={K} not divisible by scale groups {num_groups}"
                 )
             group_size = K // num_groups
+            # NPU constraint: group_size must be multiple of 32, between 32 and K-1
+            if group_size % 32 != 0 or not (32 <= group_size <= K - 1):
+                raise RuntimeError(
+                    f"Derived group_size={group_size} is invalid for NPU"
+                )
         else:
             raise RuntimeError(f"Unexpected scale tensor shape: {scales.shape}")
     
