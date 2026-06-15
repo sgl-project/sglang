@@ -9,7 +9,6 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
 from sgl_kernel_npu.mamba.causal_conv1d import (
     causal_conv1d_fn_npu,
     causal_conv1d_update_npu,
-    causal_conv1d_update_v2,
 )
 import sgl_kernel_npu
 
@@ -116,18 +115,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        '''
-        conv_states_tmp = conv_states.transpose(1, 2).clone()
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states_tmp,
-            layer.conv_weights,
-            layer.bias,
-            layer.activation,
-            conv_state_indices=cache_indices,
-        )
-        conv_states[:] = conv_states_tmp.transpose(1, 2)
-        '''
         mixed_qkv = torch.ops.npu.causal_conv1d(
             mixed_qkv,
             layer.conv_weights.transpose(0, 1).contiguous(),
@@ -241,13 +228,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 and forward_batch.mamba_track_mask.any()
             ):
                 conv_dst = forward_batch.mamba_track_indices
-                mixed_qkv_to_track = mixed_qkv[
-                    :, forward_metadata.track_conv_indices
-                ]
+                mixed_qkv_to_track = mixed_qkv[:, forward_metadata.track_conv_indices]
                 mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
                 conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
             kernel_size = layer.conv_weights.shape[-1]
-            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :].contiguous()
+            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
             mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
                 layer.conv_weights.transpose(0, 1).contiguous(),
