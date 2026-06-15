@@ -471,6 +471,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
             and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
             and _gdn_use_alt_stream
         ):
@@ -850,6 +851,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
             and _qknorm_use_alt_stream
         ):
             current_stream = torch.cuda.current_stream()

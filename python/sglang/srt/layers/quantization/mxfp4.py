@@ -170,47 +170,41 @@ def _patch_sm120_mxfp4_min_warps():
     if _sm120_mxfp4_min_warps_patched:
         return
 
-    import inspect
-
-    from triton_kernels.matmul_ogs_details.opt_flags_details import opt_flags_nvidia
-    from triton_kernels.tensor import get_layout
+    from triton_kernels.matmul_details.opt_flags_details import opt_flags_nvidia
+    from triton_kernels.tensor import Tensor
     from triton_kernels.tensor_details.layout import StridedLayout
 
     compute_num_warps = opt_flags_nvidia.compute_num_warps
-    params = inspect.signature(compute_num_warps).parameters
+    if getattr(compute_num_warps, "_sglang_sm120_mxfp4_min_warps", False):
+        _sm120_mxfp4_min_warps_patched = True
+        return
 
-    if "is_persistent" in params and not getattr(
-        compute_num_warps, "_sglang_sm120_mxfp4_patch", False
+    def _compute_num_warps_sm120_mxfp4(
+        block_m, block_n, is_persistent, precision_config, constraints
     ):
-
-        def _compute_num_warps_sm120_mxfp4(
-            block_m, block_n, is_persistent, precision_config
+        selected_num_warps = compute_num_warps(
+            block_m, block_n, is_persistent, precision_config, constraints
+        )
+        weight_scale = getattr(precision_config, "b_mx_scale", None)
+        weight_scale_layout = (
+            weight_scale.storage.layout if isinstance(weight_scale, Tensor) else None
+        )
+        if (
+            not is_persistent
+            and weight_scale is not None
+            and isinstance(weight_scale_layout, StridedLayout)
         ):
-            selected_num_warps = compute_num_warps(
-                block_m, block_n, is_persistent, precision_config
-            )
-            weight_scale = getattr(precision_config, "weight_scale", None)
-            weight_scale_layout = get_layout(weight_scale)
-            if (
-                not is_persistent
-                and weight_scale is not None
-                and (
-                    weight_scale_layout is StridedLayout
-                    or isinstance(weight_scale_layout, StridedLayout)
-                )
-            ):
-                return max(selected_num_warps, 4)
-            return selected_num_warps
+            return max(selected_num_warps, 4)
+        return selected_num_warps
 
-        _compute_num_warps_sm120_mxfp4._sglang_sm120_mxfp4_patch = True
-        opt_flags_nvidia.compute_num_warps = _compute_num_warps_sm120_mxfp4
-
+    _compute_num_warps_sm120_mxfp4._sglang_sm120_mxfp4_min_warps = True
+    opt_flags_nvidia.compute_num_warps = _compute_num_warps_sm120_mxfp4
     _sm120_mxfp4_min_warps_patched = True
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
-    import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+    import triton_kernels.matmul_details.opt_flags as opt_flags
     from triton_kernels.numerics import InFlexData
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout
@@ -218,12 +212,12 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     if is_sm120_supported():
         # SM120 desktop Blackwell does not support the persistent/TMA MXFP4 path.
         # This MXFP4 path uses StridedLayout and the non-persistent kernel.
-        _patch_sm120_mxfp4_min_warps()
         from triton_kernels.tensor_details.layout import StridedLayout
 
-        value_layout = StridedLayout
+        _patch_sm120_mxfp4_min_warps()
+        value_layout = StridedLayout(-2)
         value_layout_opts = {}
-        scale_layout = StridedLayout
+        scale_layout = StridedLayout(-2)
         scale_layout_opts = {}
         constraints = {
             "is_persistent": False,
@@ -231,14 +225,12 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         }
         opt_flags.update_opt_flags_constraints(constraints)
     else:
-        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-            mx_axis=1
+        value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+        value_layout_opts = {}
+        scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+            mx_axis=-2, num_warps=num_warps
         )
-        scale_layout, scale_layout_opts = (
-            layout.make_default_matmul_mxfp4_w_scale_layout(
-                mx_axis=1, num_warps=num_warps
-            )
-        )
+        scale_layout_opts = {}
         if is_sm100_supported():
             constraints = {
                 "is_persistent": True,
@@ -855,7 +847,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_triton_kernels:
 
-            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+            from triton_kernels.matmul import FlexCtx, PrecisionConfig
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
             w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
@@ -873,10 +865,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
             )
             self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
             )
 
             self.w13_weight_triton_tensor = w13_weight

@@ -1,6 +1,6 @@
 import math
 import sys
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import pytest
 import torch
@@ -370,27 +370,23 @@ def test_convert_vertical_slash_indexes_mergehead(causal):
         )
     )
 
-    # Manually create expected outputs for this input
-    # For demonstration, assume:
-    # - batch=1, head=2, num_rows=2, nnz_v=2, nnz_s=2
-    # Fill these expected tensors according to your kernel's behavior
-
-    expected_column_index = torch.tensor(
-        [[[[1, 0], [1, 3]], [[-1079459945, -1077788999], [-1080050043, -1104625879]]]],
-        dtype=torch.int32,
-        device="cuda",
-    )
+    # column_index is torch.empty-backed; only entries before column_count are valid.
+    expected_column_count = torch.zeros((1, 2, 2), dtype=torch.int32, device="cuda")
+    expected_column_index = [[[[], []], [[], []]]]
 
     if not causal:
-        # If non-causal mode output is different, update these values
-        expected_column_index = torch.tensor(
-            [[[[1, 0], [1, 3]], [[2, -1077788999], [2, -1104625879]]]],
-            dtype=torch.int32,
-            device="cuda",
+        expected_column_count = torch.tensor(
+            [[[1, 2], [1, 1]]], dtype=torch.int32, device="cuda"
         )
+        expected_column_index = [[[[1], [1, 3]], [[2], [2]]]]
 
-    # Assert that outputs match expectations
-    assert torch.equal(column_index, expected_column_index)
+    assert torch.equal(column_count, expected_column_count)
+    for batch_idx, batch_expected in enumerate(expected_column_index):
+        for head_idx, head_expected in enumerate(batch_expected):
+            for row_idx, expected_values in enumerate(head_expected):
+                count = int(column_count[batch_idx, head_idx, row_idx].item())
+                actual = column_index[batch_idx, head_idx, row_idx, :count].tolist()
+                assert actual == expected_values
 
 
 # skip cause use fa2 for test

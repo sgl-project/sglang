@@ -61,7 +61,9 @@ echo "NVCC_THREADS:   ${NVCC_THREADS:-32}"
 echo "USE_CCACHE:     ${USE_CCACHE:-1}"
 echo "RESET_BUILDER:  ${RESET_BUILDER:-0}"
 echo "GITHUB_ARTIFACTORY: ${GITHUB_ARTIFACTORY:-github.com}"
-echo "PYTORCH_INDEX_BASE: ${PYTORCH_INDEX_BASE:-https://download.pytorch.org/whl}"
+# TEMP: use the PyTorch test index for PR CI until torch 2.12.1 CUDA
+# wheels are available on the normal PyTorch index.
+echo "PYTORCH_INDEX_BASE: ${PYTORCH_INDEX_BASE:-https://download.pytorch.org/whl/test}"
 echo "PIP_DEFAULT_INDEX:  ${PIP_DEFAULT_INDEX:-https://pypi.python.org/simple}"
 echo "YUM_MIRROR:         ${YUM_MIRROR:-(upstream)}"
 echo "----------------------------------------"

@@ -62,7 +62,7 @@ env:
   SGLANG_ENABLE_ASYNC_ASSERT: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
+  # TEMP: rebuild deepep against the new torch for torch-212-merge PR only; revert before merging to main.
   FORCE_REBUILD_DEEPEP: '1'
 
 permissions:
@@ -263,7 +263,10 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+          # TEMP: use the PyTorch test CUDA index until torch 2.12.1 wheels are
+          # available on the normal PyTorch index. Keep this on cu130 to match
+          # the default PyPI torch wheel behavior more closely than +cpu.
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow --extra-index-url https://download.pytorch.org/whl/test/cu130
 
       - name: Run test
         timeout-minutes: 60
