@@ -579,6 +579,25 @@ class MultimodalInputs:
     def contains_mm_input(self) -> bool:
         return any(True for item in self.mm_items if item.is_valid())
 
+    def compute_mm_token_counts(self) -> Tuple[int, int, int]:
+        """Count prompt tokens consumed by each modality (image, audio, video).
+
+        A modality's token count is the total span covered by its items'
+        offsets. Returns a (image_tokens, audio_tokens, video_tokens) tuple.
+        """
+        image_tokens = audio_tokens = video_tokens = 0
+        for item in self.mm_items:
+            if not item.offsets:
+                continue
+            num_tokens = sum(end - start + 1 for start, end in item.offsets)
+            if item.is_image():
+                image_tokens += num_tokens
+            elif item.is_audio():
+                audio_tokens += num_tokens
+            elif item.is_video():
+                video_tokens += num_tokens
+        return image_tokens, audio_tokens, video_tokens
+
     def merge(self, other: MultimodalInputs):
         """
         merge image inputs when requests are being merged
@@ -811,6 +830,11 @@ class Req(ReqDllmMixin):
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        # Pre-computed multimodal prompt token counts; populated on the prefill
+        # node and transferred to decode via the metadata buffer in disagg (PD) mode.
+        self.mm_image_tokens: int = 0
+        self.mm_audio_tokens: int = 0
+        self.mm_video_tokens: int = 0
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
