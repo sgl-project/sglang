@@ -177,8 +177,9 @@ class FunctionCallParser:
         tool_call_list = parsed_result.calls
         if tool_call_list:
             return parsed_result.normal_text, tool_call_list
-        else:
-            return full_text, []
+        if self.detector.compatibility.records or self.detector.compatibility.dropped:
+            return parsed_result.normal_text, []
+        return full_text, []
 
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """

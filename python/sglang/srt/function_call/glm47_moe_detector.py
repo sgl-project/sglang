@@ -7,6 +7,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import (
+    CompatibilityEvent,
+    synthesize_json_close,
+)
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -220,30 +224,40 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         # Parse tool calls
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
+        if not match_result_list:
+            self.compatibility.note(
+                CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                detail=text[text.find(self.bot_token) : text.find(self.bot_token) + 80],
+            )
+            return StreamingParseResult(normal_text=text, calls=[])
         calls = []
-        try:
-            for match_result in match_result_list:
-                # Get function name
-                func_detail = self.func_detail_regex.search(match_result)
-                if func_detail is None:
+        for match_result in match_result_list:
+            # Get function name
+            func_detail = self.func_detail_regex.search(match_result)
+            if func_detail is None:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=match_result[:80],
+                )
+                continue
+            func_name = func_detail.group(1) if func_detail.group(1) else ""
+            func_args = func_detail.group(2) if func_detail.group(2) else ""
+            arguments = {}
+            if func_args:
+                pairs = self.func_arg_regex.findall(func_args)
+                if not pairs:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=func_args[:80],
+                    )
                     continue
-                func_name = func_detail.group(1) if func_detail.group(1) else ""
-                func_args = func_detail.group(2) if func_detail.group(2) else ""
-                arguments = {}
-                if func_args:
-                    pairs = self.func_arg_regex.findall(func_args)
-                    # Parse arguments using shared method
-                    arguments = self._parse_argument_pairs(pairs, func_name, tools)
+                # Parse arguments using shared method
+                arguments = self._parse_argument_pairs(pairs, func_name, tools)
 
-                # construct match_result for parse_base_json
-                match_result = {"name": func_name, "parameters": arguments}
-                calls.extend(self.parse_base_json(match_result, tools))
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
-        except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
-            self._note_malformed_tool_call(e)
-            # return the normal text if parsing fails
-            return StreamingParseResult(normal_text=text)
+            # construct match_result for parse_base_json
+            match_result = {"name": func_name, "parameters": arguments}
+            calls.extend(self.parse_base_json(match_result, tools))
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
         """Get parameter type from tool definition, with fallback to auto-detection.
@@ -312,15 +326,18 @@ class Glm47MoeDetector(BaseFormatDetector):
             # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
-            try:
-                num = _convert_to_number(value.strip() if value else "")
-                return str(num)
-            except (ValueError, AttributeError):
-                # Fallback to string if not a valid number
+            raw = value.strip() if value else ""
+            num = _convert_to_number(raw)
+            if isinstance(num, str):
                 logger.warning(
                     f"Failed to parse '{value}' as number, treating as string"
                 )
+                self.compatibility.note(
+                    CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                    detail=f"number: {value[:80]}",
+                )
                 return json.dumps(str(value) if value else "", ensure_ascii=False)
+            return str(num)
         else:
             # For object/array types, return as-is (should already be valid JSON)
             return value
@@ -566,6 +583,13 @@ class Glm47MoeDetector(BaseFormatDetector):
             List of tool call items to add
         """
         calls = []
+        pairs = self.func_arg_regex.findall(func_args_raw)
+        malformed_args = bool(func_args_raw.strip()) and not pairs
+        if malformed_args:
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=func_args_raw[:80],
+            )
 
         # Handle no-arg function or need to close braces
         if self._is_first_param and not self._sent_empty_object:
@@ -579,6 +603,21 @@ class Glm47MoeDetector(BaseFormatDetector):
             )
             self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
+            self._sent_empty_object = True
+        elif malformed_args and not self._sent_empty_object:
+            closing_brace = synthesize_json_close(self._last_arguments)
+            if closing_brace is None:
+                closing_brace = "}"
+            if closing_brace:
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=None,
+                        parameters=closing_brace,
+                    )
+                )
+                self._last_arguments += closing_brace
+                self.streamed_args_for_tool[self.current_tool_id] += closing_brace
             self._sent_empty_object = True
         elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
             # Need to close brace
@@ -596,15 +635,17 @@ class Glm47MoeDetector(BaseFormatDetector):
         # Parse final arguments
         if func_args_raw:
             try:
-                pairs = self.func_arg_regex.findall(func_args_raw)
                 if pairs:
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
                     self.prev_tool_call_arr[self.current_tool_id][
                         "arguments"
                     ] = arguments
-            except Exception as e:
+            except (json.JSONDecodeError, ValueError) as e:
                 logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
-                self._note_malformed_tool_call(e, detail=func_args_raw[:80])
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=func_args_raw[:80],
+                )
 
         # Clean buffer
         self._buffer = current_text[match_end_pos:]
@@ -668,81 +709,79 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._tool_indices = self._get_tool_indices(tools)
 
         calls: list[ToolCallItem] = []
-        try:
-            # Try to match a partial or complete tool call
-            # Use a single flexible regex pattern that handles all cases
-            partial_match = re.search(
-                r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)",
-                current_text,
-                re.DOTALL,
+        # Try to match a partial or complete tool call
+        # Use a single flexible regex pattern that handles all cases
+        partial_match = re.search(
+            r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)",
+            current_text,
+            re.DOTALL,
+        )
+
+        if not partial_match:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        # Extract match groups using helper method
+        func_name, func_args_raw, is_tool_end = self._extract_match_groups(
+            partial_match
+        )
+        if func_name not in self._tool_indices and self._skip_unknown_tool(func_name):
+            if is_tool_end == self.eot_token:
+                self._buffer = current_text[partial_match.end() :]
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+        # Initialize tool call state if needed (keeping existing logic)
+        if self.current_tool_id == -1:
+            self.current_tool_id = 0
+            self.prev_tool_call_arr = []
+            self.streamed_args_for_tool = [""]
+            self._streamed_raw_length = 0
+            self.current_tool_name_sent = False  # Reset for new tool call
+            self._reset_streaming_state()
+        # Check if this is a continuation of an existing tool call or a new one
+        elif not self.current_tool_name_sent:
+            # Only increment tool_id if we're truly starting a NEW tool call
+            # Don't increment if this is just the first time we're processing
+            # a tool call that was received in the buffer
+            # The key insight: only increment when we've COMPLETED a previous tool call
+            # and now see another bot_token in new_text
+            pass  # Remove the problematic auto-increment logic
+
+        # Ensure tracking arrays are large enough (keeping existing logic)
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+
+        # Determine if function name is complete by checking for <arg_key> in the full text
+        # This is important for streaming scenarios where args come in later chunks
+        has_arg_key = "<arg_key" in current_text
+
+        # Send tool name if needed
+        tool_name_item = self._send_tool_name_if_needed(
+            func_name, has_arg_key, is_tool_end
+        )
+        if tool_name_item:
+            calls.append(tool_name_item)
+
+        # Process streaming arguments if tool name has been sent
+        if self.current_tool_name_sent:
+            arg_item = self._process_arguments_streaming(
+                func_name, func_args_raw, tools
             )
+            if arg_item:
+                calls.append(arg_item)
 
-            if not partial_match:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
-
-            # Extract match groups using helper method
-            func_name, func_args_raw, is_tool_end = self._extract_match_groups(
-                partial_match
-            )
-
-            # Initialize tool call state if needed (keeping existing logic)
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
-                self._streamed_raw_length = 0
-                self.current_tool_name_sent = False  # Reset for new tool call
-                self._reset_streaming_state()
-            # Check if this is a continuation of an existing tool call or a new one
-            elif not self.current_tool_name_sent:
-                # Only increment tool_id if we're truly starting a NEW tool call
-                # Don't increment if this is just the first time we're processing
-                # a tool call that was received in the buffer
-                # The key insight: only increment when we've COMPLETED a previous tool call
-                # and now see another bot_token in new_text
-                pass  # Remove the problematic auto-increment logic
-
-            # Ensure tracking arrays are large enough (keeping existing logic)
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
-
-            # Determine if function name is complete by checking for <arg_key> in the full text
-            # This is important for streaming scenarios where args come in later chunks
-            has_arg_key = "<arg_key" in current_text
-
-            # Send tool name if needed
-            tool_name_item = self._send_tool_name_if_needed(
-                func_name, has_arg_key, is_tool_end
-            )
-            if tool_name_item:
-                calls.append(tool_name_item)
-
-            # Process streaming arguments if tool name has been sent
-            if self.current_tool_name_sent:
-                arg_item = self._process_arguments_streaming(
-                    func_name, func_args_raw, tools
+            # Finalize tool call if end token is encountered
+            if is_tool_end == self.eot_token and not self._tool_call_completed:
+                finalize_calls = self._finalize_tool_call(
+                    func_name,
+                    func_args_raw,
+                    tools,
+                    partial_match.end(),
+                    current_text,
                 )
-                if arg_item:
-                    calls.append(arg_item)
-
-                # Finalize tool call if end token is encountered
-                if is_tool_end == self.eot_token and not self._tool_call_completed:
-                    finalize_calls = self._finalize_tool_call(
-                        func_name,
-                        func_args_raw,
-                        tools,
-                        partial_match.end(),
-                        current_text,
-                    )
-                    calls.extend(finalize_calls)
-                    return StreamingParseResult(normal_text=normal_text, calls=calls)
-
-        except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
-            self._note_malformed_tool_call(e)
-            return StreamingParseResult(normal_text=current_text)
+                calls.extend(finalize_calls)
+                return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
@@ -778,10 +817,29 @@ class Glm47MoeDetector(BaseFormatDetector):
                 # If type is not defined, keep the parsed value as-is
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
             else:
+                if not self._matches_expected_type(parsed_value, arg_type):
+                    self.compatibility.note(
+                        CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                        detail=f"{func_name}.{arg_key}: {arg_value[:80]}",
+                    )
                 # For other types (number, object, array, etc.), use parsed value
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
 
         return arguments
+
+    @staticmethod
+    def _matches_expected_type(value: Any, arg_type: str) -> bool:
+        if arg_type in ("integer", "int"):
+            return isinstance(value, int) and not isinstance(value, bool)
+        if arg_type == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if arg_type in ("boolean", "bool"):
+            return isinstance(value, bool)
+        if arg_type == "object":
+            return isinstance(value, dict)
+        if arg_type in ("array", "list"):
+            return isinstance(value, list)
+        return True
 
     def supports_structural_tag(self) -> bool:
         return False

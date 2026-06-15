@@ -16,10 +16,9 @@ except ImportError:
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.compatibility import (
+    CompatibilityContext,
     CompatibilityEvent,
-    CompatibilityMode,
     CompatibilityRecord,
-    CompatibilityViolation,
     synthesize_json_close,
 )
 from sglang.srt.function_call.core_types import (
@@ -28,6 +27,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import (
+    _closed_top_level_json_end,
     _find_common_prefix,
     _is_complete_json,
     _partial_json_loads,
@@ -57,14 +57,19 @@ class BaseFormatDetector(ABC):
         # Critical for serving layer to calculate remaining content when streaming ends.
         # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
         self.streamed_args_for_tool: List[str] = []
+        # True after the detector has accepted the outer tool-call marker and
+        # remains inside the model's multi-call sequence. This lets separator
+        # continuations survive dropped malformed/unknown entries, including
+        # when the separator and next call arrive in different chunks.
+        self._in_tool_call_sequence: bool = False
 
         # Token configuration (override in subclasses)
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
 
-        # Compatibility-mode policy: the audit trail of tolerances applied to this request.
-        self.compatibility = CompatibilityMode()
+        # Compatibility-mode policy and audit trail.
+        self.compatibility = CompatibilityContext()
 
     @property
     def compatibility_records(self) -> List[CompatibilityRecord]:
@@ -174,20 +179,74 @@ class BaseFormatDetector(ABC):
         )
         return True
 
-    def _note_malformed_tool_call(self, error: Exception, *, detail: str = "") -> None:
-        """Record a detector-local parse fallback.
+    def _consume_leading_eot_token(self, text: str) -> str:
+        if self.eot_token and text.startswith(self.eot_token):
+            self._in_tool_call_sequence = False
+            return text[len(self.eot_token) :]
+        return text
 
-        Detectors that can locally recover from malformed model output call
-        this before returning their legacy fallback. In strict mode the note
-        raises ``CompatibilityViolation`` and the ``FunctionCallParser``
-        boundary performs fail-open recovery.
-        """
-        if isinstance(error, CompatibilityViolation):
-            raise error
+    def _starts_with_tool_call_separator(self, text: str) -> bool:
+        return bool(
+            self.tool_call_separator and text.startswith(self.tool_call_separator)
+        )
+
+    def _has_tool_call_sequence_context(self) -> bool:
+        """Whether a leading separator can belong to the active tool-call sequence."""
+        return self._in_tool_call_sequence or self.current_tool_name_sent
+
+    def _should_retry_buffer(self, previous_text: str) -> bool:
+        return bool(self._buffer and self._buffer != previous_text)
+
+    def _retry_streaming_tail(
+        self,
+        previous_text: str,
+        calls: List[ToolCallItem],
+        tools: List[Tool],
+    ) -> StreamingParseResult:
+        if not self._should_retry_buffer(previous_text):
+            return StreamingParseResult(calls=calls)
+        tail_result = self.parse_streaming_increment("", tools)
+        return StreamingParseResult(
+            normal_text=tail_result.normal_text,
+            calls=[*calls, *tail_result.calls],
+        )
+
+    def _drop_completed_malformed_entry(
+        self, current_text: str, start_idx: int, end_idx: int, detail: str
+    ) -> bool:
         self.compatibility.note(
             CompatibilityEvent.MALFORMED_JSON_DROPPED,
-            detail=detail or str(error)[:120],
+            detail=detail[:80],
         )
+        self._buffer = self._consume_leading_eot_token(
+            current_text[start_idx + end_idx :]
+        )
+        self.current_tool_name_sent = False
+        return self._should_retry_buffer(current_text)
+
+    def _close_started_malformed_call(self) -> List[ToolCallItem]:
+        """Finish a call whose name was already streamed before its body failed."""
+        if not self.current_tool_name_sent:
+            return []
+
+        tid = self.current_tool_id
+        self.current_tool_name_sent = False
+        if tid < 0:
+            return []
+
+        while len(self.streamed_args_for_tool) <= tid:
+            self.streamed_args_for_tool.append("")
+
+        calls = self._close_mid_stream_call()
+        if not self.streamed_args_for_tool[tid]:
+            calls.append(ToolCallItem(tool_index=tid, parameters="{}"))
+            self.streamed_args_for_tool[tid] = "{}"
+            while len(self.prev_tool_call_arr) <= tid:
+                self.prev_tool_call_arr.append({})
+            self.prev_tool_call_arr[tid]["arguments"] = {}
+
+        self.current_tool_id = tid + 1
+        return calls
 
     def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
@@ -196,7 +255,21 @@ class BaseFormatDetector(ABC):
 
         results = []
         for act in action:
+            if not isinstance(act, dict):
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=repr(act)[:80],
+                )
+                continue
+
             name = act.get("name")
+            if not name:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=repr(act)[:80],
+                )
+                continue
+
             if not (name and name in tool_indices):
                 if self._skip_unknown_tool(name):
                     continue
@@ -269,201 +342,300 @@ class BaseFormatDetector(ABC):
 
         For incompatible formats, detectors should override this method with custom logic.
         """
-        # Append new text to buffer
         self._buffer += new_text
-        current_text = self._buffer
+        emitted_calls: List[ToolCallItem] = []
 
-        # The current_text has tool_call if it is the start of a new tool call sequence
-        # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
-        if not (
-            self.has_tool_call(current_text)
-            or (
-                self.current_tool_id > 0
-                and current_text.startswith(self.tool_call_separator)
+        def empty_or_emitted() -> StreamingParseResult:
+            return (
+                StreamingParseResult(calls=emitted_calls)
+                if emitted_calls
+                else StreamingParseResult()
             )
-        ):
-            normal_text, self._buffer = self._hold_back_partial_tokens(
-                current_text, (self.bot_token,)
-            )
-            if self.eot_token in normal_text:
-                normal_text = normal_text.replace(self.eot_token, "")
-            return StreamingParseResult(normal_text=normal_text)
 
-        # Build tool indices if not already built
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
-        flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
-
-        try:
-            # Priority check: if we're processing a subsequent tool (current_tool_id > 0),
-            # first check if text starts with the tool separator. This is critical for
-            # parallel tool calls because the bot_token (e.g., '[') can also
-            # appear inside array parameters of the current tool, and we must not
-            # mistakenly identify that as the start of a new tool.
-            used_separator_branch = False
-            if self.current_tool_id > 0 and current_text.startswith(
-                self.tool_call_separator
+        # A completed bad entry can be consumed without emitting output. Keep
+        # reparsing so a same-chunk tail can still produce the next call:
+        # '<tool_call>{"name":"bad","arguments":{}}, {"name":"get_weather",...}'
+        # becomes ', {"name":"get_weather",...}' after the drop.
+        while True:
+            current_text = self._buffer
+            if (
+                self._in_tool_call_sequence
+                and self.eot_token
+                and current_text.startswith(self.eot_token)
             ):
-                start_idx = len(self.tool_call_separator)
-                used_separator_branch = True
-            else:
-                tool_call_pos = current_text.find(self.bot_token)
-                if tool_call_pos != -1:
-                    start_idx = tool_call_pos + len(self.bot_token)
-                else:
-                    start_idx = 0
+                self._buffer = self._consume_leading_eot_token(current_text)
+                if self._buffer:
+                    continue
+                return StreamingParseResult(calls=emitted_calls)
 
-            if start_idx >= len(current_text):
-                return StreamingParseResult()
+            # If the first entry was dropped, current_tool_id may still be -1
+            # while the buffer starts with ', {"name":"get_weather",...}'.
+            # The outer marker was already accepted, so the comma is sequence
+            # syntax rather than normal text.
+            starts_with_sequence_separator = (
+                self._starts_with_tool_call_separator(current_text)
+                and self._has_tool_call_sequence_context()
+            )
+            has_tool_call = self.has_tool_call(current_text)
+
+            # Parse when a marker starts a sequence, or a leading separator
+            # keeps consuming entries from the current sequence.
+            if not (has_tool_call or starts_with_sequence_separator):
+                normal_text, self._buffer = self._hold_back_partial_tokens(
+                    current_text, (self.bot_token,)
+                )
+                if self.eot_token in normal_text:
+                    normal_text = normal_text.replace(self.eot_token, "")
+                    self._in_tool_call_sequence = False
+                if emitted_calls and normal_text:
+                    # Preserve wire order: callers emit normal_text before calls,
+                    # so text found after recovered calls must wait for the next tick.
+                    self._buffer = normal_text + self._buffer
+                    return StreamingParseResult(calls=emitted_calls)
+                if emitted_calls:
+                    return StreamingParseResult(calls=emitted_calls)
+                return StreamingParseResult(normal_text=normal_text)
+
+            if has_tool_call:
+                self._in_tool_call_sequence = True
+
+            # Build tool indices if not already built
+            if not hasattr(self, "_tool_indices"):
+                self._tool_indices = self._get_tool_indices(tools)
+
+            flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
             try:
-                obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
-            except (MalformedJSON, json.JSONDecodeError):
-                # Separator landed on non-JSON markup; fall back to
-                # bot_token which skips past all inter-object markup.
-                # e.g. Qwen25: separator "," matches between eot/bot tags.
-                if used_separator_branch and self.bot_token in current_text:
-                    start_idx = current_text.find(self.bot_token) + len(self.bot_token)
-                    if start_idx >= len(current_text):
-                        return StreamingParseResult()
-                    obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
+                # Priority check: if we're processing a subsequent tool, first
+                # check if text starts with the tool separator. This is critical
+                # for parallel tool calls because the bot_token (e.g., '[') can
+                # also appear inside array parameters of the current tool.
+                used_separator_branch = False
+                if starts_with_sequence_separator:
+                    start_idx = len(self.tool_call_separator)
+                    used_separator_branch = True
                 else:
-                    raise
+                    tool_call_pos = current_text.find(self.bot_token)
+                    if tool_call_pos != -1:
+                        start_idx = tool_call_pos + len(self.bot_token)
+                    else:
+                        start_idx = 0
 
-            is_current_complete = _is_complete_json(
-                current_text[start_idx : start_idx + end_idx]
-            )
+                if start_idx >= len(current_text):
+                    return empty_or_emitted()
 
-            # Validate tool name if present (honoring
-            # SGLANG_FORWARD_UNKNOWN_TOOLS, like the non-streaming path)
-            if (
-                "name" in obj
-                and obj["name"] not in self._tool_indices
-                and self._skip_unknown_tool(obj["name"])
-            ):
-                # Invalid tool name - reset state
-                self._buffer = ""
-                self.current_tool_id = -1
-                self.current_tool_name_sent = False
-                if self.streamed_args_for_tool:
-                    self.streamed_args_for_tool.pop()
-                return StreamingParseResult()
-
-            # Handle parameters/arguments consistency
-            # NOTE: we assume here that the obj is always partial of a single tool call
-            if "parameters" in obj:
-                assert (
-                    "arguments" not in obj
-                ), "model generated both parameters and arguments"
-                obj["arguments"] = obj["parameters"]
-
-            current_tool_call = obj
-
-        except (MalformedJSON, json.JSONDecodeError):
-            return StreamingParseResult()
-
-        if not current_tool_call:
-            return StreamingParseResult()
-
-        # Case 1: Handle tool name streaming
-        # This happens when we encounter a tool but haven't sent its name yet
-        if not self.current_tool_name_sent:
-            function_name = current_tool_call.get("name")
-
-            if function_name and (
-                function_name in self._tool_indices
-                or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
-            ):
-                # If this is a new tool (current_tool_id was -1), initialize it
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.streamed_args_for_tool.append("")
-                # If this is a subsequent tool, ensure streamed_args_for_tool is large enough
-                elif self.current_tool_id >= len(self.streamed_args_for_tool):
-                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                        self.streamed_args_for_tool.append("")
-
-                # Send the tool name with empty parameters
-                res = StreamingParseResult(
-                    calls=[
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=function_name,
-                            parameters="",
+                try:
+                    obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
+                except (MalformedJSON, json.JSONDecodeError):
+                    # Separator landed on non-JSON markup; fall back to
+                    # bot_token which skips past all inter-object markup.
+                    # e.g. Qwen25: separator "," matches between eot/bot tags.
+                    if used_separator_branch and self.bot_token in current_text:
+                        start_idx = current_text.find(self.bot_token) + len(
+                            self.bot_token
                         )
-                    ],
+                        if start_idx >= len(current_text):
+                            return empty_or_emitted()
+                        obj, end_idx = _partial_json_loads(
+                            current_text[start_idx:], flags
+                        )
+                    else:
+                        raise
+
+                is_current_complete = _is_complete_json(
+                    current_text[start_idx : start_idx + end_idx]
                 )
-                self.current_tool_name_sent = True
-            else:
-                res = StreamingParseResult()
 
-        # Case 2: Handle streaming arguments
-        # This happens when we've already sent the tool name and now need to stream arguments incrementally
-        else:
-            cur_arguments = current_tool_call.get("arguments")
-            res = StreamingParseResult()
+                if not isinstance(obj, dict):
+                    if not is_current_complete:
+                        return empty_or_emitted()
+                    if self._drop_completed_malformed_entry(
+                        current_text,
+                        start_idx,
+                        end_idx,
+                        repr(obj),
+                    ):
+                        continue
+                    return empty_or_emitted()
 
-            if cur_arguments is not None:
-                # Calculate how much of the arguments we've already streamed
-                sent = len(self.streamed_args_for_tool[self.current_tool_id])
-                cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
-                prev_arguments = None
-                if self.current_tool_id < len(self.prev_tool_call_arr):
-                    prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get(
-                        "arguments"
+                name = obj.get("name")
+                if not name:
+                    if not is_current_complete:
+                        return empty_or_emitted()
+                    if self._drop_completed_malformed_entry(
+                        current_text,
+                        start_idx,
+                        end_idx,
+                        repr(obj),
+                    ):
+                        continue
+                    return empty_or_emitted()
+
+                # Validate tool name if present (honoring
+                # SGLANG_FORWARD_UNKNOWN_TOOLS, like the non-streaming path)
+                if "name" in obj and obj["name"] not in self._tool_indices:
+                    if not is_current_complete:
+                        return empty_or_emitted()
+                    if self._skip_unknown_tool(obj["name"]):
+                        # Consume only this completed unknown call. Retry from
+                        # the remaining buffer so following calls stay parseable
+                        # even when they share the current chunk.
+                        self._buffer = self._consume_leading_eot_token(
+                            current_text[start_idx + end_idx :]
+                        )
+                        self.current_tool_name_sent = False
+                        if self._should_retry_buffer(current_text):
+                            continue
+                        return empty_or_emitted()
+
+                # Handle parameters/arguments consistency
+                # NOTE: we assume here that the obj is always partial of a single tool call
+                if "parameters" in obj:
+                    assert (
+                        "arguments" not in obj
+                    ), "model generated both parameters and arguments"
+                    obj["arguments"] = obj["parameters"]
+
+                current_tool_call = obj
+
+            except (MalformedJSON, json.JSONDecodeError):
+                fragment = current_text[start_idx:]
+                # A parser error alone does not tell us where the bad entry
+                # ends. Wait until the top-level boundary appears; then
+                # '{"arguments":{x}}, {"name":"get_weather",...}' can drop only
+                # the bad entry and retry from the following comma.
+                closed_end = _closed_top_level_json_end(fragment)
+                if closed_end is not None:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=fragment[:closed_end][:80],
                     )
-
-                argument_diff = None
-
-                # If the current tool's JSON is complete, send all remaining arguments
-                if is_current_complete:
-                    argument_diff = cur_args_json[sent:]
-                    completing_tool_id = (
-                        self.current_tool_id
-                    )  # Save the ID of the tool that's completing
-
-                    # Only remove the processed portion, keep unprocessed content
-                    self._buffer = current_text[start_idx + end_idx :]
-
-                # If the tool is still being parsed, send incremental changes
-                elif prev_arguments:
-                    prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
-                    if cur_args_json != prev_args_json:
-                        prefix = _find_common_prefix(prev_args_json, cur_args_json)
-                        argument_diff = prefix[sent:]
-
-                # Update prev_tool_call_arr with current state
-                if self.current_tool_id >= 0:
-                    # Ensure prev_tool_call_arr is large enough
-                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                        self.prev_tool_call_arr.append({})
-                    self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
-
-                # Advance to next tool if complete
-                if is_current_complete:
-                    self.current_tool_name_sent = False
-                    self.current_tool_id += 1
-
-                # Send the argument diff if there's something new
-                if argument_diff is not None:
-                    # Use the correct tool_index: completing_tool_id for completed tools, current_tool_id for ongoing
-                    tool_index_to_use = (
-                        completing_tool_id
-                        if is_current_complete
-                        else self.current_tool_id
+                    closing_calls = self._close_started_malformed_call()
+                    self._buffer = self._consume_leading_eot_token(
+                        fragment[closed_end:]
                     )
+                    if closing_calls:
+                        emitted_calls.extend(closing_calls)
+                        if self._should_retry_buffer(current_text):
+                            continue
+                        return StreamingParseResult(calls=emitted_calls)
+                    if self._should_retry_buffer(current_text):
+                        continue
+                return empty_or_emitted()
+
+            if not current_tool_call:
+                return empty_or_emitted()
+
+            # Case 1: Handle tool name streaming
+            # This happens when we encounter a tool but haven't sent its name yet
+            if not self.current_tool_name_sent:
+                function_name = current_tool_call.get("name")
+
+                if function_name and (
+                    function_name in self._tool_indices
+                    or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                ):
+                    # If this is a new tool (current_tool_id was -1), initialize it
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                        self.streamed_args_for_tool.append("")
+                    # If this is a subsequent tool, ensure streamed_args_for_tool is large enough
+                    elif self.current_tool_id >= len(self.streamed_args_for_tool):
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
+
+                    # Send the tool name with empty parameters
                     res = StreamingParseResult(
                         calls=[
                             ToolCallItem(
-                                tool_index=tool_index_to_use,
-                                parameters=argument_diff,
+                                tool_index=self.current_tool_id,
+                                name=function_name,
+                                parameters="",
                             )
                         ],
                     )
-                    self.streamed_args_for_tool[tool_index_to_use] += argument_diff
+                    self.current_tool_name_sent = True
+                else:
+                    res = StreamingParseResult()
 
-        return res
+            # Case 2: Handle streaming arguments
+            # This happens when we've already sent the tool name and now need to stream arguments incrementally
+            else:
+                cur_arguments = current_tool_call.get("arguments")
+                res = StreamingParseResult()
+
+                if cur_arguments is not None:
+                    # Calculate how much of the arguments we've already streamed
+                    sent = len(self.streamed_args_for_tool[self.current_tool_id])
+                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
+                    prev_arguments = None
+                    if self.current_tool_id < len(self.prev_tool_call_arr):
+                        prev_arguments = self.prev_tool_call_arr[
+                            self.current_tool_id
+                        ].get("arguments")
+
+                    argument_diff = None
+
+                    # If the current tool's JSON is complete, send all remaining arguments
+                    if is_current_complete:
+                        argument_diff = cur_args_json[sent:]
+                        completing_tool_id = (
+                            self.current_tool_id
+                        )  # Save the ID of the tool that's completing
+
+                        # Only remove the processed portion, keep unprocessed content
+                        self._buffer = self._consume_leading_eot_token(
+                            current_text[start_idx + end_idx :]
+                        )
+
+                    # If the tool is still being parsed, send incremental changes
+                    elif prev_arguments:
+                        prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
+                        if cur_args_json != prev_args_json:
+                            prefix = _find_common_prefix(prev_args_json, cur_args_json)
+                            argument_diff = prefix[sent:]
+
+                    # Update prev_tool_call_arr with current state
+                    if self.current_tool_id >= 0:
+                        # Ensure prev_tool_call_arr is large enough
+                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                            self.prev_tool_call_arr.append({})
+                        self.prev_tool_call_arr[self.current_tool_id] = (
+                            current_tool_call
+                        )
+
+                    # Advance to next tool if complete
+                    if is_current_complete:
+                        self.current_tool_name_sent = False
+                        self.current_tool_id += 1
+
+                    # Send the argument diff if there's something new
+                    if argument_diff is not None:
+                        # Use the correct tool_index: completing_tool_id for completed tools, current_tool_id for ongoing
+                        tool_index_to_use = (
+                            completing_tool_id
+                            if is_current_complete
+                            else self.current_tool_id
+                        )
+                        res = StreamingParseResult(
+                            calls=[
+                                ToolCallItem(
+                                    tool_index=tool_index_to_use,
+                                    parameters=argument_diff,
+                                )
+                            ],
+                        )
+                        self.streamed_args_for_tool[tool_index_to_use] += argument_diff
+
+            if emitted_calls:
+                emitted_calls.extend(res.calls)
+                if res.calls and self._buffer:
+                    continue
+                return StreamingParseResult(
+                    normal_text=res.normal_text, calls=emitted_calls
+                )
+
+            return res
 
     @abstractmethod
     def has_tool_call(self, text: str) -> bool:

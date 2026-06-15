@@ -1,6 +1,6 @@
 from typing import Dict, Generator, Optional
 
-from sglang.srt.function_call.compatibility import CompatibilityMode
+from sglang.srt.function_call.compatibility import CompatibilityContext
 from sglang.srt.function_call.core_types import _GetInfoFunc
 from sglang.srt.function_call.parsing import TagToolCallParser
 from sglang.srt.function_call.tag_format_detector import TagToolCallDetector
@@ -104,7 +104,7 @@ class MinimaxM2Detector(TagToolCallDetector):
         return self.tool_call_start_token in text
 
     def _make_grammar(
-        self, functions: Optional[Dict], compatibility: CompatibilityMode
+        self, functions: Optional[Dict], compatibility: CompatibilityContext
     ) -> M2TextParser:
         return M2TextParser(functions=functions, compatibility=compatibility)
 

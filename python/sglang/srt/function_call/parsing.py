@@ -50,10 +50,10 @@ Parsers emit only ``content`` and ``tool_calls`` (reasoning is handled by
 SGLang's separate ``--reasoning-parser`` stage).
 
 Tolerances applied while parsing are recorded on the parser's
-:class:`CompatibilityMode` (injected at construction — the detector's policy, so
-all tolerances for a request share one audit trail); coroutine code cannot
-wrap ``yield`` in ``CompatibilityMode.absorb``, so the generator helpers here call
-``note()`` directly. Errors the grammar cannot absorb propagate as
+:class:`CompatibilityContext` (injected at construction so helper parsers share
+the detector's request context); coroutine code cannot wrap ``yield`` in
+``CompatibilityContext.absorb``, so the generator helpers here call ``note()``
+directly. Errors the grammar cannot absorb propagate as
 ``PatternMismatched`` to ``FunctionCallParser``, which fails open to text.
 
 TODO: accept token-level inputs (match special-token markers by token id
@@ -81,9 +81,9 @@ from typing import (
 from typing_extensions import Self
 
 from sglang.srt.environ import envs
-from sglang.srt.function_call.compatibility.mode import (
+from sglang.srt.function_call.compatibility.context import (
+    CompatibilityContext,
     CompatibilityEvent,
-    CompatibilityMode,
     CompatibilityRecord,
 )
 from sglang.srt.function_call.compatibility.param_types import (
@@ -125,7 +125,7 @@ class GeneratorParser(ABC):
     def _process(self) -> Generator[Dict[str, Any], None, None]:
         pass
 
-    def __init__(self, *, compatibility: CompatibilityMode):
+    def __init__(self, *, compatibility: CompatibilityContext):
         # The policy is required by construction so a request's tolerances
         # cannot silently fork onto a second audit trail. Must be set before
         # `_process()` starts: the grammar may consult it from its first step.
@@ -586,7 +586,7 @@ class TagToolCallParser(GeneratorParser, ABC):
     def __init__(
         self,
         *,
-        compatibility: CompatibilityMode,
+        compatibility: CompatibilityContext,
         functions: Optional[Dict] = None,
         content_field: str = "content",
         tool_call_output_key: Callable[

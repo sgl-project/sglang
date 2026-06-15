@@ -5,6 +5,7 @@ from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -44,21 +45,37 @@ class HermesDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         calls = []
-        try:
-            for match in self.tool_call_regex.findall(text):
-                raw = match[0] or match[1]
-                if not raw:
-                    continue
+        truncated_parts = []
+        for match in self.tool_call_regex.findall(text):
+            raw = match[0] or match[1]
+            if not raw:
+                continue
+            if match[1]:
+                self.compatibility.note(
+                    CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                    detail=raw[:80],
+                )
+                truncated_parts.append(f"{self.bot_token}{raw}")
+                continue
+            with self.compatibility.absorb(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                json.JSONDecodeError,
+                detail=raw[:80],
+            ) as absorbed:
                 parsed = json.loads(raw.strip())
-                if isinstance(parsed, list):
-                    calls.extend(self.parse_base_json(parsed, tools))
-                else:
-                    calls.extend(self.parse_base_json(parsed, tools))
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
-        except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
-            self._note_malformed_tool_call(e)
-            return StreamingParseResult(normal_text=text)
+            if absorbed.fired:
+                return StreamingParseResult(normal_text=text, calls=[])
+            parsed_items = parsed if isinstance(parsed, list) else [parsed]
+            if not all(isinstance(item, dict) for item in parsed_items):
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=raw[:80],
+                )
+                return StreamingParseResult(normal_text=text, calls=[])
+            calls.extend(self.parse_base_json(parsed_items, tools))
+        return StreamingParseResult(
+            normal_text=normal_text + "".join(truncated_parts), calls=calls
+        )
 
     def _clean_normal_text(self, text: str) -> str:
         if not text:

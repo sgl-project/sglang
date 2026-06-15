@@ -1,4 +1,4 @@
-"""Compatibility policy and audit records for tool-call parsing."""
+"""Compatibility add-on context and audit records for tool-call parsing."""
 
 import logging
 from contextlib import contextmanager
@@ -93,19 +93,19 @@ class CompatibilityViolation(Exception):
 
 @dataclass(slots=True)
 class _Absorbed:
-    """Outcome of one :meth:`CompatibilityMode.absorb` block, for flow control."""
+    """Outcome of one :meth:`CompatibilityContext.absorb` block, for flow control."""
 
     fired: bool = False
     record: Optional[CompatibilityRecord] = None
 
 
 @dataclass
-class CompatibilityMode:
-    """Per-request tolerance policy plus the audit trail of applied tolerances.
+class CompatibilityContext:
+    """Per-request compatibility add-on shared by detectors and helpers.
 
     ``BaseFormatDetector`` creates one per detector instance (detectors are
     per-request locals); a detector's internal parser shares the detector's
-    policy so all tolerances for a request land on one audit trail.
+    context so policy and audit records stay on one object.
     """
 
     strict: bool = False

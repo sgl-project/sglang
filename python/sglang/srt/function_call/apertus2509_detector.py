@@ -3,6 +3,7 @@ from typing import Any, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -53,10 +54,26 @@ class Apertus2509Detector(BaseFormatDetector):
             tool_part = text[start:]
             parsed_arr, json_end = self._try_parse_json_array(tool_part)
             if parsed_arr is None:
+                if self.suffix in tool_part:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=tool_part[:80],
+                    )
+                    cursor = start + tool_part.find(self.suffix) + len(self.suffix)
+                    continue
+                else:
+                    self.compatibility.note(
+                        CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                        detail=tool_part[:80],
+                    )
                 normal_parts.append(tool_part)
                 break
 
             if (suffix_pos := tool_part.find(self.suffix, json_end)) == -1:
+                self.compatibility.note(
+                    CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                    detail=tool_part[:80],
+                )
                 normal_parts.append(tool_part)
                 break
 
@@ -121,10 +138,14 @@ class Apertus2509Detector(BaseFormatDetector):
             parsed_arr, suffix_pos = self._try_parse_json_array(self._buffer)
             if parsed_arr is None:
                 if self.suffix in self._buffer:
-                    out_normal += self._buffer
-                    self._buffer = ""
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=self._buffer[:80],
+                    )
+                    suffix_end = self._buffer.find(self.suffix) + len(self.suffix)
+                    self._buffer = self._buffer[suffix_end:]
                     self._in_tools_block = False
-                    return StreamingParseResult(normal_text=out_normal, calls=out_calls)
+                    continue
                 return StreamingParseResult(normal_text=out_normal, calls=out_calls)
 
             while suffix_pos < len(self._buffer) and self._buffer[suffix_pos].isspace():
@@ -139,6 +160,10 @@ class Apertus2509Detector(BaseFormatDetector):
             for item in parsed_arr:
                 name, args = self._apertus_obj_to_call(item)
                 if name is None:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=repr(item)[:80],
+                    )
                     continue
                 if args is None:
                     args = {}
@@ -218,6 +243,10 @@ class Apertus2509Detector(BaseFormatDetector):
         for item in arr:
             name, args = self._apertus_obj_to_call(item)
             if name is None:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=repr(item)[:80],
+                )
                 continue
             if args is None:
                 args = {}

@@ -40,7 +40,7 @@ class MistralDetector(BaseFormatDetector):
         # Common marker shared by both JSON-array and compact formats.
         self._tool_calls_marker = "[TOOL_CALLS"
         self.eot_token = "]"
-        self.tool_call_separator = ", "
+        self.tool_call_separator = ","
 
     def has_tool_call(self, text: str) -> bool:
         """Return True if the text contains either supported tool-call marker."""
@@ -65,7 +65,11 @@ class MistralDetector(BaseFormatDetector):
         if self.bot_token in tool_part:
             json_array_str = self._extract_json_array(tool_part)
             if not json_array_str:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
+                self.compatibility.note(
+                    CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                    detail=tool_part[:80],
+                )
+                return StreamingParseResult(normal_text=text, calls=[])
 
             calls: list = []
             with self.compatibility.absorb(
@@ -106,7 +110,11 @@ class MistralDetector(BaseFormatDetector):
             remaining = remaining[consumed:].strip()
 
         if not all_calls:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+            self.compatibility.note(
+                CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                detail=tool_part[:80],
+            )
+            return StreamingParseResult(normal_text=text, calls=[])
 
         combined_normal = (
             (normal_text + " " + remaining).strip() if remaining else normal_text
@@ -126,6 +134,14 @@ class MistralDetector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
+        # A leading separator may follow a valid or dropped entry in this sequence.
+        starts_with_sequence_separator = (
+            self._starts_with_tool_call_separator(current_text)
+            and self._has_tool_call_sequence_context()
+        )
+        if starts_with_sequence_separator:
+            return super().parse_streaming_increment(new_text="", tools=tools)
+
         # No marker: either flush as normal text or keep buffering a partial marker.
         if self._tool_calls_marker not in current_text:
             if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
@@ -133,6 +149,7 @@ class MistralDetector(BaseFormatDetector):
                 self._buffer = ""
                 if self.eot_token in normal_text:
                     normal_text = normal_text.replace(self.eot_token, "")
+                    self._in_tool_call_sequence = False
                 return StreamingParseResult(normal_text=normal_text)
             return StreamingParseResult()
 
@@ -151,11 +168,11 @@ class MistralDetector(BaseFormatDetector):
         compact = self._try_parse_compact_args_format(current_text)
         if compact:
             func_name, args_obj, consumed = compact
-            if func_name not in self._tool_indices:
-                # Unknown tool: treat as normal text and reset state.
-                normal_text = self._buffer
-                self._buffer = ""
-                return StreamingParseResult(normal_text=normal_text)
+            if func_name not in self._tool_indices and self._skip_unknown_tool(
+                func_name
+            ):
+                self._buffer = current_text[consumed:]
+                return self._retry_streaming_tail(current_text, [], tools)
 
             # Initialize state if this is the first tool call.
             if self.current_tool_id == -1:
@@ -187,7 +204,7 @@ class MistralDetector(BaseFormatDetector):
             self._buffer = current_text[consumed:]
             self.current_tool_id += 1
             self.current_tool_name_sent = False
-            return StreamingParseResult(normal_text="", calls=calls)
+            return self._retry_streaming_tail(current_text, calls, tools)
 
         # Canonical format delegates to the BaseFormatDetector JSON streaming logic.
         if self.bot_token in current_text:

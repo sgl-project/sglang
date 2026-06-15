@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -157,8 +158,7 @@ class PoolsideV1Detector(BaseFormatDetector):
 
     _STRING_TYPES = frozenset({"string", "str", "text", "enum"})
 
-    @staticmethod
-    def _convert_param_value(raw: str, schema: dict, key: str) -> Any:
+    def _convert_param_value(self, raw: str, schema: dict, key: str) -> Any:
         """Coerce a raw arg_value string per schema; fall back to raw on failure.
 
         Decoder selection by schema type:
@@ -190,6 +190,11 @@ class PoolsideV1Detector(BaseFormatDetector):
                 return result
             except (ValueError, SyntaxError, TypeError):
                 continue
+        if param_type:
+            self.compatibility.note(
+                CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                detail=f"{key}: {raw[:80]}",
+            )
         return raw
 
     def _find_name_boundary(self, text: str) -> int:
@@ -221,7 +226,15 @@ class PoolsideV1Detector(BaseFormatDetector):
         normal_text = text[:first_idx] if first_idx > 0 else ""
 
         calls: List[ToolCallItem] = []
-        for body in self.tool_call_regex.findall(text):
+        bodies = self.tool_call_regex.findall(text)
+        if not bodies:
+            self.compatibility.note(
+                CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                detail=text[first_idx : first_idx + 80],
+            )
+            return StreamingParseResult(normal_text=text)
+
+        for body in bodies:
             # _find_name_boundary searches for `\n` / `<arg_key>` /
             # `</tool_call>`, but the regex already stripped `</tool_call>`,
             # so a no-arg call without a trailing newline
@@ -229,12 +242,26 @@ class PoolsideV1Detector(BaseFormatDetector):
             # that case as "name == entire body".
             boundary = self._find_name_boundary(body)
             name = (body if boundary == -1 else body[:boundary]).strip()
-            if not name or name not in tool_indices:
+            if not name:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=body[:80],
+                )
+                continue
+            if name not in tool_indices and self._skip_unknown_tool(name):
                 continue
 
             schema = self._get_param_schema(name, tools)
             args: dict = {}
-            for raw_key, raw_val in self.arg_pair_regex.findall(body):
+            pairs = self.arg_pair_regex.findall(body)
+            if not pairs and (
+                self.arg_key_start in body or self.arg_value_start in body
+            ):
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=body[:80],
+                )
+            for raw_key, raw_val in pairs:
                 key = raw_key.strip()
                 # Strip at most one wrapping `\n` on each side (template adds
                 # them around the value); preserve newlines that are part of
@@ -244,7 +271,7 @@ class PoolsideV1Detector(BaseFormatDetector):
 
             calls.append(
                 ToolCallItem(
-                    tool_index=tool_indices[name],
+                    tool_index=tool_indices.get(name, -1),
                     name=name,
                     parameters=json.dumps(args, ensure_ascii=False),
                 )
@@ -309,7 +336,12 @@ class PoolsideV1Detector(BaseFormatDetector):
                     consume += 1
                 self.parsed_pos += consume
 
-                if name and name in tool_indices:
+                if name:
+                    if name not in tool_indices and self._skip_unknown_tool(name):
+                        # Unknown name: drain to </tool_call> with no
+                        # client-visible emission after recording the gate.
+                        self._state = _ParseState.DRAINING
+                        continue
                     self.current_tool_id += 1
                     while len(self.streamed_args_for_tool) <= self.current_tool_id:
                         self.streamed_args_for_tool.append("")
@@ -326,8 +358,10 @@ class PoolsideV1Detector(BaseFormatDetector):
                     )
                     self._state = _ParseState.READING_KEY
                 else:
-                    # Unknown / empty name — drain to </tool_call> with no
-                    # client-visible emission.
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=slice_[:80],
+                    )
                     self._state = _ParseState.DRAINING
                 continue
 
@@ -343,13 +377,20 @@ class PoolsideV1Detector(BaseFormatDetector):
                 if slice_.startswith("<"):
                     if self._is_partial_tag(slice_):
                         break
-                    # Bare '<' that's not any known tag — discard silently
-                    # (inside a tool call, this is not normal_text).
+                    self.compatibility.note(
+                        CompatibilityEvent.SKIPPED_GARBAGE,
+                        detail="inside <tool_call>: '<'",
+                    )
                     self.parsed_pos += 1
                     continue
-                # Inter-tag whitespace / newline — discard.
                 next_lt = slice_.find("<")
-                self.parsed_pos += len(slice_) if next_lt == -1 else next_lt
+                skipped = slice_ if next_lt == -1 else slice_[:next_lt]
+                if skipped.strip():
+                    self.compatibility.note(
+                        CompatibilityEvent.SKIPPED_GARBAGE,
+                        detail=f"inside <tool_call>: {skipped[:80]!r}",
+                    )
+                self.parsed_pos += len(skipped)
                 continue
 
             if state is _ParseState.READING_VALUE:
@@ -370,6 +411,15 @@ class PoolsideV1Detector(BaseFormatDetector):
                 # Without this branch the FSM treats the second <arg_key>
                 # as bare-`<` garbage and the next <arg_value> binds to
                 # the stale K1 — wrong-argument corruption.
+                if slice_.startswith(self.tool_call_end_token):
+                    self.compatibility.note(
+                        CompatibilityEvent.MISSING_CLOSE_TAG,
+                        detail=(
+                            self.current_pending_key or self.current_func_name or ""
+                        )[:80],
+                    )
+                    self._close_current_call(calls)
+                    continue
                 if slice_.startswith(self.arg_key_start):
                     if not self._consume_arg_key(slice_):
                         break  # incomplete <arg_key>
@@ -377,6 +427,48 @@ class PoolsideV1Detector(BaseFormatDetector):
                 if slice_.startswith(self.arg_value_start):
                     end = slice_.find(self.arg_value_end)
                     if end == -1:
+                        close = slice_.find(
+                            self.tool_call_end_token, len(self.arg_value_start)
+                        )
+                        if close != -1:
+                            raw = (
+                                slice_[len(self.arg_value_start) : close]
+                                .removeprefix("\n")
+                                .removesuffix("\n")
+                            )
+                            self.compatibility.note(
+                                CompatibilityEvent.MISSING_CLOSE_TAG,
+                                detail=(
+                                    self.current_pending_key
+                                    or self.current_func_name
+                                    or ""
+                                )[:80],
+                            )
+                            schema = self._get_param_schema(
+                                self.current_func_name, tools
+                            )
+                            converted = self._convert_param_value(
+                                raw, schema, self.current_pending_key
+                            )
+                            kv = (
+                                f"{json.dumps(self.current_pending_key)}: "
+                                f"{json.dumps(converted, ensure_ascii=False)}"
+                            )
+                            fragment = "{" + kv if not self.json_started else ", " + kv
+                            self.json_started = True
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    parameters=fragment,
+                                )
+                            )
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += fragment
+                            self.current_pending_key = None
+                            self.parsed_pos += close
+                            self._close_current_call(calls)
+                            continue
                         break  # incomplete <arg_value> — no partial emission
                     raw = (
                         slice_[len(self.arg_value_start) : end]
@@ -410,10 +502,20 @@ class PoolsideV1Detector(BaseFormatDetector):
                 if slice_.startswith("<"):
                     if self._is_partial_tag(slice_):
                         break
+                    self.compatibility.note(
+                        CompatibilityEvent.SKIPPED_GARBAGE,
+                        detail="inside <arg_value>: '<'",
+                    )
                     self.parsed_pos += 1
                     continue
                 next_lt = slice_.find("<")
-                self.parsed_pos += len(slice_) if next_lt == -1 else next_lt
+                skipped = slice_ if next_lt == -1 else slice_[:next_lt]
+                if skipped.strip():
+                    self.compatibility.note(
+                        CompatibilityEvent.SKIPPED_GARBAGE,
+                        detail=f"inside <arg_value>: {skipped[:80]!r}",
+                    )
+                self.parsed_pos += len(skipped)
                 continue
 
             if state is _ParseState.DRAINING:

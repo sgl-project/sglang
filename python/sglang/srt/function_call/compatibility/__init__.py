@@ -2,8 +2,8 @@
 
 The implementation is split by responsibility:
 
-- ``mode.py`` defines the compatibility policy, events, records, and strict
-  mode behavior.
+- ``context.py`` defines the per-request compatibility context, events,
+  records, and strict behavior.
 - ``recovery.py`` owns fail-open recovery at the ``FunctionCallParser``
   boundary.
 - ``param_types.py`` handles schema-driven value conversion.
@@ -12,9 +12,9 @@ Importing from ``sglang.srt.function_call.compatibility`` remains the stable
 package-level API for detectors and tests.
 """
 
-from sglang.srt.function_call.compatibility.mode import (
+from sglang.srt.function_call.compatibility.context import (
+    CompatibilityContext,
     CompatibilityEvent,
-    CompatibilityMode,
     CompatibilityRecord,
     CompatibilityViolation,
 )
@@ -26,7 +26,7 @@ from sglang.srt.function_call.compatibility.recovery import (
 
 __all__ = [
     "CompatibilityEvent",
-    "CompatibilityMode",
+    "CompatibilityContext",
     "CompatibilityRecord",
     "CompatibilityViolation",
     "recover_nonstream",

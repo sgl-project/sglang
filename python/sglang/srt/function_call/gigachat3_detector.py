@@ -5,6 +5,7 @@ from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -63,36 +64,66 @@ class GigaChat3Detector(BaseFormatDetector):
         if model_output.rstrip().endswith("</s>"):
             model_output = model_output[: model_output.rfind("</s>")]
         m_func = REGEX_FUNCTION_CALL.search(model_output)
+        function_payload = None
+        trailing_content = ""
+        if m_func:
+            prefix = model_output[: m_func.start()]
+            content = (
+                prefix.split("<|message_sep|>", 1)[0]
+                if "<|message_sep|>" in prefix
+                else prefix
+            )
+            function_payload = m_func.group(1)
+            eos_pos = function_payload.find("</s>")
+            if eos_pos != -1:
+                trailing_content = function_payload[eos_pos + len("</s>") :]
+                function_payload = function_payload[:eos_pos]
         if m_func:
             try:
-                function_call = json.loads(m_func.group(1), strict=False)
+                function_call = json.loads(function_payload or "", strict=False)
                 if not (
                     isinstance(function_call, dict)
                     and "name" in function_call
                     and "arguments" in function_call
                 ):
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=(function_payload or "")[:80],
+                    )
                     function_call = None
                 elif not isinstance(function_call["arguments"], dict):
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=(function_payload or "")[:80],
+                    )
                     function_call = None
             except json.JSONDecodeError as e:
                 logger.warning(f"[GigaChat3] JSON decode error: {e}")
-                self._note_malformed_tool_call(e, detail=m_func.group(1)[:80])
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=(function_payload or "")[:80],
+                )
                 return StreamingParseResult(
-                    normal_text=model_output,
+                    normal_text=(content or "") + trailing_content,
                     calls=[],
                 )
-        m_content = REGEX_CONTENT_PATTERN.search(model_output)
-        if m_content:
-            content = m_content.group(1)
-        else:
-            content = model_output
+        if content is None:
+            m_content = REGEX_CONTENT_PATTERN.search(model_output)
+            if m_content:
+                content = m_content.group(1)
+            else:
+                content = model_output
         if not function_call:
-            return StreamingParseResult(normal_text=content, calls=[])
+            return StreamingParseResult(
+                normal_text=(content or "") + trailing_content, calls=[]
+            )
         name = function_call["name"]
         args = function_call["arguments"]
         match_result = {"name": name, "arguments": args}
         calls = self.parse_base_json(match_result, tools)
-        return StreamingParseResult(normal_text=content, calls=calls)
+        return StreamingParseResult(
+            normal_text=(content or "") + trailing_content, calls=calls
+        )
 
     def parse_streaming_increment(
         self,
@@ -103,28 +134,40 @@ class GigaChat3Detector(BaseFormatDetector):
         Streaming parser for incremental text chunks.
         Maintains state across calls to build complete tool calls.
         """
-        if not new_text:
+        if not new_text and not self._buffer:
             return StreamingParseResult()
         logger.debug(f"[GigaChat3] parse_streaming_increment: '{new_text}'")
         self._buffer += new_text
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
         current_text = self._buffer
-        delta_text = new_text
+        delta_text = new_text if new_text else current_text
         content = None
         func_name = None
         cur_args = None
+        args_complete = False
         m_func = REGEX_FUNCTION_CALL.search(current_text)
         if not self.tool_started:
             m_content = REGEX_CONTENT_PATTERN.search(delta_text)
-            if m_content:
-                content = m_content.group(1)
-                self.end_content = True
-            else:
-                if not self.end_content:
-                    content = delta_text
             if m_func:
+                prefix = current_text[: m_func.start()]
+                content = (
+                    prefix.split("<|message_sep|>", 1)[0]
+                    if "<|message_sep|>" in prefix
+                    else (m_content.group(1) if m_content else prefix)
+                )
                 self.tool_started = True
                 logger.debug("[GigaChat3] Tool call started")
-            if content:
+            elif m_content:
+                content = m_content.group(1)
+                self.end_content = True
+            elif not self.end_content:
+                content = delta_text
+            if content and not m_func:
+                if m_content:
+                    self._buffer = current_text[len(content) :]
+                else:
+                    self._buffer = ""
                 return StreamingParseResult(normal_text=content)
         if not m_func:
             return StreamingParseResult()
@@ -135,8 +178,9 @@ class GigaChat3Detector(BaseFormatDetector):
         args_match = ARGS_REGEX.search(json_tail)
         if args_match:
             cur_args = args_match.group(1).strip()
-            if cur_args.endswith("</s>"):
-                cur_args = cur_args[: -len("</s>")]
+            args_complete = "</s>" in cur_args
+            if args_complete:
+                cur_args = cur_args.split("</s>", 1)[0]
             if cur_args.endswith("}"):
                 try:
                     candidate = cur_args[:-1].strip()
@@ -144,26 +188,87 @@ class GigaChat3Detector(BaseFormatDetector):
                     cur_args = candidate
                 except json.JSONDecodeError:
                     pass
+            if args_complete:
+                try:
+                    json.loads(cur_args, strict=False)
+                except json.JSONDecodeError:
+                    calls: List[ToolCallItem] = []
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=cur_args[:80],
+                    )
+                    calls.extend(self._close_started_malformed_call())
+                    end_pos = current_text.find("</s>", m_func.start())
+                    self._buffer = (
+                        current_text[end_pos + len("</s>") :] if end_pos != -1 else ""
+                    )
+                    self.tool_started = False
+                    self.tool_name_sent = False
+                    self.current_tool_name_sent = False
+                    tail = self._retry_streaming_tail(current_text, calls, tools)
+                    tail.normal_text = (content or "") + tail.normal_text
+                    return tail
         calls: List[ToolCallItem] = []
-        if not self.prev_tool_call_arr:
-            self.prev_tool_call_arr.append({})
         if not self.tool_name_sent:
             if not func_name:
-                return StreamingParseResult()
+                if args_complete:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=json_tail[:80],
+                    )
+                    end_pos = current_text.find("</s>", m_func.start())
+                    self._buffer = (
+                        current_text[end_pos + len("</s>") :] if end_pos != -1 else ""
+                    )
+                    self.tool_started = False
+                    self.tool_name_sent = False
+                    self.current_tool_name_sent = False
+                    tail = self._retry_streaming_tail(current_text, [], tools)
+                    tail.normal_text = (content or "") + tail.normal_text
+                    return tail
+                return StreamingParseResult(normal_text=content or "")
+            if func_name not in self._tool_indices and self._skip_unknown_tool(
+                func_name
+            ):
+                if args_complete:
+                    end_pos = current_text.find("</s>", m_func.start())
+                    self._buffer = (
+                        current_text[end_pos + len("</s>") :] if end_pos != -1 else ""
+                    )
+                else:
+                    self._buffer = ""
+                self.tool_started = False
+                self.tool_name_sent = False
+                self.current_tool_name_sent = False
+                self.prev_tool_call_arr = []
+                tail = self._retry_streaming_tail(current_text, [], tools)
+                tail.normal_text = (content or "") + tail.normal_text
+                return tail
+            if self.current_tool_id == -1:
+                self.current_tool_id = 0
+            while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
             self.tool_name_sent = True
-            self.prev_tool_call_arr[0]["name"] = func_name
+            self.current_tool_name_sent = True
+            self.prev_tool_call_arr[self.current_tool_id]["name"] = func_name
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = {}
             logger.debug(f"[GigaChat3] Sending tool name: {func_name}")
             calls.append(
                 ToolCallItem(
-                    tool_index=0,
+                    tool_index=self.current_tool_id,
                     name=func_name,
                     parameters="",
                 )
             )
-            return StreamingParseResult(calls=calls)
+            if cur_args is None:
+                return StreamingParseResult(normal_text=content or "", calls=calls)
         if cur_args is None:
             return StreamingParseResult()
-        prev_args = self.prev_tool_call_arr[0].get("arguments_str", "")
+        prev_args = self.prev_tool_call_arr[self.current_tool_id].get(
+            "arguments_str", ""
+        )
         if not prev_args:
             delta_args = cur_args
         elif cur_args.startswith(prev_args):
@@ -175,22 +280,37 @@ class GigaChat3Detector(BaseFormatDetector):
             )
             return StreamingParseResult()
         if not delta_args:
-            return StreamingParseResult()
-        self.prev_tool_call_arr[0]["arguments_str"] = cur_args
+            return StreamingParseResult(normal_text=content or "", calls=calls)
+        self.prev_tool_call_arr[self.current_tool_id]["arguments_str"] = cur_args
         try:
             args_dict = json.loads(cur_args, strict=False)
-            self.prev_tool_call_arr[0]["arguments"] = args_dict
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = args_dict
         except json.JSONDecodeError:
-            self.prev_tool_call_arr[0]["arguments"] = {}
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = {}
         logger.debug(f"[GigaChat3] Sending args delta: '{delta_args[:100]}...'")
         calls.append(
             ToolCallItem(
-                tool_index=0,
+                tool_index=self.current_tool_id,
                 name=None,
                 parameters=delta_args,
             )
         )
-        return StreamingParseResult(calls=calls)
+        self.streamed_args_for_tool[self.current_tool_id] += delta_args
+
+        if args_complete:
+            end_pos = current_text.find("</s>", m_func.start())
+            self._buffer = (
+                current_text[end_pos + len("</s>") :] if end_pos != -1 else ""
+            )
+            self.tool_started = False
+            self.tool_name_sent = False
+            self.current_tool_name_sent = False
+            self.current_tool_id += 1
+            tail = self._retry_streaming_tail(current_text, calls, tools)
+            tail.normal_text = (content or "") + tail.normal_text
+            return tail
+
+        return StreamingParseResult(normal_text=content or "", calls=calls)
 
     def supports_structural_tag(self) -> bool:
         """GigaChat3 does not use structural tags"""

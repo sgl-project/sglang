@@ -21,6 +21,7 @@ from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -41,7 +42,11 @@ def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
 
 
 def _convert_param_value(
-    param_value: str, param_name: str, func_name: str, tools: List[Tool]
+    param_value: str,
+    param_name: str,
+    func_name: str,
+    tools: List[Tool],
+    compatibility=None,
 ) -> Any:
     """
     Convert parameter value based on its type in the schema.
@@ -68,6 +73,11 @@ def _convert_param_value(
         try:
             return int(param_value)
         except (ValueError, TypeError):
+            if compatibility is not None:
+                compatibility.note(
+                    CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                    detail=f"{func_name}.{param_name}: {param_value[:80]}",
+                )
             logger.warning(
                 "Parsed value '%s' of parameter '%s' is not an "
                 "integer in tool '%s', degenerating to string.",
@@ -85,6 +95,11 @@ def _convert_param_value(
                 else int(float_param_value)
             )
         except (ValueError, TypeError):
+            if compatibility is not None:
+                compatibility.note(
+                    CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                    detail=f"{func_name}.{param_name}: {param_value[:80]}",
+                )
             logger.warning(
                 "Parsed value '%s' of parameter '%s' is not a float "
                 "in tool '%s', degenerating to string.",
@@ -94,16 +109,22 @@ def _convert_param_value(
             )
             return param_value
     elif param_type in ["boolean", "bool", "binary"]:
+        raw_value = param_value
         param_value = param_value.lower()
         if param_value not in ["true", "false"]:
+            if compatibility is not None:
+                compatibility.note(
+                    CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                    detail=f"{func_name}.{param_name}: {raw_value[:80]}",
+                )
             logger.warning(
                 "Parsed value '%s' of parameter '%s' is not a boolean "
-                "(`true` or `false`) in tool '%s', degenerating to "
-                "false.",
-                param_value,
+                "(`true` or `false`) in tool '%s', degenerating to string.",
+                raw_value,
                 param_name,
                 func_name,
             )
+            return raw_value
         return param_value == "true"
     else:
         if (
@@ -126,6 +147,11 @@ def _convert_param_value(
         try:
             param_value = ast.literal_eval(param_value)  # safer
         except (ValueError, SyntaxError, TypeError):
+            if compatibility is not None:
+                compatibility.note(
+                    CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                    detail=f"{func_name}.{param_name}: {param_value[:80]}",
+                )
             logger.warning(
                 "Parsed value '%s' of parameter '%s' cannot be "
                 "converted via Python `ast.literal_eval()` in tool "
@@ -172,9 +198,13 @@ class MiMoDetector(BaseFormatDetector):
         tool_indices = self._get_tool_indices(tools)
 
         calls = []
+        normal_parts = [normal_text]
         last_end = idx
+        saw_block = False
 
         for match in self.tool_call_regex.finditer(text):
+            saw_block = True
+            normal_parts.append(text[last_end : match.start()])
             tool_call_body = match.group(1)
 
             parsed = self._parse_tool_call(tool_call_body, tools)
@@ -183,8 +213,6 @@ class MiMoDetector(BaseFormatDetector):
                 func_name = parsed.get("name")
                 if func_name not in tool_indices:
                     if self._skip_unknown_tool(func_name):
-                        # Return tool call block as normal text
-                        normal_text += text[last_end : match.end()]
                         last_end = match.end()
                         continue
 
@@ -198,10 +226,22 @@ class MiMoDetector(BaseFormatDetector):
                         ),
                     )
                 )
+            else:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=tool_call_body[:80],
+                )
 
             last_end = match.end()
 
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        if not saw_block:
+            self.compatibility.note(
+                CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                detail=text[idx : idx + 80],
+            )
+
+        normal_parts.append(text[last_end:])
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -280,7 +320,11 @@ class MiMoDetector(BaseFormatDetector):
             param_name = param_match.group(1).strip()
             param_value = param_match.group(2)
             params[param_name] = _convert_param_value(
-                param_value, param_name, func_name, tools
+                param_value,
+                param_name,
+                func_name,
+                tools,
+                compatibility=self.compatibility,
             )
 
         return {"name": func_name, "parameters": params}

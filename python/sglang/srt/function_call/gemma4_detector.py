@@ -4,6 +4,7 @@ from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -268,7 +269,7 @@ class Gemma4Detector(BaseFormatDetector):
                     args_str = (
                         args_content[:match_idx] if match_idx != -1 else args_content
                     )
-                    results.append((func_name, args_str))
+                    results.append((func_name, args_str, match_idx != -1))
             search_from = end + len(TOOL_CALL_END)
         return results
 
@@ -280,13 +281,48 @@ class Gemma4Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
         calls = []
+        content_end = text.find(self.tool_call_start_token)
+        normal_text = text[:content_end] if content_end > 0 else ""
         try:
             matches = self._extract_tool_calls(text)
             if not matches:
-                return StreamingParseResult(normal_text=text)
+                if self.tool_call_end_token in text:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=text[text.find(self.tool_call_start_token) :][:80],
+                    )
+                    end_pos = text.find(
+                        self.tool_call_end_token,
+                        text.find(self.tool_call_start_token),
+                    )
+                    normal_text = (
+                        text[:content_end]
+                        + text[end_pos + len(self.tool_call_end_token) :]
+                    )
+                    return StreamingParseResult(normal_text=normal_text)
+                else:
+                    self.compatibility.note(
+                        CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                        detail=text[text.find(self.tool_call_start_token) :][:80],
+                    )
+                    return StreamingParseResult(normal_text=text)
 
             tool_indices = self._get_tool_indices(tools)
-            for func_name, args_str in matches:
+            for func_name, args_str, args_complete in matches:
+                if not func_name:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=args_str[:80],
+                    )
+                    continue
+                if not args_complete:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=args_str[:80],
+                    )
+                    continue
+                if func_name not in tool_indices and self._skip_unknown_tool(func_name):
+                    continue
                 arguments = _parse_gemma4_args(args_str)
                 calls.append(
                     ToolCallItem(
@@ -296,16 +332,15 @@ class Gemma4Detector(BaseFormatDetector):
                     )
                 )
 
-            # Content = text before first tool call
-            content_end = text.find(self.tool_call_start_token)
-            normal_text = text[:content_end] if content_end > 0 else ""
-
             return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except (ValueError, IndexError, TypeError, KeyError) as e:
             logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
-            self._note_malformed_tool_call(e)
-            return StreamingParseResult(normal_text=text)
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=str(e)[:120],
+            )
+            return StreamingParseResult(normal_text=normal_text)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -372,15 +407,41 @@ class Gemma4Detector(BaseFormatDetector):
                             brace_pos = current_slice.find("{")
                             if brace_pos != -1:
                                 func_name = current_slice[5:brace_pos]
+                                if (
+                                    func_name not in self._tool_indices
+                                    and self._skip_unknown_tool(func_name)
+                                ):
+                                    end_pos = current_slice.find(
+                                        self.tool_call_end_token
+                                    )
+                                    if end_pos == -1:
+                                        break
+                                    self.parsed_pos += end_pos + len(
+                                        self.tool_call_end_token
+                                    )
+                                    self.is_inside_tool_call = False
+                                    self.current_func_name = None
+                                    continue
                                 self.current_tool_id += 1
+                                while (
+                                    len(self.streamed_args_for_tool)
+                                    <= self.current_tool_id
+                                ):
+                                    self.streamed_args_for_tool.append("")
+                                while (
+                                    len(self.prev_tool_call_arr) <= self.current_tool_id
+                                ):
+                                    self.prev_tool_call_arr.append({})
                                 self.current_func_name = func_name
                                 self.current_tool_name_sent = True
+                                self.prev_tool_call_arr[self.current_tool_id] = {
+                                    "name": func_name,
+                                    "arguments": {},
+                                }
 
                                 calls.append(
                                     ToolCallItem(
-                                        tool_index=self._tool_indices.get(
-                                            func_name, -1
-                                        ),
+                                        tool_index=self.current_tool_id,
                                         name=func_name,
                                         parameters="",
                                     )
@@ -388,7 +449,18 @@ class Gemma4Detector(BaseFormatDetector):
                                 self.parsed_pos += brace_pos + 1
                                 continue
                             else:
-                                # Incomplete call:name{
+                                end_pos = current_slice.find(self.tool_call_end_token)
+                                if end_pos != -1:
+                                    self.compatibility.note(
+                                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                                        detail=current_slice[:80],
+                                    )
+                                    self.parsed_pos += end_pos + len(
+                                        self.tool_call_end_token
+                                    )
+                                    self.is_inside_tool_call = False
+                                    self.current_func_name = None
+                                    continue
                                 break
                         else:
                             # Check for partial matches
@@ -397,7 +469,10 @@ class Gemma4Detector(BaseFormatDetector):
                             ) or self.tool_call_end_token.startswith(current_slice):
                                 break
 
-                            # Unexpected content, skip
+                            self.compatibility.note(
+                                CompatibilityEvent.SKIPPED_GARBAGE,
+                                detail=f"inside Gemma4 tool_call: {current_slice[:1]!r}",
+                            )
                             self.parsed_pos += 1
                             continue
                     else:
@@ -406,27 +481,58 @@ class Gemma4Detector(BaseFormatDetector):
                         if match_idx != -1:
                             args_str = current_slice[:match_idx]
                             arguments = _parse_gemma4_args(args_str)
+                            parameters = json.dumps(arguments, ensure_ascii=False)
 
                             calls.append(
                                 ToolCallItem(
-                                    tool_index=self._tool_indices.get(
-                                        self.current_func_name, -1
-                                    ),
-                                    parameters=json.dumps(
-                                        arguments, ensure_ascii=False
-                                    ),
+                                    tool_index=self.current_tool_id,
+                                    parameters=parameters,
                                 )
                             )
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += parameters
+                            self.prev_tool_call_arr[self.current_tool_id] = {
+                                "name": self.current_func_name,
+                                "arguments": arguments,
+                            }
                             self.parsed_pos += match_idx + 1
                             self.current_func_name = None
                             continue
                         else:
-                            # Incomplete arguments block
+                            end_pos = current_slice.find(self.tool_call_end_token)
+                            if end_pos != -1:
+                                self.compatibility.note(
+                                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                                    detail=current_slice[:80],
+                                )
+                                calls.append(
+                                    ToolCallItem(
+                                        tool_index=self.current_tool_id,
+                                        parameters="{}",
+                                    )
+                                )
+                                self.streamed_args_for_tool[
+                                    self.current_tool_id
+                                ] += "{}"
+                                self.prev_tool_call_arr[self.current_tool_id] = {
+                                    "name": self.current_func_name,
+                                    "arguments": {},
+                                }
+                                self.parsed_pos += end_pos + len(
+                                    self.tool_call_end_token
+                                )
+                                self.current_func_name = None
+                                self.is_inside_tool_call = False
+                                continue
                             break
 
         except (ValueError, IndexError, TypeError, KeyError) as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
-            self._note_malformed_tool_call(e)
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=str(e)[:120],
+            )
             # Reset parser state to prevent corruption
             self.is_inside_tool_call = False
             self.current_func_name = None

@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -172,8 +173,8 @@ class HunyuanDetector(BaseFormatDetector):
         except (json.JSONDecodeError, ValueError):
             return value
 
-    @staticmethod
     def _parse_value(
+        self,
         value: str,
         function_name: str,
         arg_key: str,
@@ -202,10 +203,19 @@ class HunyuanDetector(BaseFormatDetector):
             try:
                 return json.loads(value)
             except (json.JSONDecodeError, ValueError):
-                pass
+                self.compatibility.note(
+                    CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                    detail=f"{function_name}.{arg_key}: {value[:80]}",
+                )
 
         if "string" in types:
             return value
+
+        if types & {"boolean", "integer", "number"}:
+            self.compatibility.note(
+                CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                detail=f"{function_name}.{arg_key}: {value[:80]}",
+            )
 
         return HunyuanDetector._deserialize(value)
 
@@ -222,34 +232,62 @@ class HunyuanDetector(BaseFormatDetector):
 
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx > 0 else ""
+        section_end = text.find(self.eot_token, idx + len(self.bot_token))
+        if section_end != -1:
+            normal_text = (
+                text[:idx] + text[section_end + len(self.eot_token) :]
+            ).strip()
 
         tool_indices = self._get_tool_indices(tools)
         calls: List[ToolCallItem] = []
-        try:
-            for function_name, function_args in self.tool_call_regex.findall(text):
-                function_name = function_name.strip()
-                if function_name not in tool_indices and self._skip_unknown_tool(
-                    function_name
-                ):
-                    continue
-
-                arg_dict: Dict[str, Any] = {}
-                for key, value in self.func_args_regex.findall(function_args):
-                    key = key.strip()
-                    arg_dict[key] = self._parse_value(value, function_name, key, tools)
-
-                calls.append(
-                    ToolCallItem(
-                        tool_index=tool_indices.get(function_name, -1),
-                        name=function_name,
-                        parameters=json.dumps(arg_dict, ensure_ascii=False),
-                    )
+        matches = self.tool_call_regex.findall(text)
+        if not matches:
+            if self.eot_token in text:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=text[idx : idx + 80],
                 )
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
-        except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
-            self._note_malformed_tool_call(e)
-            return StreamingParseResult(normal_text=text)
+                return StreamingParseResult(normal_text=normal_text, calls=[])
+            else:
+                self.compatibility.note(
+                    CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                    detail=text[idx : idx + 80],
+                )
+                return StreamingParseResult(normal_text=text, calls=[])
+
+        for function_name, function_args in matches:
+            function_name = function_name.strip()
+            if not function_name:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=function_args[:80],
+                )
+                continue
+            if function_name not in tool_indices and self._skip_unknown_tool(
+                function_name
+            ):
+                continue
+
+            arg_dict: Dict[str, Any] = {}
+            arg_pairs = self.func_args_regex.findall(function_args)
+            if function_args.strip() and not arg_pairs:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=function_args[:80],
+                )
+                continue
+            for key, value in arg_pairs:
+                key = key.strip()
+                arg_dict[key] = self._parse_value(value, function_name, key, tools)
+
+            calls.append(
+                ToolCallItem(
+                    tool_index=tool_indices.get(function_name, -1),
+                    name=function_name,
+                    parameters=json.dumps(arg_dict, ensure_ascii=False),
+                )
+            )
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     # ------------------------------------------------------------------
     # Streaming
@@ -263,12 +301,7 @@ class HunyuanDetector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        try:
-            return self._parse_streaming_increment_impl(new_text, tools)
-        except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
-            self._note_malformed_tool_call(e)
-            return StreamingParseResult()
+        return self._parse_streaming_increment_impl(new_text, tools)
 
     def _parse_streaming_increment_impl(
         self, new_text: str, tools: List[Tool]
@@ -399,6 +432,35 @@ class HunyuanDetector(BaseFormatDetector):
                     self._streaming_tool_name or "", partial_key, tools
                 ):
                     partial_value = tail[av_start + len(self.arg_value_start_token) :]
+
+        malformed_tail = bool(is_complete and tail.strip())
+        if malformed_tail:
+            event = (
+                CompatibilityEvent.MISSING_CLOSE_TAG
+                if partial_key is not None and partial_value is not None
+                else CompatibilityEvent.MALFORMED_JSON_DROPPED
+            )
+            self.compatibility.note(
+                event,
+                detail=tail[:80],
+            )
+
+            if (
+                partial_value is not None
+                and 0 <= self.current_tool_id < len(self.streamed_args_for_tool)
+                and self.streamed_args_for_tool[self.current_tool_id]
+            ):
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": self._streaming_tool_name,
+                    "arguments": {},
+                }
+                closing_calls = self._close_mid_stream_call()
+                end_idx = self._buffer.find(self.tool_call_end_token)
+                self._buffer = self._buffer[end_idx + len(self.tool_call_end_token) :]
+                self._reset_streaming_tool_state()
+                return closing_calls
 
         # Avoid emitting a lone "{" before any arg content is knowable.
         if not is_complete and not self._completed_args and partial_value is None:

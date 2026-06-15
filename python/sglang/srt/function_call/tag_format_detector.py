@@ -18,9 +18,9 @@ from typing import Dict, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.compatibility.mode import (
+from sglang.srt.function_call.compatibility.context import (
+    CompatibilityContext,
     CompatibilityEvent,
-    CompatibilityMode,
 )
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -49,7 +49,7 @@ class TagToolCallDetector(BaseFormatDetector, ABC):
 
     @abstractmethod
     def _make_grammar(
-        self, functions: Optional[Dict], compatibility: CompatibilityMode
+        self, functions: Optional[Dict], compatibility: CompatibilityContext
     ) -> GeneratorParser:
         """Build a fresh parser for this request.
 
@@ -190,6 +190,13 @@ class TagToolCallDetector(BaseFormatDetector, ABC):
         grammar = self._init_grammar(tools)
         # May raise; FunctionCallParser catches and calls fail_open_nonstream().
         grammar.update(text)
+        delta = grammar.get_delta()
+        grammar.restash_delta(delta)
+        if self._has_unclosed_nonstream_tail(text, grammar, delta):
+            self.compatibility.note(
+                CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                detail=grammar.uncommitted_text()[:80],
+            )
         return self._nonstream_result(grammar, text, tools, failed=False)
 
     def fail_open_nonstream(
@@ -199,8 +206,8 @@ class TagToolCallDetector(BaseFormatDetector, ABC):
 
         Calls truncated by the error are dropped; their raw text and the
         unconsumed tail are re-surfaced as content (``uncommitted_text``).
-        When no call survived, ``FunctionCallParser.parse_non_stream`` falls
-        back to returning the full original text.
+        When no call survived, the failed path still returns the full original
+        text.
         """
         grammar = self._grammar
         if grammar is None:
@@ -212,6 +219,10 @@ class TagToolCallDetector(BaseFormatDetector, ABC):
     ) -> StreamingParseResult:
         delta = grammar.get_delta()
         if delta is None:
+            if not failed and (
+                self.compatibility.records or self.compatibility.dropped
+            ):
+                return StreamingParseResult(calls=[])
             return StreamingParseResult(normal_text=text, calls=[])
 
         normal_text = delta.get("content", "")
@@ -256,6 +267,28 @@ class TagToolCallDetector(BaseFormatDetector, ABC):
         normal_text += grammar.uncommitted_text()
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _has_unclosed_nonstream_tail(
+        self, text: str, grammar: GeneratorParser, delta: Optional[Dict]
+    ) -> bool:
+        """True when EOF left the grammar inside a recognized tool construct.
+
+        Partial argument JSON is handled in ``_nonstream_result`` so it can be
+        dropped consistently with strict-mode recovery. This method covers the
+        earlier truncation case where the marker has been consumed but no
+        argument object exists yet.
+        """
+        if not self.has_tool_call(text) or not grammar.uncommitted_text().strip():
+            return False
+        for tc in (delta or {}).get("tool_calls", []):
+            arguments = tc.get("function", {}).get("arguments")
+            if arguments is None:
+                continue
+            try:
+                json.loads(arguments)
+            except json.JSONDecodeError:
+                return False
+        return True
 
     def _nonstream_call_items(
         self, name: str, args_dict: Dict, index: int, tools: List[Tool]

@@ -24,7 +24,10 @@ parameter type.
 
 from typing import Dict, Generator, Optional
 
-from sglang.srt.function_call.compatibility import CompatibilityEvent, CompatibilityMode
+from sglang.srt.function_call.compatibility import (
+    CompatibilityContext,
+    CompatibilityEvent,
+)
 from sglang.srt.function_call.core_types import _GetInfoFunc
 from sglang.srt.function_call.parsing import TagToolCallParser
 from sglang.srt.function_call.tag_format_detector import TagToolCallDetector
@@ -155,7 +158,7 @@ class Step3Detector(TagToolCallDetector):
         return self.bot_token in text
 
     def _make_grammar(
-        self, functions: Optional[Dict], compatibility: CompatibilityMode
+        self, functions: Optional[Dict], compatibility: CompatibilityContext
     ) -> Step3TextParser:
         return Step3TextParser(functions=functions, compatibility=compatibility)
 

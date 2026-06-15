@@ -4,7 +4,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, List, Optional
 
-from sglang.srt.function_call.compatibility.mode import CompatibilityEvent
+from sglang.srt.function_call.compatibility.context import CompatibilityEvent
 from sglang.srt.function_call.core_types import StreamingParseResult
 
 if TYPE_CHECKING:

@@ -8,9 +8,9 @@ import jsonschema
 import jsonschema.exceptions
 from typing_extensions import Self
 
-from sglang.srt.function_call.compatibility.mode import (
+from sglang.srt.function_call.compatibility.context import (
+    CompatibilityContext,
     CompatibilityEvent,
-    CompatibilityMode,
 )
 
 # fmt: off
@@ -316,7 +316,7 @@ class FunctionCallParameterDataType:
         string: str,
         *,
         always_nullable: bool = False,
-        compatibility: Optional[CompatibilityMode] = None,
+        compatibility: Optional[CompatibilityContext] = None,
     ) -> Any:
         if always_nullable:
             stripped = string.strip()

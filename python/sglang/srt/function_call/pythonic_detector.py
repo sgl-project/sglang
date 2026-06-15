@@ -89,6 +89,10 @@ class PythonicDetector(BaseFormatDetector):
             isinstance(parsed, ast.List)
             and all(isinstance(e, ast.Call) for e in parsed.elts)
         ):
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=tool_call_text[:80],
+            )
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         calls = []
@@ -223,10 +227,12 @@ class PythonicDetector(BaseFormatDetector):
         if isinstance(val, ast.Constant):
             return val.value
         elif isinstance(val, ast.Dict):
-            return {
-                k.value: self._get_parameter_value(v)
-                for k, v in zip(val.keys, val.values)
-            }
+            result = {}
+            for k, v in zip(val.keys, val.values):
+                if not isinstance(k, ast.Constant):
+                    raise ValueError("Tool call dict keys must be literals")
+                result[k.value] = self._get_parameter_value(v)
+            return result
         elif isinstance(val, ast.List):
             return [self._get_parameter_value(v) for v in val.elts]
         else:

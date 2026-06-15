@@ -27,7 +27,10 @@ values are converted via the tool's JSON schema.
 import json
 from typing import Dict, Generator, Optional
 
-from sglang.srt.function_call.compatibility import CompatibilityEvent, CompatibilityMode
+from sglang.srt.function_call.compatibility import (
+    CompatibilityContext,
+    CompatibilityEvent,
+)
 from sglang.srt.function_call.core_types import ToolCallItem, _GetInfoFunc
 from sglang.srt.function_call.parsing import TagToolCallParser
 from sglang.srt.function_call.tag_format_detector import TagToolCallDetector
@@ -133,7 +136,7 @@ class Qwen3CoderDetector(TagToolCallDetector):
         return self.tool_call_start_token in text
 
     def _make_grammar(
-        self, functions: Optional[Dict], compatibility: CompatibilityMode
+        self, functions: Optional[Dict], compatibility: CompatibilityContext
     ) -> Qwen3CoderTextParser:
         # Historical Qwen3-Coder behavior: unknown tool names are forwarded,
         # not gated (mirrors _nonstream_call_items below).

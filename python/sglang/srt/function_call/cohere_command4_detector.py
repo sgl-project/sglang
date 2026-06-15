@@ -8,6 +8,7 @@ from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -32,8 +33,7 @@ class CohereCommand4Detector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
-    @staticmethod
-    def _normalize_calls(arr) -> List[dict]:
+    def _normalize_calls(self, arr) -> List[dict]:
         """Translate Cohere's per-item shape ``{tool_call_id, tool_name,
         parameters}`` into the shape ``parse_base_json`` expects (``name`` /
         ``parameters``). Drops ``tool_call_id`` since the OpenAI Chat
@@ -41,14 +41,28 @@ class CohereCommand4Detector(BaseFormatDetector):
         if isinstance(arr, dict):
             arr = [arr]
         if not isinstance(arr, list):
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=repr(arr)[:80],
+            )
             return []
         out: List[dict] = []
         for act in arr:
             if not isinstance(act, dict):
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=repr(act)[:80],
+                )
                 continue
             normalized = dict(act)
             if "name" not in normalized and "tool_name" in normalized:
                 normalized["name"] = normalized.pop("tool_name")
+            if "name" not in normalized:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=repr(act)[:80],
+                )
+                continue
             normalized.pop("tool_call_id", None)
             out.append(normalized)
         return out
@@ -58,28 +72,57 @@ class CohereCommand4Detector(BaseFormatDetector):
         idx = text.find(self.bot_token)
         if idx == -1:
             return StreamingParseResult(normal_text=text)
-        normal_text = text[:idx]
         body_start = idx + len(self.bot_token)
         eot_idx = text.find(self.eot_token, body_start)
         body = text[body_start:eot_idx] if eot_idx != -1 else text[body_start:]
+        normal_text = (
+            text[:idx] + text[eot_idx + len(self.eot_token) :]
+            if eot_idx != -1
+            else text[:idx]
+        )
 
         # body should be ``[ {...}, {...} ]`` (with arbitrary whitespace).
         # Prefer the full-text JSON parser when the block is complete; fall
         # back to ``_partial_json_loads`` to be forgiving when generation was
         # truncated before ``<|END_ACTION|>``.
         arr = None
+        used_partial = False
+        parse_error = None
         try:
             arr = orjson.loads(body)
-        except (orjson.JSONDecodeError, TypeError, ValueError):
+        except (orjson.JSONDecodeError, TypeError, ValueError) as e:
+            parse_error = e
             try:
                 arr, _ = _partial_json_loads(body, Allow.ALL)
+                used_partial = True
             except (MalformedJSON, json.JSONDecodeError, ValueError) as e:
                 logger.warning(
                     f"Cohere tool-call body did not parse as JSON: {e}; "
                     "returning surrounding text as normal output."
                 )
-                self._note_malformed_tool_call(e, detail=body[:80])
+                if eot_idx == -1:
+                    self.compatibility.note(
+                        CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                        detail=body[:80],
+                    )
+                else:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=body[:80],
+                    )
                 return StreamingParseResult(normal_text=normal_text)
+        if used_partial:
+            if eot_idx == -1:
+                self.compatibility.note(
+                    CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                    detail=body[:80],
+                )
+                return StreamingParseResult(normal_text=text, calls=[])
+            elif parse_error is not None:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=body[:80],
+                )
 
         normalized = self._normalize_calls(arr)
         return StreamingParseResult(

@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     _GetInfoFunc,
@@ -52,6 +53,14 @@ def parse_arguments(json_value):
         return json_value, False
 
 
+def _should_record_unconvertible(arg_type, parsed_ok: bool) -> bool:
+    if parsed_ok or arg_type is None:
+        return False
+    if isinstance(arg_type, list):
+        return "string" not in arg_type
+    return arg_type != "string"
+
+
 class MiniCPM5Detector(BaseFormatDetector):
     """
     Detector for MiniCPM-4 models (V3 schema) adapted to the new chat template.
@@ -91,164 +100,194 @@ class MiniCPM5Detector(BaseFormatDetector):
             req = params.get("required", []) if isinstance(params, dict) else []
             try:
                 name_to_required[name] = set(req)
-            except Exception:
+            except TypeError:
                 name_to_required[name] = set()
 
-        try:
-            last_end = 0
-            for m in re.finditer(self.func_call_regex, text, re.DOTALL):
-                if m.start() > last_end:
-                    normal_parts.append(text[last_end : m.start()])
+        last_end = 0
+        saw_block = False
+        for m in re.finditer(self.func_call_regex, text, re.DOTALL):
+            saw_block = True
+            if m.start() > last_end:
+                normal_parts.append(text[last_end : m.start()])
 
-                block = m.group(0)
-                func_name = None
-                arguments = {}
+            block = m.group(0)
+            func_name = None
+            arguments = {}
+            parsed_ok = False
+            param_invalid = False
+            parse_error = None
+            invalid_reason = ""
+
+            # Primary path: XML parsing (lxml preferred, stdlib fallback)
+            try:
+                if _HAS_LXML:
+                    try:
+                        parser = ET.XMLParser(**{"strip_cdata": False})  # type: ignore[call-arg]
+                    except TypeError:
+                        parser = ET.XMLParser()
+                    root = ET.fromstring(block, parser=parser)
+                else:
+                    root = ET.fromstring(block)
+
+                if root.tag == "function":
+                    func_node = root
+                else:
+                    func_node = root.find("function") if hasattr(root, "find") else None
+
+                if func_node is not None:
+                    func_name = (func_node.attrib.get("name") or "").strip()
+
+                args_node = (
+                    func_node.find("arguments") if func_node is not None else None
+                )
+                param_nodes = []
+                if func_node is not None:
+                    param_nodes = list(func_node.findall("param"))
+                    if args_node is not None and not param_nodes:
+                        param_nodes = list(args_node.findall("param"))
+
+                if func_node is not None:
+                    seen_keys = set()
+                    allowed_props = set()
+                    if func_name in tool_names:
+                        allowed_props = name_to_allowed_props.get(func_name, set())
+                    has_invalid_param = False
+                    for param in param_nodes:
+                        key = param.attrib.get("name")
+                        if not key:
+                            has_invalid_param = True
+                            invalid_reason = "parameter missing name"
+                            break
+                        if allowed_props and key not in allowed_props:
+                            has_invalid_param = True
+                            invalid_reason = f"unknown parameter {key!r}"
+                            break
+                        if key in seen_keys:
+                            has_invalid_param = True
+                            invalid_reason = f"duplicate parameter {key!r}"
+                            break
+                        seen_keys.add(key)
+                        val_text = param.text or ""
+                        val_text = val_text.strip()
+                        arg_type = get_argument_type(func_name or "", key, name_to_tool)
+                        if arg_type != "string":
+                            parsed_val, parsed_ok = parse_arguments(val_text)
+                            if _should_record_unconvertible(arg_type, parsed_ok):
+                                self.compatibility.note(
+                                    CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                                    detail=f"{func_name}.{key}: {val_text[:80]}",
+                                )
+                            arguments[key] = parsed_val
+                        else:
+                            arguments[key] = val_text
+                    if has_invalid_param:
+                        arguments.clear()
+                        param_invalid = True
+                parsed_ok = bool(func_name)
+            except (ET.ParseError, TypeError, ValueError) as e:
+                parse_error = e
                 parsed_ok = False
-                param_invalid = False
-                parse_error = None
 
-                # Primary path: XML parsing (lxml preferred, stdlib fallback)
+            if not parsed_ok:
+                # Fallback path: regex extraction
                 try:
-                    if _HAS_LXML:
-                        try:
-                            parser = ET.XMLParser(**{"strip_cdata": False})  # type: ignore[call-arg]
-                        except TypeError:
-                            parser = ET.XMLParser()
-                        root = ET.fromstring(block, parser=parser)
-                    else:
-                        root = ET.fromstring(block)
-
-                    if root.tag == "function":
-                        func_node = root
-                    else:
-                        func_node = (
-                            root.find("function") if hasattr(root, "find") else None
-                        )
-
-                    if func_node is not None:
-                        func_name = (func_node.attrib.get("name") or "").strip()
-
-                    args_node = (
-                        func_node.find("arguments") if func_node is not None else None
+                    m_fn = _FUNC_NAME_V1_REGEX.search(block)
+                    if m_fn:
+                        func_name = (m_fn.group(1) or "").strip()
+                    has_invalid_param = (
+                        _PARAM_MISSING_NAME_REGEX.search(block) is not None
                     )
-                    param_nodes = []
-                    if func_node is not None:
-                        param_nodes = list(func_node.findall("param"))
-                        if args_node is not None and not param_nodes:
-                            param_nodes = list(args_node.findall("param"))
-
-                    if func_node is not None:
-                        seen_keys = set()
-                        allowed_props = set()
-                        if func_name in tool_names:
-                            allowed_props = name_to_allowed_props.get(func_name, set())
-                        has_invalid_param = False
-                        for param in param_nodes:
-                            key = param.attrib.get("name")
-                            if not key:
-                                has_invalid_param = True
-                                break
-                            if allowed_props and key not in allowed_props:
-                                has_invalid_param = True
-                                break
-                            if key in seen_keys:
-                                has_invalid_param = True
-                                break
-                            seen_keys.add(key)
-                            val_text = param.text or ""
-                            val_text = val_text.strip()
-                            arg_type = get_argument_type(
-                                func_name or "", key, name_to_tool
-                            )
-                            if arg_type != "string":
-                                parsed_val, _ = parse_arguments(val_text)
-                                arguments[key] = parsed_val
-                            else:
-                                arguments[key] = val_text
-                        if has_invalid_param:
-                            arguments.clear()
-                            param_invalid = True
+                    seen_keys = set()
+                    allowed_props = set()
+                    if func_name in tool_names:
+                        allowed_props = name_to_allowed_props.get(func_name, set())
+                    for pm in _PARAM_WITH_NAME_REGEX.finditer(block):
+                        key = pm.group(1).strip()
+                        if allowed_props and key not in allowed_props:
+                            has_invalid_param = True
+                            invalid_reason = f"unknown parameter {key!r}"
+                            break
+                        if key in seen_keys:
+                            has_invalid_param = True
+                            invalid_reason = f"duplicate parameter {key!r}"
+                            break
+                        seen_keys.add(key)
+                        val_text = pm.group(2) or ""
+                        if val_text.startswith("<![CDATA[") and val_text.endswith(
+                            "]]>"
+                        ):
+                            val_text = val_text[len("<![CDATA[") : -len("]]>")]
+                        val_text = val_text.strip()
+                        arg_type = get_argument_type(func_name or "", key, name_to_tool)
+                        if arg_type != "string":
+                            parsed_val, parsed_ok = parse_arguments(val_text)
+                            if _should_record_unconvertible(arg_type, parsed_ok):
+                                self.compatibility.note(
+                                    CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                                    detail=f"{func_name}.{key}: {val_text[:80]}",
+                                )
+                            arguments[key] = parsed_val
+                        else:
+                            arguments[key] = val_text
+                    if has_invalid_param:
+                        arguments.clear()
+                        param_invalid = True
                     parsed_ok = bool(func_name)
-                except Exception as e:
+                    if parsed_ok:
+                        parse_error = None
+                except (IndexError, TypeError, ValueError) as e:
                     parse_error = e
                     parsed_ok = False
 
-                if not parsed_ok:
-                    # Fallback path: regex extraction
-                    try:
-                        m_fn = _FUNC_NAME_V1_REGEX.search(block)
-                        if m_fn:
-                            func_name = (m_fn.group(1) or "").strip()
-                        has_invalid_param = (
-                            _PARAM_MISSING_NAME_REGEX.search(block) is not None
-                        )
-                        seen_keys = set()
-                        allowed_props = set()
-                        if func_name in tool_names:
-                            allowed_props = name_to_allowed_props.get(func_name, set())
-                        for pm in _PARAM_WITH_NAME_REGEX.finditer(block):
-                            key = pm.group(1).strip()
-                            if allowed_props and key not in allowed_props:
-                                has_invalid_param = True
-                                break
-                            if key in seen_keys:
-                                has_invalid_param = True
-                                break
-                            seen_keys.add(key)
-                            val_text = pm.group(2) or ""
-                            if val_text.startswith("<![CDATA[") and val_text.endswith(
-                                "]]>"
-                            ):
-                                val_text = val_text[len("<![CDATA[") : -len("]]>")]
-                            val_text = val_text.strip()
-                            arg_type = get_argument_type(
-                                func_name or "", key, name_to_tool
-                            )
-                            if arg_type != "string":
-                                parsed_val, _ = parse_arguments(val_text)
-                                arguments[key] = parsed_val
-                            else:
-                                arguments[key] = val_text
-                        if has_invalid_param:
-                            arguments.clear()
-                            param_invalid = True
-                        parsed_ok = bool(func_name)
-                        if parsed_ok:
-                            parse_error = None
-                    except Exception as e:
-                        parse_error = e
-                        parsed_ok = False
-
-                if func_name and func_name not in tool_names:
-                    if self._skip_unknown_tool(func_name):
-                        parsed_ok = False
-                    else:
-                        parsed_ok = not param_invalid
-                elif not func_name or param_invalid:
+            if func_name and func_name not in tool_names:
+                if self._skip_unknown_tool(func_name):
                     parsed_ok = False
+                    invalid_reason = ""
                 else:
-                    req_props = name_to_required.get(func_name, set())
-                    if req_props and not req_props.issubset(arguments.keys()):
-                        parsed_ok = False
+                    parsed_ok = not param_invalid
+            elif not func_name or param_invalid:
+                if not invalid_reason:
+                    invalid_reason = (
+                        "missing function name"
+                        if not func_name
+                        else "invalid parameter"
+                    )
+                parsed_ok = False
+            else:
+                req_props = name_to_required.get(func_name, set())
+                if req_props and not req_props.issubset(arguments.keys()):
+                    missing = sorted(req_props - set(arguments.keys()))
+                    invalid_reason = f"missing required parameters {missing!r}"
+                    parsed_ok = False
 
-                if parsed_ok:
-                    tool_call_obj = {"name": func_name, "parameters": arguments}
-                    calls.extend(self.parse_base_json(tool_call_obj, tools))
-                else:
-                    if parse_error is not None:
-                        self._note_malformed_tool_call(parse_error, detail=block[:80])
-                    normal_parts.append(block)
+            if parsed_ok:
+                tool_call_obj = {"name": func_name, "parameters": arguments}
+                calls.extend(self.parse_base_json(tool_call_obj, tools))
+            else:
+                if parse_error is not None:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=block[:80],
+                    )
+                elif invalid_reason:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=block[:80],
+                    )
+                normal_parts.append(block)
 
-                last_end = m.end()
+            last_end = m.end()
 
-            if last_end < len(text):
-                normal_parts.append(text[last_end:])
+        if not saw_block:
+            self.compatibility.note(
+                CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                detail=text[idx : idx + 80],
+            )
 
-            return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
-        except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
-            self._note_malformed_tool_call(e)
-            return StreamingParseResult(normal_text=text)
+        if last_end < len(text):
+            normal_parts.append(text[last_end:])
+
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def _append_tool_call(self, call, all_calls: List) -> None:
         if self.current_tool_id == -1:

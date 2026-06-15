@@ -220,6 +220,53 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
         raise MalformedJSON(str(e)) from e
 
 
+def _closed_top_level_json_end(text: str) -> Optional[int]:
+    """Best-effort end offset for a closed top-level JSON fragment.
+
+    Partial JSON is expected during streaming and should keep buffering. When
+    the top-level array/object has syntactically closed outside a string, a
+    parser failure is no longer just "need more bytes"; callers can safely
+    isolate that fragment for malformed-payload recovery.
+    """
+    closers = {"[": "]", "{": "}"}
+    stack: List[str] = []
+    in_string = False
+    escape = False
+    started = False
+
+    for i, ch in enumerate(text):
+        if not started:
+            if ch.isspace():
+                continue
+            if ch in closers:
+                started = True
+                stack.append(closers[ch])
+                continue
+            return None
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch in closers:
+            stack.append(closers[ch])
+        elif ch in "]}":
+            if not stack or ch != stack[-1]:
+                return i + 1
+            stack.pop()
+            if not stack:
+                return i + 1
+
+    return None
+
+
 def _is_complete_json(input_str: str) -> bool:
     try:
         orjson.loads(input_str)

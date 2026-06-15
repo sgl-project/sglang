@@ -206,6 +206,10 @@ class GptOssDetector(BaseFormatDetector):
 
         if not match:
             logger.debug(f"Could not extract tool call from: {content[:100]}")
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=content[:80],
+            )
             return None
 
         full_function_name = match.group(1)

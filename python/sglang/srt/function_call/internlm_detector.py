@@ -7,6 +7,7 @@ from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -87,67 +88,86 @@ class InternlmDetector(BaseFormatDetector):
         tool_call_pattern = (
             rf"{re.escape(self.bot_token)}\s*(.*?){re.escape(self.eot_token)}"
         )
-        matches = re.findall(tool_call_pattern, text, re.DOTALL)
+        matches = list(re.finditer(tool_call_pattern, text, re.DOTALL))
 
         if not matches:
             logger.warning("[InternLM Tool Call] No complete tool call blocks found")
+            self.compatibility.note(
+                CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                detail=text[text.find(self.bot_token) :][:80],
+            )
             return StreamingParseResult(normal_text=text, calls=[])
 
         logger.info(f"[InternLM Tool Call] Found {len(matches)} tool call(s)")
 
         calls = []
         tool_indices = self._get_tool_indices(tools)
+        normal_parts = []
+        cursor = 0
 
-        try:
-            for idx, action_json in enumerate(matches):
-                action_json = action_json.strip()
+        for idx, action_json in enumerate(matches):
+            normal_parts.append(text[cursor : action_json.start()])
+            cursor = action_json.end()
+            action_json = action_json.group(1).strip()
 
-                try:
-                    # Parse the JSON
-                    action_dict = json.loads(action_json)
-                    name = action_dict.get("name")
-                    parameters = self.get_arguments(action_dict)
+            try:
+                # Parse the JSON
+                action_dict = json.loads(action_json)
+            except json.JSONDecodeError as e:
+                logger.error(
+                    f"[InternLM Tool Call] Failed to parse JSON for tool call #{idx+1}: {e}"
+                )
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=action_json[:80],
+                )
+                continue
 
-                    if not parameters:
-                        parameters = {}
+            if not isinstance(action_dict, dict):
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=action_json[:80],
+                )
+                continue
 
-                    logger.info(
-                        f"[InternLM Tool Call] Parsed tool call #{idx+1}: name={name}, "
-                        f"parameters={json.dumps(parameters, ensure_ascii=False)}"
-                    )
+            name = action_dict.get("name")
+            parameters = self.get_arguments(action_dict)
 
-                    # Validate tool name
-                    if not (name and name in tool_indices):
-                        if self._skip_unknown_tool(name):
-                            continue
+            if not name:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=action_json[:80],
+                )
+                continue
 
-                    # Create tool call item and add to list
-                    tool_call = ToolCallItem(
-                        tool_index=tool_indices.get(name, -1),
-                        name=name,
-                        parameters=json.dumps(parameters, ensure_ascii=False),
-                    )
-                    calls.append(tool_call)
-
-                except json.JSONDecodeError as e:
-                    logger.error(
-                        f"[InternLM Tool Call] Failed to parse JSON for tool call #{idx+1}: {e}"
-                    )
-                    self._note_malformed_tool_call(e, detail=action_json[:80])
-                    continue
+            if not parameters:
+                parameters = {}
 
             logger.info(
-                f"[InternLM Tool Call] Successfully parsed {len(calls)} tool call(s), "
-                f"normal_text_length={len(normal_text)}"
+                f"[InternLM Tool Call] Parsed tool call #{idx+1}: name={name}, "
+                f"parameters={json.dumps(parameters, ensure_ascii=False)}"
             )
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
-        except Exception as e:
-            logger.error(
-                f"[InternLM Tool Call] Error in detect_and_parse: {e}", exc_info=True
+            # Validate tool name
+            if not (name and name in tool_indices):
+                if self._skip_unknown_tool(name):
+                    continue
+
+            # Create tool call item and add to list
+            tool_call = ToolCallItem(
+                tool_index=tool_indices.get(name, -1),
+                name=name,
+                parameters=json.dumps(parameters, ensure_ascii=False),
             )
-            self._note_malformed_tool_call(e)
-            return StreamingParseResult(normal_text=text, calls=[])
+            calls.append(tool_call)
+
+        normal_parts.append(text[cursor:])
+        normal_text = "".join(normal_parts).strip()
+        logger.info(
+            f"[InternLM Tool Call] Successfully parsed {len(calls)} tool call(s), "
+            f"normal_text_length={len(normal_text)}"
+        )
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]

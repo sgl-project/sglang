@@ -2,10 +2,12 @@ import json
 import logging
 import re
 
+from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -128,9 +130,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 # Remove incomplete invoke end call prefix in case they are captured by param
                 for token in reversed(self.prefix_invoke_end_call):
                     invoke_content_stripped = invoke_content_stripped.rstrip(token)
-                return invoke_content_stripped
-            elif invoke_content_stripped.endswith("}"):
-                return invoke_content_stripped
+            return invoke_content_stripped
 
         # Fall back to XML parameter tag parsing (original format)
         parameters = {}
@@ -154,12 +154,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 try:
                     parameters[param_name] = json.loads(param_value.strip())
                 except (json.JSONDecodeError, ValueError):
+                    if not allow_partial:
+                        self.compatibility.note(
+                            CompatibilityEvent.UNCONVERTIBLE_VALUE_KEPT_RAW,
+                            detail=f"{param_name}: {param_value[:80]}",
+                        )
                     parameters[param_name] = param_value.strip()
+
+        remaining_content = invoke_content[last_match_end:]
 
         # If allowed, try to parse a partial parameter at the end
         if allow_partial:
-            remaining_content = invoke_content[last_match_end:]
-
             # Remove incomplete parameter_end_call prefix in case they are captured by param
             for token in reversed(self.prefix_parameter_end_call):
                 remaining_content = remaining_content.rstrip(token)
@@ -179,8 +184,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         parameters[param_name] = _partial_json_loads(
                             param_value, Allow.ALL
                         )[0]
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, MalformedJSON):
                         parameters[param_name] = param_value.strip()
+        elif remaining_content.strip():
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=remaining_content[:80],
+            )
 
         return json.dumps(parameters, ensure_ascii=False)
 
@@ -198,34 +208,66 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         calls = []
-        try:
-            # Extract content between function_calls tags
-            function_calls_match = re.search(
-                self.function_calls_regex,
-                text,
-                re.DOTALL,
+        # Extract content between function_calls tags
+        function_calls_match = re.search(
+            self.function_calls_regex,
+            text,
+            re.DOTALL,
+        )
+        if not function_calls_match:
+            if self.eot_token in text:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=text[idx : idx + 80],
+                )
+            else:
+                self.compatibility.note(
+                    CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                    detail=text[idx : idx + 80],
+                )
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        normal_text = (
+            text[: function_calls_match.start()].removesuffix("\n\n")
+            + text[function_calls_match.end() :]
+        )
+        function_calls_content = function_calls_match.group(1)
+        found_invoke = False
+
+        # Find all invoke blocks
+        for invoke_match in re.finditer(
+            self.invoke_regex, function_calls_content, re.DOTALL
+        ):
+            found_invoke = True
+            func_name, invoke_content, is_complete = self._unpack_invoke_match(
+                invoke_match
             )
-            if not function_calls_match:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
+            if not is_complete:
+                self.compatibility.note(
+                    CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                    detail=invoke_match.group(0)[:80],
+                )
+                continue
+            func_args = self._parse_parameters_from_xml(invoke_content)
+            with self.compatibility.absorb(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                json.JSONDecodeError,
+                detail=f"{func_name}: {func_args[:80]}",
+            ) as absorbed:
+                parsed_args = json.loads(func_args)
+            if absorbed.fired:
+                continue
+            # construct match_result for parse_base_json
+            match_result = {"name": func_name, "parameters": parsed_args}
+            calls.extend(self.parse_base_json(match_result, tools))
 
-            function_calls_content = function_calls_match.group(1)
+        if not found_invoke and function_calls_content.strip():
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=function_calls_content[:80],
+            )
 
-            # Find all invoke blocks
-            for invoke_match in re.finditer(
-                self.invoke_regex, function_calls_content, re.DOTALL
-            ):
-                func_name, invoke_content, _ = self._unpack_invoke_match(invoke_match)
-                func_args = self._parse_parameters_from_xml(invoke_content)
-                # construct match_result for parse_base_json
-                match_result = {"name": func_name, "parameters": json.loads(func_args)}
-                calls.extend(self.parse_base_json(match_result, tools))
-
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
-        except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
-            self._note_malformed_tool_call(e)
-            # return the normal text if parsing fails
-            return StreamingParseResult(normal_text=text)
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
@@ -259,109 +301,125 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     current_text = current_text.replace(e_token, "")
             return StreamingParseResult(normal_text=current_text)
 
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+
         all_calls: list[ToolCallItem] = []
-        try:
-            # Loop to handle multiple consecutive invoke blocks
-            while True:
-                # Try to match an invoke block (may be partial)
-                invoke_match = re.search(
-                    pattern=self.invoke_regex,
-                    string=current_text,
-                    flags=re.DOTALL,
-                )
-                if not invoke_match:
-                    break
+        # Loop to handle multiple consecutive invoke blocks
+        while True:
+            # Try to match an invoke block (may be partial)
+            invoke_match = re.search(
+                pattern=self.invoke_regex,
+                string=current_text,
+                flags=re.DOTALL,
+            )
+            if not invoke_match:
+                break
 
-                func_name, invoke_content, is_tool_end = self._unpack_invoke_match(
-                    invoke_match
-                )
-
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
-
-                # Ensure arrays are large enough for current tool
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
-
-                # 1. Send tool name if not sent yet
-                if not self.current_tool_name_sent:
-                    all_calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
-                        )
-                    )
-                    self.current_tool_name_sent = True
-
-                # 2. Parse current parameters (partial or complete)
-                current_params = self._parse_parameters_from_xml(
-                    invoke_content, allow_partial=not is_tool_end
-                )
-
-                # 3. Calculate and send incremental arguments
-                sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
-                prev_params = self.prev_tool_call_arr[self.current_tool_id].get(
-                    "arguments"
-                )
-
-                argument_diff = None
-
+            func_name, invoke_content, is_tool_end = self._unpack_invoke_match(
+                invoke_match
+            )
+            if func_name not in self._tool_indices and self._skip_unknown_tool(
+                func_name
+            ):
                 if is_tool_end:
-                    # If complete, send everything remaining
-                    argument_diff = current_params[sent_len:]
-                elif prev_params is not None:
-                    # If partial, send stable prefix diff
-                    if current_params != prev_params:
-                        prefix = _find_common_prefix(current_params, prev_params)
-                        if len(prefix) > sent_len:
-                            argument_diff = prefix[sent_len:]
-
-                if argument_diff:
-                    all_calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=None,
-                            parameters=argument_diff,
-                        )
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
-
-                # Update the stored arguments
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": func_name,
-                    "arguments": current_params,
-                }
-
-                # Check if tool call is complete (has closing tag)
-                if is_tool_end:
-                    # Remove the completed tool call from buffer
                     self._buffer = current_text[invoke_match.end() :]
-                    current_text = self._buffer  # Update for next iteration
-
-                    # Move to next tool call
-                    self.current_tool_id += 1
-                    self.current_tool_name_sent = False
-
-                    # Continue loop to check for more invoke blocks
+                    current_text = self._buffer
                     continue
-                else:
-                    # Tool call not complete yet, don't return anything
-                    # Wait for more chunks until we see </｜DSML｜invoke>
-                    break
+                break
 
-            # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            # 1. Parse current parameters (partial or complete)
+            current_params = self._parse_parameters_from_xml(
+                invoke_content, allow_partial=not is_tool_end
+            )
+            if is_tool_end and invoke_content.strip().startswith(("{", "[")):
+                try:
+                    json.loads(current_params)
+                except json.JSONDecodeError:
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=current_params[:80],
+                    )
+                    all_calls.extend(self._close_started_malformed_call())
+                    self._buffer = current_text[invoke_match.end() :]
+                    current_text = self._buffer
+                    self.current_tool_name_sent = False
+                    continue
 
-        except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}")
-            self._note_malformed_tool_call(e)
-            return StreamingParseResult(normal_text=current_text)
+            # Initialize state if this is the first tool call
+            if self.current_tool_id == -1:
+                self.current_tool_id = 0
+                self.prev_tool_call_arr = []
+                self.streamed_args_for_tool = [""]
+
+            # Ensure arrays are large enough for current tool
+            while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
+
+            # 2. Send tool name if not sent yet
+            if not self.current_tool_name_sent:
+                all_calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=func_name,
+                        parameters="",
+                    )
+                )
+                self.current_tool_name_sent = True
+
+            # 3. Calculate and send incremental arguments
+            sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
+            prev_params = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+
+            argument_diff = None
+
+            if is_tool_end:
+                # If complete, send everything remaining
+                argument_diff = current_params[sent_len:]
+            elif prev_params is not None:
+                # If partial, send stable prefix diff
+                if current_params != prev_params:
+                    prefix = _find_common_prefix(current_params, prev_params)
+                    if len(prefix) > sent_len:
+                        argument_diff = prefix[sent_len:]
+
+            if argument_diff:
+                all_calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=None,
+                        parameters=argument_diff,
+                    )
+                )
+                self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+
+            # Update the stored arguments
+            self.prev_tool_call_arr[self.current_tool_id] = {
+                "name": func_name,
+                "arguments": current_params,
+            }
+
+            # Check if tool call is complete (has closing tag)
+            if is_tool_end:
+                # Remove the completed tool call from buffer
+                self._buffer = current_text[invoke_match.end() :]
+                current_text = self._buffer  # Update for next iteration
+
+                # Move to next tool call
+                self.current_tool_id += 1
+                self.current_tool_name_sent = False
+
+                # Continue loop to check for more invoke blocks
+                continue
+            else:
+                # Tool call not complete yet, don't return anything
+                # Wait for more chunks until we see </｜DSML｜invoke>
+                break
+
+        # No more invoke blocks found
+        return StreamingParseResult(normal_text="", calls=all_calls)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

@@ -6,7 +6,10 @@ from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.compatibility import CompatibilityViolation
+from sglang.srt.function_call.compatibility import (
+    CompatibilityEvent,
+    CompatibilityViolation,
+)
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -102,19 +105,30 @@ class Llama32Detector(BaseFormatDetector):
 
                 next_obj_start = action_text.find('{"name":', idx + 1)
                 if next_obj_start == -1:
-                    if not all_actions and action_text[idx:].strip():
-                        self._note_malformed_tool_call(
-                            parse_error, detail=action_text[idx : idx + 80]
+                    if action_text[idx:].strip():
+                        self.compatibility.note(
+                            CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                            detail=action_text[idx : idx + 80],
                         )
                     break
-                if not all_actions:
-                    self._note_malformed_tool_call(
-                        parse_error, detail=action_text[idx:next_obj_start][:80]
+                if action_text[idx:next_obj_start].strip():
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=action_text[idx:next_obj_start][:80],
                     )
                 idx = next_obj_start
 
         # Only process if we found valid JSON objects
-        calls = self.parse_base_json(all_actions, tools) if all_actions else []
+        valid_actions = []
+        for action in all_actions:
+            if not isinstance(action, dict):
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=repr(action)[:80],
+                )
+                continue
+            valid_actions.append(action)
+        calls = self.parse_base_json(valid_actions, tools) if valid_actions else []
         # Use safe_idx to avoid idx containing the last part of an invalid JSON object
         trailing_text = (
             action_text[safe_idx:].strip() if safe_idx < action_text_len else ""

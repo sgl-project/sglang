@@ -8,10 +8,12 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
     Gemma4Detector,
     _parse_gemma4_args,
@@ -717,22 +719,31 @@ class TestBaseFormatDetector(unittest.TestCase):
             tourist_calls[0].tool_index, 1, "Second tool should have tool_index=1"
         )
 
-    def test_buffer_reset_on_invalid_tool(self):
-        """Test that buffer and state are reset when an invalid tool name is encountered."""
+    def test_buffer_reset_on_completed_invalid_tool(self):
+        """Test that invalid tools are dropped once their JSON object is complete."""
         # Start fresh with an invalid tool name from the beginning
         result = self.detector.parse_streaming_increment(
             '<tool_call>{"name": "invalid_tool", ', self.tools
         )
 
-        # Should return empty result and reset state
         self.assertEqual(result.calls, [], "Should return no calls for invalid tool")
         self.assertEqual(
             self.detector.current_tool_id,
             -1,
             "current_tool_id should remain -1 for invalid tool",
         )
+
+        result = self.detector.parse_streaming_increment(
+            '"arguments": {}}</tool_call>', self.tools
+        )
+
+        self.assertEqual(result.calls, [], "Should return no calls for invalid tool")
         self.assertEqual(
             self.detector._buffer, "", "Buffer should be cleared for invalid tool"
+        )
+        self.assertEqual(
+            [r.event for r in self.detector.compatibility_records],
+            [CompatibilityEvent.UNKNOWN_TOOL_DROPPED],
         )
 
     def test_chinese_characters_not_double_escaped(self):
@@ -3405,6 +3416,22 @@ class TestJsonArrayParser(unittest.TestCase):
         ]
         self.detector = JsonArrayParser()
 
+    def _collect_streaming(self, chunks, detector=None, ticks=8):
+        detector = detector or self.detector
+        normal_text = ""
+        calls = []
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+        for _ in range(ticks):
+            result = detector.parse_streaming_increment("", self.tools)
+            if not result.normal_text and not result.calls:
+                break
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+        return normal_text, calls
+
     def test_json_detector_has_no_ebnf(self):
         """JsonArrayParser no longer exposes EBNF generation helpers."""
         self.assertFalse(
@@ -3425,6 +3452,98 @@ class TestJsonArrayParser(unittest.TestCase):
         result = self.detector.parse_streaming_increment(text, self.tools)
 
         self.assertIsInstance(result, StreamingParseResult)
+
+    def test_streaming_drops_non_dict_and_missing_name_entries(self):
+        normal_text, calls = self._collect_streaming(
+            [
+                '[1,{"arguments":{}},'
+                '{"name":"get_weather","arguments":{"location":"Paris"}}]'
+            ]
+        )
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual([call.name for call in calls if call.name], ["get_weather"])
+        self.assertEqual({call.tool_index for call in calls}, {0})
+        streamed_parameters = "".join(
+            call.parameters for call in calls if call.parameters
+        )
+        self.assertEqual(json.loads(streamed_parameters), {"location": "Paris"})
+        self.assertEqual(
+            [r.event for r in self.detector.compatibility_records],
+            [
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+            ],
+        )
+
+    def test_malformed_arguments_after_streamed_name_use_fresh_next_index(self):
+        normal_text, calls = self._collect_streaming(
+            [
+                '[{"name":"get_weather",',
+                '"arguments":{bad}}',
+                ',{"name":"search","arguments":{"query":"rome"}}]',
+            ]
+        )
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in calls if call.name],
+            [(0, "get_weather"), (1, "search")],
+        )
+
+        parameters_by_index = {}
+        for call in calls:
+            if call.parameters:
+                parameters_by_index[call.tool_index] = (
+                    parameters_by_index.get(call.tool_index, "") + call.parameters
+                )
+
+        self.assertEqual(json.loads(parameters_by_index[0]), {})
+        self.assertEqual(json.loads(parameters_by_index[1]), {"query": "rome"})
+        self.assertEqual(
+            [r.event for r in self.detector.compatibility_records],
+            [CompatibilityEvent.MALFORMED_JSON_DROPPED],
+        )
+
+    def test_parser_wrapper_drains_tail_after_malformed_started_call(self):
+        parser = FunctionCallParser.with_detector(
+            JsonArrayParser(), self.tools, enable_compatibility_mode=True
+        )
+
+        normal_text, first_calls = parser.parse_stream_chunk('[{"name":"get_weather",')
+        self.assertEqual(normal_text, "")
+        self.assertEqual(
+            [(call.tool_index, call.name, call.parameters) for call in first_calls],
+            [(0, "get_weather", "")],
+        )
+
+        normal_text, second_calls = parser.parse_stream_chunk(
+            '"arguments":{bad}}, {"name":"search","arguments":{"query":"rome"}}]'
+        )
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual(
+            [(call.tool_index, call.name, call.parameters) for call in second_calls],
+            [
+                (0, None, "{}"),
+                (1, "search", ""),
+                (1, None, '{"query": "rome"}'),
+            ],
+        )
+        self.assertEqual(parser.detector._buffer, "")
+
+    def test_trailing_comma_text_after_closed_array_is_flushed(self):
+        normal_text, calls = self._collect_streaming(
+            ['[{"name":"get_weather","arguments":{}}], trailing', " more"]
+        )
+
+        self.assertEqual(normal_text, ", trailing more")
+        self.assertEqual([call.name for call in calls if call.name], ["get_weather"])
+        streamed_parameters = "".join(
+            call.parameters for call in calls if call.parameters
+        )
+        self.assertEqual(json.loads(streamed_parameters), {})
+        self.assertEqual(self.detector.compatibility_records, [])
 
     def test_parse_streaming_increment_empty_input(self):
         """Test parsing with empty input"""
@@ -4181,9 +4300,12 @@ function call<|role_sep|>
         text = '<|message_sep|>\n\nfunction call<|role_sep|>\n{"name": "manage_user_memory", "arguments": {invalid json}}'
         result = self.detector.detect_and_parse(text, self.tools)
 
-        # Should return the full text as content when JSON parsing fails
-        self.assertIn("function call", result.normal_text)
+        self.assertEqual(result.normal_text, "")
         self.assertEqual(len(result.calls), 0)
+        self.assertEqual(
+            [r.event for r in self.detector.compatibility_records],
+            [CompatibilityEvent.MALFORMED_JSON_DROPPED],
+        )
 
     def test_detect_and_parse_missing_name(self):
         """Test parsing with missing function name."""
@@ -4584,8 +4706,12 @@ function call<|role_sep|>
         text = '<|function_call|>{"name": "manage_user_memory", "arguments": {invalid json}}'
         result = self.detector.detect_and_parse(text, self.tools)
 
-        self.assertIn("<|function_call|>", result.normal_text)
+        self.assertEqual(result.normal_text, "")
         self.assertEqual(len(result.calls), 0)
+        self.assertEqual(
+            [r.event for r in self.detector.compatibility_records],
+            [CompatibilityEvent.MALFORMED_JSON_DROPPED],
+        )
 
     def test_streaming_function_call_marker_simple_tool_call(self):
         """Test streaming parsing of the <|function_call|> marker form."""
@@ -5093,8 +5219,7 @@ class TestGemma4Detector(unittest.TestCase):
     def test_detect_and_parse_unknown_tool_index(self):
         text = '<|tool_call>call:unknown_func{arg:<|"|>val<|"|>}<tool_call|>'
         result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].tool_index, -1)
+        self.assertEqual(len(result.calls), 0)
 
     def test_detect_and_parse_nested_object(self):
         text = '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>,details:{temp:25,unit:<|"|>celsius<|"|>}}<tool_call|>'

@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -123,6 +124,10 @@ class Lfm2Detector(BaseFormatDetector):
             logger.warning(
                 f"Tool call function must be a simple name, got: {type(call.func).__name__}"
             )
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=ast.dump(call)[:80],
+            )
             return None
 
         function_name = call.func.id
@@ -137,13 +142,18 @@ class Lfm2Detector(BaseFormatDetector):
             if keyword.arg is None:
                 # **kwargs unpacking - skip for now
                 logger.warning("Tool call with **kwargs unpacking is not supported")
-                continue
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=function_name,
+                )
+                return None
             try:
                 arguments[keyword.arg] = self._get_parameter_value(keyword.value)
             except ValueError as e:
                 logger.warning(f"Failed to parse argument {keyword.arg}: {e}")
-                self._note_malformed_tool_call(
-                    e, detail=f"{function_name}.{keyword.arg}"
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=f"{function_name}.{keyword.arg}",
                 )
                 return None
 
@@ -171,41 +181,52 @@ class Lfm2Detector(BaseFormatDetector):
 
         try:
             module = ast.parse(content)
-            parsed = getattr(module.body[0], "value", None) if module.body else None
-
-            if parsed is None:
-                return [], "Empty or invalid Python expression"
-
-            # Handle both single call and list of calls
-            if isinstance(parsed, ast.List):
-                call_nodes = parsed.elts
-            elif isinstance(parsed, ast.Call):
-                call_nodes = [parsed]
-            else:
-                return (
-                    [],
-                    f"Expected function call or list, got: {type(parsed).__name__}",
-                )
-
-            # Validate all elements are calls
-            if not all(isinstance(e, ast.Call) for e in call_nodes):
-                return [], "Not all elements in list are function calls"
-
-            calls = []
-            for call_index, call in enumerate(call_nodes):
-                item = self._parse_pythonic_call(call, call_index, tool_indices)
-                if item is not None:
-                    calls.append(item)
-
-            return calls, ""
-
         except SyntaxError as e:
-            self._note_malformed_tool_call(e, detail=content[:80])
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=content[:80],
+            )
             return [], f"Python syntax error: {e}"
-        except Exception as e:
-            logger.exception("Unexpected error in pythonic tool call parsing")
-            self._note_malformed_tool_call(e, detail=content[:80])
-            return [], f"Unexpected error: {e}"
+
+        parsed = getattr(module.body[0], "value", None) if module.body else None
+
+        if parsed is None:
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=content[:80],
+            )
+            return [], "Empty or invalid Python expression"
+
+        # Handle both single call and list of calls
+        if isinstance(parsed, ast.List):
+            call_nodes = parsed.elts
+        elif isinstance(parsed, ast.Call):
+            call_nodes = [parsed]
+        else:
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=content[:80],
+            )
+            return (
+                [],
+                f"Expected function call or list, got: {type(parsed).__name__}",
+            )
+
+        # Validate all elements are calls
+        if not all(isinstance(e, ast.Call) for e in call_nodes):
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=content[:80],
+            )
+            return [], "Not all elements in list are function calls"
+
+        calls = []
+        for call_index, call in enumerate(call_nodes):
+            item = self._parse_pythonic_call(call, call_index, tool_indices)
+            if item is not None:
+                calls.append(item)
+
+        return calls, ""
 
     def _parse_json_content(
         self, content: str, tools: List[Tool]
@@ -227,13 +248,23 @@ class Lfm2Detector(BaseFormatDetector):
 
         try:
             parsed = json.loads(content)
+            parsed_items = parsed if isinstance(parsed, list) else [parsed]
+            if not all(isinstance(item, dict) for item in parsed_items):
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=content[:80],
+                )
+                return [], "JSON tool call items must be objects"
             # parse_base_json handles list/dict normalization, tool validation,
             # and SGLANG_FORWARD_UNKNOWN_TOOLS consistently with other detectors
             calls = self.parse_base_json(parsed, tools)
             return calls, ""
 
         except json.JSONDecodeError as e:
-            self._note_malformed_tool_call(e, detail=content[:80])
+            self.compatibility.note(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                detail=content[:80],
+            )
             return [], f"JSON parse error: {e}"
 
     def _parse_tool_calls_content(
@@ -276,14 +307,27 @@ class Lfm2Detector(BaseFormatDetector):
 
         # Find all <|tool_call_start|>...<|tool_call_end|> blocks
         pattern = rf"{re.escape(self.bot_token)}(.*?){re.escape(self.eot_token)}"
-        match_result_list = re.findall(pattern, text, re.DOTALL)
+        match_result_list = list(re.finditer(pattern, text, re.DOTALL))
+        if not match_result_list:
+            self.compatibility.note(
+                CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                detail=text[idx : idx + 80],
+            )
+            return StreamingParseResult(normal_text=text, calls=[])
 
         calls = []
+        normal_parts = []
+        cursor = 0
         for match_result in match_result_list:
-            parsed_calls = self._parse_tool_calls_content(match_result, tools)
+            normal_parts.append(text[cursor : match_result.start()])
+            parsed_calls = self._parse_tool_calls_content(match_result.group(1), tools)
             calls.extend(parsed_calls)
+            cursor = match_result.end()
 
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        normal_parts.append(text[cursor:])
+        return StreamingParseResult(
+            normal_text="".join(normal_parts).strip(), calls=calls
+        )
 
     def _strip_special_tokens(self, text: str) -> str:
         """Remove special tokens from text."""

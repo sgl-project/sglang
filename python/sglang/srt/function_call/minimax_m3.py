@@ -3,7 +3,10 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Union
 
 from typing_extensions import Self
 
-from sglang.srt.function_call.compatibility import CompatibilityEvent, CompatibilityMode
+from sglang.srt.function_call.compatibility import (
+    CompatibilityContext,
+    CompatibilityEvent,
+)
 from sglang.srt.function_call.compatibility.param_types import (
     AtomDataType,
     FunctionCallParameterDataType,
@@ -36,7 +39,7 @@ class M3TextParser(TagToolCallParser):
     def __init__(
         self,
         *,
-        compatibility: CompatibilityMode,
+        compatibility: CompatibilityContext,
         functions: Optional[Dict] = None,
         tool_call_xml_tag_name: str = "tool_call",
         tool_call_namespace_token: str = "]<]minimax[>[",
@@ -85,8 +88,7 @@ class M3TextParser(TagToolCallParser):
             # PatternMismatched (pattern exhausted).
             tool_call_index = 0
             while True:
-                if tool_call_index:
-                    yield from self._literal("\n", should_raise=False)
+                yield from self._literal("\n", should_raise=False)
                 tried = yield from self._literal(
                     (self._invoke_prefix, self._tool_call_end),
                     should_raise=False,
@@ -305,7 +307,7 @@ class _StackItem:
     value: Optional[Union[Dict, List]]
     texts: Optional[List[str]]
     data_type: Optional[FunctionCallParameterDataType]
-    compatibility: CompatibilityMode
+    compatibility: CompatibilityContext
 
     def _note(self, event: CompatibilityEvent, detail: str = "") -> None:
         self.compatibility.note(event, detail)
@@ -403,7 +405,7 @@ class MinimaxM3Detector(TagToolCallDetector):
         return "]<]minimax[>[<tool_call>" in text
 
     def _make_grammar(
-        self, functions: Optional[Dict], compatibility: CompatibilityMode
+        self, functions: Optional[Dict], compatibility: CompatibilityContext
     ) -> M3TextParser:
         return M3TextParser(functions=functions, compatibility=compatibility)
 

@@ -68,7 +68,16 @@ class DeepSeekV3Detector(BaseFormatDetector):
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
+        eot_idx = text.find(self.eot_token, idx + len(self.bot_token))
+        if eot_idx != -1:
+            normal_text = (text[:idx] + text[eot_idx + len(self.eot_token) :]).strip()
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
+        if not match_result_list:
+            self.compatibility.note(
+                CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                detail=text[idx : idx + 80],
+            )
+            return StreamingParseResult(normal_text=text, calls=[])
         calls = []
 
         for match_result in match_result_list:
@@ -142,6 +151,31 @@ class DeepSeekV3Detector(BaseFormatDetector):
         if partial_match:
             func_name = partial_match.group(2).strip()
             func_args_raw = partial_match.group(3).strip()
+            tool_call_end_pattern = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+            completed_call_match = re.search(
+                tool_call_end_pattern, current_text, re.DOTALL
+            )
+            if completed_call_match and not _is_complete_json(func_args_raw):
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=f"{func_name}: {func_args_raw[:80]}",
+                )
+                calls.extend(self._close_started_malformed_call())
+                self._buffer = current_text[completed_call_match.end() :]
+                self.current_tool_name_sent = False
+                self._last_arguments = ""
+                return self._retry_streaming_tail(current_text, calls, tools)
+            if func_name not in self._tool_indices and self._skip_unknown_tool(
+                func_name
+            ):
+                if _is_complete_json(func_args_raw):
+                    tool_call_end_pattern = (
+                        r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+                    )
+                    match = re.search(tool_call_end_pattern, current_text, re.DOTALL)
+                    self._buffer = current_text[match.end() :] if match else ""
+                    return self._retry_streaming_tail(current_text, calls, tools)
+                return StreamingParseResult(normal_text="", calls=calls)
 
             # Initialize state if this is the first tool call
             if self.current_tool_id == -1:
@@ -198,9 +232,6 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         pass
 
                     # Find the end of the current tool call and remove only that part from buffer
-                    tool_call_end_pattern = (
-                        r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-                    )
                     match = re.search(tool_call_end_pattern, current_text, re.DOTALL)
                     if match:
                         # Remove the completed tool call from buffer, keep any remaining content

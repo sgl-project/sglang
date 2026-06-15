@@ -172,11 +172,32 @@ class KimiK2Detector(BaseFormatDetector):
         """
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
+        section_start = text.find(self.bot_token)
+        section_end = text.find(self.eot_token, section_start + len(self.bot_token))
+        normal_text = (
+            text[:section_start] + text[section_end + len(self.eot_token) :]
+            if section_end != -1
+            else text[:section_start]
+        )
         function_call_tuples = self.tool_call_regex.findall(text)
+        if not function_call_tuples:
+            if self.eot_token in text:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=text[text.find(self.bot_token) :][:80],
+                )
+                return StreamingParseResult(normal_text=normal_text, calls=[])
+            else:
+                self.compatibility.note(
+                    CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                    detail=text[text.find(self.bot_token) :][:80],
+                )
+                return StreamingParseResult(normal_text=text, calls=[])
 
         logger.debug("function_call_tuples: %s", function_call_tuples)
 
         tool_calls = []
+        tool_indices = self._get_tool_indices(tools)
         for match in function_call_tuples:
             function_id, function_args = match
             # With a missing <|tool_call_end|> the args capture can span into
@@ -193,6 +214,14 @@ class KimiK2Detector(BaseFormatDetector):
                 function_id, tools, function_args
             )
             if function_name is None:
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=f"{function_id}: {function_args[:80]}",
+                )
+                continue
+            if function_name not in tool_indices and self._skip_unknown_tool(
+                function_name
+            ):
                 continue
 
             logger.debug(f"function_name {function_name}")
@@ -205,8 +234,7 @@ class KimiK2Detector(BaseFormatDetector):
                 )
             )
 
-        content = text[: text.find(self.bot_token)]
-        return StreamingParseResult(normal_text=content, calls=tool_calls)
+        return StreamingParseResult(normal_text=normal_text, calls=tool_calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -237,6 +265,25 @@ class KimiK2Detector(BaseFormatDetector):
         if match:
             function_id = match.group("tool_call_id")
             function_args = match.group("function_arguments")
+            parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
+            is_tool_end = self.tool_call_end_token in function_args
+
+            if is_tool_end and not _is_complete_json(parsed_args):
+                self.compatibility.note(
+                    CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                    detail=f"{function_id}: {parsed_args[:80]}",
+                )
+                calls.extend(self._close_started_malformed_call())
+                end_match = re.search(
+                    r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>",
+                    current_text,
+                    re.DOTALL,
+                )
+                self._buffer = current_text[end_match.end() :] if end_match else ""
+                self._last_arguments = ""
+                self.current_tool_name_sent = False
+                self._current_stream_function_name = None
+                return self._retry_streaming_tail(current_text, calls, tools)
 
             # Reuse cached name for current tool call to avoid repeated
             # json.loads on partial JSON in _infer_tool_name.
@@ -247,6 +294,33 @@ class KimiK2Detector(BaseFormatDetector):
                     function_id, tools, function_args
                 )
             if function_name is None:
+                if is_tool_end and _is_complete_json(parsed_args):
+                    self.compatibility.note(
+                        CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                        detail=f"{function_id}: {parsed_args[:80]}",
+                    )
+                    end_match = re.search(
+                        r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>",
+                        current_text,
+                        re.DOTALL,
+                    )
+                    self._buffer = current_text[end_match.end() :] if end_match else ""
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                    self._current_stream_function_name = None
+                    return self._retry_streaming_tail(current_text, calls, tools)
+                return StreamingParseResult(normal_text="", calls=calls)
+            if function_name not in self._tool_indices and self._skip_unknown_tool(
+                function_name
+            ):
+                if _is_complete_json(parsed_args):
+                    end_match = re.search(
+                        r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>",
+                        current_text,
+                        re.DOTALL,
+                    )
+                    self._buffer = current_text[end_match.end() :] if end_match else ""
+                    return self._retry_streaming_tail(current_text, calls, tools)
                 return StreamingParseResult(normal_text="", calls=calls)
 
             # Initialize state if this is the first tool call
@@ -303,7 +377,6 @@ class KimiK2Detector(BaseFormatDetector):
                         self.current_tool_id
                     ] += parsed_args_diff
 
-                parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
                 if _is_complete_json(parsed_args):
                     try:
                         parsed_args = json.loads(parsed_args)

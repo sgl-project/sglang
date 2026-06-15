@@ -59,18 +59,34 @@ class Qwen25Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         # Find all <tool_call>\n...\n</tool_call> blocks
-        pattern = rf"{re.escape(self.bot_token)}(.*?){re.escape(self.eot_token)}"
-        match_result_list = re.findall(pattern, text, re.DOTALL)
+        pattern = re.compile(
+            rf"{re.escape(self.bot_token)}(.*?){re.escape(self.eot_token)}",
+            re.DOTALL,
+        )
+        match_result_list = list(pattern.finditer(text))
+        if not match_result_list:
+            self.compatibility.note(
+                CompatibilityEvent.TRUNCATED_CALL_DROPPED,
+                detail=text[idx : idx + 80],
+            )
+            return StreamingParseResult(normal_text=text, calls=[])
         calls = []
+        normal_parts = []
+        cursor = 0
         for match_result in match_result_list:
-            block = match_result.strip()
+            normal_parts.append(text[cursor : match_result.start()])
+            block = match_result.group(1).strip()
             with self.compatibility.absorb(
                 CompatibilityEvent.MALFORMED_JSON_DROPPED,
                 json.JSONDecodeError,
                 detail=block[:80],
             ):
                 calls.extend(self.parse_base_json(json.loads(block), tools))
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+            cursor = match_result.end()
+        normal_parts.append(text[cursor:])
+        return StreamingParseResult(
+            normal_text="".join(normal_parts).strip(), calls=calls
+        )
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
