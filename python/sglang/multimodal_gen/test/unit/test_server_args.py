@@ -496,6 +496,132 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertFalse(server_args.server_warmup)
 
 
+class TestWarmupModeNormalization(unittest.TestCase):
+    """`_adjust_warmup` resolves the canonical warmup_mode and its derived booleans."""
+
+    def _resolve(
+        self,
+        *,
+        warmup_mode=None,
+        warmup=False,
+        server_warmup=False,
+        warmup_resolutions=None,
+        disagg_role=None,
+        explicit=(),
+    ):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.warmup_mode = warmup_mode
+        sa.warmup = warmup
+        sa.server_warmup = server_warmup
+        sa.warmup_resolutions = warmup_resolutions
+        sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
+        sa._explicit_arg_names = set(explicit)
+        sa._adjust_warmup()
+        return sa
+
+    def test_explicit_mode_off_disables_all(self):
+        sa = self._resolve(warmup_mode="off", explicit=("warmup_mode",))
+        self.assertEqual(sa.warmup_mode, "off")
+        self.assertFalse(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_explicit_mode_request(self):
+        sa = self._resolve(warmup_mode="request", explicit=("warmup_mode",))
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_explicit_mode_server(self):
+        sa = self._resolve(warmup_mode="server", explicit=("warmup_mode",))
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_explicit_mode_overrides_explicit_legacy(self):
+        sa = self._resolve(
+            warmup_mode="request",
+            warmup=True,
+            server_warmup=True,
+            explicit=("warmup_mode", "warmup", "server_warmup"),
+        )
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_explicit_legacy_false_beats_defaulted_mode(self):
+        # serve defaults warmup_mode="server" (not explicit); `--warmup false` wins.
+        sa = self._resolve(
+            warmup_mode="server",
+            warmup=False,
+            server_warmup=False,
+            explicit=("warmup",),
+        )
+        self.assertEqual(sa.warmup_mode, "off")
+        self.assertFalse(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_defaulted_mode_applies_without_legacy_flags(self):
+        # bare `sglang serve`: warmup_mode="server" defaulted, no legacy override.
+        sa = self._resolve(warmup_mode="server")
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_legacy_only_maps_to_request(self):
+        sa = self._resolve(warmup_mode=None, warmup=True, explicit=("warmup",))
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_resolutions_force_warmup_on(self):
+        sa = self._resolve(
+            warmup_mode="off",
+            warmup_resolutions=["512x512"],
+            explicit=("warmup_mode",),
+        )
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+        self.assertEqual(sa.warmup_mode, "request")
+
+    def test_disagg_role_disables_server_warmup(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = self._resolve(
+            warmup_mode="server",
+            disagg_role=RoleType.DENOISER,
+            explicit=("warmup_mode",),
+        )
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+        self.assertEqual(sa.warmup_mode, "request")
+
+    def test_invalid_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self._resolve(warmup_mode="bogus", explicit=("warmup_mode",))
+
+
+class TestWarmupImageIsModelValid(unittest.TestCase):
+    """The server-warmup placeholder image must be large enough for real pipelines."""
+
+    def test_minimum_warmup_image_is_at_least_64px(self):
+        import base64
+        import struct
+
+        from sglang.multimodal_gen.runtime.server_warmup import (
+            MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+        )
+
+        payload = MINIMUM_PICTURE_BASE64_FOR_WARMUP.split(",", 1)[-1]
+        raw = base64.b64decode(payload)
+        self.assertEqual(raw[:8], b"\x89PNG\r\n\x1a\n")
+        # IHDR width/height are the two big-endian uint32 after the chunk header.
+        width, height = struct.unpack(">II", raw[16:24])
+        self.assertGreaterEqual(width, 64)
+        self.assertGreaterEqual(height, 64)
+
+
 class TestOffloadDefaults(unittest.TestCase):
     def _from_dict_with_pipeline_config(
         self,
