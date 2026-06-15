@@ -171,3 +171,9 @@ class AWQAscendMoEKernel:
 
         self.w13_kernel.process_weights_after_loading(layer, "w13")
         self.w2_kernel.process_weights_after_loading(layer, "w2")
+
+        # --- Free memory: delete original AWQ parameters ---
+        for attr in ("w13_qweight", "w13_qzeros", "w13_scales",
+                     "w2_qweight", "w2_qzeros", "w2_scales"):
+            if hasattr(layer, attr):
+                delattr(layer, attr)
