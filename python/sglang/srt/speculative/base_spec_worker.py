@@ -111,7 +111,9 @@ class EagleDraftWorkerBase(ABC):
         gpu_only = batch.seq_lens_cpu is None
 
         batch.spec_info = draft_extend_input
-        batch.input_ids = predict
+        # Normalize draft token ids before ForwardBatch construction; DeepSeekV4 DP
+        # gather requires input_ids to have a consistent integer dtype across ranks.
+        batch.input_ids = predict.to(torch.int64)
         maybe_detect_oob(
             batch.input_ids,
             0,

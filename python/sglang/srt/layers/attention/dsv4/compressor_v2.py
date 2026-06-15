@@ -511,7 +511,10 @@ class CompressorBackendMixin:
             elif is_unified_kv_triton():
                 kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
                 page_size = 1
-                out_loc = out_loc + token_to_kv_pool.unified_swa_pages
+                out_loc = getattr(
+                    self.forward_metadata.core_metadata.unified,
+                    f"c{compressor.ratio}_out_loc",
+                )
                 bf16_store = True
             else:
                 _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
