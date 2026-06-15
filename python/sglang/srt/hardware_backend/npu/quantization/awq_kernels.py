@@ -31,67 +31,80 @@ class AWQAscendLinearKernel:
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Keep scales as a parameter (groups, N) – needed for NPU path
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-
-        # Unpack weight
-        qweight_tmp = torch.zeros_like(layer.qweight.data)
-        qzeros_tmp = layer.qzeros.data
-        qzeros_list = []
-        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-
-        for i in range(self.quant_config.pack_factor):
-            shift_num = shifts[i] * 4
-            qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
-            qweight_tmp.bitwise_or_(
-                ((layer.qweight.data >> shift_num) & 0xF) << (4 * i)
-            )
-
-        qweight_tmp.bitwise_xor_(0x88888888)   # signed int4 now
-
-        qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
-        qzeros_tmp = -(qzeros_tmp - 8)
-        qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
-
+    
+        # We need the raw packed tensors – store references before overwriting
+        raw_qweight = layer.qweight.data   # (K, N // pack_factor) int32
+        raw_qzeros  = layer.qzeros.data    # (groups, N // pack_factor) int32
+    
         pack_factor = self.quant_config.pack_factor
-        K = qweight_tmp.shape[0]
-        N = qweight_tmp.shape[1] * pack_factor
+        K = raw_qweight.shape[0]
+        N = raw_qweight.shape[1] * pack_factor
         num_groups = layer.scales.shape[0]
-
+    
         if K % num_groups != 0:
             raise RuntimeError(f"K={K} not divisible by scale groups {num_groups}")
         group_size = K // num_groups
 
         # NPU constraint
         npu_ok = False #(group_size == 0) or (group_size % 32 == 0 and 32 <= group_size < K)
-
         if npu_ok:
-            # Use NPU kernel – keep weight, scales, and precomputed group_size
+            # Replicate the old NPU preparation (XOR + zero processing)
+            qweight_tmp = torch.zeros_like(raw_qweight)
+            qzeros_tmp = raw_qzeros.clone()
+            qzeros_list = []
+            shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+            for i in range(pack_factor):
+                shift_num = shifts[i] * 4
+                qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
+                qweight_tmp.bitwise_or_(
+                    ((raw_qweight >> shift_num) & 0xF) << (4 * i)
+                )
+            qweight_tmp.bitwise_xor_(0x88888888)   # signed int4
+            qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(raw_qzeros.shape[0], -1)
+            qzeros_tmp = -(qzeros_tmp - 8)
+            qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
+    
             layer.register_parameter("weight", torch.nn.Parameter(qweight_tmp, requires_grad=False))
             layer.register_parameter("zeros", torch.nn.Parameter(qzeros_tmp, requires_grad=False))
             layer.use_npu_matmul = True
             layer.npu_group_size = group_size
-            # scales already a parameter, do not delete
+            # scales already registered
         else:
-            # Fallback: dequantize to bfloat16
-            weight_int8 = torch.zeros((K, N), dtype=torch.int8, device=qweight_tmp.device)
+            # === Fallback: asymmetric dequantisation ===
+            # unpack unsigned weight nibbles
+            weight_u8 = torch.zeros((K, N), dtype=torch.int8, device=raw_qweight.device)
+            zeros_u8  = torch.zeros((num_groups, N), dtype=torch.int8, device=raw_qzeros.device)
+    
             for i in range(pack_factor):
-                nibbles = (qweight_tmp >> (4 * i)) & 0xF          # unsigned 0..15
-                # sign‑extend: values >= 8 are negative
-                signed_nibbles = torch.where(nibbles >= 8, nibbles - 16, nibbles)
-                weight_int8[:, i::pack_factor] = signed_nibbles.to(torch.int8)
-
+                shift = shifts[i] * 4
+                # weight
+                nib_w = (raw_qweight >> shift) & 0xF
+                weight_u8[:, i::pack_factor] = nib_w.to(torch.int8)
+                # zeros
+                nib_z = (raw_qzeros >> shift) & 0xF
+                zeros_u8[:, i::pack_factor] = nib_z.to(torch.int8)
+    
+            # Expand zeros and scales to (K, N)
             if group_size > 0:
-                scales_exp = layer.scales.data.repeat_interleave(group_size, dim=0)   # (K, N)
+                zeros_exp = zeros_u8.repeat_interleave(group_size, dim=0)    # (K, N)
+                scales_exp = layer.scales.data.repeat_interleave(group_size, dim=0)
             else:
+                zeros_exp = zeros_u8
                 scales_exp = layer.scales.data
-
-            # Weight already signed, no zero‑point subtraction
-            weight_float = weight_int8.float() * scales_exp.float()
-            weight_float = weight_float.t().contiguous().to(torch.bfloat16)
-
+    
+            # Dequantise: weight = (w - z) * scale
+            weight_float = (weight_u8.float() - zeros_exp.float()) * scales_exp.float()
+            weight_float = weight_float.t().contiguous().to(torch.bfloat16)   # (N, K)
+    
             layer.register_parameter("weight", torch.nn.Parameter(weight_float, requires_grad=False))
-            # No need for scales anymore – we can delete them
+            # scales no longer needed
             delattr(layer, "scales")
             layer.use_npu_matmul = False
+    
+        # Always delete original packed tensors to free memory
+        for attr in ("qweight", "qzeros"):
+            if hasattr(layer, attr):
+                delattr(layer, attr)
 
     def apply(
         self,
