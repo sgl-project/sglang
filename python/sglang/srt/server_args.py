@@ -2661,12 +2661,11 @@ class ServerArgs:
                 and self.quantization is None
                 and get_quantization_config(hf_config) is None
             ):
-                # For unquantized (bf16) Qwen3 MoE on ROCm with aiter, use the triton
-                # MoE backend because the aiter CK fused-MoE kernel does not support all
-                # GEMM dimensions (TP-sharded intermediate, e.g. 768 // 8 = 96).
+                # For Qwen3 MoE bf16 on ROCm with aiter, use triton backend
+                # because aiter CK kernel doesn't support all GEMM dimensions
                 self.moe_runner_backend = "triton"
                 logger.warning(
-                    "Detected ROCm with SGLANG_USE_AITER for unquantized Qwen3 MoE, "
+                    "Detected ROCm with SGLANG_USE_AITER for Qwen3 MoE bf16 model, "
                     "using triton MOE kernel."
                 )
 
