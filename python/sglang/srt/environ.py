@@ -243,6 +243,12 @@ class Envs:
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
+    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_NVTX"
+    )
+    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
+    )
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
@@ -309,6 +315,10 @@ class Envs:
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
+    # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
+    # already enabled regardless of this flag (see start_event_loop).
+    SGLANG_ENABLE_WAR_BARRIER = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
@@ -467,6 +477,10 @@ class Envs:
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
     SGLANG_MLX_USE_CUSTOM_ROPE = EnvBool(False)
+    SGLANG_MLX_FUSE_SWIGLU = EnvBool(False)
+    # Number of decode steps between periodic mx.clear_cache() calls.
+    # Set to 0 to disable cache clearing entirely.
+    SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
@@ -619,7 +633,6 @@ class Envs:
     SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
 
     # Overlap Spec V2
-    SGLANG_ENABLE_SPEC_V2 = EnvBool(True)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     SGLANG_DFLASH_PREFILL_REFILL_TARGET = EnvInt(None)
 
@@ -629,6 +642,9 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    # Sanitize NaN logits before sampling kernels and log a throttled warning
+    # (see sanitize_nan_logits).
+    SGLANG_SANITIZE_NAN_LOGITS = EnvBool(True)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
@@ -715,6 +731,7 @@ class Envs:
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(False)
+    SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
@@ -775,6 +792,9 @@ class Envs:
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
+
+    # Unified radix cache
+    SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
 
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
@@ -857,6 +877,7 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")

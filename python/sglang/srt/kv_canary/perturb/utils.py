@@ -70,7 +70,7 @@ def should_run_perturbation(
     perturb_name: str,
     probability: float,
     warmup_gate: WarmupGate,
-    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional[ForwardBatch],
     require_forward_batch: bool = True,
 ) -> bool:
     if probability <= 0.0:

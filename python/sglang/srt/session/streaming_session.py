@@ -247,7 +247,7 @@ class StreamingSession(BasePrefixCache):
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
         # already applied). min handles retract retry where committed_len
         # can exceed len(token_ids) by 1.
-        prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
+        prefix_len = min(req.kv_committed_len, len(params.key))
 
         # Streaming sessions are append-only (session_controller rollback
         # ensures req_nodes always points to the last successful req).
