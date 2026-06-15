@@ -7,6 +7,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import threading
 import time
 import unittest
+from queue import Queue
 from unittest.mock import MagicMock
 
 import torch
@@ -15,6 +16,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller impo
     ContiguousMemoryAllocator,
     EmbeddingCacheController,
     EmbeddingInsertOperation,
+    EmbeddingPrefetchOperation,
 )
 
 # ---------------------------------------------------------------------------
@@ -138,6 +140,15 @@ def _make_controller(
 
 def _embedding_bytes(num_tokens, dim):
     return num_tokens * dim * torch.float32.itemsize
+
+
+def _wait_until(predicate, timeout=1.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +465,81 @@ class TestRefCounting(unittest.TestCase):
 
         with ctrl.lock:
             self.assertNotIn(h, ctrl.ref_counts)
+
+
+class TestIOLoopBackendErrors(unittest.TestCase):
+    def _make_threaded_controller(self):
+        ctrl = _make_controller()
+        ctrl.prefetch_queue = Queue()
+        ctrl.insert_queue = Queue()
+        ctrl.stop_event = threading.Event()
+        ctrl.io_thread = threading.Thread(target=ctrl._io_loop, daemon=True)
+        ctrl.io_thread.start()
+        return ctrl
+
+    def tearDown(self):
+        ctrl = getattr(self, "ctrl", None)
+        if ctrl is not None:
+            ctrl.stop_event.set()
+            ctrl.io_thread.join(timeout=1)
+
+    def test_prefetch_backend_error_marks_failed_and_thread_continues(self):
+        self.ctrl = self._make_threaded_controller()
+        failing_op = EmbeddingPrefetchOperation("req_fail", ["h1"], [1], [4])
+        retry_op = EmbeddingPrefetchOperation("req_ok", ["h2"], [2], [4])
+
+        with self.ctrl.lock:
+            self.ctrl._protect_hash("h1")
+            self.ctrl._protect_hash("h2")
+
+        self.ctrl.mooncake_store.batch_get.side_effect = [
+            RuntimeError("temporary mooncake failure"),
+            [True],
+        ]
+
+        self.ctrl.prefetch_queue.put(failing_op)
+        self.assertTrue(_wait_until(lambda: failing_op.is_finished))
+        self.assertFalse(failing_op.success)
+        self.assertTrue(self.ctrl.io_thread.is_alive())
+        with self.ctrl.lock:
+            self.assertNotIn("h1", self.ctrl.ref_counts)
+
+        self.ctrl.prefetch_queue.put(retry_op)
+        self.assertTrue(_wait_until(lambda: retry_op.is_finished))
+        self.assertTrue(retry_op.success)
+        self.assertTrue(self.ctrl.io_thread.is_alive())
+        with self.ctrl.lock:
+            self.assertNotIn("h2", self.ctrl.ref_counts)
+
+    def test_insert_backend_error_releases_ref_and_thread_continues(self):
+        self.ctrl = self._make_threaded_controller()
+        failing_op = EmbeddingInsertOperation(["h1"], [1], [4])
+        retry_op = EmbeddingInsertOperation(["h2"], [2], [4])
+
+        with self.ctrl.lock:
+            self.ctrl._protect_hash("h1")
+            self.ctrl._protect_hash("h2")
+
+        self.ctrl.mooncake_store.batch_put.side_effect = [
+            RuntimeError("temporary mooncake failure"),
+            None,
+        ]
+
+        self.ctrl.insert_queue.put(failing_op)
+        self.assertTrue(
+            _wait_until(lambda: self.ctrl.mooncake_store.batch_put.call_count >= 1)
+        )
+        self.assertTrue(self.ctrl.io_thread.is_alive())
+        with self.ctrl.lock:
+            self.assertNotIn("h1", self.ctrl.ref_counts)
+
+        self.ctrl.insert_queue.put(retry_op)
+        self.assertTrue(
+            _wait_until(lambda: self.ctrl.mooncake_store.batch_put.call_count >= 2)
+        )
+        self.assertTrue(self.ctrl.io_thread.is_alive())
+        with self.ctrl.lock:
+            self.assertNotIn("h2", self.ctrl.ref_counts)
 
 
 # ---------------------------------------------------------------------------
