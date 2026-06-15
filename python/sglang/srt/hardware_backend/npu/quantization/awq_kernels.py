@@ -121,12 +121,7 @@ class AWQAscendLinearKernel:
             return out.reshape(out_shape)
         else:
             # fallback: weight is (N, K) bfloat16
-            weight = layer.weight   # (N, K)
-            out_shape = x.shape[:-1] + (weight.shape[0],)
-            out = torch.matmul(reshaped_x, weight.t())
-            if bias is not None:
-                out = out + bias.to(out.dtype)
-            return out.reshape(out_shape)
+            return F.linear(x, layer.weight, bias)
 
 
     def apply(
