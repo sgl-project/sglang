@@ -2654,7 +2654,8 @@ class ServerArgs:
                         f"{model_arch}"
                     )
             elif (
-                is_hip()
+                model_arch == "Qwen3MoeForCausalLM"
+                and is_hip()
                 and envs.SGLANG_USE_AITER.get()
                 and self.moe_runner_backend == "auto"
                 and self.quantization is None
