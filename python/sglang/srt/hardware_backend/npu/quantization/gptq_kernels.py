@@ -159,40 +159,39 @@ class GPTQMoEAscendKernel:
             .reshape(-1, layer.w13_qweight.shape[-2])
         )
         w13_qweight_tmp = unpack_from_int32(w13_qweight_2d, self.quant_config.weight_bits, packed_dim=1)
-        # w13_qweight_tmp shape: (E * K, N)
+        # shape: (E * N, K)   where N = out_features, K = in_features
     
-        E_w13 = layer.w13_qweight.shape[0]          # num experts
-        N_w13 = w13_qweight_tmp.shape[1]            # output features (N)
-        K_w13 = w13_qweight_tmp.shape[0] // E_w13   # input features (K)
+        E_w13 = layer.w13_qweight.shape[0]
+        N_w13 = w13_qweight_tmp.shape[0] // E_w13   # output features
+        K_w13 = w13_qweight_tmp.shape[1]            # input features
     
-        # 1) Reshape to [E, K, N] – used for sign flipping
-        w13_weight = w13_qweight_tmp.reshape(E_w13, K_w13, N_w13)   # [E, K, N]
+        # Reshape directly to [E, N, K] – this matches NPU matmul expectation
+        w13_weight = w13_qweight_tmp.reshape(E_w13, N_w13, K_w13)   # [E, N, K]
     
-        # 2) Handle negative scales (4‑bit only) – mask matches [E, K, N]
+        # Handle negative scales (4‑bit only) – mask must be [E, N, K]
         if self.quant_config.weight_bits == 4:
             group_size = self.quant_config.group_size
-            # Scale shape: [E, groups, N] -> expand to [E, K, N]
+            # layer.w13_scales shape: [E, groups, N]   groups = K // group_size
+            # Expand and transpose to get [E, N, K]
             scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)  # [E, K, N]
+            scale_expanded = scale_expanded.transpose(-1, -2)                            # [E, N, K]
             neg_mask = scale_expanded < 0
             if neg_mask.any():
                 w13_weight[neg_mask] = -w13_weight[neg_mask]
                 w13_weight.clamp_(max=7)
             layer.w13_scales.data.abs_()   # scales stay [E, groups, N]
     
-        # 3) Permute to [E, N, K] required by NPU matmul
-        w13_weight = w13_weight.permute(0, 2, 1).contiguous()   # [E, N, K]
-    
-        # 4) Convert to NPU NZ format
+        # Convert to NPU NZ format
         w13_weight = npu_format_cast(w13_weight)
     
-        # 5) Pack 4 int8 values into int32 along K dimension
+        # Pack K dimension: 4 int8 → 1 int32 (for 4‑bit weights)
         if self.quant_config.weight_bits == 4:
             assert w13_weight.shape[-1] % 4 == 0
             w13_weight = self._pack_to_int32(w13_weight)   # [E, N, K//4] int32
     
         layer.w13_qweight = torch.nn.Parameter(w13_weight, requires_grad=False)
     
-        # ---------- w2 (identical pattern) ----------
+        # ---------- w2 (identical) ----------
         w2_qzeros_2d = layer.w2_qzeros.data.contiguous().reshape(-1, layer.w2_qzeros.shape[-1])
         layer.w2_qzeros = torch.nn.Parameter(
             unpack_from_int32(w2_qzeros_2d, self.quant_config.weight_bits, packed_dim=1)
@@ -211,28 +210,22 @@ class GPTQMoEAscendKernel:
         w2_qweight_tmp = unpack_from_int32(w2_qweight_2d, self.quant_config.weight_bits, packed_dim=1)
     
         E_w2 = layer.w2_qweight.shape[0]
-        N_w2 = w2_qweight_tmp.shape[1]
-        K_w2 = w2_qweight_tmp.shape[0] // E_w2
+        N_w2 = w2_qweight_tmp.shape[0] // E_w2
+        K_w2 = w2_qweight_tmp.shape[1]
     
-        # 1) Reshape to [E, K, N]
-        w2_weight = w2_qweight_tmp.reshape(E_w2, K_w2, N_w2)   # [E, K, N]
+        w2_weight = w2_qweight_tmp.reshape(E_w2, N_w2, K_w2)   # [E, N, K]
     
-        # 2) Sign flip with mask in [E, K, N]
         if self.quant_config.weight_bits == 4:
-            scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)  # [E, K, N]
+            scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)
+            scale_expanded = scale_expanded.transpose(-1, -2)
             neg_mask = scale_expanded < 0
             if neg_mask.any():
                 w2_weight[neg_mask] = -w2_weight[neg_mask]
                 w2_weight.clamp_(max=7)
             layer.w2_scales.data.abs_()
     
-        # 3) Permute to [E, N, K]
-        w2_weight = w2_weight.permute(0, 2, 1).contiguous()   # [E, N, K]
-    
-        # 4) NZ format conversion
         w2_weight = npu_format_cast(w2_weight)
     
-        # 5) Pack to int32 (for 4-bit)
         if self.quant_config.weight_bits == 4:
             assert w2_weight.shape[-1] % 4 == 0
             w2_weight = self._pack_to_int32(w2_weight)
