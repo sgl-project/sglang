@@ -39,6 +39,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
+    DEFAULT_LONGCAT_VIDEO_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
@@ -364,6 +365,27 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="FastVideo/FastHunyuan-diffusers",
         ),
+    ),
+    DiffusionTestCase(
+        "longcat_video_t2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_LONGCAT_VIDEO_MODEL_NAME_FOR_TEST,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="832x480",
+            num_frames=25,
+            extras={
+                "num_inference_steps": 50,
+                "guidance_scale": 4.0,
+                "seed": 0,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        # LongCat-Video ships a non-standard diffusers layout that is not yet
+        # supported by the component accuracy harness.
+        run_component_accuracy_check=False,
     ),
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(

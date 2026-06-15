@@ -8,6 +8,7 @@ from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfi
 from sglang.multimodal_gen.configs.models.dits.lingbot_world import (
     LingBotWorldVideoConfig,
 )
+from sglang.multimodal_gen.configs.models.dits.longcat_video import LongCatVideoConfig
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
 from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
@@ -21,6 +22,7 @@ __all__ = [
     "HunyuanVideoConfig",
     "Ideogram4DiTConfig",
     "LingBotWorldVideoConfig",
+    "LongCatVideoConfig",
     "WanVideoConfig",
     "Hunyuan3DDiTConfig",
     "MOVAAudioConfig",
