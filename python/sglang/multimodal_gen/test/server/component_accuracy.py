@@ -493,6 +493,14 @@ class AccuracyEngine:
             if src_tensor is None:
                 unmatched_details.append(f"{name}: no matching source tensor")
                 continue
+            weight_loader = getattr(tensor, "weight_loader", None)
+            if callable(weight_loader) and src_tensor.numel() != tensor.numel():
+                weight_loader(
+                    tensor,
+                    src_tensor.to(device=tensor.device, dtype=tensor.dtype),
+                )
+                matched += 1
+                continue
             shard_context = shard_contexts.get(name)
             shard_world_size = (
                 shard_context.world_size if shard_context is not None else tp_world
