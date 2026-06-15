@@ -1413,7 +1413,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Truncate fill_len to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (output_ids is 1 ahead).
-        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
         req.fill_len = req.kv_committed_len
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
@@ -1534,7 +1533,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer
-        decode_req.req.output_ids.append(output_id[0].item())
+        decode_req.req.append_output_id(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that

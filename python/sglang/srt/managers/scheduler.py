@@ -1273,7 +1273,7 @@ class Scheduler(
             for req in batch.reqs:
                 start = len(req.prefix_indices)
                 end = start + req.extend_input_len
-                fill_ids = req.origin_input_ids + req.output_ids
+                fill_ids = req.token_buf.readonly_view()
                 if start == 0:
                     tokens = fill_ids[start:end]
                     column_starts.append(0)
@@ -1925,9 +1925,11 @@ class Scheduler(
 
         padded_input_ids = array("q", padded_input_ids)
         if prefix_len == 0:
-            req.origin_input_ids = padded_input_ids
+            req.rebuild_origin_input_ids(padded_input_ids)
         else:
-            req.origin_input_ids = req.origin_input_ids[:prefix_len] + padded_input_ids
+            req.rebuild_origin_input_ids(
+                array("q", req.origin_input_ids[:prefix_len]) + padded_input_ids
+            )
         return True
 
     def _maybe_compute_mrope_positions(self, req) -> None:
@@ -2100,8 +2102,13 @@ class Scheduler(
                 not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
                 and self.pad_input_ids_func
             ):
-                req.origin_input_ids = array(
-                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                req.rebuild_origin_input_ids(
+                    array(
+                        "q",
+                        self.pad_input_ids_func(
+                            array("q", req.origin_input_ids), image_inputs
+                        ),
+                    )
                 )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
@@ -2200,7 +2207,7 @@ class Scheduler(
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
-                new_input_tokens = req.full_untruncated_fill_ids[matched_len:]
+                new_input_tokens = req.get_full_untruncated_fill_ids()[matched_len:]
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -2377,8 +2384,13 @@ class Scheduler(
                 and self.pad_input_ids_func
             ):
                 # See companion call site above for the array.array wrap rationale.
-                req.origin_input_ids = array(
-                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                req.rebuild_origin_input_ids(
+                    array(
+                        "q",
+                        self.pad_input_ids_func(
+                            array("q", req.origin_input_ids), image_inputs
+                        ),
+                    )
                 )
 
             req.extend_image_inputs(image_inputs)

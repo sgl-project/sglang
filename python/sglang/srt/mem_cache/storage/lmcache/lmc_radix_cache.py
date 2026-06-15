@@ -443,7 +443,7 @@ class LMCRadixCache(RadixCache):
                 len(req.output_ids) - 1, 0
             )
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = req.fill_ids_upto(kv_committed_len)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]

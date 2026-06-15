@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import time
+from array import array
 from typing import TYPE_CHECKING
 
 import torch
@@ -134,14 +135,14 @@ class DecodeKVCacheOffloadManager:
             return False
 
         # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
-        all_tokens = req.origin_input_ids + req.output_ids[:-1]
+        all_tokens = array("q", req.origin_input_ids) + array("q", req.output_ids[:-1])
         prefill_offloaded_len = (
             len(req.origin_input_ids) // self.page_size * self.page_size
         )
         state = self.offloaded_state.get(req.rid)
         if state is None:
             prefill_hashes = self._compute_prefix_hash(
-                req.origin_input_ids[:prefill_offloaded_len]
+                all_tokens[:prefill_offloaded_len]
             )
             last_prefill_hash = (
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None

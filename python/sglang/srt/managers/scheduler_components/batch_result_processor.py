@@ -224,7 +224,7 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
-                    req.output_ids.append(next_token_id)
+                    req.append_output_id(next_token_id)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -312,7 +312,7 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
-                    req.output_ids.append(0)
+                    req.append_output_id(0)
                     req.update_finish_state()
 
                     if req.finished():
@@ -425,7 +425,7 @@ class SchedulerBatchResultProcessor:
         """Validate PP skip output comm correctness.
 
         - When skip=True: all reqs must be middle chunks (inflight_middle_chunks > 0)
-          so placeholder zeros are never consumed via req.output_ids.append().
+          so placeholder zeros are never consumed via req.append_output_id().
         - When skip=False: at least one req should consume next_token_ids
           (inflight_middle_chunks <= 0), otherwise warn.
         """
@@ -645,9 +645,9 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
-                req.output_ids.append(next_token_id)
+                req.append_output_id(next_token_id)
             else:
-                req.output_ids.extend(next_token_id)
+                req.extend_output_ids(next_token_id)
                 new_accepted_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
