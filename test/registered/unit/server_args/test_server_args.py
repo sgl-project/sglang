@@ -518,6 +518,52 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("ipc://"))
         self.assertIsInstance(port_args.nccl_port, int)
 
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_builds_decoupled_spec_ipc_config(self, mock_temp_file):
+        mock_temp_file.return_value.name = "temp_file"
+
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        server_args.decoupled_spec_role = "verifier"
+        server_args.decoupled_spec_bind_endpoint = "ipc:///tmp/v"
+        server_args.decoupled_spec_connect_endpoints = ["ipc:///tmp/d"]
+        server_args.decoupled_spec_rank = 0
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertIsNotNone(port_args.decoupled_spec_ipc_config)
+        self.assertEqual(port_args.decoupled_spec_ipc_config.rank, 0)
+        self.assertEqual(
+            port_args.decoupled_spec_ipc_config.bind_endpoint, "ipc:///tmp/v"
+        )
+        self.assertEqual(
+            port_args.decoupled_spec_ipc_config.connect_endpoints, ("ipc:///tmp/d",)
+        )
+
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_no_decoupled_config_when_role_null(self, mock_temp_file):
+        mock_temp_file.return_value.name = "temp_file"
+
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        # decoupled_spec_role defaults to "null"
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertIsNone(port_args.decoupled_spec_ipc_config)
+
+    def test_init_new_decoupled_role_requires_endpoints(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        server_args.decoupled_spec_role = "drafter"
+        # endpoints intentionally left as their None defaults
+
+        with self.assertRaises(ValueError):
+            PortArgs.init_new(server_args)
+
     def test_init_new_with_single_node_dp_attention(self):
 
         server_args = ServerArgs(model_path="dummy")

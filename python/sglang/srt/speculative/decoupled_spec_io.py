@@ -53,7 +53,7 @@ class DraftSync:
     src_verifier_rank: int
     dst_drafter_rank: int
     prompt_token_ids: list[int] = field(default_factory=list)
-    committed_output_ids: list[int] = field(default_factory=list)
+    committed_outputs: list[int] = field(default_factory=list)
 
     @property
     def draft_key(self) -> DraftReqKey:
@@ -68,10 +68,10 @@ class VerifyCommit:
     """
     Sent from verifier to drafter to commit a portion of the draft outputs.
 
-    committed_token_ids is the verifier-committed contiguous output segment:
+    committed_tokens is the verifier-committed contiguous output segment:
     output_ids[
         pre_verify_committed_len:
-        pre_verify_committed_len + len(committed_token_ids)
+        pre_verify_committed_len + len(committed_tokens)
     ].
     Drafter must align its reqs to these committed tokens,
     and sometimes needs to truncate tokens / reprefill.
@@ -81,7 +81,7 @@ class VerifyCommit:
     src_verifier_rank: int
     dst_drafter_rank: int
     pre_verify_committed_len: int
-    committed_token_ids: list[int]
+    committed_tokens: list[int]
 
     @property
     def draft_key(self) -> DraftReqKey:
@@ -90,10 +90,10 @@ class VerifyCommit:
             request_id=self.request_id,
         )
 
-    def validate_committed_token_ids(self) -> None:
-        if not self.committed_token_ids:
+    def validate_committed_tokens(self) -> None:
+        if not self.committed_tokens:
             raise ValueError(
-                "VerifyCommit committed_token_ids must be non-empty: "
+                "VerifyCommit committed_tokens must be non-empty: "
                 f"request_id={self.request_id} "
                 f"pre_verify_committed_len={self.pre_verify_committed_len}"
             )
@@ -130,7 +130,7 @@ class DraftTailStreamOutput:
     stale-base boundary before accepting the token as tail data or as
     pending-prefix confirmation.
 
-    new_token_pos is the 0-based output token position for new_token_id. Normal
+    new_token_pos is the 0-based output token position for new_token. Normal
     decode streams send the latest generated token.
     """
 
@@ -139,7 +139,7 @@ class DraftTailStreamOutput:
     request_id: str
     base_committed_len: int
     new_token_pos: int
-    new_token_id: int
+    new_token: int
 
 
 @dataclass
@@ -169,11 +169,11 @@ class VerifierCommitSegment:
     draft_key: DraftReqKey
     dst_drafter_rank: int
     pre_verify_committed_len: int
-    committed_token_ids: list[int] = field(default_factory=list)
+    committed_tokens: list[int] = field(default_factory=list)
 
     @property
     def end_committed_len(self) -> int:
-        return int(self.pre_verify_committed_len) + len(self.committed_token_ids)
+        return int(self.pre_verify_committed_len) + len(self.committed_tokens)
 
     def append_message(self, message: VerifyCommit) -> None:
         """
@@ -200,7 +200,7 @@ class VerifierCommitSegment:
                 f"segment_drafter_rank={self.dst_drafter_rank} "
                 f"message_drafter_rank={message.dst_drafter_rank}"
             )
-        message.validate_committed_token_ids()
+        message.validate_committed_tokens()
         pre_verify_committed_len = int(message.pre_verify_committed_len)
         if pre_verify_committed_len != self.end_committed_len:
             raise RuntimeError(
@@ -211,8 +211,8 @@ class VerifierCommitSegment:
                 f"actual_pre_verify_committed_len={pre_verify_committed_len}"
             )
 
-        token_ids = [int(token_id) for token_id in message.committed_token_ids]
-        self.committed_token_ids.extend(token_ids)
+        token_ids = [int(token_id) for token_id in message.committed_tokens]
+        self.committed_tokens.extend(token_ids)
 
     def extract_prefix(self, num_tokens: int) -> VerifierCommitSegment:
         num_tokens = int(num_tokens)
@@ -221,28 +221,28 @@ class VerifierCommitSegment:
                 "Verifier commit segment prefix length must be positive: "
                 f"request_id={self.draft_key.request_id} num_tokens={num_tokens}"
             )
-        if num_tokens > len(self.committed_token_ids):
+        if num_tokens > len(self.committed_tokens):
             raise ValueError(
                 "Verifier commit segment prefix length exceeds segment length: "
                 f"request_id={self.draft_key.request_id} "
                 f"num_tokens={num_tokens} "
-                f"segment_len={len(self.committed_token_ids)}"
+                f"segment_len={len(self.committed_tokens)}"
             )
 
         prefix_tokens = [
-            int(token_id) for token_id in self.committed_token_ids[:num_tokens]
+            int(token_id) for token_id in self.committed_tokens[:num_tokens]
         ]
         remaining_tokens = [
-            int(token_id) for token_id in self.committed_token_ids[num_tokens:]
+            int(token_id) for token_id in self.committed_tokens[num_tokens:]
         ]
         prefix_segment = VerifierCommitSegment(
             draft_key=self.draft_key,
             dst_drafter_rank=int(self.dst_drafter_rank),
             pre_verify_committed_len=int(self.pre_verify_committed_len),
-            committed_token_ids=prefix_tokens,
+            committed_tokens=prefix_tokens,
         )
         self.pre_verify_committed_len = int(self.pre_verify_committed_len) + num_tokens
-        self.committed_token_ids = remaining_tokens
+        self.committed_tokens = remaining_tokens
         return prefix_segment
 
 
@@ -327,7 +327,7 @@ class DraftControlInbox:
             ready_controls.ready_commit_segments.append(
                 segment.extract_prefix(consumable_len)
             )
-            if not segment.committed_token_ids:
+            if not segment.committed_tokens:
                 self.verifier_commit_segments.pop(draft_key, None)
 
         return ready_controls

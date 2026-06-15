@@ -1564,6 +1564,7 @@ class ServerArgs:
     decoupled_spec_bind_endpoint: Optional[str] = None
     decoupled_spec_connect_endpoints: Optional[List[str]] = None
     decoupled_spec_rank: Optional[int] = None
+    decoupled_spec_role: Literal["null", "verifier", "drafter"] = "null"
     spec_trace_dir: Optional[str] = None
 
     # Speculative decoding (ngram)
@@ -7336,7 +7337,7 @@ class PortArgs:
         instance_id = uuid.uuid4().hex[:12]
 
         decoupled_spec_ipc_config = None
-        if server_args.speculative_algorithm in ("DECOUPLED_VERIFY", "DECOUPLED_DRAFT"):
+        if server_args.decoupled_spec_role != "null":
             if (
                 server_args.decoupled_spec_bind_endpoint is None
                 or server_args.decoupled_spec_connect_endpoints is None
