@@ -234,6 +234,12 @@ class MMEncoder:
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
         set_global_server_args_for_scheduler(server_args)
+
+        # Global Context P1d: publish a config-tier context (this MMEncoder process
+        # builds no ModelRunner) so get_global_server_args() resolves via the context.
+        from sglang.srt.runtime_context import publish_config_context
+
+        publish_config_context(server_args)
         self.rank = rank
         self.profiler = EncoderProfiler(rank)
         self._load_mm_processor(server_args)

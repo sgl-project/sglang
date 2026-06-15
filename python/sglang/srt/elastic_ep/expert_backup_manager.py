@@ -160,6 +160,13 @@ def run_expert_backup_manager_process(
     port_args: PortArgs,
 ):
     set_global_server_args_for_scheduler(server_args)
+
+    # Global Context P1d: publish a config-tier context for this (non-ModelRunner)
+    # process so get_global_server_args() resolves via the context path.
+    from sglang.srt.runtime_context import publish_config_context
+
+    publish_config_context(server_args)
+
     from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
         init_mooncake_transfer_engine,
     )

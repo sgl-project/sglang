@@ -159,6 +159,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             is_draft_worker=True,
         )
         set_global_server_args_for_scheduler(saved_server_args)
+
+        # Global Context P1d (re-seed): a context already exists (the draft runner
+        # published one), so this swaps ONLY ctx.server_args to the restored
+        # saved_server_args in place, preserving the resolved parallel/flags —
+        # matching the legacy global re-seed above.
+        from sglang.srt.runtime_context import publish_config_context
+
+        publish_config_context(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner

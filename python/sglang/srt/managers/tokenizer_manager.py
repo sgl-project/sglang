@@ -259,6 +259,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.crash_dump_folder = server_args.crash_dump_folder
         set_global_server_args_for_tokenizer(server_args)
 
+        # Global Context P1d: also publish a config-tier context so this
+        # (non-ModelRunner) process resolves get_global_server_args() via the context
+        # path, uniformly with the runner processes (dual-write with the seed above).
+        from sglang.srt.runtime_context import publish_config_context
+
+        publish_config_context(server_args)
+
         # Init model config
         self.init_model_config()
 

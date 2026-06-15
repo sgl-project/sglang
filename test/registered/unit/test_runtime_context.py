@@ -25,6 +25,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_flags,
     get_server_args,
+    publish_config_context,
     resolve_parallel_context,
     get_tp_rank,
     get_tp_size,
@@ -566,6 +567,51 @@ class TestB2DeclarativeRouting(unittest.TestCase):
         )
         self.assertEqual(sa.chunked_prefill_size, -1)
         self.assertTrue(sa.disable_chunked_prefix_cache)
+
+
+class TestConfigOnlyPublish(unittest.TestCase):
+    """P1d: publish_config_context — fresh degenerate publish for non-ModelRunner
+    processes, and in-place server_args swap (re-seed) when a context already exists."""
+
+    def setUp(self):
+        reset_context()
+
+    def tearDown(self):
+        reset_context()
+
+    def test_publishes_degenerate_when_no_context(self):
+        sa = object()
+        self.assertFalse(has_context())
+        publish_config_context(sa)
+        self.assertTrue(has_context())
+        self.assertIs(get_context().server_args, sa)
+        self.assertEqual(get_context().parallel.tp_size, 1)  # degenerate defaults
+        self.assertFalse(get_context().flags.attn.use_mla_backend)
+
+    def test_reseed_swaps_server_args_in_place_preserving_parallel(self):
+        # a full context exists (e.g. a runner published one) ...
+        first = object()
+        full = build_context(
+            server_args=first,
+            parallel=ParallelContext(tp_size=4, tp_rank=2),
+            use_mla_backend=True,
+        )
+        set_context(full)
+        # ... re-seed swaps ONLY server_args, preserving parallel/flags + identity
+        second = object()
+        publish_config_context(second)
+        self.assertIs(get_context(), full)  # same context object, not replaced
+        self.assertIs(get_context().server_args, second)  # server_args swapped
+        self.assertEqual(get_context().parallel.tp_size, 4)  # parallel preserved
+        self.assertTrue(get_context().flags.attn.use_mla_backend)  # flags preserved
+
+    def test_reseed_visible_through_shim(self):
+        from sglang.srt.server_args import get_global_server_args
+
+        publish_config_context(object())
+        second = object()
+        publish_config_context(second)
+        self.assertIs(get_global_server_args(), second)
 
 
 if __name__ == "__main__":

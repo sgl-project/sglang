@@ -498,6 +498,20 @@ def has_context() -> bool:
     return _context is not None
 
 
+def publish_config_context(server_args) -> None:
+    """Publish (or re-seed) a config-tier context for a process that does NOT build a
+    full ModelRunner context (Global Context P1d). If a context already exists — e.g.
+    a spec-decode worker restoring a saved server_args in a ModelRunner process — swap
+    ONLY its ``server_args`` in place, preserving the resolved parallel/flags from the
+    runner that published it. Otherwise publish a fresh degenerate (config-only)
+    context. Either way ``get_global_server_args()`` resolves via the context path
+    uniformly in every process (which is what lets P8 drop the legacy fallback)."""
+    if has_context():
+        get_context().server_args = server_args
+    else:
+        set_context(build_config_only_context(server_args=server_args))
+
+
 def reset_context() -> None:
     """Single teardown point — the legacy globals have no such primitive
     (a multi-engine / test-isolation hazard). Drops cached buffers + the tp_group
