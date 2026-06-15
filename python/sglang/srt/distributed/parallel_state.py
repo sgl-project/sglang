@@ -178,6 +178,62 @@ def outplace_all_reduce(
     return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
 
 
+def _aiter_fused_allreduce_rmsnorm_fake(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(input_), torch.empty_like(residual_inp_)
+
+
+@register_custom_op(fake_impl=_aiter_fused_allreduce_rmsnorm_fake)
+def aiter_fused_allreduce_rmsnorm(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dynamo-opaque AITER fused all-reduce + RMSNorm.
+
+    The AITER kernel needs to know whether execution is inside CUDA graph stream
+    capture (to use registered buffers). Keep that query inside this registered
+    op so PCG/Dynamo sees only an opaque op plus the fake implementation above.
+    """
+    group = _groups[group_name]() if group_name in _groups else None
+    if group is None:
+        raise ValueError(f"Group {group_name} is not found or destroyed.")
+    ca_comm = group.ca_comm
+    if ca_comm is None or getattr(ca_comm, "disabled", True):
+        raise RuntimeError("AITER custom allreduce communicator is unavailable.")
+
+    # 1-stage vs 2-stage selection for fused AR+RMSNorm:
+    # The 1-stage kernel launches one block per token and is capped at
+    # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
+    # prefill batches fall through to the 2-stage kernel instead of
+    # hitting a runtime error.  AITER's C++ dispatch already gates
+    # which hidden_dims have valid 1-stage support.
+    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+    else:
+        total_bytes = input_.numel() * input_.element_size()
+        use_1stage_ar = total_bytes <= 128 * 1024
+
+    out = ca_comm.fused_ar_rms(
+        input_,
+        residual_inp_,
+        w=weight_,
+        eps=eps,
+        registered=torch.cuda.is_current_stream_capturing(),
+        use_1stage=use_1stage_ar,
+    )
+    if out is None:
+        raise RuntimeError("AITER fused_ar_rms returned None.")
+    return out
+
+
 @register_custom_op(mutates_args=["output"])
 def reg_all_gather_into_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
@@ -684,6 +740,20 @@ class GroupCoordinator:
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
 
+        if hasattr(ca_comm, "fused_ar_rms"):
+            try:
+                return aiter_fused_allreduce_rmsnorm(
+                    input_, residual_inp_, weight_, eps, self.unique_name
+                )
+            except Exception:
+                if is_in_tc_piecewise_cuda_graph():
+                    raise
+                logger.debug(
+                    "AITER registered fused allreduce+rmsnorm failed; "
+                    "falling back to legacy fused path.",
+                    exc_info=True,
+                )
+
         # Prefer communicator-native fused API when provided.
         if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
             try:
@@ -709,29 +779,13 @@ class GroupCoordinator:
             total_bytes = input_.numel() * input_.element_size()
             use_1stage_ar = total_bytes <= 128 * 1024
 
-        if (
-            getattr(ca_comm, "_IS_CAPTURING", False)
-            and not torch.cuda.is_current_stream_capturing()
-            and is_in_tc_piecewise_cuda_graph()
-        ):
-            if not hasattr(ca_comm, "fused_ar_rms"):
-                return None
-            return ca_comm.fused_ar_rms(
-                input_,
-                residual_inp_,
-                w=weight_,
-                eps=eps,
-                registered=False,
-                use_1stage=use_1stage_ar,
-            )
-        fused_outputs = ca_comm.custom_fused_ar_rms(
+        return ca_comm.custom_fused_ar_rms(
             input_,
             residual_inp_,
             weight_,
             eps,
             use_1stage_ar,
         )
-        return fused_outputs
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
