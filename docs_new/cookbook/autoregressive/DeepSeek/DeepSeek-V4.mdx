@@ -244,8 +244,10 @@ Two variants are exposed:
 - **W4A8** — default MegaMoE kernel (FP4 weights, FP8 activations).
 - **W4A4** — adds `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1` and
   `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1` to run the custom W4A4
-  kernel (FP4 activations). Higher throughput with negligible accuracy drop
-  (~89.5 GPQA on Pro).
+  kernel (FP4 activations). As of sgl-deep-gemm 0.1.3 this routes to the
+  packed FP4xFP4 `sm100_fp4_mega_moe` kernel (halved activation bytes and
+  SMEM). Higher throughput with negligible accuracy drop (~89.5 GPQA on Pro;
+  GSM8K/HumanEval parity within 1pp on Flash).
 
 Notes:
 - MegaMoE is **only supported on Blackwell GPUs** (B200 / B300 / GB200 / GB300). The chip is hidden when the Deploy panel's base cell sits on Hopper (H100 / H200).

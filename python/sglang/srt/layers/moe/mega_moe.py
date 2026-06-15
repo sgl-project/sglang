@@ -47,12 +47,18 @@ def _apply_mega_moe_dg_env() -> None:
     Forwarding once at first use is sufficient (these are static config
     flags, not per-request state) and matches the `setdefault` pattern so
     explicit `DG_USE_*` overrides from outside still win.
+
+    `DG_MEGA_MOE_FP4` additionally selects DeepGEMM's packed FP4xFP4 mega-MoE
+    kernel (reached through the same `fp8_fp4_mega_moe` entry point), so the
+    FP4-acts opt-in also routes to the packed kernel without any further
+    sglang-side change.
     """
     global _MEGA_MOE_DG_ENV_APPLIED
     if _MEGA_MOE_DG_ENV_APPLIED:
         return
     if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
         os.environ.setdefault("DG_USE_FP4_ACTS", "1")
+        os.environ.setdefault("DG_MEGA_MOE_FP4", "1")
     if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
         os.environ.setdefault("DG_USE_MXF4_KIND", "1")
     _MEGA_MOE_DG_ENV_APPLIED = True
