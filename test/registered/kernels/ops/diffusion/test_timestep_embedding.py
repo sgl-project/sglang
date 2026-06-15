@@ -14,6 +14,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion.timestep_embedding import (
     timestep_embedding as timestep_embedding_cuda,
 )
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -39,12 +40,9 @@ DTYPES = get_ci_test_range(
 )
 SCALES = get_ci_test_range([1, 0.01], [1, 0.01])
 
-# Determine device: prefer XPU if available, otherwise CUDA
-if hasattr(torch, "xpu") and torch.xpu.is_available():
-    DEVICE = "xpu"
-elif torch.cuda.is_available():
-    DEVICE = "cuda"
-else:
+try:
+    DEVICE = get_device()
+except RuntimeError:
     DEVICE = None
 
 

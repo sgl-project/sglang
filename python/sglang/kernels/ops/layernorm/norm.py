@@ -12,14 +12,12 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_xpu
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# XPU support
-_HAS_XPU = hasattr(torch, "xpu") and torch.xpu.is_available()
-
-if _HAS_XPU:
+if is_xpu():
     from sglang.kernels.jit.utils_xpu import load_jit_sycl
 
 
@@ -76,7 +74,7 @@ def is_supported_jit_fused_add_rmsnorm_hidden_size(hidden_size: int) -> bool:
     return hidden_size > 0 and hidden_size % 16 == 0 and hidden_size <= 8192
 
 
-if _HAS_XPU:
+if is_xpu():
 
     @cache_once
     def _jit_rmsnorm_module_xpu(hidden_size: int, dtype: torch.dtype):
@@ -148,14 +146,14 @@ if _HAS_XPU:
                 ]
 
             def rmsnorm(self, input, weight, output, eps):
-                if input.stride(-1) != 1:
+                if not input.is_contiguous():
                     raise ValueError(
-                        f"XPU RMSNorm requires contiguous last dim on input, "
+                        f"XPU RMSNorm requires contiguous input, "
                         f"got stride={input.stride()}"
                     )
-                if output.stride(-1) != 1:
+                if not output.is_contiguous():
                     raise ValueError(
-                        f"XPU RMSNorm requires contiguous last dim on output, "
+                        f"XPU RMSNorm requires contiguous output, "
                         f"got stride={output.stride()}"
                     )
                 if not weight.is_contiguous():
@@ -242,6 +240,14 @@ if _HAS_XPU:
             ]
 
         def qknorm(self, q, k, q_weight, k_weight, eps):
+            if not q.is_contiguous():
+                raise ValueError(f"XPU QKNorm requires contiguous q, got stride={q.stride()}")
+            if not k.is_contiguous():
+                raise ValueError(f"XPU QKNorm requires contiguous k, got stride={k.stride()}")
+            if not q_weight.is_contiguous():
+                raise ValueError("XPU QKNorm requires contiguous q_weight")
+            if not k_weight.is_contiguous():
+                raise ValueError("XPU QKNorm requires contiguous k_weight")
             queue = torch.xpu.current_stream().sycl_queue
 
             num_tokens = q.shape[0]
@@ -295,24 +301,15 @@ def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
 
 @torch.compiler.assume_constant_result
 @cache_once
-def can_use_fused_inplace_qknorm(
-    head_dim: int, dtype: torch.dtype, *, device_type: str = "cuda"
-) -> bool:
+def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
     if head_dim not in [64, 128, 256, 512, 1024]:
         logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
         return False
     try:
-        if device_type == "xpu":
-            if not _HAS_XPU:
-                return False
+        if is_xpu():
             _jit_qknorm_module_xpu(head_dim, dtype)
-        elif device_type == "cuda":
-            _jit_qknorm_module(head_dim, dtype)
         else:
-            logger.warning(
-                f"Unsupported device_type={device_type} for JIT QK-Norm kernel"
-            )
-            return False
+            _jit_qknorm_module(head_dim, dtype)
         return True
     except Exception as e:
         logger.warning(f"Failed to load JIT QK-Norm kernel: {e}")
@@ -331,7 +328,7 @@ def fused_inplace_qknorm(
 ) -> None:
     head_dim = head_dim or q.size(-1)
     # XPU path
-    if _HAS_XPU and q.device.type == "xpu":
+    if is_xpu() and q.device.type == "xpu":
         module = _jit_qknorm_module_xpu(head_dim, q.dtype)
         module.qknorm(q, k, q_weight, k_weight, eps)
     else:
@@ -350,7 +347,7 @@ def rmsnorm(
     out = out if out is not None else input
     hidden_size = input.size(-1)
     # XPU path
-    if _HAS_XPU and input.device.type == "xpu":
+    if is_xpu() and input.device.type == "xpu":
         module = _jit_rmsnorm_module_xpu(hidden_size, input.dtype)
         module.rmsnorm(input, weight, out, eps)
     else:

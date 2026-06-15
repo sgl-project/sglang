@@ -6,14 +6,13 @@ import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.srt.utils import is_xpu
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# XPU support
-_HAS_XPU = hasattr(torch, "xpu") and torch.xpu.is_available()
 
-if _HAS_XPU:
+if is_xpu():
     from sglang.kernels.jit.utils_xpu import load_jit_sycl
 
 
@@ -33,7 +32,7 @@ def _jit_timestep_embedding_module(dtype: torch.dtype) -> Module:
     )
 
 
-if _HAS_XPU:
+if is_xpu():
 
     @cache_once
     def _jit_timestep_embedding_module_xpu(dtype: torch.dtype):
@@ -135,7 +134,7 @@ def timestep_embedding(
     output = torch.empty((t.shape[0], dim), dtype=torch.float32, device=t.device)
 
     # XPU path
-    if _HAS_XPU and t.device.type == "xpu":
+    if is_xpu() and t.device.type == "xpu":
         module = _jit_timestep_embedding_module_xpu(t.dtype)
         module.timestep_embedding(
             t,
