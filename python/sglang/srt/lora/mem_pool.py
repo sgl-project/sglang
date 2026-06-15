@@ -1389,3 +1389,20 @@ class LoRAMemoryPool:
 
     def get_buffer_id(self, lora_uid: str):
         return self.uid_to_buffer_id[lora_uid]
+
+    def release_lora_slot(self, uid: Optional[str]) -> None:
+        """Release the GPU buffer slot for an explicitly-unloaded LoRA adapter.
+
+        Cleans ``uid_to_buffer_id``, resets the slot to ``EMPTY_SLOT``, and
+        removes the uid from the eviction policy. ``uid=None`` (base model) is
+        a no-op since None is never assigned a dedicated slot.
+        """
+        if uid is None:
+            return
+
+        if uid in self.uid_to_buffer_id:
+            buffer_id = self.uid_to_buffer_id.pop(uid)
+            self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
+            logger.debug(f"Released LoRA slot {buffer_id} for adapter {uid}.")
+
+        self.eviction_policy.remove(uid)
