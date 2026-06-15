@@ -105,11 +105,18 @@ def _embed(prompts, **engine_kwargs):
         engine.shutdown()
 
 
-# Enables the piecewise CUDA graph the way production does (ENABLE_PIECEWISE_CUDA_GRAPH).
-# NOTE: `enforce_piecewise_cuda_graph=True` does NOT reproduce the bug for this path.
+# Enables the piecewise CUDA graph for prefill the way production does. After the
+# cuda-graph refactor (#23906) the piecewise config lives in cuda_graph_config; the
+# convenience kwargs below fold into cuda_graph_config[prefill]:
+#   - cuda_graph_backend_prefill="tc_piecewise" -> prefill.backend (also the default)
+#   - cuda_graph_max_bs_prefill=32768           -> prefill.max_bs (for tc_piecewise
+#     prefill, max_bs/bs carries the captured TOKEN count -- the old
+#     piecewise_cuda_graph_max_tokens)
+#   - cuda_graph_tc_compiler="inductor"         -> prefill.tc_compiler
 _PIECEWISE_KWARGS = dict(
-    piecewise_cuda_graph_max_tokens=32768,
-    piecewise_cuda_graph_compiler="inductor",
+    cuda_graph_backend_prefill="tc_piecewise",
+    cuda_graph_max_bs_prefill=32768,
+    cuda_graph_tc_compiler="inductor",
 )
 
 
@@ -139,7 +146,7 @@ class TestFaSkipKvCachePiecewiseNoNaN(CustomTestCase):
     def test_matches_non_piecewise(self):
         prompts = _short_prompts()
         with_pcg = _embed(prompts, **_PIECEWISE_KWARGS)
-        without_pcg = _embed(prompts, disable_piecewise_cuda_graph=True)
+        without_pcg = _embed(prompts, disable_prefill_cuda_graph=True)
         for i, (a, b) in enumerate(zip(with_pcg, without_pcg)):
             self.assertFalse(
                 torch.isnan(a).any(),
