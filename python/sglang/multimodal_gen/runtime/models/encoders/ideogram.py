@@ -11,13 +11,10 @@ from sglang.multimodal_gen.configs.models.encoders.ideogram import (
     Ideogram4TextEncoderConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
+    BitsAndBytesConfig,
     attach_bitsandbytes_4bit_quant_states,
     build_bitsandbytes_4bit_quant_states,
     is_bitsandbytes_4bit_state_name,
-    swap_linears_to_bitsandbytes_4bit,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
-    swap_linears_to_weight_only_fp8,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -36,14 +33,26 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
         text_config = getattr(arch_config, "text_config")
         if isinstance(text_config, dict):
             text_config = Qwen3VLTextConfig(**text_config)
-        self.language_model = Qwen3VLTextModel(text_config)
         self._uses_bitsandbytes_4bit = getattr(
             arch_config, "ideogram_bnb_4bit_weight_only", False
         )
+        self._uses_weight_only_fp8 = getattr(
+            arch_config, "ideogram_fp8_weight_only", False
+        )
+        quant_config = None
         if self._uses_bitsandbytes_4bit:
-            swap_linears_to_bitsandbytes_4bit(self.language_model)
-        elif getattr(arch_config, "ideogram_fp8_weight_only", False):
-            swap_linears_to_weight_only_fp8(self.language_model)
+            source_quant_config = getattr(arch_config, "quantization_config")
+            if isinstance(source_quant_config, dict):
+                quant_config_dict = source_quant_config
+            else:
+                quant_config_dict = source_quant_config.to_dict()
+            quant_config = BitsAndBytesConfig.from_config(quant_config_dict)
+        self.language_model = Qwen3VLTextModel(
+            text_config,
+            quant_config=quant_config,
+            use_weight_only_fp8=self._uses_weight_only_fp8,
+            use_tensor_parallel=True,
+        )
 
     @torch.no_grad()
     def forward(

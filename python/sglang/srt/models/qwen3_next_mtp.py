@@ -59,7 +59,6 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
         self.pp_group = get_pp_group()
-        # self.determine_num_fused_shared_experts("Qwen3NextForCausalLMMTP")
 
         # currently based on the provided ckpt, we:
         # (1) do not use_dedicated_mtp_embeddings provided in ckpt since not provided and directly use the target model embeddings
@@ -70,10 +69,11 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             config.hidden_size, config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
-        config.num_hidden_layers = 1
-        config.full_attention_interval = 1
+        mtp_config = copy.deepcopy(config)
+        mtp_config.num_hidden_layers = 1
+        mtp_config.full_attention_interval = 1
         self.model = Qwen3NextModel(
-            config,
+            mtp_config,
             quant_config,
             prefix=add_prefix("model", prefix),
             is_nextn=True,
@@ -86,6 +86,19 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        # Mirror Qwen3NextForCausalLM.__init__'s shared-expert fusion setup so
+        # the inherited load_weights() can find the attribute on the MTP path.
+        # We compute it from the actual MTP MoE layer (1 layer with is_nextn=True),
+        # not hardcode it — when the layer's MoE pre-fuses the shared expert,
+        # load_weights must remap mlp.shared_expert.* into the fused slot.
+        self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        if self.num_fused_shared_experts > 1:
+            raise ValueError(
+                "Qwen3-Next MTP shared expert fusion currently supports exactly one "
+                "shared expert because checkpoint weight remapping maps it into "
+                "a single fused MoE expert slot."
+            )
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
     @torch.no_grad()
     def forward(

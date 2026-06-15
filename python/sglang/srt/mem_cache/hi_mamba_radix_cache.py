@@ -508,7 +508,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if node.mamba_value is None:
             return 0
         mamba_num = len(node.mamba_value)
-        self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+        self.req_to_token_pool.mamba_allocator.free(node.mamba_value)
         if node.mamba_lock_ref > 0:
             self.mamba_protected_size_ -= mamba_num
             node.mamba_lock_ref = 0
@@ -797,7 +797,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 # Internal: free device mamba only, KV stays on device (tombstone)
                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
                 mamba_num_evicted += len(x.mamba_value)
-                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+                self.req_to_token_pool.mamba_allocator.free(x.mamba_value)
                 self.mamba_lru_list.remove_node(x)
                 self._tombstone_internal_node(x)
             else:
@@ -1041,13 +1041,12 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_host_hit = (
             1 if (last_host_node.mamba_evicted and last_host_node.mamba_backuped) else 0
         )
-        host_hit_length = max(kv_host_hit_length, mamba_host_hit)
 
         mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
             if req.mamba_pool_idx is None:
                 dst_index = self._alloc_with_evict(
-                    self.req_to_token_pool.mamba_pool,
+                    self.req_to_token_pool.mamba_allocator,
                     1,
                     self.evict_mamba,
                     lock_node=mamba_node,
@@ -1069,7 +1068,8 @@ class HiMambaRadixCache(MambaRadixCache):
             last_host_node=last_host_node,
             # TODO(ispobock): use best_match_node as start node for load_back
             best_match_node=last_host_node,
-            host_hit_length=host_hit_length,
+            host_hit_length=kv_host_hit_length,
+            mamba_host_hit_length=mamba_host_hit,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
 
@@ -2085,7 +2085,7 @@ class HiMambaRadixCache(MambaRadixCache):
         ):
             if req.mamba_pool_idx is None:
                 req.mamba_pool_idx = self._alloc_with_evict(
-                    self.req_to_token_pool.mamba_pool,
+                    self.req_to_token_pool.mamba_allocator,
                     len(last_hit_node.mamba_host_value),
                     self.evict_mamba,
                     lock_node=last_hit_node,

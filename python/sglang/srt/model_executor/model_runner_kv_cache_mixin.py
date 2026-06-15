@@ -17,13 +17,14 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.hisparse_memory_pool import (
+from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -63,12 +64,17 @@ _is_hip = is_hip()
 
 class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
-        post_model_load_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
+        # Use the snapshot taken at the end of this runner's weight-load phase,
+        # not the current free memory: draft-model weights loaded after that
+        # point are charged to the non-static slack, not the static budget.
+        post_model_load_memory = getattr(self, "post_model_load_memory", None)
+        if post_model_load_memory is None:
+            post_model_load_memory = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=get_world_group().world_size > 1,
+                cpu_group=get_world_group().cpu_group,
+            )
 
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
@@ -294,26 +300,8 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
-            # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
             max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
-            extra_max_context_len = 4
-            if max_spec_draft_tokens is not None:
-                extra_max_context_len += max_spec_draft_tokens
-
-            # page>1 + topk>1 reserves a holey draft footprint (2 * get_alloc_len_per_decode
-            # = topk * num_new_pages * page) far beyond the default num_draft_tokens
-            # headroom; widen the row to hold it, else free leaks KV and the holey gather OOBs.
-            if (
-                self.server_args.speculative_algorithm is not None
-                and self.server_args.page_size > 1
-                and (self.server_args.speculative_eagle_topk or 1) > 1
-            ):
-                from sglang.srt.managers.utils import get_alloc_len_per_decode
-
-                extra_max_context_len = max(
-                    extra_max_context_len,
-                    2 * get_alloc_len_per_decode(self.server_args),
-                )
+            extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (
@@ -418,6 +406,9 @@ class ModelRunnerKVCacheMixin:
                 compression_ratios = self.model_config.compress_ratios
             self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
                 max_num_reqs=self.max_running_requests,
+                # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
+                # past max_running_requests (pre-alloc), so size to the real capacity.
+                num_req_slots=self.req_to_token_pool.req_to_token.shape[0],
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
                 c128_size=self.c128_max_total_num_tokens,
@@ -425,6 +416,7 @@ class ModelRunnerKVCacheMixin:
                 c128_state_pool_size=self.c128_state_pool_size,
                 page_size=self.page_size,
                 swa_page_size=swa_page_size,
+                sliding_window=self.model_config.window_size,
                 dtype=self.kv_cache_dtype,
                 state_dtype=self.state_dtype,
                 qk_nope_head_dim=self.model_config.qk_nope_head_dim,
@@ -522,9 +514,6 @@ class ModelRunnerKVCacheMixin:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     token_to_kv_pool_class=NPUMHATokenToKVPool,
-                    enable_kv_cache_copy=(
-                        self.server_args.speculative_algorithm is not None
-                    ),
                     **kwargs,
                 )
             elif self.use_mla_backend:
@@ -681,6 +670,9 @@ class ModelRunnerKVCacheMixin:
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     **extra_args,
@@ -896,8 +888,10 @@ class ModelRunnerKVCacheMixin:
 
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
-            max_num_reqs = min(max_num_reqs // self.dp_size, estimated)
+            requested_per_worker = max_num_reqs // self.dp_size
+            max_num_reqs = min(requested_per_worker, token_capacity // 2)
         else:
+            requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
         if self.mambaish_config is not None:
@@ -915,6 +909,13 @@ class ModelRunnerKVCacheMixin:
                     f"(2) increase --mem-fraction-static, or "
                     f"(3) use GPUs with more memory."
                 )
+        if requested_per_worker is not None and max_num_reqs < requested_per_worker:
+            logger.warning(
+                "max_running_requests was reduced from the requested %d to %d "
+                "(per dp worker) due to the available KV cache capacity.",
+                requested_per_worker,
+                max_num_reqs,
+            )
         logger.info(
             f"Max concurrent requests (per dp worker) from the finalized token capacity: "
             f"max_num_reqs={max_num_reqs}."

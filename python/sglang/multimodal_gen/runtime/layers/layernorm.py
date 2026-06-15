@@ -33,6 +33,7 @@ _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
+_use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda or _is_xpu:
@@ -506,10 +507,39 @@ class _ScaleResidualNormScaleShift(CustomOp):
             self.eps,
         )
 
-    def forward_hip(self, *args, **kwargs):
-        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_hip(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not _use_rocm_flydsl:
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        try:
+            from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+                FLYDSL_NORM_MIN_ALIGNED_DIM,
+                flydsl_fused_residual_norm_scale_shift,
+            )
+        except ImportError:
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        return flydsl_fused_residual_norm_scale_shift(
+            residual.contiguous(),
+            x.contiguous(),
+            gate.contiguous() if isinstance(gate, torch.Tensor) else None,
+            _ensure_contiguous(getattr(self.norm, "weight", None)),
+            _ensure_contiguous(getattr(self.norm, "bias", None)),
+            scale.contiguous(),
+            shift.contiguous(),
+            self.norm_type,
+            self.eps,
+        )
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
@@ -648,10 +678,36 @@ class _NormScaleShift(CustomOp):
             self.eps,
         )
 
-    def forward_hip(self, *args, **kwargs):
-        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        if not _use_rocm_flydsl:
+            return self.forward_native(x, shift, scale)
+
+        try:
+            from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+                FLYDSL_NORM_MIN_ALIGNED_DIM,
+                flydsl_norm_scale_shift,
+            )
+        except ImportError:
+            return self.forward_native(x, shift, scale)
+
+        if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
+            return self.forward_native(x, shift, scale)
+
+        result = flydsl_norm_scale_shift(
+            x.contiguous(),
+            _ensure_contiguous(getattr(self.norm, "weight", None)),
+            _ensure_contiguous(getattr(self.norm, "bias", None)),
+            scale.contiguous(),
+            shift.contiguous(),
+            self.norm_type,
+            self.eps,
+        )
+        return result.to(x.dtype)
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
