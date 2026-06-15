@@ -65,7 +65,7 @@ class TestChunkedPrefillAbortE2E(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
+        if cls.process:
             kill_process_tree(cls.process.pid)
 
     def test_abort_mid_chunked_prefill_by_rid(self):

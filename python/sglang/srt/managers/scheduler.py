@@ -2425,22 +2425,34 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
-    def _abort_chunked_prefill_req(
-        self,
-        req: Req,
-        error_message: str,
-        status_code=None,
-        include_finished_reason: bool = False,
-    ) -> None:
-        prepare_abort(req, error_message, status_code=status_code)
+    def process_pending_chunked_abort(self) -> None:
+        """Abort an in-flight chunked-prefill request once it is safe to do so.
+
+        ``abort_request`` only records the target in ``_pending_chunked_abort_req``
+        (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
+        the top of the scheduling step stops the next chunk from launching; the
+        chunk already launched is drained when its result is resolved. Under overlap
+        the result lands a step later, so the batch-result processors keep
+        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
+        ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
+        ``process_batch_result_prefill`` via its chunked branch (the finished req
+        is excluded from streaming and its logprob offset is still accounted).
+        Mirrors ``handle_bootstrap_failure``.
+        """
+        req = self._pending_chunked_abort_req
+        if req is None:
+            return
+        if self.chunked_req is not req:
+            # Already past chunked prefill; the running-batch abort path handles
+            # it. Drop the marker once the request is actually gone.
+            if req.finished() or req.req_pool_idx is None:
+                self._pending_chunked_abort_req = None
+            return
+
+        prepare_abort(req, "Aborted")
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            if (
-                hasattr(req, "disagg_kv_sender")
-                and req.disagg_kv_sender is not None
-                and hasattr(req.disagg_kv_sender, "abort")
-            ):
-                req.disagg_kv_sender.abort()
+            req.disagg_kv_sender.abort()
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
@@ -2453,23 +2465,10 @@ class Scheduler(
             release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
+        self._chunked_req_scheduled_last_iter = False
         self._pending_chunked_abort_req = None
-        abort_req = AbortReq(rid=req.rid)
-        if include_finished_reason and req.finished_reason is not None:
-            abort_req.finished_reason = req.finished_reason.to_json()
-        self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
-
-    def process_pending_chunked_abort(self) -> None:
-        req = self._pending_chunked_abort_req
-        if req is None:
-            return
-        if self.chunked_req is not req:
-            if req.finished() or req.req_pool_idx is None:
-                self._pending_chunked_abort_req = None
-            return
-
-        self._abort_chunked_prefill_req(req, "Aborted")
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -2773,7 +2772,6 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
-        dead_peer_reqs = set()
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
@@ -2793,13 +2791,6 @@ class Scheduler(
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
-
-            if (
-                self.disaggregation_mode == DisaggregationMode.PREFILL
-                and self.abort_dead_peer_prefill_req(req)
-            ):
-                dead_peer_reqs.add(req)
-                continue
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
@@ -2851,10 +2842,6 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
-        if dead_peer_reqs:
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req not in dead_peer_reqs
-            ]
         if len(can_run_list) == 0:
             return None
 

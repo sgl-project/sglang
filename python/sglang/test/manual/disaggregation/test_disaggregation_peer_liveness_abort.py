@@ -95,7 +95,7 @@ class TestDisaggregationPeerLivenessAbort(PDDisaggregationServerBase):
         try:
             super().tearDownClass()
         finally:
-            if getattr(cls, "_disagg_failure_ctx", None):
+            if cls._disagg_failure_ctx:
                 cls._disagg_failure_ctx.__exit__(None, None, None)
 
     def _post_generate(self, rid: str, max_new_tokens: int = 32) -> dict[str, Any]:
