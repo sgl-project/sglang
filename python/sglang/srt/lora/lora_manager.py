@@ -606,12 +606,8 @@ class LoRAManager:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
 
-        # DSA indexer fusion folds wk + weights_proj into a single bf16
-        # wk_weights_proj, so the separate wk / weights_proj modules that LoRA
-        # wraps do not exist. A LoRA that targets the indexer would then be
-        # silently dropped, so fail fast and point at the opt-out env var. This
-        # covers both --lora-target-modules and adapter-inferred targets, since
-        # both land in self.target_modules above.
+        # Fusion folds wk + weights_proj into wk_weights_proj, so the modules
+        # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
         indexer_targets = self.target_modules & DSA_INDEXER_LORA_NAMES
         if indexer_targets:
             from sglang.srt.layers.attention.dsa.dsa_indexer import (
