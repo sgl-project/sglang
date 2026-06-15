@@ -48,7 +48,6 @@ _SS = "session/streaming_session.py"
 _OWNER_SITES = {
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
-    (_SB, "ScheduleBatch.prepare_for_decode", "kv_committed_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_decode", "kv_allocated_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
@@ -58,12 +57,25 @@ _OWNER_SITES = {
     # spec v2: pre-claim in the scheduler-driven mixin, settle in resolve
     (*_MIXIN, "decode_batch_idx"): 1,
     (*_MIXIN, "evict"): 1,
-    (*_MIXIN, "kv_committed_len"): 1,
     (*_MIXIN, "kv_allocated_len"): 1,
-    # 3rd resolve mutation: DFLASH settles its full commit_lens here (no
-    # pre-claim in prepare_for_decode, unlike the EAGLE mixin).
-    (*_RESOLVE, "kv_committed_len"): 3,
-    (*_RESOLVE, "spec_verify_ct"): 1,
+    # Settle-at-result: one unified settle site for spec and non-spec decode.
+    (
+        "managers/scheduler_components/batch_result_processor.py",
+        "SchedulerBatchResultProcessor.process_batch_result_decode",
+        "kv_committed_len",
+    ): 1,
+    (
+        "managers/scheduler_components/batch_result_processor.py",
+        "SchedulerBatchResultProcessor.process_batch_result_decode",
+        "spec_verify_ct",
+    ): 1,
+    # Mixed chunked prefill: decode steps ride in the prefill batch and
+    # settle in the prefill result path.
+    (
+        "managers/scheduler_components/batch_result_processor.py",
+        "SchedulerBatchResultProcessor.process_batch_result_prefill",
+        "kv_committed_len",
+    ): 1,
     (
         "speculative/dflash_info_v2.py",
         "DFlashDraftInputV2.prepare_for_decode",

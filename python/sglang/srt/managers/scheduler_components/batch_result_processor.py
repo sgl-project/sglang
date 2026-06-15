@@ -212,6 +212,16 @@ class SchedulerBatchResultProcessor:
 
             hidden_state_offset = 0
 
+            # Settle the decode ledger for decode reqs mixed into this
+            # prefill batch: their decode step's result is processed here,
+            # not in process_batch_result_decode. Must precede the loop --
+            # release_kv_cache below reads kv_committed_len.
+            if batch.decoding_reqs:
+                for req in batch.decoding_reqs:
+                    if req.is_retracted or req.finished():
+                        continue
+                    req.kv_committed_len += 1
+
             # Check finish conditions
             logprob_pt = 0
 
@@ -535,6 +545,7 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
+        result.accept_lens_cpu = accept_lens
         result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
@@ -545,40 +556,15 @@ class SchedulerBatchResultProcessor:
             result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
         )
 
-        predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
-        for i, req in enumerate(batch.reqs):
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
-
-            if req.is_retracted:
-                # reset_for_retract() already zeroes committed/allocated KV.
-                continue
-
-            if req.finished():
-                if not batch.spec_algorithm.is_dflash():
-                    # EAGLE prepare_for_decode pre-claimed the bonus slot.
-                    req.kv_committed_len -= 1
-                continue
-
-            if batch.spec_algorithm.is_dflash():
-                # DFLASH materialized accepted draft tokens plus the bonus token.
-                req.kv_committed_len += accept_lens[i]
-            else:
-                # EAGLE prepare_for_decode pre-claimed the bonus slot.
-                req.kv_committed_len += accept_lens[i] - 1
-            req.spec_verify_ct += 1
-
-            num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-            req.spec_num_correct_drafts += num_correct_drafts
-            req.update_spec_correct_drafts_histogram(num_correct_drafts)
-
-        return predict_tokens
+        return [
+            next_token_ids[i * stride : i * stride + accept_lens[i]]
+            for i in range(len(batch.reqs))
+        ]
 
     def process_batch_result_idle(
         self,
@@ -618,6 +604,20 @@ class SchedulerBatchResultProcessor:
             logits_output=logits_output,
             next_token_ids=next_token_ids,
         )
+
+        # Settle the decode ledger. Must precede the per-req loop: the mamba
+        # track-boundary check reads kv_committed_len with this step included.
+        # Reqs finished/retracted in an earlier iteration never settle.
+        accept_lens = result.accept_lens_cpu  # None for non-spec: 1 token/req
+        for i, req in enumerate(batch.reqs):
+            if req.is_retracted or req.finished():
+                continue
+            req.kv_committed_len += 1 if accept_lens is None else accept_lens[i]
+            if accept_lens is not None:
+                req.spec_verify_ct += 1
+                num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
+                req.spec_num_correct_drafts += num_correct_drafts
+                req.update_spec_correct_drafts_histogram(num_correct_drafts)
 
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
@@ -883,11 +883,11 @@ class SchedulerBatchResultProcessor:
 
         Returns (at_boundary, track_seqlen).  The boundary condition
         matches what the forward's tracking mask used:
-        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
-        ``kv_committed_len`` by 1, then checks
-        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
-        here reproduces that check exactly, and the value is always a
-        multiple of ``interval`` (hence page-aligned).
+        ``prepare_for_decode`` increments ``seq_lens_cpu`` by 1 and checks
+        ``seq_lens_cpu % interval == 0``; ``kv_committed_len`` settles to the
+        same value earlier in result processing, so using it here reproduces
+        that check exactly, and the value is always a multiple of
+        ``interval`` (hence page-aligned).
 
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
