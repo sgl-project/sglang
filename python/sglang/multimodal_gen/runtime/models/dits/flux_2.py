@@ -60,6 +60,115 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
+def _shard_text_for_sp(
+    encoder_hidden_states: torch.Tensor,
+    freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    image_seq_len: int,
+    num_txt_tokens: int,
+) -> Tuple[
+    torch.Tensor,
+    Optional[Tuple[torch.Tensor, torch.Tensor]],
+    int,
+    int,
+    Optional[torch.Tensor],
+    Optional[Dict[str, int]],
+]:
+    sp_size = get_sp_world_size()
+    num_replicated_prefix = num_txt_tokens
+    if sp_size == 1:
+        return (
+            encoder_hidden_states,
+            freqs_cis,
+            num_replicated_prefix,
+            num_txt_tokens,
+            None,
+            None,
+        )
+
+    sp_rank = get_sp_parallel_rank()
+    local_txt_tokens = (num_txt_tokens + sp_size - 1) // sp_size
+    padded_txt_tokens = local_txt_tokens * sp_size
+    num_pad_tokens = padded_txt_tokens - num_txt_tokens
+
+    if num_pad_tokens > 0:
+        pad_hidden_states = encoder_hidden_states.new_zeros(
+            encoder_hidden_states.shape[0],
+            num_pad_tokens,
+            encoder_hidden_states.shape[2],
+        )
+        encoder_hidden_states = torch.cat(
+            [encoder_hidden_states, pad_hidden_states], dim=1
+        )
+
+    encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_size, dim=1)[sp_rank]
+    if freqs_cis is not None:
+        cos, sin = freqs_cis
+        txt_cos = cos[:num_txt_tokens]
+        txt_sin = sin[:num_txt_tokens]
+        if num_pad_tokens > 0:
+            pad_cos = txt_cos.new_ones(num_pad_tokens, txt_cos.shape[1])
+            pad_sin = txt_sin.new_zeros(num_pad_tokens, txt_sin.shape[1])
+            txt_cos = torch.cat([txt_cos, pad_cos], dim=0)
+            txt_sin = torch.cat([txt_sin, pad_sin], dim=0)
+        freqs_cis = (
+            torch.cat(
+                [
+                    torch.chunk(txt_cos, sp_size, dim=0)[sp_rank],
+                    cos[num_txt_tokens:],
+                ],
+                dim=0,
+            ),
+            torch.cat(
+                [
+                    torch.chunk(txt_sin, sp_size, dim=0)[sp_rank],
+                    sin[num_txt_tokens:],
+                ],
+                dim=0,
+            ),
+        )
+
+    num_replicated_prefix = 0
+    if num_pad_tokens == 0:
+        return (
+            encoder_hidden_states,
+            freqs_cis,
+            num_replicated_prefix,
+            local_txt_tokens,
+            None,
+            None,
+        )
+
+    txt_start = sp_rank * local_txt_tokens
+    valid_txt_tokens = min(local_txt_tokens, max(num_txt_tokens - txt_start, 0))
+    text_mask = torch.zeros(
+        encoder_hidden_states.shape[0],
+        local_txt_tokens,
+        dtype=torch.bool,
+        device=encoder_hidden_states.device,
+    )
+    text_mask[:, :valid_txt_tokens] = True
+    image_mask = torch.ones(
+        encoder_hidden_states.shape[0],
+        image_seq_len,
+        dtype=torch.bool,
+        device=encoder_hidden_states.device,
+    )
+    return (
+        encoder_hidden_states,
+        freqs_cis,
+        num_replicated_prefix,
+        local_txt_tokens,
+        torch.cat([text_mask, image_mask], dim=1),
+        {
+            "gap_start": (sp_size - 1) * (local_txt_tokens + image_seq_len)
+            + local_txt_tokens
+            - num_pad_tokens,
+            "gap_end": (sp_size - 1) * (local_txt_tokens + image_seq_len)
+            + local_txt_tokens,
+        },
+    )
+
+
 def _get_qkv_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
@@ -301,6 +410,8 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         num_replicated_prefix: int = 0,
+        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask_meta: Optional[Dict[str, int]] = None,
     ) -> torch.Tensor:
         (
             query,
@@ -370,7 +481,12 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             )
 
         hidden_states = self.attn(
-            query, key, value, num_replicated_prefix=num_replicated_prefix
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
         )
 
         hidden_states = hidden_states.flatten(2, 3)
@@ -512,6 +628,11 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         num_replicated_prefix: int = 0,
         **kwargs,
     ) -> torch.Tensor:
+        attn_mask = kwargs.get("attn_mask")
+        attn_mask_meta = kwargs.get("attn_mask_meta")
+        if attn_mask is None:
+            attn_mask = attention_mask
+
         # Parallel in (QKV + MLP in) projection
         hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden_states = torch.split(
@@ -546,7 +667,12 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
                 query, key, cos_sin_cache, is_neox=False
             )
         hidden_states = self.attn(
-            query, key, value, num_replicated_prefix=num_replicated_prefix
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -711,9 +837,11 @@ class Flux2TransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         # Modulation parameters shape: [1, 1, self.dim]
-        (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = (
-            temb_mod_params_img
-        )
+        (shift_msa, scale_msa, gate_msa), (
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = temb_mod_params_img
         (c_shift_msa, c_scale_msa, c_gate_msa), (
             c_shift_mlp,
             c_scale_mlp,
@@ -1068,32 +1196,25 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_states, _ = self.x_embedder(hidden_states)
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 
-        # 3. Shard text tokens for Ulysses SP when evenly divisible.
-        # Instead of replicating text on every SP rank (which causes redundant
-        # GEMMs), shard text along the sequence dimension so each rank only
-        # processes S_text/SP tokens. The standard USP all-to-all path
-        # (num_replicated_prefix=0) then gathers text+image together.
-        sp_size = get_sp_world_size()
-        num_replicated_prefix = num_txt_tokens
-        if sp_size > 1 and num_txt_tokens % sp_size == 0:
-            sp_rank = get_sp_parallel_rank()
-            encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_size, dim=1)[
-                sp_rank
-            ]
-            if freqs_cis is not None:
-                cos, sin = freqs_cis
-                txt_cos_local = torch.chunk(cos[:num_txt_tokens], sp_size, dim=0)[
-                    sp_rank
-                ]
-                txt_sin_local = torch.chunk(sin[:num_txt_tokens], sp_size, dim=0)[
-                    sp_rank
-                ]
-                freqs_cis = (
-                    torch.cat([txt_cos_local, cos[num_txt_tokens:]], dim=0),
-                    torch.cat([txt_sin_local, sin[num_txt_tokens:]], dim=0),
-                )
-            num_replicated_prefix = 0
-            num_txt_tokens = num_txt_tokens // sp_size
+        (
+            encoder_hidden_states,
+            freqs_cis,
+            num_replicated_prefix,
+            num_txt_tokens,
+            attn_mask,
+            attn_mask_meta,
+        ) = _shard_text_for_sp(
+            encoder_hidden_states,
+            freqs_cis,
+            hidden_states.shape[1],
+            num_txt_tokens,
+        )
+        if attn_mask is not None:
+            joint_attention_kwargs = (
+                joint_attention_kwargs.copy() if joint_attention_kwargs else {}
+            )
+            joint_attention_kwargs["attn_mask"] = attn_mask
+            joint_attention_kwargs["attn_mask_meta"] = attn_mask_meta
 
         # 4. Double Stream Transformer Blocks
         for index_block, block in enumerate(self.transformer_blocks):
