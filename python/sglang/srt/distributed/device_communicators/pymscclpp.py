@@ -90,8 +90,13 @@ class PyMscclppCommunicator:
             rank=self.rank,
         )
 
+        # NVLS (NVLink SHARP) algos are NVIDIA-only and raise InvalidUsage on
+        # ROCm/AMD during tuning, crashing init. Skip them on HIP — the generic
+        # `default_allreduce_packet` algo (0-2MB) covers small decode messages.
+        _is_hip = getattr(torch.version, "hip", None) is not None
+
         for algo in algos:
-            if algo.name == "default_allreduce_nvls_packet":
+            if algo.name == "default_allreduce_nvls_packet" and not _is_hip:
                 algo.set_message_size_range(0, 512 << 10)
                 navitve_algorithms_config.append(
                     (algo, [4, 8, 12, 16], [256, 512, 768, 1024])
