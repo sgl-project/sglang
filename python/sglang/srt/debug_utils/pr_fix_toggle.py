@@ -94,6 +94,22 @@ patches:
 """
 
 
+_PR_REVERT_YAML_28254 = """
+patches:
+  - target: sglang.srt.managers.schedule_batch._compute_chunked_req_next_prompt_token
+    edits:
+      - match: |
+          fill_ids = chunked_req.full_untruncated_fill_ids
+          if fill_len >= len(fill_ids):
+              return None
+          return int(fill_ids[fill_len])
+        replacement: |
+          if fill_len >= len(chunked_req.origin_input_ids):
+              return None
+          return int(chunked_req.origin_input_ids[fill_len])
+"""
+
+
 _PR_FIX_REVERT_YAML: Dict[int, str] = {
     25015: _PR_REVERT_YAML_25015,
     26329: _PR_REVERT_YAML_26329,
@@ -101,6 +117,7 @@ _PR_FIX_REVERT_YAML: Dict[int, str] = {
     27360: _PR_REVERT_YAML_27360,
     26972: _PR_REVERT_YAML_26972,
     27460: _PR_REVERT_YAML_27460,
+    28254: _PR_REVERT_YAML_28254,
 }
 
 

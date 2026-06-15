@@ -2,7 +2,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    _compute_chunked_req_next_prompt_token,
+)
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
@@ -554,6 +557,25 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         req.set_extend_input_len.assert_called_once_with(200)
         self.assertIn(req, adder.can_run_list)
+
+    def test_chunked_req_next_prompt_token_indexes_full_fill_sequence(self):
+        origin = list(range(100))
+        output = list(range(100, 140))
+        req = MagicMock(spec=Req)
+        req.origin_input_ids = origin
+        req.output_ids = output
+        req.full_untruncated_fill_ids = origin + output
+
+        self.assertIsNone(_compute_chunked_req_next_prompt_token(None))
+
+        req.fill_len = 50
+        self.assertEqual(_compute_chunked_req_next_prompt_token(req), 50)
+
+        req.fill_len = 120
+        self.assertEqual(_compute_chunked_req_next_prompt_token(req), 120)
+
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        self.assertIsNone(_compute_chunked_req_next_prompt_token(req))
 
 
 if __name__ == "__main__":

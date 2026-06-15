@@ -1649,9 +1649,10 @@ def _compute_chunked_req_next_prompt_token(
     if chunked_req is None:
         return None
     fill_len = chunked_req.fill_len
-    if fill_len >= len(chunked_req.origin_input_ids):
+    fill_ids = chunked_req.full_untruncated_fill_ids
+    if fill_len >= len(fill_ids):
         return None
-    return int(chunked_req.origin_input_ids[fill_len])
+    return int(fill_ids[fill_len])
 
 
 @dataclasses.dataclass
