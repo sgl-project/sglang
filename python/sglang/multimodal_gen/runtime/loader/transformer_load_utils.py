@@ -21,10 +21,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     _patch_nunchaku_scales,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
-from sglang.multimodal_gen.runtime.precision import resolve_precision
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
     get_metadata_from_safetensors_file,

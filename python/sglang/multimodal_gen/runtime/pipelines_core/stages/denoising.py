@@ -97,16 +97,16 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
     RolloutDenoisingMixin,
 )
-from sglang.multimodal_gen.runtime.precision import (
-    autocast_enabled as precision_autocast_enabled,
-)
-from sglang.multimodal_gen.runtime.precision import (
-    resolve_precision,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled as precision_autocast_enabled,
+)
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list
 from sglang.srt.utils.common import get_compiler_backend

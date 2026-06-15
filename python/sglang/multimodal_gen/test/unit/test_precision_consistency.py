@@ -13,6 +13,7 @@ def _load_precision_module():
         "sglang",
         "sglang.multimodal_gen",
         "sglang.multimodal_gen.runtime",
+        "sglang.multimodal_gen.runtime.utils",
         "sglang.multimodal_gen.utils",
     )
     missing = object()
@@ -31,7 +32,9 @@ def _load_precision_module():
             sys.modules[package_name] = package
         sys.modules["sglang.multimodal_gen.utils"] = utils_module
 
-        precision_path = Path(__file__).resolve().parents[2] / "runtime/precision.py"
+        precision_path = (
+            Path(__file__).resolve().parents[2] / "runtime/utils/precision.py"
+        )
         spec = importlib.util.spec_from_file_location(
             "_diffusion_precision_under_test", precision_path
         )

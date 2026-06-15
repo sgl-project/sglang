@@ -13,11 +13,11 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
-from sglang.multimodal_gen.runtime.precision import resolve_precision
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 
 class AdapterLoader(ComponentLoader):
