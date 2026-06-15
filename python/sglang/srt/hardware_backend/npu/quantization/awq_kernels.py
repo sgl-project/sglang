@@ -47,8 +47,8 @@ class AWQAscendLinearKernel:
             raise RuntimeError(f"K={K} not divisible by scale groups {num_groups}")
         group_size = K // num_groups
     
-        # NPU constraint (keep disabled for now)
-        npu_ok = False  # enable after merging PR #10158
+        # NPU constraint
+        npu_ok = (group_size == 0) or (group_size % 32 == 0 and 32 <= group_size < K)
     
         if npu_ok:
             # Replicate the old NPU preparation (XOR + zero processing)
