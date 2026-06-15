@@ -50,49 +50,49 @@ class AWQAscendLinearKernel:
         layer.zeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
         layer.weight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
 
-def apply(
-    self,
-    layer: torch.nn.Module,
-    x: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    qweight = layer.weight          # shape: (K, N // pack_factor)
-    scales = layer.scales           # shape: (N, 1) or (N, num_groups)
-    qzeros = layer.zeros
-    pack_factor = self.quant_config.pack_factor   # 8 for 4‑bit
-    out_shape = x.shape[:-1] + (qweight.shape[1] * pack_factor,)
-    reshaped_x = x.reshape(-1, x.shape[-1])
-
-    # Input features (K) from the first dimension of the weight
-    K = qweight.shape[0]
-    # Output features (N) from the second dimension * pack_factor
-    # N = qweight.shape[1] * pack_factor   # not needed directly
-
-    # Derive group_size from the scale tensor
-    if scales.ndim == 2 and scales.shape[1] == 1:
-        group_size = 0                     # per‑channel
-    elif scales.ndim == 2:
-        num_groups = scales.shape[1]
-        if K % num_groups != 0:
-            raise RuntimeError(
-                f"Input features {K} not divisible by scale groups {num_groups}"
-            )
-        group_size = K // num_groups
-    else:
-        raise RuntimeError(f"Unexpected scale tensor shape: {scales.shape}")
-
-    if bias is not None and bias.dtype == torch.bfloat16:
-        bias = bias.float()
-
-    out = torch_npu.npu_weight_quant_batchmatmul(
-        reshaped_x,
-        qweight,
-        antiquant_scale=scales,
-        antiquant_offset=qzeros,
-        antiquant_group_size=group_size,
-        bias=bias,
-    )
-    return out.reshape(out_shape)
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        qweight = layer.weight          # shape: (K, N // pack_factor)
+        scales = layer.scales           # shape: (N, 1) or (N, num_groups)
+        qzeros = layer.zeros
+        pack_factor = self.quant_config.pack_factor   # 8 for 4‑bit
+        out_shape = x.shape[:-1] + (qweight.shape[1] * pack_factor,)
+        reshaped_x = x.reshape(-1, x.shape[-1])
+    
+        # Input features (K) from the first dimension of the weight
+        K = qweight.shape[0]
+        # Output features (N) from the second dimension * pack_factor
+        # N = qweight.shape[1] * pack_factor   # not needed directly
+    
+        # Derive group_size from the scale tensor
+        if scales.ndim == 2 and scales.shape[1] == 1:
+            group_size = 0                     # per‑channel
+        elif scales.ndim == 2:
+            num_groups = scales.shape[1]
+            if K % num_groups != 0:
+                raise RuntimeError(
+                    f"Input features {K} not divisible by scale groups {num_groups}"
+                )
+            group_size = K // num_groups
+        else:
+            raise RuntimeError(f"Unexpected scale tensor shape: {scales.shape}")
+    
+        if bias is not None and bias.dtype == torch.bfloat16:
+            bias = bias.float()
+    
+        out = torch_npu.npu_weight_quant_batchmatmul(
+            reshaped_x,
+            qweight,
+            antiquant_scale=scales,
+            antiquant_offset=qzeros,
+            antiquant_group_size=group_size,
+            bias=bias,
+        )
+        return out.reshape(out_shape)
 
 class AWQAscendMoEKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
