@@ -808,8 +808,10 @@ class HiSparseCoordinator:
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
 
-        # todo, adjustable for performance
-        block_size = 1024
+        # 1024-thread blocks can trip illegal memory accesses in the swap-in
+        # kernel on B200 for GLM HiSparse shapes; 512 keeps the same work
+        # distribution and passes the standalone B200 replay.
+        block_size = 512
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
