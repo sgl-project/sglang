@@ -517,6 +517,8 @@ class Envs:
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
+    # Temporary: route draft_extend_v2 through the TRT-LLM MHA decode kernel path.
+    SGLANG_TRTLLM_MHA_DRAFT_EXTEND_V2_DECODE = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
