@@ -175,13 +175,16 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
 
 
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
-@pytest.mark.parametrize("prefix_len", [128, 256])
-def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
-    """Prefill once, then a second prefill that extends across one compress event.
+@pytest.mark.parametrize("prefix_len", [128, 120, 256])
+@pytest.mark.parametrize("extend_len", [128, 256])
+def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> None:
+    """Prefill once, then a second prefill that extends across compress event(s).
 
-    First prefill ends at a 128-boundary so the second prefill starts fresh.
+    A prefix that is not a multiple of the ratio (e.g. 120) makes the first
+    compress event land at extend index j < window_size, so its buffer_len is
+    nonzero (window_size - min(j+1, window_size)) and the overlap must be read
+    out of the state buffer. Every compress event in the extend is checked.
     """
-    extend_len = RATIO
     seq_len = prefix_len + extend_len
 
     if mode == "legacy":
@@ -214,10 +217,13 @@ def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
         extend_lens_cpu,
     )
 
-    P = seq_len - 1
-    gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
-    # Single compress event in this extend; compact plan_id 0.
-    triton.testing.assert_close(out[0].cpu(), gt, atol=ATOL, rtol=RTOL)
+    # One compact output row per compress event in the extend, position-ascending.
+    first_event = ((prefix_len // RATIO) + 1) * RATIO - 1
+    for plan_id, P in enumerate(range(first_event, seq_len, RATIO)):
+        gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
+        triton.testing.assert_close(
+            out[plan_id].cpu(), gt, atol=ATOL, rtol=RTOL, err_msg=f"{plan_id=}, {P=}"
+        )
 
 
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
