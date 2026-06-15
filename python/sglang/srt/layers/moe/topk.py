@@ -1193,20 +1193,36 @@ def _fill_padded_rows(
     )
 
 
+def _eplb_remap_enabled() -> bool:
+    # A real logical->physical mapping only exists when EPLB is enabled, the
+    # initial expert placement is non-trivial, or there are redundant physical
+    # experts. Otherwise the map is identity and the remap must be skipped (it is
+    # both unnecessary and not well-defined over the padded region of topk_ids).
+    from sglang.srt.server_args import get_global_server_args
+
+    server_args = get_global_server_args()
+    return (
+        server_args.enable_eplb
+        or server_args.init_expert_location != "trivial"
+        or server_args.ep_num_redundant_experts > 0
+    )
+
+
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
+    fill_value: int = -1,
 ) -> None:
     if num_token_non_padded is None:
         return
     # TODO: let the kernel support other dtypes
-    if _is_cuda and topk_ids.dtype == torch.int32:
+    if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
         mask_topk_ids(topk_ids, num_token_non_padded)
     elif _can_fuse_padded_region(topk_ids):
         _fill_padded_rows(topk_ids, num_token_non_padded, -1)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
+        topk_ids[indices >= num_token_non_padded, :] = fill_value
 
 
 def _zero_topk_weights_padded_region(
@@ -1593,13 +1609,24 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_hip:
-        topk_ids = _biased_grouped_topk_postprocess(
-            topk_ids, expert_location_dispatch_info, num_token_non_padded
-        )
-        # NOTE (HIP): padded-token routing-weight zeroing is done once at the
-        # very end of this function. An earlier pass here would be redundant --
-        # the final pass re-zeros after any shared-expert append/remap -- so it
-        # is omitted to avoid a second per-layer masking-kernel launch.
+        # The logical->physical remap is only meaningful when a real
+        # expert-location mapping exists. With a trivial placement and EPLB off
+        # the map is identity, and indexing it here is both unnecessary and not
+        # well-defined for the dp-attention padded region of topk_ids; skip it.
+        # ``--ep-dispatch-algorithm fake`` is a routing benchmark artifact and
+        # does not by itself require remapping.
+        if _eplb_remap_enabled():
+            # Mask the padded region to a valid in-range id (0) before the
+            # gather so it never indexes the dispatch map out of bounds. -1 is
+            # not used here: the aiter MoE kernels do not handle topk_ids=-1.
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info
+            )
+        # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
+        # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
+        # That final pass re-zeros after any shared-expert append/remap, so a
+        # second zeroing here would be redundant (zeroing is idempotent).
 
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids

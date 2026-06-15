@@ -14,6 +14,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -43,6 +44,30 @@ class TestPrepareServerArgs(CustomTestCase):
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
+
+    def test_config_nested_dict_args_are_json(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("mm-process-config:\n  image:\n    resize: 128\n")
+            config_file = f.name
+
+        try:
+            parser = server_args_module.argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                [
+                    "--config",
+                    config_file,
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                ]
+            )
+            value = merged[merged.index("--mm-process-config") + 1]
+            parsed = parser.parse_args(merged)
+
+            self.assertEqual(json.loads(value), {"image": {"resize": 128}})
+            self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
+        finally:
+            os.unlink(config_file)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -84,7 +109,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
 
-    def test_pd_decode_radix_cache_rejects_unknown_backend(self):
+    def test_pd_decode_radix_cache_rejects_fake_backend(self):
         with self.assertRaises(ValueError) as context:
             ServerArgs(
                 model_path="dummy",
@@ -93,8 +118,32 @@ class TestLoadBalanceMethod(unittest.TestCase):
                 disaggregation_transfer_backend="fake",
             )
 
-        self.assertIn("('nixl', 'mooncake')", str(context.exception))
-        self.assertIn("'fake'", str(context.exception))
+        self.assertIn(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with --disaggregation-transfer-backend fake",
+            str(context.exception),
+        )
+
+    def test_pd_decode_radix_cache_allows_ascend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="ascend",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake_tcp",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+        self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
 
 class TestContextParallelServerArgs(CustomTestCase):

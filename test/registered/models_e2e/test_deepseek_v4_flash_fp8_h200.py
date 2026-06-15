@@ -14,6 +14,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -29,6 +30,7 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 
 
 class TestDSV4FlashFP8H200(
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -36,6 +38,8 @@ class TestDSV4FlashFP8H200(
     """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
 
     gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 1.8
+    bs_1_speed_thres = 140
 
     @classmethod
     def setUpClass(cls):
