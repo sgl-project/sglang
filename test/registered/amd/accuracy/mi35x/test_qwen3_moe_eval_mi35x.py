@@ -1,14 +1,7 @@
-"""MI35x Qwen3 MoE (bf16) GSM8K Completion Evaluation Test (8-GPU)
+"""MI35x Qwen3 MoE (unquantized) GSM8K Completion Evaluation Test (8-GPU)
 
 Tests unquantized (bf16) Qwen3 MoE (Qwen/Qwen3-30B-A3B) using a few-shot GSM8K
-completion benchmark on MI35x with aiter enabled.
-
-Regression guard for the ROCm aiter unquantized-MoE garbage bug: on gfx950 the
-aiter CK fused-MoE cannot run the TP-sharded per-rank intermediate
-(768 // 8 = 96) and falls back to the Triton MoE runner with aiter-pre-shuffled
-weights, producing garbage tokens. ServerArgs routes the unquantized Qwen3 MoE
-runner to triton on ROCm with aiter; this test exercises that path
-(SGLANG_USE_AITER=1).
+completion benchmark on MI35x with aiter enabled (SGLANG_USE_AITER=1).
 
 Registry: nightly-amd-8-gpu-mi35x suite
 """
@@ -71,11 +64,8 @@ MI35X_QWEN3_MOE_MODELS = [
             "0.8",
             "--trust-remote-code",
         ],
-        # With SGLANG_USE_AITER=1, ServerArgs routes the unquantized Qwen3 MoE
-        # runner to triton on ROCm because the aiter CK fused-MoE does not
-        # support the TP-sharded per-rank intermediate (e.g. 768 // 8 = 96).
-        # Without that routing the MoE falls back to Triton with aiter-pre-shuffled
-        # weights and emits garbage (gsm8k ~ 0); this test guards the fix.
+        # ServerArgs routes the unquantized Qwen3 MoE runner to triton on ROCm with
+        # aiter (aiter CK can't run the TP-sharded intermediate, e.g. 768 // 8).
         env_vars={"SGLANG_USE_AITER": "1"},
     ),
 ]
@@ -157,7 +147,7 @@ def run_gsm8k_benchmark(
 
 
 class TestQwen3MoeEvalMI35x(unittest.TestCase):
-    """Qwen3 MoE (bf16) GSM8K Completion Evaluation Test for AMD MI35x."""
+    """Unquantized Qwen3 MoE GSM8K Completion Evaluation Test for AMD MI35x."""
 
     @classmethod
     def setUpClass(cls):
