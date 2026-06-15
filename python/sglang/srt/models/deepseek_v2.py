@@ -885,13 +885,23 @@ class DeepseekV2MoE(nn.Module):
         shared_output = self._forward_shared_experts(
             hidden_states, gemm_output_zero_allocator
         )
+        copy_add_state = None
+        copy_add_ctx = nullcontext(None)
+        if shared_output is not None and not self._shared_expert_tp1:
+            from sglang.srt.layers.moe.moe_runner.base import moe_output_copy_add_ctx
+
+            shared_ready_event = current_stream.record_event()
+            copy_add_ctx = moe_output_copy_add_ctx(
+                shared_output,
+                shared_ready_event,
+            )
         server_args = get_global_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if server_args.enable_eplb
             else None
         )
-        with torch.cuda.stream(self.alt_stream):
+        with torch.cuda.stream(self.alt_stream), copy_add_ctx as copy_add_state:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_kwargs = (
@@ -926,6 +936,10 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
+        if copy_add_state is not None and copy_add_state.consumed:
+            # The FlashInfer output copy path already wrote
+            # routed_output + shared_output, so skip the generic shared add.
+            shared_output = None
 
         if deferred_finalize:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (

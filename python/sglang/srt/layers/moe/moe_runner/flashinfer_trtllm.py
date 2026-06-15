@@ -27,6 +27,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
     _moe_output_buf,
+    maybe_moe_output_copy_add,
     register_fused_func,
 )
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -749,6 +750,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     else routing_method_type
                 ),
                 use_shuffled_weight=use_shuffled_weight,
+                output=symm_output,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
@@ -756,6 +758,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
+            # TODO: When FlashInfer's non-routed trtllm_fp8_block_scale_moe
+            # public API accepts an output tensor, pass symm_output here and
+            # remove the copy-add stream workaround below. FlashInfer v0.6.12
+            # still does not expose that output argument for this API.
             output = trtllm_fp8_block_scale_moe_wrapper(
                 routing_logits=router_logits,
                 routing_bias=correction_bias,
@@ -783,9 +789,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
             )
-        # TODO: Once https://github.com/flashinfer-ai/flashinfer/issues/2703 is fixed, pass output to moe kernel and remove this copy.
-        symm_output.copy_(output)
-        output = symm_output
+        # Routed FlashInfer can write directly into symm_output. Non-routed
+        # and per-tensor paths still need the copy-add workaround below.
+        output = maybe_moe_output_copy_add(output, symm_output)
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
         assert quant_info.w13_input_scale is not None
@@ -841,8 +847,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
             activation_type=quant_info.activation_type,
         )
-        symm_output.copy_(output)
-        output = symm_output
+        output = maybe_moe_output_copy_add(output, symm_output)
 
     return StandardCombineInput(hidden_states=output)
 

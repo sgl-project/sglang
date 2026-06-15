@@ -125,16 +125,21 @@ def _fake_fp8_block_scale_routed_moe(
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
     enable_pdl: Optional[bool] = None,
+    output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
 ) -> torch.Tensor:
+    if output is not None:
+        return output
     return torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
     )
 
 
-@register_custom_op(fake_impl=_fake_fp8_block_scale_routed_moe)
+@register_custom_op(
+    fake_impl=_fake_fp8_block_scale_routed_moe, mutates_args=["output"]
+)
 def trtllm_fp8_block_scale_routed_moe_wrapper(
     topk_ids: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -156,6 +161,7 @@ def trtllm_fp8_block_scale_routed_moe_wrapper(
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
     enable_pdl: Optional[bool] = None,
+    output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
@@ -188,6 +194,7 @@ def trtllm_fp8_block_scale_routed_moe_wrapper(
         "use_shuffled_weight": use_shuffled_weight,
         "weight_layout": weight_layout,
         "enable_pdl": enable_pdl,
+        "output": output,
         "tune_max_num_tokens": tune_max_num_tokens,
     }
     if fp8_quantization_type is not None:
@@ -200,7 +207,8 @@ def trtllm_fp8_block_scale_routed_moe_wrapper(
 
         kwargs["activation_type"] = ActivationType(activation_type)
 
-    return trtllm_fp8_block_scale_routed_moe(**kwargs)
+    result = trtllm_fp8_block_scale_routed_moe(**kwargs)
+    return output if output is not None else result
 
 
 def _fake_fp8_per_tensor_scale_moe(
