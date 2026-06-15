@@ -240,6 +240,11 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    # Transitional gate for runtime dispatch through cp.strategy. The default
+    # stays off while CP-v2 model/backend integrations land incrementally.
+    SGLANG_ENABLE_CP_V2 = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_REFACTOR_CP"
+    )
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
