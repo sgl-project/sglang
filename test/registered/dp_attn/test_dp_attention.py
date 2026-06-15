@@ -5,7 +5,7 @@ import requests
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
@@ -22,6 +22,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=630, suite="stage-b-test-2-gpu-large-amd")
 
 
 class TestDPAttentionDP2TP2(
