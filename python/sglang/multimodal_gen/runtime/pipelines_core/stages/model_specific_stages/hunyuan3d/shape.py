@@ -432,7 +432,6 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
                 timestep=timestep_expanded,
                 target_dtype=target_dtype,
                 guidance=guidance,
-                enable_bcg=not batch.is_warmup,
                 scheduler=batch.scheduler,
                 encoder_hidden_states=cond,
             )
@@ -556,16 +555,15 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
         if isinstance(mesh, list):
             mesh = mesh[0]
 
+        if batch.is_warmup:
+            logger.info("Skipping mesh export during warmup")
+            batch.extra["shape_obj_path"] = None
+            batch.extra["shape_return_path"] = None
+            if self.config.paint_enable:
+                return batch
+            return OutputBatch(output_file_paths=[], metrics=batch.metrics)
+
         if mesh is None:
-            if batch.is_warmup:
-                logger.info(
-                    "Skipping mesh export during warmup "
-                    "(surface extraction returned None)"
-                )
-                batch.extra["_mesh_failed"] = True
-                if self.config.paint_enable:
-                    return batch
-                return OutputBatch(output_file_paths=[], metrics=batch.metrics)
             raise RuntimeError(
                 "Mesh generation failed: surface extraction returned None. "
                 "The surface level may be outside the volume data range."
