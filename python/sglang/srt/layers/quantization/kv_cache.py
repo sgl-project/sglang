@@ -83,3 +83,11 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale.copy_(v_scale)
         layer.k_scale_float = k_scale
         layer.v_scale_float = v_scale
+
+        # Precompute inverse scales as persistent GPU tensors so the FP8 KV
+        # cache write path doesn't have to launch scalar reciprocal kernels on
+        # every forward pass.  These are constant across the model's lifetime
+        # and safe to reference from inside CUDA graphs (fixed device pointers).
+        device = layer.k_scale.device
+        layer.inv_k_scale = (1.0 / layer.k_scale).to(device=device, dtype=torch.float32)
+        layer.inv_v_scale = (1.0 / layer.v_scale).to(device=device, dtype=torch.float32)

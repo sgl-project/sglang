@@ -592,6 +592,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k_scale=layer.k_scale,  # May be None
             v_scale=layer.v_scale,  # May be None
             page_size=self.page_size,
+            inv_k_scale=getattr(layer, "inv_k_scale", None),
+            inv_v_scale=getattr(layer, "inv_v_scale", None),
         )
 
     def init_forward_metadata_out_graph(

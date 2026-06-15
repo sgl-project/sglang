@@ -213,6 +213,12 @@ def fused_fp8_set_kv_buffer(
     v_scale: Optional[float] = None,
     page_size: int = 16,
     use_triton: bool = True,  # Whether to use Triton kernel (set to False to force naive fallback)
+    inv_k_scale: Optional[
+        torch.Tensor
+    ] = None,  # Precomputed 1/k_scale (0-D GPU tensor)
+    inv_v_scale: Optional[
+        torch.Tensor
+    ] = None,  # Precomputed 1/v_scale (0-D GPU tensor)
 ) -> None:
     """
     Python wrapper for the fused FP8 quantization + paged KV cache write kernel.
@@ -351,27 +357,33 @@ def fused_fp8_set_kv_buffer(
 
         device = k_3d.device
 
-        def _to_tensor_scale(scale):
-            """Convert scale to 0-D CUDA tensor (accepts Python float or Tensor)."""
-            if isinstance(scale, torch.Tensor):
-                return scale.to(device=device, dtype=torch.float32)
-            else:
-                # Python float / np scalar
-                return torch.tensor(float(scale), device=device, dtype=torch.float32)
-
         # Compute inverse scales on GPU to avoid GPU→CPU sync in CUDA graph capture.
         # Previously we used float(k_scale) which triggers synchronization and fails
         # during CUDA graph capture with cudaErrorStreamCaptureUnsupported.
         if use_provided_scale:
-            k_scale_tensor = _to_tensor_scale(k_scale)
-            v_scale_tensor = _to_tensor_scale(v_scale)
+            if inv_k_scale is not None and inv_v_scale is not None:
+                # Fast path: caller precomputed the inverse scales once (e.g. at
+                # model load time) so we skip the per-call 1/x reciprocal kernels.
+                inv_k_scale_ptr = inv_k_scale
+                inv_v_scale_ptr = inv_v_scale
+            else:
+                # Fallback: compute inverse scales on GPU.  This path is kept
+                # for callers that don't supply precomputed inverses (e.g.
+                # tests, external integrations).  The GPU scalar ops avoid
+                # CPU sync that would break CUDA graph capture.
+                def _to_tensor_scale(scale):
+                    if isinstance(scale, torch.Tensor):
+                        return scale.to(device=device, dtype=torch.float32)
+                    return torch.tensor(
+                        float(scale), device=device, dtype=torch.float32
+                    )
 
-            # Pure GPU scalar operation, safe for CUDA graph
-            inv_k_scale = (1.0 / k_scale_tensor).to(device=device, dtype=torch.float32)
-            inv_v_scale = (1.0 / v_scale_tensor).to(device=device, dtype=torch.float32)
-
-            inv_k_scale_ptr = inv_k_scale
-            inv_v_scale_ptr = inv_v_scale
+                inv_k_scale_ptr = (1.0 / _to_tensor_scale(k_scale)).to(
+                    device=device, dtype=torch.float32
+                )
+                inv_v_scale_ptr = (1.0 / _to_tensor_scale(v_scale)).to(
+                    device=device, dtype=torch.float32
+                )
         else:
             # When use_provided_scale=False, kernel uses constant 1.0 for inv_scale.
             # Triton will optimize away the tl.load() calls via constant folding.
