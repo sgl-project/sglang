@@ -24,6 +24,7 @@ def sigmoid_gate_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Compute x * sigmoid(gate) in a single fused kernel."""
     out = torch.empty_like(x)
     n = x.numel()
-    grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+    def grid(meta):
+        return (triton.cdiv(n, meta["BLOCK_SIZE"]),)
     _sigmoid_gate_mul_kernel[grid](x, gate, out, n, BLOCK_SIZE=1024)
     return out

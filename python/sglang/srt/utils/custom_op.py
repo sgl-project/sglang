@@ -323,7 +323,8 @@ def register_custom_op_from_extern(
 
         fake_impl = _fake_impl
     elif fake_impl is None:
-        fake_impl = lambda *args, **kwargs: None
+        def fake_impl(*args, **kwargs):
+            return None
 
     from sglang.srt.utils.common import direct_register_custom_op
 

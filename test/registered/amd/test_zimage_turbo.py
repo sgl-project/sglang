@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
+from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F811
     DiffusionServerBase,
     diffusion_server,
 )
@@ -120,7 +120,7 @@ class TestZImageTurboAMD(DiffusionServerBase):
     def test_diffusion_generation(
         self,
         case: DiffusionTestCase,
-        diffusion_server: ServerContext,
+        diffusion_server: ServerContext,  # noqa: F811
     ):
         generate_fn = get_generate_fn(
             model_path=case.server_args.model_path,

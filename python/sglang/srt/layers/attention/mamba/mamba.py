@@ -489,15 +489,16 @@ class MambaMixer2(torch.nn.Module):
         )
 
         # - get hidden_states, B and C after depthwise convolution.
-        split_hidden_states_B_C_fn = lambda hidden_states_B_C: torch.split(
-            hidden_states_B_C,
-            [
-                self.intermediate_size // self.tp_size,
-                self.groups_ssm_state_size // self.tp_size,
-                self.groups_ssm_state_size // self.tp_size,
-            ],
-            dim=-1,
-        )
+        def split_hidden_states_B_C_fn(hidden_states_B_C):
+            return torch.split(
+                    hidden_states_B_C,
+                    [
+                        self.intermediate_size // self.tp_size,
+                        self.groups_ssm_state_size // self.tp_size,
+                        self.groups_ssm_state_size // self.tp_size,
+                    ],
+                    dim=-1,
+                )
 
         num_prefills = metadata.num_prefills  # request count
         num_decodes = metadata.num_decodes  # token count (=request)

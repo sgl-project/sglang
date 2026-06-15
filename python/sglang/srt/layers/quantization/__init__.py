@@ -16,8 +16,6 @@ class DummyConfig:
         return None
 
 
-CompressedTensorsConfig = DummyConfig
-
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQCPUConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig

@@ -38,9 +38,10 @@ def pad_vit_attn_dummy_heads(config, name: str, loaded_weight: torch.Tensor):
             dummy_shape = [num_dummy_heads, head_dim]
         else:
             raise RuntimeError(f"Unsupported weight with name={name}")
-        pad_func = lambda x: torch.cat(
-            [x.unflatten(0, (-1, head_dim)), x.new_zeros(dummy_shape)], dim=0
-        ).flatten(0, 1)
+        def pad_func(x):
+            return torch.cat(
+                    [x.unflatten(0, (-1, head_dim)), x.new_zeros(dummy_shape)], dim=0
+                ).flatten(0, 1)
         wq, wk, wv = pad_func(wq), pad_func(wk), pad_func(wv)
         loaded_weight = torch.cat([wq, wk, wv], dim=0)
     elif any([_ in name for _ in ["attn.q_proj", "attn.k_proj", "attn.v_proj"]]):

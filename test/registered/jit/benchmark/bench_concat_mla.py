@@ -111,7 +111,8 @@ def bench_concat_mla_k(num_tokens: int, provider: str):
         "jit": jit_concat_mla_k,
         "torch": torch_concat_mla_k,
     }
-    fn = lambda: FN_MAP[provider](k, k_nope, k_rope)
+    def fn():
+        return FN_MAP[provider](k, k_nope, k_rope)
     return run_benchmark(fn)
 
 
@@ -146,13 +147,15 @@ def bench_concat_mla_absorb_q(dim_0: int, dim_1: int, provider: str):
         out = torch.empty(
             dim_0, dim_1, A_LAST_DIM + B_LAST_DIM, dtype=DTYPE, device=DEVICE
         )
-        fn = lambda: torch_concat_mla_absorb_q(a, b, out)
+        def fn():
+            return torch_concat_mla_absorb_q(a, b, out)
     else:
         FN_MAP = {
             "aot": aot_concat_mla_absorb_q,
             "jit": jit_concat_mla_absorb_q,
         }
-        fn = lambda: FN_MAP[provider](a, b)
+        def fn():
+            return FN_MAP[provider](a, b)
 
     return run_benchmark(fn)
 

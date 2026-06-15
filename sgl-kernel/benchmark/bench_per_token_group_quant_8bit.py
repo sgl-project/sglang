@@ -227,13 +227,14 @@ def benchmark(
             "per_token_group_quant_8bit_kernel",
         ),
     }[provider]
-    bench_fn = lambda: fn(
-        x=x,
-        masked_m=masked_m,
-        group_size=group_size,
-        dst_dtype=dst_dtype,
-        **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
-    )
+    def bench_fn():
+        return fn(
+            x=x,
+            masked_m=masked_m,
+            group_size=group_size,
+            dst_dtype=dst_dtype,
+            **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
+        )
 
     time_s = bench_kineto(
         bench_fn, kernel_names=kernel_names, num_tests=300 if mode_concentrated else 30

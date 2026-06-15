@@ -1192,7 +1192,8 @@ def moe_ep_deepgemm_preprocess(
         reorder_topk_ids, seg_indptr, topk_ids.numel()
     )
 
-    grid = lambda meta: (triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),)
+    def grid(meta):
+        return (triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),)
     compute_masked_m_triton_kernel[(num_local_experts,)](seg_indptr, masked_m)
 
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
@@ -1299,7 +1300,6 @@ def zero_experts_compute_triton(
 ):
     N = expert_indices.numel()
     top_k = expert_indices.size(-1)
-    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]),)
 
     if zero_expert_type == "identity":
         zero_expert_mask = expert_indices < num_experts
@@ -1314,7 +1314,8 @@ def zero_experts_compute_triton(
     hidden_dim = hidden_states.size(-1)
     num_tokens = hidden_states.size(0)
 
-    grid = lambda meta: (num_tokens * (hidden_dim // meta["BLOCK_SIZE"]),)
+    def grid(meta):
+        return (num_tokens * (hidden_dim // meta["BLOCK_SIZE"]),)
     compute_identity_kernel[grid](
         top_k,
         hidden_states,
@@ -1371,7 +1372,8 @@ def compute_problem_sizes_w4a8(
     masked_m, problem_sizes1, problem_sizes2, n, k, num_experts
 ):
     BLOCK_SIZE = 256
-    grid = lambda meta: (triton.cdiv(num_experts, meta["BLOCK_SIZE"]),)
+    def grid(meta):
+        return (triton.cdiv(num_experts, meta["BLOCK_SIZE"]),)
     compute_problem_sizes_w4a8_kernel[grid](
         masked_m,
         problem_sizes1,

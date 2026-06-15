@@ -32,7 +32,7 @@ def get_algorithm(config: DllmConfig):
     try:
         name = config.algorithm
         return algo_name_to_cls[name](config)
-    except:
+    except Exception:
         raise RuntimeError(f"Unknown diffusion LLM algorithm: {name}")
 
 

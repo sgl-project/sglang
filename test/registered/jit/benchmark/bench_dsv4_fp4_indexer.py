@@ -135,30 +135,32 @@ def _make_case(batch: int, seq_len_kv: int):
 def benchmark(batch: int, seq_len_kv: int, provider: str):
     case = _make_case(batch, seq_len_kv)
     if provider == "fp8":
-        fn = lambda: deep_gemm.fp8_paged_mqa_logits(
-            case["q_fp8"],
-            case["k_cache_fp8"],
-            case["weights_fp8"],
-            case["context_lens"],
-            case["page_table"],
-            case["schedule"],
-            case["padded_len"],
-            clean_logits=False,
-            indices=None,
-        )
+        def fn():
+            return deep_gemm.fp8_paged_mqa_logits(
+                    case["q_fp8"],
+                    case["k_cache_fp8"],
+                    case["weights_fp8"],
+                    case["context_lens"],
+                    case["page_table"],
+                    case["schedule"],
+                    case["padded_len"],
+                    clean_logits=False,
+                    indices=None,
+                )
     elif provider == "fp4":
-        fn = lambda: deep_gemm.fp8_fp4_paged_mqa_logits(
-            (case["q_fp4"], case["q_sf"]),
-            case["k_cache_fp4"],
-            case["weights"],
-            case["context_lens"],
-            case["page_table"],
-            case["schedule"],
-            case["padded_len"],
-            clean_logits=False,
-            logits_dtype=torch.float32,
-            indices=None,
-        )
+        def fn():
+            return deep_gemm.fp8_fp4_paged_mqa_logits(
+                    (case["q_fp4"], case["q_sf"]),
+                    case["k_cache_fp4"],
+                    case["weights"],
+                    case["context_lens"],
+                    case["page_table"],
+                    case["schedule"],
+                    case["padded_len"],
+                    clean_logits=False,
+                    logits_dtype=torch.float32,
+                    indices=None,
+                )
     else:
         raise ValueError(f"Unknown provider: {provider}")
     return tuple(t * 1000 for t in run_bench(fn, use_cuda_graph=False))

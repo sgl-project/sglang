@@ -82,23 +82,24 @@ def benchmark(batch_size, seq_len, save_kv_cache, provider):
 
     query_flashinfer, key_flashinfer = inputs["query"].clone(), inputs["key"].clone()
 
-    bench_fn = lambda: rope_flashinfer.forward_cuda(
-        inputs["pos_ids"],
-        query_flashinfer,
-        key_flashinfer,
-        fused_set_kv_buffer_arg=(
-            FusedSetKVBufferArg(
-                value=inputs["value"],
-                k_buffer=pool_flashinfer.k_buffer[0].view(-1, num_kv_heads * head_size),
-                v_buffer=pool_flashinfer.v_buffer[0].view(-1, num_kv_heads * head_size),
-                k_scale=None,
-                v_scale=None,
-                cache_loc=inputs["out_cache_loc"],
-            )
-            if save_kv_cache
-            else None
-        ),
-    )
+    def bench_fn():
+        return rope_flashinfer.forward_cuda(
+            inputs["pos_ids"],
+            query_flashinfer,
+            key_flashinfer,
+            fused_set_kv_buffer_arg=(
+                FusedSetKVBufferArg(
+                    value=inputs["value"],
+                    k_buffer=pool_flashinfer.k_buffer[0].view(-1, num_kv_heads * head_size),
+                    v_buffer=pool_flashinfer.v_buffer[0].view(-1, num_kv_heads * head_size),
+                    k_scale=None,
+                    v_scale=None,
+                    cache_loc=inputs["out_cache_loc"],
+                )
+                if save_kv_cache
+                else None
+            ),
+        )
 
     time_s = bench_kineto(bench_fn, kernel_names="BatchQKApplyRotaryPosIds")
     return time_s * 1e6

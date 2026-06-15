@@ -174,10 +174,6 @@ class Platform:
     def is_xpu(self) -> bool:
         return hasattr(torch, "xpu") and torch.xpu.is_available()
 
-    @lru_cache(maxsize=1)
-    def is_npu(self) -> bool:
-        return hasattr(torch, "npu") and torch.npu.is_available()
-
     def is_out_of_tree(self) -> bool:
         return self._enum == PlatformEnum.OOT
 

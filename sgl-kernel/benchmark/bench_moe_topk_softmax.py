@@ -187,13 +187,16 @@ def benchmark(num_tokens, num_experts, topk, provider):
     if provider == "vllm" or provider == "vllm1":
         if not VLLM_AVAILABLE:
             return (0, 0, 0)
-        fn = lambda: vllm_topk_softmax(gating_output, topk)
+        def fn():
+            return vllm_topk_softmax(gating_output, topk)
     elif provider == "sglang" or provider == "sglang1":
-        fn = lambda: sglang_topk_softmax(gating_output, topk)
+        def fn():
+            return sglang_topk_softmax(gating_output, topk)
     elif provider == "musa" or provider == "musa1":
         if not MUSA_AVAILABLE:
             return (0, 0, 0)
-        fn = lambda: musa_topk_softmax_fn(gating_output, topk)
+        def fn():
+            return musa_topk_softmax_fn(gating_output, topk)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)

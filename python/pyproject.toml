@@ -218,3 +218,7 @@ binding = "PyO3"
 
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["sglang/multimodal_gen/third_party/*", "*/third_party/*"]

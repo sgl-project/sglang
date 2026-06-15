@@ -33,7 +33,7 @@ try:
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     _support_tensor_descriptor = True
-except:
+except Exception:
     _support_tensor_descriptor = False
 
 _is_hip = is_hip()
@@ -801,10 +801,11 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
-    grid = lambda META: (
-        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        return (
+            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+        )
 
     K = B.shape[2] - padded_size
     if K % config["BLOCK_SIZE_K"] == 0:

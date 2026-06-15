@@ -59,11 +59,13 @@ def benchmark_q_norm_rope(batch_size, num_heads, head_dim, provider):
     )
 
     if provider == "sglang":
-        fn = lambda: sgl_kernel.dsv4_fused_q_norm_rope(
-            q_input, freqs_cis, positions, eps, q_output
-        )
+        def fn():
+            return sgl_kernel.dsv4_fused_q_norm_rope(
+                    q_input, freqs_cis, positions, eps, q_output
+                )
     else:
-        fn = lambda: torch_rmsnorm_rope(q_input, freqs_cis, positions, eps)
+        def fn():
+            return torch_rmsnorm_rope(q_input, freqs_cis, positions, eps)
 
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
         fn, quantiles=[0.5, 0.2, 0.8]

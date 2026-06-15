@@ -60,11 +60,14 @@ def benchmark(size: int, provider: str):
     )
 
     if provider == "jit":
-        fn = lambda: resolve_future_token_ids_cuda(input_ids.clone(), future_map)
+        def fn():
+            return resolve_future_token_ids_cuda(input_ids.clone(), future_map)
     elif provider == "torch_compile":
-        fn = lambda: _compiled_resolve(input_ids.clone(), future_map)
+        def fn():
+            return _compiled_resolve(input_ids.clone(), future_map)
     else:
-        fn = lambda: _torch_resolve(input_ids.clone(), future_map)
+        def fn():
+            return _torch_resolve(input_ids.clone(), future_map)
 
     return run_benchmark(fn)
 

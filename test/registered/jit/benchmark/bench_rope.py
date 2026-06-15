@@ -224,7 +224,8 @@ def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str)
         "jit_pos_enc": sglang_pos_enc_rope,
         "jit_fused_rope": sglang_fused_rope,
     }
-    fn = lambda: FN_MAP[provider](q, k, positions, is_neox)
+    def fn():
+        return FN_MAP[provider](q, k, positions, is_neox)
     return run_benchmark(fn)
 
 
@@ -295,9 +296,10 @@ def benchmark_store(batch_size: int, num_q_k_heads: str, is_neox: bool, provider
         "jit_rope_then_store": jit_rope_then_store,
         "jit_fused_store": jit_fused_rope_store,
     }
-    fn = lambda: FN_MAP[provider](
-        q, k, v, k_cache, v_cache, positions, out_loc, is_neox
-    )
+    def fn():
+        return FN_MAP[provider](
+            q, k, v, k_cache, v_cache, positions, out_loc, is_neox
+        )
     return run_benchmark(fn)
 
 

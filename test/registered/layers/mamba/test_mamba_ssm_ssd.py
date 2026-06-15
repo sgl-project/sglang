@@ -500,7 +500,8 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
     C_chunked = torch.zeros_like(C)[:, :chunked_input_seq_len, ...]
     for i in range(num_sequences):
         # fmt: off
-        chunk_f = lambda x, i: x[:, cu_seqlens[i]:cu_seqlens[i] + chunked_seqlens[i], ...]  # noqa: E501
+        def chunk_f(x, i):
+            return x[:, cu_seqlens[i]:cu_seqlens[i] + chunked_seqlens[i], ...]  # noqa: E501
 
         X_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(X, i)  # noqa: E501
         dt_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(dt, i)  # noqa: E501
@@ -556,7 +557,8 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
     remaining_B_chunked = torch.zeros_like(B)[:, :remaining_chunked_input_seq_len, ...]  # noqa: E501
     remaining_C_chunked = torch.zeros_like(C)[:, :remaining_chunked_input_seq_len, ...]  # noqa: E501
     for i in range(num_sequences):
-        remaining_chunk_f = lambda x, i: x[:, cu_seqlens[i] + chunked_seqlens[i]:cu_seqlens[i+1], ...]  # noqa: E501
+        def remaining_chunk_f(x, i):
+            return x[:, cu_seqlens[i] + chunked_seqlens[i]:cu_seqlens[i+1], ...]  # noqa: E501
 
         remaining_X_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(X, i)  # noqa: E501
         remaining_dt_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(dt, i)  # noqa: E501
@@ -564,12 +566,14 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
         remaining_C_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(C, i)  # noqa: E501
 
     # assert input chunking is correct
-    concat_chunk_f = lambda pt1, pt2, i: torch.cat([
-        pt1[:,chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1],...],
-        pt2[:,remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1],...],
-        ],
-        dim=1)
-    concat_batch_f = lambda pt1, pt2: torch.cat([concat_chunk_f(pt1, pt2, i) for i in range(num_sequences)], dim=1)  # noqa: E501
+    def concat_chunk_f(pt1, pt2, i):
+        return torch.cat([
+            pt1[:,chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1],...],
+            pt2[:,remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1],...],
+            ],
+            dim=1)
+    def concat_batch_f(pt1, pt2):
+        return torch.cat([concat_chunk_f(pt1, pt2, i) for i in range(num_sequences)], dim=1)  # noqa: E501
     # fmt: on
 
     assert concat_batch_f(X_chunked, remaining_X_chunked).equal(X)

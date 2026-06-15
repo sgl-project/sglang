@@ -129,9 +129,10 @@ def install_torch_compiled(
     if backend_factory is None:
         from sglang.srt.compilation.backend import SGLangBackend
 
-        backend_factory = lambda gm, ex: SGLangBackend(compile_config, graph_pool)(
-            gm, ex
-        )
+        def backend_factory(gm, ex):
+            return SGLangBackend(compile_config, graph_pool)(
+                    gm, ex
+                )
 
     compiled_codes: list[type(original_code)] = []
     state = {"compiled": False, "compiled_callable": None}

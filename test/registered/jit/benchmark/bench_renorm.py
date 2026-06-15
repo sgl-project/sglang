@@ -156,9 +156,11 @@ def benchmark_top_k_renorm(batch_size, vocab_size, k, provider):
     top_k_tensor = torch.full((batch_size,), k, device=device, dtype=torch.int32)
 
     if provider == "torch":
-        fn = lambda: torch_top_k_renorm_probs(probs.clone(), top_k_tensor)
+        def fn():
+            return torch_top_k_renorm_probs(probs.clone(), top_k_tensor)
     elif provider == "sglang":
-        fn = lambda: sgl_kernel.top_k_renorm_prob(probs.clone(), top_k_tensor)
+        def fn():
+            return sgl_kernel.top_k_renorm_prob(probs.clone(), top_k_tensor)
 
     return run_benchmark_no_cudagraph(fn)
 
@@ -185,9 +187,11 @@ def benchmark_top_p_renorm(batch_size, vocab_size, p, provider):
     top_p_tensor = torch.full((batch_size,), p, device=device, dtype=torch.float32)
 
     if provider == "torch":
-        fn = lambda: torch_top_p_renorm_probs(probs.clone(), top_p_tensor)
+        def fn():
+            return torch_top_p_renorm_probs(probs.clone(), top_p_tensor)
     elif provider == "sglang":
-        fn = lambda: sgl_kernel.top_p_renorm_prob(probs.clone(), top_p_tensor)
+        def fn():
+            return sgl_kernel.top_p_renorm_prob(probs.clone(), top_p_tensor)
 
     return run_benchmark_no_cudagraph(fn)
 
