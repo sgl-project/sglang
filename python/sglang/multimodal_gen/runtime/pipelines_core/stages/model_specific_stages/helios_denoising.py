@@ -222,7 +222,6 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                                 else None
                             ),
                         },
-                        enable_bcg=not getattr(batch, "is_warmup", False),
                     )
 
                 if do_cfg:
@@ -257,7 +256,6 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                                     else None
                                 ),
                             },
-                            enable_bcg=not getattr(batch, "is_warmup", False),
                         )
 
                     if is_cfg_zero_star:
@@ -428,7 +426,6 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                                     else None
                                 ),
                             },
-                            enable_bcg=not getattr(batch, "is_warmup", False),
                         )
 
                     if do_cfg:
@@ -463,7 +460,6 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                                         else None
                                     ),
                                 },
-                                enable_bcg=not getattr(batch, "is_warmup", False),
                             )
 
                         if is_cfg_zero_star:
