@@ -134,6 +134,22 @@ class MoeFlags(_StaticFlags):
 
 
 @dataclass(slots=True)
+class CaptureFlags:
+    """Non-frozen capture-flags group (Global Context P2a). Home for values whose
+    inputs only resolve DURING cuda-graph capture — AT/after ``freeze()`` (timing
+    bucket B4) — so they cannot be materialized as frozen flags. A PLAIN dataclass,
+    NOT a ``_StaticFlags`` subclass: ``freeze()`` does NOT lock it (same exemption as
+    ``ctx.parallel`` / ``ctx.metrics``), so the capture-time write is legal. Lets the
+    cuda-graph readers read a named flag instead of raw ``server_args``.
+
+    ``enable_torch_compile`` is the canonical member: written at capture time
+    (``_dummy_run``), read by the decode/base cuda-graph runners. The capture-time
+    write + reader-flip is a GPU-gated slice (P2e); this group DEFINITION is P2a."""
+
+    enable_torch_compile: Optional[bool] = None
+
+
+@dataclass(slots=True)
 class Flags:
     """The flags namespace. A subsystem family gets a wrapper (``attn`` / ``moe``);
     a lone general property stays flat (``is_extend_in_batch``). Reads and writes
@@ -143,6 +159,8 @@ class Flags:
 
     attn: AttnFlags = field(default_factory=AttnFlags)
     moe: MoeFlags = field(default_factory=MoeFlags)
+    # B4 capture-time values; freeze() does NOT lock this group (see CaptureFlags).
+    capture: CaptureFlags = field(default_factory=CaptureFlags)
     # per-forward, flat — a batch-level property, not a moe/attn family member.
     is_extend_in_batch: bool = False
 
@@ -239,6 +257,76 @@ class Metrics:
     pre_model_load_memory: Optional[float] = None
 
 
+# ---------------------------------------------------------------------------
+# Model override contract (P2a): the bounded write surface for model-declared
+# config overrides. Replaces the scattered imperative ``server_args.X = ...``.
+# ---------------------------------------------------------------------------
+
+# The fields a model is allowed to override. Verified against origin/main as the
+# union of the 21 ``self.X =`` fields mutated inside
+# ``ServerArgs._handle_model_specific_adjustments`` (timing bucket B1 — the
+# per-arch identity branches) and the 3 fields ``ModelRunner.__init__`` resolves
+# before load (bucket B2). A model declaring anything outside this set, or any
+# write after ``freeze()``, is rejected.
+#
+# NOT here, by design: ``model_path`` / ``load_format`` (runtime weight-reload, not
+# init resolution); ``kv_cache_dtype`` (B3, weight-driven) and
+# ``enable_torch_compile`` (B4, capture-driven) — both need runtime-loaded inputs
+# and stay imperative (kv_cache_dtype raw; enable_torch_compile -> flags.capture).
+#
+# NOTE (P2c/P2d, deferred): the 5 ``arg_groups/*_hook.py`` hooks write a wider set
+# than these 24 (e.g. kv_cache_dtype, max_running_requests, disaggregation_*,
+# speculative_draft_*). Folding the hooks into this contract will require either
+# extending this frozenset or scoping which hooks the contract bounds — resolved
+# when P2c/P2d migrate the hook registry, not in P2a.
+MODEL_OVERRIDABLE_FIELDS: frozenset = frozenset(
+    {
+        # B1 — _handle_model_specific_adjustments self.X mutations (21)
+        "attention_backend",
+        "attn_cp_size",
+        "disable_hybrid_swa_memory",
+        "disable_overlap_schedule",
+        "dtype",
+        "enable_dp_attention",
+        "enable_flashinfer_allreduce_fusion",
+        "enable_multi_layer_eagle",
+        "ep_size",
+        "hicache_io_backend",
+        "hicache_mem_layout",
+        "moe_a2a_backend",
+        "moe_dense_tp_size",
+        "moe_runner_backend",
+        "page_size",
+        "prefill_attention_backend",
+        "quantization",
+        "speculative_moe_a2a_backend",
+        "speculative_moe_runner_backend",
+        "swa_full_tokens_ratio",
+        "uses_mamba_radix_cache",
+        # B2 — ModelRunner.__init__ pre-load resolutions (3)
+        "use_mla_backend",
+        "chunked_prefill_size",
+        "disable_chunked_prefix_cache",
+    }
+)
+
+
+def apply_model_overrides(server_args, overrides: dict) -> None:
+    """Apply model-declared config overrides to ``server_args`` through the bounded
+    write surface. Transactional like ``_StaticFlags.override``: validate EVERY key
+    against ``MODEL_OVERRIDABLE_FIELDS`` BEFORE mutating any, so a bad key never
+    leaves a partial write. Last-writer-wins among the applied keys (the terminal
+    enforce-disable pass runs separately, after all per-arch overrides)."""
+    for name in overrides:
+        if name not in MODEL_OVERRIDABLE_FIELDS:
+            raise KeyError(
+                f"{name!r} is not a model-overridable server-arg field "
+                "(not in MODEL_OVERRIDABLE_FIELDS)"
+            )
+    for name, value in overrides.items():
+        setattr(server_args, name, value)
+
+
 @dataclass(slots=True)
 class RuntimeContext:
     # Config provenance: the resolved ServerArgs the four subsystems below are
@@ -323,6 +411,30 @@ class RuntimeContext:
         self.flags.attn.freeze()
         self.flags.moe.freeze()
         self._frozen = True
+
+    @contextmanager
+    def override_server_args(self, **kwargs):
+        """Scoped set-with-restore on ``ctx.server_args``, the server-arg sibling of
+        ``flags.<group>.override(...)`` — lets a test force a server-arg code path,
+        restoring on exit (and on exception). Transactional + whitelist-bounded:
+        validates every key against ``MODEL_OVERRIDABLE_FIELDS`` before mutating any.
+        Unlike the static flag groups, ``server_args`` is not freeze-locked (B3/B4
+        write it post-freeze), so this needs no freeze bypass — it is purely scoped."""
+        for name in kwargs:  # validate all keys before mutating any (transactional)
+            if name not in MODEL_OVERRIDABLE_FIELDS:
+                raise KeyError(
+                    f"{name!r} is not a model-overridable server-arg field "
+                    "(not in MODEL_OVERRIDABLE_FIELDS)"
+                )
+        saved = []
+        for name, value in kwargs.items():
+            saved.append((name, getattr(self.server_args, name)))
+            setattr(self.server_args, name, value)
+        try:
+            yield
+        finally:
+            for name, old in saved:
+                setattr(self.server_args, name, old)
 
 
 # ---------------------------------------------------------------------------

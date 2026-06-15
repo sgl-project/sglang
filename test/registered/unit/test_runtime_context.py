@@ -13,10 +13,12 @@ from unittest import mock
 import torch
 
 from sglang.srt.runtime_context import (
+    MODEL_OVERRIDABLE_FIELDS,
     BufferSpec,
     BufferStore,
     ParallelContext,
     RuntimeContext,
+    apply_model_overrides,
     get_attn_tp_size,
     get_context,
     get_flags,
@@ -384,6 +386,108 @@ class TestServerArgsShim(unittest.TestCase):
         get_global_server_args().use_mla_backend = True
         self.assertTrue(get_context().server_args.use_mla_backend)
         self.assertIs(get_global_server_args(), sa)
+
+
+class TestModelOverrideContract(unittest.TestCase):
+    """P2a: the bounded model-override write surface — the 24-field whitelist, the
+    transactional apply_model_overrides, and the scoped ctx.override_server_args."""
+
+    def setUp(self):
+        reset_context()
+
+    def tearDown(self):
+        reset_context()
+
+    def test_whitelist_membership(self):
+        self.assertEqual(len(MODEL_OVERRIDABLE_FIELDS), 24)
+        for f in ("use_mla_backend", "attention_backend", "moe_a2a_backend"):
+            self.assertIn(f, MODEL_OVERRIDABLE_FIELDS)
+        # excluded by design: runtime-reload + B3/B4 runtime-driven fields
+        for f in ("model_path", "load_format", "kv_cache_dtype", "enable_torch_compile"):
+            self.assertNotIn(f, MODEL_OVERRIDABLE_FIELDS)
+
+    def test_apply_sets_whitelisted_fields(self):
+        from types import SimpleNamespace
+
+        sa = SimpleNamespace(use_mla_backend=False, page_size=1)
+        apply_model_overrides(sa, {"use_mla_backend": True, "page_size": 64})
+        self.assertTrue(sa.use_mla_backend)
+        self.assertEqual(sa.page_size, 64)
+
+    def test_apply_rejects_non_whitelisted_key(self):
+        from types import SimpleNamespace
+
+        sa = SimpleNamespace(bogus=0)
+        with self.assertRaises(KeyError):
+            apply_model_overrides(sa, {"bogus": 1})
+
+    def test_apply_is_transactional_no_partial_write(self):
+        # a bad key aborts BEFORE any valid key is mutated
+        from types import SimpleNamespace
+
+        sa = SimpleNamespace(use_mla_backend=False)
+        with self.assertRaises(KeyError):
+            apply_model_overrides(sa, {"use_mla_backend": True, "bogus": 1})
+        self.assertFalse(sa.use_mla_backend)  # not left flipped
+
+    def test_override_server_args_scoped_and_restores(self):
+        from types import SimpleNamespace
+
+        sa = SimpleNamespace(use_mla_backend=False, page_size=1)
+        set_context(RuntimeContext(server_args=sa))
+        with get_context().override_server_args(use_mla_backend=True, page_size=64):
+            self.assertTrue(sa.use_mla_backend)
+            self.assertEqual(sa.page_size, 64)
+        self.assertFalse(sa.use_mla_backend)  # restored
+        self.assertEqual(sa.page_size, 1)
+
+    def test_override_server_args_restores_on_exception(self):
+        from types import SimpleNamespace
+
+        class _Boom(Exception):
+            pass
+
+        sa = SimpleNamespace(use_mla_backend=False)
+        set_context(RuntimeContext(server_args=sa))
+        with self.assertRaises(_Boom):
+            with get_context().override_server_args(use_mla_backend=True):
+                raise _Boom()
+        self.assertFalse(sa.use_mla_backend)  # restored despite exception
+
+    def test_override_server_args_transactional_no_leak(self):
+        from types import SimpleNamespace
+
+        sa = SimpleNamespace(use_mla_backend=False)
+        set_context(RuntimeContext(server_args=sa))
+        with self.assertRaises(KeyError):
+            with get_context().override_server_args(use_mla_backend=True, bogus=1):
+                pass
+        self.assertFalse(sa.use_mla_backend)  # invalid key aborted before mutating
+
+
+class TestCaptureFlags(unittest.TestCase):
+    """P2a: flags.capture is a NON-frozen group (B4 home) — freeze() must NOT lock
+    it, so the capture-time enable_torch_compile write stays legal post-freeze."""
+
+    def setUp(self):
+        reset_context()
+
+    def tearDown(self):
+        reset_context()
+
+    def test_capture_group_present_and_default_none(self):
+        set_context(RuntimeContext())
+        self.assertIsNone(get_flags().capture.enable_torch_compile)
+
+    def test_capture_writable_after_freeze(self):
+        set_context(RuntimeContext())
+        with mock.patch(_PREDICATE, return_value=False):
+            get_context().freeze()
+        # static groups are locked now; capture must remain writable (B4 post-freeze)
+        with self.assertRaises(RuntimeError):
+            get_flags().attn.use_mla_backend = True
+        get_flags().capture.enable_torch_compile = False  # legal post-freeze
+        self.assertEqual(get_flags().capture.enable_torch_compile, False)
 
 
 if __name__ == "__main__":
