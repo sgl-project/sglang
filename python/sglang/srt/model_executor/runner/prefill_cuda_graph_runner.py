@@ -97,6 +97,7 @@ from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidde
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
+    is_cuda,
     is_hip,
     is_npu,
     require_attn_tp_gather,
@@ -418,6 +419,53 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             buf.copy_(local)
         return buf
 
+    def _prime_dummy_mamba_track_state(
+        self,
+        *,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        force_track: bool,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_track_mask: Optional[torch.Tensor],
+        mamba_track_seqlens: Optional[torch.Tensor],
+    ) -> None:
+        """Populate dummy mamba tracking inputs for capture / warmup.
+
+        ``force_track`` lets warmup exercise the extra-buffer tracking branch
+        without changing the default capture state used for the actual graph.
+        """
+        if (
+            mamba_track_indices is None
+            or mamba_track_mask is None
+            or mamba_track_seqlens is None
+        ):
+            return
+
+        # Reuse the live per-request mamba slot as a capture-safe destination.
+        # Replay overwrites these buffers with the real ping-pong indices before
+        # the captured graph runs.
+        mamba_track_indices.copy_(
+            self.model_runner.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        )
+        mamba_track_mask.fill_(force_track)
+        mamba_track_seqlens.fill_(num_tokens if force_track else -1)
+
+    def _should_dual_warm_dummy_mamba_track(self, num_tokens: int) -> bool:
+        return (
+            self.mamba_track_enabled
+            and num_tokens >= self.model_runner.server_args.mamba_cache_chunk_size
+        )
+
+    def _get_runtime_mamba_track_variant(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.mamba_track_enabled
+            and forward_batch.extend_seq_lens_cpu is not None
+            and any(
+                seq_len >= self.model_runner.server_args.mamba_cache_chunk_size
+                for seq_len in forward_batch.extend_seq_lens_cpu
+            )
+        )
+
     _aiter_chip_info_cached = False
 
     @classmethod
@@ -454,7 +502,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             logger.warning(f"Failed to pre-warm aiter chip info: {e}")
 
     @torch.no_grad()
-    def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
+    def _run_forward(
+        self,
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+        *,
+        mamba_track_variant: Optional[bool] = None,
+    ):
         """Run forward inside the prefill set_tc_piecewise_forward_context.
 
         BCG path: captures only the inner layer_model.forward (transformer
@@ -481,18 +535,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         set_is_extend_in_batch(False)
 
-        with (
-            forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
-            ),
-            set_tc_piecewise_forward_context(
-                forward_batch,
-                self.attention_layers,
-                self.quant_config,
-                self.moe_layers,
-                self.moe_fusions,
-                dsa_indexers=self.dsa_indexers,
-            ),
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ), set_tc_piecewise_forward_context(
+            forward_batch,
+            self.attention_layers,
+            self.quant_config,
+            self.moe_layers,
+            self.moe_fusions,
+            dsa_indexers=self.dsa_indexers,
+            mamba_track_variant=mamba_track_variant,
         ):
             if self.layer_model is not None:
                 positions = self._get_layer_model_positions(forward_batch)
@@ -524,15 +576,28 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch.positions
 
     def _run_dummy_forward(self, num_tokens: int) -> None:
-        """Build a dummy ForwardBatch at this shape, init attn metadata,
-        run forward once. Used by TcPiecewiseCudaGraphBackend.prepare
-        for both the JIT-activate forward (single shape, before
-        torch.compile install) and the compile-loop pass (every shape,
-        inside enable_torch_compile_warmup).
+        """Build a dummy ForwardBatch at this shape and run warmup forwards.
+
+        When mamba extra-buffer is enabled and the shape is large enough,
+        we exercise both tracking states (True then False) so torch.compile
+        sees both branches. CUDA capture may later record an extra track=True
+        graph; non-CUDA platforms keep the original single-graph behavior.
         """
-        fb, attn_backend = self.capture_prepare(num_tokens)
-        attn_backend.init_forward_metadata(fb)
-        self._run_forward(fb, num_tokens)
+
+        def run_once(*, force_mamba_track: bool) -> None:
+            fb, attn_backend = self.capture_prepare(
+                num_tokens, force_mamba_track=force_mamba_track
+            )
+            attn_backend.init_forward_metadata(fb)
+            self._run_forward(
+                fb,
+                num_tokens,
+                mamba_track_variant=force_mamba_track,
+            )
+
+        if self._should_dual_warm_dummy_mamba_track(num_tokens):
+            run_once(force_mamba_track=True)
+        run_once(force_mamba_track=False)
 
     def _has_inactive_dp_rank(self, forward_batch: ForwardBatch) -> bool:
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
@@ -660,12 +725,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_states=self.static_draft_hidden_states[:num_tokens],
         )
 
-    def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
+    def capture_prepare(
+        self, num_tokens: int, *, force_mamba_track: bool = False
+    ) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
         Default tensor inputs are fresh literals; under a Breakable
         backend, we swap in slices of our static buffers so captured
-        segments read from stable addresses.
+        segments read from stable addresses. ``force_mamba_track`` is
+        warmup-only and lets TcPiecewise cover the extra-buffer branch
+        without changing the default capture batch.
 
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
@@ -701,6 +770,28 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         def _slot(name):
             return registry.get_slot(name).slice_for(bs, num_tokens)
+
+        mamba_track_indices = (
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
+            else None
+        )
+        mamba_track_mask = (
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
+        )
+        mamba_track_seqlens = (
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
+            else None
+        )
+        self._prime_dummy_mamba_track_state(
+            num_tokens=num_tokens,
+            req_pool_indices=shape_inputs["req_pool_indices"],
+            force_track=force_mamba_track,
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            mamba_track_seqlens=mamba_track_seqlens,
+        )
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
@@ -745,21 +836,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 seq_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
                 out_cache_loc=_slot("out_cache_loc"),
                 seq_lens_sum=num_tokens,
-                mamba_track_indices=(
-                    _slot("mamba_track_indices")
-                    if registry.has_slot("mamba_track_indices")
-                    else None
-                ),
-                mamba_track_mask=(
-                    _slot("mamba_track_mask")
-                    if registry.has_slot("mamba_track_mask")
-                    else None
-                ),
-                mamba_track_seqlens=(
-                    _slot("mamba_track_seqlens")
-                    if registry.has_slot("mamba_track_seqlens")
-                    else None
-                ),
+                mamba_track_indices=mamba_track_indices,
+                mamba_track_mask=mamba_track_mask,
+                mamba_track_seqlens=mamba_track_seqlens,
                 encoder_lens=None,
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
@@ -831,37 +910,58 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def capture_one_shape(self, size: int) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
+
+        CUDA tc_piecewise captures an extra track=True graph for mamba
+        extra-buffer shapes. Other backends keep the original single
+        capture (track=False).
         """
         num_tokens = size
-        forward_batch, attn_backend = self.capture_prepare(num_tokens)
-        if self._is_full_backend:
-            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
-        else:
-            self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
-        def run_once():
-            return self._run_forward(forward_batch, num_tokens)
+        need_dual = self._should_dual_warm_dummy_mamba_track(num_tokens)
 
-        # Main's monolithic BCG runner never invokes
-        # on_after_cuda_graph_warmup between warmup iterations — the BCG
-        # contract is to keep warmup state untouched and let
-        # init_forward_metadata_in_graph (recorded inside the captured
-        # forward) do any raw->full upgrade. cg-refactor's runner_backend
-        # abstraction exposes a post_warmup_hook for backends that need
-        # workspace cleanup between iterations; suppress it for BCG so
-        # DSV4's hook (which restores forward_metadata to a stale
-        # _current_capture_raw left over from decode CG capture) doesn't
-        # corrupt warmup iter 2's metadata read.
-        if isinstance(self.backend, BreakableCudaGraphBackend):
-            post_warmup_hook = None
-        else:
-            post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
-        self.backend.capture_one(
-            ShapeKey(size=num_tokens),
-            run_once,
-            dummies=None,
-            post_warmup_hook=post_warmup_hook,
-        )
+        # CUDA-only dual capture; other platforms preserve the single graph.
+        track_states = [True, False] if need_dual and is_cuda() else [False]
+
+        for force_mamba_track in track_states:
+            forward_batch, attn_backend = self.capture_prepare(
+                num_tokens, force_mamba_track=force_mamba_track
+            )
+            if self._is_full_backend:
+                attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=True
+                )
+            else:
+                self._init_forward_metadata_for_capture(forward_batch, num_tokens)
+
+            def run_once():
+                return self._run_forward(
+                    forward_batch,
+                    num_tokens,
+                    mamba_track_variant=force_mamba_track,
+                )
+
+            # Main's monolithic BCG runner never invokes
+            # on_after_cuda_graph_warmup between warmup iterations — the BCG
+            # contract is to keep warmup state untouched and let
+            # init_forward_metadata_in_graph (recorded inside the captured
+            # forward) do any raw->full upgrade. cg-refactor's runner_backend
+            # abstraction exposes a post_warmup_hook for backends that need
+            # workspace cleanup between iterations; suppress it for BCG so
+            # DSV4's hook (which restores forward_metadata to a stale
+            # _current_capture_raw left over from decode CG capture) doesn't
+            # corrupt warmup iter 2's metadata read.
+            if isinstance(self.backend, BreakableCudaGraphBackend):
+                post_warmup_hook = None
+            else:
+                post_warmup_hook = getattr(
+                    attn_backend, "on_after_cuda_graph_warmup", None
+                )
+            self.backend.capture_one(
+                ShapeKey(size=num_tokens),
+                run_once,
+                dummies=None,
+                post_warmup_hook=post_warmup_hook,
+            )
 
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
@@ -1088,19 +1188,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # existing call unchanged.
                 tail_batch = forward_batch if full_path else static_forward_batch
                 try:
-                    with (
-                        forward_context(
-                            ForwardContext(attn_backend=self.model_runner.attn_backend)
-                        ),
-                        set_tc_piecewise_forward_context(
-                            static_forward_batch,
-                            self.attention_layers,
-                            self.quant_config,
-                            self.moe_layers,
-                            self.moe_fusions,
-                            dsa_indexers=self.dsa_indexers,
-                            num_tokens=static_num_tokens,
-                            raw_num_tokens=raw_num_tokens,
+                    with forward_context(
+                        ForwardContext(attn_backend=self.model_runner.attn_backend)
+                    ), set_tc_piecewise_forward_context(
+                        static_forward_batch,
+                        self.attention_layers,
+                        self.quant_config,
+                        self.moe_layers,
+                        self.moe_fusions,
+                        dsa_indexers=self.dsa_indexers,
+                        num_tokens=static_num_tokens,
+                        raw_num_tokens=raw_num_tokens,
+                        mamba_track_variant=self._get_runtime_mamba_track_variant(
+                            forward_batch
                         ),
                     ):
                         output = self.model_runner.model.forward(
@@ -1114,21 +1214,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else:
                 # TC_PIECEWISE path. backend.replay calls the compiled
                 # outer model.forward directly (torch.compile handles
-                # multi-req via bs-invariant FX-traced kernels). Full/BCG use
-                # the captured-body path above; only tc_piecewise reaches here.
-                with (
-                    forward_context(
-                        ForwardContext(attn_backend=self.model_runner.attn_backend)
-                    ),
-                    set_tc_piecewise_forward_context(
-                        static_forward_batch,
-                        self.attention_layers,
-                        self.quant_config,
-                        self.moe_layers,
-                        self.moe_fusions,
-                        dsa_indexers=self.dsa_indexers,
-                        num_tokens=static_num_tokens,
-                        raw_num_tokens=raw_num_tokens,
+                # multi-req via bs-invariant FX-traced kernels).
+                with forward_context(
+                    ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ), set_tc_piecewise_forward_context(
+                    static_forward_batch,
+                    self.attention_layers,
+                    self.quant_config,
+                    self.moe_layers,
+                    self.moe_fusions,
+                    dsa_indexers=self.dsa_indexers,
+                    num_tokens=static_num_tokens,
+                    raw_num_tokens=raw_num_tokens,
+                    mamba_track_variant=self._get_runtime_mamba_track_variant(
+                        forward_batch
                     ),
                 ):
                     output = self.backend.replay(
