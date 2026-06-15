@@ -94,6 +94,22 @@ patches:
 """
 
 
+_PR_REVERT_YAML_28255 = """
+patches:
+  - target: sglang.srt.managers.scheduler.Scheduler.abort_request
+    edits:
+      - match: |
+          if self.dllm_config is not None:
+              for req in self.dllm_manager.waiting_queue:
+                  if not req.finished() and (
+                      recv_req.abort_all or req.rid.startswith(recv_req.rid)
+                  ):
+                      logger.debug(f"Abort dLLM request. {req.rid=}")
+                      req.to_finish = FINISH_ABORT()
+        replacement: ""
+"""
+
+
 _PR_FIX_REVERT_YAML: Dict[int, str] = {
     25015: _PR_REVERT_YAML_25015,
     26329: _PR_REVERT_YAML_26329,
@@ -101,6 +117,7 @@ _PR_FIX_REVERT_YAML: Dict[int, str] = {
     27360: _PR_REVERT_YAML_27360,
     26972: _PR_REVERT_YAML_26972,
     27460: _PR_REVERT_YAML_27460,
+    28255: _PR_REVERT_YAML_28255,
 }
 
 
