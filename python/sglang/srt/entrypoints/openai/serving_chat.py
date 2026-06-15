@@ -648,6 +648,16 @@ class OpenAIServingChat(OpenAIServingBase):
         thinking_requested = (request.chat_template_kwargs or {}).get(
             "thinking", envs.SGLANG_DEFAULT_THINKING.get()
         )
+        # Single source of truth: persist the resolved thinking decision back
+        # onto the request so the reasoning parser agrees with the prompt we
+        # actually built. Otherwise SGLANG_DEFAULT_THINKING turns thinking ON
+        # in the dsv4/dsv32 prompt while _get_reasoning_from_request still
+        # treats the request as non-thinking, leaking </think> into content.
+        # Scoped to the custom encoder path, which is the only one env drives.
+        if self.chat_encoding_spec in ("dsv4", "dsv32"):
+            ctk = dict(request.chat_template_kwargs or {})
+            ctk.setdefault("thinking", thinking_requested)
+            request.chat_template_kwargs = ctk
         thinking_mode = (
             ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
         )
