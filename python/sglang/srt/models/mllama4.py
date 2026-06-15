@@ -30,6 +30,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
+    MultimodalInputFormat,
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -542,6 +543,18 @@ class Llama4ForConditionalGeneration(nn.Module):
         self,
         items: List[MultimodalDataItem],
     ) -> torch.Tensor:
+
+        # Pre-projected embeddings supplied by the caller (e.g. RL workflows,
+        # disaggregated serving): skip the vision tower + projector entirely.
+        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+            return torch.concat(
+                [
+                    torch.as_tensor(item.feature).view(-1, item.feature.shape[-1])
+                    for item in items
+                ],
+                dim=0,
+            )
+
         # For text-only models, return None or raise an error
         if not self.has_vision or self.vision_model is None:
             raise ValueError("Vision model not available for text-only checkpoint")
