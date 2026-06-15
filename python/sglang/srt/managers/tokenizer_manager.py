@@ -600,7 +600,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         if self.server_args.tokenizer_worker_num > 1:
-            self._attach_multi_http_worker_info(obj)
+            # here the obj is either GenerateReqInput or EmbeddingReqInput,
+            # both of which have the http_worker_ipc attribute,
+            # so we can set it directly without checking the type again.
+            obj.http_worker_ipc = self.tokenizer_ipc_name
         self._init_req_state(obj, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)

@@ -922,6 +922,9 @@ class ServerArgs:
     # For msProbe
     msprobe_dump_config: Optional[str] = None
 
+    # For grpc
+    enable_grpc: bool = False
+
     # Whether the post-init processing has been completed
     is_initialized: bool = False
 

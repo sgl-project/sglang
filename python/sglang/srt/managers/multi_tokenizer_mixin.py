@@ -29,7 +29,7 @@ import sys
 import threading
 import zlib
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import psutil
 import setproctitle
@@ -40,9 +40,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
-    BaseBatchReqIpc,
     BaseReq,
-    BaseReqIpc,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -342,13 +340,13 @@ class MultiHttpWorkerDetokenizerMixin:
             # Fan out the output back to the originating tokenizer worker(s).
             # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
             # forward either batched or single requests, so handle both shapes.
-            if isinstance(recv_obj, BaseBatchReqIpc):
+            if isinstance(recv_obj, BaseBatchReq):
                 for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
                     new_output = _handle_output_by_index(output, i)
                     self.socket_mapping.send_output(
                         ipc_name, new_output, is_tokenizer=True
                     )
-            elif isinstance(recv_obj, BaseReqIpc):
+            elif isinstance(recv_obj, BaseReq):
                 self.socket_mapping.send_output(
                     recv_obj.http_worker_ipc, output, is_tokenizer=True
                 )
@@ -468,9 +466,9 @@ class MultiTokenizerRouter:
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
-        if isinstance(recv_obj, BaseReqIpc):
+        if isinstance(recv_obj, BaseReq):
             ipc_names = [recv_obj.http_worker_ipc]
-        elif isinstance(recv_obj, BaseBatchReqIpc):
+        elif isinstance(recv_obj, BaseBatchReq):
             ipc_names = recv_obj.http_worker_ipcs
         else:
             raise ValueError(f"Unknown recv_obj type: {type(recv_obj)}")
@@ -514,7 +512,7 @@ class MultiDetokenizerRouter:
                 continue
 
             # Single request: route by its own http_worker_ipc.
-            if isinstance(recv_obj, BaseReqIpc):
+            if isinstance(recv_obj, BaseReq):
                 assert (
                     recv_obj.http_worker_ipc is not None
                 ), f"Single req {recv_obj.rid=} missing http_worker_ipc"
@@ -522,7 +520,7 @@ class MultiDetokenizerRouter:
                 continue
 
             # Batch request.
-            if isinstance(recv_obj, BaseBatchReqIpc):
+            if isinstance(recv_obj, BaseBatchReq):
                 # Idle/no-op batch (rids=[]): broadcast to all detokenizers
                 if not recv_obj.rids:
                     for ipc in self.ipc_name_list:
@@ -655,15 +653,6 @@ class TokenizerWorker(TokenizerManager):
         if self._pause_continue_future and not self._pause_continue_future.done():
             self._pause_continue_future.set_result(True)
             self._pause_continue_future = None
-
-    def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
-
-        if isinstance(req, BaseReq):
-            req.http_worker_ipc = self.tokenizer_ipc_name
-        elif isinstance(req, BaseBatchReq):
-            req.http_worker_ipcs = [self.tokenizer_ipc_name] * len(req.rids)
-        else:
-            raise ValueError(f"Unknown req type: {type(req)}")
 
 
 async def print_exception_wrapper(func):

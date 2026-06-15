@@ -22,7 +22,6 @@ import copy
 import logging
 import pickle
 import uuid
-from abc import ABC
 from array import array
 from collections import Counter
 from dataclasses import dataclass, field
@@ -65,48 +64,14 @@ else:
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class BaseReq(ABC):
-    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
-    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
-
-    def regenerate_rid(self):
-        """Generate a new request ID and return it."""
-        if isinstance(self.rid, list):
-            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
-        else:
-            self.rid = uuid.uuid4().hex
-        return self.rid
-
-    def _validate_rid_uniqueness(self):
-        """Validate that request IDs within a batch are unique."""
-        if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
-            counts = Counter(self.rid)
-            duplicates = [rid for rid, count in counts.items() if count > 1]
-            raise ValueError(
-                f"Duplicate request IDs detected within the request: {duplicates}"
-            )
-
-
 # The BaseReq IPC class for IPC object
-class BaseReqIpc(msgspec.Struct, tag=True, kw_only=True):
+class BaseReq(msgspec.Struct, tag=True, kw_only=True):
     rid: Optional[str] = None
     http_worker_ipc: Optional[str] = None
 
 
-@dataclass
-class BaseBatchReq(ABC):
-    rids: Optional[List[str]] = field(default=None, kw_only=True)
-    http_worker_ipcs: Optional[List[str]] = field(default=None, kw_only=True)
-
-    def regenerate_rids(self):
-        """Generate new request IDs and return them."""
-        self.rids = [uuid.uuid4().hex for _ in range(len(self.rids))]
-        return self.rids
-
-
 # The BaseBatchReq IPC class for IPC object
-class BaseBatchReqIpc(msgspec.Struct, tag=True, kw_only=True):
+class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True):
     rids: Optional[List[str]] = None
     http_worker_ipcs: Optional[List[Optional[str]]] = None
 
@@ -139,7 +104,11 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput(BaseReq):
+class GenerateReqInput:
+    # From BaseReq dataclass
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -287,6 +256,23 @@ class GenerateReqInput(BaseReq):
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
+    def _validate_rid_uniqueness(self):
+        """Validate that request IDs within a batch are unique."""
+        if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
+            counts = Counter(self.rid)
+            duplicates = [rid for rid, count in counts.items() if count > 1]
+            raise ValueError(
+                f"Duplicate request IDs detected within the request: {duplicates}"
+            )
 
     def contains_mm_input(self) -> bool:
         return (
@@ -736,7 +722,7 @@ class GenerateReqInput(BaseReq):
         return sub
 
 
-class TokenizedGenerateReqInput(BaseReqIpc, kw_only=True):
+class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # The input text
     input_text: Optional[Union[str, List[Union[str, List[str]]]]]  # str
     # The input token ids
@@ -833,7 +819,7 @@ class TokenizedGenerateReqInput(BaseReqIpc, kw_only=True):
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
 
-class BatchTokenizedGenerateReqInput(BaseBatchReqIpc, kw_only=True):
+class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized requests
     batch: List[TokenizedGenerateReqInput]
 
@@ -848,7 +834,11 @@ class BatchTokenizedGenerateReqInput(BaseBatchReqIpc, kw_only=True):
 
 
 @dataclass
-class EmbeddingReqInput(BaseReq):
+class EmbeddingReqInput:
+    # From BaseReq dataclass
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -915,6 +905,23 @@ class EmbeddingReqInput(BaseReq):
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
+    def _validate_rid_uniqueness(self):
+        """Validate that request IDs within a batch are unique."""
+        if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
+            counts = Counter(self.rid)
+            duplicates = [rid for rid, count in counts.items() if count > 1]
+            raise ValueError(
+                f"Duplicate request IDs detected within the request: {duplicates}"
+            )
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -1059,7 +1066,7 @@ class EmbeddingReqInput(BaseReq):
         return sub
 
 
-class TokenizedEmbeddingReqInput(BaseReqIpc, kw_only=True):
+class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # The input text
     input_text: Optional[Union[str, List[Union[str, List[str]]]]]  # str
     # The input token ids
@@ -1090,7 +1097,7 @@ class TokenizedEmbeddingReqInput(BaseReqIpc, kw_only=True):
     return_pooled_hidden_states: bool = False
 
 
-class BatchTokenizedEmbeddingReqInput(BaseBatchReqIpc, kw_only=True):
+class BatchTokenizedEmbeddingReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized embedding requests
     batch: List[TokenizedEmbeddingReqInput]
 
@@ -1104,7 +1111,7 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReqIpc, kw_only=True):
         return iter(self.batch)
 
 
-class BatchTokenIDOutput(BaseBatchReqIpc, kw_only=True):
+class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[Dict[str, Any]]]  # List[BaseFinishReason]
     # For incremental decoding
@@ -1225,7 +1232,7 @@ class BatchTokenIDOutput(BaseBatchReqIpc, kw_only=True):
     spec_correct_drafts_histogram: Optional[List[List[int]]]
 
 
-class BatchStrOutput(BaseBatchReqIpc, kw_only=True):
+class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[Dict[str, Any]]]  # List[dict]
     # The output decoded strings
@@ -1340,7 +1347,7 @@ class BatchStrOutput(BaseBatchReqIpc, kw_only=True):
     spec_correct_drafts_histogram: Optional[List[List[int]]]
 
 
-class BatchEmbeddingOutput(BaseBatchReqIpc, kw_only=True):
+class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[Dict[str, Any]]]  # List[BaseFinishReason]
     # The output embedding
@@ -1367,58 +1374,58 @@ class BatchEmbeddingOutput(BaseBatchReqIpc, kw_only=True):
     is_pooled_hidden_states_stacked: bool = False
 
 
-class ClearHiCacheReqInput(BaseReqIpc, kw_only=True):
+class ClearHiCacheReqInput(BaseReq, kw_only=True):
     pass
 
 
-class ClearHiCacheReqOutput(BaseReqIpc, kw_only=True):
+class ClearHiCacheReqOutput(BaseReq, kw_only=True):
     success: bool
 
 
-class FlushCacheReqInput(BaseReqIpc, kw_only=True):
+class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
 
 
-class FlushCacheReqOutput(BaseReqIpc, kw_only=True):
+class FlushCacheReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
 
 
-class AddExternalCorpusReqInput(BaseReqIpc, kw_only=True):
+class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None
     documents: Optional[List[str]] = None
     token_chunks: Optional[List[List[int]]] = None
 
 
-class AddExternalCorpusReqOutput(BaseReqIpc, kw_only=True):
+class AddExternalCorpusReqOutput(BaseReq, kw_only=True):
     success: bool
     corpus_id: str = ""
     message: str = ""
     loaded_token_count: int = 0
 
 
-class RemoveExternalCorpusReqInput(BaseReqIpc, kw_only=True):
+class RemoveExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: str
 
 
-class RemoveExternalCorpusReqOutput(BaseReqIpc, kw_only=True):
+class RemoveExternalCorpusReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
 
 
-class ListExternalCorporaReqInput(BaseReqIpc, kw_only=True):
+class ListExternalCorporaReqInput(BaseReq, kw_only=True):
     pass
 
 
-class ListExternalCorporaReqOutput(BaseReqIpc, kw_only=True):
+class ListExternalCorporaReqOutput(BaseReq, kw_only=True):
     success: bool
     corpus_token_counts: Dict[str, int] = field(default_factory=dict)
     message: str = ""
 
 
 # see also AttachHiCacheStorageReqInput in the http_server.py
-class AttachHiCacheStorageReqInput(BaseReqIpc, kw_only=True):
+class AttachHiCacheStorageReqInput(BaseReq, kw_only=True):
     """Dynamically attach (enable) HiCache storage backend at runtime.
 
     Note: `hicache_storage_backend_extra_config_json` is a JSON string. It may contain both:
@@ -1432,23 +1439,23 @@ class AttachHiCacheStorageReqInput(BaseReqIpc, kw_only=True):
     hicache_write_policy: Optional[str] = None
 
 
-class AttachHiCacheStorageReqOutput(BaseReqIpc, kw_only=True):
+class AttachHiCacheStorageReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
 
 
-class DetachHiCacheStorageReqInput(BaseReqIpc, kw_only=True):
+class DetachHiCacheStorageReqInput(BaseReq, kw_only=True):
     """Dynamically detach (disable) HiCache storage backend at runtime."""
 
     pass
 
 
-class DetachHiCacheStorageReqOutput(BaseReqIpc, kw_only=True):
+class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
 
 
-class PauseGenerationReqInput(BaseReqIpc, kw_only=True):
+class PauseGenerationReqInput(BaseReq, kw_only=True):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
     abort: Abort and return all requests currently being processed.
@@ -1477,7 +1484,7 @@ class PauseGenerationReqInput(BaseReqIpc, kw_only=True):
             )
 
 
-class ContinueGenerationReqInput(BaseReqIpc, kw_only=True):
+class ContinueGenerationReqInput(BaseReq, kw_only=True):
     # Call torch.cuda.empty_cache() before un-pausing. Returns blocks
     # cached by the PyTorch allocator (left over from transient allocs
     # during post-weight-update processing) back to the driver before
@@ -1486,19 +1493,19 @@ class ContinueGenerationReqInput(BaseReqIpc, kw_only=True):
     torch_empty_cache: bool = True
 
 
-class TokenizerWorkerRegistrationReq(BaseReqIpc, kw_only=True):
+class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 
     worker_ipc_name: str
 
 
-class PauseContinueBroadcastReq(BaseReqIpc, kw_only=True):
+class PauseContinueBroadcastReq(BaseReq, kw_only=True):
     """Broadcast from router to all workers to set is_pause state."""
 
     is_pause: bool
 
 
-class UpdateWeightFromDiskReqInput(BaseReqIpc, kw_only=True):
+class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -1523,14 +1530,14 @@ class UpdateWeightFromDiskReqInput(BaseReqIpc, kw_only=True):
     manifest: Optional[Dict[str, Any]] = None
 
 
-class UpdateWeightFromDiskReqOutput(BaseReqIpc, kw_only=True):
+class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
     # Number of paused requests during weight sync.
     num_paused_requests: Optional[int] = 0
 
 
-class UpdateWeightsFromDistributedReqInput(BaseReqIpc, kw_only=True):
+class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     names: List[str]
     dtypes: List[str]
     shapes: List[List[int]]
@@ -1548,12 +1555,12 @@ class UpdateWeightsFromDistributedReqInput(BaseReqIpc, kw_only=True):
     torch_empty_cache: bool = False
 
 
-class UpdateWeightsFromDistributedReqOutput(BaseReqIpc, kw_only=True):
+class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-class UpdateWeightsFromTensorReqInput(BaseReqIpc, kw_only=True):
+class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     """Update model weights from tensor input.
 
     - Tensors are serialized for transmission
@@ -1576,12 +1583,12 @@ class UpdateWeightsFromTensorReqInput(BaseReqIpc, kw_only=True):
     torch_empty_cache: bool = False
 
 
-class UpdateWeightsFromTensorReqOutput(BaseReqIpc, kw_only=True):
+class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReqIpc, kw_only=True):
+class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq, kw_only=True):
     # The master address
     master_address: str
     # The ports for each rank's communication group
@@ -1598,7 +1605,7 @@ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReqIpc, kw_only=True):
 
 # Now UpdateWeightsFromIPCReqInput and UpdateWeightsFromIPCReqOutput
 # are only used by Checkpoint Engine (https://github.com/MoonshotAI/checkpoint-engine)
-class UpdateWeightsFromIPCReqInput(BaseReqIpc, kw_only=True):
+class UpdateWeightsFromIPCReqInput(BaseReq, kw_only=True):
     # ZMQ socket paths for each device UUID
     zmq_handles: Dict[str, str]
     # Whether to flush cache after weight update
@@ -1609,17 +1616,17 @@ class UpdateWeightsFromIPCReqInput(BaseReqIpc, kw_only=True):
     torch_empty_cache: bool = False
 
 
-class UpdateWeightsFromIPCReqOutput(BaseReqIpc, kw_only=True):
+class UpdateWeightsFromIPCReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReqIpc, kw_only=True):
+class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-class SendWeightsToRemoteInstanceReqInput(BaseReqIpc, kw_only=True):
+class SendWeightsToRemoteInstanceReqInput(BaseReq, kw_only=True):
     # The master address
     master_address: str
     # The ports for each rank's communication group
@@ -1628,23 +1635,23 @@ class SendWeightsToRemoteInstanceReqInput(BaseReqIpc, kw_only=True):
     group_name: str = "weight_send_group"
 
 
-class SendWeightsToRemoteInstanceReqOutput(BaseReqIpc, kw_only=True):
+class SendWeightsToRemoteInstanceReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-class UpdateExpertBackupReq(BaseReqIpc, kw_only=True):
+class UpdateExpertBackupReq(BaseReq, kw_only=True):
     pass
 
 
-class BackupDramReq(BaseReqIpc, kw_only=True):
+class BackupDramReq(BaseReq, kw_only=True):
     rank: int
     weight_pointer_map: Dict[str, Any]
     session_id: str
     buffer_size: int
 
 
-class InitWeightsUpdateGroupReqInput(BaseReqIpc, kw_only=True):
+class InitWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     # The master address
     master_address: str
     # The master port
@@ -1659,68 +1666,68 @@ class InitWeightsUpdateGroupReqInput(BaseReqIpc, kw_only=True):
     backend: str = "nccl"
 
 
-class InitWeightsUpdateGroupReqOutput(BaseReqIpc, kw_only=True):
+class InitWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-class DestroyWeightsUpdateGroupReqInput(BaseReqIpc, kw_only=True):
+class DestroyWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     group_name: str = "weight_update_group"
 
 
-class DestroyWeightsUpdateGroupReqOutput(BaseReqIpc, kw_only=True):
+class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-class GetWeightsByNameReqInput(BaseReqIpc, kw_only=True):
+class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100
 
 
-class GetWeightsByNameReqOutput(BaseReqIpc, kw_only=True):
+class GetWeightsByNameReqOutput(BaseReq, kw_only=True):
     parameter: list
 
 
-class ReleaseMemoryOccupationReqInput(BaseReqIpc, kw_only=True):
+class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
 
 
-class ReleaseMemoryOccupationReqOutput(BaseReqIpc, kw_only=True):
+class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
 
 
-class ResumeMemoryOccupationReqInput(BaseReqIpc, kw_only=True):
+class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
 
 
-class ResumeMemoryOccupationReqOutput(BaseReqIpc, kw_only=True):
+class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
 
 
-class CheckWeightsReqInput(BaseReqIpc, kw_only=True):
+class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
 
 
-class CheckWeightsReqOutput(BaseReqIpc, kw_only=True):
+class CheckWeightsReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
     payload: Optional[Dict] = None
 
 
-class SlowDownReqInput(BaseReqIpc, kw_only=True):
+class SlowDownReqInput(BaseReq, kw_only=True):
     forward_sleep_time: Optional[float]
 
 
-class SlowDownReqOutput(BaseReqIpc, kw_only=True):
+class SlowDownReqOutput(BaseReq, kw_only=True):
     pass
 
 
-class AbortReq(BaseReqIpc, kw_only=True):
+class AbortReq(BaseReq, kw_only=True):
     # Whether to abort all requests
     abort_all: bool = False
     # The finished reason data
@@ -1733,15 +1740,15 @@ class AbortReq(BaseReqIpc, kw_only=True):
             self.rid = ""
 
 
-class ActiveRanksOutput(BaseReqIpc, kw_only=True):
+class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
 
 
-class GetInternalStateReq(BaseReqIpc, kw_only=True):
+class GetInternalStateReq(BaseReq, kw_only=True):
     pass
 
 
-class GetInternalStateReqOutput(BaseReqIpc, kw_only=True):
+class GetInternalStateReqOutput(BaseReq, kw_only=True):
     server_args: ServerArgs
     last_gen_throughput: float
     memory_usage: Dict[str, Union[float, int]]
@@ -1752,13 +1759,13 @@ class GetInternalStateReqOutput(BaseReqIpc, kw_only=True):
 
 # The ServerArgs has a lot of fields with different types
 # let's use object to make it serialize/deserialize via pickle for now
-class SetInternalStateReq(BaseReqIpc, kw_only=True):
+class SetInternalStateReq(BaseReq, kw_only=True):
     server_args: Dict[str, object]
 
 
 # The ServerArgs has a lot of fields with different types
 # let's use object to make it serialize/deserialize via pickle for now
-class SetInternalStateReqOutput(BaseReqIpc, kw_only=True):
+class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
     server_args: Dict[str, object]
 
@@ -1768,7 +1775,7 @@ class ProfileReqType(Enum):
     STOP_PROFILE = 2
 
 
-class ProfileReq(BaseReqIpc, kw_only=True):
+class ProfileReq(BaseReq, kw_only=True):
     req_type: ProfileReqType
     output_dir: Optional[str] = None
     start_step: Optional[int] = None
@@ -1783,16 +1790,16 @@ class ProfileReq(BaseReqIpc, kw_only=True):
     profile_stages: Optional[List[str]] = None
 
 
-class ProfileReqOutput(BaseReqIpc, kw_only=True):
+class ProfileReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-class FreezeGCReq(BaseReqIpc, kw_only=True):
+class FreezeGCReq(BaseReq, kw_only=True):
     pass
 
 
-class ConfigureLoggingReq(BaseReqIpc, kw_only=True):
+class ConfigureLoggingReq(BaseReq, kw_only=True):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
     log_requests_format: Optional[str] = None
@@ -1803,23 +1810,23 @@ class ConfigureLoggingReq(BaseReqIpc, kw_only=True):
     dump_requests_exclude_meta_keys: Optional[List[str]] = None
 
 
-class OpenSessionReqInput(BaseReqIpc, kw_only=True):
+class OpenSessionReqInput(BaseReq, kw_only=True):
     capacity_of_str_len: int
     session_id: Optional[str] = None
     streaming: Optional[bool] = None
     timeout: Optional[float] = None
 
 
-class CloseSessionReqInput(BaseReqIpc, kw_only=True):
+class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
-class OpenSessionReqOutput(BaseReqIpc, kw_only=True):
+class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool
 
 
-class HealthCheckOutput(BaseReqIpc, kw_only=True):
+class HealthCheckOutput(BaseReq, kw_only=True):
     pass
 
 
@@ -1829,11 +1836,11 @@ class ExpertDistributionReqType(Enum):
     DUMP_RECORD = 3
 
 
-class ExpertDistributionReq(BaseReqIpc, kw_only=True):
+class ExpertDistributionReq(BaseReq, kw_only=True):
     action: ExpertDistributionReqType
 
 
-class ExpertDistributionReqOutput(BaseReqIpc, kw_only=True):
+class ExpertDistributionReqOutput(BaseReq, kw_only=True):
     pass
 
 
@@ -1850,17 +1857,17 @@ class Tool:
     type: Optional[str] = "function"
 
 
-class RpcReqInput(BaseReqIpc, kw_only=True):
+class RpcReqInput(BaseReq, kw_only=True):
     method: str
     parameters: Optional[Dict] = None
 
 
-class RpcReqOutput(BaseReqIpc, kw_only=True):
+class RpcReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-class LoadLoRAAdapterReqInput(BaseReqIpc, kw_only=True):
+class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):
     # The name of the lora module to newly loaded.
     lora_name: str
     # The path of loading.
@@ -1879,7 +1886,7 @@ class LoadLoRAAdapterReqInput(BaseReqIpc, kw_only=True):
         )
 
 
-class UnloadLoRAAdapterReqInput(BaseReqIpc, kw_only=True):
+class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):
     # The name of lora module to unload.
     lora_name: str
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
@@ -1892,7 +1899,7 @@ class UnloadLoRAAdapterReqInput(BaseReqIpc, kw_only=True):
         )
 
 
-class LoadLoRAAdapterFromTensorsReqInput(BaseReqIpc, kw_only=True):
+class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     lora_name: str
     config_dict: Dict[str, Any]
     serialized_tensors: str
@@ -1910,7 +1917,7 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReqIpc, kw_only=True):
         )
 
 
-class LoRAUpdateOutput(BaseReqIpc, kw_only=True):
+class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
@@ -1926,7 +1933,7 @@ class BlockReqType(Enum):
     UNBLOCK = 2
 
 
-class BlockReqInput(BaseReqIpc, kw_only=True):
+class BlockReqInput(BaseReq, kw_only=True):
     req_type: BlockReqType
 
 
@@ -2014,7 +2021,7 @@ class QueueMetrics:
     retracted: int = field(metadata={"metric": ("gauge", "Retracted requests count")})
 
 
-class GetLoadsReqInput(BaseReqIpc, kw_only=True):
+class GetLoadsReqInput(BaseReq, kw_only=True):
     """Request for /v1/loads endpoint."""
 
     VALID_SECTIONS = frozenset(
@@ -2035,7 +2042,7 @@ class GetLoadsReqInput(BaseReqIpc, kw_only=True):
                 )
 
 
-class GetLoadsReqOutput(BaseReqIpc, kw_only=True):
+class GetLoadsReqOutput(BaseReq, kw_only=True):
     """Per-DP-rank load metrics for /v1/loads endpoint."""
 
     dp_rank: Optional[int]
@@ -2075,32 +2082,32 @@ class GetLoadsReqOutput(BaseReqIpc, kw_only=True):
     queues: Optional[QueueMetrics] = None
 
 
-class WatchLoadUpdateReq(BaseReqIpc, kw_only=True):
+class WatchLoadUpdateReq(BaseReq, kw_only=True):
     loads: List[GetLoadsReqOutput]
 
 
-class SetInjectDumpMetadataReqInput(BaseReqIpc, kw_only=True):
+class SetInjectDumpMetadataReqInput(BaseReq, kw_only=True):
     dump_metadata: Dict[str, Any]
 
 
-class SetInjectDumpMetadataReqOutput(BaseReqIpc, kw_only=True):
+class SetInjectDumpMetadataReqOutput(BaseReq, kw_only=True):
     success: bool
 
 
-class LazyDumpTensorsReqInput(BaseReqIpc, kw_only=True):
+class LazyDumpTensorsReqInput(BaseReq, kw_only=True):
     pass
 
 
-class LazyDumpTensorsReqOutput(BaseReqIpc, kw_only=True):
+class LazyDumpTensorsReqOutput(BaseReq, kw_only=True):
     success: bool
 
 
-class DumperControlReqInput(BaseReqIpc, kw_only=True):
+class DumperControlReqInput(BaseReq, kw_only=True):
     method: str
     body: Dict[str, Any]
 
 
-class DumperControlReqOutput(BaseReqIpc, kw_only=True):
+class DumperControlReqOutput(BaseReq, kw_only=True):
     success: bool
     response: List[Dict[str, Any]]
     error: str = ""
@@ -2115,17 +2122,14 @@ def _check_all_req_types():
     for class_type in all_classes:
         # check its name
         name = class_type[0]
+        # GenerateReqInput and EmbeddingReqInput are not io object.
+        if name in ("GenerateReqInput", "EmbeddingReqInput"):
+            continue
         is_io_struct = (
-            name.endswith("Req")
-            or name.endswith("Input")
-            or name.endswith("Output")
-            or name.endswith("Ipc")  # allow IPC-specific struct naming
+            name.endswith("Req") or name.endswith("Input") or name.endswith("Output")
         )
-        is_base_req = (
-            issubclass(class_type[1], BaseReq)
-            or issubclass(class_type[1], BaseBatchReq)
-            or issubclass(class_type[1], BaseReqIpc)
-            or issubclass(class_type[1], BaseBatchReqIpc)
+        is_base_req = issubclass(class_type[1], BaseReq) or issubclass(
+            class_type[1], BaseBatchReq
         )
         if is_io_struct and not is_base_req:
             raise ValueError(f"{name} is not a subclass of BaseReq or BaseBatchReq.")
@@ -2139,7 +2143,7 @@ _check_all_req_types()
 
 
 # Below are msgpack serialization and ipc utils
-class PickleWrapperIpc(msgspec.Struct, tag=True):
+class PickleWrapper(msgspec.Struct, tag=True):
     data: bytes
 
 
@@ -2207,20 +2211,28 @@ def dec_hook(tp: Type, obj: Any) -> Any:
 
 _struct_types = tuple(
     cls
-    for cls in BaseReqIpc.__subclasses__()
-    + BaseBatchReqIpc.__subclasses__()
-    + [PickleWrapperIpc]
+    for cls in BaseReq.__subclasses__()
+    + BaseBatchReq.__subclasses__()
+    + [PickleWrapper]
 )
 # str primitive types should encode to bytes
 _primitive_types = (int, float, bool, bytes)
 _all_types = _struct_types + _primitive_types
 
-
 _msgpack_encoder = msgspec.msgpack.Encoder(enc_hook=enc_hook)
 _msgpack_decoder = msgspec.msgpack.Decoder(Union[_all_types], dec_hook=dec_hook)
 
 
-def _maybe_wrap_pickle(obj: Any) -> PickleWrapperIpc:
+# technically all the msgpack struct type should be define in this file
+# in case there are other types has to be defined outside of this file
+# and need to be serialized via msgpack
+def hook_custom_types(*new_types: Type):
+    global _msgpack_decoder, _all_types
+    _all_types = tuple(dict.fromkeys(_all_types + new_types))
+    _msgpack_decoder = msgspec.msgpack.Decoder(Union[_all_types], dec_hook=dec_hook)
+
+
+def _maybe_wrap_pickle(obj: Any) -> PickleWrapper:
     # for msgspec.Struct type, we can directly serialize
     if isinstance(obj, msgspec.Struct):
         return obj
@@ -2229,19 +2241,17 @@ def _maybe_wrap_pickle(obj: Any) -> PickleWrapperIpc:
         return obj
 
     if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
-        logger.info(f"Object of type {type(obj)} is wrapped via PickleWrapperIpc.")
-    return PickleWrapperIpc(pickle.dumps(obj))
+        logger.info(f"Object of type {type(obj)} is wrapped via PickleWrapper.")
+    return PickleWrapper(pickle.dumps(obj))
 
 
 def _maybe_unwrap_pickle(obj: Any) -> Any:
-    # only PickleWrapperIpc type needs to be unwrapped,
+    # only PickleWrapper type needs to be unwrapped,
     # other types can be directly used
-    if isinstance(obj, PickleWrapperIpc):
+    if isinstance(obj, PickleWrapper):
         obj = pickle.loads(obj.data)
         if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
-            logger.info(
-                f"Object of type {type(obj)} is unwrapped from PickleWrapperIpc."
-            )
+            logger.info(f"Object of type {type(obj)} is unwrapped from PickleWrapper.")
         return obj
 
     return obj

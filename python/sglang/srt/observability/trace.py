@@ -287,9 +287,8 @@ class TraceReqContext(msgspec.Struct, tag=True):
     events_cache: List[TraceEvent] = []
 
     def __post_init__(self):
-
         self.rid = str(self.rid)
-
+        self.trace_level = global_trace_level
         self.tracing_enable = opentelemetry_initialized and self.trace_level > 0
 
         # Filter by --trace-modules only for explicitly named modules; contexts
@@ -391,7 +390,8 @@ class TraceReqContext(msgspec.Struct, tag=True):
         return state
 
     def __setstate__(self, state: Dict[str, Any]):
-        self.__dict__.update(state)
+        for k, v in state.items():
+            setattr(self, k, v)
         if not opentelemetry_initialized:
             self.tracing_enable = False
         if not self.tracing_enable:

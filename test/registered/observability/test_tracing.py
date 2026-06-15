@@ -16,13 +16,18 @@ import logging
 import multiprocessing as mp
 import time
 import unittest
-from dataclasses import dataclass
 from typing import List, Optional, Union
 
+import msgspec
 import requests
 import zmq
 
 from sglang import Engine
+from sglang.srt.managers.io_struct import (
+    hook_custom_types,
+    sock_recv,
+    sock_send,
+)
 from sglang.srt.observability.req_time_stats import RequestStage
 from sglang.srt.observability.trace import (
     TraceReqContext,
@@ -104,10 +109,12 @@ EXPECTED_SPANS_LEVEL_3 = EXPECTED_SPANS_LEVEL_2 + [
 ]
 
 
-@dataclass
-class Req:
+class Req(msgspec.Struct, tag=True):
     rid: int
     req_context: Optional[Union[TraceReqContext]] = None
+
+
+hook_custom_types(Req)
 
 
 def _subprocess_worker():
@@ -121,7 +128,7 @@ def _subprocess_worker():
     recv_from_main = get_zmq_socket(context, zmq.PULL, "ipc:///tmp/zmq_test.ipc", True)
 
     try:
-        req = recv_from_main.recv_pyobj()
+        req = sock_recv(recv_from_main)
         req.req_context.rebuild_thread_context()
         req.req_context.trace_slice_start("work", level=1)
         time.sleep(0.2)
@@ -235,7 +242,7 @@ class TestTracePackage(CustomTestCase):
             req.req_context.trace_req_start()
             req.req_context.trace_slice_start("dispatch", level=1)
             time.sleep(0.2)
-            send_to_subproc.send_pyobj(req)
+            sock_send(send_to_subproc, req)
             req.req_context.trace_slice_end("dispatch", level=1)
 
             subproc.join()
