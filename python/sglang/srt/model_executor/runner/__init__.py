@@ -6,8 +6,10 @@ delegates capture/replay mechanics to a pluggable
 ExecutionBackend chosen via cuda_graph_config.
 
 Public API:
-  - BaseCudaGraphRunner — abstract base; shared init + bucket
-    padding + capture-loop scaffolding.
+  - BaseRunner — minimal abstract base shared by the cuda-graph runners
+    and the eager runner (warmup + abstract load_batch/execute).
+  - BaseCudaGraphRunner — abstract cuda-graph base; bucket padding +
+    capture-loop scaffolding on top of BaseRunner.
   - DecodeCudaGraphRunner — concrete decode-phase runner.
   - PrefillCudaGraphRunner — concrete prefill-phase runner.
   - Buffer dataclasses, capture-mode flags, the global memory pool,
@@ -22,6 +24,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (  # noqa: F
     freeze_gc,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.base_runner import BaseRunner  # noqa: F401
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
