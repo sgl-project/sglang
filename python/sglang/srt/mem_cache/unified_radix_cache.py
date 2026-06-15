@@ -6,6 +6,7 @@ import threading
 import time
 from array import array
 from collections import defaultdict
+from dataclasses import dataclass
 from functools import partial
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeVar
@@ -259,6 +260,19 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class HostOnlyBackupPending:
+    anchor_node: UnifiedTreeNode
+    suffix_key: RadixKey
+    value_start: int
+    host_indices: torch.Tensor
+    device_indices: torch.Tensor
+    insert_params: InsertParams
+    comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    mamba_device_indices: Optional[torch.Tensor]
+    release_device_on_ack: bool = True
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
@@ -330,6 +344,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        self.hicache_tree_placement = params.hicache_tree_placement
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -444,6 +459,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ],
         ] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self.ongoing_host_only_backup: dict[int, HostOnlyBackupPending] = {}
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -664,6 +680,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
+        if (
+            self.hicache_tree_placement == "host_only"
+            and self.cache_controller is not None
+            and is_insert
+        ):
+            self._cache_finished_req_host_only(req, kv_committed_len)
+            return
+
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
@@ -739,6 +763,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        if (
+            self.cache_controller is not None
+            and self.hicache_tree_placement == "host_only"
+        ):
+            self._cache_unfinished_req_host_only(
+                req=req,
+                token_ids=token_ids,
+                kv_indices_orig=kv_indices_orig,
+                chunked=chunked,
+            )
+            return
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
@@ -1154,10 +1189,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         node: UnifiedTreeNode,
         key: RadixKey,
         host_value: torch.Tensor,
-        hash_value: list[str],
+        hash_value: Optional[list[str]],
+        priority: int = 0,
     ) -> InsertResult:
         total_len = len(key)
         self._touch_node(node)
+        node.priority = max(node.priority, priority)
         if total_len == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
@@ -1166,11 +1203,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
+            node.priority = max(node.priority, priority)
             prefix_len = node.key.match(key, page_size=self.page_size)
 
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
-            hash_value = hash_value[prefix_len // self.page_size :]
+            if hash_value is not None:
+                hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
 
             if prefix_len < len(node.key):
@@ -1191,7 +1230,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node = UnifiedTreeNode(self.tree_components, priority=node.priority)
         new_node.parent = node
         new_node.key = key
-        new_node.hash_value = hash_value
+        if hash_value is not None:
+            new_node.hash_value = hash_value
+        elif self.enable_storage:
+            new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
         node.children[child_key] = new_node
         self._update_evictable_leaf_sets(new_node)
@@ -2277,35 +2319,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if write_back:
             # Blocking: wait for all pending write-backs
-            while self.ongoing_write_through:
+            while self.ongoing_write_through or self.ongoing_host_only_backup:
                 for _, finish_event, ack_list in cc.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        if ack_id in self.ongoing_write_through:
-                            self._finish_write_through_ack(ack_id)
+                        self._finish_write_ack(ack_id)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
+                assert len(self.ongoing_host_only_backup) == 0
             return
 
-        # Every rank must enter the all_reduce below; ongoing_write_through can
-        # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_write_queue:
+            for _, finish_event, _ in cc.ack_write_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
 
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        if self.hicache_tree_placement != "host_only":
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = finish_count_tensor.item()
 
-        # Process completed acks
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                self._finish_write_through_ack(ack_id)
+                self._finish_write_ack(ack_id)
             finish_count -= 1
 
     def loading_check(self) -> None:
@@ -2313,17 +2355,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
-        # Every rank must enter the all_reduce below; ongoing_load_back can
-        # diverge across ranks.
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_load_queue:
+            for _, finish_event, _ in cc.ack_load_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        if self.hicache_tree_placement != "host_only":
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = finish_count_tensor.item()
 
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
@@ -2874,3 +2917,347 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     if cd.host_value is not None:
                         self.host_lru_lists[ct].insert_mru(node)
             stack.extend(node.children.values())
+
+    def _cache_unfinished_req_host_only(
+        self,
+        req: Req,
+        token_ids: array,
+        kv_indices_orig: torch.Tensor,
+        chunked: bool,
+    ) -> None:
+        insert_params = InsertParams(
+            prev_prefix_len=req.cache_protected_len,
+            chunked=chunked,
+            priority=getattr(req, "priority", 0) or 0,
+        )
+        effective_cache_len = len(token_ids)
+        for comp in self._components_tuple:
+            comp_len = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=len(token_ids),
+                is_finished=False,
+            )
+            if comp_len is not None:
+                effective_cache_len = min(effective_cache_len, comp_len)
+
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(
+                    req, effective_cache_len - 1, insert_params
+                )
+
+        if effective_cache_len <= 0:
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=False, insert_params=insert_params
+                )
+            return
+
+        kv_indices = kv_indices_orig[:effective_cache_len]
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
+        page_aligned_len = len(radix_key)
+        insert_params.key = radix_key
+        insert_params.value = kv_indices[:page_aligned_len].to(
+            dtype=torch.int64, copy=True
+        )
+
+        mamba_device_indices = None
+        if insert_params.mamba_value is not None:
+            mamba_device_indices = insert_params.mamba_value.reshape(-1).to(
+                dtype=torch.int64, copy=True
+            )
+        host_prefix_len = min(
+            getattr(req, "host_only_cached_len", req.cache_protected_len),
+            page_aligned_len,
+        )
+        if self._queue_host_only_backup(
+            req=req,
+            insert_params=insert_params,
+            radix_key=radix_key,
+            kv_indices=kv_indices,
+            host_prefix_len=host_prefix_len,
+            mamba_device_indices=mamba_device_indices,
+            release_device_on_ack=False,
+        ):
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+            req.last_host_node = match_result.last_host_node
+            req.best_match_node = match_result.best_match_node
+            req.host_only_cached_len = max(
+                getattr(req, "host_only_cached_len", req.cache_protected_len),
+                min(
+                    page_aligned_len,
+                    len(match_result.device_indices) + match_result.host_hit_length,
+                ),
+            )
+
+        req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
+        req.mamba_last_track_seqlen = None
+
+    def _cache_finished_req_host_only(self, req: Req, kv_committed_len: int) -> None:
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ]
+
+        insert_params = InsertParams(
+            prev_prefix_len=req.cache_protected_len,
+            priority=getattr(req, "priority", 0) or 0,
+        )
+        cache_len = len(token_ids)
+        for comp in self._components_tuple:
+            comp_len = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=cache_len,
+                is_finished=True,
+            )
+            if comp_len is not None:
+                cache_len = min(cache_len, comp_len)
+
+        radix_key = RadixKey(
+            token_ids[:cache_len], req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
+        page_aligned_len = len(radix_key)
+        insert_params.key = radix_key
+        insert_params.value = kv_indices[:page_aligned_len].to(
+            dtype=torch.int64, copy=True
+        )
+        host_prefix_len = min(
+            getattr(req, "host_only_cached_len", req.cache_protected_len),
+            page_aligned_len,
+        )
+
+        if host_prefix_len > req.cache_protected_len:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : host_prefix_len]
+            )
+
+        free_start = max(page_aligned_len, req.cache_protected_len)
+        if free_start < kv_committed_len:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[free_start:kv_committed_len]
+            )
+
+        self.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        if (
+            req.cache_protected_len > 0
+            and req.last_node is not None
+            and req.last_node is not self.root_node
+        ):
+            tracker = {ct: 0 for ct in self.tree_components}
+            cur = req.last_node
+            while cur is not self.root_node:
+                parent = cur.parent
+                if self._is_device_leaf(cur):
+                    if not cur.backuped:
+                        self.write_backup(cur)
+                        self.writing_check(write_back=True)
+                    if cur.backuped:
+                        self._evict_to_host(cur, tracker)
+                cur = parent
+
+        pop_mamba_indices = getattr(
+            self.components.get(ComponentType.MAMBA),
+            "pop_host_only_device_indices",
+            None,
+        )
+        self._queue_host_only_backup(
+            req=req,
+            insert_params=insert_params,
+            radix_key=radix_key,
+            kv_indices=kv_indices,
+            host_prefix_len=host_prefix_len,
+            mamba_device_indices=(
+                pop_mamba_indices(req) if pop_mamba_indices is not None else None
+            ),
+        )
+
+    def _queue_host_only_backup(
+        self,
+        *,
+        req: Req,
+        insert_params: InsertParams,
+        radix_key: RadixKey,
+        kv_indices: torch.Tensor,
+        host_prefix_len: int,
+        mamba_device_indices: Optional[torch.Tensor],
+        release_device_on_ack: bool = True,
+    ) -> bool:
+        page_aligned_len = len(radix_key)
+        anchor_node = self.root_node
+        if host_prefix_len > 0:
+            for node in (
+                getattr(req, "last_host_node", None),
+                getattr(req, "best_match_node", None),
+                getattr(req, "last_node", None),
+            ):
+                if node is not None and node is not self.root_node:
+                    anchor_node = node
+                    break
+            if anchor_node is self.root_node:
+                host_prefix_len = 0
+        suffix_key = radix_key[host_prefix_len:]
+        suffix_values = kv_indices[host_prefix_len:page_aligned_len].to(
+            dtype=torch.int64, copy=True
+        )
+        device_to_free = suffix_values if release_device_on_ack else suffix_values[:0]
+
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            build_transfers = getattr(comp, "build_host_only_backup_transfers", None)
+            if build_transfers is None:
+                continue
+            xfers = build_transfers(
+                req=req,
+                insert_params=insert_params,
+                values=suffix_values,
+                value_start=host_prefix_len,
+            )
+            if xfers:
+                comp_xfers[comp.component_type] = xfers
+
+        kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=suffix_values)
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
+        )
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+
+        if len(suffix_values) == 0 and not aux_xfers:
+            self._free_host_only_device_resources(device_to_free, mamba_device_indices)
+            return True
+
+        host_avail = self.cache_controller.mem_pool_host.available_size()
+        needed = len(suffix_values) - host_avail
+        if needed > 0:
+            evicted = self.evict_host(needed)
+            if evicted < needed:
+                logger.warning(
+                    "HiCache host-only backup skipped: insufficient host KV memory "
+                    "(needed=%d, evicted=%d)",
+                    needed,
+                    evicted,
+                )
+                self._free_host_only_device_resources(
+                    device_to_free, mamba_device_indices
+                )
+                return False
+
+        ack_id = UnifiedTreeNode.counter
+        UnifiedTreeNode.counter += 1
+        host_indices = self.cache_controller.write(
+            suffix_values,
+            node_id=ack_id,
+            extra_pools=aux_xfers or None,
+        )
+        if host_indices is None:
+            logger.warning(
+                "HiCache host-only backup skipped: D2H write allocation failed"
+            )
+            self._free_host_only_device_resources(device_to_free, mamba_device_indices)
+            return False
+
+        self.ongoing_host_only_backup[ack_id] = HostOnlyBackupPending(
+            anchor_node=anchor_node,
+            suffix_key=suffix_key,
+            value_start=host_prefix_len,
+            host_indices=host_indices,
+            device_indices=suffix_values,
+            insert_params=insert_params,
+            comp_xfers=comp_xfers,
+            mamba_device_indices=mamba_device_indices,
+            release_device_on_ack=release_device_on_ack,
+        )
+        if self.hicache_tree_placement == "host_only":
+            self.writing_check(write_back=True)
+        return True
+
+    def _free_host_only_device_resources(
+        self,
+        device_indices: torch.Tensor,
+        mamba_device_indices: Optional[torch.Tensor],
+    ) -> None:
+        if device_indices.numel() > 0:
+            self.token_to_kv_pool_allocator.free(device_indices)
+        if mamba_device_indices is not None and mamba_device_indices.numel() > 0:
+            self.req_to_token_pool.mamba_allocator.free(mamba_device_indices)
+
+    def _finish_host_only_backup_ack(self, ack_id: int) -> None:
+        pending = self.ongoing_host_only_backup.pop(ack_id)
+        insert_result = self._insert_helper_host(
+            pending.anchor_node,
+            pending.suffix_key,
+            pending.host_indices,
+            hash_value=None,
+            priority=pending.insert_params.priority,
+        )
+
+        if insert_result.prefix_len > 0:
+            self.cache_controller.mem_pool_host.free(
+                pending.host_indices[: insert_result.prefix_len]
+            )
+
+        target_node = insert_result.inserted_host_node
+        extra_release: list[PoolTransfer] = []
+        for ct, xfers in pending.comp_xfers.items():
+            commit_host_insert = getattr(
+                self.components[ct], "commit_host_only_insert", None
+            )
+            if commit_host_insert is not None:
+                extra_release.extend(
+                    commit_host_insert(
+                        node=target_node,
+                        insert_result=insert_result,
+                        insert_params=pending.insert_params,
+                        transfers=xfers,
+                        value_start=pending.value_start,
+                    )
+                )
+        for transfer in extra_release:
+            if (
+                transfer.host_indices is None
+                or transfer.host_indices.numel() == 0
+                or transfer.indices_from_pool is not None
+            ):
+                continue
+            entry = self.cache_controller.mem_pool_host.entry_map.get(transfer.name)
+            if entry is not None and not entry.is_primary_index_anchor:
+                entry.host_pool.free(transfer.host_indices)
+
+        if (
+            target_node is not None
+            and insert_result.total_len > insert_result.prefix_len
+        ):
+            self._record_store_event(target_node, medium=StorageMedium.CPU)
+            if self.enable_storage:
+                self.write_backup_storage(target_node)
+
+        device_indices = (
+            pending.device_indices
+            if pending.release_device_on_ack
+            else pending.device_indices[:0]
+        )
+        self._free_host_only_device_resources(
+            device_indices, pending.mamba_device_indices
+        )
+
+    def _finish_write_ack(self, ack_id: int) -> None:
+        if ack_id in self.ongoing_host_only_backup:
+            self._finish_host_only_backup_ack(ack_id)
+            return
+        if ack_id in self.ongoing_write_through:
+            self._finish_write_through_ack(ack_id)

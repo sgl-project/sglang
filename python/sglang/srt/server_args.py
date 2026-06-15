@@ -705,6 +705,7 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    hicache_tree_placement: Literal["dual_tier", "host_only"] = "dual_tier"
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -4407,6 +4408,13 @@ class ServerArgs:
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
+        if (
+            self.hicache_tree_placement == "host_only"
+            and not self.enable_hierarchical_cache
+        ):
+            raise ValueError(
+                "--hicache-tree-placement host_only requires --enable-hierarchical-cache."
+            )
 
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
@@ -6575,6 +6583,19 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--hicache-tree-placement",
+            type=str,
+            choices=("dual_tier", "host_only"),
+            default=ServerArgs.hicache_tree_placement,
+            help=(
+                "Tree placement for hierarchical cache. 'dual_tier' keeps "
+                "finished-request prefix-cache entries on both device and host. "
+                "'host_only' keeps "
+                "finished-request prefix-cache entries as host-only tree nodes "
+                "and releases GPU KV after D2H offload completes."
+            ),
         )
 
         # Hierarchical sparse attention

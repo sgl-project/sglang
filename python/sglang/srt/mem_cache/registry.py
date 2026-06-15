@@ -99,8 +99,12 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.enable_hierarchical_cache:
-        if ctx.is_hybrid_ssm or ctx.is_hybrid_swa:
-            # HybridModel launches HiCache via UnifiedRadixCache by default.
+        if (
+            ctx.is_hybrid_ssm
+            or ctx.is_hybrid_swa
+            or server_args.hicache_tree_placement == "host_only"
+        ):
+            # HybridModel and host-only tree placement launch via UnifiedRadixCache.
             return _create_unified_radix_cache(ctx, server_args, params)
         else:
             from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
