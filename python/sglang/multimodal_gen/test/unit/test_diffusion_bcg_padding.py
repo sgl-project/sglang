@@ -132,6 +132,16 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertIsNone(self.stage._maybe_get_bcg_runner(self.hunyuanvideo_model))
         self.assertEqual(self.stage._bcg_runners, {})
 
+    def test_missing_bcg_flag_defaults_disabled(self):
+        self.stage.server_args = SimpleNamespace()
+        self.stage._bcg_runners = {}
+        self.stage._cache_dit_enabled = False
+
+        self.assertIsNone(self.stage._maybe_get_bcg_runner(self.qwen_model))
+        self.stage._maybe_enable_torch_compile(self.qwen_model)
+        self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
+        self.assertEqual(self.stage._bcg_runners, {})
+
     def test_generic_prompt_padding_keeps_single_bucket_env_compatibility(self):
         kwargs = {
             "hidden_states": torch.zeros(1, 16, 64),
