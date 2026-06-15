@@ -18,10 +18,12 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 register_cuda_ci(est_time=320, stage="extra-a", runner_config="1-gpu-small")
 
-_CHUNK = 64
-_PROMPT_LEN = 200
-_DECODE_STEPS = 400
-_MAX_NEW_TOKENS = 450
+_CHUNK = 32
+_PROMPT_LEN = 64
+_DECODE_STEPS = 300
+_MAX_NEW_TOKENS = 360
+_TEMPERATURE = 2.0
+_DECODE_MAX_STEPS = 900
 
 
 def _eagle_kwargs() -> Dict[str, object]:
@@ -63,9 +65,9 @@ def _script_retract_resume_output_region(t: ScriptedContext, expect_violation: b
         prompt_len=_PROMPT_LEN,
         max_new_tokens=_MAX_NEW_TOKENS,
         ignore_eos=True,
-        temperature=1.0,
+        temperature=_TEMPERATURE,
     )
-    yield from advance_to_decode_step(r, _DECODE_STEPS)
+    yield from advance_to_decode_step(r, _DECODE_STEPS, max_steps=_DECODE_MAX_STEPS)
     chunks_before = r.chunks_done
     t.pause_generation(mode="retract")
     t.continue_generation()
@@ -95,11 +97,18 @@ class _EagleRetractNextTokenBase(ScriptedTestCase):
     def setUpClass(cls) -> None:
         if cls is _EagleRetractNextTokenBase:
             raise unittest.SkipTest("abstract base; concrete subclasses set revert_pr")
-        env: Dict[str, str] = {"SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT": "1"}
+        cls._env_backup = {
+            k: os.environ.get(k)
+            for k in (
+                "SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT",
+                "SGLANG_DEBUG_REVERT_PR",
+            )
+        }
+        os.environ["SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT"] = "1"
         if cls.revert_pr:
-            env["SGLANG_DEBUG_REVERT_PR"] = "28254"
-        cls._env_backup = {k: os.environ.get(k) for k in env}
-        os.environ.update(env)
+            os.environ["SGLANG_DEBUG_REVERT_PR"] = "28254"
+        else:
+            os.environ.pop("SGLANG_DEBUG_REVERT_PR", None)
         super().setUpClass()
 
     @classmethod
