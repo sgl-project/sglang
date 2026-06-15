@@ -7,8 +7,8 @@
 // sparse) are measured on PR #27944 — warm steady-state from a 3-run sweep (the
 // B200 3-run is identical; the H200 cold-start first run, ~2x slower, is
 // excluded). B300 / GB300
-// rows are the earlier sglang main (2026-06-11) tp4 MSA
-// numbers, pending a #27944 re-measure on their own boxes. GB200 is a bare-match
+// rows are the earlier 2026-06-11 tp4 MSA numbers (pre-piecewise),
+// pending a #27944 re-measure on their own boxes. GB200 is a bare-match
 // stub (inferred-supported, not benchmarked). AMD: MI355X at 8-GPU tp8 (native
 // MXFP8) carries a bench_serving speed row; MI300X (MXFP8 -> block-fp8) was
 // accuracy-only. MI350X / MI325X inherit their same-arch sibling's recipe
@@ -35,7 +35,7 @@ export const benchmarks = [
     // #27944 tp4 speed + GSM8K drift were pre-fix; the merged MSA decode fix
     // resolves the drift (stable single-run greedy 96.89% / recommended 96.51%).
     match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "PR #27944 (piecewise, 2026-06-15)",
+    sglang_version: "PR #27944",
     speed: [
       // bench_serving --flush-cache, MSA path, tp8; warm steady-state (3-run, identical).
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
@@ -57,7 +57,7 @@ export const benchmarks = [
   },
   {
     match: { hw: "b300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "main (2026-06-11)",
+    sglang_version: "PR #27944",
     speed: [
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64 },
         ttft_ms: null, tpot_ms: 32.8, tokens_per_sec_per_gpu: 365 },
@@ -68,7 +68,7 @@ export const benchmarks = [
   { match: { hw: "gb200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" } },
   {
     match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "main (2026-06-11)",
+    sglang_version: "PR #27944",
     speed: [
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64 },
         ttft_ms: 4746, tpot_ms: 39.3, tokens_per_sec_per_gpu: 277 },
@@ -82,7 +82,7 @@ export const benchmarks = [
   // No TTFT/TPOT reported for this run.
   {
     match: { hw: "mi355x", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "main (2026-06-11)",
+    sglang_version: "PR #27944",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 64, num_prompts: 640 },
         ttft_ms: null, tpot_ms: null, tokens_per_sec_per_gpu: 210 },
@@ -94,7 +94,7 @@ export const benchmarks = [
   // MI300X (gfx942): MXFP8 -> block-fp8 [128,128].
   {
     match: { hw: "mi300x", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "main (2026-06-11)",
+    sglang_version: "PR #27944",
     accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on MI300X (legacy run_eval 1319: 92.0, triton 0.917-0.929 / aiter ~0.929)
   },
   // MI325X (gfx942): inferred-supported from MI300X, not separately benchmarked.
