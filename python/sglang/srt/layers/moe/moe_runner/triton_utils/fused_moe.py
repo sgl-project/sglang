@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
@@ -86,6 +87,10 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         _has_vllm_ops = False
 
 padding_size = get_moe_padding_size(_use_aiter)
+
+
+def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
+    return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -728,7 +733,7 @@ def _fused_moe_kernel_sequence(
             ).squeeze(dim=1)
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
-            if num_tokens <= 32:
+            if _use_moe_sum_reduce_torch_compile(num_tokens):
                 moe_sum_reduce_torch_compile(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
@@ -748,7 +753,7 @@ def _fused_moe_kernel_sequence(
             )
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
-            if num_tokens <= 32:
+            if _use_moe_sum_reduce_torch_compile(num_tokens):
                 moe_sum_reduce_torch_compile(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,

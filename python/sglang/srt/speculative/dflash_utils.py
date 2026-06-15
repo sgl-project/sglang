@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
@@ -7,11 +9,15 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+
+logger = logging.getLogger(__name__)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
@@ -20,6 +26,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "FlashInferAttnBackend",
         "FlashInferMLAAttnBackend",
         "FlashAttentionBackend",
+        "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
     }
@@ -47,6 +54,36 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def resolve_dflash_prefill_refill_target(max_running_requests: int) -> int:
+    """Choose how many free running-request slots DFlash waits for before refill."""
+    override = envs.SGLANG_DFLASH_PREFILL_REFILL_TARGET.get()
+    if override is not None:
+        return override
+
+    max_running_requests = max(0, int(max_running_requests))
+    if max_running_requests < 8:
+        return 1
+    return min(4, max(2, (max_running_requests + 5) // 6))
+
+
+def should_delay_dflash_prefill_for_batching(
+    *,
+    running_bs: int,
+    num_allocatable_reqs: int,
+    max_running_requests: int,
+    prefill_refill_target: int,
+) -> bool:
+    if running_bs <= 0:
+        return False
+
+    target_prefill_bs = int(prefill_refill_target)
+    if target_prefill_bs <= 1:
+        return False
+
+    target_prefill_bs = min(target_prefill_bs, int(max_running_requests))
+    return int(num_allocatable_reqs) < target_prefill_bs
 
 
 def scale_kv_cell_size_per_token_for_dflash(
@@ -99,6 +136,95 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
         backend = full_backend
     backend_name = type(backend).__name__
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
+
+
+def apply_dflash_verify_logits_adjustments(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+) -> None:
+    """Apply sampling-time logit adjustments for DFlash verify in place.
+
+    This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
+    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
+    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    """
+    if sampling_info is None:
+        return
+    if next_token_logits.ndim != 2:
+        raise ValueError(
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
+        )
+    if draft_token_num <= 0:
+        raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
+
+    bs = len(sampling_info)
+    if next_token_logits.shape[0] != bs * draft_token_num:
+        raise ValueError(
+            "next_token_logits row count mismatch for DFlash verify adjustments. "
+            f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
+        )
+
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=draft_token_num,
+        )
+
+    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    vocab_mask = getattr(sampling_info, "vocab_mask", None)
+    logit_bias = getattr(sampling_info, "logit_bias", None)
+
+    logits_3d: Optional[torch.Tensor] = None
+
+    def get_logits_3d() -> torch.Tensor:
+        nonlocal logits_3d
+        if logits_3d is None:
+            logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
+        return logits_3d
+
+    # Dense fallback only when we need live penalizer application or a vocab mask.
+    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
+    # broadcast over the verify block without materializing a repeated buffer.
+    if (
+        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
+    ) or vocab_mask is not None:
+        linear_penalty = torch.zeros(
+            (bs, next_token_logits.shape[1]),
+            dtype=torch.float32,
+            device=next_token_logits.device,
+        )
+        sampling_info.apply_logits_bias(linear_penalty)
+        get_logits_3d().add_(
+            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
+        )
+        return
+
+    if acc_linear_penalties is not None:
+        if (
+            acc_linear_penalties.device != next_token_logits.device
+            or acc_linear_penalties.dtype != next_token_logits.dtype
+        ):
+            acc_linear_penalties = acc_linear_penalties.to(
+                device=next_token_logits.device,
+                dtype=next_token_logits.dtype,
+            )
+        get_logits_3d().add_(acc_linear_penalties[:, None, :])
+
+    if logit_bias is not None:
+        if (
+            logit_bias.device != next_token_logits.device
+            or logit_bias.dtype != next_token_logits.dtype
+        ):
+            logit_bias = logit_bias.to(
+                device=next_token_logits.device,
+                dtype=next_token_logits.dtype,
+            )
+        get_logits_3d().add_(logit_bias[:, None, :])
 
 
 def _get_or_create_chain_verify_buffers(
@@ -198,6 +324,36 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
         int(round(start + (i * span) / (num_draft_layers - 1)))
         for i in range(num_draft_layers)
     ]
+
+
+def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
+    text_config = _get_text_config(config)
+    layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
+    if layer_types is None:
+        return None
+    if isinstance(layer_types, str) or not isinstance(layer_types, Sequence):
+        raise ValueError(
+            "DFLASH config.layer_types must be a sequence of attention type strings."
+        )
+    return layer_types
+
+
+def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return None
+
+    text_config = _get_text_config(config)
+    sliding_window = _cfg_get(
+        text_config, "sliding_window", _cfg_get(config, "sliding_window")
+    )
+    if sliding_window is None:
+        raise ValueError(
+            "DFLASH sliding_attention layers require config.sliding_window."
+        )
+
+    # HF sliding windows include the current token; SGLang stores window_left.
+    return int(sliding_window) - 1
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
@@ -465,6 +621,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     candidates: torch.Tensor,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
     threshold_single: Optional[float] = None,
     threshold_acc: Optional[float] = None,
     uniform_samples: Optional[torch.Tensor] = None,
@@ -561,12 +719,19 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         ).to(dtype=torch.int64)
         vocab_size = int(scaled_logits.shape[-1])
         repeated_top_ks.clamp_(min=1, max=vocab_size)
-        max_top_k = int(repeated_top_ks.max().item())
+        if max_top_k is None:
+            max_top_k = int(repeated_top_ks.max().item())
+        else:
+            max_top_k = int(max_top_k)
+        if max_top_k < 1:
+            max_top_k = 1
+        elif max_top_k > vocab_size:
+            max_top_k = vocab_size
 
         # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
         if 0 < max_top_k < vocab_size:
             topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
-            if not torch.all(repeated_top_ks == max_top_k):
+            if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
                 ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
                     None, :
                 ]
@@ -639,9 +804,12 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
-def validate_dflash_request(req: Req) -> Optional[str]:
+def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
+
+    if enable_overlap and req.return_hidden_states:
+        return "DFLASH speculative decoding does not support return_hidden_states yet."
 
     if (
         req.sampling_params.json_schema is not None

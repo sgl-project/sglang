@@ -146,12 +146,12 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    def get_prefix_hash_values(self, node: "TreeNode") -> List[str]:
+    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
         if node is None or node.hash_value is None:
             return []
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
-    def __lt__(self, other: "TreeNode"):
+    def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
 
@@ -319,7 +319,7 @@ class LRUList:
             return False
         return node.id in self.cache
 
-    def pretty_print(self, tree_cache: Optional["MambaRadixCache"] = None):
+    def pretty_print(self, tree_cache: Optional[MambaRadixCache] = None):
         """
         Pretty print the lru list
         """
@@ -358,7 +358,7 @@ class LRUList:
         return evictable_size
 
     # Note: this is expensive, only use for debug or idle check
-    def sanity_check(self, tree_cache: "MambaRadixCache"):
+    def sanity_check(self, tree_cache: MambaRadixCache):
         """
         Check if the lru list is valid by rebuilding the lru list from the tree, heapifying it, and
         checking if the lru list is valid.
@@ -507,7 +507,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         prev_prefix_len = params.prev_prefix_len
 
         if value is None:
-            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
+            value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
             self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
@@ -611,14 +611,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         def _skip_cache_unfinished_req(req: Req) -> None:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
+                req.req_pool_idx, : req.fill_len
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
         cache_len = (
             req.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer

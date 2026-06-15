@@ -270,6 +270,9 @@ class GenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
     mm_data_mooncake: Optional[List] = None
+    # Snapshot of encoder URLs at the time tokenizer-side computed
+    # ``num_items_assigned``.
+    encoder_urls: Optional[List[str]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -425,6 +428,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
+        self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -594,6 +598,21 @@ class GenerateReqInput(BaseReq):
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
             )
 
+    def _normalize_extra_key(self, num):
+        """Normalize extra_key for batch processing."""
+        if self.extra_key is None:
+            return
+        if isinstance(self.extra_key, str):
+            self.extra_key = [self.extra_key] * num
+        elif isinstance(self.extra_key, list):
+            if len(self.extra_key) != self.batch_size:
+                raise ValueError(
+                    "The length of extra_key should be equal to the batch size."
+                )
+            self.extra_key = self.extra_key * self.parallel_sample_num
+        else:
+            raise ValueError("extra_key should be a list or a string.")
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -710,7 +729,7 @@ class GenerateReqInput(BaseReq):
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
-            extra_key=self.extra_key,
+            extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -815,6 +834,10 @@ class TokenizedGenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
     mm_data_mooncake: Optional[List] = None
+    # Encoder URL snapshot frozen at tokenizer-side dispatch time so that
+    # encoder_idx assignments stay consistent in the scheduler subprocess.
+    # Internal IPC only.
+    encoder_urls: Optional[List[str]] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
