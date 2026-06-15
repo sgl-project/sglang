@@ -38,6 +38,14 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     tvm::ffi::TensorView mask,
     bool use_silu_and_mul);
 
+void silu_and_mul_scaled_fp4_experts_quant_packed_sm100a(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView output_scale,
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView input_global_scale,
+    tvm::ffi::TensorView input_offset_by_experts,
+    tvm::ffi::TensorView output_scale_offset_by_experts);
+
 void scaled_fp4_quant(
     tvm::ffi::TensorView output,
     tvm::ffi::TensorView input,
@@ -65,4 +73,15 @@ void silu_and_mul_scaled_fp4_experts_quant(
     tvm::ffi::TensorView mask,
     bool use_silu_and_mul) {
   silu_and_mul_scaled_fp4_experts_quant_sm100a(output, output_scale, input, input_global_scale, mask, use_silu_and_mul);
+}
+
+void silu_and_mul_scaled_fp4_experts_quant_packed(
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView output_scale,
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView input_global_scale,
+    tvm::ffi::TensorView input_offset_by_experts,
+    tvm::ffi::TensorView output_scale_offset_by_experts) {
+  silu_and_mul_scaled_fp4_experts_quant_packed_sm100a(
+      output, output_scale, input, input_global_scale, input_offset_by_experts, output_scale_offset_by_experts);
 }
