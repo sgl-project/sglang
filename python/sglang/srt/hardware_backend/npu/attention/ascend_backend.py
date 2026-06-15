@@ -1556,12 +1556,9 @@ class AscendAttnBackend(AttentionBackend):
                 q, k, v = [
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
                 ]
-                if q_rope is not None:
-                    q_nope = q
-                else:
-                    q_nope, q_rope = q.split(
-                        [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
-                    )
+                q_nope, q_rope = q.split(
+                    [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+                )
                 k_nope, k_rope = k.split(
                     [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
                 )
@@ -1723,12 +1720,9 @@ class AscendAttnBackend(AttentionBackend):
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
                 ]
 
-                if q_rope is not None:
-                    q_nope = q
-                else:
-                    q_nope, q_rope = q.split(
-                        [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
-                    )
+                q_nope, q_rope = q.split(
+                    [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+                )
                 k_nope, k_rope = k.split(
                     [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
                 )
