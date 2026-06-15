@@ -261,8 +261,8 @@ python3 -m sglang.profiler \
 ```
 ```bash Command
 # Terminal 2: Wait for "Waiting for N steps" output from Terminal 1, then send requests. 
-The profiler starts recording once /start_profile is received by the server. 
-Requests sent before the server receives /start_profile will not be captured.
+# The profiler starts recording once /start_profile is received by the server. 
+# Requests sent before the server receives /start_profile will not be captured.
 curl http://127.0.0.1:30000/generate \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello", "sampling_params": {"max_new_tokens": 32}}'
@@ -433,7 +433,7 @@ Waiting for 10 steps and the trace to be flushed.... (profile_by_stage=False)
 The directory structure is
 `<output_dir>/<hostname>_<pid>_<timestamp>_ascend_pt/`. When using Method C
 (`bench_serving --profile`), a timestamp subdirectory is added:
-`<output_dir>/<timestamp>/<output_dir>/<hostname>_<pid>_<timestamp>_ascend_pt/`. Always check the server log for the exact path:
+`<output_dir>/<timestamp>/<hostname>_<pid>_<timestamp>_ascend_pt/`. Always check the server log for the exact path:
 `Profiling done. Traces are saved to: <path>`.
 
 ### 5. Viewing Results
