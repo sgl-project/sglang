@@ -70,7 +70,7 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.token_buffer import TokenBuffer
+from sglang.srt.managers.viewable_array import ViewableArray
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -710,7 +710,7 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.token_buf = TokenBuffer(origin_input_ids)
+        self.token_buf = ViewableArray(origin_input_ids)
         self.origin_input_len: int = len(origin_input_ids)
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
@@ -1034,7 +1034,7 @@ class Req(ReqDllmMixin):
         self.token_buf.truncate(self.origin_input_len)
 
     def rebuild_origin_input_ids(self, new_origin_input_ids: Iterable[int]) -> None:
-        self.token_buf = TokenBuffer(new_origin_input_ids)
+        self.token_buf = ViewableArray(new_origin_input_ids)
         self.origin_input_len = len(self.token_buf)
 
     @property
@@ -1127,8 +1127,11 @@ class Req(ReqDllmMixin):
             length += self.dllm_config.block_size
         return length
 
+    def fill_ids_upto(self, length: int) -> array:
+        return array("q", self.get_full_untruncated_fill_ids()[:length])
+
     def get_fill_ids(self) -> array:
-        return array("q", self.get_full_untruncated_fill_ids()[: self.fill_len])
+        return self.fill_ids_upto(self.fill_len)
 
     def init_next_round_input(
         self,
