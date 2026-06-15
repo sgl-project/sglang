@@ -2386,6 +2386,12 @@ class DeepseekV2Model(nn.Module):
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
+    def disable_allreduce_fusion_for_eagle3_aux_capture(self) -> None:
+        for capture_id in self.layers_to_capture:
+            producer_id = capture_id - 1
+            comm = self.layers[producer_id].layer_communicator
+            comm.disable_allreduce_fusion_for_eagle3_aux_capture = True
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2776,6 +2782,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 self.model.layers_to_capture = [val + 1 for val in layer_ids]
             else:
                 self.model.layers_to_capture = list(layer_ids)
+        self.model.disable_allreduce_fusion_for_eagle3_aux_capture()
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:
@@ -2788,6 +2795,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.disable_allreduce_fusion_for_eagle3_aux_capture()
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

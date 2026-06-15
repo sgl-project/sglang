@@ -457,6 +457,10 @@ class LayerCommunicator:
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
+        # Per-layer opt-out of MLP all-reduce fusion, set on the layers that
+        # produce EAGLE3 (and DFLASH) aux-capture inputs so the captured residual
+        # stream is the reduced value rather than a per-rank partial sum.
+        self.disable_allreduce_fusion_for_eagle3_aux_capture = False
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -738,6 +742,9 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        if self.disable_allreduce_fusion_for_eagle3_aux_capture:
+            return False
+
         # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
