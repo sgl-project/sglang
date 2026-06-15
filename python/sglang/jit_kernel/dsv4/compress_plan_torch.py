@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-import numpy as np
 import torch
 
 
@@ -96,8 +95,8 @@ def plan_compress_prefill(
     is_overlap = compress_ratio == 4
     mtp_pad = min(ring_size - compress_ratio, 4)
 
-    seq_np = seq_lens.cpu().numpy().astype(np.int32)
-    ext_np = extend_lens.cpu().numpy().astype(np.int32)
+    seq_list = seq_lens.cpu().tolist()
+    ext_list = extend_lens.cpu().tolist()
 
     c_seq: List[int] = []
     c_rid16: List[int] = []
@@ -107,7 +106,7 @@ def plan_compress_prefill(
     w_pos1: List[int] = []
 
     counter = 0
-    for b, (sl, el) in enumerate(zip(seq_np, ext_np)):
+    for b, (sl, el) in enumerate(zip(seq_list, ext_list)):
         sl = int(sl)
         el = int(el)
         prefix_len = sl - el
@@ -264,8 +263,8 @@ def plan_compress_prefill_legacy(
     device = req_pool_indices.device
     is_overlap = compress_ratio == 4
 
-    seq_np = seq_lens.cpu().numpy().astype(np.int32)
-    ext_np = extend_lens.cpu().numpy().astype(np.int32)
+    seq_list = seq_lens.cpu().tolist()
+    ext_list = extend_lens.cpu().tolist()
 
     c_seq: List[int] = []
     c_rid16: List[int] = []
@@ -275,7 +274,7 @@ def plan_compress_prefill_legacy(
     w_pos1: List[int] = []
 
     counter = 0
-    for b, (sl, el) in enumerate(zip(seq_np, ext_np)):
+    for b, (sl, el) in enumerate(zip(seq_list, ext_list)):
         sl = int(sl)
         el = int(el)
         prefix_len = sl - el
