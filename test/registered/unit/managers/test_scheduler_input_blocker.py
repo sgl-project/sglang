@@ -147,17 +147,20 @@ class TestInputBlockerGuardRegion(CustomTestCase):
         send_to_scheduler = MagicMock()
         with input_blocker_guard_region(send_to_scheduler):
             pass
-        self.assertEqual(send_to_scheduler.send_pyobj.mock_calls, [
-            unittest.mock.call(_block()), unittest.mock.call(_unblock())
-        ])
+        self.assertEqual(
+            send_to_scheduler.send_pyobj.mock_calls,
+            [unittest.mock.call(_block()), unittest.mock.call(_unblock())],
+        )
 
     def test_sends_unblock_even_on_exception(self):
         send_to_scheduler = MagicMock()
         with self.assertRaises(ValueError):
             with input_blocker_guard_region(send_to_scheduler):
                 raise ValueError("boom")
-        self.assertEqual(send_to_scheduler.send_pyobj.mock_calls,
-                         [unittest.mock.call(_block()), unittest.mock.call(_unblock())])
+        self.assertEqual(
+            send_to_scheduler.send_pyobj.mock_calls,
+            [unittest.mock.call(_block()), unittest.mock.call(_unblock())],
+        )
 
 
 if __name__ == "__main__":
