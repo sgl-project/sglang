@@ -158,6 +158,7 @@ class HfModelConfigParser(ModelConfigParserBase):
             "gemma4_assistant",
             "gemma4_unified",
             "gemma4_unified_assistant",
+            "diffusion_gemma",
         ):
             # Gemma4 configs use base attributes for SWA layers and `global_*`
             # variants for full-attention layers.  SGLang expects the opposite:
