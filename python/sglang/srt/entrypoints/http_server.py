@@ -1498,7 +1498,7 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInputSpec, request: Request):
         LoadLoRAAdapterReqInput(**obj.__dict__),
         request,
     )
-    result = msgspec.to_builtins(result)
+    result = msgspec.structs.asdict(result)
 
     if result.get("success", False):
         return ORJSONResponse(
@@ -1521,7 +1521,7 @@ async def load_lora_adapter_from_tensors(
         LoadLoRAAdapterFromTensorsReqInput(**obj.__dict__),
         request,
     )
-    result = msgspec.to_builtins(result)
+    result = msgspec.structs.asdict(result)
 
     if result.get("success", False):
         return ORJSONResponse(result, status_code=HTTPStatus.OK)
@@ -1537,7 +1537,7 @@ async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInputSpec, request: Reque
         UnloadLoRAAdapterReqInput(**obj.__dict__),
         request,
     )
-    result = msgspec.to_builtins(result)
+    result = msgspec.structs.asdict(result)
 
     if result.get("success", False):
         return ORJSONResponse(

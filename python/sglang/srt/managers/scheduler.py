@@ -3579,7 +3579,10 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        server_args = vars(get_global_server_args())
+        server_args = dict(vars(get_global_server_args()))
+        # This field is not serializable.
+        server_args.pop("model_config", None)
+
         last_gen_throughput = self.metrics_reporter.last_gen_throughput
         memory_usage = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -3655,9 +3658,14 @@ class Scheduler(
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
+
+        server_args = dict(vars(get_global_server_args()))
+        # This field is not serializable.
+        server_args.pop("model_config", None)
+
         return SetInternalStateReqOutput(
             updated=True,
-            server_args=vars(get_global_server_args()),
+            server_args=server_args,
         )
 
     def save_remote_model(self, **kwargs):

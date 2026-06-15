@@ -801,7 +801,7 @@ class TokenizerControlMixin:
         )
         results = []
         for response in responses:
-            res = msgspec.to_builtins(response)
+            res = msgspec.structs.asdict(response)
             server_args = res.pop("server_args", None) or {}
             res = {k: v for k, v in res.items() if v is not None}
             results.append(server_args | res)

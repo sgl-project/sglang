@@ -64,13 +64,13 @@ logger = logging.getLogger(__name__)
 
 
 # The BaseReq IPC class for IPC object
-class BaseReq(msgspec.Struct, tag=True, kw_only=True):
+class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     rid: Optional[str] = None
     http_worker_ipc: Optional[str] = None
 
 
 # The BaseBatchReq IPC class for IPC object
-class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True):
+class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     rids: Optional[List[str]] = None
     http_worker_ipcs: Optional[List[Optional[str]]] = None
 
@@ -1782,14 +1782,10 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
     step_time_dict: Optional[Dict[str, float]] = None
 
 
-# The ServerArgs has a lot of fields with different types
-# let's use object to make it serialize/deserialize via pickle for now
 class SetInternalStateReq(BaseReq, kw_only=True):
     server_args: Dict[str, Any]
 
 
-# The ServerArgs has a lot of fields with different types
-# let's use object to make it serialize/deserialize via pickle for now
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
     server_args: Dict[str, Any]
@@ -2168,7 +2164,7 @@ _check_all_req_types()
 
 
 # Below are msgpack serialization and ipc utils
-class PickleWrapper(msgspec.Struct, tag=True):
+class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
     data: bytes
 
 
