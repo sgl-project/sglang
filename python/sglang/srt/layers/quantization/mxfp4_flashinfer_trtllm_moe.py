@@ -453,6 +453,9 @@ def maybe_fuse_routed_scale_and_shared_add(
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         Mxfp4FlashinferCutlassMoEMethod,
     )
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_w4a8_moe import (
+        Mxfp4FlashinferW4A8MoEMethod,
+    )
     from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
         Mxfp4MarlinMoEMethod,
     )
@@ -462,6 +465,7 @@ def maybe_fuse_routed_scale_and_shared_add(
         (
             Mxfp4FlashinferTrtllmMoEMethod,
             Mxfp4FlashinferCutlassMoEMethod,
+            Mxfp4FlashinferW4A8MoEMethod,
             Mxfp4MarlinMoEMethod,
         ),
     )
