@@ -32,8 +32,6 @@ alloc_decode, using the per-pool slot indices returned in ``DSV4OutCacheLoc``.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE

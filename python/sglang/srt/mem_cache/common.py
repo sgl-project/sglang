@@ -31,6 +31,7 @@ _is_hip = is_hip()
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
@@ -101,7 +102,9 @@ def free_swa_out_of_window_slots(
             maybe_evict_dsv4_state_on_swa,
         )
 
-        maybe_evict_dsv4_state_on_swa(token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen)
+        maybe_evict_dsv4_state_on_swa(
+            token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen
+        )
         req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
@@ -345,7 +348,7 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     backup_state: bool = False,
     req_pool_indices: Optional[torch.Tensor] = None,
-    dsv4_state_lens: Optional["DSV4StateLens"] = None,
+    dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
@@ -357,9 +360,7 @@ def alloc_paged_token_slots_extend(
     if backup_state:
         state = allocator.backup_state()
 
-    is_dsv4 = req_pool_indices is not None and hasattr(
-        allocator, "c4_attn_allocator"
-    )
+    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
     extra_alloc_kwargs = {}
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
@@ -527,7 +528,7 @@ def alloc_paged_token_slots_decode(
     last_loc: torch.Tensor,
     token_per_req: int = 1,
     req_pool_indices: Optional[torch.Tensor] = None,
-    dsv4_state_lens: Optional["DSV4StateLens"] = None,
+    dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
@@ -541,9 +542,7 @@ def alloc_paged_token_slots_decode(
     # bundle, which we unpack to out_full_loc and stash on the batch (see
     # alloc_paged_token_slots_extend). Gate via hasattr so non-DSV4
     # allocators stay unchanged.
-    is_dsv4 = req_pool_indices is not None and hasattr(
-        allocator, "c4_attn_allocator"
-    )
+    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
     extra_alloc_kwargs = {}
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
@@ -554,9 +553,7 @@ def alloc_paged_token_slots_decode(
         if dsv4_state_lens is not None:
             extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
-    out = allocator.alloc_decode(
-        seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs
-    )
+    out = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs)
 
     if is_dsv4:
         bundle = out

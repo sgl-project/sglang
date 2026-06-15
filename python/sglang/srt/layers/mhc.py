@@ -1457,16 +1457,11 @@ def npu_hc_pre(
     # so the dummies must too — otherwise downstream comb/post-aware
     # ops see a silent fp32 ↔ bf16 split between idle and non-idle
     # batches.
-    is_idle = (
-        forward_batch is not None
-        and forward_batch.forward_mode.is_idle()
-    )
+    is_idle = forward_batch is not None and forward_batch.forward_mode.is_idle()
     if is_idle or x.shape[0] == 0:
         bs = x.shape[0]
         y = torch.empty((bs, shape[-1]), dtype=dtype, device=x.device)
-        post = torch.empty(
-            (bs, hc_mult), dtype=torch.float32, device=x.device
-        )
+        post = torch.empty((bs, hc_mult), dtype=torch.float32, device=x.device)
         comb = torch.empty(
             (bs, hc_mult, hc_mult),
             dtype=torch.float32,

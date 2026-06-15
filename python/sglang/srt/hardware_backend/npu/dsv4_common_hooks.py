@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 
 def maybe_write_dsv4_extend(
-    batch: "ScheduleBatch",
+    batch: ScheduleBatch,
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
@@ -117,7 +117,7 @@ def maybe_write_dsv4_extend(
 
 
 def maybe_write_dsv4_decode(
-    batch: "ScheduleBatch",
+    batch: ScheduleBatch,
     seq_lens_cpu: torch.Tensor,
     token_per_req: int,
 ) -> None:
@@ -259,7 +259,7 @@ def _write_per_req_slice(
     )
 
 
-def maybe_evict_dsv4_state(batch: "ScheduleBatch", req: "Req", pre_len: int) -> None:
+def maybe_evict_dsv4_state(batch: ScheduleBatch, req: Req, pre_len: int) -> None:
     """Per-decode evict for the DSV4-NPU compress-state pools, independent of
     SWA evict cadence. Called every decode step from ``ScheduleBatch``.
 
@@ -289,17 +289,25 @@ def maybe_evict_dsv4_state(batch: "ScheduleBatch", req: "Req", pre_len: int) -> 
     c128_watermark = ((max(0, pre_len - (128 + 64))) // page_size) * page_size
 
     _free_state_range(
-        allocator.c4_state_attn_allocator, pool, "req_to_token_c4_state",
-        req, "c4_state_alloc_offset", c4_watermark,
+        allocator.c4_state_attn_allocator,
+        pool,
+        "req_to_token_c4_state",
+        req,
+        "c4_state_alloc_offset",
+        c4_watermark,
     )
     _free_state_range(
-        allocator.c128_state_attn_allocator, pool, "req_to_token_c128_state",
-        req, "c128_state_alloc_offset", c128_watermark,
+        allocator.c128_state_attn_allocator,
+        pool,
+        "req_to_token_c128_state",
+        req,
+        "c128_state_alloc_offset",
+        c128_watermark,
     )
 
 
 def maybe_evict_dsv4_state_on_swa(
-    allocator, pool, req: "Req", new_swa_evicted_seqlen: int
+    allocator, pool, req: Req, new_swa_evicted_seqlen: int
 ) -> None:
     """Free compress-state slots that ride along with SWA eviction.
 
@@ -315,16 +323,24 @@ def maybe_evict_dsv4_state_on_swa(
     fast enough, and the SWA-ride eviction is the primary reclaim mechanism.
     For typical large-window models (DS-V4 with window >> 192), the
     watermark eviction always runs first, making this path a no-op.
-  """
+    """
     if not hasattr(allocator, "c4_state_attn_allocator"):
         return
     _free_state_range(
-        allocator.c4_state_attn_allocator, pool, "req_to_token_c4_state",
-        req, "c4_state_alloc_offset", new_swa_evicted_seqlen,
+        allocator.c4_state_attn_allocator,
+        pool,
+        "req_to_token_c4_state",
+        req,
+        "c4_state_alloc_offset",
+        new_swa_evicted_seqlen,
     )
     _free_state_range(
-        allocator.c128_state_attn_allocator, pool, "req_to_token_c128_state",
-        req, "c128_state_alloc_offset", new_swa_evicted_seqlen,
+        allocator.c128_state_attn_allocator,
+        pool,
+        "req_to_token_c128_state",
+        req,
+        "c128_state_alloc_offset",
+        new_swa_evicted_seqlen,
     )
 
 
@@ -332,7 +348,7 @@ def _free_state_range(
     state_allocator,
     pool,
     table_attr: str,
-    req: "Req",
+    req: Req,
     offset_attr: str,
     watermark: int,
 ) -> None:
@@ -340,11 +356,7 @@ def _free_state_range(
     and advance its low-water mark. No-op when the allocator/table is absent or
     the watermark hasn't advanced past the current offset."""
     offset = getattr(req, offset_attr, 0)
-    if (
-        state_allocator is None
-        or not hasattr(pool, table_attr)
-        or watermark <= offset
-    ):
+    if state_allocator is None or not hasattr(pool, table_attr) or watermark <= offset:
         return
     free_slots = getattr(pool, table_attr)[req.req_pool_idx, offset:watermark]
     state_allocator.free(free_slots.to(torch.int64))

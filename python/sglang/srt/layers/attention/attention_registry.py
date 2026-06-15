@@ -6,7 +6,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.utils import get_device_capability, is_musa, is_npu, is_hip
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
 _is_npu = is_npu()

@@ -19,9 +19,7 @@ from sglang.srt.layers.moe.topk import (
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
 )
-from sglang.srt.utils import is_hip, is_npu
-
-_is_npu = is_npu()
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -171,21 +169,10 @@ class HashTopK(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 scoring_func=self.score_func,
             )
-        elif _is_npu:
-            # fused_shared_experts == 1 is not supported
-            from sglang.srt.hardware_backend.npu.moe.topk import fused_hash_topk_npu
-            return fused_hash_topk_npu(
-                router_logits=router_logits,
-                input_ids=input_ids,
-                tid2eid=self.tid2eid,
-                routed_scaling_factor=self.routed_scaling_factor,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-            )
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
 
-        if is_hip():
-            topk_weights = topk_weights.to(torch.float32)
+        topk_weights = topk_weights.to(torch.float32)
 
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         if is_hip():

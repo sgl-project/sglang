@@ -49,7 +49,6 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.deepseek_v4_rope import (
-    apply_rotary_emb_triton,
     v4_rope_inplace_npu,
 )
 from sglang.srt.layers.dp_attention import (
@@ -62,7 +61,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
-    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_dp_global_num_tokens,
@@ -460,7 +458,8 @@ class MQALayer(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=attn_tp_size == get_tensor_model_parallel_world_size() and attn_tp_size > 1,
+            reduce_results=attn_tp_size == get_tensor_model_parallel_world_size()
+            and attn_tp_size > 1,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -839,19 +838,29 @@ class MQALayer(nn.Module):
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            
+            _dummy = q.new_ones(q.shape[-1])
+            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
             else:
                 kv, _ = self.wkv(x)
             kv = self.kv_norm(kv)
-            
+
             v4_rope_inplace_npu(
-                    q[..., -self.qk_rope_head_dim :],
-                    kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-                    self.freqs_cis,
-                    positions,
-                )
+                q[..., -self.qk_rope_head_dim :],
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions,
+            )
+            attn_backend.store_cache(
+                layer_id=self.layer_id,
+                swa_k=kv,
+                forward_batch=forward_batch,
+            )
+            kv = None
+            if q_out is not None:
+                q_out.copy_(q)
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
@@ -1526,7 +1535,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_ffn_base,
                 norm=self.post_attention_layernorm,
                 forward_batch=forward_batch,
-        )
+            )
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 

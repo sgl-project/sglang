@@ -37,10 +37,10 @@ import torch_npu
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    ONLINE_C128,
     DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
-    ONLINE_C128,
 )
 
 
@@ -72,9 +72,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         # Use the GLOBAL kernel_page_size so cmp_kv.shape[1] == ori_kv.shape[1].
         # Writes are flat-indexed (set_compress_buffer flattens (0, 1) and
         # indexes by loc), so page granularity affects only shape, not location.
-        npu_num_pages = (
-            self.size + self.kernel_page_size + 1
-        ) // self.kernel_page_size
+        npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
         return torch.zeros(
             npu_num_pages,
             self.kernel_page_size,
@@ -159,7 +157,10 @@ class NPUCompressStatePool(CompressStatePool):
         # (``state_cache_3d`` property, ``kv_score_buffer`` attribute,
         # ``__getitem__`` semantics via KVAndScore) stays intact because
         # we set the same fields.
-        assert ratio in (4, 128), f"NPUCompressStatePool only supports ratio in (4, 128); got {ratio}"
+        assert ratio in (
+            4,
+            128,
+        ), f"NPUCompressStatePool only supports ratio in (4, 128); got {ratio}"
         assert page_size > 1, (
             "NPUCompressStatePool requires page_size>1 (kernel's "
             "state_cache_3d view is (block_num, page_size, slot_dim)). "
@@ -232,15 +233,23 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.index_k_buffer = [
                 torch.zeros(
-                    npu_num_pages, kp, 1, self.index_head_dim,
-                    dtype=torch.int8, device=self.device,
+                    npu_num_pages,
+                    kp,
+                    1,
+                    self.index_head_dim,
+                    dtype=torch.int8,
+                    device=self.device,
                 )
                 for _ in range(self.layer_num)
             ]
             self.index_scale_buffer = [
                 torch.zeros(
-                    npu_num_pages, kp, 1, 1,
-                    dtype=torch.float16, device=self.device,
+                    npu_num_pages,
+                    kp,
+                    1,
+                    1,
+                    dtype=torch.float16,
+                    device=self.device,
                 )
                 for _ in range(self.layer_num)
             ]
@@ -550,9 +559,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         if from_indexer:
             assert ratio == 4, f"indexer only on c4 layers, got ratio={ratio}"
             if device_type == "npu":
-                assert self.c4_indexer_kv_pool.has_npu_storage, (
-                    "NPU index buffers not allocated — pool was init'd on CUDA?"
-                )
+                assert (
+                    self.c4_indexer_kv_pool.has_npu_storage
+                ), "NPU index buffers not allocated — pool was init'd on CUDA?"
                 self.c4_indexer_kv_pool.set_index_k_scale(
                     compress_layer_id, loc, kv, kv_scale
                 )

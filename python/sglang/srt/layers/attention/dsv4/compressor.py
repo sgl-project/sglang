@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from sglang.jit_kernel.dsv4 import linear_bf16_fp32, triton_create_paged_compress_data
 from sglang.jit_kernel.dsv4.compress_old import (
@@ -20,18 +19,18 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import add_prefix, get_bool_env_var, set_weight_attrs, is_npu
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -391,7 +390,6 @@ class Compressor(MultiPlatformOp):
 
         self.ape_converted = False
 
-
     def _apply_ape_hotfix(self):
         self.ape_converted = True
 
@@ -478,7 +476,7 @@ class Compressor(MultiPlatformOp):
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
-        
+
         if dsa_use_prefill_cp(forward_batch):
             x = cp_all_gather_rerange_output(
                 x,
@@ -487,9 +485,8 @@ class Compressor(MultiPlatformOp):
                 torch.cuda.current_stream(),
             )
 
-        return get_attn_backend().forward_compress(
-            self, x, forward_batch
-        )
+        return get_attn_backend().forward_compress(self, x, forward_batch)
+
 
 if _is_hip and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
     from sglang.srt.layers.attention.dsv4.compress_hip import (  # noqa: F811

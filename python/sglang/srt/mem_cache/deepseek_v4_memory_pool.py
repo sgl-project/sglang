@@ -778,10 +778,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if ratio == 0:
                 continue
 
-            self.compress_state_pools[idx] = self._make_attn_state_pool(ratio, enable_memory_saver)
+            self.compress_state_pools[idx] = self._make_attn_state_pool(
+                ratio, enable_memory_saver
+            )
 
             if ratio == 4:
-                self.indexer_compress_state_pools[idx] = self._make_indexer_state_pool(ratio, enable_memory_saver)
+                self.indexer_compress_state_pools[idx] = self._make_indexer_state_pool(
+                    ratio, enable_memory_saver
+                )
 
     def _init_compressed_layer_mapping(self):
         c1_cnt = c4_cnt = c128_cnt = 0

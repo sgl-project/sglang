@@ -14,8 +14,10 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 _is_hip = is_hip()
 _is_npu = is_npu()
 
+
 def _lcm(a: int, b: int) -> int:
     return a // gcd(a, b) * b
+
 
 @dataclasses.dataclass
 class KVAndScore:
@@ -108,7 +110,9 @@ class CompressStatePool:
             # op (torch.ops.custom.compressor wants its state_cache in that
             # 3D layout). page_size=1 (default) falls back to the original
             # ratio-only padding.
-            pad_to = _lcm(ratio, swa_page_size) if (swa_page_size > 1 and _is_npu) else ratio
+            pad_to = (
+                _lcm(ratio, swa_page_size) if (swa_page_size > 1 and _is_npu) else ratio
+            )
             self._size = (self._size + pad_to - 1) // pad_to * pad_to
             last_dim = 2 * (1 + overlap) * head_dim
 
@@ -175,6 +179,4 @@ class CompressStatePool:
             "state_cache_3d requires page_size>1; pool was constructed "
             "with the default page_size=1 (flat 2D layout)."
         )
-        return self.kv_score_buffer.kv_score.view(
-            -1, self.page_size, self.last_dim
-        )
+        return self.kv_score_buffer.kv_score.view(-1, self.page_size, self.last_dim)

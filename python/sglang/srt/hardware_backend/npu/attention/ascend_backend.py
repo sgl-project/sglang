@@ -561,7 +561,6 @@ class AscendAttnBackend(AttentionBackend):
         Default no-op. Overridden by DeepseekV4AscendAttnBackend.
         """
         pass
-            
 
     def _init_cuda_graph_metadata(
         self,

@@ -468,7 +468,9 @@ def fused_norm_rope_inplace_triton(
 _NPU_ROPE_CONTIG_CACHE: dict[int, tuple] = {}
 
 
-def _get_contig_freqs_real_imag(freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _get_contig_freqs_real_imag(
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Return contiguous (real, imag) halves of ``freqs_cis``, cached by id.
 
     Used by NPU rope paths to avoid the per-call StridedSlice materialization
