@@ -57,6 +57,14 @@ echo "DEEPGEMM_SRC:   ${DEEPGEMM_SRC}"
 echo "DEPS_TAG:       ${DEPS_TAG}"
 echo "----------------------------------------"
 
+# Keep future sgl-deep-gemm wheel metadata aligned with SGLang's tvm-ffi ABI range.
+DEEPGEMM_PYPROJECT="${DEEPGEMM_SRC}/sgl_deep_gemm/pyproject.toml"
+if [ -f "${DEEPGEMM_PYPROJECT}" ] && grep -q '"apache-tvm-ffi==0.1.9"' "${DEEPGEMM_PYPROJECT}"; then
+  tmp_pyproject="${DEEPGEMM_PYPROJECT}.tmp"
+  sed 's/"apache-tvm-ffi==0\.1\.9"/"apache-tvm-ffi>=0.1.9,<0.2"/g' "${DEEPGEMM_PYPROJECT}" > "${tmp_pyproject}"
+  mv "${tmp_pyproject}" "${DEEPGEMM_PYPROJECT}"
+fi
+
 docker build \
   -f "${DOCKERFILE}" "$(dirname "${DOCKERFILE}")" \
   --build-arg BASE_IMG="${BASE_IMG}" \
