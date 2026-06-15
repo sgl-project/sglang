@@ -50,19 +50,21 @@ def _pack_decode_plans(
     )
 
 
-def _c4_prefill_buffer_len(prefix_len: int, seq_len_at_event: int) -> int:
-    """
-    Match CUDA JIT planner behavior:
+def _prefill_buffer_len(j: int, compress_ratio: int) -> int:
+    """How many of a compress event's window tokens come from the state buffer.
 
-    - For prefill with prefix (extend phase), overlap half (4 tokens) comes from buffer,
-      fresh half comes from kv_input => buffer_len=4.
-    - For initial prefill with no prefix:
-        * first compress at seq_len==4 => buffer_len=4
-        * later compresses => buffer_len=0 (overlap not in buffer yet during prefill)
+    Matches the CUDA JIT planner (c_plan.cuh): for the compress event at extend
+    index ``j`` (0-based position within the current extend chunk),
+
+        buffer_len = window_size - min(j + 1, window_size)
+
+    where ``window_size`` is ``2 * compress_ratio`` for the overlapping c4 path
+    and ``compress_ratio`` otherwise. The count decreases as ``j`` grows and
+    reaches 0 once the whole window lives in ``kv_input`` (j + 1 >= window_size).
+    It depends only on ``j``, not on ``prefix_len``.
     """
-    if prefix_len > 0:
-        return 4
-    return 4 if seq_len_at_event == 4 else 0
+    window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
+    return window_size - min(j + 1, window_size)
 
 
 def plan_compress_prefill(
@@ -120,10 +122,7 @@ def plan_compress_prefill(
             ragged_id = counter + j
 
             if (position + 1) % compress_ratio == 0:
-                if compress_ratio == 4:
-                    buffer_len = _c4_prefill_buffer_len(prefix_len, position + 1)
-                else:
-                    buffer_len = 0
+                buffer_len = _prefill_buffer_len(j, compress_ratio)
 
                 c_seq.append(position + 1)
                 c_rid16.append(ragged_id & 0xFFFF)
@@ -289,10 +288,7 @@ def plan_compress_prefill_legacy(
             ragged_id = counter + j
 
             if (position + 1) % compress_ratio == 0:
-                if compress_ratio == 4:
-                    buffer_len = _c4_prefill_buffer_len(prefix_len, position + 1)
-                else:
-                    buffer_len = 0
+                buffer_len = _prefill_buffer_len(j, compress_ratio)
 
                 c_seq.append(position + 1)
                 c_rid16.append(ragged_id & 0xFFFF)
