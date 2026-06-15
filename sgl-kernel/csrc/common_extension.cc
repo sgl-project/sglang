@@ -97,6 +97,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
       "topk_indices_offset, Tensor ? row_starts) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
+  m.def(
+      "fast_kpool_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_token_indices, int pool_size, "
+      "Tensor? page_table, Tensor? topk_indices_offset, Tensor? row_starts, Tensor? seq_lens) -> ()");
+  m.impl("fast_kpool_topk_transform_fused", torch::kCUDA, &fast_kpool_topk_transform_interface);
 
   /*
    * From csrc/gemm

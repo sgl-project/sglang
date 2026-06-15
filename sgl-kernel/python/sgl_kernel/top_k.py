@@ -147,3 +147,51 @@ def fast_topk_transform_ragged_fused(
         score, lengths, topk_indices_ragged, topk_indices_offset, row_starts
     )
     return topk_indices_ragged
+
+
+def fast_kpool_topk_transform_fused(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    pool_size: int,
+    topk: int,
+    page_table: Optional[torch.Tensor] = None,
+    topk_indices_offset: Optional[torch.Tensor] = None,
+    row_starts: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Pool-level radix top-k for NSA kpool indexer.
+
+    Selects pool groups from ``score`` at pool granularity, expands each selected
+    group to ``pool_size`` token indices, and optionally transforms those token
+    indices through a page table or a ragged offset.
+    """
+    assert topk % pool_size == 0
+    group_topk = topk // pool_size
+    assert group_topk in (128, 160, 192, 224, 256, 512), (
+        "fast_kpool_topk_transform_fused supports pool-level topk "
+        "128, 160, 192, 224, 256, and 512 only"
+    )
+    assert score.dim() == 2
+    assert page_table is None or topk_indices_offset is None
+    if seq_lens is not None:
+        assert seq_lens.dim() == 1
+        assert seq_lens.shape[0] == score.shape[0]
+
+    op = getattr(torch.ops.sgl_kernel, "fast_kpool_topk_transform_fused", None)
+    if op is None:
+        raise NotImplementedError("fast_kpool_topk_transform_fused op is not built")
+
+    out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
+    dst_token_indices = score.new_empty((score.shape[0], out_cols), dtype=torch.int32)
+    op(
+        score,
+        lengths,
+        dst_token_indices,
+        pool_size,
+        page_table,
+        topk_indices_offset,
+        row_starts,
+        seq_lens,
+    )
+    return dst_token_indices

@@ -81,8 +81,8 @@ FetchContent_Populate(repo-flashinfer)
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/bcf72ccc6816b36a5fae2c5a3c027604629785e0.tar.gz
-    URL_HASH SHA256=2110d8ca1ed9b330b9f99c1d4088be12a37e44152c39fdf90dfb6526f532ba96
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/65c54cc5a6d29fee56036484c749bc5b8e00fd66.tar.gz
+    URL_HASH SHA256=53307eefba65d9ac26092433a8bc4d48182ce0bb27132e69ab0b8d6ff8ee47db
 )
 FetchContent_Populate(repo-flash-attention)
 

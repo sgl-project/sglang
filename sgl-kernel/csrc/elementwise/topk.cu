@@ -87,10 +87,12 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-__device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
+template <int K>
+__device__ void
+fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
   // An optimized topk kernel copied from tilelang kernel
-  // We assume length > TopK here, or it will crash
-  int topk = TopK;
+  // We assume length > K here, or it will crash
+  int topk = K;
   constexpr auto BLOCK_SIZE = 1024;
   constexpr auto RADIX = 256;
   constexpr auto SMEM_INPUT_SIZE = kSmem / (2 * sizeof(int));
@@ -232,7 +234,7 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
           if (round == 3) {
             const auto pos = ::atomicAdd(&s_last_remain, -1);
             if (pos > 0) {
-              index[TopK - pos] = idx;
+              index[K - pos] = idx;
             }
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
@@ -249,6 +251,24 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       __syncthreads();
     }
   }
+}
+
+__device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
+  fast_topk_cuda_tl_impl<TopK>(input, index, row_start, length);
+}
+
+__device__ __forceinline__ int32_t transform_kpool_token(
+    int32_t raw_token,
+    const int32_t* __restrict__ page_table_entry,
+    const int32_t* __restrict__ topk_indices_offset,
+    int32_t offset) {
+  if (page_table_entry != nullptr) {
+    return page_table_entry[raw_token];
+  }
+  if (topk_indices_offset != nullptr) {
+    return raw_token + offset;
+  }
+  return raw_token;
 }
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // topk
@@ -380,6 +400,67 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
   }
 }
 
+template <int K>
+__global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
+    const FastTopKParams params,
+    int32_t* __restrict__ dst_token_indices,
+    const int64_t dst_stride,
+    const int32_t pool_size,
+    const int32_t token_topk,
+    const int32_t out_cols,
+    const int32_t* __restrict__ page_table,
+    const int64_t page_table_stride,
+    const int32_t* __restrict__ topk_indices_offset,
+    const int32_t* __restrict__ seq_lens) {
+  const auto& [input, row_starts, _, lengths, input_stride] = params;
+  const auto bid = static_cast<uint64_t>(blockIdx.x);
+  const auto tid = threadIdx.x;
+  const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
+  const auto length = lengths[bid];
+  const auto score = input + bid * input_stride;
+  const auto dst = dst_token_indices + bid * dst_stride;
+  const auto page_table_entry = page_table == nullptr ? nullptr : page_table + bid * page_table_stride;
+  const auto offset = topk_indices_offset == nullptr ? 0 : topk_indices_offset[bid];
+  const bool append_tail = seq_lens != nullptr;
+  const auto full_pool_token_len = length * pool_size;
+  const auto history_len = full_pool_token_len < token_topk ? full_pool_token_len : token_topk;
+  const auto tail_count = append_tail ? seq_lens[bid] % pool_size : 0;
+
+  if (length <= K) {
+    for (int col = tid; col < out_cols; col += kThreadsPerBlock) {
+      if (col < history_len) {
+        const auto group_rank = col / pool_size;
+        const auto slot = col % pool_size;
+        const auto raw_token = group_rank * pool_size + slot;
+        dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
+      } else if (append_tail && col < history_len + tail_count) {
+        const auto raw_token = length * pool_size + (col - history_len);
+        dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
+      } else {
+        dst[col] = -1;
+      }
+    }
+    return;
+  }
+
+  __shared__ int s_indices[K];
+  fast_topk_cuda_tl_impl<K>(score, s_indices, row_start, length);
+  for (int col = tid; col < out_cols; col += kThreadsPerBlock) {
+    if (col < history_len) {
+      const auto group_rank = col / pool_size;
+      const auto group_id = s_indices[group_rank];
+      const auto slot = col % pool_size;
+      const auto raw_token = group_id * pool_size + slot;
+      dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
+    } else if (append_tail && col < history_len + tail_count) {
+      const auto raw_token = length * pool_size + (col - history_len);
+      dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
+    } else {
+      dst[col] = -1;
+    }
+  }
+}
+
 auto get_params(
     const at::Tensor& score,
     const at::Tensor& lengths,
@@ -428,6 +509,35 @@ void setup_kernel_smem_once() {
 #endif
   }();
   TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
+}
+
+template <int K>
+void launch_kpool_topk_transform_kernel(
+    const FastTopKParams& params,
+    int32_t* dst_token_indices,
+    int64_t dst_stride,
+    int32_t pool_size,
+    int32_t token_topk,
+    int32_t out_cols,
+    const int32_t* page_table,
+    int64_t page_table_stride,
+    const int32_t* topk_indices_offset,
+    const int32_t* seq_lens,
+    dim3 grid,
+    dim3 block,
+    cudaStream_t stream) {
+  setup_kernel_smem_once<kpool_topk_transform_kernel<K>, kSmem>();
+  kpool_topk_transform_kernel<K><<<grid, block, kSmem, stream>>>(
+      params,
+      dst_token_indices,
+      dst_stride,
+      pool_size,
+      token_topk,
+      out_cols,
+      page_table,
+      page_table_stride,
+      topk_indices_offset,
+      seq_lens);
 }
 
 }  // namespace
@@ -543,4 +653,192 @@ void fast_topk_transform_ragged_interface(
 
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+}
+
+void fast_kpool_topk_transform_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_token_indices,
+    int64_t pool_size,
+    std::optional<at::Tensor> page_table_opt,
+    std::optional<at::Tensor> topk_indices_offset_opt,
+    std::optional<at::Tensor> row_starts_opt,
+    std::optional<at::Tensor> seq_lens_opt) {
+  CHECK_CUDA(score);
+  CHECK_CUDA(lengths);
+  CHECK_CUDA(dst_token_indices);
+  if (page_table_opt.has_value()) {
+    CHECK_CUDA(page_table_opt.value());
+  }
+  if (topk_indices_offset_opt.has_value()) {
+    CHECK_CUDA(topk_indices_offset_opt.value());
+  }
+  if (row_starts_opt.has_value()) {
+    CHECK_CUDA(row_starts_opt.value());
+  }
+  if (seq_lens_opt.has_value()) {
+    CHECK_CUDA(seq_lens_opt.value());
+  }
+  TORCH_CHECK(!page_table_opt.has_value() || !topk_indices_offset_opt.has_value());
+  TORCH_CHECK(pool_size > 1);
+  TORCH_CHECK(score.scalar_type() == at::ScalarType::Float);
+  TORCH_CHECK(lengths.scalar_type() == at::ScalarType::Int);
+  TORCH_CHECK(dst_token_indices.scalar_type() == at::ScalarType::Int);
+  if (row_starts_opt.has_value()) {
+    TORCH_CHECK(row_starts_opt.value().scalar_type() == at::ScalarType::Int);
+  }
+
+  const auto params = get_params(score, lengths, row_starts_opt);
+  const auto B = score.size(0);
+  TORCH_CHECK(dst_token_indices.dim() == 2 && dst_token_indices.is_contiguous());
+  TORCH_CHECK(dst_token_indices.size(0) == B);
+  const auto tail_cols = seq_lens_opt.has_value() ? pool_size - 1 : 0;
+  TORCH_CHECK(dst_token_indices.size(1) > tail_cols);
+  const auto token_topk = dst_token_indices.size(1) - tail_cols;
+  TORCH_CHECK(token_topk % pool_size == 0);
+  const auto group_topk = token_topk / pool_size;
+  TORCH_CHECK(
+      group_topk == 128 || group_topk == 160 || group_topk == 192 || group_topk == 224 || group_topk == 256 ||
+          group_topk == 512,
+      "fast_kpool_topk_transform_fused supports pool-level topk 128, 160, 192, 224, 256, and 512 only");
+
+  const int32_t* page_table_ptr = nullptr;
+  int64_t page_table_stride = 0;
+  if (page_table_opt.has_value()) {
+    const auto& page_table = page_table_opt.value();
+    TORCH_CHECK(page_table.dim() == 2 && page_table.stride(1) == 1);
+    TORCH_CHECK(page_table.size(0) == B);
+    TORCH_CHECK(page_table.scalar_type() == at::ScalarType::Int);
+    page_table_ptr = page_table.data_ptr<int32_t>();
+    page_table_stride = page_table.stride(0);
+  }
+
+  const int32_t* topk_indices_offset_ptr = nullptr;
+  if (topk_indices_offset_opt.has_value()) {
+    const auto& topk_indices_offset = topk_indices_offset_opt.value();
+    TORCH_CHECK(topk_indices_offset.dim() == 1 && topk_indices_offset.is_contiguous());
+    TORCH_CHECK(topk_indices_offset.size(0) == B);
+    TORCH_CHECK(topk_indices_offset.scalar_type() == at::ScalarType::Int);
+    topk_indices_offset_ptr = topk_indices_offset.data_ptr<int32_t>();
+  }
+
+  const int32_t* seq_lens_ptr = nullptr;
+  if (seq_lens_opt.has_value()) {
+    const auto& seq_lens = seq_lens_opt.value();
+    TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous());
+    TORCH_CHECK(seq_lens.size(0) == B);
+    TORCH_CHECK(seq_lens.scalar_type() == at::ScalarType::Int);
+    seq_lens_ptr = seq_lens.data_ptr<int32_t>();
+  }
+
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  const auto grid = dim3{static_cast<uint32_t>(B)};
+  const auto block = dim3{kThreadsPerBlock};
+  const auto dst_stride = dst_token_indices.stride(0);
+  const auto token_topk_i32 = static_cast<int32_t>(token_topk);
+  const auto out_cols = static_cast<int32_t>(dst_token_indices.size(1));
+  const auto pool_size_i32 = static_cast<int32_t>(pool_size);
+
+  auto* dst_token_indices_ptr = dst_token_indices.data_ptr<int32_t>();
+  switch (group_topk) {
+    case 128:
+      launch_kpool_topk_transform_kernel<128>(
+          params,
+          dst_token_indices_ptr,
+          dst_stride,
+          pool_size_i32,
+          token_topk_i32,
+          out_cols,
+          page_table_ptr,
+          page_table_stride,
+          topk_indices_offset_ptr,
+          seq_lens_ptr,
+          grid,
+          block,
+          stream);
+      break;
+    case 160:
+      launch_kpool_topk_transform_kernel<160>(
+          params,
+          dst_token_indices_ptr,
+          dst_stride,
+          pool_size_i32,
+          token_topk_i32,
+          out_cols,
+          page_table_ptr,
+          page_table_stride,
+          topk_indices_offset_ptr,
+          seq_lens_ptr,
+          grid,
+          block,
+          stream);
+      break;
+    case 192:
+      launch_kpool_topk_transform_kernel<192>(
+          params,
+          dst_token_indices_ptr,
+          dst_stride,
+          pool_size_i32,
+          token_topk_i32,
+          out_cols,
+          page_table_ptr,
+          page_table_stride,
+          topk_indices_offset_ptr,
+          seq_lens_ptr,
+          grid,
+          block,
+          stream);
+      break;
+    case 224:
+      launch_kpool_topk_transform_kernel<224>(
+          params,
+          dst_token_indices_ptr,
+          dst_stride,
+          pool_size_i32,
+          token_topk_i32,
+          out_cols,
+          page_table_ptr,
+          page_table_stride,
+          topk_indices_offset_ptr,
+          seq_lens_ptr,
+          grid,
+          block,
+          stream);
+      break;
+    case 256:
+      launch_kpool_topk_transform_kernel<256>(
+          params,
+          dst_token_indices_ptr,
+          dst_stride,
+          pool_size_i32,
+          token_topk_i32,
+          out_cols,
+          page_table_ptr,
+          page_table_stride,
+          topk_indices_offset_ptr,
+          seq_lens_ptr,
+          grid,
+          block,
+          stream);
+      break;
+    case 512:
+      launch_kpool_topk_transform_kernel<512>(
+          params,
+          dst_token_indices_ptr,
+          dst_stride,
+          pool_size_i32,
+          token_topk_i32,
+          out_cols,
+          page_table_ptr,
+          page_table_stride,
+          topk_indices_offset_ptr,
+          seq_lens_ptr,
+          grid,
+          block,
+          stream);
+      break;
+  }
+
+  const auto result = cudaGetLastError();
+  TORCH_CHECK(result == cudaSuccess, "kpool topk kernel failed:", ::cudaGetErrorString(result));
 }

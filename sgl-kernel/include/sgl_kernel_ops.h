@@ -156,6 +156,15 @@ void fast_topk_transform_ragged_interface(
     at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt = std::nullopt);
+void fast_kpool_topk_transform_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_token_indices,
+    int64_t pool_size,
+    std::optional<at::Tensor> page_table_opt = std::nullopt,
+    std::optional<at::Tensor> topk_indices_offset_opt = std::nullopt,
+    std::optional<at::Tensor> row_starts_opt = std::nullopt,
+    std::optional<at::Tensor> seq_lens_opt = std::nullopt);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);

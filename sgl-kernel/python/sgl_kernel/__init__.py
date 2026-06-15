@@ -119,6 +119,7 @@ else:
         verify_tree_greedy,
     )
     from sgl_kernel.top_k import (
+        fast_kpool_topk_transform_fused,
         fast_topk,
         fast_topk_transform_fused,
         fast_topk_transform_ragged_fused,
