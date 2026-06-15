@@ -56,27 +56,42 @@ class AWQAscendLinearKernel:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qweight = layer.weight
-        scales = layer.scales
+        qweight = layer.weight          # int32 packed weight, shape (N, K // pack_factor)
+        scales = layer.scales           # per‑channel: (N, 1)  or  per‑group: (N, num_groups)
         qzeros = layer.zeros
-        pack_factor = self.quant_config.pack_factor
+        pack_factor = self.quant_config.pack_factor   # 8 for 4‑bit
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
-
+    
+        # Logical input features (K dimension of the original weight)
+        K = qweight.shape[1] * pack_factor
+    
+        # Derive group_size from the scale tensor shape
+        if scales.ndim == 2 and scales.shape[1] == 1:
+            group_size = 0          # per‑channel quantization
+        elif scales.ndim == 2:
+            # scales shape (N, num_groups)  →  group_size = K // num_groups
+            num_groups = scales.shape[1]
+            if K % num_groups != 0:
+                raise RuntimeError(
+                    f"Mismatch between weight K={K} and scale groups {num_groups}"
+                )
+            group_size = K // num_groups
+        else:
+            raise RuntimeError(f"Unexpected scale tensor shape: {scales.shape}")
+    
         if bias is not None and bias.dtype == torch.bfloat16:
             bias = bias.float()
-
+    
         out = torch_npu.npu_weight_quant_batchmatmul(
             reshaped_x,
             qweight,
             antiquant_scale=scales,
             antiquant_offset=qzeros,
-            antiquant_group_size=self.quant_config.group_size,
+            antiquant_group_size=group_size,
             bias=bias,
         )
-
         return out.reshape(out_shape)
-
 
 class AWQAscendMoEKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
