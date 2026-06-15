@@ -189,7 +189,9 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                                 compile_range.set_description(
                                     f"Compiling num tokens ({num_tokens=})"
                                 )
-                            cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
+                            cuda_graph_runner._run_dummy_forward(
+                                num_tokens=num_tokens
+                            )
             finally:
                 _toggle_multi_platform_ops(
                     language_model.model, reverse=True, num_tokens=16

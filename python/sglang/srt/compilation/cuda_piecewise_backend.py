@@ -42,6 +42,16 @@ class ConcreteSizeEntry:
     input_addresses: Optional[list[int]] = None
 
 
+@dataclasses.dataclass
+class VariantGraphEntry:
+    """CUDA-only extra cudagraph state for mamba track=True replays."""
+
+    num_finished_warmup: int = 0
+    cudagraph: Optional[torch.cuda.CUDAGraph] = None
+    output: Optional[Any] = None
+    input_addresses: Optional[list[int]] = None
+
+
 class CUDAPiecewiseBackend:
 
     def __init__(
@@ -92,6 +102,10 @@ class CUDAPiecewiseBackend:
         # the entries for different shapes that we need to either
         # compile or capture cudagraph
         self.concrete_size_entries: dict[int, ConcreteSizeEntry] = {}
+        # CUDA-only extra track=True cudagraphs keyed by runtime_shape.
+        # The default (track=False / no-mamba) graph continues to live in the
+        # base ConcreteSizeEntry so other backends keep the original contract.
+        self.track_variant_cudagraph_entries: dict[int, VariantGraphEntry] = {}
 
         # to_be_compiled_sizes tracks the remaining sizes to compile,
         # and updates during the compilation process, so we need to copy it
@@ -108,6 +122,114 @@ class CUDAPiecewiseBackend:
             # no specific sizes to compile
             # save the hash of the inductor graph for the next run
             self.sglang_backend.compiler_manager.save_to_file()
+
+    @staticmethod
+    def _infer_track_variant_from_args(args, sym_shape_indices) -> Optional[bool]:
+        """Best-effort inference of mamba track variant from positional args.
+
+        During warmup / capture the runner sets the dummy mamba_track_mask
+        before calling forward. The mask is an element somewhere in *args*;
+        we detect it heuristically as a 1-D bool tensor.
+
+        Returns:
+          True  — if any element in the mask is True (the tracking branch
+                  must execute so we need the track=True cudagraph)
+          False — if all elements are False
+          None  — if no bool tensor is found (non-mamba models)
+        """
+        for a in args:
+            if (
+                isinstance(a, torch.Tensor)
+                and a.dtype == torch.bool
+                and a.dim() == 1
+                and a.numel() > 0
+            ):
+                if a.any().item():
+                    return True
+                return False
+        return None
+
+    def _run_cudagraph_with_entry(
+        self,
+        graph_entry: ConcreteSizeEntry | VariantGraphEntry,
+        runnable: Callable,
+        args,
+    ) -> Any:
+        if graph_entry.cudagraph is None:
+            if graph_entry.num_finished_warmup < 1:  # noqa
+                graph_entry.num_finished_warmup += 1
+                return runnable(*args)
+
+            # During normal capture (PiecewiseCudaGraphRunner.capture()),
+            # set_pcg_capture_stream() guarantees a valid stream. However,
+            # Dynamo may silently recompile on HIP/MLA serving batches whose
+            # token count exceeds the captured range. The replacement backend
+            # has no capture stream; fall back there instead of crashing while
+            # preserving the original assertion on other platforms.
+            stream = get_pcg_capture_stream()
+            if _is_hip and stream is None:
+                print_warning_once(
+                    "PCG capture stream is not set; likely a Dynamo runtime "
+                    "recompilation. Falling back to eager execution for this "
+                    "subgraph."
+                )
+                return runnable(*args)
+            assert (
+                stream is not None
+            ), "PCG capture stream is not set, please check if runtime recompilation happened"
+
+            if self.compile_config.get_enable_debug_mode():
+                input_addresses = [
+                    x.data_ptr() for x in args if isinstance(x, torch.Tensor)
+                ]
+                graph_entry.input_addresses = input_addresses
+            cudagraph = torch.cuda.CUDAGraph()
+
+            with ExitStack() as stack:
+                if not self.is_first_graph:
+                    # during every model forward, we will capture
+                    # many pieces of cudagraphs (roughly one per layer).
+                    # running gc again and again across layers will
+                    # make the cudagraph capture very slow.
+                    # therefore, we only run gc for the first graph,
+                    # and disable gc for the rest of the graphs.
+                    stack.enter_context(patch("gc.collect", lambda: None))
+                    stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
+                # mind-exploding: carefully manage the reference and memory.
+                with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
+                    # `output` is managed by pytorch's cudagraph pool
+                    output = runnable(*args)
+                    if self.is_last_graph:
+                        # by converting it to weak ref,
+                        # the original `output` will immediately be released
+                        # to save memory. It is only safe to do this for
+                        # the last graph, because the output of the last graph
+                        # will not be used by any other cuda graph.
+                        output = weak_ref_tensors(output)
+
+            # here we always use weak ref for the output
+            # to save memory
+            graph_entry.output = weak_ref_tensors(output)
+            graph_entry.cudagraph = cudagraph
+
+            compilation_counter.num_cudagraph_captured += 1
+
+            # important: we need to return the output, rather than
+            # the weak ref of the output, so that pytorch can correctly
+            # manage the memory during cuda graph capture
+            return output
+
+        if self.compile_config.get_enable_debug_mode():
+            # check if the input addresses are the same
+            new_input_addresses = [
+                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
+            ]
+            assert new_input_addresses == graph_entry.input_addresses, (
+                "Input addresses for cudagraphs are different during replay."
+                f" Expected {graph_entry.input_addresses}, got {new_input_addresses}"
+            )
+        graph_entry.cudagraph.replay()
+        return graph_entry.output
 
     def __call__(self, *args) -> Any:
         if not self.first_run_finished:
@@ -148,78 +270,19 @@ class CUDAPiecewiseBackend:
         if is_in_torch_compile_warmup():
             return entry.runnable(*args)
 
-        if entry.cudagraph is None:
-            if entry.num_finished_warmup < 1:  # noqa
-                entry.num_finished_warmup += 1
-                return entry.runnable(*args)
+        track_variant = self._infer_track_variant_from_args(
+            args, self.sym_shape_indices
+        )
+        if track_variant is True:
+            variant_entry = self.track_variant_cudagraph_entries.get(runtime_shape)
+            if variant_entry is None:
+                # The extra track=True graph is a CUDA-only extension. Capture it
+                # during explicit capture, but fall back to the compiled runnable
+                # if replay reaches this branch before a variant graph exists.
+                if get_pcg_capture_stream() is None:
+                    return entry.runnable(*args)
+                variant_entry = VariantGraphEntry()
+                self.track_variant_cudagraph_entries[runtime_shape] = variant_entry
+            return self._run_cudagraph_with_entry(variant_entry, entry.runnable, args)
 
-            # During normal capture (PiecewiseCudaGraphRunner.capture()),
-            # set_pcg_capture_stream() guarantees a valid stream. However,
-            # Dynamo may silently recompile on HIP/MLA serving batches whose
-            # token count exceeds the captured range. The replacement backend
-            # has no capture stream; fall back there instead of crashing while
-            # preserving the original assertion on other platforms.
-            stream = get_pcg_capture_stream()
-            if _is_hip and stream is None:
-                print_warning_once(
-                    "PCG capture stream is not set; likely a Dynamo runtime "
-                    "recompilation. Falling back to eager execution for this "
-                    "subgraph."
-                )
-                return entry.runnable(*args)
-            assert (
-                stream is not None
-            ), "PCG capture stream is not set, please check if runtime recompilation happened"
-
-            if self.compile_config.get_enable_debug_mode():
-                input_addresses = [
-                    x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-                ]
-                entry.input_addresses = input_addresses
-            cudagraph = torch.cuda.CUDAGraph()
-
-            with ExitStack() as stack:
-                if not self.is_first_graph:
-                    # during every model forward, we will capture
-                    # many pieces of cudagraphs (roughly one per layer).
-                    # running gc again and again across layers will
-                    # make the cudagraph capture very slow.
-                    # therefore, we only run gc for the first graph,
-                    # and disable gc for the rest of the graphs.
-                    stack.enter_context(patch("gc.collect", lambda: None))
-                    stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
-                # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
-                    # `output` is managed by pytorch's cudagraph pool
-                    output = entry.runnable(*args)
-                    if self.is_last_graph:
-                        # by converting it to weak ref,
-                        # the original `output` will immediately be released
-                        # to save memory. It is only safe to do this for
-                        # the last graph, because the output of the last graph
-                        # will not be used by any other cuda graph.
-                        output = weak_ref_tensors(output)
-
-            # here we always use weak ref for the output
-            # to save memory
-            entry.output = weak_ref_tensors(output)
-            entry.cudagraph = cudagraph
-
-            compilation_counter.num_cudagraph_captured += 1
-
-            # important: we need to return the output, rather than
-            # the weak ref of the output, so that pytorch can correctly
-            # manage the memory during cuda graph capture
-            return output
-
-        if self.compile_config.get_enable_debug_mode():
-            # check if the input addresses are the same
-            new_input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
-            assert new_input_addresses == entry.input_addresses, (
-                "Input addresses for cudagraphs are different during replay."
-                f" Expected {entry.input_addresses}, got {new_input_addresses}"
-            )
-        entry.cudagraph.replay()
-        return entry.output
+        return self._run_cudagraph_with_entry(entry, entry.runnable, args)
