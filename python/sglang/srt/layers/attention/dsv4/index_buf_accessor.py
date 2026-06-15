@@ -40,7 +40,7 @@ class NopeBf16RopeBf16Pack:
         assert self.k_nope_bf16.shape[-1] == 448
         assert self.k_rope_bf16.shape[-1] == 64
 
-    def slice_pack(self, _slice: Any) -> "NopeBf16RopeBf16Pack":
+    def slice_pack(self, _slice: Any) -> NopeBf16RopeBf16Pack:
         return NopeBf16RopeBf16Pack(
             k_nope_bf16=self.k_nope_bf16[_slice],
             k_rope_bf16=self.k_rope_bf16[_slice],
