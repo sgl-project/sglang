@@ -54,7 +54,7 @@ class AWQAscendLinearKernel:
 
         layer.zeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
         # Weight stays (K, N // pack_factor) – no transpose!
-        layer.weight = torch.nn.Parameter(torch.ops.npu.npu_format_cast(qweight_tmp, 29), requires_grad=False)
+        layer.weight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
 
     def apply(
         self,
