@@ -378,13 +378,10 @@ def fused_conv_window_scatter_with_mask(
     if total_requests == 0:
         return
 
-    if dst.device != src.device:
+    if not (dst.is_cuda and src.is_cuda and dst.device == src.device):
         raise ValueError(
-            f"dst and src must be on the same device. {dst.device=} {src.device=}"
-        )
-    if not dst.is_cuda or not src.is_cuda:
-        raise ValueError(
-            "fused_conv_window_scatter_with_mask only supports CUDA tensors."
+            "fused_conv_window_scatter_with_mask requires dst and src to be CUDA "
+            f"tensors on the same device ({dst.device=}, {src.device=})."
         )
     if dst.ndim != 4 or src.ndim != 5:
         raise ValueError(f"Unexpected ranks: {dst.ndim=} (want 4) {src.ndim=} (want 5)")
@@ -413,7 +410,9 @@ def fused_conv_window_scatter_with_mask(
     # `dst` stays contiguous; `src` is an intentionally non-contiguous (overlapping)
     # view, so we do NOT assert src contiguity here (unlike the dense scatter).
     if not dst.is_contiguous():
-        raise ValueError("dst tensor must be contiguous")
+        raise ValueError(
+            "dst tensor in fused_conv_window_scatter_with_mask must be contiguous"
+        )
 
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()

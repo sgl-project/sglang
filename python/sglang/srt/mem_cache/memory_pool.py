@@ -90,6 +90,26 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
+def conv_window_dedup_enabled(
+    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+) -> bool:
+    """Whether the deduplicated sliding-window conv-intermediate layout is safe.
+
+    It is only correct for a *linear* draft chain (``speculative_eagle_topk <= 1``,
+    i.e. NEXTN / MTP): consecutive draft tokens then form a true sliding window, so
+    the overlapping physical columns hold identical values. Under EAGLE *tree*
+    verify (``topk > 1``) the conv kernel walks per-token tree ancestors, so aliased
+    columns can need different values from different parent chains -> fall back to
+    the dense layout. NPU/CPU also keep the dense layout (their kernels assume
+    contiguous per-step windows). See ``MambaPool.__init__``.
+    """
+    return (
+        not is_npu
+        and not is_cpu
+        and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
+    )
+
+
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -316,6 +336,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        speculative_eagle_topk: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -408,9 +429,15 @@ class MambaPool:
                 # overlapping stores) and `fused_conv_window_scatter_with_mask`
                 # consume the view through its strides.
                 #
-                # NPU/CPU keep the original dense layout (their conv kernels and
-                # state-scatter paths assume contiguous per-step windows).
-                dedup_conv_window = not _is_npu and not _is_cpu
+                # Dedup the sliding-window conv-intermediate only when it is safe:
+                # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
+                # verify (topk > 1) keep the dense layout -- see
+                # `conv_window_dedup_enabled` for the full rationale. The
+                # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
+                # so the dense fallback reads correctly through the same code path.
+                dedup_conv_window = conv_window_dedup_enabled(
+                    _is_npu, _is_cpu, speculative_eagle_topk
+                )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
                     intermediate_conv_window_cache = []
@@ -449,8 +476,9 @@ class MambaPool:
                         self._intermediate_conv_window_phys.append(phys)
                         intermediate_conv_window_cache.append(view)
                 else:
-                    # Original dense layout (NPU/CPU): one [dim, K-1] window per
-                    # draft token. Shape: [num_layers, size+1, draft_tokens, dim, K-1]
+                    # Original dense layout (NPU/CPU, or EAGLE tree verify): one
+                    # [dim, K-1] window per draft token.
+                    # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
                     intermediate_conv_window_cache = [
                         torch.zeros(
                             size=(
@@ -490,7 +518,19 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
-            self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
+            mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
+            if isinstance(self.mamba_cache, self.SpeculativeState):
+                # `intermediate_conv_window` is an as_strided view whose logical
+                # shape over-reports its real footprint; charge the physical buffers
+                # instead. No-op for the dense layout, where the view and the
+                # physical tensors coincide.
+                mem_usage_bytes -= get_tensor_size_bytes(
+                    self.mamba_cache.intermediate_conv_window
+                )
+                mem_usage_bytes += get_tensor_size_bytes(
+                    self._intermediate_conv_window_phys
+                )
+            self.mem_usage = mem_usage_bytes / GB
             self.num_mamba_layers = num_mamba_layers
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
@@ -620,6 +660,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
+        speculative_eagle_topk: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
     ):
@@ -644,6 +685,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
 
     def _init_mamba_pool(
@@ -655,6 +697,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        speculative_eagle_topk: Optional[int] = None,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -664,6 +707,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
