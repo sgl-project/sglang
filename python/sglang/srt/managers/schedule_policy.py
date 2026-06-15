@@ -1051,8 +1051,14 @@ class PrefillAdder:
         )
 
         preemptible_reqs = []
+        # extend_input_len is only populated by init_next_round_input, which runs
+        # AFTER this preemption check in the waiting-queue loop. A freshly arrived
+        # or retracted request still has extend_input_len == 0 here, which would
+        # drop its prompt tokens from the budget and under-preempt. Derive the
+        # prefill demand directly so we free enough KV for the prompt itself.
+        num_extend_tokens = req.seqlen - len(req.prefix_indices)
         min_tokens_to_remove = (
-            req.extend_input_len
+            num_extend_tokens
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens
         )
