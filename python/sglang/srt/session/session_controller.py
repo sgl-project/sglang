@@ -390,15 +390,13 @@ class SessionController:
 
     def _close(self, session_id: str):
         session = self.sessions[session_id]
-        req = None
         has_unfinished_request = False
         if session.streaming and session._inflight:
             has_unfinished_request = True
-        elif session.streaming and session.req_nodes:
-            assert len(session.req_nodes) == 1
-            [last_node] = session.req_nodes.values()
-            req = last_node.req
-            if not req.finished():
+        elif session.req_nodes:
+            if session.streaming:
+                assert len(session.req_nodes) == 1
+            if not self._all_requests_finished(session):
                 has_unfinished_request = True
 
         if has_unfinished_request:
@@ -455,9 +453,16 @@ class SessionController:
                 self.sessions[sid].close_on_finish = False
                 self._close(sid)
 
-            timed_out = [
-                sid for sid, session in self.sessions.items() if session.is_timed_out()
-            ]
+            timed_out = []
+            for sid, session in self.sessions.items():
+                if (session.streaming and session._inflight) or (
+                    not self._all_requests_finished(session)
+                ):
+                    # The session is busy decoding, not idle: keep the idle
+                    # timeout clock from expiring underneath an active request.
+                    session.last_active_time = now
+                elif session.is_timed_out():
+                    timed_out.append(sid)
             for sid in timed_out:
                 log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
                 self._close(sid)
