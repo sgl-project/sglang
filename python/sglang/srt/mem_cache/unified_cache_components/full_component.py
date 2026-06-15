@@ -143,7 +143,11 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(heap)
             if x not in self.cache.evictable_device_leaves:
                 continue
-            self.cache._evict_device_leaf(x, tracker)
+            self.cache._evict_device_leaf(
+                x,
+                tracker,
+                evict_mamba=self.cache._should_evict_mamba_with_full(),
+            )
             if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
                 heapq.heappush(
                     heap,
