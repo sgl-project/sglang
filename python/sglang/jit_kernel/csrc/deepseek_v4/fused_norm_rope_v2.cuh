@@ -202,7 +202,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
       local_max = math::max(local_max, math::abs(data[i]));
     }
     const auto abs_max = warp::reduce_max(local_max);
-    const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
     const auto inv_scale = 1.0f / scale;
     const int64_t page = out_loc >> kPageBits;
     const int64_t offset = out_loc & ((1 << kPageBits) - 1);
