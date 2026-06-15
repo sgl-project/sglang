@@ -28,13 +28,11 @@ class AWQAscendLinearKernel:
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Keep scales in original shape (groups, N) – no transpose!
+        # Keep original layout – no transposes
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
-        # Unpack qweight and qzeros – keep weight as (K, N // pack_factor)
-        qweight_tmp = torch.zeros_like(layer.qweight.data)   # (K, N // pack_factor)
-        print(qweight_tmp.shape)
-        qzeros_tmp = layer.qzeros.data                        # (groups, N // pack_factor)
+        qweight_tmp = torch.zeros_like(layer.qweight.data)
+        qzeros_tmp = layer.qzeros.data
         qzeros_list = []
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
 
@@ -47,14 +45,38 @@ class AWQAscendLinearKernel:
 
         qweight_tmp.bitwise_xor_(0x88888888)
 
-        # Unpacked zeros shape: (groups, N) – no transpose!
         qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(layer.qzeros.shape[0], -1)
         qzeros_tmp = -(qzeros_tmp - 8)
         qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
 
         layer.zeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
-        # Weight stays (K, N // pack_factor) – no transpose!
         layer.weight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
+
+    def _dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        """Dequantize packed int4 weights to float32 (N, K) for fallback matmul."""
+        qweight = layer.weight                # (K, N // pack_factor)
+        scales = layer.scales                 # (groups, N)
+        zeros = layer.zeros                   # (groups, N)
+        pack_factor = self.quant_config.pack_factor
+        K = qweight.shape[0]
+        N = qweight.shape[1] * pack_factor
+
+        # Unpack int4 -> int8
+        weight_int8 = torch.zeros((K, N), dtype=torch.int8, device=qweight.device)
+        for i in range(pack_factor):
+            weight_int8[:, i::pack_factor] = ((qweight >> (4 * i)) & 0xF).to(torch.int8)
+
+        # Expand per‑group scales / zeros to full K dimension
+        group_size = K // scales.shape[0] if scales.shape[0] > 1 else 0
+        if group_size > 0:
+            scales_exp = scales.repeat_interleave(group_size, dim=0)
+            zeros_exp = zeros.repeat_interleave(group_size, dim=0)
+        else:
+            scales_exp = scales
+            zeros_exp = zeros
+
+        weight_float = (weight_int8.float() - zeros_exp.float()) * scales_exp.float()
+        return weight_float.t().contiguous()   # (N, K)
 
     def apply(
         self,
@@ -62,24 +84,34 @@ class AWQAscendLinearKernel:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qweight = layer.weight          # (K, N // pack_factor)
-        scales = layer.scales           # (groups, N)   ← original layout
-        qzeros = layer.zeros            # (groups, N)
+        qweight = layer.weight
+        scales = layer.scales
+        qzeros = layer.zeros
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        K = qweight.shape[0]            # input features (e.g., 7168)
-        num_groups = scales.shape[0]    # e.g., 56
-
+        K = qweight.shape[0]
+        num_groups = scales.shape[0]
         if K % num_groups != 0:
             raise RuntimeError(f"K={K} not divisible by scale groups {num_groups}")
-        group_size = K // num_groups    # e.g., 128
+        group_size = K // num_groups
 
-        # Validate NPU constraint
-        if group_size % 32 != 0 or not (32 <= group_size <= K - 1):
-            raise RuntimeError(f"Derived group_size={group_size} is invalid for NPU")
+        # NPU constraint check
+        valid_npu = (
+            group_size == 0
+            or (group_size % 32 == 0 and 32 <= group_size < K)
+        )
 
+        if not valid_npu:
+            # Fallback – dequantize and do a standard matmul
+            weight_float = self._dequantize_weight(layer)   # (N, K)
+            out = torch.matmul(reshaped_x, weight_float.t())  # (..., N)
+            if bias is not None:
+                out = out + bias.to(out.dtype)
+            return out.reshape(out_shape)
+
+        # Normal NPU path
         if bias is not None and bias.dtype == torch.bfloat16:
             bias = bias.float()
 
