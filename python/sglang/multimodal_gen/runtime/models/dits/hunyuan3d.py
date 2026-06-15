@@ -1,13 +1,19 @@
 # Copied and adapted from: https://github.com/Tencent-Hunyuan/Hunyuan3D-2
 from __future__ import annotations
 
+import copy
+import json
 import math
+import os as _os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from diffusers.models import UNet2DConditionModel
+from diffusers.models.attention_processor import Attention as DiffusersAttention
+from diffusers.models.transformers.transformer_2d import BasicTransformerBlock
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.dits.hunyuan3d import (
@@ -288,7 +294,6 @@ class _FluxDoubleStreamBlock(nn.Module):
     def forward(
         self, img: torch.Tensor, txt: torch.Tensor, vec: torch.Tensor, pe: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
 
@@ -610,15 +615,6 @@ class Hunyuan3D2DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         latent = latent[:, cond.shape[1] :, ...]
         latent = self.final_layer(latent, vec)
         return latent
-
-
-import copy
-import json
-import os as _os
-
-from diffusers.models import UNet2DConditionModel
-from diffusers.models.attention_processor import Attention as DiffusersAttention
-from diffusers.models.transformers.transformer_2d import BasicTransformerBlock
 
 
 def _chunked_feed_forward(
@@ -1022,7 +1018,7 @@ def compute_voxel_grid_mask(position: torch.Tensor, grid_resolution: int = 8):
 
     valid_mask = (position != 1).all(dim=2, keepdim=True)
     valid_mask = valid_mask.expand_as(position)
-    position[valid_mask == False] = 0
+    position[~valid_mask] = 0
 
     position = rearrange(
         position,
@@ -1085,7 +1081,7 @@ def compute_discrete_voxel_indice(
 
     valid_mask = (position != 1).all(dim=2, keepdim=True)
     valid_mask = valid_mask.expand_as(position)
-    position[valid_mask == False] = 0
+    position[~valid_mask] = 0
 
     position = rearrange(
         position,
