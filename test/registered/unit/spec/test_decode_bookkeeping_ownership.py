@@ -154,7 +154,7 @@ def _scan_srt():
 
 
 def _draft_worker_classes():
-    """All transitive BaseDraftWorker subclasses under speculative/."""
+    """All transitive EagleDraftWorkerBase subclasses under speculative/."""
     by_name = {}
     for path in sorted(_SPECULATIVE_DIR.glob("*.py")):
         rel = path.relative_to(_SRT_DIR).as_posix()
@@ -166,7 +166,7 @@ def _draft_worker_classes():
                 }
                 by_name[node.name] = (rel, node, bases)
 
-    workers = {"BaseDraftWorker"}
+    workers = {"EagleDraftWorkerBase"}
     changed = True
     while changed:
         changed = False
@@ -177,7 +177,7 @@ def _draft_worker_classes():
     return [
         (rel, node)
         for name, (rel, node, _) in sorted(by_name.items())
-        if name in workers and name != "BaseDraftWorker"
+        if name in workers and name != "EagleDraftWorkerBase"
     ]
 
 

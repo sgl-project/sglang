@@ -765,18 +765,10 @@ class MQALayer(nn.Module):
 
             token_to_kv_pool = get_token_to_kv_pool()
             if unified:
-                swa_ring_size = token_to_kv_pool.unified_swa_ring_size
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
-                # ring slot = req_slot * ring + pos % ring, per token.
-                # positions is per-token; req_pool_indices is per-req.
-                req_slot = forward_batch.req_pool_indices.to(torch.int64)
-                if req_slot.shape[0] != positions.shape[0]:
-                    req_slot = req_slot.repeat_interleave(
-                        positions.shape[0] // req_slot.shape[0]
-                    )
-                swa_loc = (
-                    req_slot * swa_ring_size + positions.to(torch.int64) % swa_ring_size
-                ).to(torch.int32)
+                # swa_loc is layer-independent; computed once per forward by the
+                # backend and cached on the metadata (read here by every layer).
+                swa_loc = attn_backend.get_unified_swa_loc(forward_batch)
                 swa_page_size, bf16_store = 1, True
             else:
                 swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
