@@ -669,9 +669,12 @@ def pre_permute_deepep_ll_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
-        dispatch_output
-    )
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    topk_ids = dispatch_output.topk_ids
+    topk_weights = dispatch_output.topk_weights
+    masked_m = dispatch_output.masked_m
+    expected_m = dispatch_output.expected_m
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights

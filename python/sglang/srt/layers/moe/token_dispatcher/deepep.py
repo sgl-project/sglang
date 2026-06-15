@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
+    is_fused_grouped_gemm_combine_enabled,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
@@ -62,6 +63,7 @@ from enum import Enum, IntEnum, auto
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as torch_symmetric_memory
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -75,6 +77,12 @@ def _deepep_precompile_tp_barrier() -> None:
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
     if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
         get_tp_group().barrier()
+
+
+@dataclass
+class FusedGroupedGemmCombineArgs:
+    output_tensor: torch.Tensor
+    out_ptrs_tensor: torch.Tensor
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
@@ -106,6 +114,11 @@ class DeepEPLLDispatchOutput(NamedTuple):
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
     expected_m: int
+    recv_topk_weights: torch.Tensor
+    recv_rank_info: torch.Tensor
+    recv_idx_info: torch.Tensor
+    combine_out: torch.Tensor
+    combine_out_ptrs: torch.Tensor
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -628,6 +641,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+    # Class data member for fused grouped gemm combine
+    fused_grouped_gemm_combine_args: Optional[FusedGroupedGemmCombineArgs] = None
+
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -638,6 +654,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
+        self.fused_grouped_gemm_combine_enabled = (
+            is_fused_grouped_gemm_combine_enabled()
+        )
 
     def dispatch_a(
         self,
@@ -645,15 +664,60 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_output: TopKOutput,
     ):
         buffer = self._get_buffer()
-        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        if self.fused_grouped_gemm_combine_enabled:
+            out_dtype = (
+                torch.float32
+                if envs.SGLANG_FUSED_GROUPED_GEMM_COMBINE_FP32.get()
+                else torch.bfloat16
+            )
+            assert (
+                hidden_states.shape[0] <= self.num_max_dispatch_tokens_per_rank
+            ), "hidden_states.shape[0] must be less than or equal to SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
+            # Allocate MoE block symmetric output buffer large enough to support BS up to SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+            # TODO @nvcastet: Refactor allocation to use a mempool
+            if _DeepEPDispatcherImplLowLatency.fused_grouped_gemm_combine_args is None:
+                max_bs_rank = self.num_max_dispatch_tokens_per_rank
+                out = torch_symmetric_memory.empty(
+                    [max_bs_rank, hidden_states.shape[1]],
+                    dtype=out_dtype,
+                    device=hidden_states.device,
+                )
+                out_handle = torch_symmetric_memory.rendezvous(out, group=buffer.group)
+                out_ptrs = out_handle.buffer_ptrs
+                # out = out.permute(1, 2, 0)  # requirement of kernel
+                out_ptrs_tensor = torch.tensor(
+                    out_ptrs, dtype=torch.int64, device=hidden_states.device
+                )
+                _DeepEPDispatcherImplLowLatency.fused_grouped_gemm_combine_args = (
+                    FusedGroupedGemmCombineArgs(
+                        out,
+                        out_ptrs_tensor,
+                    )
+                )
+            # Only zero out the output tensor slice needed for the current batch
+            _DeepEPDispatcherImplLowLatency.fused_grouped_gemm_combine_args.output_tensor[
+                : hidden_states.shape[0], :
+            ].zero_()
+
+        topk_weights = topk_output.topk_weights
+        topk_ids = topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
-        hidden_states, masked_m, event, hook = self._dispatch_core(
+        (
+            hidden_states,
+            masked_m,
+            recv_topk_weights,
+            recv_rank_info,
+            recv_idx_info,
+            event,
+            hook,
+        ) = self._dispatch_core(
             hidden_states,
             topk_ids,
+            topk_weights if self.fused_grouped_gemm_combine_enabled else None,
         )
         return (
             hidden_states,
@@ -661,6 +725,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_weights,
             masked_m,
             expected_m,
+            recv_topk_weights,
+            recv_rank_info,
+            recv_idx_info,
             event,
             hook,
         )
@@ -672,6 +739,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights,
         masked_m,
         expected_m,
+        recv_topk_weights,
+        recv_rank_info,
+        recv_idx_info,
         event,
         hook,
     ):
@@ -693,6 +763,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_weights,
             masked_m,
             expected_m,
+            recv_topk_weights,
+            recv_rank_info,
+            recv_idx_info,
+            (
+                _DeepEPDispatcherImplLowLatency.fused_grouped_gemm_combine_args.output_tensor
+                if self.fused_grouped_gemm_combine_enabled
+                else None
+            ),
+            (
+                _DeepEPDispatcherImplLowLatency.fused_grouped_gemm_combine_args.out_ptrs_tensor
+                if self.fused_grouped_gemm_combine_enabled
+                else None
+            ),
         )
         return deepep_output
 
@@ -700,6 +783,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_weights: Optional[torch.Tensor] = None,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
@@ -719,25 +803,52 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
-        packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
-            buffer.low_latency_dispatch(
-                hidden_states,
-                topk_ids,
-                self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
-                use_fp8=self.use_fp8,
-                **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
-                **(
-                    dict(x_global_scale=input_global_scale)
-                    if input_global_scale is not None
-                    else dict()
-                ),
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-                **fp8_deepgemm_scale_opts,
-            )
+        dispatch_output = buffer.low_latency_dispatch(
+            hidden_states,
+            topk_ids,
+            self.num_max_dispatch_tokens_per_rank,
+            self.num_experts,
+            use_fp8=self.use_fp8,
+            **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
+            **(
+                dict(x_global_scale=input_global_scale)
+                if input_global_scale is not None
+                else dict()
+            ),
+            topk_weights=topk_weights,
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+            **fp8_deepgemm_scale_opts,
         )
-        return packed_recv_hidden, self.packed_recv_count, event, hook
+        if topk_weights is not None:
+            (
+                packed_recv_hidden,
+                self.packed_recv_count,
+                recv_topk_weights,
+                recv_rank_info,
+                self.handle,
+                event,
+                hook,
+            ) = dispatch_output
+        else:
+            (
+                packed_recv_hidden,
+                self.packed_recv_count,
+                self.handle,
+                event,
+                hook,
+            ) = dispatch_output
+            recv_topk_weights = None
+            recv_rank_info = None
+        return (
+            packed_recv_hidden,
+            self.packed_recv_count,
+            recv_topk_weights,
+            recv_rank_info,
+            self.handle[0],
+            event,
+            hook,
+        )
 
     def combine_a(
         self,
@@ -757,7 +868,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if overlap_args is not None:
             overlap_args.stream.wait_stream(self.device_module.current_stream())
 
-        hook() if self.return_recv_hook else event.current_stream_wait()
+        (
+            hook()
+            if self.return_recv_hook or event is None
+            else event.current_stream_wait()
+        )
 
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
@@ -770,6 +885,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        if self.fused_grouped_gemm_combine_enabled:
+            return hidden_states[: topk_ids.shape[0], :], None, lambda: None
         buffer = self._get_buffer()
         overlap_args = self.overlap_args
         meta_overlap_args = self.meta_overlap_args
