@@ -65,6 +65,15 @@ def can_fuse_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
     """
     if not (_HAS_ADDMM_ACTIVATION and x.is_cuda):
         return False
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if getattr(linear, "_sgl_disable_fused_linear_gelu", False):
+        return False
+    # Quantized checkpoints can leave selected layers unquantized via their
+    # exclude list. Keep those layers on the reference path because the fused
+    # epilogue can move strict image-consistency metrics in mixed-precision runs.
+    if getattr(linear, "quant_config", None) is not None:
+        return False
     # Plain nn.Linear has no quant_method (None); sglang linears must be
     # unquantized. Reject any real quantization method.
     quant_method = getattr(linear, "quant_method", None)
@@ -79,6 +88,8 @@ def can_fuse_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
     weight = getattr(linear, "weight", None)
     bias = getattr(linear, "bias", None)
     if weight is None or bias is None or weight.dim() != 2:
+        return False
+    if weight.dtype != x.dtype or bias.dtype != x.dtype:
         return False
     return weight.dtype in (torch.bfloat16, torch.float16)
 
@@ -105,9 +116,16 @@ class FusedTanhGELU(nn.Module):
     up-projection GEMM with the tanh-GELU via :func:`linear_gelu_tanh`.
     """
 
-    def __init__(self, dim_in: int, dim_out: int, bias: bool = True):
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        bias: bool = True,
+        disable_fused: bool = False,
+    ):
         super().__init__()
         self.proj = nn.Linear(dim_in, dim_out, bias=bias)
+        self.proj._sgl_disable_fused_linear_gelu = disable_fused
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return linear_gelu_tanh(self.proj, hidden_states)
