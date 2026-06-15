@@ -188,6 +188,11 @@ def _get_sm_count(device: torch.device) -> int:
     if device.type == "xpu":
         assert torch.xpu.is_available(), "XPU device is not available"
         return torch.xpu.get_device_properties(device).gpu_subslice_count
+    if device.type == "cpu":
+        # CPU has no streaming multiprocessors; use the intra-op thread count
+        # as the parallelism proxy so calc_rows_per_block stays well-defined
+        # instead of crashing in torch.cuda.get_device_properties.
+        return max(torch.get_num_threads(), 1)
     props = torch.cuda.get_device_properties(device)
     return props.multi_processor_count
 
