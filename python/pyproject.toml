@@ -137,6 +137,7 @@ fastokens = [
 test = [
   "accelerate",
   "addict",
+  "auto-round",
   "bitsandbytes",
   "expecttest",
   "jsonlines",
