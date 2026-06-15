@@ -9,6 +9,22 @@ void verify_tree_greedy_cpu(
     const at::Tensor& retrive_next_token,
     const at::Tensor& retrive_next_sibling,
     const at::Tensor& target_predict) {
+  TORCH_CHECK(predicts.dtype() == at::kInt, "predicts must be int32");
+  TORCH_CHECK(accept_index.dtype() == at::kInt, "accept_index must be int32");
+  TORCH_CHECK(accept_token_num.dtype() == at::kInt, "accept_token_num must be int32");
+  TORCH_CHECK(candidates.dtype() == at::kLong, "candidates must be int64");
+  TORCH_CHECK(retrive_index.dtype() == at::kLong, "retrive_index must be int64");
+  TORCH_CHECK(retrive_next_token.dtype() == at::kLong, "retrive_next_token must be int64");
+  TORCH_CHECK(retrive_next_sibling.dtype() == at::kLong, "retrive_next_sibling must be int64");
+  TORCH_CHECK(target_predict.dtype() == at::kLong, "target_predict must be int64");
+  TORCH_CHECK(predicts.is_contiguous(), "predicts must be contiguous");
+  TORCH_CHECK(accept_index.is_contiguous(), "accept_index must be contiguous");
+  TORCH_CHECK(accept_token_num.is_contiguous(), "accept_token_num must be contiguous");
+  TORCH_CHECK(candidates.is_contiguous(), "candidates must be contiguous");
+  TORCH_CHECK(retrive_index.is_contiguous(), "retrive_index must be contiguous");
+  TORCH_CHECK(retrive_next_token.is_contiguous(), "retrive_next_token must be contiguous");
+  TORCH_CHECK(retrive_next_sibling.is_contiguous(), "retrive_next_sibling must be contiguous");
+  TORCH_CHECK(target_predict.is_contiguous(), "target_predict must be contiguous");
   int64_t batch_size = candidates.size(0);
   int64_t num_spec_step = accept_index.size(1);
   int64_t num_draft_tokens = candidates.size(1);
@@ -69,6 +85,22 @@ void build_tree_kernel_efficient_cpu(
     int64_t depth,
     int64_t draft_token_num,
     int64_t tree_mask_mode) {
+  TORCH_CHECK(parent_list.dtype() == at::kLong, "parent_list must be int64");
+  TORCH_CHECK(selected_index.dtype() == at::kLong, "selected_index must be int64");
+  TORCH_CHECK(verified_seq_len.dtype() == at::kLong, "verified_seq_len must be int64");
+  TORCH_CHECK(tree_mask.dtype() == at::kBool, "tree_mask must be bool");
+  TORCH_CHECK(positions.dtype() == at::kLong, "positions must be int64");
+  TORCH_CHECK(retrive_index.dtype() == at::kLong, "retrive_index must be int64");
+  TORCH_CHECK(retrive_next_token.dtype() == at::kLong, "retrive_next_token must be int64");
+  TORCH_CHECK(retrive_next_sibling.dtype() == at::kLong, "retrive_next_sibling must be int64");
+  TORCH_CHECK(parent_list.is_contiguous(), "parent_list must be contiguous");
+  TORCH_CHECK(selected_index.is_contiguous(), "selected_index must be contiguous");
+  TORCH_CHECK(verified_seq_len.is_contiguous(), "verified_seq_len must be contiguous");
+  TORCH_CHECK(tree_mask.is_contiguous(), "tree_mask must be contiguous");
+  TORCH_CHECK(positions.is_contiguous(), "positions must be contiguous");
+  TORCH_CHECK(retrive_index.is_contiguous(), "retrive_index must be contiguous");
+  TORCH_CHECK(retrive_next_token.is_contiguous(), "retrive_next_token must be contiguous");
+  TORCH_CHECK(retrive_next_sibling.is_contiguous(), "retrive_next_sibling must be contiguous");
   // tree_mask_mode: 0=FULL_MASK, 1=QLEN_ONLY (2=QLEN_ONLY_BITPACKING is rejected below)
   int64_t bs = parent_list.size(0);
 
@@ -89,7 +121,7 @@ void build_tree_kernel_efficient_cpu(
 
   for (int64_t bid = 0; bid < bs; ++bid) {
     int64_t off = bid * draft_token_num;
-    int32_t seq_len = seqlen_ptr[bid];
+    int64_t seq_len = seqlen_ptr[bid];
 
     // tid == 0 logic: build retrive_index, retrive_next_token, retrive_next_sibling
     pos_ptr[off] = seq_len;
@@ -263,6 +295,12 @@ at::Tensor build_draft_decode_metadata_cpu(
 
 void fill_bonus_tokens_cpu(
     const at::Tensor& accept_tokens, const at::Tensor& accept_lens, at::Tensor bonus_tokens, int64_t accept_stride) {
+  TORCH_CHECK(accept_tokens.dtype() == at::kInt, "accept_tokens must be int32");
+  TORCH_CHECK(accept_lens.dtype() == at::kInt, "accept_lens must be int32");
+  TORCH_CHECK(bonus_tokens.dtype() == at::kInt, "bonus_tokens must be int32");
+  TORCH_CHECK(accept_tokens.is_contiguous(), "accept_tokens must be contiguous");
+  TORCH_CHECK(accept_lens.is_contiguous(), "accept_lens must be contiguous");
+  TORCH_CHECK(bonus_tokens.is_contiguous(), "bonus_tokens must be contiguous");
   int64_t bs = accept_lens.size(0);
   auto* accept_ptr = accept_tokens.data_ptr<int32_t>();
   auto* al_ptr = accept_lens.data_ptr<int32_t>();
@@ -278,6 +316,12 @@ void fill_bonus_tokens_cpu(
 
 void fill_accept_out_cache_loc_cpu(
     const at::Tensor& accept_index, const at::Tensor& out_cache_loc, at::Tensor accept_out_cache_loc, int64_t size) {
+  TORCH_CHECK(accept_index.dtype() == at::kInt, "accept_index must be int32");
+  TORCH_CHECK(out_cache_loc.dtype() == at::kLong, "out_cache_loc must be int64");
+  TORCH_CHECK(accept_out_cache_loc.dtype() == at::kLong, "accept_out_cache_loc must be int64");
+  TORCH_CHECK(accept_index.is_contiguous(), "accept_index must be contiguous");
+  TORCH_CHECK(out_cache_loc.is_contiguous(), "out_cache_loc must be contiguous");
+  TORCH_CHECK(accept_out_cache_loc.is_contiguous(), "accept_out_cache_loc must be contiguous");
   auto* ai_ptr = accept_index.data_ptr<int32_t>();
   auto* ocl_ptr = out_cache_loc.data_ptr<int64_t>();
   auto* out_ptr = accept_out_cache_loc.data_ptr<int64_t>();
@@ -365,6 +409,18 @@ void rotate_input_ids_cpu(
     const at::Tensor& extend_seq_lens,
     const at::Tensor& topk_index,
     const c10::optional<at::Tensor>& select_index_opt) {
+  TORCH_CHECK(input_ids.dtype() == at::kLong, "input_ids must be int64");
+  TORCH_CHECK(extend_start_loc.dtype() == at::kLong, "extend_start_loc must be int64");
+  TORCH_CHECK(extend_seq_lens.dtype() == at::kLong, "extend_seq_lens must be int64");
+  TORCH_CHECK(topk_index.dtype() == at::kLong, "topk_index must be int64");
+  TORCH_CHECK(input_ids.is_contiguous(), "input_ids must be contiguous");
+  TORCH_CHECK(extend_start_loc.is_contiguous(), "extend_start_loc must be contiguous");
+  TORCH_CHECK(extend_seq_lens.is_contiguous(), "extend_seq_lens must be contiguous");
+  TORCH_CHECK(topk_index.is_contiguous(), "topk_index must be contiguous");
+  if (select_index_opt.has_value()) {
+    TORCH_CHECK(select_index_opt.value().dtype() == at::kLong, "select_index must be int64");
+    TORCH_CHECK(select_index_opt.value().is_contiguous(), "select_index must be contiguous");
+  }
   int64_t bs = extend_seq_lens.size(0);
   auto* ids_ptr = input_ids.data_ptr<int64_t>();
   auto* start_ptr = extend_start_loc.data_ptr<int64_t>();

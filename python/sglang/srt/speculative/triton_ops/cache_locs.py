@@ -4,8 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
+_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -375,4 +376,23 @@ def assign_extend_cache_locs_func(
             out_cache_loc,
         )
 
+        return out_cache_loc
+
+    elif _is_cpu:
+        # CPU fallback: replicate the Triton kernel logic in pure PyTorch
+        out_cache_loc = torch.empty(
+            (batch_size * draft_token_num,),
+            dtype=torch.int64,
+            device=device,
+        )
+        pt = 0
+        for pid in range(batch_size):
+            row_idx = req_pool_indices[pid].long().item()
+            kv_start = start_offset[pid].item()
+            kv_end = end_offset[pid].item()
+            length = kv_end - kv_start
+            out_cache_loc[pt : pt + length] = req_to_token[
+                row_idx, kv_start:kv_end
+            ].to(torch.int64)
+            pt += length
         return out_cache_loc

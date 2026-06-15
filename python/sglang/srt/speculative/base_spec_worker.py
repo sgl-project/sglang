@@ -5,6 +5,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -196,15 +200,29 @@ class EagleDraftWorkerBase(ABC):
                     device=batch.device,
                 )
                 # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous[(bs,)](
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    num_steps,
-                )
+                if _is_cpu:
+                    # CPU fallback: replicate the Triton kernel logic in PyTorch
+                    copy_len = topk * num_steps
+                    for pid in range(bs):
+                        kv_start = batch.seq_lens[pid].item()
+                        row_idx = batch.req_pool_indices[pid].long().item()
+                        batch.out_cache_loc[
+                            pid * copy_len : (pid + 1) * copy_len
+                        ] = req_to_token_pool.req_to_token[
+                            row_idx, kv_start : kv_start + copy_len
+                        ].to(
+                            torch.int64
+                        )
+                else:
+                    assign_draft_cache_locs_contiguous[(bs,)](
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        req_to_token_pool.req_to_token.shape[1],
+                        topk,
+                        num_steps,
+                    )
             else:
                 # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
                 # Reduce out_cache_loc from the page-aligned tree region down to the

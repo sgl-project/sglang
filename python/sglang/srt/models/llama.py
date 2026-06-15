@@ -55,11 +55,12 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
+from sglang.srt.utils import add_prefix, is_cpu, is_cuda, is_npu, is_xpu, make_layers
 from sglang.utils import get_exception_traceback
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
@@ -784,7 +785,7 @@ class LlamaForCausalLM(nn.Module):
         if _is_xpu:
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
-        elif torch.cuda.is_available():
+        elif not _is_cpu:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
@@ -803,7 +804,7 @@ class LlamaForCausalLM(nn.Module):
         if _is_xpu:
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
-        elif torch.cuda.is_available():
+        elif not _is_cpu:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 

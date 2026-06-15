@@ -1113,7 +1113,7 @@ void fused_gdn_gating_kernel_impl(
 
 template <bool is_last_dim_contiguous>
 inline void
-CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const int64_t& dim, const at::IntArrayRef& sizes, at::ScalarType st) {
+CHECK_INPUT_SHAPE_DIM_DTYPE(const at::Tensor& tensor, const int64_t& dim, const at::IntArrayRef& sizes, at::ScalarType st) {
   TORCH_CHECK(tensor.sizes() == sizes, "Input tensor shape mismatch: expected ", sizes, ", got ", tensor.sizes());
   TORCH_CHECK(tensor.dtype() == st, "Input tensor dtype mismatch");
   CHECK_DIM(dim, tensor);
@@ -1158,13 +1158,13 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   TORCH_CHECK(v_num_head % qk_num_head == 0, "expect v_num_head multiple of qk_num_head.");
   TORCH_CHECK(qk_head_size % 32 == 0, "expect qk_head_size to be multiples of 32.");
   TORCH_CHECK(v_head_size % 32 == 0, "expect v_head_size to be multiples of 32.");
-  CHECK_INPUT_SHAPE_DTYPE<true>(query, 4, {B, global_seq_len, qk_num_head, qk_head_size}, at::kBFloat16);
-  CHECK_INPUT_SHAPE_DTYPE<true>(key, 4, {B, global_seq_len, qk_num_head, qk_head_size}, at::kBFloat16);
-  CHECK_INPUT_SHAPE_DTYPE<true>(value, 4, {B, global_seq_len, v_num_head, v_head_size}, at::kBFloat16);
-  CHECK_INPUT_SHAPE_DTYPE<false>(g, 3, {B, global_seq_len, v_num_head}, at::kFloat);
-  CHECK_INPUT_SHAPE_DTYPE<false>(beta, 3, {B, global_seq_len, v_num_head}, at::kBFloat16);
-  CHECK_INPUT_SHAPE_DTYPE<false>(cu_seqlens, 1, {batch_size + 1}, at::kInt);
-  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, 4, {batch_size, v_num_head, qk_head_size, v_head_size}, at::kFloat);
+  CHECK_INPUT_SHAPE_DIM_DTYPE<true>(query, 4, {B, global_seq_len, qk_num_head, qk_head_size}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DIM_DTYPE<true>(key, 4, {B, global_seq_len, qk_num_head, qk_head_size}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DIM_DTYPE<true>(value, 4, {B, global_seq_len, v_num_head, v_head_size}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DIM_DTYPE<false>(g, 3, {B, global_seq_len, v_num_head}, at::kFloat);
+  CHECK_INPUT_SHAPE_DIM_DTYPE<false>(beta, 3, {B, global_seq_len, v_num_head}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DIM_DTYPE<false>(cu_seqlens, 1, {batch_size + 1}, at::kInt);
+  CHECK_INPUT_SHAPE_DIM_DTYPE<false>(initial_state, 4, {batch_size, v_num_head, qk_head_size, v_head_size}, at::kFloat);
 
   at::Tensor output = at::empty_like(value, value.options());  // [B, T, HV, EV]
   at::Tensor final_state = initial_state.to(at::kFloat);       // [N, HV, EK, EV]
@@ -1340,17 +1340,17 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
   int64_t v_num_heads = v.size(2);
   int64_t v_head_dim = v.size(3);
 
-  CHECK_INPUT_SHAPE_DTYPE<true>(k, 4, {q.size(0), q.size(1), num_heads, head_dim}, q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<true>(v, 4, {q.size(0), q.size(1), v_num_heads, v_head_dim}, q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<false>(a, 2, {total_tokens, v_num_heads}, q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<false>(b, 2, {total_tokens, v_num_heads}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DIM_DTYPE<true>(k, 4, {q.size(0), q.size(1), num_heads, head_dim}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DIM_DTYPE<true>(v, 4, {q.size(0), q.size(1), v_num_heads, v_head_dim}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DIM_DTYPE<false>(a, 2, {total_tokens, v_num_heads}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DIM_DTYPE<false>(b, 2, {total_tokens, v_num_heads}, q.scalar_type());
   // A_log accepts fp32 or q's reduced dtype (dispatch below pairs them as param_t).
-  CHECK_INPUT_SHAPE_DTYPE<true>(
+  CHECK_INPUT_SHAPE_DIM_DTYPE<true>(
       A_log, 1, {v_num_heads}, A_log.scalar_type() == at::kFloat ? at::kFloat : q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<true>(dt_bias, 1, {v_num_heads}, q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<true>(initial_state_indices, 1, {num_sequences}, at::kInt);
-  CHECK_INPUT_SHAPE_DTYPE<true>(cu_seqlens, 1, {num_sequences + 1}, at::kInt);
-  CHECK_INPUT_SHAPE_DTYPE<false>(
+  CHECK_INPUT_SHAPE_DIM_DTYPE<true>(dt_bias, 1, {v_num_heads}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DIM_DTYPE<true>(initial_state_indices, 1, {num_sequences}, at::kInt);
+  CHECK_INPUT_SHAPE_DIM_DTYPE<true>(cu_seqlens, 1, {num_sequences + 1}, at::kInt);
+  CHECK_INPUT_SHAPE_DIM_DTYPE<false>(
       initial_state_source, 4, {initial_state_source.size(0), v_num_heads, head_dim, v_head_dim}, at::kFloat);
   CHECK(initial_state_source.size(0) >= num_sequences);
   CHECK_EQ(v_num_heads % num_heads, 0);

@@ -10,11 +10,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.speculative.spec_utils import (
-    assign_req_to_token_pool_func,
-    create_extend_after_decode_spec_info,
-)
-from sglang.srt.utils import is_cpu, next_power_of_2
+from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 _is_cpu = is_cpu()
@@ -393,42 +389,6 @@ class EagleDraftExtendInput(SpecInput):
             req_pool_indices=torch.empty((0,), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
         )
-
-    def prepare_extend_after_decode(
-        self,
-        batch: ScheduleBatch,
-        speculative_num_steps: int,
-    ):
-        # Caller must have installed `self` as `batch.spec_info` before calling.
-        assert batch.spec_info is self
-        if batch.forward_mode.is_idle():
-            return
-
-        # The kernel below populates `self.positions` and `self.bonus_tokens`;
-        # the worker reads `self.bonus_tokens` to construct next iter's
-        # `EagleDraftInput`.
-        batch.input_ids = self.input_ids
-        batch.extend_lens = self.num_accept_tokens_cpu
-        batch.extend_num_tokens = sum(batch.extend_lens)
-        batch.seq_lens = self.seq_lens
-        batch.seq_lens_cpu = self.seq_lens_cpu
-        batch.req_pool_indices = self.req_pool_indices
-        batch.return_logprob = False
-        batch.return_hidden_states = False
-
-        self.capture_hidden_mode = CaptureHiddenMode.LAST
-        self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
-        self.bonus_tokens = torch.empty_like(self.num_accept_tokens, dtype=torch.int32)
-
-        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
-            batch.input_ids,
-            batch.seq_lens,
-            self.num_accept_tokens,
-            self.positions,
-            self.bonus_tokens,
-            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
-        )
-
 
     def generate_attn_arg_prefill(
         self,

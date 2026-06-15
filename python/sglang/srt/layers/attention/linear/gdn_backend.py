@@ -477,6 +477,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
+            if is_cpu():
+                verify_cache_indices = cache_indices[:batch_size]
+                verify_state_indices = intermediate_state_indices[:batch_size]
+            else:
+                verify_cache_indices = cache_indices
+                verify_state_indices = intermediate_state_indices
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
@@ -486,10 +492,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a=a,
                 b=b,
                 ssm_states=ssm_states,
-                cache_indices=cache_indices[:batch_size],
+                cache_indices=verify_cache_indices,
                 query_start_loc=query_start_loc,
                 intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                intermediate_state_indices=verify_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )

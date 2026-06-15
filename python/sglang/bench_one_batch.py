@@ -335,6 +335,8 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
             dp_rank=None,
             nccl_port=port_args.nccl_port,
         )
+        target_worker.alloc_memory_pool()
+        target_worker.init_backends()
         rank_print(
             f"max_total_num_tokens={target_worker.model_runner.max_total_num_tokens}"
         )
@@ -351,6 +353,13 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
             nccl_port=port_args.nccl_port,
             target_worker=target_worker,
         )
+        pool, allocator = target_worker.get_memory_pool()
+        spec_worker.alloc_memory_pool(
+            memory_pool_config=target_worker.model_runner.memory_pool_config,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+        )
+        spec_worker.init_backends()
 
         tokenizer = get_tokenizer(
             server_args.tokenizer_path,
@@ -432,7 +441,9 @@ def prepare_extend_inputs_for_correctness_test(
 ):
     for i in range(len(reqs)):
         req: Req = reqs[i]
-        req.full_untruncated_fill_ids += input_ids[i][bench_args.cut_len :]
+        req.full_untruncated_fill_ids.extend(
+            array("q", input_ids[i][bench_args.cut_len :])
+        )
         req.fill_len = len(req.full_untruncated_fill_ids)
         if model_runner is not None:
             # Use req.req_pool_idx instead of i to handle slot 0 padding correctly
@@ -585,6 +596,9 @@ class _SpecBenchRunner:
     def __init__(self, spec_worker, target_worker, server_args):
         self.spec_worker = spec_worker
         self.model_runner = target_worker.model_runner
+        # Alias so correctness_test's prepare_extend_inputs_for_correctness_test
+        # can look up prefix indices in the req_to_token pool.
+        self.torch_runner = self.model_runner
         self.server_args = server_args
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -924,6 +938,35 @@ def latency_test_run_once(
     trace_filename_decode = None
     profiler = None
 
+    def _maybe_start_decode_profiler(step):
+        """Start the decode profiler at the configured step. Returns (profiler, trace_filename)."""
+        nonlocal trace_filename_decode
+        if enable_profile_decode and step == profile_start:
+            trace_filename_decode = _create_torch_profiler_filename(
+                profile_filename_prefix, batch_size, input_len, output_len, "decode"
+            )
+            return start_profile(
+                profile_activities,
+                profile_record_shapes=profile_record_shapes,
+                rank_print=rank_print,
+                trace_filename=trace_filename_decode,
+            )
+        return None
+
+    def _maybe_stop_decode_profiler(prof, step):
+        """Stop the decode profiler once the configured window is reached. Returns the (possibly cleared) profiler."""
+        if enable_profile_decode and prof is not None and step >= profile_end - 1:
+            stop_profile(
+                prof,
+                profile_activities,
+                rank_print=rank_print,
+                save_trace=True,
+                trace_filename=trace_filename_decode,
+                stage="decode",
+            )
+            return None
+        return prof
+
     is_spec = isinstance(model_runner, _SpecBenchRunner)
     if is_spec:
         # Per-request accounting: each request stops contributing once it
@@ -933,36 +976,14 @@ def latency_test_run_once(
         step = 0
         while min(tokens_generated) < output_len:
             model_runner.synchronize()
-            if enable_profile_decode and step == profile_start:
-                trace_filename_decode = _create_torch_profiler_filename(
-                    profile_filename_prefix, batch_size, input_len, output_len, "decode"
-                )
-                profiler = start_profile(
-                    profile_activities,
-                    profile_record_shapes=profile_record_shapes,
-                    rank_print=rank_print,
-                    trace_filename=trace_filename_decode,
-                )
+            profiler = _maybe_start_decode_profiler(step) or profiler
 
             tic = time.perf_counter()
             next_token_ids, _, accept_lens = model_runner.decode(next_token_ids, batch)
             model_runner.synchronize()
             latency = time.perf_counter() - tic
 
-            if (
-                enable_profile_decode
-                and profiler is not None
-                and step >= profile_end - 1
-            ):
-                stop_profile(
-                    profiler,
-                    profile_activities,
-                    rank_print=rank_print,
-                    save_trace=True,
-                    trace_filename=trace_filename_decode,
-                    stage="decode",
-                )
-                profiler = None
+            profiler = _maybe_stop_decode_profiler(profiler, step)
 
             num_new_tokens = 0
             for i in range(batch_size):
@@ -1002,32 +1023,14 @@ def latency_test_run_once(
     else:
         for i in range(output_len - 1):
             model_runner.synchronize()
-            if enable_profile_decode and i == profile_start:
-                trace_filename_decode = _create_torch_profiler_filename(
-                    profile_filename_prefix, batch_size, input_len, output_len, "decode"
-                )
-                profiler = start_profile(
-                    profile_activities,
-                    profile_record_shapes=profile_record_shapes,
-                    rank_print=rank_print,
-                    trace_filename=trace_filename_decode,
-                )
+            profiler = _maybe_start_decode_profiler(i) or profiler
 
             tic = time.perf_counter()
             next_token_ids, _ = model_runner.decode(next_token_ids, batch)
             model_runner.synchronize()
             latency = time.perf_counter() - tic
 
-            if enable_profile_decode and profiler is not None and i >= profile_end - 1:
-                stop_profile(
-                    profiler,
-                    profile_activities,
-                    rank_print=rank_print,
-                    save_trace=True,
-                    trace_filename=trace_filename_decode,
-                    stage="decode",
-                )
-                profiler = None
+            profiler = _maybe_stop_decode_profiler(profiler, i)
 
             tot_latency += latency
             throughput = batch_size / latency
