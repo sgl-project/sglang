@@ -74,11 +74,11 @@ class AWQAscendLinearKernel:
                 if hasattr(layer, attr):
                     delattr(layer, attr)
         else:
-            # fallback: dequantize to float32 weight once
+            # fallback: dequantize to bfloat16 weight once
             weight_int8 = torch.zeros((K, N), dtype=torch.int8, device=qweight_tmp.device)
             for i in range(pack_factor):
                 weight_int8[:, i::pack_factor] = ((qweight_tmp >> (4 * i)) & 0xF).to(torch.int8)
-
+            
             # expand per-group scales/zeros
             if group_size > 0:
                 scales_exp = layer.scales.data.repeat_interleave(group_size, dim=0)  # (K, N)
@@ -86,13 +86,13 @@ class AWQAscendLinearKernel:
             else:
                 scales_exp = layer.scales.data
                 zeros_exp = qzeros_tmp
-
-            weight_float = (weight_int8.float() - zeros_exp.float()) * scales_exp.float()  # (K, N)
-            weight_float = weight_float.t().contiguous()  # (N, K)
-
-            # replace the packed weight with a float parameter
+            
+            # Compute in float32, then cast to bfloat16 to save memory
+            weight_float = (weight_int8.float() - zeros_exp.float()) * scales_exp.float()
+            weight_float = weight_float.t().contiguous().to(torch.bfloat16)  # (N, K) in bf16
+            
             layer.register_parameter("weight", torch.nn.Parameter(weight_float, requires_grad=False))
-            # we can delete scales and zeros since they are no longer needed
+            # delete unused attributes
             for attr in ("scales", "zeros", "qweight", "qzeros"):
                 if hasattr(layer, attr):
                     delattr(layer, attr)
