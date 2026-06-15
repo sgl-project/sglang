@@ -1152,16 +1152,16 @@ class DeepseekV4HipRadixBackend(
                     ring_stride=ring_stride,
                     final_pos=positions,
                 )
-            unified = core_attn_metadata.unified
+            unified_metadata = core_attn_metadata.unified
             if compress_ratio == 0:
-                kv_indices = unified.swa_indices
-                kv_indptr = unified.swa_indptr
+                kv_indices = unified_metadata.swa_indices
+                kv_indptr = unified_metadata.swa_indptr
             elif compress_ratio == 128:
-                kv_indices = unified.hca_indices
-                kv_indptr = unified.hca_indptr
+                kv_indices = unified_metadata.hca_indices
+                kv_indptr = unified_metadata.hca_indptr
             elif compress_ratio == 4:
-                kv_indices = unified.csa_indices
-                kv_indptr = unified.csa_indptr
+                kv_indices = unified_metadata.csa_indices
+                kv_indptr = unified_metadata.csa_indptr
                 runtime.fill_compress_tail(
                     indices=kv_indices,
                     indptr=kv_indptr,
