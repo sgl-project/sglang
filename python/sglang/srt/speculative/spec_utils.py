@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -45,6 +45,7 @@ from sglang.srt.speculative.triton_ops.eagle import (
 )
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -477,9 +478,7 @@ def spec_stage_span(name: str):
     """Profiler span for a coarse speculative-decoding stage (``draft`` /
     ``draft_extend`` / ``verify``).
     """
-    if torch.autograd._profiler_enabled():
-        return torch.profiler.record_function(name)
-    return nullcontext()
+    return profile_range(name)
 
 
 def move_accept_tokens_to_target_kvcache(
