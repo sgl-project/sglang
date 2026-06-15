@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
+import mmap
+import os
+import shutil
+import socket
+import tempfile
 import threading
+import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import wraps
@@ -93,6 +101,155 @@ class HostTensorAllocator:
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
+
+
+class SharedMemoryHostTensorAllocator(HostTensorAllocator):
+    """Allocate CPU tensors from one mmap shared by a single-node TP group."""
+
+    def __init__(
+        self,
+        group: Optional[Any],
+        name_prefix: str,
+        is_writer: bool,
+        directory: Optional[str] = None,
+        unlink_after_attach: bool = True,
+    ):
+        super().__init__()
+        self.group = group
+        self.name_prefix = self._sanitize_name(name_prefix)
+        self.is_writer = is_writer
+        if directory is None:
+            if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK):
+                self.directory = "/dev/shm"
+            else:
+                self.directory = tempfile.gettempdir()
+        else:
+            self.directory = directory
+        self.unlink_after_attach = unlink_after_attach
+        self._alloc_index = 0
+        self._mmap_refs = []
+
+    @staticmethod
+    def _sanitize_name(name: str) -> str:
+        return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+
+    def _needs_group_barrier(self) -> bool:
+        return (
+            self.group is not None
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=self.group) > 1
+        )
+
+    def _check_directory_capacity(self, nbytes: int) -> None:
+        available = shutil.disk_usage(self.directory).free
+        if available < nbytes:
+            raise RuntimeError(
+                f"Not enough free space in {self.directory} for shared host tensor. "
+                f"Need {nbytes / 1e9:.2f} GB, available {available / 1e9:.2f} GB."
+            )
+
+    def _open_or_create(self, path: str, nbytes: int) -> tuple[int, bool]:
+        os.makedirs(self.directory, exist_ok=True)
+        if self.is_writer:
+            self._check_directory_capacity(nbytes)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            try:
+                os.ftruncate(fd, nbytes)
+            except Exception:
+                os.close(fd)
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                raise
+            return fd, True
+
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                size = os.path.getsize(path)
+                if size == nbytes:
+                    return os.open(path, os.O_RDWR), False
+            except FileNotFoundError:
+                pass
+
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Timed out waiting for shared host tensor {path}.")
+            time.sleep(0.05)
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        if device != "cpu":
+            raise ValueError(
+                "SharedMemoryHostTensorAllocator only supports CPU tensors, "
+                f"got device={device}."
+            )
+
+        self.dtype = dtype
+        self.dims = dims
+        numel = math.prod(dims)
+        if numel == 0:
+            return torch.empty(dims, dtype=dtype, device=device)
+
+        nbytes = numel * torch.empty((), dtype=dtype).element_size()
+        path = os.path.join(
+            self.directory,
+            f"{self.name_prefix}_{self._alloc_index}_{nbytes}.bin",
+        )
+        self._alloc_index += 1
+
+        fd, created = self._open_or_create(path, nbytes)
+        try:
+            mapping = mmap.mmap(fd, nbytes, access=mmap.ACCESS_WRITE)
+        finally:
+            os.close(fd)
+
+        self._mmap_refs.append(mapping)
+        tensor = torch.frombuffer(mapping, dtype=dtype, count=numel).reshape(dims)
+
+        if self._needs_group_barrier():
+            torch.distributed.barrier(group=self.group)
+        if created and self.unlink_after_attach:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        return tensor
+
+
+def create_shared_memory_host_tensor_allocator(
+    group: Optional[Any],
+    namespace: str,
+) -> Optional[SharedMemoryHostTensorAllocator]:
+    if (
+        group is None
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size(group=group) <= 1
+    ):
+        return None
+
+    group_ranks = torch.distributed.get_process_group_ranks(group)
+    hostname = socket.gethostname()
+    hostnames = [None] * len(group_ranks)
+    torch.distributed.all_gather_object(hostnames, hostname, group=group)
+    if len(set(hostnames)) != 1:
+        raise RuntimeError(
+            "SGLANG_HISPARSE_CPU_SHARE only supports single-node TP groups. "
+            f"Got hostnames: {hostnames}."
+        )
+
+    src_rank = group_ranks[0]
+    shared_name = [None]
+    if torch.distributed.get_rank() == src_rank:
+        shared_name[0] = f"{namespace}_{uuid.uuid4().hex}"
+    torch.distributed.broadcast_object_list(shared_name, src=src_rank, group=group)
+
+    return SharedMemoryHostTensorAllocator(
+        group=group,
+        name_prefix=shared_name[0],
+        is_writer=torch.distributed.get_rank() == src_rank,
+    )
 
 
 class HiSparseHostPoolMixin:
@@ -242,13 +399,14 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        allocator: Optional[HostTensorAllocator] = None,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = allocator or get_allocator_from_storage(allocator_type)
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -270,7 +428,11 @@ class HostKVCache(abc.ABC):
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
+        is_shared_reader = (
+            isinstance(self.allocator, SharedMemoryHostTensorAllocator)
+            and not self.allocator.is_writer
+        )
+        if requested_bytes > available_bytes and not is_shared_reader:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
@@ -278,8 +440,9 @@ class HostKVCache(abc.ABC):
                 f"size of the hierarchical cache."
             )
         else:
+            action = "Attaching to shared" if is_shared_reader else "Allocating"
             logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                f"{action} {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
 
         self.kv_buffer = self.init_kv_buffer()
@@ -1166,6 +1329,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        allocator: Optional[HostTensorAllocator] = None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -1177,6 +1341,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            allocator,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
