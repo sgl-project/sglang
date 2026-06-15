@@ -150,6 +150,18 @@ class BaseCudaGraphRunner(ABC):
         self.attn_tp_rank = get_attention_tp_rank()
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
+    def warmup(self) -> None:
+        """Warm up + autotune kernels once, before this runner captures —
+        part of the Runner lifecycle, called from prepare().
+
+        Run-once across the decode and prefill runners via a flag on the shared
+        ModelRunner: whichever runner prepares first does the warmup; the other
+        is a no-op. The logic lives on ModelRunner (it uses _dummy_run /
+        _flashinfer_autotune); the eager path (no graph runner) warms up via the
+        same run-once helper called from init_backends.
+        """
+        self.model_runner.kernel_warmup()
+
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
         """Return the smallest buckets[i] >= raw_size.

@@ -756,6 +756,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def prepare(self) -> None:
+        # Warm up + autotune kernels once before capture (run-once across the
+        # decode + prefill runners; see BaseCudaGraphRunner.warmup).
+        self.warmup()
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()

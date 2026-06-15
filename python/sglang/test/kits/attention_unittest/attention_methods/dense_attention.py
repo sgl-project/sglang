@@ -324,6 +324,10 @@ class MockModelRunner(ModelRunner):
         self.pp_size = 1
         self.is_draft_worker = False
         self.spec_algorithm = SpeculativeAlgorithm.NONE
+        # The runner lifecycle warms up kernels in prepare() via
+        # ModelRunner.kernel_warmup; this mock never calls init_backends and has
+        # no real kernels to warm up, so mark it done (warmup becomes a no-op).
+        self._kernel_warmed_up = True
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()

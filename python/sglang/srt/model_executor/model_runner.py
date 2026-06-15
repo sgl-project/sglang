@@ -886,7 +886,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
-            self.kernel_warmup()
+            # Kernel warmup / autotune moved into the Runner lifecycle
+            # (BaseCudaGraphRunner.warmup -> ModelRunner.kernel_warmup, run-once,
+            # called from decode/prefill prepare() before capture). The eager
+            # fallback below covers the cuda-graph-disabled path.
             self._pre_initialize_flashinfer_allreduce_workspace()
             if not disable_cuda_graph:
                 self.init_decode_cuda_graph()
@@ -929,6 +932,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             register_forward_hooks(self.model, server_args.forward_hooks)
 
         self.init_prefill_cuda_graph()
+
+        # Eager fallback: when cuda graph is fully disabled no runner runs
+        # prepare(), so warm up here. Run-once via _kernel_warmed_up, so when a
+        # graph runner already warmed up in prepare() this is a no-op.
+        self.kernel_warmup()
 
         self.prealloc_symmetric_memory_pool()
 
@@ -2437,7 +2445,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return attn_backend_wrapper(self, full_attention_backend)
 
     def kernel_warmup(self):
-        """Warmup and tune kernels before cuda graph capture."""
+        """Warm up + autotune kernels once, before cuda graph capture.
+
+        Part of the Runner lifecycle: BaseCudaGraphRunner.warmup() (called from
+        decode/prefill prepare()) delegates here so the autotune runs right
+        before capture. Run-once via _kernel_warmed_up so the decode and prefill
+        runners don't both warm up. When cuda graph is disabled (eager, no
+        runner runs prepare()), init_backends calls this directly as a fallback.
+        """
+        if getattr(self, "_kernel_warmed_up", False):
+            return
+        self._kernel_warmed_up = True
+
         if self.device != "cuda":
             return
 
