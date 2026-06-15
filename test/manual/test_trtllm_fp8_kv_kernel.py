@@ -476,6 +476,122 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
 
         # If we get here without exception, no-scale CUDA graph compatibility is confirmed
 
+    def test_precomputed_inverse_scales_match_on_the_fly(self):
+        """
+        Precomputed inverse scales (inv_k_scale / inv_v_scale) must produce a
+        bit-identical KV cache to the on-the-fly 1/scale path.
+
+        This is the contract that lets the trtllm_mha backend precompute the
+        inverse scales once at model load instead of relaunching reciprocal
+        kernels on every forward pass.
+        """
+        device = torch.device("cuda")
+
+        num_tokens = 16
+        num_kv_heads = 8
+        head_dim = 128
+        page_size = 16
+        total_slots = 128 * page_size
+
+        k = torch.randn(
+            num_tokens, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+
+        cache_loc = torch.randperm(total_slots, device=device, dtype=torch.int32)[
+            :num_tokens
+        ]
+
+        k_scale = torch.tensor(0.5, device=device, dtype=torch.float32)
+        v_scale = torch.tensor(0.75, device=device, dtype=torch.float32)
+        inv_k_scale = (1.0 / k_scale).to(device=device, dtype=torch.float32)
+        inv_v_scale = (1.0 / v_scale).to(device=device, dtype=torch.float32)
+
+        def _run(extra_kwargs):
+            kc = torch.zeros(
+                total_slots,
+                num_kv_heads,
+                head_dim,
+                device=device,
+                dtype=torch.float8_e4m3fn,
+            )
+            vc = torch.zeros_like(kc)
+            fused_fp8_set_kv_buffer(
+                k.clone(),
+                v.clone(),
+                kc,
+                vc,
+                cache_loc,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                page_size=page_size,
+                use_triton=True,
+                **extra_kwargs,
+            )
+            return kc, vc
+
+        kc_on_the_fly, vc_on_the_fly = _run({})
+        kc_precomputed, vc_precomputed = _run(
+            {"inv_k_scale": inv_k_scale, "inv_v_scale": inv_v_scale}
+        )
+
+        self.assertTrue(
+            torch.equal(kc_on_the_fly, kc_precomputed),
+            "K cache mismatch between on-the-fly and precomputed inverse scales",
+        )
+        self.assertTrue(
+            torch.equal(vc_on_the_fly, vc_precomputed),
+            "V cache mismatch between on-the-fly and precomputed inverse scales",
+        )
+
+    def test_precomputed_inverse_scales_cuda_graph_compatible(self):
+        """Precomputed inverse scales must also be safe under CUDA graph capture."""
+        device = torch.device("cuda")
+
+        num_tokens = 4
+        num_kv_heads = 2
+        head_dim = 64
+        page_size = 16
+        total_slots = page_size
+
+        k = torch.randn(
+            num_tokens, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+
+        k_cache = torch.empty(
+            total_slots,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        v_cache = torch.empty_like(k_cache)
+        cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
+
+        k_scale = torch.tensor(0.5, device=device, dtype=torch.float32)
+        v_scale = torch.tensor(0.75, device=device, dtype=torch.float32)
+        inv_k_scale = (1.0 / k_scale).to(device=device, dtype=torch.float32)
+        inv_v_scale = (1.0 / v_scale).to(device=device, dtype=torch.float32)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fused_fp8_set_kv_buffer(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                cache_loc,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                page_size=page_size,
+                use_triton=True,
+                inv_k_scale=inv_k_scale,
+                inv_v_scale=inv_v_scale,
+            )
+
+        graph.replay()
+
 
 if __name__ == "__main__":
     unittest.main()
