@@ -434,12 +434,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self._set_positions(forward_batch)
         self._expand_for_topk_draft(forward_batch)
 
-        can_run_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch
+        can_run_cuda_graph = (
+            self.cuda_graph_runner
+            and self.cuda_graph_runner.can_run_graph(forward_batch)
         )
         if can_run_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-                forward_batch
+            parent_list, top_scores_index, draft_tokens = (
+                self.cuda_graph_runner.execute(forward_batch)
             )
         else:
             forward_batch.can_run_dp_cuda_graph = False

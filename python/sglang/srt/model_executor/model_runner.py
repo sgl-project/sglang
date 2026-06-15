@@ -3416,13 +3416,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Check piecewies cuda graph
         can_run_graph = (
             self.prefill_cuda_graph_runner is not None
-            and self.prefill_cuda_graph_runner.can_run(forward_batch)
+            and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
         )
         if get_cp_strategy() is not None:
             can_run_graph = False
         if can_run_graph:
             # TODO: device_timer.wrap is too broad here — it also includes
-            # replay_prepare time. Move timing into the prefill cuda graph
+            # load_batch time. Move timing into the prefill cuda graph
             # runner to capture only the model.forward part.
             ctx = (
                 self.device_timer.wrap(metadata={"category": "extend"})
@@ -3430,7 +3430,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else contextlib.nullcontext()
             )
             with ctx:
-                ret = self.prefill_cuda_graph_runner.replay(forward_batch, **kwargs)
+                ret = self.prefill_cuda_graph_runner.execute(forward_batch, **kwargs)
             return (ret, can_run_graph)
 
         if not self.server_args.enable_pdmux:
@@ -3704,7 +3704,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             can_run_graph = bool(
                 mode_check()
                 and self.decode_cuda_graph_runner
-                and self.decode_cuda_graph_runner.can_run(forward_batch)
+                and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
 
             if (
@@ -3717,7 +3717,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Replay cuda graph if applicable
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.replay(
+                ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
