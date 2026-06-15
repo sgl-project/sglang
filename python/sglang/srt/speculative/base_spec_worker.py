@@ -241,6 +241,11 @@ class BaseSpecWorker(ABC):
         Default returns target only; subclasses extend with draft backends."""
         return (self.target_worker.model_runner.attn_backend,)
 
+    @property
+    def draft_models(self) -> list:
+        """Separately owned draft models for distributed weight updates."""
+        return [runner.model for runner in self._draft_model_runners()]
+
     def clear_cache_pool(self):
         """Default no-op: the allocator and kv cache pool are shared with the
         target worker and cleared by the scheduler."""
