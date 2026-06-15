@@ -424,7 +424,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            self.drain_aborted_waiting_reqs()
+            self.process_waiting_queue()
             if self._engine_paused:
                 continue
 
@@ -458,7 +458,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            self.drain_aborted_waiting_reqs()
+            self.process_waiting_queue()
             if self._engine_paused:
                 continue
 
@@ -799,8 +799,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         return transferred_rids
 
-    def drain_aborted_waiting_reqs(self: Scheduler) -> None:
-        """Drop waiting_queue requests marked Failed by decode abort (e.g. waiting timeout)."""
+    def process_waiting_queue(self: Scheduler) -> None:
+        """Process waiting_queue requests marked failed by decode abort (e.g. waiting timeout)."""
         if not self.waiting_queue:
             return
 
