@@ -45,8 +45,6 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_available_gpu_memory
-from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
-from sglang.srt.weight_cache.protocol import get_socket_path
 
 # Try to import accelerate (optional dependency)
 try:
@@ -3156,6 +3154,9 @@ def get_model_loader(
         return RunaiModelStreamerLoader(load_config)
 
     if load_config.load_format == LoadFormat.IPC_CACHE:
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.protocol import get_socket_path
+
         socket_path = (
             load_config.weight_cache_socket
             if load_config.weight_cache_socket
