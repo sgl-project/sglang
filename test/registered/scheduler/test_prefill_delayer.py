@@ -49,6 +49,7 @@ class NegotiateCall:
     max_prefill_bs: Optional[List[int]] = None
     waiting_queue_len: Optional[List[int]] = None
     max_running_requests: Optional[int] = None
+    num_allocatable_reqs: Optional[List[int]] = None
     # Inter-call sleep (seconds). Used to exercise the queue-trigger
     # wall-clock timeout.
     sleep_before_s: float = 0.0
@@ -66,6 +67,8 @@ class NegotiateTestCase:
     # to exercise the legacy slot-only code paths.
     queue_min_ratio: Optional[float] = None
     max_delay_ms: Optional[float] = None
+    # Allocatable-slots trigger knob; None keeps the trigger disabled.
+    min_allocatable_reqs: Optional[int] = None
     # Expected accumulated wait surfaced on the final (release) outcome. When
     # set, asserts the wait histograms would observe this value instead of 0.
     expected_wait_forward_passes: Optional[int] = None
@@ -89,6 +92,7 @@ def _run_negotiate_test(rank, test_cases):
             ),
             max_delay_passes=case.max_delay_passes,
             token_usage_low_watermark=case.token_usage_low_watermark,
+            min_allocatable_reqs=case.min_allocatable_reqs,
         )
 
         for call in case.calls:
@@ -104,6 +108,8 @@ def _run_negotiate_test(rank, test_cases):
                 extra_kwargs["waiting_queue_len"] = call.waiting_queue_len[rank]
             if call.max_running_requests is not None:
                 extra_kwargs["max_running_requests"] = call.max_running_requests
+            if call.num_allocatable_reqs is not None:
+                extra_kwargs["num_allocatable_reqs"] = call.num_allocatable_reqs[rank]
 
             result = delayer._negotiate_should_allow_prefill(
                 local_prefillable=call.prefillable[rank],
@@ -370,6 +376,127 @@ _NEGOTIATE_TEST_CASES = [
         expected_reason="wait_success",
         # One queue-trigger delay was recorded before the wall-clock release.
         expected_wait_forward_passes=1,
+    ),
+    # Allocatable-slots trigger: the most-constrained rank has 2 allocatable
+    # slots, below min_allocatable_reqs=4, so prefill must wait for more to free.
+    NegotiateTestCase(
+        name="allocatable_trigger_delay",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        min_allocatable_reqs=4,
+        max_delay_ms=5000,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_running_requests=1024,
+                num_allocatable_reqs=[2, 3, 8, 8],
+            ),
+            # skip_first_delayer consumes the first would-be delay; a second
+            # identical call must actually delay.
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_running_requests=1024,
+                num_allocatable_reqs=[2, 3, 8, 8],
+            ),
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
+    # Allocatable slots at the threshold on every rank: trigger must not fire.
+    NegotiateTestCase(
+        name="allocatable_trigger_enough_slots",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        min_allocatable_reqs=4,
+        max_delay_ms=5000,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_running_requests=1024,
+                num_allocatable_reqs=[4, 8, 8, 8],
+            )
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+    ),
+    # Nothing running: there is no decode batch to protect, prefill at once.
+    NegotiateTestCase(
+        name="allocatable_trigger_idle_running_batch",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        min_allocatable_reqs=4,
+        max_delay_ms=5000,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                max_running_requests=1024,
+                num_allocatable_reqs=[1, 1, 1, 1],
+            )
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+    ),
+    # Callers that do not provide the slot count (e.g. while a chunked
+    # prefill is in flight) must not be delayed by this trigger.
+    NegotiateTestCase(
+        name="allocatable_trigger_na_when_not_provided",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        min_allocatable_reqs=4,
+        max_delay_ms=5000,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_running_requests=1024,
+            )
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+    ),
+    # max_delay_ms wall-clock timeout applies to this trigger as well: same
+    # skip-first / delay / force-release sequence as the queue trigger.
+    NegotiateTestCase(
+        name="allocatable_trigger_wall_clock_timeout",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        min_allocatable_reqs=4,
+        max_delay_ms=50,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_running_requests=1024,
+                num_allocatable_reqs=[2, 3, 8, 8],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_running_requests=1024,
+                num_allocatable_reqs=[2, 3, 8, 8],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_running_requests=1024,
+                num_allocatable_reqs=[2, 3, 8, 8],
+                sleep_before_s=0.2,  # > max_delay_ms (50ms)
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_success",
     ),
 ]
 

@@ -16,6 +16,11 @@ _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
 logger = logging.getLogger(__name__)
 
+# Sentinel packed into the all-gather when a rank's allocatable-slot count is
+# not applicable this pass (chunked prefill in flight, or the caller did not
+# provide it); large so it never constrains the min() across ranks.
+_ALLOCATABLE_NA = 1 << 30
+
 
 @dataclass(frozen=True)
 class _State:
@@ -49,6 +54,7 @@ class PrefillDelayer:
         server_args,
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
+        min_allocatable_reqs: Optional[int] = None,
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         device: Optional["torch.device"] = "cpu",
         device_group=None,
@@ -58,6 +64,13 @@ class PrefillDelayer:
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
         # is explicitly set. Additive with the slot-based trigger.
         self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
+        # Allocatable-slots trigger is opt-in as well: a threshold of 0/1 is a
+        # no-op (a pass with 0 allocatable slots cannot prefill anyway).
+        self._min_allocatable_reqs = (
+            min_allocatable_reqs
+            if min_allocatable_reqs is not None and min_allocatable_reqs > 1
+            else None
+        )
         # Fall back to 5000ms if unset; this is a local safety cap, not a
         # semantic default, so we don't surface it via ServerArgs.
         self._max_delay_ms = server_args.prefill_delayer_max_delay_ms
@@ -69,6 +82,7 @@ class PrefillDelayer:
             f"max_delay_passes={self._max_delay_passes} "
             f"token_usage_low_watermark={self._token_usage_low_watermark} "
             f"queue_min_ratio={self._queue_min_ratio} "
+            f"min_allocatable_reqs={self._min_allocatable_reqs} "
             f"max_delay_ms={self._max_delay_ms} "
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
@@ -95,9 +109,9 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len, num_allocatable_reqs.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 5),
+            (dp_size_dim, attn_tp_size, 6),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -119,6 +133,7 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
+        num_allocatable_reqs: Optional[int] = None,
     ) -> _NegotiateOutput:
         out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
@@ -128,6 +143,7 @@ class PrefillDelayer:
             max_prefill_bs=max_prefill_bs,
             max_running_requests=max_running_requests,
             waiting_queue_len=waiting_queue_len,
+            num_allocatable_reqs=num_allocatable_reqs,
         )
         self._curr_state = out.next_state
         return out
@@ -142,6 +158,7 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
+        num_allocatable_reqs: Optional[int] = None,
     ) -> _NegotiateOutput:
         # Compute local states
         local_token_watermark_force_allow = (
@@ -157,12 +174,14 @@ class PrefillDelayer:
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
+            num_allocatable_reqs=num_allocatable_reqs,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
+        global_num_allocatable_reqs = tp0_info[:, 5]
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -213,8 +232,7 @@ class PrefillDelayer:
             global_waiting_queue_max = int(global_waiting_queue_len.max().item())
 
             # Queue-based trigger: delay prefill until the waiting queue
-            # reaches queue_min = min(running_req * ratio, max_prefill_bs),
-            # capped by a wall-clock timeout to bound worst-case TTFT.
+            # reaches queue_min = min(running_req * ratio, max_prefill_bs).
             # Targets workloads where decode requests finish one-at-a-time
             # and fragment prefill into many tiny batches.
             queue_condition = False
@@ -227,17 +245,31 @@ class PrefillDelayer:
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
                 )
-                if queue_condition and prev_state is not None:
-                    elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
-                    if elapsed_ms >= self._max_delay_ms:
-                        queue_condition = False
+
+            # Allocatable-slots trigger: hold new prefills until at least
+            # min_allocatable_reqs request slots are free, so freed slots are
+            # admitted in one batch instead of one request at a time. Targets
+            # workloads where each admission is disproportionately expensive
+            # (e.g. speculative decoding with a separate draft prefill pass).
+            allocatable_condition = (
+                self._min_allocatable_reqs is not None
+                and global_running_batch_max > 0
+                and int(global_num_allocatable_reqs.min().item())
+                < self._min_allocatable_reqs
+            )
+
+            # Wall-clock cap on the adaptive triggers to bound worst-case TTFT.
+            if (queue_condition or allocatable_condition) and prev_state is not None:
+                elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
+                if elapsed_ms >= self._max_delay_ms:
+                    queue_condition = allocatable_condition = False
 
             slot_condition = (
                 max_running_requests - global_running_batch_max
                 < global_max_prefill_bs_max
             )
 
-            if slot_condition or queue_condition:
+            if slot_condition or queue_condition or allocatable_condition:
                 # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
                 # the first merge_batch causes the decoding to fail to reach the maximum batch size.
                 if self.skip_first_delayer:
@@ -307,6 +339,7 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
+        num_allocatable_reqs: Optional[int] = None,
     ):
         local_info = torch.tensor(
             [
@@ -315,6 +348,11 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
+                (
+                    _ALLOCATABLE_NA
+                    if num_allocatable_reqs is None
+                    else num_allocatable_reqs
+                ),
             ],
             device=self._gather_device,
             dtype=torch.int64,
@@ -355,6 +393,7 @@ class PrefillDelayerSinglePassExecutor:
         max_prefill_bs: int = 0,
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
+        num_allocatable_reqs: Optional[int] = None,
     ) -> bool:
         if not self._called:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
@@ -364,6 +403,7 @@ class PrefillDelayerSinglePassExecutor:
                 max_prefill_bs=max_prefill_bs,
                 max_running_requests=max_running_requests,
                 waiting_queue_len=waiting_queue_len,
+                num_allocatable_reqs=num_allocatable_reqs,
             )
         return self._result.output_allow
 
