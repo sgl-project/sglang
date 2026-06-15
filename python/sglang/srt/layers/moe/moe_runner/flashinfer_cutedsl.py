@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -341,8 +342,51 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     # v1 only: True when DeepEP pre-quantizes activations to NVFP4.
     use_nvfp4_dispatch: bool = False
 
+    # v2 only: quantize hidden states with per-token dynamic activation scales.
+    use_per_token_activation: bool = False
+
     # v1 only: SBO down-GEMM overlap args.
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
+
+
+def _quantize_hidden_states_nvfp4(
+    hidden_states: torch.Tensor,
+    input_scale: torch.Tensor,
+    use_per_token_activation: bool,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    if use_per_token_activation:
+        from flashinfer import SfLayout, nvfp4_quantize
+
+        e4m3_max = 448.0
+        if (
+            envs.FLASHINFER_NVFP4_4OVER6.get()
+            and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
+        ):
+            e4m3_max = 256.0
+
+        x_fp4_bytes, x_sf_bytes, per_token_scale = nvfp4_quantize(
+            hidden_states,
+            1.0 / (e4m3_max * 6.0),
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+        seq_len, hidden_size = hidden_states.shape
+        x_fp4 = x_fp4_bytes.reshape(seq_len, hidden_size // 2)
+        x_sf = x_sf_bytes.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // _FP4_SF_VEC_SIZE
+        )
+        return x_fp4, x_sf, per_token_scale
+
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    x_fp4, x_sf = fp4_quantize(
+        hidden_states,
+        input_scale,
+        sf_vec_size=_FP4_SF_VEC_SIZE,
+        is_sf_swizzled_layout=False,
+    )
+    return x_fp4, x_sf, None
 
 
 @register_fused_func("none", "flashinfer_cutedsl")
@@ -353,7 +397,6 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
@@ -367,11 +410,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    x_fp4, x_sf = fp4_quantize(
+    x_fp4, x_sf, per_token_scale = _quantize_hidden_states_nvfp4(
         hidden_states,
         quant_info.a1_scale,
-        sf_vec_size=_FP4_SF_VEC_SIZE,
-        is_sf_swizzled_layout=False,
+        quant_info.use_per_token_activation,
     )
 
     output = quant_info.wrapper.run(
@@ -386,6 +428,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
+        per_token_scale=per_token_scale,
     )
 
     return StandardCombineInput(hidden_states=output)
@@ -407,7 +450,6 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         FlashinferCombineInput,
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
@@ -423,14 +465,19 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         topk_ids = topk_ids.to(torch.int32)
 
     if x_sf is not None:
+        if quant_info.use_per_token_activation:
+            raise ValueError(
+                "flashinfer_cutedsl per-token activation requires BF16 dispatch "
+                "so the runner can forward per_token_scale to FlashInfer."
+            )
         # NVFP4 dispatch, inputs are already quantized.
         x_fp4 = hidden_states
+        per_token_scale = None
     else:
-        x_fp4, x_sf = fp4_quantize(
+        x_fp4, x_sf, per_token_scale = _quantize_hidden_states_nvfp4(
             hidden_states,
             quant_info.a1_scale,
-            sf_vec_size=_FP4_SF_VEC_SIZE,
-            is_sf_swizzled_layout=False,
+            quant_info.use_per_token_activation,
         )
 
     output = quant_info.wrapper.run(
@@ -445,6 +492,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
+        per_token_scale=per_token_scale,
     )
 
     # Note: output contains routed expert results; shared_expert is handled separately
@@ -472,6 +520,11 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     assert (
         not runner_config.apply_router_weight_on_input
     ), "apply_router_weight_on_input is not supported for Flashinfer"
+    if quant_info.use_per_token_activation:
+        raise ValueError(
+            "flashinfer_cutedsl per-token activation is supported only on the "
+            "CuteDSL v2 path (moe_a2a_backend='none' or 'flashinfer')."
+        )
 
     hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
 

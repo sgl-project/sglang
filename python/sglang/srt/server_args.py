@@ -3551,11 +3551,12 @@ class ServerArgs:
             elif self.moe_runner_backend not in [
                 "flashinfer_trtllm",
                 "flashinfer_trtllm_routed",
+                "flashinfer_cutedsl",
             ]:
                 raise ValueError(
                     "--quantization nvfp4_online supports only "
                     "--moe-runner-backend flashinfer_trtllm or "
-                    "flashinfer_trtllm_routed."
+                    "flashinfer_trtllm_routed, or flashinfer_cutedsl."
                 )
         if self.quantization == "mxfp8":
             if self.moe_runner_backend == "auto":
@@ -3597,8 +3598,9 @@ class ServerArgs:
 
         if self.moe_runner_backend == "flashinfer_cutedsl":
             assert self.quantization in [
-                "modelopt_fp4"
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4'."
+                "modelopt_fp4",
+                "nvfp4_online",
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4' or 'nvfp4_online'."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -3611,6 +3613,14 @@ class ServerArgs:
                 f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
                 f"got '{self.moe_a2a_backend}'."
             )
+            if self.moe_a2a_backend == "deepep" and (
+                self.quantization == "nvfp4_online"
+                or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+            ):
+                raise ValueError(
+                    "flashinfer_cutedsl per-token NVFP4 activation requires "
+                    "moe_a2a_backend='none' or 'flashinfer'."
+                )
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
