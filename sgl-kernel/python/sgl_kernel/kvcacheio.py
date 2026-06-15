@@ -245,7 +245,7 @@ def transfer_kv_per_layer_mla_pf_lf(
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
-    block_quota: int = 2,
+    block_quota: int = 16 if _is_hip else 2,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf.default(
