@@ -1684,10 +1684,10 @@ class MMReceiverBase(ABC):
         finally:
             recv_socket.close()
 
-    def send_encode_request(self, obj):
-        self._send_encode_request(obj)
+    def send_encode_request(self, obj, time_stats_json=None):
+        self._send_encode_request(obj, time_stats_json=time_stats_json)
 
-    def _send_encode_request(self, obj):
+    def _send_encode_request(self, obj, time_stats_json=None):
         mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
@@ -1730,6 +1730,7 @@ class MMReceiverBase(ABC):
                     num_items_assigned,
                     None,
                     encode_urls,
+                    time_stats_json,
                 ),
                 daemon=True,
             )
@@ -1839,6 +1840,7 @@ class MMReceiverBase(ABC):
         num_items_assigned,
         embedding_port,
         encode_urls=None,
+        time_stats_json=None,
     ):
         try:
             asyncio.run(
@@ -1850,6 +1852,7 @@ class MMReceiverBase(ABC):
                     endpoint_send=None,
                     num_items_assigned=num_items_assigned,
                     encode_urls=encode_urls,
+                    time_stats_json=time_stats_json,
                 )
             )
         except Exception as e:
@@ -2069,6 +2072,7 @@ class MMReceiverHTTP(MMReceiverBase):
         endpoint_send,
         num_items_assigned=None,
         encode_urls=None,
+        time_stats_json=None,
     ):
         if len(mm_data) == 0:
             return
@@ -2121,6 +2125,7 @@ class MMReceiverHTTP(MMReceiverBase):
                         "modality": modality.name,  # convert enum to string for json serialization
                         "prefill_host": self.host,
                         "embedding_port": embedding_port,
+                        "time_stats_json": time_stats_json,
                     }
                 )
                 cum_idx += 1

@@ -8,10 +8,7 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.eagle_info_v2 import (
-    EagleDraftInputV2Mixin,
-    EagleVerifyInputV2Mixin,
-)
+from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
@@ -30,7 +27,7 @@ def _draft_runner_of(worker):
 
 
 @dataclass
-class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
+class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor
@@ -53,6 +50,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
+
+    @property
+    def max_tree_depth(self) -> int:
+        """Longest root-to-leaf chain of the verify tree, incl. the root;
+        bounds the accept_index row width. EAGLE trees are depth-bounded by
+        the draft loop. Algorithms with other tree shapes override this."""
+        return self.spec_steps + 1
+
+    @property
+    def tree_topk(self) -> int:
+        """Branching factor passed to the tree-verify kernels; -1 means an
+        irregular tree (no fixed per-level branching)."""
+        return self.topk
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -168,10 +178,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
-    # V2 reuses `EagleDraftInput` across phases (V1 has a separate
-    # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
-    num_correct_drafts: Optional[torch.Tensor] = None
-    num_accept_tokens: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -277,16 +283,17 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
 @dataclass
 class EagleDraftExtendInput(SpecInput):
-    """Inputs to the draft-extend forward (the per-accepted-token pass after verify).
+    """Inputs to the draft-extend forward (the fill-draft-kvcache pass after
+    target prefill / verify).
 
-    Produced by `EagleVerifyInput.verify`, installed on `batch.spec_info` for
-    the draft-extend forward, then replaced with a fresh `EagleDraftInput` for
-    the next iter's draft.
+    Installed on `batch.spec_info` by the worker's `_draft_extend_for_*`
+    (and synthetically by draft-extend cuda-graph capture), then replaced
+    with a fresh `EagleDraftInput` for the next iter's draft.
     """
 
-    # shape: (total_accepted, hidden_size). Sliced from verify-time hidden_states
-    # by accept_index; consumed by the draft-extend forward. None when the spec
-    # algorithm's draft doesn't read hidden_states (e.g., STANDALONE).
+    # Target-model hidden states for the draft-extend forward; None when the
+    # draft doesn't read hidden_states (e.g., STANDALONE). Shape: decode
+    # (bs * num_draft_tokens, hidden), prefill (extend_num_tokens, hidden).
     hidden_states: Optional[torch.Tensor] = None
 
     # Per-req accept counts. `num_accept_tokens = num_correct_drafts + 1`.
