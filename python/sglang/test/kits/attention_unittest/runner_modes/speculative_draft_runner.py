@@ -187,6 +187,15 @@ class _EagleDraftWorkerHarness:
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         EagleDraftWorker._rebuild_topk1_chain_buffers(self)
+        # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
+        self.index_share_for_mtp_iteration = (
+            getattr(
+                self.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+            and self.topk == 1
+        )
 
     @property
     def draft_model_runner(self):
@@ -1861,7 +1870,7 @@ def run_dsa_eagle_draft_cuda_graph_runner_case(
 #   1. Multi-query-per-request: `num_input_tokens = sum(input_lens)`.
 #   2. Routes through `forward_extend` rather than `forward_decode`.
 #      Production picks `dsa_decode_impl` (default `flashmla_kv`)
-#      because `is_draft_extend(include_v2=True)` is in the
+#      because `is_draft_extend_v2()` is in the
 #      decode-impl branch (`dsa_backend.py:1352-1358`).
 #   3. DraftBackendFactory returns a single `DeepseekSparseAttnBackend`
 #      (not a multi-step wrapper) via `_create_dsa_prefill_backend`.

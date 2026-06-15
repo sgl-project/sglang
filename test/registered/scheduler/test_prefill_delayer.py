@@ -69,6 +69,9 @@ class NegotiateTestCase:
     max_delay_ms: Optional[float] = None
     # Allocatable-slots trigger knob; None keeps the trigger disabled.
     min_allocatable_reqs: Optional[int] = None
+    # Expected accumulated wait surfaced on the final (release) outcome. When
+    # set, asserts the wait histograms would observe this value instead of 0.
+    expected_wait_forward_passes: Optional[int] = None
 
 
 def _run_negotiate_test(rank, test_cases):
@@ -119,6 +122,17 @@ def _run_negotiate_test(rank, test_cases):
             case.expected_reason,
         ), f"Case {case.name} rank {rank}"
 
+        if case.expected_wait_forward_passes is not None:
+            assert result.wait_forward_passes == case.expected_wait_forward_passes, (
+                f"Case {case.name} rank {rank}: wait_forward_passes "
+                f"{result.wait_forward_passes} != {case.expected_wait_forward_passes}"
+            )
+            # On a release after a real wait, seconds must be observed too.
+            if case.expected_wait_forward_passes > 0:
+                assert (
+                    result.wait_seconds > 0.0
+                ), f"Case {case.name} rank {rank}: wait_seconds not surfaced"
+
 
 _NEGOTIATE_TEST_CASES = [
     NegotiateTestCase(
@@ -133,6 +147,8 @@ _NEGOTIATE_TEST_CASES = [
         ],
         expected_allow=True,
         expected_reason="no_wait",
+        # No prior wait, so the histograms legitimately observe 0.
+        expected_wait_forward_passes=0,
     ),
     NegotiateTestCase(
         name="all_prefillable_with_previous_wait",
@@ -150,6 +166,9 @@ _NEGOTIATE_TEST_CASES = [
         ],
         expected_allow=True,
         expected_reason="wait_success",
+        # One mixed delay preceded the release, so the wait histograms must
+        # observe 1 forward pass (regression guard for #25949).
+        expected_wait_forward_passes=1,
     ),
     NegotiateTestCase(
         name="none_prefillable",
@@ -236,6 +255,9 @@ _NEGOTIATE_TEST_CASES = [
         ],
         expected_allow=True,
         expected_reason="wait_timeout",
+        # Two delays accumulated before timing out; the timeout release must
+        # still surface that wait to the histograms.
+        expected_wait_forward_passes=2,
     ),
     # Queue-based trigger: waiting queue below queue_min = min(running * R,
     # max_prefill_bs) should defer prefill. With R=0.5, running=100 and
@@ -352,6 +374,8 @@ _NEGOTIATE_TEST_CASES = [
         ],
         expected_allow=True,
         expected_reason="wait_success",
+        # One queue-trigger delay was recorded before the wall-clock release.
+        expected_wait_forward_passes=1,
     ),
     # Allocatable-slots trigger: the most-constrained rank has 2 allocatable
     # slots, below min_allocatable_reqs=4, so prefill must wait for more to free.

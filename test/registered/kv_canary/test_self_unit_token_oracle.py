@@ -26,7 +26,7 @@ class TestTokenOracleManager(CustomTestCase):
     ) -> None:
         """Verify EAGLE draft extend maps one request row to every draft token."""
         forward_batch = SimpleNamespace(
-            forward_mode=ForwardMode.DRAFT_EXTEND,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
             spec_info=SimpleNamespace(num_tokens_per_req=4),
             rids_int=torch.tensor([3, 7], dtype=torch.int64, device=self.device),
             bootstrap_room_ids_int=None,

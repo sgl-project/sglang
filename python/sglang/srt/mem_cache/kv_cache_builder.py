@@ -89,8 +89,8 @@ def maybe_register_hicache_draft(
         MLATokenToKVPool,
     )
     from sglang.srt.mem_cache.memory_pool_host import (
-        MHATokenToKVPoolHost,
         MLATokenToKVPoolHost,
+        get_mha_host_pool_cls,
     )
 
     pool = draft_kv_pool
@@ -107,7 +107,7 @@ def maybe_register_hicache_draft(
         layout=server_args.hicache_mem_layout,
     )
     if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
+        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
     else:
