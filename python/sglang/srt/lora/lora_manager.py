@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -46,6 +47,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +123,17 @@ class LoRAManager:
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
         )
+
+        # ===== TO BE REFACTORED ====
+        # Pre-create the experimental LoRA two-stream side stream now (gated) so the
+        # torch.cuda.Stream() call never lands inside a cuda-graph capture region.
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            from sglang.srt.lora.trtllm_lora_temp import (
+                init_lora_two_stream_resources,
+            )
+
+            init_lora_two_stream_resources(self.device)
+        # ===== END TO BE REFACTORED ====
 
     def init_cuda_graph_moe_buffers(
         self, max_bs: int, max_loras: int, compute_dtype, moe_layer
@@ -799,7 +813,11 @@ class LoRAManager:
                 continue
 
             # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.target_modules:
+            parts = module_name.split(".")
+            if (
+                parts[-1] in self.target_modules
+                or ".".join(parts[-2:]) in self.target_modules
+            ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue

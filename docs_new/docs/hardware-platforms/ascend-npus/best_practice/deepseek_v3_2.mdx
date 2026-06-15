@@ -1,0 +1,590 @@
+---
+title: "DeepSeek-V3.2"
+metatags:
+  description: "Best Practice for DeepSeek-V3.2 on Ascend NPU"
+---
+
+This guide describes the best practice data for DeepSeek-V3.2 on the Ascend NPU.
+
+### Low Latency
+
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-26ms) |
+| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs8) |
+
+### High Throughput
+
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 107ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs16) |
+
+
+## Optimal Configuration
+
+### DeepSeek-V3.2 W8A8 1P1D 32P IN128K OUT1K 26ms
+
+**Model**: DeepSeek-V3.2
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 32
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 128K+1K
+
+**TPOT**: 26ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
+MODEL_PATH=/path/to/model-weights
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=1200
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export TASK_QUEUE_ENABLE=2
+
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
+        --nnodes 2 \
+        --tp 32 \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.73 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 1 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal \
+        --quantization modelslim \
+        --disaggregation-transfer-backend ascend \
+        --disable-cuda-graph \
+        --moe-dense-tp-size 1 \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 32 \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 1 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 2
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=400
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
+        export TASK_QUEUE_ENABLE=0
+
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
+        --nnodes 2 \
+        --tp 32 \
+        --dp 8 \
+        --ep 32 \
+        --moe-dense-tp-size 1 \
+        --enable-dp-attention \
+        --enable-dp-lm-head \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.79 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 32 \
+        --cuda-graph-max-bs 4 \
+        --moe-a2a-backend deepep \
+        --deepep-mode low_latency \
+        --quantization modelslim \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --disaggregation-transfer-backend ascend
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+# ============================================================
+
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --decode http://<your decode ip1>:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --mini-lb
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 8 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 8 \
+    --random-range-ratio 1
+```
+
+### DeepSeek-V3.2 W8A8 1P1D 32P IN128K OUT1K BS16
+
+**Model**: DeepSeek-V3.2
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 32
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 128K+1K
+
+**TPOT**: 107ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
+MODEL_PATH=/path/to/model-weights
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=1200
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export TASK_QUEUE_ENABLE=2
+
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
+        --nnodes 2 \
+        --tp 32 \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.73 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 1 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal \
+        --quantization modelslim \
+        --disaggregation-transfer-backend ascend \
+        --disable-cuda-graph \
+        --moe-dense-tp-size 1 \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 32 \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 1 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 2
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=400
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
+        export TASK_QUEUE_ENABLE=0
+
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
+        --nnodes 2 \
+        --tp 32 \
+        --dp 8 \
+        --ep 32 \
+        --moe-dense-tp-size 1 \
+        --enable-dp-attention \
+        --enable-dp-lm-head \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.79 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 32 \
+        --cuda-graph-max-bs 4 \
+        --moe-a2a-backend deepep \
+        --deepep-mode low_latency \
+        --quantization modelslim \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --disaggregation-transfer-backend ascend
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+# ============================================================
+
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --decode http://<your decode ip1>:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --mini-lb
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 16 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 16 \
+    --random-range-ratio 1
+```
+
+### DeepSeek-V3.2 W8A8 1P1D 32P IN128K OUT1K BS8
+
+**Model**: DeepSeek-V3.2
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 32
+
+**Deploy Mode**: PD Disaggregation
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 128K+1K
+
+**TPOT**: 26ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+P_IP=('<your prefill ip1>' '<your prefill ip2>')
+D_IP=('<your decode ip1>' '<your decode ip2>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
+
+MODEL_PATH=/path/to/model-weights
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=1200
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export TASK_QUEUE_ENABLE=2
+
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --host ${P_IP[$i]} \
+        --port 8000 \
+        --dist-init-addr ${P_IP[0]}:5000 \
+        --disaggregation-bootstrap-port 8998 \
+        --node-rank $i \
+        --nnodes 2 \
+        --tp 32 \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.73 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 1 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal \
+        --quantization modelslim \
+        --disaggregation-transfer-backend ascend \
+        --disable-cuda-graph \
+        --moe-dense-tp-size 1 \
+        --enable-nsa-prefill-context-parallel \
+        --nsa-prefill-cp-mode in-seq-split \
+        --attn-cp-size 32 \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 1 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 2
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=400
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
+        export TASK_QUEUE_ENABLE=0
+
+        python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --host ${D_IP[$i]} \
+        --port 8001 \
+        --dist-init-addr ${D_IP[0]}:5000 \
+        --node-rank $i \
+        --nnodes 2 \
+        --tp 32 \
+        --dp 8 \
+        --ep 32 \
+        --moe-dense-tp-size 1 \
+        --enable-dp-attention \
+        --enable-dp-lm-head \
+        --watchdog-timeout 9000 \
+        --mem-fraction-static 0.79 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 68000 \
+        --max-running-requests 32 \
+        --cuda-graph-max-bs 4 \
+        --moe-a2a-backend deepep \
+        --deepep-mode low_latency \
+        --quantization modelslim \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --disaggregation-transfer-backend ascend
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+# ============================================================
+
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --decode http://<your decode ip1>:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --mini-lb
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 8 \
+    --random-input-len 131072 \
+    --random-output-len 1024 \
+    --num-prompts 8 \
+    --random-range-ratio 1
+```
