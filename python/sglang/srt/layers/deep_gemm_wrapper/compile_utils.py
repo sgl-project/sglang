@@ -1,9 +1,12 @@
+import hashlib
+import json
 import logging
 import os
 import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -32,6 +35,13 @@ _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
+_USE_SHARED_PRECOMPILE_MARKER = (
+    envs.SGLANG_JIT_DEEPGEMM_USE_SHARED_PRECOMPILE_MARKER.get()
+)
+_SHARD_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_SHARD_PRECOMPILE.get()
+_SHOW_PROGRESS = envs.SGLANG_JIT_DEEPGEMM_SHOW_PROGRESS.get()
+_PRECOMPILE_SHARD_RANK = 0
+_PRECOMPILE_SHARD_WORLD_SIZE = 1
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
@@ -48,6 +58,8 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
+    global _PRECOMPILE_SHARD_RANK
+    global _PRECOMPILE_SHARD_WORLD_SIZE
 
     _BUILTIN_M_LIST = []
 
@@ -88,12 +100,15 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
         _BUILTIN_M_LIST += list(range(1, m_max + 1))
 
     _IS_FIRST_RANK_ON_NODE = server_args.base_gpu_id == gpu_id
+    _PRECOMPILE_SHARD_RANK, _PRECOMPILE_SHARD_WORLD_SIZE = (
+        _get_local_precompile_shard_info(gpu_id, server_args)
+    )
 
     # Check if is the first rank on node.
     # Default each rank will try compile all Ms to
     # load all symbols at the launch stages.
     # Avoid loading symbols at the serving stages.
-    _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
+    _DO_COMPILE_ALL = _SHARD_PRECOMPILE or _IS_FIRST_RANK_ON_NODE
 
 
 class DeepGemmKernelType(IntEnum):
@@ -107,6 +122,241 @@ class DeepGemmKernelType(IntEnum):
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+
+
+def _get_local_precompile_shard_info(
+    gpu_id: int, server_args: ServerArgs
+) -> Tuple[int, int]:
+    tp_size_per_node = max(
+        1,
+        (server_args.tp_size + max(1, server_args.nnodes) - 1)
+        // max(1, server_args.nnodes),
+    )
+    shard_size_override = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE_SHARD_SIZE.get()
+    shard_rank_override = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE_SHARD_RANK.get()
+    world_size = int(
+        shard_size_override
+        or os.getenv("LOCAL_WORLD_SIZE")
+        or os.getenv("LOCAL_SIZE")
+        or tp_size_per_node
+    )
+    world_size = max(1, world_size)
+
+    rank = -1 if shard_rank_override is None else int(shard_rank_override)
+    if rank < 0:
+        rank = (
+            (gpu_id - server_args.base_gpu_id) // server_args.gpu_id_step
+        ) % world_size
+    return rank, world_size
+
+
+def _get_deep_gemm_shape_owner_rank(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+) -> int:
+    if _PRECOMPILE_SHARD_WORLD_SIZE <= 1:
+        return 0
+    encoded = f"{kernel_type.value}:{n}:{k}:{num_groups}".encode()
+    return int(hashlib.sha256(encoded).hexdigest(), 16) % (_PRECOMPILE_SHARD_WORLD_SIZE)
+
+
+def _is_deep_gemm_shape_owner(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+) -> bool:
+    return _PRECOMPILE_SHARD_RANK == _get_deep_gemm_shape_owner_rank(
+        kernel_type, n, k, num_groups
+    )
+
+
+def _should_show_deep_gemm_warmup_progress() -> bool:
+    return _SHOW_PROGRESS
+
+
+def _get_deep_gemm_warmup_progress_position() -> int:
+    return _PRECOMPILE_SHARD_RANK if _SHARD_PRECOMPILE else 0
+
+
+def _safe_get_deep_gemm_version() -> str:
+    if not ENABLE_JIT_DEEPGEMM:
+        return "disabled"
+
+    version = getattr(deep_gemm, "__version__", None)
+    if version is not None:
+        return str(version)
+
+    try:
+        from importlib import metadata
+
+        for package_name in ("sgl-deep-gemm", "deep_gemm", "deep-gemm"):
+            try:
+                return metadata.version(package_name)
+            except metadata.PackageNotFoundError:
+                pass
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+def _safe_get_triton_version() -> str:
+    try:
+        import triton
+
+        return str(triton.__version__)
+    except Exception:
+        return "unknown"
+
+
+def _safe_get_device_key() -> str:
+    try:
+        if torch.cuda.is_available():
+            gpu_id = torch.cuda.current_device()
+            capability = ".".join(
+                str(v) for v in torch.cuda.get_device_capability(gpu_id)
+            )
+            return f"{torch.cuda.get_device_name(gpu_id)}|sm{capability}"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _m_list_fingerprint(m_list: List[int]) -> Dict[str, object]:
+    encoded = json.dumps(m_list, separators=(",", ":")).encode()
+    return {
+        "count": len(m_list),
+        "first": m_list[0] if m_list else None,
+        "last": m_list[-1] if m_list else None,
+        "sha256": hashlib.sha256(encoded).hexdigest()[:16],
+    }
+
+
+def _deep_gemm_precompile_marker_payload(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+    m_list: List[int],
+) -> Dict[str, object]:
+    return {
+        "schema": 1,
+        "kernel_type": kernel_type.name,
+        "n": n,
+        "k": k,
+        "num_groups": num_groups,
+        "m_list": _m_list_fingerprint(m_list),
+        "fast_warmup": bool(_FAST_WARMUP),
+        "deep_gemm_version": _safe_get_deep_gemm_version(),
+        "torch_version": torch.__version__,
+        "cuda_version": getattr(torch.version, "cuda", None),
+        "triton_version": _safe_get_triton_version(),
+        "device": _safe_get_device_key(),
+        "dg_jit_use_nvrtc": os.getenv("DG_JIT_USE_NVRTC", ""),
+    }
+
+
+def _deep_gemm_precompile_marker_path(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+    m_list: List[int],
+) -> Path:
+    payload = _deep_gemm_precompile_marker_payload(
+        kernel_type, n, k, num_groups, m_list
+    )
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    marker_dir = Path(os.environ["DG_JIT_CACHE_DIR"]) / ".sglang_precompile_markers"
+    return marker_dir / f"{digest}.done"
+
+
+def _deep_gemm_precompile_marker_dir() -> Path:
+    return Path(os.environ["DG_JIT_CACHE_DIR"]) / ".sglang_precompile_markers"
+
+
+def is_deep_gemm_precompile_marked(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+    m_list: Optional[List[int]] = None,
+) -> bool:
+    if m_list is None:
+        m_list = _BUILTIN_M_LIST
+    return _deep_gemm_precompile_marker_path(
+        kernel_type, n, k, num_groups, m_list
+    ).exists()
+
+
+def mark_deep_gemm_precompiled(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+    m_list: Optional[List[int]] = None,
+) -> None:
+    if m_list is None:
+        m_list = _BUILTIN_M_LIST
+    marker_path = _deep_gemm_precompile_marker_path(
+        kernel_type, n, k, num_groups, m_list
+    )
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _deep_gemm_precompile_marker_payload(
+        kernel_type, n, k, num_groups, m_list
+    )
+    payload["created_at"] = time.time()
+    marker_path.write_text(json.dumps(payload, sort_keys=True))
+
+
+def sync_deep_gemm_precompile_markers() -> List[str]:
+    """All-gather visible marker paths across distributed ranks.
+
+    The compiled artifacts themselves live in DeepGEMM's cache directory; this
+    function is a lightweight synchronization point for the runtime metadata.
+    """
+    marker_dir = _deep_gemm_precompile_marker_dir()
+    local_markers = sorted(str(path) for path in marker_dir.glob("*.done"))
+
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return local_markers
+
+    gathered = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, local_markers)
+    return sorted({marker for markers in gathered for marker in (markers or [])})
+
+
+@contextmanager
+def _deep_gemm_precompile_file_lock(marker_path: Path):
+    lock_path = marker_path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+")
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            logger.warning(
+                "Failed to acquire DeepGEMM precompile lock %s; continuing without "
+                "cross-process serialization.",
+                lock_path,
+                exc_info=True,
+            )
+        yield
+    finally:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_file.close()
 
 
 # TODO improve code
@@ -127,31 +377,86 @@ def _maybe_compile_deep_gemm_one_type_all(
     ):
         _INITIALIZATION_DICT[query_key] = True
 
-        # TODO maybe improve logs
-        if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
-            logger.warning(
-                "Entering DeepGEMM JIT Pre-Compile session. "
-                "It may take a long time (typically 10-20 mins) "
-                "if you have not run `sglang.compile_deep_gemm`. "
-                "It is recommended to run `sglang.compile_deep_gemm` with same args as `sglang.launch_server`"
-                " for pre-compilation to reduce the overhead if you have not run it before. "
-                "For example: "
-                "`python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code`"
+        marker_path = _deep_gemm_precompile_marker_path(
+            kernel_type, n, k, num_groups, _BUILTIN_M_LIST
+        )
+        use_marker = _USE_SHARED_PRECOMPILE_MARKER or _SHARD_PRECOMPILE
+        if use_marker and marker_path.exists():
+            logger.info(
+                "Skip DeepGEMM all-M warmup for <%s> N=%s, K=%s, num_groups=%s "
+                "because shared precompile marker exists: %s",
+                kernel_type.name,
+                n,
+                k,
+                num_groups,
+                marker_path,
+            )
+            return
+        if _SHARD_PRECOMPILE and not _is_deep_gemm_shape_owner(
+            kernel_type, n, k, num_groups
+        ):
+            owner_rank = _get_deep_gemm_shape_owner_rank(kernel_type, n, k, num_groups)
+            logger.info(
+                "Skip DeepGEMM all-M warmup for <%s> N=%s, K=%s, num_groups=%s "
+                "on shard rank %s/%s; owner shard rank is %s.",
+                kernel_type.name,
+                n,
+                k,
+                num_groups,
+                _PRECOMPILE_SHARD_RANK,
+                _PRECOMPILE_SHARD_WORLD_SIZE,
+                owner_rank,
+            )
+            return
+
+        maybe_lock = (
+            _deep_gemm_precompile_file_lock(marker_path)
+            if use_marker
+            else nullcontext()
+        )
+
+        with maybe_lock:
+            if use_marker and marker_path.exists():
+                logger.info(
+                    "Skip DeepGEMM all-M warmup for <%s> N=%s, K=%s, "
+                    "num_groups=%s because another process created marker: %s",
+                    kernel_type.name,
+                    n,
+                    k,
+                    num_groups,
+                    marker_path,
+                )
+                return
+
+            # TODO maybe improve logs
+            if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
+                logger.warning(
+                    "Entering DeepGEMM JIT Pre-Compile session. "
+                    "It may take a long time (typically 10-20 mins) "
+                    "if you have not run `sglang.compile_deep_gemm`. "
+                    "It is recommended to run `sglang.compile_deep_gemm` with same args as `sglang.launch_server`"
+                    " for pre-compilation to reduce the overhead if you have not run it before. "
+                    "For example: "
+                    "`python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code`"
+                )
+
+            logger.info(
+                f"Try DeepGEMM JIT Compiling for "
+                f"<{kernel_type.name}> N={n}, K={k}, num_groups={num_groups} with all Ms."
+                f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
             )
 
-        logger.info(
-            f"Try DeepGEMM JIT Compiling for "
-            f"<{kernel_type.name}> N={n}, K={k}, num_groups={num_groups} with all Ms."
-            f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
-        )
-
-        _compile_deep_gemm_one_type_all(
-            kernel_type=kernel_type,
-            n=n,
-            k=k,
-            num_groups=num_groups,
-            m_list=_BUILTIN_M_LIST,
-        )
+            _compile_deep_gemm_one_type_all(
+                kernel_type=kernel_type,
+                n=n,
+                k=k,
+                num_groups=num_groups,
+                m_list=_BUILTIN_M_LIST,
+            )
+            if use_marker:
+                mark_deep_gemm_precompiled(
+                    kernel_type, n, k, num_groups, _BUILTIN_M_LIST
+                )
 
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
@@ -173,8 +478,10 @@ def _compile_deep_gemm_one_type_all(
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
-        # Here the precompilation is only run on the first rank, so gpu_id should be 0
-        memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
+        # Precompilation normally runs on the first local rank, but sharded
+        # precompile can assign a shape to any local rank.
+        gpu_id = torch.cuda.current_device()
+        memory_budget = get_available_gpu_memory(device="cuda", gpu_id=gpu_id)
 
         # If the memory budget is less memory requirement, we need to reduce max_m to avoid out of memory, which might further cause hanging during warmup
         max_m = max(m_list)
@@ -212,7 +519,18 @@ def _compile_deep_gemm_one_type_all(
             deep_gemm.set_compile_mode(1)
 
         # TODO can use multi thread
-        for m in tqdm(m_list, desc="DeepGEMM warmup"):
+        for m in tqdm(
+            m_list,
+            desc=(
+                "DeepGEMM warmup"
+                f" shard={_PRECOMPILE_SHARD_RANK}/{_PRECOMPILE_SHARD_WORLD_SIZE}"
+                f" {kernel_type.name} N={n} K={k} G={num_groups}"
+            ),
+            disable=not _should_show_deep_gemm_warmup_progress(),
+            position=_get_deep_gemm_warmup_progress_position(),
+            dynamic_ncols=True,
+            leave=False,
+        ):
             executor.execute(m=m)
         if has_compile_mode_api:
             deep_gemm.set_compile_mode(old_compile_mode)

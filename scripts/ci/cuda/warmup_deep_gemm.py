@@ -331,12 +331,67 @@ def compile_one_shape(kernel_type, n, k, num_groups, m_list):
 
 def compile_shapes_lightweight(shapes, m_list):
     """Compile all DeepGEMM shapes directly (no model loading)."""
+    shard_rank = int(os.getenv("SGLANG_JIT_DEEPGEMM_PRECOMPILE_SHARD_RANK", "0"))
+    shard_size = int(os.getenv("SGLANG_JIT_DEEPGEMM_PRECOMPILE_SHARD_SIZE", "1"))
+    shard_size = max(1, shard_size)
+
     for i, (kernel_type, n, k, num_groups) in enumerate(shapes, 1):
+        owner_rank = get_sglang_precompile_shape_owner_rank(
+            kernel_type, n, k, num_groups, shard_size
+        )
+        if shard_size > 1 and owner_rank != shard_rank:
+            print(
+                f"\n[{i}/{len(shapes)}] SKIP shard {shard_rank}/{shard_size}: "
+                f"{kernel_type} N={n} K={k} G={num_groups} "
+                f"(owner shard rank is {owner_rank})"
+            )
+            continue
         print(f"\n[{i}/{len(shapes)}] {kernel_type} N={n} K={k} G={num_groups}")
         t0 = time.time()
         compile_one_shape(kernel_type, n, k, num_groups, m_list)
+        write_sglang_precompile_marker(kernel_type, n, k, num_groups, m_list)
         elapsed = time.time() - t0
         print(f"  Done in {elapsed:.1f}s")
+
+
+def get_sglang_precompile_shape_owner_rank(kernel_type, n, k, num_groups, shard_size):
+    """Match server-side DeepGEMM sharded precompile ownership."""
+    if shard_size <= 1:
+        return 0
+
+    from sglang.srt.layers.deep_gemm_wrapper.compile_utils import DeepGemmKernelType
+
+    type_map = {
+        "NORMAL": DeepGemmKernelType.GEMM_NT_F8F8BF16,
+        "CONTIG": DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+        "MASKED": DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
+    }
+    encoded = f"{type_map[kernel_type].value}:{n}:{k}:{num_groups}".encode()
+    return int(hashlib.sha256(encoded).hexdigest(), 16) % shard_size
+
+
+def write_sglang_precompile_marker(kernel_type, n, k, num_groups, m_list):
+    """Write the runtime marker used to skip repeated service-start warmup."""
+    try:
+        from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
+            DeepGemmKernelType,
+            mark_deep_gemm_precompiled,
+        )
+
+        type_map = {
+            "NORMAL": DeepGemmKernelType.GEMM_NT_F8F8BF16,
+            "CONTIG": DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+            "MASKED": DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED,
+        }
+        mark_deep_gemm_precompiled(
+            type_map[kernel_type],
+            n,
+            k,
+            num_groups,
+            m_list=m_list,
+        )
+    except Exception as exc:
+        print(f"  Warning: failed to write SGLang precompile marker: {exc}")
 
 
 def _kill_pg_and_wait(proc):
@@ -443,6 +498,10 @@ def fallback_compile_deep_gemm(model, tp):
     crashed = threading.Event()
     proc = subprocess.Popen(
         cmd,
+        env={
+            **os.environ,
+            "SGLANG_JIT_DEEPGEMM_USE_SHARED_PRECOMPILE_MARKER": "1",
+        },
         preexec_fn=os.setsid,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -510,6 +569,11 @@ def main():
     )
     print(f"=== DeepGEMM Lightweight Warmup ({len(model_tp_pairs)} model(s)) ===")
     print(f"    Fast warmup: {fast_warmup}")
+    print(
+        "    Shard: "
+        f"{os.getenv('SGLANG_JIT_DEEPGEMM_PRECOMPILE_SHARD_RANK', '0')}/"
+        f"{os.getenv('SGLANG_JIT_DEEPGEMM_PRECOMPILE_SHARD_SIZE', '1')}"
+    )
     print(
         f"    Cache dir: {os.environ.get('DG_JIT_CACHE_DIR', '~/.cache/deep_gemm')}\n"
     )
