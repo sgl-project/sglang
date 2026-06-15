@@ -67,8 +67,8 @@ latency p50 ≤ 1.10× SMG` acceptance criterion targets.
 
 Both `random` and `power_of_two` are now O(1), ensuring consistent
 performance regardless of worker count.
-File an issue and pair it with a Criterion regression-guard in the same
-bench.
+TODO: Add a regression guard for the O(n) shape. Although `policy_select`
+measures the metric, nothing currently runs or gates on these results.
 
 ## Pre-deprecation calibration runbook
 
