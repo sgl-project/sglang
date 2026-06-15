@@ -8,10 +8,7 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.eagle_info_v2 import (
-    EagleDraftInputV2Mixin,
-    EagleVerifyInputV2Mixin,
-)
+from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
@@ -30,7 +27,7 @@ def _draft_runner_of(worker):
 
 
 @dataclass
-class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
+class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor
@@ -53,6 +50,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
+
+    @property
+    def max_tree_depth(self) -> int:
+        """Longest root-to-leaf chain of the verify tree, incl. the root;
+        bounds the accept_index row width. EAGLE trees are depth-bounded by
+        the draft loop. Algorithms with other tree shapes override this."""
+        return self.spec_steps + 1
+
+    @property
+    def tree_topk(self) -> int:
+        """Branching factor passed to the tree-verify kernels; -1 means an
+        irregular tree (no fixed per-level branching)."""
+        return self.topk
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
