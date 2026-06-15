@@ -172,8 +172,8 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         **extra_weight_attrs,
     ):
         self.moe_runner_config = moe_runner_config
-        layer.w13_kernel = NPUW4A16Int8MoEMethod()
-        layer.w2_kernel = NPUW4A16Int8MoEMethod()
+        layer.w13_kernel = NPUW4A16Int4MoEMethod()
+        layer.w2_kernel = NPUW4A16Int4MoEMethod()
         moe_runner_config.layer = layer
         backend = get_moe_runner_backend()
         if backend.is_auto():
