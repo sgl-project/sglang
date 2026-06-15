@@ -52,7 +52,7 @@ class ScriptedHttpServer:
         self._dirty: Optional[str] = None
 
     @classmethod
-    def start(cls, **engine_kwargs: Any) -> "ScriptedHttpServer":
+    def start(cls, **engine_kwargs: Any) -> ScriptedHttpServer:
         out_of_band_error_path = _create_oob_error_file()
 
         ctx = zmq.Context()
