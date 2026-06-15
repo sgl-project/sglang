@@ -2,6 +2,9 @@ name: Release Docker Images Nightly Miles ROCm7.2 (AMD)
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release-docker-amd-miles-rocm720-nightly.yml"
   schedule:
     - cron: "0 12 * * *"
 
@@ -45,17 +48,21 @@ jobs:
       - name: Build and push miles image to rocm/sgl-dev
         run: |
           base="miles-${{ matrix.rocm_tag }}"
-          dated="${base}-${{ env.DATE }}"
-          echo "IMAGE_TAG=${dated}" >> $GITHUB_ENV
-          echo "Building rocm/sgl-dev:${dated} from miles main @ ${{ steps.miles.outputs.sha }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            image_tag="${base}-${{ env.DATE }}-test-${{ github.run_id }}"
+          else
+            image_tag="${base}-${{ env.DATE }}"
+          fi
+          echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
+          echo "Building rocm/sgl-dev:${image_tag} from miles main @ ${{ steps.miles.outputs.sha }}"
           docker build . \
             -f docker/Dockerfile.rocm \
             --build-arg GPU_ARCH=${{ matrix.gpu_arch }} \
             --build-arg SGLANG_IMAGE_TAG=${{ matrix.sglang_image_tag }} \
             --build-arg MILES_COMMIT=${{ steps.miles.outputs.sha }} \
-            -t rocm/sgl-dev:${dated} \
+            -t rocm/sgl-dev:${image_tag} \
             --no-cache
-          docker push rocm/sgl-dev:${dated}
+          docker push rocm/sgl-dev:${image_tag}
 
       - name: Save published image tag
         run: |
