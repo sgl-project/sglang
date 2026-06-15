@@ -3292,6 +3292,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch_template=forward_batch,
         )
 
+    def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Pad / normalize a batch for the eager (non-cuda-graph) forward.
+
+        Runs the DP/MLP-sync padding, the attn-tp num_token_non_padded
+        normalization, and the hisparse-coordinator refresh that the eager
+        forward path needs — the cuda-graph path does the equivalent inside the
+        runner's capture/replay, so this is skipped there.
+        """
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.prepare_mlp_sync_batch(self)
+        else:
+            forward_batch.prepare_attn_tp_scatter_input(self)
+
+        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+        # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
+        # flavors already feed a zigzag-split rank-local layout whose token count
+        # should not be further divided by attn_tp_size. MHA-arch prefill CP
+        # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
+        # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
+        if (
+            forward_batch.num_token_non_padded is not None
+            and forward_batch.global_num_tokens_gpu is not None
+            and require_gathered_buffer(self.server_args)
+            and not is_dsa_enable_prefill_cp()
+            and not is_mla_prefill_cp_enabled()
+        ):
+            forward_batch.adjust_num_token_non_padded_for_attn_tp(
+                server_args=self.server_args,
+            )
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
     def _pp_kwargs(self, pp_proxy_tensors) -> dict:
         """Build the pp_proxy_tensors forward kwarg, in one place.
 
@@ -3629,32 +3662,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
-            # For MLP sync
-            if forward_batch.global_num_tokens_cpu is not None:
-                forward_batch.prepare_mlp_sync_batch(self)
-            else:
-                forward_batch.prepare_attn_tp_scatter_input(self)
-
-            # Normalize num_token_non_padded to be local to this attention TP rank if needed.
-            # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
-            # flavors already feed a zigzag-split rank-local layout whose token count
-            # should not be further divided by attn_tp_size. MHA-arch prefill CP
-            # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
-            # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
-            if (
-                forward_batch.num_token_non_padded is not None
-                and forward_batch.global_num_tokens_gpu is not None
-                and require_gathered_buffer(self.server_args)
-                and not is_dsa_enable_prefill_cp()
-                and not is_mla_prefill_cp_enabled()
-            ):
-                forward_batch.adjust_num_token_non_padded_for_attn_tp(
-                    server_args=self.server_args,
-                )
-
-            # Hisparse coordinator — backends now read it from self.model_runner.
-            if self.hisparse_coordinator is not None:
-                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+            # DP / MLP-sync padding + attn-tp normalization that the eager
+            # (non-graph) forward needs. The graph path skips it: capture/replay
+            # pads inside the runner.
+            self._prepare_eager_forward_batch(forward_batch)
 
             # Forward without cuda graph
             if forward_batch.forward_mode.is_decode():
