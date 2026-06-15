@@ -488,7 +488,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     const auto x = cast<float>(cast<bf16_t>(data[0]));
     const auto y = cast<float>(cast<bf16_t>(data[1]));
     const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
-    const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    const auto scale_raw = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
     const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
     const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
     const auto result = pack_fp8(x * inv_scale, y * inv_scale);
