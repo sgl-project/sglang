@@ -54,6 +54,11 @@ if _use_aiter:
 logger = logging.getLogger(__name__)
 
 
+def _should_record_expert_distribution() -> bool:
+    recorder = get_global_expert_distribution_recorder()
+    return recorder.recording or torch.get_device_module().is_current_stream_capturing()
+
+
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
 
     def __call__(self, dispatcher: BaseDispatcher):
@@ -634,6 +639,8 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     ):
         done_event: Optional[torch.cuda.Event] = None
 
+        record = _should_record_expert_distribution()
+
         if self._comm_stream:
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream  # comm stream
@@ -668,7 +675,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     topk_weights,
                     scale,
                     topk_ids,
-                    call_local_expert_count=True,
+                    call_local_expert_count=record,
                 )
                 if self.enable_sdma:
                     self.mori_op.dispatch_recv()
@@ -700,16 +707,15 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 topk_weights,
                 scale,
                 topk_ids,
-                call_local_expert_count=True,
+                call_local_expert_count=record,
             )
 
-        # Use low_latency hook instead of normal since mori local_expert_count is
-        # a GPU tensor, while the normal hook expects a Python list (CPU).  The
-        # low_latency path accumulates counts directly on GPU via
-        # _DeepepLowLatencySinglePassGatherer, which is CUDA-graph safe.
-        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            self.mori_op.local_expert_count
-        )
+        # mori local_expert_count is a GPU tensor; route it through the
+        # low_latency hook only when the recorder is actually active.
+        if record:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                self.mori_op.local_expert_count
+            )
 
         return (
             packed_recv_hidden,
@@ -888,11 +894,13 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             is mori.ops.EpDispatchCombineKernelType.AsyncLL
         ), "mori asyncll mismatch"
 
-        self.mori_op.dispatch_recv(call_local_expert_count=True)
+        record = _should_record_expert_distribution()
+        self.mori_op.dispatch_recv(call_local_expert_count=record)
 
-        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            self.mori_op.local_expert_count
-        )
+        if record:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                self.mori_op.local_expert_count
+            )
 
         return MoriEPLLDispatchOutput(
             hidden_states=hidden_states,
