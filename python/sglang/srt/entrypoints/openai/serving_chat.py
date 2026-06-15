@@ -566,6 +566,21 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self._patch_reasoning_skip_special_tokens(request)
 
+        # Resolve the thinking decision once, up front, and persist it onto the
+        # request so every downstream consumer agrees on a single source of
+        # truth: the reasoning parser (_get_reasoning_from_request, both below
+        # and again at response time), the xgrammar tool-call constraint, and
+        # the dsv4/dsv32 prompt encoder. Without this, SGLANG_DEFAULT_THINKING
+        # enables thinking in the custom-encoder prompt while the parser still
+        # treats the request as non-thinking, leaking </think> into content.
+        # Scoped to the custom encoder path (the only one SGLANG_DEFAULT_THINKING
+        # drives); jinja/conversation-template models keep reading
+        # chat_template_kwargs as-is.
+        if self.chat_encoding_spec is not None:
+            ctk = dict(request.chat_template_kwargs or {})
+            ctk.setdefault("thinking", envs.SGLANG_DEFAULT_THINKING.get())
+            request.chat_template_kwargs = ctk
+
         thinking_mode = self._get_reasoning_from_request(request)
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
         # when --reasoning-parser is configured, so builtin xgrammar
@@ -644,20 +659,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
         template_content_format = self.template_manager.jinja_template_content_format
 
-        # Try custom encoding first (override in subclass for custom renderers)
+        # Try custom encoding first (override in subclass for custom renderers).
+        # The thinking decision was already resolved and persisted onto the
+        # request in _process_messages, so this read is now a single source of
+        # truth shared with the reasoning parser and the tool-call constraint.
         thinking_requested = (request.chat_template_kwargs or {}).get(
             "thinking", envs.SGLANG_DEFAULT_THINKING.get()
         )
-        # Single source of truth: persist the resolved thinking decision back
-        # onto the request so the reasoning parser agrees with the prompt we
-        # actually built. Otherwise SGLANG_DEFAULT_THINKING turns thinking ON
-        # in the dsv4/dsv32 prompt while _get_reasoning_from_request still
-        # treats the request as non-thinking, leaking </think> into content.
-        # Scoped to the custom encoder path, which is the only one env drives.
-        if self.chat_encoding_spec in ("dsv4", "dsv32"):
-            ctk = dict(request.chat_template_kwargs or {})
-            ctk.setdefault("thinking", thinking_requested)
-            request.chat_template_kwargs = ctk
         thinking_mode = (
             ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
         )
