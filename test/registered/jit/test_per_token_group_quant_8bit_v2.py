@@ -1,4 +1,3 @@
-import deep_gemm
 import pytest
 import torch
 from sgl_kernel import sgl_per_token_group_quant_8bit  # AOT v2 reference op
@@ -87,19 +86,26 @@ def test_v2_jit_matches_aot(dtype, num_tokens, hidden, fuse_silu_and_mul, scale_
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 33, 128])
 @pytest.mark.parametrize("hidden", [128, 512, 4096, 7168])
-def test_sglang_per_token_group_quant_fp8_row_major_ue8m0_matches_ceil(
+def test_sglang_per_token_group_quant_fp8_row_major_ue8m0(
     dtype, num_tokens, hidden
 ):
+    """Row-major scale_ue8m0=True quantizes WITH the rounded (power-of-2) scale.
+    Verify: (1) scales are exact powers of 2, (2) dequant ≈ original within FP8 tolerance."""
     torch.manual_seed(num_tokens * 1000 + hidden)
     x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
 
-    q_ref, s_ref = sglang_per_token_group_quant_fp8(x, G, scale_ue8m0=False)
-    s_ref = deep_gemm.ceil_to_ue8m0(s_ref)
     x_q, x_s = sglang_per_token_group_quant_fp8(x, G, scale_ue8m0=True)
     torch.cuda.synchronize()
 
-    assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "fp8 codes differ"
-    assert torch.equal(x_s, s_ref), "row-major ue8m0 scales differ"
+    # Scales must be exact powers of 2
+    log2_s = torch.log2(x_s.abs())
+    assert torch.equal(log2_s, log2_s.round()), "scales are not power-of-2"
+
+    # Dequant should approximate original within FP8 precision
+    x_deq = x_q.float().view(num_tokens, -1, G) * x_s.unsqueeze(-1)
+    x_deq = x_deq.view(num_tokens, hidden)
+    rel_err = (x.float() - x_deq).abs() / (x.float().abs() + 1e-6)
+    assert rel_err.mean() < 0.05, f"mean relative dequant error too large: {rel_err.mean():.4f}"
 
 
 # Masked (EP-MoE) path: the v2 op only has a masked scheduler for the

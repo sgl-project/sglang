@@ -309,21 +309,14 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
         local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax);
 
         float y_scale, y_scale_inv;
-        if constexpr (SCALE_UE8M0 && !IS_COLUMN_MAJOR) {
-          // For row-major + UE8M0: quantize with exact scale, but output rounded scale_inv.
-          // This is equivalent to the original two-step approach (quant then ceil_to_ue8m0).
-          // local_absmax starts from LOCAL_ABSMAX_ABS, so the division is safe.
-          constexpr float MAX_8BIT_INV = 1.0f / dst_dtype_info::MAX;
-          y_scale_inv = local_absmax * MAX_8BIT_INV;
-          y_scale = dst_dtype_info::MAX / local_absmax;
-          if (lane_id == 0) {
-            *scale_output = fast_pow2(fast_log2_ceil(y_scale_inv));
-          }
-        } else {
-          calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
-          if (lane_id == 0) {
-            *scale_output = extract_required_scale_format < SCALE_UE8M0 && IS_COLUMN_MAJOR > (y_scale_inv);
-          }
+        // When SCALE_UE8M0, always quantize with the rounded (power-of-2) scale
+        // — not with the exact scale followed by post-hoc rounding.
+        // This matches the official DeepSeek-V4 kernel.py act_quant(scale_fmt="ue8m0")
+        // and avoids a scale mismatch between quantization and downstream GEMM dequant,
+        // which otherwise amplifies error ~14x and degrades EAGLE accept rate on Blackwell.
+        calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
+        if (lane_id == 0) {
+          *scale_output = extract_required_scale_format < SCALE_UE8M0 && IS_COLUMN_MAJOR > (y_scale_inv);
         }
         float2 y_scale_repeated = {y_scale, y_scale};
 
