@@ -38,6 +38,19 @@ export const MiniMaxM27Deployment = () => {
         ];
       }
     },
+    precision: {
+      name: 'precision',
+      title: 'Precision',
+      getDynamicItems: (values) => {
+        const hw = values.hardware;
+        const isBlackwell = hw === 'b200' || hw === 'gb300';
+        return [
+          { id: 'fp8', label: 'FP8', default: true,  disabled: false },
+          { id: 'fp4', label: 'FP4', default: false, disabled: !isBlackwell,
+            disabledReason: 'NVFP4 requires Blackwell (B200/GB300)' }
+        ];
+      }
+    },
     thinking: {
       name: 'thinking',
       title: 'Thinking Capabilities',
@@ -115,7 +128,7 @@ export const MiniMaxM27Deployment = () => {
 
   // Generate command mirrors sgl-cookbook src/components/autoregressive/MiniMaxM27ConfigGenerator/index.js
   const generateCommand = () => {
-    const { hardware, gpuCount, thinking, toolcall } = values;
+    const { hardware, gpuCount, precision, thinking, toolcall } = values;
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
     const isGB300 = hardware === 'gb300';
@@ -126,9 +139,22 @@ export const MiniMaxM27Deployment = () => {
       return '# Please select compatible hardware\n# 2-GPU requires AMD MI300X/MI325X/MI355X or GB300';
     }
 
-    const modelName = 'MiniMaxAI/MiniMax-M2.7';
+    const isBlackwell = hardware === 'b200' || hardware === 'gb300';
+    const isFp4 = precision === 'fp4';
 
-    let cmd = 'sglang serve \\\n';
+    if (isFp4 && !isBlackwell) {
+      return '# NVFP4 requires Blackwell hardware (B200 or GB300)';
+    }
+
+    const modelName = isFp4 ? 'nvidia/MiniMax-M2.7-NVFP4' : 'MiniMaxAI/MiniMax-M2.7';
+
+    const useAllreduceFusion = hardware === 'h200' || hardware === 'b200' || hardware === 'gb300';
+
+    let cmd = '';
+    if (useAllreduceFusion) {
+      cmd += 'SGLANG_USE_FUSED_PARALLEL_QKNORM=1 \\\n';
+    }
+    cmd += 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
 
     if (isXeon) {
@@ -157,6 +183,18 @@ export const MiniMaxM27Deployment = () => {
     if (!isXeon && isAMD) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
       cmd += ' \\\n  --attention-backend triton';
+    }
+
+    if (isBlackwell) {
+      cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm_routed';
+      if (!isFp4) {
+        cmd += ' \\\n  --fp8-gemm-backend flashinfer_trtllm';
+        cmd += ' \\\n  --dtype bfloat16';
+      }
+    }
+
+    if (useAllreduceFusion) {
+      cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
     }
 
     return cmd;

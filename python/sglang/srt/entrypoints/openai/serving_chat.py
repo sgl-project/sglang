@@ -974,6 +974,9 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        image_tokens = {}
+        audio_tokens = {}
+        video_tokens = {}
 
         stream_started = False
         try:
@@ -1000,6 +1003,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                image_tokens[index] = content["meta_info"].get("image_tokens", 0)
+                audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
+                video_tokens[index] = content["meta_info"].get("video_tokens", 0)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -1142,6 +1148,17 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Additional usage chunk
             if include_usage:
+                # Multimodal tokens are per-prompt (input side), so aggregate
+                # once per prompt (first choice), matching prompt/cached semantics.
+                total_image_tokens = sum(
+                    tok for idx, tok in image_tokens.items() if idx % request.n == 0
+                )
+                total_audio_tokens = sum(
+                    tok for idx, tok in audio_tokens.items() if idx % request.n == 0
+                )
+                total_video_tokens = sum(
+                    tok for idx, tok in video_tokens.items() if idx % request.n == 0
+                )
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     reasoning_tokens,
@@ -1149,6 +1166,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    image_tokens=total_image_tokens,
+                    audio_tokens=total_audio_tokens,
+                    video_tokens=total_video_tokens,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -1304,11 +1324,27 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             choices.append(choice_data)
 
-        # Calculate usage
+        # Calculate usage. Multimodal tokens are per-prompt (input side), so
+        # aggregate once per prompt (stride by n), matching prompt/cached semantics.
+        image_tokens = sum(
+            ret[i]["meta_info"].get("image_tokens", 0)
+            for i in range(0, len(ret), request.n)
+        )
+        audio_tokens = sum(
+            ret[i]["meta_info"].get("audio_tokens", 0)
+            for i in range(0, len(ret), request.n)
+        )
+        video_tokens = sum(
+            ret[i]["meta_info"].get("video_tokens", 0)
+            for i in range(0, len(ret), request.n)
+        )
         usage = UsageProcessor.calculate_response_usage(
             ret,
             n_choices=request.n,
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+            image_tokens=image_tokens,
+            audio_tokens=audio_tokens,
+            video_tokens=video_tokens,
         )
 
         return ChatCompletionResponse(
@@ -1563,6 +1599,111 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.reasoning_effort != "none"
         ):
             request.skip_special_tokens = False
+
+    def wrap_reasoning_history(self, reasoning_text: str) -> str:
+        """Wrap prior-turn reasoning in the detector's own start/end tokens.
+
+        Pulling the delimiters from the detector keeps adapters in lockstep
+        with any future parser that ships non-``<think>`` markers — Mistral's
+        ``[THINK]``, Gemma4's ``think_start_self_label = "thought\\n"``, etc.
+        Falling back to a plain string is unsafe: it would let prior
+        thinking text reach a non-reasoning model as ordinary assistant
+        content, so the caller must surface this state, not paper over it.
+        """
+        if self._reasoning_detector is None:
+            raise ValueError(
+                "Cannot rewrap thinking history: no reasoning detector is "
+                "configured for this model"
+            )
+        d = self._reasoning_detector
+        return (
+            f"{d.think_start_token}{d.think_start_self_label}"
+            f"{reasoning_text}\n{d.think_end_token}"
+        )
+
+    def _reasoning_default_mode(self) -> Optional[str]:
+        if self._reasoning_detector is None:
+            return None
+        return self._reasoning_detector.reasoning_default
+
+    def _get_reasoning_toggle_param(self) -> Optional[str]:
+        """Resolve the chat-template kwarg that toggles reasoning, if any."""
+        config = self.template_manager.reasoning_config
+        if config is not None:
+            return config.toggle_param
+
+        mode = self._reasoning_default_mode()
+        if mode in ("thinking", "enable_thinking"):
+            return mode
+        if mode in ("explicit_thinking", "explicit_enable_thinking"):
+            return mode.replace("explicit_", "")
+        return None
+
+    def apply_reasoning_enabled(
+        self, request: ChatCompletionRequest, enabled: bool
+    ) -> None:
+        """Force the request into the requested reasoning-on/off mode.
+
+        Mirrors the read-side logic in ``_get_reasoning_from_request``;
+        the two must stay in sync. Always-on models cannot be disabled,
+        so explicit ``enabled=False`` raises rather than silently leaving
+        reasoning on.
+        """
+        if not self.reasoning_parser:
+            if enabled:
+                raise ValueError(
+                    "Anthropic thinking is not supported for models without "
+                    "a reasoning parser"
+                )
+            return
+
+        if self.reasoning_parser == "hunyuan":
+            request.reasoning_effort = "medium" if enabled else "no_think"
+            return
+
+        config = self.template_manager.reasoning_config
+        is_mistral = (config is not None and config.special_case == "mistral") or (
+            config is None and self._reasoning_default_mode() == "mistral"
+        )
+        if is_mistral:
+            request.reasoning_effort = "medium" if enabled else "none"
+            return
+
+        is_always_on = (config is not None and config.special_case == "always") or (
+            config is None and self._reasoning_default_mode() == "always"
+        )
+        if is_always_on:
+            if not enabled:
+                raise ValueError(
+                    f"Reasoning parser '{self.reasoning_parser}' is always-on "
+                    f"and cannot be disabled via Anthropic thinking"
+                )
+            return
+
+        toggle_param = self._get_reasoning_toggle_param()
+        # The read side (``_get_reasoning_from_request``) returns False
+        # whenever ``config.toggle_param is None`` OR
+        # ``config.default_enabled is None``. The write side must mirror
+        # both conditions: if ``default_enabled`` is unset we cannot
+        # actually honor an ``enabled=True`` request even when the toggle
+        # name itself is resolvable, so writing the kwarg would set up the
+        # template to emit reasoning tokens while the parser ignores them
+        # (literal ``<think>`` markers leak into the assistant text).
+        config = self.template_manager.reasoning_config
+        read_side_supported = toggle_param is not None and (
+            config is None or config.default_enabled is not None
+        )
+        if not read_side_supported:
+            if not enabled:
+                return
+            raise ValueError(
+                f"Anthropic thinking is not supported for reasoning parser "
+                f"'{self.reasoning_parser}'"
+            )
+
+        chat_template_kwargs = dict(request.chat_template_kwargs or {})
+        chat_template_kwargs[toggle_param] = enabled
+        request.chat_template_kwargs = chat_template_kwargs
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Determine whether reasoning mode should be enabled for this request.

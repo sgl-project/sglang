@@ -216,7 +216,7 @@ class MockGDNModelRunner(ModelRunner):
         speculative_num_draft_tokens = (
             case.input_lens[0]
             if case.forward_mode.is_target_verify()
-            or case.forward_mode.is_draft_extend(include_v2=True)
+            or case.forward_mode.is_draft_extend_v2()
             else 0
         )
         self.server_args = make_mock_server_args(
@@ -291,7 +291,10 @@ class MockGDNModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            get_kvcache=lambda: self.token_to_kv_pool,
+        )
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
