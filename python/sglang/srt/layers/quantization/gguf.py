@@ -11,7 +11,9 @@ import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
-
+from sglang.srt.layers.moe.moe_runner.torch_npu import (
+    TorchNpuQuantInfo,
+)
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
