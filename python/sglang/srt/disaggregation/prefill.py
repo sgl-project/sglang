@@ -813,6 +813,8 @@ class SchedulerDisaggregationPrefillMixin:
         remaining_waiting: List[Req] = []
         for req, poll in zip(self.waiting_queue, polls):
             if poll == KVPoll.Failed:
+                # The requests in waiting queue usually have no KV yet.
+                # Defensive check to prevent leaks.
                 if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
                     release_kv_cache(req, self.tree_cache)
                 maybe_release_metadata_buffer(
