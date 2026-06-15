@@ -53,6 +53,10 @@ class TokenBuffer:
         assert 0 <= size <= self._size, (size, self._size)
         self._size = size
 
+    def overwrite(self, index: int, token_id: int) -> None:
+        assert 0 <= index < self._size, (index, self._size)
+        self._data[index] = token_id
+
     def readonly_view(
         self, start: Optional[int] = None, stop: Optional[int] = None
     ) -> memoryview:
