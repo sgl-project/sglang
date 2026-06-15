@@ -17,9 +17,12 @@ Flags are read and written via plain attribute access, symmetric:
 groups become read-only after ``freeze()``; there are no per-flag setter/getter
 functions.
 
-Lifecycle: ``init_context(model_runner)`` runs ``init_torch_distributed`` and
-publishes the resolved context once; ``freeze()`` materializes static derived flags
-and closes the static write surface; ``reset_context()`` is the single teardown point.
+Lifecycle: the caller resolves its inputs (runs ``init_torch_distributed`` itself),
+assembles the context via ``build_context(...)`` (or ``build_config_only_context``
+for non-ModelRunner processes) and publishes it once with ``set_context``;
+``freeze()`` materializes static derived flags and closes the static write surface;
+``reset_context()`` is the single teardown point. The context module is a pure
+assembler — it never reaches into a ModelRunner nor runs distributed init.
 
 Concurrency: ``_context`` is a plain module-level global, safe because a worker
 process resolves and runs synchronously on one thread.
@@ -343,53 +346,6 @@ class RuntimeContext:
     metrics: Metrics = field(default_factory=Metrics)
     _frozen: bool = False
 
-    @classmethod
-    def from_model_runner(cls, model_runner) -> "RuntimeContext":
-        """Build the context from a fully-initialized ModelRunner — call ONCE,
-        AFTER ``init_torch_distributed``. By then every parallel dim (engine +
-        attention) and the TP group are resolved, so the whole context is built
-        in one shot — no early-publish + in-place fill, no ``dataclasses.replace``.
-        The 12+ field enumeration lives here (the construction site), not at the
-        call-site.
-
-        Engine sizes/ranks are read off the model_runner (already resolved — e.g.
-        ``dp_size`` is folded); the attention dims + ``tp_group`` come from the
-        ``dp_attention`` / ``distributed`` getters. ``server_args`` alone is not
-        enough: per-process ranks come from the distributed env, not server_args."""
-        from sglang.srt.distributed import get_tp_group
-        from sglang.srt.layers.dp_attention import (
-            get_attention_cp_rank,
-            get_attention_cp_size,
-            get_attention_dp_rank,
-            get_attention_dp_size,
-            get_attention_tp_rank,
-            get_attention_tp_size,
-        )
-
-        mr = model_runner
-        return cls(
-            parallel=ParallelContext(
-                tp_size=mr.tp_size,
-                tp_rank=mr.tp_rank,
-                pp_size=mr.pp_size,
-                pp_rank=mr.pp_rank,
-                dp_size=mr.dp_size,
-                dp_rank=mr.dp_rank,
-                moe_ep_size=mr.moe_ep_size,
-                moe_ep_rank=mr.moe_ep_rank,
-                moe_dp_size=mr.moe_dp_size,
-                moe_dp_rank=mr.moe_dp_rank,
-                attn_cp_size=get_attention_cp_size(),
-                attn_cp_rank=get_attention_cp_rank(),
-                attn_tp_size=get_attention_tp_size(),
-                attn_tp_rank=get_attention_tp_rank(),
-                attn_dp_size=get_attention_dp_size(),
-                attn_dp_rank=get_attention_dp_rank(),
-                tp_group=get_tp_group(),
-            ),
-            flags=Flags(attn=AttnFlags(use_mla_backend=mr.use_mla_backend)),
-        )
-
     def freeze(self) -> None:
         """Materialize static derived flags and close the static write surface.
 
@@ -445,32 +401,96 @@ _context: Optional[RuntimeContext] = None
 
 
 def set_context(ctx: RuntimeContext) -> None:
-    """Low-level publish primitive (overwrite the module global). Used by
-    ``init_context`` and by tests that publish a hand-built context. A second
-    ModelRunner re-publishes a fresh, unfrozen context, so multi-runner
+    """Low-level publish primitive (overwrite the module global). Called by the
+    caller after ``build_context`` (or by tests that publish a hand-built context).
+    A second ModelRunner re-publishes a fresh, unfrozen context, so multi-runner
     (EAGLE draft+target) is safe."""
     global _context
     _context = ctx
 
 
-def init_context(model_runner) -> None:
-    """Resolve and publish the process context — the single runtime entry point.
+def build_context(
+    *,
+    server_args,
+    parallel: ParallelContext,
+    use_mla_backend: bool,
+    pre_model_load_memory: Optional[float] = None,
+) -> RuntimeContext:
+    """Pure assembler (Global Context P1c): build the context from EXPLICIT,
+    already-resolved inputs — NOT by reaching into a ModelRunner, NOT running
+    ``init_torch_distributed`` (the caller owns distributed init). Replaces the PoC
+    ``init_context(model_runner)`` / ``from_model_runner`` (which coupled to the
+    runner + ran distributed init inside this module). ``server_args`` is held BY
+    REFERENCE (never copied), so it stays the same live object the legacy seed +
+    in-place mutations target and ``get_global_server_args()`` returns. Does NOT
+    publish — the caller calls ``set_context``."""
+    return RuntimeContext(
+        server_args=server_args,
+        parallel=parallel,
+        flags=Flags(attn=AttnFlags(use_mla_backend=use_mla_backend)),
+        metrics=Metrics(pre_model_load_memory=pre_model_load_memory),
+    )
 
-    Runs ``model_runner.init_torch_distributed()`` (which sets up the process
-    groups + dp-attention and measures the available GPU memory before model
-    load), builds the context from the now-resolved topology, stashes that
-    measurement on ``ctx.metrics``, and publishes. Returns nothing — consumers
-    read ``get_context()`` (e.g. init_memory_pool reads
-    ``get_context().metrics.pre_model_load_memory``)."""
-    pre_model_load_memory = model_runner.init_torch_distributed()
-    ctx = RuntimeContext.from_model_runner(model_runner)
-    ctx.metrics.pre_model_load_memory = pre_model_load_memory
-    set_context(ctx)
+
+def build_config_only_context(*, server_args) -> RuntimeContext:
+    """Degenerate builder for non-ModelRunner processes (tokenizer / encode /
+    expert-backup / spec-decode re-seed): a context that only seeds ``server_args``,
+    leaving parallel/flags/buffers/metrics at their empty defaults. This makes
+    ``get_global_server_args()`` resolve uniformly via the context path in every
+    process, with no reader special-casing."""
+    return RuntimeContext(server_args=server_args)
+
+
+def resolve_parallel_context(model_runner) -> ParallelContext:
+    """Read the resolved parallel topology off a fully-initialized ModelRunner —
+    call AFTER ``init_torch_distributed`` (the caller's responsibility), by which
+    point every dim + the TP group is resolved. This is the ONE function that
+    imports ``get_tp_group`` + the dp_attention attention-dim getters and the only
+    place that touches the (duck-typed) runner; the field enumeration lives here, at
+    the construction site. Unlike the PoC ``from_model_runner`` it does NOT run
+    distributed init and returns only the parallel topology (not the whole context).
+
+    Engine sizes/ranks are read off the runner (already resolved — e.g. ``dp_size``
+    folded); attention dims + ``tp_group`` come from the getters (per-process ranks
+    come from the distributed env, not server_args alone)."""
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.dp_attention import (
+        get_attention_cp_rank,
+        get_attention_cp_size,
+        get_attention_dp_rank,
+        get_attention_dp_size,
+        get_attention_tp_rank,
+        get_attention_tp_size,
+    )
+
+    mr = model_runner
+    return ParallelContext(
+        tp_size=mr.tp_size,
+        tp_rank=mr.tp_rank,
+        pp_size=mr.pp_size,
+        pp_rank=mr.pp_rank,
+        dp_size=mr.dp_size,
+        dp_rank=mr.dp_rank,
+        moe_ep_size=mr.moe_ep_size,
+        moe_ep_rank=mr.moe_ep_rank,
+        moe_dp_size=mr.moe_dp_size,
+        moe_dp_rank=mr.moe_dp_rank,
+        attn_cp_size=get_attention_cp_size(),
+        attn_cp_rank=get_attention_cp_rank(),
+        attn_tp_size=get_attention_tp_size(),
+        attn_tp_rank=get_attention_tp_rank(),
+        attn_dp_size=get_attention_dp_size(),
+        attn_dp_rank=get_attention_dp_rank(),
+        tp_group=get_tp_group(),
+    )
 
 
 def get_context() -> RuntimeContext:
     if _context is None:
-        raise ValueError("RuntimeContext not initialized — call init_context() first")
+        raise ValueError(
+            "RuntimeContext not initialized — build it (build_context / "
+            "build_config_only_context) and publish via set_context() first"
+        )
     return _context
 
 

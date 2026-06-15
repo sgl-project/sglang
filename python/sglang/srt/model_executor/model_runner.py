@@ -185,6 +185,12 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import (
+    build_context,
+    get_context,
+    resolve_parallel_context,
+    set_context,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -562,6 +568,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Stored for later use by alloc_memory_pool().
         self.pre_model_load_memory = self.init_torch_distributed()
 
+        # Assemble + publish the unified runtime context (Global Context P1c) from
+        # the now-resolved inputs. Distributed init stays here (above) — the context
+        # module is a pure assembler. The legacy seed + FIXME write above are kept
+        # as a dual-write; since server_args is held by reference, ctx.server_args IS
+        # that same live object, so get_global_server_args() identity is preserved.
+        set_context(
+            build_context(
+                server_args=server_args,
+                parallel=resolve_parallel_context(self),
+                use_mla_backend=self.use_mla_backend,
+                pre_model_load_memory=self.pre_model_load_memory,
+            )
+        )
+
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
 
@@ -829,6 +849,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.memory_pool_config = memory_pool_config
 
         self.init_memory_pool(self.pre_model_load_memory)
+
+        # Freeze the context here (Global Context P2a): materialize static derived
+        # flags + close the static write surface. This is the origin/main structural
+        # successor of the PoC freeze site — after init_memory_pool (so the moe
+        # predicate inputs are resolved) and before backend/cuda-graph init (B4). It
+        # locks only the static flag groups, not server_args / parallel / capture.
+        get_context().freeze()
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup

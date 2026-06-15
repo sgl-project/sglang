@@ -19,10 +19,13 @@ from sglang.srt.runtime_context import (
     ParallelContext,
     RuntimeContext,
     apply_model_overrides,
+    build_config_only_context,
+    build_context,
     get_attn_tp_size,
     get_context,
     get_flags,
     get_server_args,
+    resolve_parallel_context,
     get_tp_rank,
     get_tp_size,
     has_context,
@@ -282,9 +285,11 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(get_context().metrics.pre_model_load_memory, 42.0)
 
 
-class TestFromModelRunner(unittest.TestCase):
-    """The factory: engine dims off the runner, attention dims + tp_group off the
-    getters, use_mla_backend off the runner. Stubs the getters (no GPU/distributed)."""
+class TestConstruction(unittest.TestCase):
+    """P1c construction rework: the pure assembler build_context (server_args by
+    reference, use_mla -> flags.attn, memory -> metrics), the degenerate
+    build_config_only_context, and resolve_parallel_context (engine dims off the
+    runner, attention dims + tp_group off the getters). No GPU/distributed."""
 
     def setUp(self):
         reset_context()
@@ -292,7 +297,30 @@ class TestFromModelRunner(unittest.TestCase):
     def tearDown(self):
         reset_context()
 
-    def test_reads_engine_attention_and_use_mla(self):
+    def test_build_context_assembles_by_reference(self):
+        sa = object()  # the SAME object must come back out (identity, no copy)
+        parallel = ParallelContext(tp_size=2, tp_rank=1)
+        ctx = build_context(
+            server_args=sa,
+            parallel=parallel,
+            use_mla_backend=True,
+            pre_model_load_memory=42.0,
+        )
+        self.assertIs(ctx.server_args, sa)
+        self.assertIs(ctx.parallel, parallel)
+        self.assertTrue(ctx.flags.attn.use_mla_backend)
+        self.assertEqual(ctx.metrics.pre_model_load_memory, 42.0)
+        self.assertFalse(ctx._frozen)  # build does not publish or freeze
+
+    def test_build_config_only_context_is_degenerate(self):
+        sa = object()
+        ctx = build_config_only_context(server_args=sa)
+        self.assertIs(ctx.server_args, sa)
+        self.assertEqual(ctx.parallel.tp_size, 1)  # defaults
+        self.assertFalse(ctx.flags.attn.use_mla_backend)
+        self.assertIsNone(ctx.metrics.pre_model_load_memory)
+
+    def test_resolve_parallel_context_reads_runner_and_getters(self):
         class FakeMR:
             tp_size = 2
             tp_rank = 1
@@ -304,7 +332,6 @@ class TestFromModelRunner(unittest.TestCase):
             moe_ep_rank = 0
             moe_dp_size = 1
             moe_dp_rank = None
-            use_mla_backend = True
 
         getters = {
             "get_attention_cp_size": 1,
@@ -319,12 +346,11 @@ class TestFromModelRunner(unittest.TestCase):
                 "sglang.srt.layers.dp_attention",
                 **{k: (lambda v=v: v) for k, v in getters.items()},
             ):
-                ctx = RuntimeContext.from_model_runner(FakeMR())
-        self.assertEqual(ctx.parallel.tp_size, 2)
-        self.assertEqual(ctx.parallel.tp_rank, 1)
-        self.assertEqual(ctx.parallel.attn_tp_size, 2)
-        self.assertEqual(ctx.parallel.tp_group, "TPG")
-        self.assertTrue(ctx.flags.attn.use_mla_backend)
+                parallel = resolve_parallel_context(FakeMR())
+        self.assertEqual(parallel.tp_size, 2)
+        self.assertEqual(parallel.tp_rank, 1)
+        self.assertEqual(parallel.attn_tp_size, 2)
+        self.assertEqual(parallel.tp_group, "TPG")
 
 
 class TestServerArgsShim(unittest.TestCase):
