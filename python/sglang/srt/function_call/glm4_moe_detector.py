@@ -119,6 +119,8 @@ def parse_arguments(
     # Strategy 3: ast.literal_eval
     try:
         parsed_value = ast.literal_eval(json_value)
+        if arg_type == "string" and not isinstance(parsed_value, (str, dict, list)):
+            return json_value, True
         return parsed_value, True
     except (ValueError, SyntaxError):
         pass
