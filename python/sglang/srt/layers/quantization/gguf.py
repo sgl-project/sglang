@@ -36,6 +36,8 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUUnquantMoEMethod,
 )
 
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
