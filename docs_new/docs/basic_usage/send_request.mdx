@@ -46,7 +46,7 @@ curl -s http://localhost:{port}/v1/chat/completions \
 """
 
 response = json.loads(subprocess.check_output(curl_command, shell=True))
-print_highlight(response)
+print(response)
 ```
 
 ## Using Python Requests
@@ -133,7 +133,7 @@ response = requests.post(
     },
 )
 
-print_highlight(response.json())
+print(response.json())
 ```
 ### Streaming
 
