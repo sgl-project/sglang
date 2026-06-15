@@ -278,9 +278,12 @@ class EagleDraftWorker(BaseDraftWorker):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
 
-        def maybe_share_lm_head_quant_attrs():
-            if target_lm_head is not None and hasattr(
-                self.draft_runner.model, "set_lm_head_from_target"
+        def maybe_share_target_lm_head():
+            if (
+                target_lm_head is not None
+                and self.hot_token_id is None
+                and getattr(self.draft_runner.model, "hot_token_id", None) is None
+                and hasattr(self.draft_runner.model, "set_lm_head_from_target")
             ):
                 self.draft_runner.model.set_lm_head_from_target(target_lm_head)
 
@@ -292,7 +295,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 and self.draft_runner.model.load_lm_head_from_target
             ):
                 self.draft_runner.model.set_embed_and_head(embed, head)
-                maybe_share_lm_head_quant_attrs()
+                maybe_share_target_lm_head()
             else:
                 self.draft_runner.model.set_embed(embed)
 
@@ -310,7 +313,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
-            maybe_share_lm_head_quant_attrs()
+            maybe_share_target_lm_head()
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners

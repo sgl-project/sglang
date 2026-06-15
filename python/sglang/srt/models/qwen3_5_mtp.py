@@ -140,29 +140,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if self.config.tie_word_embeddings:
             return
 
-        for param_name, param in target_lm_head.named_parameters(recurse=False):
-            if hasattr(self.lm_head, param_name):
-                delattr(self.lm_head, param_name)
-            self.lm_head.register_parameter(param_name, param)
-
-        for buffer_name, buffer in target_lm_head.named_buffers(recurse=False):
-            if hasattr(self.lm_head, buffer_name):
-                delattr(self.lm_head, buffer_name)
-            self.lm_head.register_buffer(buffer_name, buffer)
-
-        for attr_name in (
-            "quant_method",
-            "quant_config",
-            "logical_widths",
-            "input_size_per_partition",
-            "output_size_per_partition",
-            "params_dtype",
-            "weights_padding_cols",
-            "workspace",
-            "_accepts_prequantized_fp4",
-        ):
-            if hasattr(target_lm_head, attr_name):
-                setattr(self.lm_head, attr_name, getattr(target_lm_head, attr_name))
+        self.lm_head = target_lm_head
 
     @torch.no_grad()
     def forward(

@@ -654,7 +654,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
 
         self.assertEqual(result["quant_method"], "modelopt_mixed")
 
-    def test_qwen_mixed_precision_with_w4a16_nvfp4_layers_uses_modelopt_mixed(self):
+    def test_qwen_mixed_precision_with_nvfp4a16_layers_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = MagicMock()
         model_config.hf_config.model_type = "qwen3_5_moe"

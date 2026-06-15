@@ -82,6 +82,25 @@ if TYPE_CHECKING:
     )
     from sglang.srt.models.utils import WeightsMapper
 
+
+def _make_per_tensor_scale_parameter(
+    shape,
+    weight_loader,
+    *,
+    fill_value: Optional[float] = None,
+    needs_scalar_to_array: bool = False,
+) -> PerTensorScaleParameter:
+    data = (
+        torch.empty(shape, dtype=torch.float32)
+        if fill_value is None
+        else torch.full(shape, fill_value, dtype=torch.float32)
+    )
+    scale = PerTensorScaleParameter(data=data, weight_loader=weight_loader)
+    if needs_scalar_to_array:
+        set_weight_attrs(scale, {"needs_scalar_to_array": True})
+    return scale
+
+
 try:
     from flashinfer import mm_fp4 as flashinfer_fp4_gemm
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
@@ -557,15 +576,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         if self.quant_config.is_checkpoint_fp8_serialized:
             # Register weight and input scales
             for scale_name in ["weight_scale", "input_scale"]:
-                scale = PerTensorScaleParameter(
-                    data=torch.full(
-                        (len(output_partition_sizes),),
-                        torch.finfo(torch.float32).min,
-                        dtype=torch.float32,
-                    ),
+                scale = _make_per_tensor_scale_parameter(
+                    (len(output_partition_sizes),),
                     weight_loader=weight_loader,
+                    fill_value=torch.finfo(torch.float32).min,
+                    needs_scalar_to_array=True,
                 )
-                set_weight_attrs(scale, {"needs_scalar_to_array": True})
                 layer.register_parameter(scale_name, scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -617,13 +633,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         quantized_layers: Dict[str, Dict[str, Any]],
         fp8_config: ModelOptFp8Config,
         nvfp4_config: ModelOptFp4Config,
-        w4a16_nvfp4_config: ModelOptFp4Config,
+        nvfp4a16_config: ModelOptFp4Config,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
-        self.w4a16_nvfp4_config = w4a16_nvfp4_config
+        self.nvfp4a16_config = nvfp4a16_config
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -712,7 +728,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             group_size=group_size,
         )
-        w4a16_nvfp4_config = ModelOptFp4Config(
+        nvfp4a16_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
             exclude_modules=[],
@@ -728,7 +744,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
             nvfp4_config=nvfp4_config,
-            w4a16_nvfp4_config=w4a16_nvfp4_config,
+            nvfp4a16_config=nvfp4a16_config,
         )
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
@@ -807,7 +823,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
-                return ModelOptFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
+                return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
             return UnquantizedLinearMethod()
 
         if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
@@ -821,7 +837,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
-                return ModelOptNvFp4FusedMoEMethod(self.w4a16_nvfp4_config)
+                return ModelOptNvFp4FusedMoEMethod(self.nvfp4a16_config)
             return None
 
         return None
@@ -1458,18 +1474,18 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
         layer.register_parameter("weight", weight)
 
-        input_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+        input_scale = _make_per_tensor_scale_parameter(
+            (len(output_partition_sizes),),
             weight_loader=weight_loader,
+            needs_scalar_to_array=True,
         )
-        set_weight_attrs(input_scale, {"needs_scalar_to_array": True})
         layer.register_parameter("input_scale", input_scale)
 
-        weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+        weight_scale_2 = _make_per_tensor_scale_parameter(
+            (len(output_partition_sizes),),
             weight_loader=weight_loader,
+            needs_scalar_to_array=True,
         )
-        set_weight_attrs(weight_scale_2, {"needs_scalar_to_array": True})
         layer.register_parameter("weight_scale_2", weight_scale_2)
 
         weight_scale = ModelWeightParameter(
@@ -1728,8 +1744,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         return out.view(*output_shape)
 
 
-class ModelOptFp4W4A16LinearMethod(LinearMethodBase):
-    """Linear method for ModelOpt W4A16_NVFP4 checkpoints.
+class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
+    """Linear method for ModelOpt NVFP4A16 checkpoints.
 
     Loads packed NVFP4 weights with fp16/bf16 activations. ModelOpt may still
     provide input_scale tensors for fused loader compatibility; they are
@@ -1782,11 +1798,11 @@ class ModelOptFp4W4A16LinearMethod(LinearMethodBase):
         )
         layer.register_parameter("weight", weight)
 
-        weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+        weight_scale_2 = _make_per_tensor_scale_parameter(
+            (len(output_partition_sizes),),
             weight_loader=weight_loader,
+            needs_scalar_to_array=True,
         )
-        set_weight_attrs(weight_scale_2, {"needs_scalar_to_array": True})
         layer.register_parameter("weight_scale_2", weight_scale_2)
 
         weight_scale = ModelWeightParameter(
@@ -1802,13 +1818,13 @@ class ModelOptFp4W4A16LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
         # Some ModelOpt checkpoints may still include input_scale entries in
-        # fused-loader paths. W4A16 does not use them, but registering the
+        # fused-loader paths. NVFP4A16 does not use them, but registering the
         # placeholder lets the generic loader consume those tensors harmlessly.
-        input_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+        input_scale = _make_per_tensor_scale_parameter(
+            (len(output_partition_sizes),),
             weight_loader=weight_loader,
+            needs_scalar_to_array=True,
         )
-        set_weight_attrs(input_scale, {"needs_scalar_to_array": True})
         layer.register_parameter("input_scale", input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -1817,7 +1833,7 @@ class ModelOptFp4W4A16LinearMethod(LinearMethodBase):
 
         if torch.unique(layer.weight_scale_2).numel() != 1:
             logger.warning(
-                "In W4A16_NVFP4 linear, weight_scale_2 differs across fused "
+                "In NVFP4A16 linear, weight_scale_2 differs across fused "
                 "parallel layers. Accuracy may be degraded."
             )
 
@@ -1830,7 +1846,7 @@ class ModelOptFp4W4A16LinearMethod(LinearMethodBase):
 
         if self.quant_config.group_size != 16:
             raise ValueError(
-                f"W4A16_NVFP4 Marlin requires group_size=16, got {self.quant_config.group_size}."
+                f"NVFP4A16 Marlin requires group_size=16, got {self.quant_config.group_size}."
             )
         layer.quant_config = self.quant_config
         prepare_nvfp4_layer_for_marlin(layer)

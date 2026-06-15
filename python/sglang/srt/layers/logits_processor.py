@@ -88,7 +88,7 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     # Some draft models share an unquantized target lm_head tensor while still
     # carrying the draft model's stale ModelOpt quant_method. Only use the
     # ModelOpt lm_head kernel when the actual weight layout matches it.
-    if method_name in ("ModelOptFp4LinearMethod", "ModelOptFp4W4A16LinearMethod"):
+    if method_name in ("ModelOptFp4LinearMethod", "ModelOptNvFp4A16LinearMethod"):
         return lm_head.weight.dtype == torch.uint8
     if method_name == "ModelOptFp8LinearMethod":
         return lm_head.weight.dtype == torch.float8_e4m3fn
