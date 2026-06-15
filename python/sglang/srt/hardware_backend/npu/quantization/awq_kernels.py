@@ -33,6 +33,7 @@ class AWQAscendLinearKernel:
 
         # Unpack qweight and qzeros – keep weight as (K, N // pack_factor)
         qweight_tmp = torch.zeros_like(layer.qweight.data)   # (K, N // pack_factor)
+        print(qweight_tmp.shape)
         qzeros_tmp = layer.qzeros.data                        # (groups, N // pack_factor)
         qzeros_list = []
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
