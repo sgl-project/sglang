@@ -1,26 +1,3 @@
-"""Regression for the EAGLE chunked-prefill next-prompt-token fix (PR #28254).
-
-``_compute_chunked_req_next_prompt_token`` must index the full fill sequence
-``full_untruncated_fill_ids = origin_input_ids + output_ids``, not
-``origin_input_ids`` alone. A request retracted mid-decode and then resumed
-re-prefills ``origin + output`` as a chunked prefill, so a non-final chunk
-boundary can land in the output region. Indexing ``origin_input_ids`` returns
-``None`` there, and the EAGLE prefill tail-token rotation (the only consumer of
-``chunked_req_next_prompt_token``) falls back to the speculatively predicted
-token instead of the already-known fill token, corrupting that chunk's draft KV.
-
-EAGLE output stays correct (the target verifies the draft), so the only
-observable consequence is the corrupted draft KV — which the kv_canary
-``verify_token`` validator catches. This drives the exact state deterministically
-through the scripted runtime: decode past the first chunk, retract via
-``pause_generation``, resume so the re-prefilled origin+output boundary lands in
-the output region. Sampling (temperature=1) makes the boundary token differ from
-the EAGLE draft prediction so the wrong tail token is visible. The canary runs in
-LOG mode (no crash); the script reads the on-device violation counter. Reverting
-the fix (``SGLANG_DEBUG_REVERT_PR=28254``) makes the canary count rise; with the
-fix it stays zero.
-"""
-
 from __future__ import annotations
 
 import os
@@ -42,9 +19,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 register_cuda_ci(est_time=320, stage="extra-a", runner_config="1-gpu-small")
 
 _CHUNK = 64
-# origin < chunk so the initial prefill is single-chunk; output large enough that
-# the resumed origin+output re-prefill spans several chunks with non-final
-# boundaries in the output region.
 _PROMPT_LEN = 200
 _DECODE_STEPS = 400
 _MAX_NEW_TOKENS = 450
@@ -59,7 +33,6 @@ def _eagle_kwargs() -> Dict[str, object]:
         speculative_eagle_topk=1,
         speculative_num_draft_tokens=4,
         mem_fraction_static=0.3,
-        # LOG (not RAISE): a violation must not crash the scripted scheduler.
         kv_canary=CanaryMode.LOG.value,
         kv_canary_real_data="none",
         kv_canary_sweep_interval=0,
@@ -69,14 +42,11 @@ def _eagle_kwargs() -> Dict[str, object]:
 
 
 def _canary_violation_count(t: ScriptedContext) -> int:
-    """Cumulative kv_canary violations across the target and EAGLE-draft canaries."""
     scheduler = t.scheduler
     managers: List[object] = []
     target = scheduler.tp_worker.model_runner.canary_manager
     if target is not None:
         managers.append(target)
-    # EAGLE draft model has its own canary; the wrong tail token corrupts the
-    # draft KV, so this is where the verify_token violation is expected.
     if scheduler.draft_worker is not None:
         draft = scheduler.draft_worker.draft_worker.draft_runner.canary_manager
         if draft is not None:
@@ -89,9 +59,6 @@ def _canary_violation_count(t: ScriptedContext) -> int:
 
 
 def _script_retract_resume_output_region(t: ScriptedContext, expect_violation: bool):
-    # Sample (temperature=1) so the generated tokens are not the model's own greedy
-    # prediction; otherwise EAGLE predicts its output perfectly and the wrong tail
-    # token equals the real fill token, hiding the bug.
     r = t.start_req(
         prompt_len=_PROMPT_LEN,
         max_new_tokens=_MAX_NEW_TOKENS,
@@ -104,8 +71,6 @@ def _script_retract_resume_output_region(t: ScriptedContext, expect_violation: b
     t.continue_generation()
     yield from run_until_finished(r, max_steps=2000)
     assert r.finished
-    # The resumed re-prefill must itself be chunked (output-region boundary
-    # reached) for the bug to be observable.
     assert r.chunks_done - chunks_before >= 2, (
         f"resume did not re-chunk into the output region: chunks_done "
         f"{chunks_before} -> {r.chunks_done}"
@@ -155,8 +120,6 @@ class _EagleRetractNextTokenBase(ScriptedTestCase):
 
 
 class TestEagleRetractNextTokenRegression(_EagleRetractNextTokenBase):
-    """Revert PR #28254; the kv_canary verify_token validator must fire."""
-
     revert_pr = True
 
     def test_retract_resume_output_region_fires_canary(self) -> None:
@@ -164,8 +127,6 @@ class TestEagleRetractNextTokenRegression(_EagleRetractNextTokenBase):
 
 
 class TestEagleRetractNextTokenClean(_EagleRetractNextTokenBase):
-    """With the PR #28254 fix, the same retract/resume runs clean."""
-
     revert_pr = False
 
     def test_retract_resume_output_region_clean(self) -> None:

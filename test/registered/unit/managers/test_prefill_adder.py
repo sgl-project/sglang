@@ -559,9 +559,6 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIn(req, adder.can_run_list)
 
     def test_chunked_req_next_prompt_token_indexes_full_fill_sequence(self):
-        """Next chunked-prefill prompt token is read from origin+output, not origin alone."""
-        # A retracted-then-resumed decode request re-prefills origin_input_ids +
-        # output_ids; full_untruncated_fill_ids is that combined fill sequence.
         origin = list(range(100))
         output = list(range(100, 140))
         req = MagicMock(spec=Req)
@@ -569,20 +566,14 @@ class TestPrefillAdder(CustomTestCase):
         req.output_ids = output
         req.full_untruncated_fill_ids = origin + output
 
-        # A None request has no next token.
         self.assertIsNone(_compute_chunked_req_next_prompt_token(None))
 
-        # Boundary inside the prompt region: token is the fill id at fill_len.
         req.fill_len = 50
         self.assertEqual(_compute_chunked_req_next_prompt_token(req), 50)
 
-        # Boundary inside the OUTPUT region (regression): must return the real
-        # fill token. Indexing origin_input_ids alone returned None here, which
-        # made the EAGLE tail-token rotation fall back to the predicted token.
         req.fill_len = 120
         self.assertEqual(_compute_chunked_req_next_prompt_token(req), 120)
 
-        # Final chunk: the whole fill sequence is consumed, so no next token.
         req.fill_len = len(req.full_untruncated_fill_ids)
         self.assertIsNone(_compute_chunked_req_next_prompt_token(req))
 
