@@ -238,7 +238,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             draft_token_num = forward_batch.spec_info.draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1)
             conv_states_to_use = conv_states[cache_indices]
-            mixed_qkv_processed, new_conv_state = npu_causal_conv1d_update(
+            mixed_qkv_processed, new_conv_state = causal_conv1d_npu_update(
                 mixed_qkv_reshaped.transpose(1, 2).contiguous(),
                 layer.conv_weights,
                 conv_states_to_use.transpose(1, 2).contiguous(),
