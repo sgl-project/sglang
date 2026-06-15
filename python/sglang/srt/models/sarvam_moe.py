@@ -52,12 +52,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
@@ -79,8 +79,9 @@ _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
 if _is_cuda:
     try:
-        from sgl_kernel import bmm_fp8, concat_mla_k, merge_state_v2
+        from sgl_kernel import bmm_fp8, merge_state_v2
 
+        from sglang.jit_kernel.concat_mla import concat_mla_k
         from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
         _has_fp8_support = True

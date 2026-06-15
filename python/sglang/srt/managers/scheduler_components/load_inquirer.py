@@ -32,15 +32,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
-    disaggregation_mode: "DisaggregationMode"
-    ps: "ParallelState"
-    server_args: "ServerArgs"
+    disaggregation_mode: DisaggregationMode
+    ps: ParallelState
+    server_args: ServerArgs
     max_total_num_tokens: int
     max_running_requests: int
-    pool_stats_observer: "SchedulerPoolStatsObserver"
-    tp_worker: "BaseTpWorker"
-    token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator"
-    spec_algorithm: "SpeculativeAlgorithm"
+    pool_stats_observer: SchedulerPoolStatsObserver
+    tp_worker: BaseTpWorker
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    spec_algorithm: SpeculativeAlgorithm
     get_running_batch: Callable
     get_waiting_queue: Callable
     get_stats: Callable
@@ -72,6 +72,19 @@ class SchedulerLoadInquirer:
             num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
         return num_pending_tokens
 
+    def get_num_waiting_uncached_tokens(self) -> int:
+        """Get uncached input tokens waiting for prefill compute."""
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return 0
+        num_tokens = 0
+        for req in self.get_waiting_queue():
+            # if match-in-waiting-queue disabled, this metric returns seq_lens
+            num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
+        cr = self.get_chunked_req()
+        if cr is not None:
+            num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
+        return num_tokens
+
     def get_loads(self, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
         """
         Get comprehensive load metrics for /v1/loads endpoint.
@@ -91,21 +104,32 @@ class SchedulerLoadInquirer:
         num_running_reqs = len(self.get_running_batch().reqs)
 
         waiting_queues = [self.get_waiting_queue()]
+        pending_token_queues = [self.get_waiting_queue()]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            waiting_queues.append(self.get_disagg_prefill_bootstrap_queue().queue)
+            prefill_bootstrap_queue = self.get_disagg_prefill_bootstrap_queue().queue
+            waiting_queues.append(prefill_bootstrap_queue)
+            pending_token_queues.append(prefill_bootstrap_queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            waiting_queues.append(self.get_disagg_decode_prealloc_queue().queue)
-            waiting_queues.append(self.get_disagg_decode_transfer_queue().queue)
-            waiting_queues.append(
+            decode_prealloc_queue = self.get_disagg_decode_prealloc_queue().queue
+            decode_transfer_queue = self.get_disagg_decode_transfer_queue().queue
+            decode_retracted_queue = (
                 self.get_disagg_decode_prealloc_queue().retracted_queue
             )
+            waiting_queues.append(decode_prealloc_queue)
+            waiting_queues.append(decode_transfer_queue)
+            waiting_queues.append(decode_retracted_queue)
+            # In disaggregated decode, transfer-queue requests and transferred
+            # waiting-queue requests have already pre-allocated decode-side KV
+            # slots, so they are already included in num_used_tokens.
+            pending_token_queues = [decode_prealloc_queue, decode_retracted_queue]
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
+        num_waiting_uncached_tokens = self.get_num_waiting_uncached_tokens()
         num_used_tokens, kv_token_usage = (
             self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
         )
         num_total_tokens = num_used_tokens + sum(
-            req.seqlen for queue in waiting_queues for req in queue
+            req.seqlen for queue in pending_token_queues for req in queue
         )
 
         memory = None
@@ -193,6 +217,7 @@ class SchedulerLoadInquirer:
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
+            num_waiting_uncached_tokens=num_waiting_uncached_tokens,
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             max_total_num_tokens=self.max_total_num_tokens,

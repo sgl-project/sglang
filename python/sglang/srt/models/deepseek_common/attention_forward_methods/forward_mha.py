@@ -19,6 +19,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -32,7 +33,11 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    from sgl_kernel import concat_mla_k, merge_state_v2
+    from sgl_kernel import merge_state_v2
+
+    from sglang.jit_kernel.concat_mla import concat_mla_k
+elif _is_musa:
+    from sgl_kernel import concat_mla_k
 
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -148,6 +153,7 @@ class DeepseekMHAForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
+                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
                     )
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
@@ -189,6 +195,7 @@ class DeepseekMHAForwardMixin:
                     dtype_quant=torch.float8_e4m3fn,
                     res1=None,
                     output_unquantized_inp1=False,
+                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
@@ -218,6 +225,7 @@ class DeepseekMHAForwardMixin:
                 dtype_quant=torch.float8_e4m3fn,
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
+                transpose_scale=_use_aiter_bpreshuffle_gfx95,
             )
 
         else:

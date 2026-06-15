@@ -115,6 +115,13 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
     PARSER_RULES_MATRIX = [
         # (name, template_snippet, vocab, expected_parser, expected_toggle_param)
         (
+            "apertus2509_via_unique_vocab_token",
+            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}\n",
+            ["<|inner_prefix|>"],
+            "apertus2509",
+            "enable_thinking",
+        ),
+        (
             "deepseek_r1_think_tags",
             "<think>\nLet me reason about this\n</think>\nAnswer here",
             [],
@@ -267,6 +274,17 @@ class TestToolCallParserDetection(unittest.TestCase):
                 "kimi_k2",
             ),
             (
+                "minicpm5",
+                (
+                    "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+                    '\n<function name="{{ tool.name }}">'
+                    '\n<param name="{{ param.name }}">{{ param.value }}</param>'
+                    "\n</function>"
+                ),
+                ["<function", "<param"],
+                "minicpm5",
+            ),
+            (
                 "xml_kv_tool_call_via_vocab",
                 "{% set reasoning_effort = reasoning_effort | default('high', true) %}\n<think>",
                 ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
@@ -305,6 +323,25 @@ class TestToolCallParserDetection(unittest.TestCase):
         force, config = detect_reasoning_pattern("Hello {{ user }}")
         result = detect_tool_call_parser("Hello {{ user }}", None, config, force)
         self.assertIsNone(result)
+
+    def test_minicpm5_rule_precedes_broad_fallback_rules(self):
+        rule_names = [rule.name for rule in TOOL_CALL_PARSER_RULES]
+        minicpm5_idx = rule_names.index("minicpm5")
+        self.assertLess(minicpm5_idx, rule_names.index("mimo"))
+        self.assertLess(minicpm5_idx, rule_names.index("qwen"))
+
+    def test_minicpm5_not_misclassified_as_qwen(self):
+        template = (
+            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+            '\n<function name="{{ tool.name }}">'
+            '\n<param name="{{ param.name }}">{{ param.value }}</param>'
+            "\n</function>"
+        )
+        force, config = detect_reasoning_pattern(template)
+        result = detect_tool_call_parser(
+            template, _DummyTokenizer(["<function", "<param"]), config, force
+        )
+        self.assertEqual(result, "minicpm5")
 
 
 class TestResolveAutoParsers(unittest.TestCase):
