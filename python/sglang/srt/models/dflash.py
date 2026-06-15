@@ -28,6 +28,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
+    get_dflash_attention_sliding_window_size,
+    get_dflash_layer_types,
     parse_dflash_draft_config,
 )
 from sglang.srt.utils import is_npu
@@ -37,6 +39,31 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
+
+def _get_dflash_layer_attention_params(
+    config, layer_id: int
+) -> Tuple[int, AttentionType]:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None:
+        return -1, AttentionType.ENCODER_ONLY
+    if layer_id >= len(layer_types):
+        raise ValueError(
+            "DFLASH config.layer_types must contain one entry per draft layer. "
+            f"Got {len(layer_types)} entries, layer_id={layer_id}."
+        )
+
+    layer_type = layer_types[layer_id]
+    if layer_type == "full_attention":
+        return -1, AttentionType.ENCODER_ONLY
+    if layer_type == "sliding_attention":
+        sliding_window_size = get_dflash_attention_sliding_window_size(config)
+        assert sliding_window_size is not None
+        return sliding_window_size, AttentionType.DECODER
+    raise ValueError(
+        "Unsupported DFLASH draft layer type. "
+        f"layer_types[{layer_id}]={layer_type!r}."
+    )
 
 
 class DFlashAttention(nn.Module):
@@ -112,14 +139,17 @@ class DFlashAttention(nn.Module):
         )
 
         self.scaling = head_dim**-0.5
-        # DFlash uses non-causal attention over the draft block.
+        self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
+            config, layer_id
+        )
         self.attn = RadixAttention(
             num_heads=self.num_heads,
             head_dim=head_dim,
             scaling=self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            attn_type=AttentionType.ENCODER_ONLY,
+            sliding_window_size=self.sliding_window_size,
+            attn_type=self.attn_type,
         )
 
     def forward_prepare_npu(self, positions, hidden_states):
@@ -318,6 +348,9 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        return get_dflash_attention_sliding_window_size(self.config)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""

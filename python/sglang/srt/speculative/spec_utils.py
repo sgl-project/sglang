@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -29,9 +29,6 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
-    create_extend_after_decode_spec_info as create_extend_after_decode_spec_info,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
     filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
@@ -48,6 +45,7 @@ from sglang.srt.speculative.triton_ops.eagle import (
 )
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -123,7 +121,7 @@ def record_stream_each(tensors, stream):
 def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
     """Mark pre-prepare SB / verify_input GPU tensors as used on `fwd_stream`.
 
-    Spec V2 mutates SB mid-forward (`prepare_for_v2_verify` rebinds
+    Spec V2 mutates SB mid-forward (`prepare_for_verify` rebinds
     `batch.input_ids` / `out_cache_loc`; `_draft_extend_for_decode` later
     replaces `batch.input_ids` again). Each rebind drops the only SB Python
     ref to the old tensor while the verify forward kernel may still be
@@ -480,9 +478,7 @@ def spec_stage_span(name: str):
     """Profiler span for a coarse speculative-decoding stage (``draft`` /
     ``draft_extend`` / ``verify``).
     """
-    if torch.autograd._profiler_enabled():
-        return torch.profiler.record_function(name)
-    return nullcontext()
+    return profile_range(name)
 
 
 def move_accept_tokens_to_target_kvcache(

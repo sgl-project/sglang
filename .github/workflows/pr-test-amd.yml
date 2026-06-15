@@ -95,6 +95,17 @@ on:
         type: boolean
         default: false
 
+# Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra ->
+# pr-test-amd-extra.yml) declares actions: write / issues: read /
+# pull-requests: read. A called reusable workflow can only use scopes the
+# caller already holds, so without this block the call fails workflow
+# validation ("requesting actions: write... but only allowed ...none").
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
@@ -186,6 +197,25 @@ jobs:
               - "test/registered/jit/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
+
+  # =============================================== extra (scheduled) ====================================================
+  # Chain the label-gated AMD extra tier into the scheduled run, mirroring
+  # pr-test.yml's `call-pr-test-extra`. On `schedule` (and run_all_tests
+  # dispatch) the extra suite runs on `main` without needing the
+  # `run-ci-extra` label (pr-gate.yml only enforces labels on pull_request
+  # events). Targeted /rerun-stage dispatches (target_stage set) are excluded.
+  # Not added to `pr-test-amd-finish` so the base AMD gate never depends on
+  # the opt-in extra suite.
+  call-pr-test-amd-extra:
+    if: |
+      (github.event_name == 'schedule' || inputs.run_all_tests == true) &&
+      !(inputs.target_stage || inputs.target_stage_select)
+    uses: ./.github/workflows/pr-test-amd-extra.yml
+    with:
+      ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
+      aiter_ref: ${{ inputs.aiter_ref }}
+      continue_on_error: true
+    secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:

@@ -83,6 +83,7 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     evict_from_tree_cache,
+    free_swa_out_of_window_slots,
     get_alloc_reserve_per_decode,
     release_kv_cache,
 )
@@ -694,11 +695,14 @@ class Req(ReqDllmMixin):
             if origin_input_ids_unpadded
             else self.origin_input_ids
         )  # Before image padding
-        # Each decode stage's output ids
+        # Each decode stage's output ids. Append-only by contract:
+        # _refresh_fill_ids infers how many output tokens are already in
+        # full_untruncated_fill_ids from lengths alone, so in-place rewrites
+        # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
         # Full untruncated sequence: origin + output (+ DLLM mask block).
-        # Rebuilt at the top of each init_next_round_input; admission only
-        # updates fill_len, never mutates this array's length.
+        # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
+        # never mutates this array's length.
         self.full_untruncated_fill_ids = array("q")
         self.fill_len: int = 0
 
@@ -1068,6 +1072,27 @@ class Req(ReqDllmMixin):
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.fill_len]
 
+    def _refresh_fill_ids(self) -> None:
+        """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
+        appending only the new output tokens.
+
+        Falls back to a full rebuild when the in-place append is invalid:
+        - aliasing: scheduler_pp_mixin assigns full_untruncated_fill_ids =
+          origin_input_ids directly, so extending in place would write output
+          tokens into the origin;
+        - lengths disagree: fresh req (array still empty), retraction
+          (output_ids reset to empty), or set_finish_with_abort (origin
+          replaced by a 1-token stub).
+        """
+        n_have_output = len(self.full_untruncated_fill_ids) - len(self.origin_input_ids)
+        if (
+            self.full_untruncated_fill_ids is not self.origin_input_ids
+            and 0 <= n_have_output <= len(self.output_ids)
+        ):
+            self.full_untruncated_fill_ids.extend(self.output_ids[n_have_output:])
+        else:
+            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
@@ -1077,7 +1102,7 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
-            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+            self._refresh_fill_ids()
 
         input_len = len(self.full_untruncated_fill_ids)
 
@@ -1097,14 +1122,16 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.full_untruncated_fill_ids[
-            : self._compute_max_prefix_len(input_len)
-        ]
+        # Pass the full array with a raw-token cap (limit) instead of slicing,
+        # avoiding an O(context) copy per prefill-batch build.
+        token_ids_to_match = self.full_untruncated_fill_ids
+        key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
             token_ids_to_match = array("q")
+            key_limit = None
 
         if tree_cache is not None:
             if cow_mamba is None:
@@ -1112,7 +1139,9 @@ class Req(ReqDllmMixin):
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
-                        token_ids=token_ids_to_match, extra_key=self.extra_key
+                        token_ids=token_ids_to_match,
+                        extra_key=self.extra_key,
+                        limit=key_limit,
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
@@ -2313,7 +2342,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+            req._refresh_fill_ids()
             req.fill_len = len(req.full_untruncated_fill_ids)
             req.set_extend_input_len(1)
 
@@ -2835,40 +2864,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        sliding_window_size = self.tree_cache.sliding_window_size
-
-        # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-        assert (
-            req.cache_protected_len % self.tree_cache.page_size == 0
-        ), "cache_protected_len must be page aligned"
-        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
-
-        # Subtract an extra page_size so the eviction frontier never reaches the
-        # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
-        # page of non-evicted SWA KV for the tree to store as a non-tombstone node,
-        # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
-        # may become tombstoned, causing SWA memory leak.
-        # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
-        if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
-            evict_threshold = pre_len - sliding_window_size
-        else:
-            evict_threshold = pre_len - sliding_window_size - self.tree_cache.page_size
-        new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen,
-            evict_threshold,
+        free_swa_out_of_window_slots(
+            req,
+            pre_len,
+            sliding_window_size=self.tree_cache.sliding_window_size,
+            page_size=self.tree_cache.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
-
-        if self.tree_cache.page_size > 1:
-            new_swa_evicted_seqlen = (
-                new_swa_evicted_seqlen // self.tree_cache.page_size
-            ) * self.tree_cache.page_size
-
-        if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
-            free_slots = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
-            ]
-            self.token_to_kv_pool_allocator.free_swa(free_slots)
-            req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def __str__(self):
         return (
