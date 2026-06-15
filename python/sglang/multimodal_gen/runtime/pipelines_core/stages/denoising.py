@@ -2075,6 +2075,140 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return bucket
         return txt_seq_lens
 
+    _BCG_PROMPT_MASK_KEYS = (
+        "encoder_attention_mask",
+        "encoder_hidden_states_mask",
+        "attention_mask",
+        "text_mask",
+        "prompt_attention_mask",
+        "negative_attention_mask",
+        "prompt_embeds_mask",
+        "negative_prompt_embeds_mask",
+    )
+    _BCG_TEXT_DIM1_KEYS = (
+        "encoder_hidden_states",
+        "encoder_hidden_states_2",
+        "encoder_attention_mask",
+        "encoder_hidden_states_mask",
+        "attention_mask",
+        "text_mask",
+        "text_ids",
+        "text_pos_ids",
+        "txt_ids",
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "prompt_attention_mask",
+        "negative_attention_mask",
+        "prompt_embeds_mask",
+        "negative_prompt_embeds_mask",
+        "audio_encoder_hidden_states",
+        "audio_encoder_attention_mask",
+    )
+    _BCG_TEXT_DIM0_KEYS = (
+        "txt_freqs_cis",
+        "text_freqs_cis",
+    )
+
+    @classmethod
+    def _bcg_prompt_seq_and_dim(cls, call_kwargs: dict) -> tuple[int, int] | None:
+        ehs_tensor = cls._bcg_first_tensor(call_kwargs.get("encoder_hidden_states"))
+        if torch.is_tensor(ehs_tensor) and ehs_tensor.dim() >= 2:
+            if ehs_tensor.dim() == 2:
+                return int(ehs_tensor.shape[0]), 0
+            return int(ehs_tensor.shape[1]), 1
+
+        for key in cls._BCG_PROMPT_MASK_KEYS:
+            tensor = cls._bcg_first_tensor(call_kwargs.get(key))
+            if torch.is_tensor(tensor) and tensor.dim() >= 2:
+                if tensor.shape[0] == 1:
+                    return int(tensor.shape[1]), 1
+                return int(tensor.shape[0]), 0
+        return None
+
+    @classmethod
+    def _bcg_pad_nested_text_dim(
+        cls,
+        obj,
+        *,
+        source: int,
+        target: int,
+        preferred_dim: int,
+    ):
+        if torch.is_tensor(obj):
+            if obj.dim() > preferred_dim and obj.shape[preferred_dim] == source:
+                return cls._bcg_pad_tensor_dim(obj, preferred_dim, target)
+            for dim in (1, 0):
+                if (
+                    dim != preferred_dim
+                    and obj.dim() > dim
+                    and obj.shape[dim] == source
+                ):
+                    return cls._bcg_pad_tensor_dim(obj, dim, target)
+            return obj
+        if isinstance(obj, list):
+            return [
+                cls._bcg_pad_nested_text_dim(
+                    item,
+                    source=source,
+                    target=target,
+                    preferred_dim=preferred_dim,
+                )
+                for item in obj
+            ]
+        if isinstance(obj, tuple):
+            return tuple(
+                cls._bcg_pad_nested_text_dim(
+                    item,
+                    source=source,
+                    target=target,
+                    preferred_dim=preferred_dim,
+                )
+                for item in obj
+            )
+        if isinstance(obj, dict):
+            return {
+                key: cls._bcg_pad_nested_text_dim(
+                    value,
+                    source=source,
+                    target=target,
+                    preferred_dim=preferred_dim,
+                )
+                for key, value in obj.items()
+            }
+        return obj
+
+    @classmethod
+    def _bcg_pad_masked_prompt_kwargs(cls, call_kwargs: dict):
+        seq_and_dim = cls._bcg_prompt_seq_and_dim(call_kwargs)
+        if seq_and_dim is None:
+            return call_kwargs
+        seq, seq_dim = seq_and_dim
+        has_mask = any(
+            cls._bcg_first_tensor(call_kwargs.get(key)) is not None
+            for key in cls._BCG_PROMPT_MASK_KEYS
+        )
+        if not has_mask:
+            return call_kwargs
+        bucket = cls._bcg_select_text_bucket(seq)
+        if bucket is None or seq == bucket:
+            return call_kwargs
+
+        out = dict(call_kwargs)
+        for key in cls._BCG_TEXT_DIM1_KEYS:
+            if key in out and out[key] is not None:
+                out[key] = cls._bcg_pad_nested_text_dim(
+                    out[key],
+                    source=seq,
+                    target=bucket,
+                    preferred_dim=seq_dim,
+                )
+        for key in cls._BCG_TEXT_DIM0_KEYS:
+            if key in out and out[key] is not None:
+                out[key] = cls._bcg_pad_nested_dim(
+                    out[key], dim=0, source=seq, target=bucket
+                )
+        return out
+
     @staticmethod
     def _bcg_is_qwen_transformer(current_model) -> bool:
         candidates = [current_model]
@@ -2169,31 +2303,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         ):
             return self._bcg_pad_qwen_prompt_kwargs(call_kwargs)
 
-        ehs = call_kwargs.get("encoder_hidden_states")
-        mask = call_kwargs.get("encoder_attention_mask")
-        if isinstance(mask, (list, tuple)) and len(mask) == 1:
-            mask = mask[0]
-        if not torch.is_tensor(ehs) or ehs.dim() < 2:
-            return call_kwargs
-        if not torch.is_tensor(mask) or mask.dim() < 2:
-            return call_kwargs
-        seq = ehs.shape[1]
-        bucket = self._bcg_select_text_bucket(seq)
-        if bucket is None or seq == bucket:
-            return call_kwargs
-
-        out = dict(call_kwargs)
-        for key in (
-            "encoder_hidden_states",
-            "encoder_hidden_states_2",
-            "encoder_attention_mask",
-            "encoder_hidden_states_mask",
-        ):
-            if key in out and out[key] is not None:
-                out[key] = self._bcg_pad_nested_dim(
-                    out[key], dim=1, source=seq, target=bucket
-                )
-        return out
+        return self._bcg_pad_masked_prompt_kwargs(call_kwargs)
 
     def _maybe_get_bcg_runner(self, current_model):
         """Return (lazily creating) the breakable CUDA graph runner for

@@ -119,6 +119,57 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertTrue(out["encoder_attention_mask"][0, :17].all())
         self.assertFalse(out["encoder_attention_mask"][0, 17:].any())
 
+    def test_generic_masked_prompt_padding_covers_text_aux_tensors(self):
+        def kwargs(seq_len: int):
+            return {
+                "hidden_states": torch.zeros(1, 16, 64),
+                "timestep": torch.zeros(1),
+                "encoder_hidden_states": [torch.ones(1, seq_len, 128)],
+                "encoder_hidden_states_mask": torch.ones(1, seq_len, dtype=torch.bool),
+                "text_ids": torch.arange(seq_len).view(1, seq_len),
+                "txt_freqs_cis": torch.zeros(seq_len, 32),
+            }
+
+        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "64,128"}):
+            first = self.stage._bcg_pad_prompt_kwargs(
+                kwargs(17), current_model=self.flux_model
+            )
+            second = self.stage._bcg_pad_prompt_kwargs(
+                kwargs(41), current_model=self.flux_model
+            )
+
+        self.assertEqual(first["encoder_hidden_states"][0].shape, (1, 64, 128))
+        self.assertEqual(second["encoder_hidden_states"][0].shape, (1, 64, 128))
+        self.assertEqual(first["encoder_hidden_states_mask"].shape, (1, 64))
+        self.assertEqual(first["text_ids"].shape, (1, 64))
+        self.assertEqual(first["txt_freqs_cis"].shape, (64, 32))
+        self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
+
+    def test_generic_masked_prompt_padding_supports_unbatched_text_embeddings(self):
+        def kwargs(seq_len: int):
+            return {
+                "hidden_states": torch.zeros(1, 16, 64),
+                "timestep": torch.zeros(1),
+                "encoder_hidden_states": [torch.ones(seq_len, 128)],
+                "encoder_attention_mask": [torch.ones(seq_len, 128, dtype=torch.long)],
+                "encoder_hidden_states_mask": [
+                    torch.ones(seq_len, 128, dtype=torch.long)
+                ],
+            }
+
+        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "64,128"}):
+            first = self.stage._bcg_pad_prompt_kwargs(
+                kwargs(22), current_model=self.flux_model
+            )
+            second = self.stage._bcg_pad_prompt_kwargs(
+                kwargs(32), current_model=self.flux_model
+            )
+
+        self.assertEqual(first["encoder_hidden_states"][0].shape, (64, 128))
+        self.assertEqual(first["encoder_attention_mask"][0].shape, (64, 128))
+        self.assertEqual(second["encoder_hidden_states"][0].shape, (64, 128))
+        self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
+
 
 if __name__ == "__main__":
     unittest.main()
