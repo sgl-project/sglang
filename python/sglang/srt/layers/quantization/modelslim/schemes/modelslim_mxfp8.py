@@ -14,8 +14,10 @@ from sglang.srt.platforms import current_platform
 
 _is_npu = current_platform.is_npu()
 
-if _is_npu:
+try:
     import torch_npu
+except ImportError:
+    torch_npu = None
 
 MXFP8_BLOCK_SIZE = 32
 _FLOAT8_E8M0FNU_DTYPE = (
@@ -103,6 +105,12 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if torch_npu is None:
+            raise RuntimeError(
+                "torch_npu is not importable. ModelSlimMXFP8Scheme requires "
+                "an Ascend NPU environment with torch_npu installed."
+            )
+
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):
             x = x.to(torch.bfloat16)

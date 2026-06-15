@@ -10,8 +10,10 @@ from sglang.srt.platforms import current_platform
 
 _is_npu = current_platform.is_npu()
 
-if _is_npu:
+try:
     import torch_npu
+except ImportError:
+    torch_npu = None
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -314,6 +316,13 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         layer.register_parameter("weight", weight)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if torch_npu is None:
+            raise RuntimeError(
+                "torch_npu is not importable. NPUMXFP4W4A8LinearMethod "
+                "(mxfp4_w4a8_npu) requires an Ascend NPU environment with "
+                "torch_npu installed."
+            )
+
         import logging
 
         from sglang.srt.utils import get_npu_memory_capacity
@@ -361,14 +370,13 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         qw = torch_npu.npu_format_cast(qw.view(torch.int8), 29)
 
         # npu_dual_level_quant_matmul expects x2_level0_scale shape [in/512, out]:
-        # squeeze the trailing dim-1 axis, then transpose as a strided view.
-        # Mirrors the MXFP8 dense path: skipping .contiguous() avoids a physical
-        # reorder + alloc and keeps stride-1 access for the in-dim scan.
-        # TODO(NPU-validate): npu_dual_level_quant_matmul is a different kernel
-        # than npu_quant_matmul; its strided-view tolerance is NOT yet verified
-        # on Ascend 950/A3. Re-validate output (no garbled tokens) on hardware;
-        # if it regresses, restore `.contiguous()` on this line only.
-        w_dual_scale = w_dual_scale.squeeze(-1).transpose(0, 1)
+        # squeeze the trailing dim-1 axis, then transpose. .contiguous() is
+        # mandatory here — AclNN EZ1001 rejects non-contiguous x2_level0_scale
+        # with "only support x2Level0Scale is contiguous". The MXFP8 dense path
+        # (NPUMXFP8LinearMethod / ModelSlimMXFP8Scheme) can skip .contiguous()
+        # because npu_quant_matmul tolerates stride-1 views, but the dual-level
+        # kernel npu_dual_level_quant_matmul does not.
+        w_dual_scale = w_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
 
         layer.weight = Parameter(qw, requires_grad=False)
         layer.weight_dual_scale = Parameter(w_dual_scale, requires_grad=False)
@@ -390,6 +398,13 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if torch_npu is None:
+            raise RuntimeError(
+                "torch_npu is not importable. NPUMXFP4W4A8LinearMethod "
+                "(mxfp4_w4a8_npu) requires an Ascend NPU environment with "
+                "torch_npu installed."
+            )
+
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):
             x = x.to(torch.bfloat16)
