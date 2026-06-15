@@ -1191,6 +1191,11 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+    # Multimodal prompt token counts (image/audio/video). None when not applicable.
+    image_tokens: Optional[List[int]] = None
+    audio_tokens: Optional[List[int]] = None
+    video_tokens: Optional[List[int]] = None
+
 
 @dataclass
 class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
@@ -1256,6 +1261,11 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
+    # Multimodal prompt token counts (image/audio/video). None when not applicable.
+    image_tokens: Optional[List[int]] = None
+    audio_tokens: Optional[List[int]] = None
+    video_tokens: Optional[List[int]] = None
 
 
 @dataclass
