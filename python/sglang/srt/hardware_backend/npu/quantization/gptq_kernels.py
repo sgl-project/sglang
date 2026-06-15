@@ -129,6 +129,14 @@ class GPTQMoEAscendKernel:
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
+    def _pack_to_int32(self, weight: torch.Tensor) -> torch.Tensor:
+        # pack 4 int8 (representing 8 int4) into int32
+        assert weight.shape[-1] % 4 == 0, (
+            f"Last dimension of weight must be divisible by 4 for int8→int32 packing, "
+            f"got shape {weight.shape}"
+        )
+        return weight.contiguous().view(torch.int32)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
             -1, layer.w13_qzeros.shape[-1]
@@ -187,9 +195,7 @@ class GPTQMoEAscendKernel:
 
                 layer.w13_scales.data.abs_()
 
-            w13_qweight_tmp = npu_format_cast(w13_qweight_tmp)
-            layer.w13_qweight = torch.nn.Parameter(
-                torch.ops.npu.npu_convert_weight_to_int4pack(
+            '''torch.ops.npu.npu_convert_weight_to_int4pack(
                     w13_qweight_tmp.reshape(
                         layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
                     )
@@ -197,9 +203,12 @@ class GPTQMoEAscendKernel:
                     .contiguous()
                     .reshape(-1, layer.w13_qweight.shape[2])
                     .to(torch.int32)
-                )
-                .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
-                .contiguous(),
+                ).reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)'''
+
+            w13_qweight_tmp = npu_format_cast(w13_qweight_tmp)
+            w13_qweight_tmp = self._pack_to_int32(w13_qweight_tmp)
+            layer.w13_qweight = torch.nn.Parameter(
+                w13_qweight_tmp.contiguous(),
                 requires_grad=False,
             )
             print(torch.ops.npu.get_npu_format(layer.w13_qweight))
