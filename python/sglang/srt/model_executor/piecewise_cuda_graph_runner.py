@@ -304,6 +304,7 @@ class PiecewiseCudaGraphRunner:
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
+        self.nsa_indexers = getattr(self.model_runner, "nsa_indexers", None)
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -444,6 +445,7 @@ class PiecewiseCudaGraphRunner:
             self.quant_config,
             self.moe_layers,
             self.moe_fusions,
+            nsa_indexers=self.nsa_indexers,
         ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -632,6 +634,7 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                nsa_indexers=self.nsa_indexers,
             ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -826,6 +829,7 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                nsa_indexers=self.nsa_indexers,
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)

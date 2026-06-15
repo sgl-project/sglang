@@ -14,10 +14,12 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import functools
 import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -227,7 +229,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_confidential_compute, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -274,6 +276,9 @@ class EmbeddingBatchResult:
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[torch.cuda.Event] = None
+    # Set instead of copy_done when the D2H readback is offloaded to the async
+    # copy worker (confidential-compute path). worker-done => copy-done.
+    copy_ready_cpu: Optional[threading.Event] = None
 
     def copy_to_cpu(self):
         """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
@@ -1321,6 +1326,9 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        # Confidential-compute async D2H readback (set below once streams exist).
+        self.enable_cc_async_copy = False
+        self.d2h_worker = None
 
         if use_mlx():
             # MLX overlap scheduling uses mx.async_eval / mx.eval for
@@ -1343,6 +1351,19 @@ class Scheduler(
             self.future_map = None
             return
 
+        # Under confidential computing the per-step D2H result readback is forced
+        # synchronous and blocks the scheduler thread at issue, serializing the
+        # overlap pipeline. Offload it to a worker thread (TRT-LLM #8463 pattern).
+        self.enable_cc_async_copy = is_confidential_compute()
+        if self.enable_cc_async_copy:
+            from sglang.srt.managers.overlap_copy_worker import AsyncD2HCopyWorker
+
+            self.d2h_worker = AsyncD2HCopyWorker(self.device_module, self.copy_stream)
+            logger.info(
+                "Confidential computing detected: offloading the per-step D2H "
+                "result readback to a worker thread to preserve overlap scheduling."
+            )
+
         self.future_map = FutureMap(
             self.max_running_requests,
             self.chunked_prefill_size,
@@ -1352,6 +1373,31 @@ class Scheduler(
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+    def _issue_result_copy_to_cpu(self, result, copy_fn):
+        """Issue the result's D2H readback.
+
+        Default path: run ``copy_fn`` inline (async copies recorded into
+        ``result.copy_done``). Under confidential computing, the copy blocks at
+        issue, so instead record a ``src_ready`` event on the current (forward)
+        stream and hand the still-blocking copy to the worker thread; the
+        scheduler thread returns immediately and keeps launching work. The
+        deferred consume waits on ``result.copy_ready_cpu`` instead of
+        ``copy_done`` (see ``_wait_result_copy``).
+        """
+        if self.enable_cc_async_copy:
+            src_ready = self.device_module.Event()
+            src_ready.record()
+            result.copy_ready_cpu = threading.Event()
+            self.d2h_worker.submit(src_ready, copy_fn, result.copy_ready_cpu)
+        else:
+            copy_fn()
+
+    def _shutdown_d2h_worker(self):
+        """Stop the confidential-compute async D2H copy worker thread, if any."""
+        if getattr(self, "d2h_worker", None) is not None:
+            self.d2h_worker.shutdown()
+            self.d2h_worker = None
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
@@ -3044,9 +3090,13 @@ class Scheduler(
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(
-                            return_logprob=batch.return_logprob,
-                            return_hidden_states=batch.return_hidden_states,
+                        self._issue_result_copy_to_cpu(
+                            batch_result,
+                            functools.partial(
+                                batch_result.copy_to_cpu,
+                                return_logprob=batch.return_logprob,
+                                return_hidden_states=batch.return_hidden_states,
+                            ),
                         )
                     else:
                         batch_result.future_indices = future_indices
@@ -3114,7 +3164,7 @@ class Scheduler(
                         embeddings=pooler_output.embeddings,
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
                     )
-                    ret.copy_to_cpu()
+                    self._issue_result_copy_to_cpu(ret, ret.copy_to_cpu)
             else:
                 pooler_output = self.tp_worker.forward_batch_embedding(
                     model_worker_batch
@@ -3152,9 +3202,13 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
-            batch_result.copy_to_cpu(
-                return_logprob=self.cur_batch.return_logprob,
-                return_hidden_states=self.cur_batch.return_hidden_states,
+            self._issue_result_copy_to_cpu(
+                batch_result,
+                functools.partial(
+                    batch_result.copy_to_cpu,
+                    return_logprob=self.cur_batch.return_logprob,
+                    return_hidden_states=self.cur_batch.return_hidden_states,
+                ),
             )
 
         # Release the closure and large GPU tensors that are no longer needed.
@@ -4049,3 +4103,5 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler._shutdown_fpm()
+            # Stop the confidential-compute async D2H copy worker thread.
+            scheduler._shutdown_d2h_worker()
