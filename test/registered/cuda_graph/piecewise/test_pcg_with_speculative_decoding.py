@@ -25,6 +25,7 @@ class TestPCGWithEAGLE3(PCGSpecBase, unittest.TestCase):
         "--cuda-graph-backend-prefill=tc_piecewise",
         "--mem-fraction-static",
         "0.6",
+        "--enable-return-hidden-states",
         "--speculative-algorithm",
         "EAGLE3",
         "--speculative-draft-model-path",
