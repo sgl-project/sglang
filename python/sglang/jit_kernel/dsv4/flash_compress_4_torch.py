@@ -212,25 +212,31 @@ def flash_compress4_decode(
 
     seq_len, write_loc, rp0, rp1 = decode_plan_d(plan_d_u8)
 
-    for b in range(B):
-        loc = int(write_loc[b].item())
-        kv_flat[loc].copy_(kv_input[b])
+    # Scatter every token's write in one shot (each token writes a distinct slot).
+    kv_flat.index_copy_(0, write_loc, kv_input.to(kv_flat.dtype))
 
-        if int(seq_len[b].item()) % 4 != 0:
-            continue
+    # Compress fires for tokens whose seq_len just hit a multiple of the ratio.
+    # Each active token reads its own (distinct) pages, so reading after all writes
+    # matches the per-token write-then-read of the scalar path.
+    active = (seq_len % 4 == 0).nonzero(as_tuple=True)[0]
+    if active.numel() == 0:
+        return
 
-        need_overlap = int(seq_len[b].item()) > 4
-        kv_buf_0 = _page_slice(kv_flat, int(rp0[b].item()))
-        kv_buf_1 = _page_slice(kv_flat, int(rp1[b].item()))
+    # buffer_len is constant 8 in decode: overlap (rows 0..3) comes from page rp0,
+    # fresh (rows 4..7) from page rp1. Overlap is masked off when seq_len <= 4.
+    buf0 = kv_buffer[rp0[active]].float()  # [A, 4, head_dim*4]
+    buf1 = kv_buffer[rp1[active]].float()
+    kv_ov = buf0[:, :, :head_dim]
+    sc_ov = buf0[:, :, 2 * head_dim : 3 * head_dim]
+    kv_fr = buf1[:, :, head_dim : 2 * head_dim]
+    sc_fr = buf1[:, :, 3 * head_dim : 4 * head_dim]
 
-        kv_output[b].copy_(
-            c4_forward_torch(
-                kv_buf_0=kv_buf_0,
-                kv_buf_1=kv_buf_1,
-                kv_input=kv_input,
-                ragged_id=b,  # decode uses row b as kv_src
-                ape=ape,
-                should_overlap=need_overlap,
-                buffer_len=8,  # constant in flash_c4_decode
-            )
-        )
+    need_overlap = (seq_len[active] > 4)[:, None, None]
+    neg_inf = -torch.finfo(torch.float32).max
+    kv_ov = torch.where(need_overlap, kv_ov, torch.zeros_like(kv_ov))
+    sc_ov = torch.where(need_overlap, sc_ov, torch.full_like(sc_ov, neg_inf))
+
+    kv = torch.cat([kv_ov, kv_fr], dim=1)  # [A, 8, head_dim]
+    sc = torch.cat([sc_ov, sc_fr], dim=1) + ape  # ape [8, head_dim] broadcasts
+    w = torch.softmax(sc, dim=1)
+    kv_output[active] = (kv * w).sum(dim=1).to(kv_output.dtype)
