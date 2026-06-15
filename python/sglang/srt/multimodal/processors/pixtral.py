@@ -77,10 +77,14 @@ class PixtralProcessor(BaseMultimodalProcessor):
             image_data=image_data,
             return_text=True,
         )
-        if mm_data.images:
+        # Filter out format-tagged dict items (processor_output / precomputed_embedding) —
+        # they go through process_and_combine_mm_data's dict-handling path and don't need
+        # the PIL-image resize math below.
+        raw_images = [img for img in mm_data.images if not isinstance(img, dict)]
+        if raw_images:
             effective_patch = self.patch_size * self._spatial_merge_size
             image_nrows = []
-            for img in mm_data.images:
+            for img in raw_images:
                 w, h = img.size
                 ratio = max(w / self.image_size, h / self.image_size)
                 if ratio > 1:
@@ -96,7 +100,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
             )
 
             # For multi-image: split single IMAGE mm_item into per-image items
-            if len(mm_data.images) > 1:
+            if len(raw_images) > 1:
                 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
                 old_item = next(
@@ -110,7 +114,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
                     item for item in mm_items if item.modality != Modality.IMAGE
                 ]
                 offset_idx = 0
-                for i, img in enumerate(mm_data.images):
+                for i, img in enumerate(raw_images):
                     nr = image_nrows[i]
                     item_offsets = all_offsets[offset_idx : offset_idx + nr]
                     offset_idx += nr
