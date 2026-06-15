@@ -157,6 +157,72 @@ class TestSelectLatestRun(CustomTestCase):
             hfs._select_latest_run(rows, model="org/m", capture_signature="zzz")
         )
 
+    def test_prefers_older_passed_over_newer_failed(self):
+        # A failed run must not shadow an older good baseline, or a persistent
+        # regression is masked after one night.
+        rows = [
+            {
+                "model": "org/m",
+                "run_path": "good",
+                "pass_label": "passed",
+                "push_index": 1,
+            },
+            {
+                "model": "org/m",
+                "run_path": "bad",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "good")
+
+    def test_prefers_baseline_established_over_newer_failed(self):
+        rows = [
+            {
+                "model": "org/m",
+                "run_path": "seed",
+                "pass_label": "baseline_established",
+                "push_index": 1,
+            },
+            {
+                "model": "org/m",
+                "run_path": "bad",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "seed")
+
+    def test_falls_back_to_failed_when_only_failed(self):
+        rows = [
+            {
+                "model": "org/m",
+                "run_path": "bad1",
+                "pass_label": "failed",
+                "push_index": 1,
+            },
+            {
+                "model": "org/m",
+                "run_path": "bad2",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "bad2")
+
+    def test_missing_pass_label_treated_as_usable(self):
+        # Legacy rows without pass_label stay usable as baselines.
+        rows = [
+            {"model": "org/m", "run_path": "legacy", "push_index": 1},
+            {
+                "model": "org/m",
+                "run_path": "bad",
+                "pass_label": "failed",
+                "push_index": 2,
+            },
+        ]
+        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "legacy")
+
 
 class TestReadManifest(CustomTestCase):
     @patch("sglang.test.precision_baseline_store.hf_hub_download")
