@@ -15,6 +15,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.storage.nixl.nixl_tenant import (
+    prepare_tenant_storage_dirs,
+    resolve_tenant_key,
+)
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
@@ -66,23 +70,41 @@ class HiCacheNixl(HiCacheStorage):
 
         # select the NIXL backend plugin from extra_config or environment variable
         plugin = nixlconfig.get_specified_plugin()
+        uses_file_backend = plugin not in NixlBackendSelection.OBJ_PLUGINS
 
         use_direct_io = nixlconfig.get_use_direct_io()
-
-        # Might be better to be unified across HiCache backends and moved to HiCacheController
-        storage_dirs = _parse_storage_dirs(
-            envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
-        )
-        self.file_manager = (
-            NixlFileManager(storage_dirs, use_direct_io=use_direct_io)
-            if plugin not in NixlBackendSelection.OBJ_PLUGINS
-            else None
-        )
 
         tp_rank, tp_size, model_name = (
             storage_config.tp_rank,
             storage_config.tp_size,
             storage_config.model_name,
+        )
+
+        # Might be better to be unified across HiCache backends and moved to HiCacheController
+        storage_dirs = _parse_storage_dirs(
+            envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
+        )
+        self._tenant_key: Optional[str] = None
+        if uses_file_backend and storage_dirs:
+            tenant_key = resolve_tenant_key(
+                model_name,
+                tp_size,
+                num_disks=len(storage_dirs),
+                explicit_tenant=envs.SGLANG_HICACHE_NIXL_STORAGE_TENANT.get(),
+            )
+            storage_dirs, _ = prepare_tenant_storage_dirs(
+                storage_dirs,
+                tenant_key,
+                tp_rank=tp_rank,
+                force_clean_all=envs.SGLANG_HICACHE_NIXL_FORCE_CLEAN_ON_START.get(),
+                run_id=os.environ.get("SGLANG_RUN_ID"),
+            )
+            self._tenant_key = tenant_key
+
+        self.file_manager = (
+            NixlFileManager(storage_dirs, use_direct_io=use_direct_io)
+            if uses_file_backend
+            else None
         )
 
         self.is_mla_model = storage_config.is_mla_model

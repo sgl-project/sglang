@@ -376,6 +376,8 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO = EnvFloat(0.9)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    SGLANG_HICACHE_NIXL_STORAGE_TENANT = EnvStr(None)
+    SGLANG_HICACHE_NIXL_FORCE_CLEAN_ON_START = EnvBool(False)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.

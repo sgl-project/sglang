@@ -88,6 +88,24 @@ export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/storage/dir1,/path/to/st
 
 These directories are used only for **FILE-backed** plugins. **OBJ-backed** plugins use object keys instead of local files.
 
+For FILE-backed plugins, SGLang creates a tenant subdirectory below each configured
+storage directory. By default, the tenant key is derived from model name, TP size,
+number of storage directories, and the on-disk layout version. To pin an explicit
+deployment/app tenant, set:
+
+```bash
+export SGLANG_HICACHE_NIXL_STORAGE_TENANT=my-serving-app
+```
+
+At startup, TP rank 0 best-effort deletes stale sibling tenant directories created
+by previous tenant layout versions or other tenants. It does not delete arbitrary
+directories under the storage base. To force-clean all NIXL tenant directories,
+including the current tenant, before the current tenant directories are recreated:
+
+```bash
+export SGLANG_HICACHE_NIXL_FORCE_CLEAN_ON_START=1
+```
+
 ### 3. How to Provide Configuration for Backends
 
 There are three ways to specify configurations for the backends: default config, file based config, and command-line (JSON string based) config.
@@ -302,7 +320,7 @@ python/sglang/srt/mem_cache/storage/nixl/
 
 ### HiCache / NIXL Data Model
 
-- **FILE backends** use local file paths under `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`. When multiple comma-separated directories are configured, each logical cache key is routed to one base directory with a stable hash and stored as `base_dir/<bucket>/<key>`.
+- **FILE backends** use local file paths under `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`. When multiple comma-separated directories are configured, each logical cache key is routed to one base directory with a stable hash and stored as `base_dir/<tenant>/<bucket>/<key>`.
 - **OBJ backends** use object keys directly
 - **MHA naming** includes TP rank and TP size, so each rank stores its own KV data
 - **MLA naming** omits TP rank, so all ranks refer to one shared logical KV object / file
