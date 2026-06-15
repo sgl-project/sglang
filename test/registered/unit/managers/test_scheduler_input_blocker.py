@@ -147,9 +147,9 @@ class TestInputBlockerGuardRegion(CustomTestCase):
         send_to_scheduler = MagicMock()
         with input_blocker_guard_region(send_to_scheduler):
             pass
-        send_to_scheduler.send_pyobj.assert_any_call(_block())
-        send_to_scheduler.send_pyobj.assert_any_call(_unblock())
-        self.assertEqual(send_to_scheduler.send_pyobj.call_count, 2)
+        self.assertEqual(send_to_scheduler.send_pyobj.mock_calls, [
+            unittest.mock.call(_block()), unittest.mock.call(_unblock())
+        ])
 
     def test_sends_unblock_even_on_exception(self):
         send_to_scheduler = MagicMock()
