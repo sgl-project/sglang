@@ -18,12 +18,12 @@ import time
 import unittest
 from typing import List, Optional, Union
 
-import msgspec
 import requests
 import zmq
 
 from sglang import Engine
 from sglang.srt.managers.io_struct import (
+    BaseReq,
     hook_custom_types,
     sock_recv,
     sock_send,
@@ -109,7 +109,7 @@ EXPECTED_SPANS_LEVEL_3 = EXPECTED_SPANS_LEVEL_2 + [
 ]
 
 
-class Req(msgspec.Struct, tag=True):
+class Req(BaseReq, kw_only=True):
     rid: int
     req_context: Optional[Union[TraceReqContext]] = None
 
