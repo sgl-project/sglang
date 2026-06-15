@@ -500,6 +500,24 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
         return ret
 
 
+class MiniMaxM3Detector(BaseReasoningFormatDetector):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<mm:think>",
+            "</mm:think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
 class MistralDetector(BaseReasoningFormatDetector):
     """
     Detector for Mistral models with reasoning (e.g., Mistral-Small-4-119B-2603).
@@ -1081,6 +1099,7 @@ class ReasoningParser:
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
+        "minimax-m3": MiniMaxM3Detector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
         "mistral": MistralDetector,
@@ -1104,6 +1123,8 @@ class ReasoningParser:
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
 
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+
         # Special cases where we override force_reasoning
         if model_type.lower() in {
             "qwen3-thinking",
@@ -1111,6 +1132,14 @@ class ReasoningParser:
             "minimax",
         }:
             force_reasoning = True
+
+        # M3 prefills <mm:think> only for thinking_mode=enabled (start tag consumed
+        # → absent from output → must force); disabled/adaptive/unset self-emit the
+        # tag so the detector handles them. Covers callers that bypass serving_chat
+        # (e.g. /separate_reasoning); keep in sync with
+        # serving_chat._get_reasoning_from_request's M3 branch.
+        if model_type.lower() == "minimax-m3" and force_reasoning is None:
+            force_reasoning = chat_template_kwargs.get("thinking_mode") == "enabled"
 
         # Only pass force_reasoning if explicitly set, let detectors use their defaults
         kwargs = {"stream_reasoning": stream_reasoning}
@@ -1126,7 +1155,6 @@ class ReasoningParser:
             kwargs["continue_final_message"] = True
             kwargs["previous_content"] = request.messages[-1].content
 
-        chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
 
