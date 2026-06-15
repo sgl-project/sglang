@@ -180,6 +180,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._torch_compiled_module_ids: set[int] = set()
+        # Breakable CUDA graph runners, one per transformer module (lazy).
+        self._bcg_runners: dict[int, Any] = {}
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -286,6 +288,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
         """
+        if self.server_args.enable_breakable_cuda_graph:
+            # BCG captures the eager kernel stream itself; compiling first
+            # would capture inductor's own cudagraph trees / guards.
+            return
         if not self.server_args.enable_torch_compile or not isinstance(
             module, nn.Module
         ):
@@ -358,6 +364,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         transformers with (potentially) different configurations.
 
         """
+        if self.server_args.enable_breakable_cuda_graph:
+            # Cache-DiT wraps transformer.forward with step-skipping control
+            # flow that must not be baked into a captured CUDA graph.
+            return
         if isinstance(num_inference_steps, tuple):
             num_high_noise_steps, num_low_noise_steps = num_inference_steps
 
@@ -717,8 +727,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
         else:
             reserved_frames_mask_sp, z_sp = (
-                reserved_frames_masks[0] if reserved_frames_masks is not None else None
-            ), z
+                (
+                    reserved_frames_masks[0]
+                    if reserved_frames_masks is not None
+                    else None
+                ),
+                z,
+            )
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -741,7 +756,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
-                "encoder_hidden_states_mask": batch.prompt_attention_mask,
+                "encoder_hidden_states_mask": (
+                    batch.prompt_embeds_mask or batch.prompt_attention_mask
+                ),
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
@@ -762,7 +779,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
-                    "encoder_hidden_states_mask": batch.negative_attention_mask,
+                    "encoder_hidden_states_mask": (
+                        batch.negative_prompt_embeds_mask
+                        or batch.negative_attention_mask
+                    ),
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
@@ -1529,6 +1549,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     timestep=timestep,
                     target_dtype=target_dtype,
                     guidance=guidance,
+                    enable_bcg=not self._should_skip_bcg_warmup_capture(
+                        batch, server_args
+                    ),
                     **branch.kwargs,
                 )
             pred_t = _wrap(raw)
@@ -1787,18 +1810,513 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         timestep,
         target_dtype,
         guidance: torch.Tensor,
+        enable_bcg: bool = True,
         **kwargs,
     ):
         guidance_kwargs = self.prepare_extra_func_kwargs(
             getattr(current_model, "forward", current_model),
             {"guidance": guidance},
         )
-        return current_model(
+        call_kwargs = dict(
             hidden_states=latent_model_input,
             timestep=timestep,
             **guidance_kwargs,
             **kwargs,
         )
+        runner = self._maybe_get_bcg_runner(current_model) if enable_bcg else None
+        if runner is not None:
+            return runner(
+                **self._bcg_pad_prompt_kwargs(call_kwargs, current_model=current_model)
+            )
+        return current_model(**call_kwargs)
+
+    def _should_skip_bcg_warmup_capture(
+        self, batch: Req, server_args: ServerArgs
+    ) -> bool:
+        if (
+            not getattr(batch, "is_warmup", False)
+            or not server_args.enable_breakable_cuda_graph
+        ):
+            return False
+
+        model_path = (server_args.model_path or "").lower()
+        return any(
+            name in model_path
+            for name in (
+                "firered-image-edit",
+                "joyai-image-edit",
+            )
+        )
+
+    @staticmethod
+    def _bcg_text_buckets() -> tuple[int, ...]:
+        buckets_env = os.environ.get("SGLANG_BCG_TEXT_BUCKETS")
+        if buckets_env is None:
+            buckets_env = os.environ.get("SGLANG_BCG_TEXT_BUCKET")
+        if buckets_env is None:
+            buckets_env = "256,512,1024,2048"
+
+        buckets = []
+        for raw_bucket in buckets_env.replace(";", ",").split(","):
+            raw_bucket = raw_bucket.strip()
+            if not raw_bucket:
+                continue
+            try:
+                bucket = int(raw_bucket)
+            except ValueError:
+                logger.warning(
+                    "[Diffusion BCG] ignoring invalid text bucket %r",
+                    raw_bucket,
+                )
+                continue
+            if bucket <= 0:
+                logger.warning(
+                    "[Diffusion BCG] ignoring non-positive text bucket %d",
+                    bucket,
+                )
+                continue
+            buckets.append(bucket)
+        return tuple(sorted(set(buckets))) or (512,)
+
+    @classmethod
+    def _bcg_select_text_bucket(cls, seq: int) -> int | None:
+        buckets = cls._bcg_text_buckets()
+        for bucket in buckets:
+            if seq <= bucket:
+                return bucket
+        logger.warning(
+            "[Diffusion BCG] text length %d exceeds max bucket %d; not padding "
+            "(this length captures its own graph). Raise SGLANG_BCG_TEXT_BUCKETS.",
+            seq,
+            buckets[-1],
+        )
+        return None
+
+    @staticmethod
+    def _bcg_first_tensor(obj):
+        if torch.is_tensor(obj):
+            return obj
+        if isinstance(obj, (list, tuple)):
+            for item in obj:
+                tensor = DenoisingStage._bcg_first_tensor(item)
+                if tensor is not None:
+                    return tensor
+        if isinstance(obj, dict):
+            for key in sorted(obj):
+                tensor = DenoisingStage._bcg_first_tensor(obj[key])
+                if tensor is not None:
+                    return tensor
+        return None
+
+    @staticmethod
+    def _bcg_pad_tensor_dim(tensor, dim: int, target: int, value: float = 0):
+        if not torch.is_tensor(tensor) or tensor.dim() <= dim:
+            return tensor
+        seq = tensor.shape[dim]
+        if seq >= target:
+            return tensor
+        pad = [0, 0] * tensor.dim()
+        pad_index = 2 * (tensor.dim() - dim - 1) + 1
+        pad[pad_index] = target - seq
+        return torch.nn.functional.pad(tensor, tuple(pad), value=value)
+
+    @classmethod
+    def _bcg_pad_nested_dim(
+        cls,
+        obj,
+        *,
+        dim: int,
+        source: int,
+        target: int,
+        value: float = 0,
+    ):
+        if torch.is_tensor(obj):
+            if obj.dim() > dim and obj.shape[dim] == source:
+                return cls._bcg_pad_tensor_dim(obj, dim, target, value)
+            return obj
+        if isinstance(obj, list):
+            return [
+                cls._bcg_pad_nested_dim(
+                    item, dim=dim, source=source, target=target, value=value
+                )
+                for item in obj
+            ]
+        if isinstance(obj, tuple):
+            return tuple(
+                cls._bcg_pad_nested_dim(
+                    item, dim=dim, source=source, target=target, value=value
+                )
+                for item in obj
+            )
+        return obj
+
+    @staticmethod
+    def _bcg_bucket_txt_seq_lens(txt_seq_lens, bucket: int):
+        if txt_seq_lens is None:
+            return txt_seq_lens
+        if torch.is_tensor(txt_seq_lens):
+            return torch.full_like(txt_seq_lens, bucket)
+        if isinstance(txt_seq_lens, list):
+            return [
+                DenoisingStage._bcg_bucket_txt_seq_lens(seq_len, bucket)
+                for seq_len in txt_seq_lens
+            ]
+        if isinstance(txt_seq_lens, tuple):
+            return tuple(
+                DenoisingStage._bcg_bucket_txt_seq_lens(seq_len, bucket)
+                for seq_len in txt_seq_lens
+            )
+        if isinstance(txt_seq_lens, int):
+            return bucket
+        return txt_seq_lens
+
+    _BCG_PROMPT_MASK_KEYS = (
+        "encoder_attention_mask",
+        "encoder_hidden_states_mask",
+        "attention_mask",
+        "text_mask",
+        "prompt_attention_mask",
+        "negative_attention_mask",
+        "prompt_embeds_mask",
+        "negative_prompt_embeds_mask",
+    )
+    _BCG_TEXT_DIM1_KEYS = (
+        "encoder_hidden_states",
+        "encoder_hidden_states_2",
+        "encoder_attention_mask",
+        "encoder_hidden_states_mask",
+        "attention_mask",
+        "text_mask",
+        "text_ids",
+        "text_pos_ids",
+        "txt_ids",
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "prompt_attention_mask",
+        "negative_attention_mask",
+        "prompt_embeds_mask",
+        "negative_prompt_embeds_mask",
+        "audio_encoder_hidden_states",
+        "audio_encoder_attention_mask",
+    )
+    _BCG_TEXT_DIM0_KEYS = (
+        "txt_freqs_cis",
+        "text_freqs_cis",
+    )
+    _BCG_TEXT_SEQ_LEN_KEYS = (
+        "txt_seq_lens",
+        "text_seq_lens",
+    )
+
+    @classmethod
+    def _bcg_prompt_seq_and_dim(cls, call_kwargs: dict) -> tuple[int, int] | None:
+        ehs_tensor = cls._bcg_first_tensor(call_kwargs.get("encoder_hidden_states"))
+        if torch.is_tensor(ehs_tensor) and ehs_tensor.dim() >= 2:
+            if ehs_tensor.dim() == 2:
+                return int(ehs_tensor.shape[0]), 0
+            return int(ehs_tensor.shape[1]), 1
+
+        for key in cls._BCG_PROMPT_MASK_KEYS:
+            tensor = cls._bcg_first_tensor(call_kwargs.get(key))
+            if torch.is_tensor(tensor) and tensor.dim() >= 2:
+                if tensor.shape[0] == 1:
+                    return int(tensor.shape[1]), 1
+                return int(tensor.shape[0]), 0
+        return None
+
+    @classmethod
+    def _bcg_pad_nested_text_dim(
+        cls,
+        obj,
+        *,
+        source: int,
+        target: int,
+        preferred_dim: int,
+    ):
+        if torch.is_tensor(obj):
+            if obj.dim() > preferred_dim and obj.shape[preferred_dim] == source:
+                return cls._bcg_pad_tensor_dim(obj, preferred_dim, target)
+            for dim in (1, 0):
+                if (
+                    dim != preferred_dim
+                    and obj.dim() > dim
+                    and obj.shape[dim] == source
+                ):
+                    return cls._bcg_pad_tensor_dim(obj, dim, target)
+            return obj
+        if isinstance(obj, list):
+            return [
+                cls._bcg_pad_nested_text_dim(
+                    item,
+                    source=source,
+                    target=target,
+                    preferred_dim=preferred_dim,
+                )
+                for item in obj
+            ]
+        if isinstance(obj, tuple):
+            return tuple(
+                cls._bcg_pad_nested_text_dim(
+                    item,
+                    source=source,
+                    target=target,
+                    preferred_dim=preferred_dim,
+                )
+                for item in obj
+            )
+        if isinstance(obj, dict):
+            return {
+                key: cls._bcg_pad_nested_text_dim(
+                    value,
+                    source=source,
+                    target=target,
+                    preferred_dim=preferred_dim,
+                )
+                for key, value in obj.items()
+            }
+        return obj
+
+    @classmethod
+    def _bcg_bucket_text_seq_lens(cls, obj, *, target: int):
+        if isinstance(obj, int) and not isinstance(obj, bool):
+            return target
+        if isinstance(obj, list):
+            return [cls._bcg_bucket_text_seq_lens(item, target=target) for item in obj]
+        if isinstance(obj, tuple):
+            return tuple(
+                cls._bcg_bucket_text_seq_lens(item, target=target) for item in obj
+            )
+        return obj
+
+    @classmethod
+    def _bcg_pad_masked_prompt_kwargs(cls, call_kwargs: dict):
+        seq_and_dim = cls._bcg_prompt_seq_and_dim(call_kwargs)
+        if seq_and_dim is None:
+            return call_kwargs
+        seq, seq_dim = seq_and_dim
+        has_mask = any(
+            cls._bcg_first_tensor(call_kwargs.get(key)) is not None
+            for key in cls._BCG_PROMPT_MASK_KEYS
+        )
+        if not has_mask:
+            return call_kwargs
+        bucket = cls._bcg_select_text_bucket(seq)
+        if bucket is None or seq == bucket:
+            return call_kwargs
+
+        out = dict(call_kwargs)
+        for key in cls._BCG_TEXT_DIM1_KEYS:
+            if key in out and out[key] is not None:
+                out[key] = cls._bcg_pad_nested_text_dim(
+                    out[key],
+                    source=seq,
+                    target=bucket,
+                    preferred_dim=seq_dim,
+                )
+        for key in cls._BCG_TEXT_DIM0_KEYS:
+            if key in out and out[key] is not None:
+                out[key] = cls._bcg_pad_nested_dim(
+                    out[key], dim=0, source=seq, target=bucket
+                )
+        for key in cls._BCG_TEXT_SEQ_LEN_KEYS:
+            if key in out and out[key] is not None:
+                out[key] = cls._bcg_bucket_text_seq_lens(out[key], target=bucket)
+        return out
+
+    @staticmethod
+    def _bcg_is_qwen_transformer(current_model) -> bool:
+        candidates = [current_model]
+        for attr in ("module", "_orig_mod"):
+            wrapped = getattr(current_model, attr, None)
+            if wrapped is not None:
+                candidates.append(wrapped)
+
+        for candidate in candidates:
+            cls = type(candidate)
+            name = f"{cls.__module__}.{cls.__qualname__}".lower()
+            if "qwen" in name:
+                return True
+        return False
+
+    @staticmethod
+    def _bcg_is_zimage_transformer(current_model) -> bool:
+        candidates = [current_model]
+        for attr in ("module", "_orig_mod"):
+            wrapped = getattr(current_model, attr, None)
+            if wrapped is not None:
+                candidates.append(wrapped)
+
+        for candidate in candidates:
+            cls = type(candidate)
+            name = f"{cls.__module__}.{cls.__qualname__}".lower()
+            if "zimage" in name:
+                return True
+        return False
+
+    @staticmethod
+    def _bcg_build_zimage_cap_freqs(current_model, target: int, device):
+        rotary_emb = getattr(current_model, "rotary_emb", None)
+        if rotary_emb is None:
+            return None
+
+        axes = [
+            torch.arange(1, target + 1, dtype=torch.int32, device=device),
+            torch.zeros(target, dtype=torch.int32, device=device),
+            torch.zeros(target, dtype=torch.int32, device=device),
+        ]
+        cap_pos_ids = torch.stack(axes, dim=-1)
+        return rotary_emb(cap_pos_ids)
+
+    @classmethod
+    def _bcg_pad_zimage_prompt_kwargs(cls, call_kwargs: dict, current_model):
+        seq_and_dim = cls._bcg_prompt_seq_and_dim(call_kwargs)
+        if seq_and_dim is None:
+            return call_kwargs
+        seq, seq_dim = seq_and_dim
+        bucket = cls._bcg_select_text_bucket(seq)
+        if bucket is None or seq == bucket:
+            return call_kwargs
+
+        out = dict(call_kwargs)
+        for key in cls._BCG_TEXT_DIM1_KEYS:
+            if key in out and out[key] is not None:
+                out[key] = cls._bcg_pad_nested_text_dim(
+                    out[key],
+                    source=seq,
+                    target=bucket,
+                    preferred_dim=seq_dim,
+                )
+
+        freqs_cis = out.get("freqs_cis")
+        if isinstance(freqs_cis, tuple) and len(freqs_cis) == 2:
+            cap_cache, image_cache = freqs_cis
+            cap_tensor = cls._bcg_first_tensor(cap_cache)
+            if torch.is_tensor(cap_tensor):
+                cap_cache = (
+                    cls._bcg_build_zimage_cap_freqs(
+                        current_model, bucket, cap_tensor.device
+                    )
+                    or cap_cache
+                )
+            out["freqs_cis"] = (cap_cache, image_cache)
+        elif isinstance(freqs_cis, list) and len(freqs_cis) == 2:
+            cap_cache, image_cache = freqs_cis
+            cap_tensor = cls._bcg_first_tensor(cap_cache)
+            if torch.is_tensor(cap_tensor):
+                cap_cache = (
+                    cls._bcg_build_zimage_cap_freqs(
+                        current_model, bucket, cap_tensor.device
+                    )
+                    or cap_cache
+                )
+            out["freqs_cis"] = [cap_cache, image_cache]
+
+        return out
+
+    @classmethod
+    def _bcg_pad_qwen_prompt_kwargs(cls, call_kwargs: dict):
+        ehs = call_kwargs.get("encoder_hidden_states")
+        ehs_tensor = cls._bcg_first_tensor(ehs)
+        if not torch.is_tensor(ehs_tensor) or ehs_tensor.dim() < 2:
+            return call_kwargs
+
+        seq = ehs_tensor.shape[1]
+        bucket = cls._bcg_select_text_bucket(seq)
+        if bucket is None:
+            return call_kwargs
+
+        out = dict(call_kwargs)
+        if seq < bucket:
+            out["encoder_hidden_states"] = cls._bcg_pad_nested_dim(
+                ehs, dim=1, source=seq, target=bucket
+            )
+            if (
+                "encoder_hidden_states_2" in out
+                and out["encoder_hidden_states_2"] is not None
+            ):
+                out["encoder_hidden_states_2"] = cls._bcg_pad_nested_dim(
+                    out["encoder_hidden_states_2"],
+                    dim=1,
+                    source=seq,
+                    target=bucket,
+                )
+
+        mask = out.get("encoder_hidden_states_mask")
+        if mask is None and seq < bucket:
+            mask = torch.ones(
+                ehs_tensor.shape[:2],
+                device=ehs_tensor.device,
+                dtype=torch.bool,
+            )
+        if mask is not None:
+            out["encoder_hidden_states_mask"] = cls._bcg_pad_nested_dim(
+                mask, dim=1, source=seq, target=bucket
+            )
+
+        if (
+            "encoder_attention_mask" in out
+            and out["encoder_attention_mask"] is not None
+        ):
+            out["encoder_attention_mask"] = cls._bcg_pad_nested_dim(
+                out["encoder_attention_mask"],
+                dim=1,
+                source=seq,
+                target=bucket,
+            )
+
+        freqs_cis = out.get("freqs_cis")
+        if isinstance(freqs_cis, tuple) and len(freqs_cis) == 2:
+            img_cache, txt_cache = freqs_cis
+            txt_cache = cls._bcg_pad_nested_dim(
+                txt_cache, dim=0, source=seq, target=bucket
+            )
+            out["freqs_cis"] = (img_cache, txt_cache)
+        elif isinstance(freqs_cis, list) and len(freqs_cis) == 2:
+            img_cache, txt_cache = freqs_cis
+            txt_cache = cls._bcg_pad_nested_dim(
+                txt_cache, dim=0, source=seq, target=bucket
+            )
+            out["freqs_cis"] = [img_cache, txt_cache]
+
+        out["txt_seq_lens"] = cls._bcg_bucket_txt_seq_lens(
+            out.get("txt_seq_lens"), bucket
+        )
+        return out
+
+    def _bcg_pad_prompt_kwargs(self, call_kwargs: dict, current_model=None):
+        """Bucket prompt-conditioning inputs so BCG signatures ignore prompt length."""
+        if self._bcg_is_zimage_transformer(current_model):
+            return self._bcg_pad_zimage_prompt_kwargs(call_kwargs, current_model)
+
+        if (
+            self._bcg_is_qwen_transformer(current_model)
+            and "txt_seq_lens" in call_kwargs
+            and "freqs_cis" in call_kwargs
+        ):
+            return self._bcg_pad_qwen_prompt_kwargs(call_kwargs)
+
+        return self._bcg_pad_masked_prompt_kwargs(call_kwargs)
+
+    def _maybe_get_bcg_runner(self, current_model):
+        """Return (lazily creating) the breakable CUDA graph runner for
+        ``current_model``, or ``None`` if BCG is disabled / inapplicable.
+        """
+        if not self.server_args.enable_breakable_cuda_graph:
+            return None
+        if not isinstance(current_model, nn.Module):
+            return None
+        key = id(current_model)
+        runner = self._bcg_runners.get(key)
+        if runner is None:
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
+                DiffusionBreakableCudaGraphRunner,
+            )
+
+            runner = DiffusionBreakableCudaGraphRunner(
+                current_model, get_local_torch_device()
+            )
+            self._bcg_runners[key] = runner
+        return runner
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """
