@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=37, suite="base-b-kernel-unit-1-gpu-large")
@@ -74,11 +75,9 @@ HEAD_DIM_LIST = get_ci_test_range([64, 128, 256, 512, 1024], [64, 256, 1024])
 DTYPE = torch.bfloat16
 
 # Determine device: prefer XPU if available, otherwise CUDA
-if hasattr(torch, "xpu") and torch.xpu.is_available():
-    DEVICE = "xpu"
-elif torch.cuda.is_available():
-    DEVICE = "cuda"
-else:
+try:
+    DEVICE = get_device()
+except RuntimeError:
     DEVICE = None
 
 # NOTE(dark): sgl_kernel use flashinfer template, which is bitwise identical to flashinfer impl.
