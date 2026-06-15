@@ -104,7 +104,7 @@ QWEN3_32B_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/aleoyang/Qwen3-32B-w8a8-MindIE"
 )
 QWEN3_32B_EAGLE_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/Qwen/Eagle3-Qwen3-32B-zh"
+    "/root/.cache/modelscope/hub/models/Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh"
 )
 QWEN3_235B_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-235B-A22B"
 QWEN3_235B_W8A8_MODEL_PATH = (
@@ -336,6 +336,8 @@ def run_bench_serving(
     seed=None,
     output_file=None,
     repeat_rate=None,
+    temperature=None,
+    top_p=None,
 ):
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_file = (
@@ -392,6 +394,10 @@ def run_bench_serving(
             cmd_args.extend(["--num-prompts", str(num_prompts)])
         if request_rate:
             cmd_args.extend(["--request-rate", str(request_rate)])
+        if temperature is not None:
+            cmd_args.extend(["--temperature", str(temperature)])
+        if top_p is not None:
+            cmd_args.extend(["--top-p", str(top_p)])
     else:
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
@@ -433,6 +439,10 @@ def run_bench_serving(
             cmd_args.extend(["--seed", str(seed)])
         if output_file:
             cmd_args.extend(["--output-file", str(output_file)])
+        if temperature is not None:
+            cmd_args.extend(["--temperature", str(temperature)])
+        if top_p is not None:
+            cmd_args.extend(["--top-p", str(top_p)])
     logger.info(f"Command: {' '.join(cmd_args)}")
 
     # Run benchmark command and capture output
@@ -864,6 +874,8 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     image_count = None
     warmup_requests = None
     seed = None
+    temperature = None
+    top_p = None
     ttft = None
     tpot = None
     mean_e2e_latency = None
@@ -945,6 +957,8 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 "image_count": self.image_count,
                 "warmup_requests": self.warmup_requests,
                 "seed": self.seed,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             metrics = run_bench_serving(**bench_params)
@@ -970,6 +984,8 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     image_count = None
     warmup_requests = None
     seed = None
+    temperature = None
+    top_p = None
     ttft = None
     tpot = None
     mean_e2e_latency = None
@@ -1065,6 +1081,8 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 "image_count": self.image_count,
                 "warmup_requests": self.warmup_requests,
                 "seed": self.seed,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             metrics = run_bench_serving(**bench_params)
@@ -1090,6 +1108,8 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     image_count = None
     warmup_requests = None
     seed = None
+    temperature = None
+    top_p = None
     ttft = None
     tpot = None
     mean_e2e_latency = None
@@ -1202,6 +1222,8 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 "image_count": self.image_count,
                 "warmup_requests": self.warmup_requests,
                 "seed": self.seed,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             metrics = run_bench_serving(**bench_params)
