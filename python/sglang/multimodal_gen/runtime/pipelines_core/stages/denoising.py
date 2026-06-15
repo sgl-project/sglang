@@ -803,8 +803,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
         else:
             reserved_frames_mask_sp, z_sp = (
-                reserved_frames_masks[0] if reserved_frames_masks is not None else None
-            ), z
+                (
+                    reserved_frames_masks[0]
+                    if reserved_frames_masks is not None
+                    else None
+                ),
+                z,
+            )
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -827,7 +832,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
-                "encoder_hidden_states_mask": batch.prompt_attention_mask,
+                "encoder_hidden_states_mask": (
+                    batch.prompt_embeds_mask or batch.prompt_attention_mask
+                ),
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
@@ -848,7 +855,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
-                    "encoder_hidden_states_mask": batch.negative_attention_mask,
+                    "encoder_hidden_states_mask": (
+                        batch.negative_prompt_embeds_mask
+                        or batch.negative_attention_mask
+                    ),
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
@@ -2108,6 +2118,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         "txt_freqs_cis",
         "text_freqs_cis",
     )
+    _BCG_TEXT_SEQ_LEN_KEYS = (
+        "txt_seq_lens",
+        "text_seq_lens",
+    )
 
     @classmethod
     def _bcg_prompt_seq_and_dim(cls, call_kwargs: dict) -> tuple[int, int] | None:
@@ -2178,6 +2192,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return obj
 
     @classmethod
+    def _bcg_bucket_text_seq_lens(cls, obj, *, target: int):
+        if isinstance(obj, int) and not isinstance(obj, bool):
+            return target
+        if isinstance(obj, list):
+            return [cls._bcg_bucket_text_seq_lens(item, target=target) for item in obj]
+        if isinstance(obj, tuple):
+            return tuple(
+                cls._bcg_bucket_text_seq_lens(item, target=target) for item in obj
+            )
+        return obj
+
+    @classmethod
     def _bcg_pad_masked_prompt_kwargs(cls, call_kwargs: dict):
         seq_and_dim = cls._bcg_prompt_seq_and_dim(call_kwargs)
         if seq_and_dim is None:
@@ -2207,6 +2233,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 out[key] = cls._bcg_pad_nested_dim(
                     out[key], dim=0, source=seq, target=bucket
                 )
+        for key in cls._BCG_TEXT_SEQ_LEN_KEYS:
+            if key in out and out[key] is not None:
+                out[key] = cls._bcg_bucket_text_seq_lens(out[key], target=bucket)
         return out
 
     @staticmethod
@@ -2223,6 +2252,81 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if "qwen" in name:
                 return True
         return False
+
+    @staticmethod
+    def _bcg_is_zimage_transformer(current_model) -> bool:
+        candidates = [current_model]
+        for attr in ("module", "_orig_mod"):
+            wrapped = getattr(current_model, attr, None)
+            if wrapped is not None:
+                candidates.append(wrapped)
+
+        for candidate in candidates:
+            cls = type(candidate)
+            name = f"{cls.__module__}.{cls.__qualname__}".lower()
+            if "zimage" in name:
+                return True
+        return False
+
+    @staticmethod
+    def _bcg_build_zimage_cap_freqs(current_model, target: int, device):
+        rotary_emb = getattr(current_model, "rotary_emb", None)
+        if rotary_emb is None:
+            return None
+
+        axes = [
+            torch.arange(1, target + 1, dtype=torch.int32, device=device),
+            torch.zeros(target, dtype=torch.int32, device=device),
+            torch.zeros(target, dtype=torch.int32, device=device),
+        ]
+        cap_pos_ids = torch.stack(axes, dim=-1)
+        return rotary_emb(cap_pos_ids)
+
+    @classmethod
+    def _bcg_pad_zimage_prompt_kwargs(cls, call_kwargs: dict, current_model):
+        seq_and_dim = cls._bcg_prompt_seq_and_dim(call_kwargs)
+        if seq_and_dim is None:
+            return call_kwargs
+        seq, seq_dim = seq_and_dim
+        bucket = cls._bcg_select_text_bucket(seq)
+        if bucket is None or seq == bucket:
+            return call_kwargs
+
+        out = dict(call_kwargs)
+        for key in cls._BCG_TEXT_DIM1_KEYS:
+            if key in out and out[key] is not None:
+                out[key] = cls._bcg_pad_nested_text_dim(
+                    out[key],
+                    source=seq,
+                    target=bucket,
+                    preferred_dim=seq_dim,
+                )
+
+        freqs_cis = out.get("freqs_cis")
+        if isinstance(freqs_cis, tuple) and len(freqs_cis) == 2:
+            cap_cache, image_cache = freqs_cis
+            cap_tensor = cls._bcg_first_tensor(cap_cache)
+            if torch.is_tensor(cap_tensor):
+                cap_cache = (
+                    cls._bcg_build_zimage_cap_freqs(
+                        current_model, bucket, cap_tensor.device
+                    )
+                    or cap_cache
+                )
+            out["freqs_cis"] = (cap_cache, image_cache)
+        elif isinstance(freqs_cis, list) and len(freqs_cis) == 2:
+            cap_cache, image_cache = freqs_cis
+            cap_tensor = cls._bcg_first_tensor(cap_cache)
+            if torch.is_tensor(cap_tensor):
+                cap_cache = (
+                    cls._bcg_build_zimage_cap_freqs(
+                        current_model, bucket, cap_tensor.device
+                    )
+                    or cap_cache
+                )
+            out["freqs_cis"] = [cap_cache, image_cache]
+
+        return out
 
     @classmethod
     def _bcg_pad_qwen_prompt_kwargs(cls, call_kwargs: dict):
@@ -2296,6 +2400,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
     def _bcg_pad_prompt_kwargs(self, call_kwargs: dict, current_model=None):
         """Bucket prompt-conditioning inputs so BCG signatures ignore prompt length."""
+        if self._bcg_is_zimage_transformer(current_model):
+            return self._bcg_pad_zimage_prompt_kwargs(call_kwargs, current_model)
+
         if (
             self._bcg_is_qwen_transformer(current_model)
             and "txt_seq_lens" in call_kwargs

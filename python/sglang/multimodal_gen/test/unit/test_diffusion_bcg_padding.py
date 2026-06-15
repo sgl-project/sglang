@@ -7,6 +7,7 @@ import torch
 from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
     _signature_kwargs,
 )
+from sglang.multimodal_gen.runtime.models.dits.zimage import ZImageTransformer2DModel
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
@@ -20,11 +21,20 @@ class FluxTransformer2DModel(torch.nn.Module):
     pass
 
 
+class ZImageFakeTransformer2DModel(torch.nn.Module):
+    def rotary_emb(self, pos_ids):
+        return (
+            torch.zeros(pos_ids.shape[0], 64, device=pos_ids.device),
+            torch.ones(pos_ids.shape[0], 64, device=pos_ids.device),
+        )
+
+
 class TestDiffusionBCGPadding(unittest.TestCase):
     def setUp(self):
         self.stage = DenoisingStage.__new__(DenoisingStage)
         self.qwen_model = QwenImageTransformer2DModel()
         self.flux_model = FluxTransformer2DModel()
+        self.zimage_model = ZImageFakeTransformer2DModel()
 
     def _qwen_kwargs(self, seq_len: int, *, fill: float = 1.0):
         return {
@@ -128,6 +138,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 "encoder_hidden_states_mask": torch.ones(1, seq_len, dtype=torch.bool),
                 "text_ids": torch.arange(seq_len).view(1, seq_len),
                 "txt_freqs_cis": torch.zeros(seq_len, 32),
+                "txt_seq_lens": [seq_len],
             }
 
         with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "64,128"}):
@@ -143,6 +154,8 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(first["encoder_hidden_states_mask"].shape, (1, 64))
         self.assertEqual(first["text_ids"].shape, (1, 64))
         self.assertEqual(first["txt_freqs_cis"].shape, (64, 32))
+        self.assertEqual(first["txt_seq_lens"], [64])
+        self.assertEqual(second["txt_seq_lens"], [64])
         self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
 
     def test_generic_masked_prompt_padding_supports_unbatched_text_embeddings(self):
@@ -169,6 +182,58 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(first["encoder_attention_mask"][0].shape, (64, 128))
         self.assertEqual(second["encoder_hidden_states"][0].shape, (64, 128))
         self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
+
+    def test_zimage_prompt_padding_preserves_valid_mask_and_rebuilds_cap_rope(self):
+        image_freqs = (torch.zeros(4096, 64), torch.ones(4096, 64))
+
+        def kwargs(seq_len: int):
+            cap_freqs = (torch.zeros(32, 64), torch.ones(32, 64))
+            return {
+                "hidden_states": torch.zeros(1, 16, 1, 128, 128),
+                "timestep": torch.zeros(1),
+                "encoder_hidden_states": [torch.ones(seq_len, 2560)],
+                "encoder_hidden_states_mask": [
+                    torch.ones(1, seq_len, dtype=torch.bool)
+                ],
+                "freqs_cis": (cap_freqs, image_freqs),
+            }
+
+        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "64,128"}):
+            first = self.stage._bcg_pad_prompt_kwargs(
+                kwargs(17), current_model=self.zimage_model
+            )
+            second = self.stage._bcg_pad_prompt_kwargs(
+                kwargs(41), current_model=self.zimage_model
+            )
+
+        self.assertEqual(first["encoder_hidden_states"][0].shape, (64, 2560))
+        self.assertEqual(second["encoder_hidden_states"][0].shape, (64, 2560))
+        self.assertEqual(first["encoder_hidden_states_mask"][0].shape, (1, 64))
+        self.assertEqual(first["encoder_hidden_states_mask"][0].sum().item(), 17)
+        self.assertEqual(first["freqs_cis"][0][0].shape, (64, 64))
+        self.assertEqual(second["freqs_cis"][0][0].shape, (64, 64))
+        self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
+
+    def test_zimage_caption_valid_mask_comes_from_bcg_padded_mask(self):
+        mask = torch.tensor([[True, True, True, False, False]])
+        valid_mask = ZImageTransformer2DModel._caption_valid_mask_from_mask(
+            [mask], batch_size=1, max_seq_len=5
+        )
+
+        self.assertEqual(valid_mask.shape, (1, 5))
+        self.assertTrue(torch.equal(valid_mask, mask))
+
+    def test_zimage_mask_padding_replaces_only_invalid_caption_tokens(self):
+        tensor = torch.arange(15, dtype=torch.float32).view(1, 5, 3)
+        valid_mask = torch.tensor([[True, True, False, False, False]])
+        pad_token = torch.tensor([[100.0, 101.0, 102.0]])
+
+        out = ZImageTransformer2DModel._replace_padding_with_token_mask(
+            tensor, valid_mask, pad_token
+        )
+
+        self.assertTrue(torch.equal(out[:, :2], tensor[:, :2]))
+        self.assertTrue(torch.equal(out[:, 2:], pad_token.expand(1, 3, 3)))
 
 
 if __name__ == "__main__":
