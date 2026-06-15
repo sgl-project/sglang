@@ -9,7 +9,6 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
@@ -298,8 +297,7 @@ class TestDisaggregationSpecV2Grammar(PDDisaggregationServerBase):
         ]
         cls.extra_prefill_args = spec_args
         cls.extra_decode_args = spec_args
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
-            cls.launch_all()
+        cls.launch_all()
 
     @staticmethod
     def _json_schema() -> str:
