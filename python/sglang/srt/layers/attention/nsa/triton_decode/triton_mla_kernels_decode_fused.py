@@ -27,6 +27,7 @@ def _bucket_total_tokens(total_tokens: int) -> int:
         n <<= 1
     return n
 
+
 # ============================================================================
 # Constants for DSV4 layout
 # ============================================================================
@@ -46,7 +47,9 @@ DUAL_SCOPE_SPLITK_TOPK_THRESHOLD = 2048
 # Token thresholds for split-K vs no-splitk decision:
 # - Below these thresholds, split-K provides better GPU utilization.
 # - Above these thresholds, the combine kernel overhead dominates.
-NOSPLITK_TOKEN_THRESHOLD_LOW_TOPK = 64    # For total_topk < DUAL_SCOPE_SPLITK_TOPK_THRESHOLD
+NOSPLITK_TOKEN_THRESHOLD_LOW_TOPK = (
+    64  # For total_topk < DUAL_SCOPE_SPLITK_TOPK_THRESHOLD
+)
 
 # Small batch threshold: below this, split-K=4/8 for parallelism
 SMALL_BATCH_TOKEN_THRESHOLD = 8
@@ -59,18 +62,15 @@ SPLITK_HIGH_TOPK_THRESHOLD = 512
 # ============================================================================
 
 
-def _decide_splitk_dual_scope(
-    total_tokens: int, h_q: int, total_topk: int
-) -> int:
+def _decide_splitk_dual_scope(total_tokens: int, h_q: int, total_topk: int) -> int:
     """Decide the split_k value for dual-scope attention.
 
     Returns:
         split_k value (0 means no split-K, use non-splitk kernel).
     """
     # Conditions under which split-K is beneficial:
-    use_splitk_for_small_bs = (
-        total_tokens <= SMALL_BATCH_TOKEN_THRESHOLD
-        and (h_q >= 128 or total_topk >= 1024)
+    use_splitk_for_small_bs = total_tokens <= SMALL_BATCH_TOKEN_THRESHOLD and (
+        h_q >= 128 or total_topk >= 1024
     )
     use_splitk_for_h64_large_topk = (
         h_q <= 64
@@ -85,9 +85,7 @@ def _decide_splitk_dual_scope(
     # For large h_q, the non-splitk grid has very few blocks
     # in the H dimension, leading to low GPU utilization.
     use_splitk_for_large_hq = (
-        h_q > 64
-        and total_tokens > SMALL_BATCH_TOKEN_THRESHOLD
-        and total_topk >= 256
+        h_q > 64 and total_tokens > SMALL_BATCH_TOKEN_THRESHOLD and total_topk >= 256
     )
 
     if not (
@@ -113,6 +111,7 @@ def _decide_splitk_dual_scope(
         return 2
     else:
         return _select_split_k(total_topk, h_q, total_tokens)
+
 
 DSV4_NUM_TILES = 7
 DSV4_BYTES_PER_TOKEN_DATA = 576  # 448 nope + 128 rope
@@ -273,6 +272,7 @@ def _process_kv_block_aggressive(
     acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
 
     return acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_new, l_new
+
 
 # ============================================================================
 # DSV4 Fused Gather+Dequant+Attention Kernel (Single Scope)
@@ -572,6 +572,7 @@ def _fused_gather_attn_dsv4_kernel(
     lse_ptrs = LSE + pid_t * stride_lse_t + offs_h * stride_lse_h
     tl.store(lse_ptrs, lse, mask=mask_h)
 
+
 # Threshold for disabling buffer_ops optimization
 # When KV cache size exceeds this threshold, buffer_ops may overflow
 BUFFER_OPS_DISABLE_THRESHOLD = 2 * 1024 * 1024 * 1024  # 2GB
@@ -814,6 +815,7 @@ def fused_gather_attn_decode_dsv4(
         run_kernel()
 
     return output, lse
+
 
 # ============================================================================
 
@@ -1239,6 +1241,7 @@ def _fused_gather_attn_dsv4_dual_scope_kernel(
 
     lse_ptrs = LSE + pid_t * stride_lse_t + offs_h * stride_lse_h
     tl.store(lse_ptrs, lse, mask=mask_h)
+
 
 # ============================================================================
 # Split-K Kernel for Dual Scope
@@ -1696,8 +1699,10 @@ def fused_gather_attn_decode_dsv4_dual_scope(
         or kv_cache_size_extra > BUFFER_OPS_DISABLE_THRESHOLD
     )
 
-    split_k = 0 if force_no_splitk else _decide_splitk_dual_scope(
-        total_tokens, h_q, total_topk
+    split_k = (
+        0
+        if force_no_splitk
+        else _decide_splitk_dual_scope(total_tokens, h_q, total_topk)
     )
     if split_k > 0:
         topk_per_split = (total_topk + split_k - 1) // split_k
@@ -1914,6 +1919,7 @@ def fused_gather_attn_decode_dsv4_dual_scope(
         run_kernel()
 
     return output, lse
+
 
 # ============================================================================
 # Split-K Optimization for Large TopK (>= 8192)
@@ -2727,6 +2733,7 @@ def _select_split_k(topk: int, h_q: int, total_tokens: int = 64) -> int:
         return 4
     else:
         return 2
+
 
 # ============================================================================
 # Low-overhead buffer pool for splitk operations

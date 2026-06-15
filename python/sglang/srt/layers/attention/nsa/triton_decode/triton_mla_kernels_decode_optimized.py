@@ -95,7 +95,9 @@ def _triton_sparse_attn_decode_dsv4(
     # Single scope case
     if extra_kv_scope is None:
         q_reshaped = q.reshape(total_tokens, h_q, d_qk).contiguous()
-        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main).contiguous()
+        indices_main = kv_scope.indices_in_kvcache.reshape(
+            total_tokens, topk_main
+        ).contiguous()
 
         output, lse = fused_gather_attn_decode_dsv4(
             q_reshaped,
@@ -115,8 +117,12 @@ def _triton_sparse_attn_decode_dsv4(
     block_size_extra = extra_kv_scope.blocked_k.shape[1]
 
     q_reshaped = q.reshape(total_tokens, h_q, d_qk).contiguous()
-    indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main).contiguous()
-    indices_extra = extra_kv_scope.indices_in_kvcache.reshape(total_tokens, topk_extra).contiguous()
+    indices_main = kv_scope.indices_in_kvcache.reshape(
+        total_tokens, topk_main
+    ).contiguous()
+    indices_extra = extra_kv_scope.indices_in_kvcache.reshape(
+        total_tokens, topk_extra
+    ).contiguous()
 
     # Dispatch: use split-K for small batches, no-splitk for everything else.
     if _should_use_fused_splitk(total_tokens, h_q, total_topk):
