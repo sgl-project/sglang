@@ -98,7 +98,9 @@ class Sampler(nn.Module):
     ) -> torch.Tensor:
         """Apply custom logit processors and sanitize non-finite logits."""
         if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(logits, sampling_info, hidden_states=hidden_states)
+            apply_custom_logit_processor(
+                logits, sampling_info, hidden_states=hidden_states
+            )
         sanitize_nan_logits(logits, "sampler: next_token_logits")
         return logits
 
@@ -815,7 +817,9 @@ def apply_custom_logit_processor(
         params_slice = [sampling_batch_info.custom_params[i] for i in batch_indices]
 
         # Capability-aware dispatch: only forward hidden_states to processors that accept it.
-        if hidden_states is not None and _processor_accepts_hidden_states(type(processor)):
+        if hidden_states is not None and _processor_accepts_hidden_states(
+            type(processor)
+        ):
             logits[batch_mask_rep] = processor(
                 logits[batch_mask_rep],
                 params_slice,

@@ -75,6 +75,7 @@ except Exception:
         def to_str(cls) -> str:
             return ""
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -115,7 +116,8 @@ class SMIELPWithHiddenStates(CustomLogitProcessor):
         if len(custom_param_list) != batch_size:
             logger.warning(
                 "SMIELPWithHiddenStates: param list length %d != batch size %d; skipping.",
-                len(custom_param_list), batch_size,
+                len(custom_param_list),
+                batch_size,
             )
             return logits
 
@@ -125,7 +127,8 @@ class SMIELPWithHiddenStates(CustomLogitProcessor):
                 logger.warning(
                     "SMIELPWithHiddenStates: hidden_states.shape[0]=%d != batch_size=%d; "
                     "ignoring hidden_states and falling back to logit slicing.",
-                    hidden_states.shape[0], batch_size,
+                    hidden_states.shape[0],
+                    batch_size,
                 )
                 hidden_states = None
             elif hidden_states.dim() != 2:
@@ -143,7 +146,12 @@ class SMIELPWithHiddenStates(CustomLogitProcessor):
                 continue
             schema = params.get("schema")
             if not schema:
-                result = {"intent": None, "entities": [], "mode": "none", "hidden_state_l2": None}
+                result = {
+                    "intent": None,
+                    "entities": [],
+                    "mode": "none",
+                    "hidden_state_l2": None,
+                }
             else:
                 h = hidden_states[i] if hidden_states is not None else None
 
@@ -165,7 +173,9 @@ class SMIELPWithHiddenStates(CustomLogitProcessor):
                     result = self._classify_logit_slicing(logits[i], schema)
                     result["mode"] = "logit_slicing"
 
-                result["hidden_state_l2"] = float(h.float().norm().item()) if h is not None else None
+                result["hidden_state_l2"] = (
+                    float(h.float().norm().item()) if h is not None else None
+                )
 
             req = params.get("__req__")
             if req is not None:
@@ -173,14 +183,17 @@ class SMIELPWithHiddenStates(CustomLogitProcessor):
                     req.customized_info = {}
                 req.customized_info[self.OUTPUT_KEY] = [result]
             else:
-                logger.warning("SMIELPWithHiddenStates: __req__ missing in params[%d].", i)
+                logger.warning(
+                    "SMIELPWithHiddenStates: __req__ missing in params[%d].", i
+                )
 
             eos_id = params.get("eos_token_id", 2)
             vocab_size = logits.shape[1]
             if eos_id >= vocab_size:
                 logger.warning(
                     "SMIELPWithHiddenStates: eos_token_id %d >= vocab_size %d; clamping.",
-                    eos_id, vocab_size,
+                    eos_id,
+                    vocab_size,
                 )
                 eos_id = vocab_size - 1
             logits[i, :] = float("-inf")
@@ -194,40 +207,44 @@ class SMIELPWithHiddenStates(CustomLogitProcessor):
 
     def _classify_logit_slicing(self, row: torch.Tensor, schema: dict) -> dict:
         return {
-            "intent":   self._slice_intent(row, schema),
+            "intent": self._slice_intent(row, schema),
             "entities": self._slice_slots(row, schema),
         }
 
     def _slice_intent(self, row: torch.Tensor, schema: dict) -> Optional[dict]:
-        ids    = schema.get("intent_token_ids")
+        ids = schema.get("intent_token_ids")
         labels = schema.get("intent_labels")
         if not ids or not labels:
             return None
-        idx   = torch.tensor(ids, device=row.device, dtype=torch.long)
+        idx = torch.tensor(ids, device=row.device, dtype=torch.long)
         probs = F.softmax(row[idx].float(), dim=-1)
-        best  = int(probs.argmax())
+        best = int(probs.argmax())
         return {
-            "label":        labels[best],
-            "confidence":   float(probs[best]),
-            "distribution": {l: float(p) for l, p in zip(labels, probs.tolist())},
+            "label": labels[best],
+            "confidence": float(probs[best]),
+            "distribution": {lbl: float(p) for lbl, p in zip(labels, probs.tolist())},
         }
 
     def _slice_slots(self, row: torch.Tensor, schema: dict) -> List[dict]:
         entities = []
         for slot in schema.get("entity_slots", []):
-            ids    = slot.get("bio_token_ids")
+            ids = slot.get("bio_token_ids")
             labels = slot.get("bio_labels")
             if not ids or not labels:
                 continue
-            idx   = torch.tensor(ids, device=row.device, dtype=torch.long)
+            idx = torch.tensor(ids, device=row.device, dtype=torch.long)
             probs = F.softmax(row[idx].float(), dim=-1)
-            best  = int(probs.argmax())
-            entities.append({
-                "slot":         slot["name"],
-                "tag":          labels[best],
-                "confidence":   float(probs[best]),
-                "distribution": {l: float(p) for l, p in zip(labels, probs.tolist())},
-            })
+            best = int(probs.argmax())
+            entities.append(
+                {
+                    "slot": slot["name"],
+                    "tag": labels[best],
+                    "confidence": float(probs[best]),
+                    "distribution": {
+                        lbl: float(p) for lbl, p in zip(labels, probs.tolist())
+                    },
+                }
+            )
         return entities
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -236,9 +253,9 @@ class SMIELPWithHiddenStates(CustomLogitProcessor):
 
     def _classify_embedding(
         self,
-        h: torch.Tensor,           # [hidden_dim]
+        h: torch.Tensor,  # [hidden_dim]
         schema: dict,
-        label_embs: dict,          # {head_name: Tensor[num_labels, hidden_dim]}
+        label_embs: dict,  # {head_name: Tensor[num_labels, hidden_dim]}
     ) -> dict:
         """
         Classify intent and slots by cosine similarity between the last-token hidden
@@ -250,7 +267,7 @@ class SMIELPWithHiddenStates(CustomLogitProcessor):
 
         If a head is missing from label_embs, fall back to logit slicing for that head.
         """
-        h_norm = F.normalize(h.float().unsqueeze(0), dim=-1)   # [1, D]
+        h_norm = F.normalize(h.float().unsqueeze(0), dim=-1)  # [1, D]
 
         # ── Intent ────────────────────────────────────────────────────────────
         intent_result = None
@@ -261,25 +278,31 @@ class SMIELPWithHiddenStates(CustomLogitProcessor):
                 logger.warning(
                     "SMIELPWithHiddenStates: label_embs['intent'] shape %s != expected "
                     "(%d, %d); skipping intent classification.",
-                    tuple(E_raw.shape), len(intent_labels), h.shape[0],
+                    tuple(E_raw.shape),
+                    len(intent_labels),
+                    h.shape[0],
                 )
             else:
-                E     = F.normalize(E_raw, dim=-1)                 # [K, D]
-                sims  = (h_norm @ E.T).squeeze(0)                  # [K]
+                E = F.normalize(E_raw, dim=-1)  # [K, D]
+                sims = (h_norm @ E.T).squeeze(0)  # [K]
                 probs = F.softmax(sims * 10.0, dim=-1)
-                best  = int(probs.argmax())
+                best = int(probs.argmax())
                 intent_result = {
-                    "label":        intent_labels[best],
-                    "confidence":   float(probs[best]),
-                    "distribution": {l: float(p) for l, p in zip(intent_labels, probs.tolist())},
+                    "label": intent_labels[best],
+                    "confidence": float(probs[best]),
+                    "distribution": {
+                        lbl: float(p) for lbl, p in zip(intent_labels, probs.tolist())
+                    },
                 }
         else:
-            logger.debug("SMIELPWithHiddenStates: 'intent' not in label_embs; skipping intent.")
+            logger.debug(
+                "SMIELPWithHiddenStates: 'intent' not in label_embs; skipping intent."
+            )
 
         # ── Entity slots ──────────────────────────────────────────────────────
         entities = []
         for slot in schema.get("entity_slots", []):
-            name   = slot["name"]
+            name = slot["name"]
             labels = slot.get("bio_labels", [])
             if name in label_embs and labels:
                 E_raw = label_embs[name].float().to(h.device)
@@ -287,22 +310,30 @@ class SMIELPWithHiddenStates(CustomLogitProcessor):
                     logger.warning(
                         "SMIELPWithHiddenStates: label_embs['%s'] shape %s != expected "
                         "(%d, %d); skipping slot.",
-                        name, tuple(E_raw.shape), len(labels), h.shape[0],
+                        name,
+                        tuple(E_raw.shape),
+                        len(labels),
+                        h.shape[0],
                     )
                     continue
-                E     = F.normalize(E_raw, dim=-1)
-                sims  = (h_norm @ E.T).squeeze(0)
+                E = F.normalize(E_raw, dim=-1)
+                sims = (h_norm @ E.T).squeeze(0)
                 probs = F.softmax(sims * 10.0, dim=-1)
-                best  = int(probs.argmax())
-                entities.append({
-                    "slot":         name,
-                    "tag":          labels[best],
-                    "confidence":   float(probs[best]),
-                    "distribution": {l: float(p) for l, p in zip(labels, probs.tolist())},
-                })
+                best = int(probs.argmax())
+                entities.append(
+                    {
+                        "slot": name,
+                        "tag": labels[best],
+                        "confidence": float(probs[best]),
+                        "distribution": {
+                            lbl: float(p) for lbl, p in zip(labels, probs.tolist())
+                        },
+                    }
+                )
             else:
                 logger.debug(
-                    "SMIELPWithHiddenStates: '%s' not in label_embs; skipping slot.", name
+                    "SMIELPWithHiddenStates: '%s' not in label_embs; skipping slot.",
+                    name,
                 )
 
         return {"intent": intent_result, "entities": entities}

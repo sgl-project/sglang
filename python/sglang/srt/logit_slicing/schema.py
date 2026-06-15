@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +40,10 @@ class IntentSchema:
     def token_ids(self) -> List[int]:
         """Return token IDs in the same order as self.labels."""
         if not self.is_anchored:
-            raise RuntimeError("IntentSchema has not been anchored yet. Call VocabAnchor.anchor().")
-        return [self.label_to_token_id[l] for l in self.labels]
+            raise RuntimeError(
+                "IntentSchema has not been anchored yet. Call VocabAnchor.anchor()."
+            )
+        return [self.label_to_token_id[lbl] for lbl in self.labels]
 
 
 @dataclasses.dataclass
@@ -63,7 +65,9 @@ class SlotSchema:
         if len(self.labels) < 2:
             raise ValueError(f"SlotSchema '{self.name}' requires at least 2 labels.")
         if len(set(self.labels)) != len(self.labels):
-            raise ValueError(f"SlotSchema '{self.name}' has duplicate labels: {self.labels}")
+            raise ValueError(
+                f"SlotSchema '{self.name}' has duplicate labels: {self.labels}"
+            )
 
     @property
     def is_anchored(self) -> bool:
@@ -75,7 +79,7 @@ class SlotSchema:
             raise RuntimeError(
                 f"SlotSchema '{self.name}' has not been anchored. Call VocabAnchor.anchor()."
             )
-        return [self.label_to_token_id[l] for l in self.labels]
+        return [self.label_to_token_id[lbl] for lbl in self.labels]
 
 
 @dataclasses.dataclass

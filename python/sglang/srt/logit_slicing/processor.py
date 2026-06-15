@@ -76,6 +76,7 @@ except Exception:
         def to_str(cls) -> str:
             return ""
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -194,7 +195,8 @@ class SimultaneousMultiIntentEntityLogitProcessor(CustomLogitProcessor):
             schema = params.get("schema")
             if not schema:
                 logger.warning(
-                    "SMIELP: no 'schema' key in custom_params[%d]; returning empty result.", i
+                    "SMIELP: no 'schema' key in custom_params[%d]; returning empty result.",
+                    i,
                 )
                 results.append({"intent": None, "entities": []})
                 continue
@@ -217,22 +219,19 @@ class SimultaneousMultiIntentEntityLogitProcessor(CustomLogitProcessor):
             return None
 
         idx = torch.tensor(intent_token_ids, device=row.device, dtype=torch.long)
-        sliced = row[idx].float()                      # [num_intents]
-        probs = F.softmax(sliced, dim=-1)              # numerically stable
+        sliced = row[idx].float()  # [num_intents]
+        probs = F.softmax(sliced, dim=-1)  # numerically stable
         best = int(probs.argmax().item())
 
         return {
             "label": intent_labels[best],
             "confidence": float(probs[best]),
             "distribution": {
-                label: float(p)
-                for label, p in zip(intent_labels, probs.tolist())
+                label: float(p) for label, p in zip(intent_labels, probs.tolist())
             },
         }
 
-    def _classify_slots(
-        self, row: torch.Tensor, schema: dict
-    ) -> List[Dict[str, Any]]:
+    def _classify_slots(self, row: torch.Tensor, schema: dict) -> List[Dict[str, Any]]:
         entities = []
         for slot in schema.get("entity_slots", []):
             bio_token_ids = slot.get("bio_token_ids")
@@ -241,7 +240,7 @@ class SimultaneousMultiIntentEntityLogitProcessor(CustomLogitProcessor):
                 continue
 
             idx = torch.tensor(bio_token_ids, device=row.device, dtype=torch.long)
-            sliced = row[idx].float()                  # [num_tags]
+            sliced = row[idx].float()  # [num_tags]
             probs = F.softmax(sliced, dim=-1)
             best = int(probs.argmax().item())
 
@@ -251,8 +250,7 @@ class SimultaneousMultiIntentEntityLogitProcessor(CustomLogitProcessor):
                     "tag": bio_labels[best],
                     "confidence": float(probs[best]),
                     "distribution": {
-                        label: float(p)
-                        for label, p in zip(bio_labels, probs.tolist())
+                        label: float(p) for label, p in zip(bio_labels, probs.tolist())
                     },
                 }
             )

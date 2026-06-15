@@ -32,9 +32,9 @@ You can either:
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from sglang.srt.logit_slicing.schema import IntentSchema, NERSchema, SlotSchema
+from sglang.srt.logit_slicing.schema import NERSchema
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +170,9 @@ class VocabAnchor:
         token_to_labels: Dict[int, List[str]] = {}
         for label, tid in mapping.items():
             token_to_labels.setdefault(tid, []).append(label)
-        collisions = {tid: lbls for tid, lbls in token_to_labels.items() if len(lbls) > 1}
+        collisions = {
+            tid: lbls for tid, lbls in token_to_labels.items() if len(lbls) > 1
+        }
         if collisions:
             details = "; ".join(
                 f"token_id={tid} ← {lbls}" for tid, lbls in collisions.items()
@@ -181,7 +183,9 @@ class VocabAnchor:
                 "Use strategy='explicit' and hand-pick unique token IDs."
             )
 
-    def _check_vocab_range(self, mapping: Dict[str, int], tokenizer, head_name: str) -> None:
+    def _check_vocab_range(
+        self, mapping: Dict[str, int], tokenizer, head_name: str
+    ) -> None:
         if tokenizer is None:
             # No tokenizer available (e.g. STRATEGY_EXPLICIT with tokenizer=None in
             # build_phase_b_config).  Caller is responsible for providing valid IDs.
@@ -197,13 +201,16 @@ class VocabAnchor:
             )
 
     def _log_mapping(self, mapping: Dict[str, int], head_name: str) -> None:
-        lines = "  " + "\n  ".join(f"{lbl!r:30s} → {tid}" for lbl, tid in mapping.items())
+        lines = "  " + "\n  ".join(
+            f"{lbl!r:30s} → {tid}" for lbl, tid in mapping.items()
+        )
         logger.debug("VocabAnchor [%s]:\n%s", head_name, lines)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Convenience function
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def build_anchor_config(
     schema: NERSchema,
@@ -286,6 +293,7 @@ def build_phase_b_config(
         )
     """
     import torch as _torch
+
     config = build_anchor_config(
         schema,
         tokenizer,
@@ -295,7 +303,7 @@ def build_phase_b_config(
         eos_token_id=eos_token_id,
     )
     schema_cfg = config["schema"]
-    label_embs: Dict[str, "torch.Tensor"] = {}
+    label_embs: Dict[str, Any] = {}
 
     intent_ids = _torch.tensor(schema_cfg["intent_token_ids"], dtype=_torch.long)
     label_embs["intent"] = embedding_matrix[intent_ids].detach().clone().cpu()

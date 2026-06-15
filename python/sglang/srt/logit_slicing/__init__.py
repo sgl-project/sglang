@@ -1,4 +1,6 @@
-from sglang.srt.logit_slicing.processor import SimultaneousMultiIntentEntityLogitProcessor
+from sglang.srt.logit_slicing.processor import (
+    SimultaneousMultiIntentEntityLogitProcessor,
+)
 from sglang.srt.logit_slicing.processor_phase_b import SMIELPWithHiddenStates
 from sglang.srt.logit_slicing.schema import IntentSchema, NERSchema, SlotSchema
 from sglang.srt.logit_slicing.vocab_anchor import (
@@ -18,5 +20,5 @@ __all__ = [
     "build_phase_b_config",
     # Processors
     "SimultaneousMultiIntentEntityLogitProcessor",  # Phase A
-    "SMIELPWithHiddenStates",                       # Phase B
+    "SMIELPWithHiddenStates",  # Phase B
 ]
