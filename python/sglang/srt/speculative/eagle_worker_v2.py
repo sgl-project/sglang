@@ -194,6 +194,16 @@ class EagleDraftWorker(BaseDraftWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
+        # Reuse the first draft step's NSA/DSA indexer topk across the rest;
+        # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
+        self.index_share_for_mtp_iteration = (
+            getattr(
+                self.draft_runner.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+            and self.topk == 1
+        )
         self.init_token_map()
         self.init_lm_head()
 
@@ -530,6 +540,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
+        if self.index_share_for_mtp_iteration:
+            forward_batch.reuse_mtp_topk_indices = True
+            forward_batch.topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -596,6 +609,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
             forward_batch.positions.add_(1)
+
+        if self.index_share_for_mtp_iteration:
+            forward_batch.topk_indices = None
+            forward_batch.reuse_mtp_topk_indices = False
 
         # Organize the results
         if (

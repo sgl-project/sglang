@@ -112,6 +112,15 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
+        self.index_share_for_mtp_iteration = (
+            getattr(
+                self.draft_runner.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+            and self.topk == 1
+        )
 
         self.init_token_map()
         self.init_lm_head()
