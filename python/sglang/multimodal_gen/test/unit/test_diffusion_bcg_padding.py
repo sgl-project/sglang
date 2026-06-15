@@ -1,15 +1,22 @@
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
+    GlmImagePipelineConfig,
+)
 from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
     _signature_kwargs,
 )
 from sglang.multimodal_gen.runtime.models.dits.zimage import ZImageTransformer2DModel
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
+    GlmImageBeforeDenoisingStage,
 )
 
 
@@ -234,6 +241,59 @@ class TestDiffusionBCGPadding(unittest.TestCase):
 
         self.assertTrue(torch.equal(out[:, :2], tensor[:, :2]))
         self.assertTrue(torch.equal(out[:, 2:], pad_token.expand(1, 3, 3)))
+
+    def test_glm_condition_image_uses_target_request_size_for_warmup(self):
+        self.assertEqual(
+            GlmImageBeforeDenoisingStage._condition_image_preprocess_size(
+                height=1024, width=1024, multiple_of=16
+            ),
+            (1024, 1024),
+        )
+        self.assertEqual(
+            GlmImageBeforeDenoisingStage._condition_image_preprocess_size(
+                height=1025, width=769, multiple_of=16
+            ),
+            (1024, 768),
+        )
+        self.assertEqual(
+            GlmImageBeforeDenoisingStage._condition_image_preprocess_size(
+                height=64,
+                width=64,
+                multiple_of=16,
+                prior_token_shape=(32, 32),
+            ),
+            (512, 512),
+        )
+
+    def test_glm_t2i_prompt_signature_omits_empty_kv_cache_object(self):
+        cfg = GlmImagePipelineConfig.__new__(GlmImagePipelineConfig)
+        cfg.get_freqs_cis = lambda *args, **kwargs: "freqs"
+        batch = SimpleNamespace(
+            prior_token_id=torch.ones(1, 4096, dtype=torch.long),
+            prior_token_drop_cond=torch.zeros(1, 4096, dtype=torch.bool),
+            prior_token_drop_uncond=torch.ones(1, 4096, dtype=torch.bool),
+            crop_coords=torch.zeros(1, 2),
+            target_size=torch.tensor([[1024, 1024]]),
+            kv_caches=object(),
+            prior_token_image_ids=None,
+        )
+
+        pos = cfg.prepare_pos_cond_kwargs(batch, None, None, None)
+        neg = cfg.prepare_neg_cond_kwargs(batch, None, None, None)
+
+        self.assertNotIn("kv_caches", pos)
+        self.assertNotIn("kv_caches_mode", pos)
+        self.assertNotIn("kv_caches", neg)
+        self.assertNotIn("kv_caches_mode", neg)
+
+        batch.prior_token_image_ids = [torch.ones(4096, dtype=torch.long)]
+        pos = cfg.prepare_pos_cond_kwargs(batch, None, None, None)
+        neg = cfg.prepare_neg_cond_kwargs(batch, None, None, None)
+
+        self.assertIn("kv_caches", pos)
+        self.assertEqual(pos["kv_caches_mode"], "read")
+        self.assertIn("kv_caches", neg)
+        self.assertEqual(neg["kv_caches_mode"], "skip")
 
 
 if __name__ == "__main__":
