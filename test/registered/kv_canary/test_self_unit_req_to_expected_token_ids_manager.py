@@ -22,6 +22,9 @@ def _make_req(*, origin: list[int], output: list[int]) -> SimpleNamespace:
     return SimpleNamespace(
         origin_input_ids=array("q", origin),
         output_ids=array("q", output),
+        token_buf=SimpleNamespace(
+            materialize=lambda: array("q", origin) + array("q", output)
+        ),
     )
 
 
