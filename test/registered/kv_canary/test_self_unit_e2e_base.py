@@ -43,7 +43,7 @@ class _DummyHarness(CanaryE2EBase):
 class TestAssertSwaDivergenceObserved(CustomTestCase):
     def _make_harness(
         self, log_text_or_sequence
-    ) -> tuple[_DummyHarness, "patch._patch[None]"]:
+    ) -> tuple[_DummyHarness, patch._patch[None]]:
         harness = _DummyHarness()
         harness._stderr_buf = None
         harness._stdout_buf = None

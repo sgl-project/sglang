@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -69,12 +68,6 @@ class TestGemma4MTP26BA4B(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod
-    def _server_env(cls) -> dict[str, str]:
-        env = dict(os.environ)
-        env["SGLANG_ENABLE_SPEC_V2"] = "0"
-        return env
-
-    @classmethod
     def _common_server_args(cls) -> list[str]:
         args = [
             "--attention-backend",
@@ -140,7 +133,6 @@ class TestGemma4MTP26BA4B(CustomTestCase):
                 TARGET_PATH,
                 self.base_url,
                 timeout=SERVER_LAUNCH_TIMEOUT,
-                env=self._server_env(),
                 other_args=self._server_args(topk),
             )
             requests.get(self.base_url + "/flush_cache", timeout=30)

@@ -52,7 +52,7 @@ class ScriptedHttpServer:
         self._dirty: Optional[str] = None
 
     @classmethod
-    def start(cls, **engine_kwargs: Any) -> "ScriptedHttpServer":
+    def start(cls, **engine_kwargs: Any) -> ScriptedHttpServer:
         out_of_band_error_path = _create_oob_error_file()
 
         ctx = zmq.Context()
@@ -230,7 +230,7 @@ def _spawn_server_process(
         kv_canary="raise",
         kv_canary_real_data="partial",
         kv_canary_sweep_interval=100,
-        disable_piecewise_cuda_graph=True,
+        disable_prefill_cuda_graph=True,
     )
     launch_kwargs.update(engine_kwargs)
     http_port = launch_kwargs["port"]

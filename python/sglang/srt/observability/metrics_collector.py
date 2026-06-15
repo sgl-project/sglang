@@ -197,7 +197,7 @@ STAT_LOGGER_ROLE_EXPERT_DISPATCH = "expert_dispatch"
 
 
 def resolve_collector_class(
-    server_args: Optional["ServerArgs"], role: str, default_cls: type
+    server_args: Optional[ServerArgs], role: str, default_cls: type
 ) -> type:
     """Return the subclass registered for `role` on `server_args.stat_loggers`,
     or `default_cls` if none is registered. Tolerates `server_args=None` and
@@ -230,7 +230,7 @@ class SchedulerMetricsCollectorContext:
     is_stats_logging_rank: bool
     current_scheduler_metrics_enabled: bool
     enable_kv_cache_events: bool
-    collector: Optional["SchedulerMetricsCollector"]
+    collector: Optional[SchedulerMetricsCollector]
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
@@ -241,7 +241,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_lora: bool = False,
         enable_hierarchical_cache: bool = False,
         enable_streaming_session: bool = False,
-        server_args: Optional["ServerArgs"] = None,
+        server_args: Optional[ServerArgs] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
@@ -1028,7 +1028,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def init_new(
         cls,
         *,
-        server_args: "ServerArgs",
+        server_args: ServerArgs,
         ps: Any,
         tp_rank: int,
         pp_rank: int,
@@ -1036,7 +1036,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_priority_scheduling: bool,
         enable_lora: bool,
         enable_hierarchical_cache: bool,
-    ) -> "SchedulerMetricsCollectorContext":
+    ) -> SchedulerMetricsCollectorContext:
         enable_metrics = server_args.enable_metrics
         is_stats_logging_rank = ps.attn_tp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
@@ -1047,7 +1047,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             and ps.attn_tp_rank == 0
             and ps.attn_cp_rank == 0
         )
-        collector: Optional["SchedulerMetricsCollector"] = None
+        collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
             engine_type = DisaggregationMode.to_engine_type(
                 server_args.disaggregation_mode
