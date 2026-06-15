@@ -9,8 +9,11 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_npu
 
 from .utils import make_name
+
+_is_npu = is_npu()
 
 
 @cache_once

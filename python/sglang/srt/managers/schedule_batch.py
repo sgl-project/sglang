@@ -1737,6 +1737,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # DSV4-NPU: bundled per-pool slots produced by DSV4NPUTokenToKVPoolAllocator
+    # (None on non-DSV4 paths). See hardware_backend/npu/dsv4_common_hooks.py.
+    # The c4/c128 compress-state alloc lens ride on ``batch.dsv4_state_lens``,
+    # set dynamically by those hooks (read via getattr in mem_cache/common.py).
+    out_cache_loc_dsv4: Optional[Any] = None
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
@@ -2610,7 +2615,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
-        # Allocate memory
+        # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
+        # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         # Update req-level memory management fields
@@ -2854,6 +2860,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # 2. Evict swa every eviction_interval tokens to reduce the overhead.
                     if req.decode_batch_idx % eviction_interval == 1:
                         self._evict_swa(req, req.seqlen - 1)
+
+                    # DSV4-NPU only (no-op elsewhere): the small paged
+                    # compress-state pool needs draining every decode step,
+                    # independent of SWA evict cadence.
+                    from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
+                        maybe_evict_dsv4_state,
+                    )
+
+                    maybe_evict_dsv4_state(self, req, req.seqlen - 1)
 
                     # Once the decode position has moved past the sliding window,
                     # the SWA portion of the prefill-time tree lock is no longer
