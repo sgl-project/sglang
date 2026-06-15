@@ -837,10 +837,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert len(keys) == len(host_indices) // page_size
 
             tagged_keys = self._tag_keys(keys)
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
-                tagged_keys, transfer
+                keys, transfer
             )
+            key_strs = self._tag_keys(key_strs)
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             if transfer.name == PoolName.DEEPSEEK_V4_C4:
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
@@ -1255,18 +1256,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config.group_ids = group_ids
 
         if self._uses_multi_buffer(buffer_ptrs):
-            if config is not None:
-                return self.store.batch_put_from_multi_buffers(
-                    key_strs, buffer_ptrs, buffer_sizes, config
-                )
+            config = config or self._replicate_config_cls()
             return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
+                key_strs, buffer_ptrs, buffer_sizes, config
             )
-        if config is not None:
+        elif config is not None:
             return self.store.batch_put_from(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
-        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        else:
+            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
