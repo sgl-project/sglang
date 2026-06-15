@@ -44,8 +44,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -78,7 +78,7 @@ class HiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+            self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,

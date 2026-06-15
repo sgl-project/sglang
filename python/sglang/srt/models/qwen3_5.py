@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.elementwise import fused_sigmoid_mul
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -118,10 +119,10 @@ _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
-_gdn_use_alt_stream = (
+_gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
 )
-_qknorm_use_alt_stream = (
+_qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
 _is_amx_available = cpu_has_amx_support()
@@ -593,7 +594,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
-                alt_stream=(alt_stream if _disable_shared_experts_fusion() else None),
+                alt_stream=(
+                    alt_stream
+                    if (_is_cuda or _disable_shared_experts_fusion())
+                    else None
+                ),
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
@@ -805,7 +810,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
-                alt_stream=(alt_stream if _disable_shared_experts_fusion() else None),
+                alt_stream=(
+                    alt_stream
+                    if (_is_cuda or _disable_shared_experts_fusion())
+                    else None
+                ),
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
@@ -887,7 +896,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            # gate stays as 3D strided view; fused_sigmoid_mul handles it directly
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
@@ -974,15 +983,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if _is_hip:
-                from sglang.jit_kernel.triton.sigmoid_gate_mul import (
-                    sigmoid_gate_mul,
-                )
-
-                attn_output = sigmoid_gate_mul(attn_output, gate)
-            else:
-                gate = torch.sigmoid(gate)
-                attn_output = attn_output * gate
+            attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
 
         output, _ = self.o_proj(attn_output)
         return output

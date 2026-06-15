@@ -406,9 +406,7 @@ class DeepseekSparseAttnBackend(
             and is_sm100_supported()
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
-        if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
-            include_v2=True
-        ):
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
@@ -488,7 +486,7 @@ class DeepseekSparseAttnBackend(
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or forward_batch.forward_mode.is_draft_extend_v2()
             )
             else self.dsa_prefill_impl
         )
@@ -531,7 +529,7 @@ class DeepseekSparseAttnBackend(
             page_table = torch.repeat_interleave(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
-        elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
+        elif forward_batch.forward_mode.is_draft_extend_v2():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
@@ -614,11 +612,7 @@ class DeepseekSparseAttnBackend(
                 )
                 page_table = page_table[bs_idx, :max_seqlen_k]
 
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-                or bs_idx_cpu is not None
-            ):
+            if any(forward_batch.extend_prefix_lens_cpu) or bs_idx_cpu is not None:
                 max_seqlen_q = (
                     max(extend_seq_lens_cpu) if len(extend_seq_lens_cpu) != 0 else 1
                 )
@@ -690,7 +684,7 @@ class DeepseekSparseAttnBackend(
         if is_cuda() and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -905,9 +899,7 @@ class DeepseekSparseAttnBackend(
                 )
             else:
                 flashmla_metadata = None
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend(
-            include_v2=True
-        ):
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
             )
@@ -975,7 +967,7 @@ class DeepseekSparseAttnBackend(
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend(include_v2=True)
+            or forward_mode.is_draft_extend_v2()
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
@@ -1094,7 +1086,7 @@ class DeepseekSparseAttnBackend(
                 seqlens_expanded, self.dsa_index_topk
             )
             metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             max_seqlen_k = int(seq_lens_cpu.max().item())
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
@@ -1133,9 +1125,9 @@ class DeepseekSparseAttnBackend(
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend(include_v2=True)
+            or forward_mode.is_draft_extend_v2()
         ):
-            if forward_mode.is_draft_extend(include_v2=True):
+            if forward_mode.is_draft_extend_v2():
                 schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
             else:
                 schedule_seqlens_expanded = seqlens_expanded
@@ -1227,8 +1219,6 @@ class DeepseekSparseAttnBackend(
                     mode_int = 0  # DECODE
                 elif forward_mode.is_target_verify():
                     mode_int = 1  # TARGET_VERIFY
-                elif forward_mode.is_draft_extend():
-                    mode_int = 2  # DRAFT_EXTEND
                 else:
                     raise ValueError(f"Unsupported forward_mode: {forward_mode}")
 
@@ -1314,18 +1304,6 @@ class DeepseekSparseAttnBackend(
                 metadata.dsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
                 metadata.dsa_cache_seqlens_int32.copy_(precomputed.dsa_cache_seqlens)
 
-            elif forward_mode.is_draft_extend():
-                # Draft extend mode
-                rows = precomputed.page_indices.shape[0]
-                cols = precomputed.max_seqlen_k
-                metadata.page_table_1[:rows, :cols].copy_(precomputed.page_indices)
-
-                size = precomputed.seqlens_expanded_size
-                metadata.dsa_seqlens_expanded[:size].copy_(precomputed.seqlens_expanded)
-                metadata.dsa_cache_seqlens_int32[:size].copy_(
-                    precomputed.dsa_cache_seqlens
-                )
-
             # Copy DSA cu_seqlens
             size = precomputed.seqlens_expanded_size
             metadata.dsa_cu_seqlens_k[1 : 1 + size].copy_(
@@ -1400,7 +1378,7 @@ class DeepseekSparseAttnBackend(
             self.dsa_decode_impl
             if (
                 forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or forward_batch.forward_mode.is_draft_extend_v2()
             )
             else self.dsa_prefill_impl
         )
@@ -2417,7 +2395,6 @@ class DeepseekSparseAttnMultiStepBackend:
                 seq_lens=forward_batch.seq_lens,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
             )
 
             # Use multi-backend fused copy when we have 3 or more backends
