@@ -209,7 +209,7 @@ class StorageOperation:
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
 
-    def __lt__(self, other: "StorageOperation"):
+    def __lt__(self, other: StorageOperation):
         return self.id < other.id
 
 
@@ -687,6 +687,8 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+            self.host_mem_release_queue.queue.clear()
+            self.prefetch_tokens_occupied = 0
 
         self.stop_event.clear()
         self.storage_stop_event.clear()

@@ -22,6 +22,11 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -211,14 +216,24 @@ class MockGDNModelRunner(ModelRunner):
         speculative_num_draft_tokens = (
             case.input_lens[0]
             if case.forward_mode.is_target_verify()
-            or case.forward_mode.is_draft_extend(include_v2=True)
+            or case.forward_mode.is_draft_extend_v2()
             else 0
         )
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
@@ -276,7 +291,10 @@ class MockGDNModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            get_kvcache=lambda: self.token_to_kv_pool,
+        )
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None

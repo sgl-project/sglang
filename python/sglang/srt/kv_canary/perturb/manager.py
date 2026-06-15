@@ -24,7 +24,7 @@ class PerturbManager:
         self,
         *,
         config: PerturbConfig,
-        req_to_token_pool: "ReqToTokenPool",
+        req_to_token_pool: ReqToTokenPool,
         buffer_groups: tuple[CanaryBufferGroup, ...],
         outer_step_counter_getter: Callable[[], int],
         swa_window_size: int = 0,
@@ -36,18 +36,18 @@ class PerturbManager:
         self._outer_step_counter_getter = outer_step_counter_getter
         self._swa_window_size = swa_window_size
         self._sweep_interval = sweep_interval
-        self._radix_cache: Optional["BasePrefixCache"] = None
+        self._radix_cache: Optional[BasePrefixCache] = None
         self._warmup_gate = WarmupGate(
             config=config, outer_step_counter_getter=outer_step_counter_getter
         )
 
-    def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
+    def attach_radix_cache(self, radix_cache: BasePrefixCache) -> None:
         self._radix_cache = radix_cache
 
     def perturb(
         self,
         *,
-        maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
+        maybe_inaccurate_forward_batch: Optional[ForwardBatch],
     ) -> None:
         self.perturb_req_to_token(maybe_inaccurate_forward_batch)
         self.perturb_real_kv_used(maybe_inaccurate_forward_batch)
@@ -56,12 +56,12 @@ class PerturbManager:
     def perturb_post_forward(
         self,
         *,
-        maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
+        maybe_inaccurate_forward_batch: Optional[ForwardBatch],
     ) -> None:
         self.perturb_real_kv_post_forward(maybe_inaccurate_forward_batch)
 
     def perturb_req_to_token(
-        self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]
+        self, maybe_inaccurate_forward_batch: Optional[ForwardBatch]
     ) -> None:
         req_to_token.run(
             maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
@@ -71,7 +71,7 @@ class PerturbManager:
         )
 
     def perturb_real_kv_used(
-        self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]
+        self, maybe_inaccurate_forward_batch: Optional[ForwardBatch]
     ) -> None:
         real_kv_used.run(
             maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
@@ -83,7 +83,7 @@ class PerturbManager:
         )
 
     def perturb_real_kv_unused_cache(
-        self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]
+        self, maybe_inaccurate_forward_batch: Optional[ForwardBatch]
     ) -> None:
         real_kv_unused_cache.run(
             maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
@@ -97,7 +97,7 @@ class PerturbManager:
         )
 
     def perturb_real_kv_post_forward(
-        self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]
+        self, maybe_inaccurate_forward_batch: Optional[ForwardBatch]
     ) -> None:
         real_kv_post_forward.run(
             maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,

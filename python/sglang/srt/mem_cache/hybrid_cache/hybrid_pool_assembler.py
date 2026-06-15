@@ -19,9 +19,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     HostPoolGroup,
     LogicalHostPool,
     MambaPoolHost,
-    MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
     PoolEntry,
+    get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
@@ -57,7 +57,9 @@ def build_kv_host_pool(
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
 ):
-    kv_host_pool_cls = MLATokenToKVPoolHost if use_mla else MHATokenToKVPoolHost
+    kv_host_pool_cls = (
+        MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
+    )
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
