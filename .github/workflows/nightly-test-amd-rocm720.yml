@@ -1251,12 +1251,16 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4)
-        timeout-minutes: 300
+        timeout-minutes: 600
         run: |
           > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          for flashmla_backend in unified_kv_triton triton; do
+            echo "## SGLANG_HACK_FLASHMLA_BACKEND=${flashmla_backend}" >> github_summary.md
+            bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+              -e SGLANG_HACK_FLASHMLA_BACKEND=${flashmla_backend} \
+              -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+              python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          done
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1286,12 +1290,16 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 + FP4)
-        timeout-minutes: 480
+        timeout-minutes: 960
         run: |
           > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          for flashmla_backend in unified_kv_triton triton; do
+            echo "## SGLANG_HACK_FLASHMLA_BACKEND=${flashmla_backend}" >> github_summary.md
+            bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+              -e SGLANG_HACK_FLASHMLA_BACKEND=${flashmla_backend} \
+              -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+              python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          done
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
