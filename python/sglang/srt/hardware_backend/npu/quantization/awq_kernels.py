@@ -76,8 +76,8 @@ class AWQAscendLinearKernel:
         group_size = K // num_groups    # e.g., 128
 
         # Validate NPU constraint
-        #if group_size % 32 != 0 or not (32 <= group_size <= K - 1):
-        #    raise RuntimeError(f"Derived group_size={group_size} is invalid for NPU")
+        if group_size % 32 != 0 or not (32 <= group_size <= K - 1):
+            raise RuntimeError(f"Derived group_size={group_size} is invalid for NPU")
 
         if bias is not None and bias.dtype == torch.bfloat16:
             bias = bias.float()
