@@ -33,7 +33,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, set_weight_attrs
 
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A16Int4MoEMethod,
+    NPUUnquantMoEMethod,
 )
 
 if TYPE_CHECKING:
