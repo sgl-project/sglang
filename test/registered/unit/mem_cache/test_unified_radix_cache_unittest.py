@@ -450,16 +450,24 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     def _init_hicache(self, tree, *, write_policy: str = "write_through"):
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
-        orig_kv_host_pool = assembler.MHATokenToKVPoolHost
+        # Wrap the host-pool factory (not MHATokenToKVPoolHost directly)
+        # because the assembler picks between MHATokenToKVPoolHost and
+        # AsymmetricMHATokenToKVPoolHost via get_mha_host_pool_cls(device_pool).
+        orig_get_mha_host_pool_cls = assembler.get_mha_host_pool_cls
 
-        def kv_host_pool_wrapper(*args, **kwargs):
-            kwargs["pin_memory"] = False
-            return orig_kv_host_pool(*args, **kwargs)
+        def get_mha_host_pool_cls_wrapper(device_pool):
+            host_pool_cls = orig_get_mha_host_pool_cls(device_pool)
+
+            def kv_host_pool_wrapper(*args, **kwargs):
+                kwargs["pin_memory"] = False
+                return host_pool_cls(*args, **kwargs)
+
+            return kv_host_pool_wrapper
 
         patcher = mock.patch.object(
             assembler,
-            "MHATokenToKVPoolHost",
-            side_effect=kv_host_pool_wrapper,
+            "get_mha_host_pool_cls",
+            side_effect=get_mha_host_pool_cls_wrapper,
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -2370,12 +2378,20 @@ class UnifiedRadixCacheSuite:
     ):
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
-        orig_kv_host_pool = assembler.MHATokenToKVPoolHost
+        # See _init_hicache: wrap the factory rather than MHATokenToKVPoolHost
+        # directly so the pin_memory=False override applies to both
+        # MHATokenToKVPoolHost and AsymmetricMHATokenToKVPoolHost.
+        orig_get_mha_host_pool_cls = assembler.get_mha_host_pool_cls
         orig_mamba_host_pool = assembler.MambaPoolHost
 
-        def kv_host_pool_wrapper(*args, **kwargs):
-            kwargs["pin_memory"] = False
-            return orig_kv_host_pool(*args, **kwargs)
+        def get_mha_host_pool_cls_wrapper(device_pool):
+            host_pool_cls = orig_get_mha_host_pool_cls(device_pool)
+
+            def kv_host_pool_wrapper(*args, **kwargs):
+                kwargs["pin_memory"] = False
+                return host_pool_cls(*args, **kwargs)
+
+            return kv_host_pool_wrapper
 
         def mamba_host_pool_wrapper(*args, **kwargs):
             kwargs["pin_memory"] = False
@@ -2384,8 +2400,8 @@ class UnifiedRadixCacheSuite:
         patchers = [
             mock.patch.object(
                 assembler,
-                "MHATokenToKVPoolHost",
-                side_effect=kv_host_pool_wrapper,
+                "get_mha_host_pool_cls",
+                side_effect=get_mha_host_pool_cls_wrapper,
             ),
             mock.patch.object(
                 assembler,
@@ -2994,8 +3010,11 @@ class UnifiedRadixCacheSuite:
         return chain
 
     def _release_ongoing_load_back_locks(self, tree):
-        for node, lock_params in list(tree.ongoing_load_back.values()):
+        for node, lock_params, host_lock_params in list(
+            tree.ongoing_load_back.values()
+        ):
             tree.dec_lock_ref(node, lock_params)
+            tree.dec_host_lock_ref(node, host_lock_params)
         tree.ongoing_load_back.clear()
 
     def _finish_pending_loads(self, tree):

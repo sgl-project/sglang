@@ -47,7 +47,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
-from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -65,6 +65,8 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
+    eagle_prepare_for_verify,
+    eagle_sample,
     organize_draft_results,
     per_step_draft_out_cache_loc,
 )
@@ -117,7 +119,7 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
-class EagleDraftWorker(BaseDraftWorker):
+class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -186,6 +188,16 @@ class EagleDraftWorker(BaseDraftWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
+        # Reuse the first draft step's NSA/DSA indexer topk across the rest;
+        # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
+        self.index_share_for_mtp_iteration = (
+            getattr(
+                self.draft_runner.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+            and self.topk == 1
+        )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -322,6 +334,8 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
+        if self.draft_extend_attn_backend is not None:
+            self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
     def init_cuda_graphs(self):
@@ -406,7 +420,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
+        forward_batch, can_cuda_graph = self.prepare_for_draft(
+            draft_input,
             self.req_to_token_pool,
             batch,
             self.cuda_graph_runner,
@@ -537,6 +552,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
+        if self.index_share_for_mtp_iteration:
+            forward_batch.reuse_mtp_topk_indices = True
+            forward_batch.topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -603,6 +621,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
             forward_batch.positions.add_(1)
+
+        if self.index_share_for_mtp_iteration:
+            forward_batch.topk_indices = None
+            forward_batch.reuse_mtp_topk_indices = False
 
         # Organize the results
         if (
@@ -728,7 +750,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
-            forward_batch = draft_extend_input.prepare_for_extend_to_fill_draft_kvcache(
+            forward_batch = self.prepare_for_draft_extend(
+                draft_extend_input,
                 batch,
                 batch_result.next_token_ids,
                 self.speculative_num_draft_tokens,
@@ -1115,6 +1138,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.draft_runner.draft_attn_backend = state.draft_attn_backend
         dw.cuda_graph_runner = state.cuda_graph_runner
         dw.draft_extend_attn_backend = state.draft_extend_attn_backend
+        # Keep the runner's attn_backend in step with the active draft-extend
+        # backend (the draft-extend forward reads draft_runner.attn_backend);
+        # mirrors init_attention_backend. When None, the runner keeps its
+        # initialized backend (consistent across step configs).
+        if state.draft_extend_attn_backend is not None:
+            dw.draft_runner.attn_backend = state.draft_extend_attn_backend
         dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
         dw._rebuild_topk1_chain_buffers()
 
@@ -1148,6 +1177,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.draft_attn_backend,
             dw.draft_extend_attn_backend,
             dw.draft_runner.draft_attn_backend,
+            dw.draft_runner.attn_backend,
             dw.cuda_graph_runner,
             dw.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
@@ -1183,6 +1213,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.draft_attn_backend,
                 dw.draft_extend_attn_backend,
                 dw.draft_runner.draft_attn_backend,
+                dw.draft_runner.attn_backend,
                 dw.cuda_graph_runner,
                 dw.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
@@ -1203,12 +1234,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = (
-                verify_input.prepare_for_v2_verify(
-                    self.req_to_token_pool,
-                    batch,
-                    self.target_worker,
-                )
+            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+                verify_input,
+                self.req_to_token_pool,
+                batch,
+                self.target_worker,
             )
 
         # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
@@ -1254,7 +1284,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Run target verify batch in the main compute stream (GPU compute).
         # Metadata init is skipped iff cuda-graph already ran replay_prepare —
-        # prepare_for_v2_verify marked the batch in exactly that case; the
+        # eagle_prepare_for_verify marked the batch in exactly that case; the
         # non-cuda-graph path stays unmarked and gets forward_extend's init
         # (post-pad).
         forward_batch_output = self.target_worker.forward_batch_generation(
@@ -1291,7 +1321,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             predict,
             accept_lens,
             accept_index,
-        ) = verify_input.sample(batch, logits_output, vocab_mask)
+        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification
@@ -1333,7 +1363,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # verify_forward_batch transitively holds verify-time GPU tensors
         # (draft_token / out_cache_loc / ...) that must outlive the imminent
-        # batch.input_ids rebind in prepare_for_extend_to_fill_draft_kvcache.
+        # batch.input_ids rebind in prepare_for_draft_extend.
         # Scheduler pins it in batch_record_buf for the 2-iter window.
         return GenerationBatchResult(
             logits_output=logits_output,

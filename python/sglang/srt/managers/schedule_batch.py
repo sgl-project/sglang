@@ -579,6 +579,25 @@ class MultimodalInputs:
     def contains_mm_input(self) -> bool:
         return any(True for item in self.mm_items if item.is_valid())
 
+    def compute_mm_token_counts(self) -> Tuple[int, int, int]:
+        """Count prompt tokens consumed by each modality (image, audio, video).
+
+        A modality's token count is the total span covered by its items'
+        offsets. Returns a (image_tokens, audio_tokens, video_tokens) tuple.
+        """
+        image_tokens = audio_tokens = video_tokens = 0
+        for item in self.mm_items:
+            if not item.offsets:
+                continue
+            num_tokens = sum(end - start + 1 for start, end in item.offsets)
+            if item.is_image():
+                image_tokens += num_tokens
+            elif item.is_audio():
+                audio_tokens += num_tokens
+            elif item.is_video():
+                video_tokens += num_tokens
+        return image_tokens, audio_tokens, video_tokens
+
     def merge(self, other: MultimodalInputs):
         """
         merge image inputs when requests are being merged
@@ -695,11 +714,14 @@ class Req(ReqDllmMixin):
             if origin_input_ids_unpadded
             else self.origin_input_ids
         )  # Before image padding
-        # Each decode stage's output ids
+        # Each decode stage's output ids. Append-only by contract:
+        # _refresh_fill_ids infers how many output tokens are already in
+        # full_untruncated_fill_ids from lengths alone, so in-place rewrites
+        # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
         # Full untruncated sequence: origin + output (+ DLLM mask block).
-        # Rebuilt at the top of each init_next_round_input; admission only
-        # updates fill_len, never mutates this array's length.
+        # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
+        # never mutates this array's length.
         self.full_untruncated_fill_ids = array("q")
         self.fill_len: int = 0
 
@@ -808,6 +830,11 @@ class Req(ReqDllmMixin):
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        # Pre-computed multimodal prompt token counts; populated on the prefill
+        # node and transferred to decode via the metadata buffer in disagg (PD) mode.
+        self.mm_image_tokens: int = 0
+        self.mm_audio_tokens: int = 0
+        self.mm_video_tokens: int = 0
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -1069,6 +1096,27 @@ class Req(ReqDllmMixin):
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.fill_len]
 
+    def _refresh_fill_ids(self) -> None:
+        """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
+        appending only the new output tokens.
+
+        Falls back to a full rebuild when the in-place append is invalid:
+        - aliasing: scheduler_pp_mixin assigns full_untruncated_fill_ids =
+          origin_input_ids directly, so extending in place would write output
+          tokens into the origin;
+        - lengths disagree: fresh req (array still empty), retraction
+          (output_ids reset to empty), or set_finish_with_abort (origin
+          replaced by a 1-token stub).
+        """
+        n_have_output = len(self.full_untruncated_fill_ids) - len(self.origin_input_ids)
+        if (
+            self.full_untruncated_fill_ids is not self.origin_input_ids
+            and 0 <= n_have_output <= len(self.output_ids)
+        ):
+            self.full_untruncated_fill_ids.extend(self.output_ids[n_have_output:])
+        else:
+            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
@@ -1078,7 +1126,7 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
-            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+            self._refresh_fill_ids()
 
         input_len = len(self.full_untruncated_fill_ids)
 
@@ -1098,14 +1146,16 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.full_untruncated_fill_ids[
-            : self._compute_max_prefix_len(input_len)
-        ]
+        # Pass the full array with a raw-token cap (limit) instead of slicing,
+        # avoiding an O(context) copy per prefill-batch build.
+        token_ids_to_match = self.full_untruncated_fill_ids
+        key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
             token_ids_to_match = array("q")
+            key_limit = None
 
         if tree_cache is not None:
             if cow_mamba is None:
@@ -1113,7 +1163,9 @@ class Req(ReqDllmMixin):
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
-                        token_ids=token_ids_to_match, extra_key=self.extra_key
+                        token_ids=token_ids_to_match,
+                        extra_key=self.extra_key,
+                        limit=key_limit,
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
@@ -2314,7 +2366,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+            req._refresh_fill_ids()
             req.fill_len = len(req.full_untruncated_fill_ids)
             req.set_extend_input_len(1)
 

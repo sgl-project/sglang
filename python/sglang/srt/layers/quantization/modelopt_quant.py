@@ -1679,6 +1679,32 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         return out.view(*output_shape)
 
 
+def _compute_gemm1_alphas(
+    w13_weight_scale_2: torch.Tensor,
+    w13_input_scale: torch.Tensor,
+    is_gated: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GEMM1 weight x input alphas for the gate (w1) and up (w3) halves of w13.
+
+    w13 fuses the gate and up projections, which may carry separate NVFP4 weight
+    scales stored as [num_experts, 2] (col 0 = gate, col 1 = up). A 1-D (or
+    [num_experts, 1]) scale, and any non-gated layer, shares one scale across
+    both halves; the col-1 read is guarded so those cases stay in bounds.
+
+    Returns (g1_alphas, g1_alphas_up), equal for a shared scale. Single-alpha
+    backends use g1_alphas; the TRT-LLM path also uses g1_alphas_up.
+    """
+    if is_gated and w13_weight_scale_2.dim() == 2 and w13_weight_scale_2.shape[1] >= 2:
+        gate_scale = w13_weight_scale_2[:, 0]
+        up_scale = w13_weight_scale_2[:, 1]
+    else:
+        gate_scale = w13_weight_scale_2.reshape(w13_weight_scale_2.shape[0])
+        up_scale = gate_scale
+    g1_alphas = (w13_input_scale * gate_scale).to(torch.float32)
+    g1_alphas_up = (w13_input_scale * up_scale).to(torch.float32)
+    return g1_alphas, g1_alphas_up
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -1919,29 +1945,32 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-        # GEMM 1 scale processing
-        if layer.moe_runner_config.is_gated:
-            if layer.w13_weight_scale_2.dim() == 1:
-                # Some checkpoints store a shared scale for w1/w3.
-                w13_weight_scale_2 = layer.w13_weight_scale_2
-            else:
-                if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
-                    layer.w13_weight_scale_2[:, 0],
-                    layer.w13_weight_scale_2[:, 1],
-                ):
-                    logger.warning_once(
-                        "w1_weight_scale_2 must match w3_weight_scale_2. "
-                        "Accuracy may be affected."
-                    )
-
-                w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
-        else:
-            w13_weight_scale_2 = layer.w13_weight_scale_2[:]
-
+        # GEMM1 scale processing is deferred until the input scale is known;
+        # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
         if moe_runner_backend.is_marlin():
+            # Marlin supports only a single shared w1/w3 weight scale, so collapse
+            # the gate/up columns to the gate scale here. Other backends keep the
+            # raw scale and split the halves later (see _compute_gemm1_alphas).
+            if layer.moe_runner_config.is_gated:
+                if layer.w13_weight_scale_2.dim() == 1:
+                    # Some checkpoints store a shared scale for w1/w3.
+                    w13_weight_scale_2 = layer.w13_weight_scale_2
+                else:
+                    if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
+                        layer.w13_weight_scale_2[:, 0],
+                        layer.w13_weight_scale_2[:, 1],
+                    ):
+                        logger.warning_once(
+                            "w1_weight_scale_2 must match w3_weight_scale_2. "
+                            "Accuracy may be affected."
+                        )
+
+                    w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
+            else:
+                w13_weight_scale_2 = layer.w13_weight_scale_2[:]
             copy_or_rebind_param(
                 layer,
                 "w13_weight_scale_2",
@@ -1988,12 +2017,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
             w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
 
-        # Create shared parameters
-        copy_or_rebind_param(
-            layer,
-            "g1_alphas",
-            (w13_input_scale * w13_weight_scale_2).to(torch.float32),
+        # Create shared parameters. g1_alphas / g1_alphas_up are the gate (w1)
+        # and up (w3) GEMM1 scales (equal for shared-scale checkpoints).
+        g1_alphas, g1_alphas_up = _compute_gemm1_alphas(
+            layer.w13_weight_scale_2,
+            w13_input_scale,
+            layer.moe_runner_config.is_gated,
         )
+        copy_or_rebind_param(layer, "g1_alphas", g1_alphas)
+        copy_or_rebind_param(layer, "g1_alphas_up", g1_alphas_up)
         copy_or_rebind_param(
             layer,
             "g2_alphas",

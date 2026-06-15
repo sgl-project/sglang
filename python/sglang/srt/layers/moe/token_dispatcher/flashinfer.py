@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils.common import require_mlp_tp_gather
 
 try:
     from flashinfer import nvfp4_block_scale_interleave
@@ -210,6 +211,12 @@ class FlashinferDispatcher(BaseDispatcher):
             # DP attention: multiple DP ranks with different token counts.
             # Use the max across ranks so the A2A workspace fits the fattest.
             self.runtime_max_tokens_per_rank = max(dp_global)
+        elif self.ep_size > 1 and not require_mlp_tp_gather(get_global_server_args()):
+            # require_mlp_tp_gather is False, so the scheduler collapsed
+            # global_num_tokens to the local count; x.shape[0] then differs
+            # across EP ranks and breaks the fixed-geometry MoeAlltoAll. Use
+            # the static all-rank capacity instead.
+            self.runtime_max_tokens_per_rank = self.max_num_tokens
         else:
             # dp_size=1 or SP: use the actual input tensor size (post-scatter
             # in SP mode, full batch otherwise).  Avoids the pre-scatter
