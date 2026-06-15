@@ -1,19 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cohere2Moe text config used by the Cohere Command-A Plus checkpoints."""
 
-from transformers.configuration_utils import PreTrainedConfig
+from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-try:
-    from huggingface_hub.dataclasses import strict
-except ImportError:  # older huggingface_hub
 
-    def strict(cls):  # type: ignore[misc]
-        return cls
-
-
-@strict
-class Cohere2MoeConfig(PreTrainedConfig):
+class Cohere2MoeConfig(PretrainedConfig):
     model_type = "cohere2_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -52,6 +44,10 @@ class Cohere2MoeConfig(PreTrainedConfig):
     rms_norm_eps: float | None = None
     sliding_window_pattern: int = 4
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.__post_init__(**kwargs)
+
     def __post_init__(self, **kwargs):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
@@ -81,8 +77,6 @@ class Cohere2MoeConfig(PreTrainedConfig):
                 for i in range(self.num_hidden_layers - self.first_k_dense_replace)
             ]
             self.layer_types = prefix_layers + rest_layers
-
-        super().__post_init__(**kwargs)
 
 
 try:
