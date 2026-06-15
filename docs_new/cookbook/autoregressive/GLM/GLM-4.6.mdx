@@ -38,7 +38,8 @@ import { GLM46Deployment } from "/src/snippets/autoregressive/glm-46-deployment.
 
 ### 3.2 Configuration Tips
 
-For more detailed configuration tips, please refer to [GLM-4.5/GLM-4.6 Usage](../../../docs/basic_usage/glm45).
+- **EAGLE Speculative Decoding:** Supported for GLM-4.5/4.6. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default; pass `--disable-overlap-schedule` to disable.
+- **Thinking Budget:** Use `--enable-custom-logit-processor` flag and pass `Glm4MoeThinkingBudgetLogitProcessor` in requests to cap the model's thinking token count (see section 4.2.3).
 
 ## 4. Model Invocation
 
@@ -128,6 +129,10 @@ The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
 **Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
 
 #### 4.2.2 Tool Calling
+
+<Note>
+**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm45`. GLM-4.7 and GLM-4.7-Flash use `--tool-call-parser glm47`. All GLM models use `--reasoning-parser glm45` regardless of generation.
+</Note>
 
 GLM-4.6 supports tool calling capabilities. Enable the tool call parser:
 
@@ -279,6 +284,27 @@ final_response = client.chat.completions.create(
 
 print(final_response.choices[0].message.content)
 # Output: "The weather in Beijing is currently 22°C and sunny."
+```
+
+#### 4.2.3 Thinking Budget
+
+Limit the number of thinking tokens using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor`:
+
+```python Example
+import openai
+from sglang.srt.sampling.custom_logit_processor import Glm4MoeThinkingBudgetLogitProcessor
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.6",
+    messages=[{"role": "user", "content": "Is Paris the Capital of France?"}],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": Glm4MoeThinkingBudgetLogitProcessor().to_str(),
+        "custom_params": {"thinking_budget": 512},
+    },
+)
+print(response)
 ```
 
 ## 5. Benchmark

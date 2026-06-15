@@ -150,5 +150,28 @@ else
     if [ "$NVCC_MAJOR" = "13" ]; then
         sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME:-/usr/local/cuda}/include/cccl')" setup.py
     fi
-    python3 setup.py install
+
+    # Build for both Hopper (sm_90) and Blackwell (sm_100) so the same wheel
+    # runs on H200 and B200 runners. Mirrors the CUDA-version-keyed list in
+    # docker/Dockerfile's DeepEP build stage.
+    if [ -n "${NVCC_VER:-}" ]; then
+        CUDA_VERSION="$NVCC_VER"
+    elif command -v nvcc >/dev/null 2>&1; then
+        CUDA_VERSION=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
+    else
+        CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}' || true)
+    fi
+    if [ -z "${CUDA_VERSION:-}" ]; then
+        echo "FATAL: could not determine CUDA toolkit version (NVCC_VER unset, nvcc missing, nvidia-smi empty)"
+        exit 1
+    fi
+    if [ "$CUDA_VERSION" = "12.8" ]; then
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0'
+    elif awk -v ver="$CUDA_VERSION" 'BEGIN {exit !(ver > 12.8)}'; then
+        # CUDA > 12.8 supports sm_103 (Blackwell)
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3'
+    else
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0'
+    fi
+    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" python3 setup.py install
 fi

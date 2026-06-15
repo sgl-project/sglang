@@ -15,10 +15,15 @@ import unittest
 
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=8, suite="base-b-test-cpu")
 
 
 class TestProfileMerger(unittest.TestCase):
