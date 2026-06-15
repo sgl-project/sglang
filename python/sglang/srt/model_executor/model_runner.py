@@ -3289,6 +3289,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch_template=forward_batch,
         )
 
+    def _pp_kwargs(self, pp_proxy_tensors) -> dict:
+        """Build the pp_proxy_tensors forward kwarg, in one place.
+
+        Pipeline-parallel proxy tensors are threaded into model.forward only
+        when the model accepts them (``support_pp``). Centralizing the
+        forward_decode / forward_extend / forward_idle idiom here lets the
+        runner own pp_proxy_tensors as a uniform load/execute kwarg later
+        (step 15 Phase 0 prerequisite).
+        """
+        return {"pp_proxy_tensors": pp_proxy_tensors} if self.support_pp else {}
+
     def _resolve_eager_decode_pdmux(
         self,
     ) -> Tuple[Any, contextlib.AbstractContextManager]:
@@ -3336,9 +3347,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model.prepare_forward_batch(forward_batch)
             attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
-        kwargs = {}
-        if self.support_pp:
-            kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        kwargs = self._pp_kwargs(pp_proxy_tensors)
 
         # Launch forward
         ctx = (
@@ -3363,9 +3372,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
         # Setup extra arguments
-        kwargs = {}
-        if self.support_pp:
-            kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        kwargs = self._pp_kwargs(pp_proxy_tensors)
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if (
@@ -3493,9 +3500,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.attn_backend.forward_metadata = None
 
-        kwargs = {}
-        if self.support_pp:
-            kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        kwargs = self._pp_kwargs(pp_proxy_tensors)
         ctx = (
             self.device_timer.wrap(metadata={"category": "idle"})
             if self.device_timer
