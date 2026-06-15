@@ -9,6 +9,7 @@ from sglang.jit_kernel.dsv4 import (
     CompressorPrefillPlan,
     compress_forward,
     compress_norm_rope_store,
+    compress_norm_rope_store_bf16,
 )
 from sglang.jit_kernel.utils import is_hip_runtime
 from sglang.srt.environ import envs
@@ -459,7 +460,15 @@ class CompressorBackendMixin:
         )
 
         # Step 2: norm + rope + store
-        compress_norm_rope_store(
+        # NOTE: indexer always uses FP8 storage (to use deep_gemm.fp8_paged_mqa_logits),
+        # only core attention respects kv_cache_dtype for BF16 storage.
+        use_bf16_store = getattr(self, "is_bf16_kv_cache", False) and not is_indexer
+        store_fn = (
+            compress_norm_rope_store_bf16
+            if use_bf16_store
+            else compress_norm_rope_store
+        )
+        store_fn(
             kv_compressed,
             plan,
             norm_weight=norm.weight,
