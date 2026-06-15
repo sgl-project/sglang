@@ -79,16 +79,12 @@ class GlmImageVisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        # self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        # self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
-            # tp_size=self.tp_size,
-            # tp_rank=self.tp_rank,
         )
         self.fc2 = RowParallelLinear(
             hidden_features,
@@ -96,8 +92,6 @@ class GlmImageVisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("fc2", prefix),
-            # tp_size=self.tp_size,
-            # tp_rank=self.tp_rank,
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.act = nn.GELU()
@@ -786,15 +780,9 @@ class GlmImageTextAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        # q2, k2 = self.rotary_emb(positions, q, k)
         q, k = self.rot2(positions, q, k)
-        # print(q2-q,k2-k)
-
         attn_output = self.attn(q, k, v, forward_batch)
-
         attn_output = self.o_proj(attn_output)
-
         return attn_output
 
 
@@ -889,12 +877,6 @@ class GlmImageTextRotaryEmbedding(nn.Module):
         position_ids_expanded = position_ids[
             :, :, None, :
         ].float()  # shape (3, bs, 1, positions)
-
-        device_type = (
-            x.device.type
-            if isinstance(x.device.type, str) and x.device.type != "mps"
-            else "cpu"
-        )
 
         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(
             2, 3
@@ -1173,7 +1155,6 @@ class GlmImageTextModel(nn.Module):
             input_embeds = self.embed_tokens(input_ids)
 
         hidden_states = input_embeds
-        # position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
 
         residual = None
         for layer in self.layers:
@@ -1182,9 +1163,6 @@ class GlmImageTextModel(nn.Module):
                 hidden_states,
                 forward_batch,
                 residual,
-                # attention_mask=attention_mask,
-                # position_ids=text_position_ids,
-                # position_embeddings=position_embeddings,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -1232,7 +1210,7 @@ class GlmImageForConditionalGeneration(nn.Module):
         # VQ-VAE (small frozen module, no TP needed)
         self.vqvae = GlmImageVQVAE(self.vq_config)
 
-        # Language model (reuse Glm4Model)
+        # Language model
         self.model = GlmImageTextModel(
             self.text_config,
             quant_config=quant_config,
@@ -1365,11 +1343,6 @@ class GlmImageForConditionalGeneration(nn.Module):
     ):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
-            # if forward_batch.forward_mode.is_decode():
-            #    # Use pre-computed 2D spatial positions for image generation
-            #    positions = self._get_decode_mrope_positions(forward_batch)
-            # else:
-            #    positions = forward_batch.mrope_positions
 
         if not (
             forward_batch.forward_mode.is_decode()
