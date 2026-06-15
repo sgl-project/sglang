@@ -136,9 +136,6 @@ def forward_mha_core_npu(
     v: torch.Tensor,
     forward_batch: "ForwardBatch",
 ) -> torch.Tensor:
-    print(q)
-    print(k)
-    print(v)
     attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_output)
