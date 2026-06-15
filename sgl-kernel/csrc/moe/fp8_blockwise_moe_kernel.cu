@@ -647,6 +647,201 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
  *       will internally transpose input matrices to align with the optimal memory access
  *       pattern for better GPU efficiency. This transformation is done within the kernel.
  */
+template <typename OutType, typename ScheduleConfig, typename LayoutD>
+void launch_sm120_fp8_blockwise_scaled_group_mm(
+    torch::Tensor& out_ptrs,
+    const torch::Tensor& a_ptrs,
+    const torch::Tensor& b_ptrs,
+    const torch::Tensor& a_scales_ptrs,
+    const torch::Tensor& b_scales_ptrs,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_c,
+    const torch::Tensor& layout_sfa,
+    const torch::Tensor& layout_sfb,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace) {
+  using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+  using ElementA = cutlass::float_e4m3_t;
+  using ElementB = cutlass::float_e4m3_t;
+  using ElementC = OutType;
+  using ElementD = ElementC;
+  using ElementAccumulator = float;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutC = LayoutD;
+
+  static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+  static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+  using ArchTag = cutlass::arch::Sm120;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      typename ScheduleConfig::MmaTileShape,
+      typename ScheduleConfig::ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementAccumulator,
+      void,
+      LayoutC*,
+      AlignmentC,
+      ElementD,
+      LayoutC*,
+      AlignmentC,
+      typename ScheduleConfig::EpilogueSchedule>::CollectiveOp;
+
+  // Passing pointer (LayoutA* / LayoutB*) operand layouts makes the SM120 blockwise
+  // collective builder select the PtrArray (grouped) kernel automatically, i.e.
+  // KernelScheduleSm120Blockwise -> KernelPtrArrayTmaWarpSpecialized*BlockwiseScalingSm120.
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      cute::tuple<LayoutA*, typename ScheduleConfig::LayoutSFA*>,
+      AlignmentA,
+      ElementB,
+      cute::tuple<LayoutB*, typename ScheduleConfig::LayoutSFB*>,
+      AlignmentB,
+      ElementAccumulator,
+      typename ScheduleConfig::MmaTileShape,
+      typename ScheduleConfig::ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      typename ScheduleConfig::KernelSchedule>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue, void>;
+
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using UnderlyingProblemShape = ProblemShape::UnderlyingProblemShape;
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+  using StrideD = typename Gemm::GemmKernel::InternalStrideD;
+
+  int num_experts = (int)expert_offsets.size(0);
+  Gemm gemm_op;
+
+  typename GemmKernel::MainloopArguments mainloop_args{
+      static_cast<const ElementA**>(a_ptrs.data_ptr()),
+      static_cast<StrideA*>(stride_a.data_ptr()),
+      static_cast<const ElementB**>(b_ptrs.data_ptr()),
+      static_cast<StrideB*>(stride_b.data_ptr()),
+      static_cast<const ElementAccumulator**>(a_scales_ptrs.data_ptr()),
+      reinterpret_cast<typename ScheduleConfig::LayoutSFA*>(layout_sfa.data_ptr()),
+      static_cast<const ElementAccumulator**>(b_scales_ptrs.data_ptr()),
+      reinterpret_cast<typename ScheduleConfig::LayoutSFB*>(layout_sfb.data_ptr())};
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = a_ptrs.get_device();
+  hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+  typename GemmKernel::EpilogueArguments epilogue_args{
+      {},
+      nullptr,
+      static_cast<StrideC*>(stride_c.data_ptr()),
+      static_cast<ElementD**>(out_ptrs.data_ptr()),
+      static_cast<StrideC*>(stride_c.data_ptr())};
+
+  UnderlyingProblemShape* problem_sizes_as_shapes = static_cast<UnderlyingProblemShape*>(problem_sizes.data_ptr());
+  typename GemmKernel::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {num_experts, problem_sizes_as_shapes, nullptr},
+      mainloop_args,
+      epilogue_args,
+      hw_info};
+
+  at::cuda::CUDAGuard device_guard{(char)a_ptrs.get_device()};
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a_ptrs.get_device());
+
+  auto can_implement_status = gemm_op.can_implement(args);
+  TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement SM120 grouped GEMM");
+
+  auto status = gemm_op.initialize(args, workspace.data_ptr(), stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize SM120 grouped GEMM");
+
+  status = gemm_op.run(stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run SM120 grouped GEMM");
+}
+
+template <typename OutType>
+void sm120_fp8_blockwise_group_mm_dispatch_shape(
+    torch::Tensor& output,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& a_scales_ptrs,
+    torch::Tensor& b_scales_ptrs,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_c,
+    const torch::Tensor& layout_sfa,
+    const torch::Tensor& layout_sfb,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace) {
+  // SM120 (consumer Blackwell: RTX PRO 6000 / RTX 50xx / GB10) blockwise-scaled grouped
+  // FP8 MoE. SM120 lacks SM100's 2-SM TMA cluster, so we use a single-SM 1x1x1 cluster.
+  // Scale granularity follows the DeepSeek FP8 convention: per-token (1) x 128-K activation
+  // tiles, 128x128 weight tiles. Both scale factors are K-major, matching how the grouped
+  // caller lays them out (see tests/test_fp8_blockwise_moe.py: "We need K-Major scale
+  // factor") and the SM90/SM100 grouped configs above.
+  struct MmaConfig {
+    using ElementA = cutlass::float_e4m3_t;
+    using MmaTileShape = Shape<_128, _128, _128>;
+    using ClusterShape = Shape<_1, _1, _1>;
+    using KernelSchedule = cutlass::gemm::KernelScheduleSm120Blockwise;
+    using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+    using ScaleConfig =
+        cutlass::detail::Sm120BlockwiseScaleConfig<1, 128, 128, cute::UMMA::Major::K, cute::UMMA::Major::K>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  };
+
+  int num_experts = (int)expert_offsets.size(0);
+  torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
+  torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
+
+  run_get_group_gemm_starts<MmaConfig::LayoutSFA, MmaConfig::LayoutSFB, MmaConfig::ScaleConfig>(
+      expert_offsets,
+      a_ptrs,
+      b_ptrs,
+      out_ptrs,
+      a_scales_ptrs,
+      b_scales_ptrs,
+      a,
+      b,
+      output,
+      scales_a,
+      scales_b,
+      layout_sfa,
+      layout_sfb,
+      problem_sizes,
+      problem_sizes_transpose);
+  launch_sm120_fp8_blockwise_scaled_group_mm<OutType, MmaConfig, cutlass::layout::RowMajor>(
+      out_ptrs,
+      a_ptrs,
+      b_ptrs,
+      a_scales_ptrs,
+      b_scales_ptrs,
+      stride_a,
+      stride_b,
+      stride_c,
+      layout_sfa,
+      layout_sfb,
+      problem_sizes,
+      expert_offsets,
+      workspace);
+}
+
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     torch::Tensor& a_ptrs,
@@ -783,6 +978,53 @@ void fp8_blockwise_scaled_grouped_mm(
           workspace);
     } else {
       sm90_fp8_blockwise_group_mm_dispatch_shape<cutlass::half_t>(
+          output,
+          a_ptrs,
+          b_ptrs,
+          out_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          a,
+          b,
+          scales_a,
+          scales_b,
+          stride_a,
+          stride_b,
+          stride_c,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          expert_offsets,
+          workspace);
+    }
+    can_implement = true;
+  }
+#endif
+
+#if defined(CUTLASS_ARCH_MMA_SM120A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
+  if (sm_version == 120 || sm_version == 121) {
+    if (output.scalar_type() == torch::kBFloat16) {
+      sm120_fp8_blockwise_group_mm_dispatch_shape<cutlass::bfloat16_t>(
+          output,
+          a_ptrs,
+          b_ptrs,
+          out_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          a,
+          b,
+          scales_a,
+          scales_b,
+          stride_a,
+          stride_b,
+          stride_c,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          expert_offsets,
+          workspace);
+    } else {
+      sm120_fp8_blockwise_group_mm_dispatch_shape<cutlass::half_t>(
           output,
           a_ptrs,
           b_ptrs,
