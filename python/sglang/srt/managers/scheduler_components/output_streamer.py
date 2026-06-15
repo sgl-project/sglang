@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -365,7 +366,7 @@ class _GenerationStreamAccumulator:
 
         req.send_decode_id_offset = len(decode_ids)
         self.read_offsets.append(read_offset)
-        self.output_ids.append(output_ids_[send_token_offset:])
+        self.output_ids.append(array("q", output_ids_[send_token_offset:]))
         req.send_token_offset = len(output_ids_)
         self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
         self.spaces_between_special_tokens.append(
