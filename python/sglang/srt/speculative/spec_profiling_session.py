@@ -1,7 +1,7 @@
 """Real-path profiling: measure one (batch_size, num_steps, seq_len) decode cost.
 
 Prefill is untimed; only decode cycles (draft + verify + draft_extend) are timed.
-Forward isolation mirrors ``Scheduler._forward_isolation`` + carry-over.
+Forward isolation mirrors ``Scheduler._forward_isolation`` + carry-over (branches on ``batch.spec_algorithm.is_none()``).
 """
 
 from __future__ import annotations
@@ -138,11 +138,11 @@ class SpecProfilingSession:
         return start_evt.elapsed_time(end_evt) / max(1, self._n_measure)
 
     def _run_forward_isolated(self, batch: ScheduleBatch) -> None:
-        """Mirror scheduler forward isolation; branch on batch.is_spec_v2."""
-        is_v2 = batch.is_spec_v2
+        """Mirror scheduler _forward_isolation; snapshot when spec algorithm is active."""
+        is_spec = not batch.spec_algorithm.is_none()
         snapshot = (
             {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
-            if is_v2
+            if is_spec
             else None
         )
         sampling_info = batch.sampling_info
@@ -151,7 +151,7 @@ class SpecProfilingSession:
         try:
             result = self._worker.forward_batch_generation(batch)
         finally:
-            if is_v2:
+            if is_spec:
                 for name, value in snapshot.items():
                     setattr(batch, name, value)
             else:
@@ -160,8 +160,8 @@ class SpecProfilingSession:
         self._apply_carry_over(batch, result)
 
     def _apply_carry_over(self, batch: ScheduleBatch, result) -> None:
-        """Mirror scheduler post-forward carry-over (spec_v2 vs spec_v1)."""
-        if batch.is_spec_v2:
+        """Mirror scheduler post-forward carry-over."""
+        if not batch.spec_algorithm.is_none():
             batch.spec_info = result.next_draft_input
             if result.new_seq_lens is not None:
                 batch.seq_lens = result.new_seq_lens
