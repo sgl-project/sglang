@@ -1578,6 +1578,11 @@ class AscendAttnBackend(AttentionBackend):
                     dtype=torch.float32,
                     device=q_nope.device,
                 )
+                print('q_nope', q_nope)
+                print('q_rope', q_rope)
+                print('k_nope', k_nope)
+                print('k_rope', k_rope)
+                print('v', v)
                 torch_npu.atb.npu_ring_mla(
                     q_nope=q_nope,
                     q_rope=q_rope,
