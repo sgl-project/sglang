@@ -118,11 +118,11 @@ class AWQAscendLinearKernel:
                 antiquant_group_size=layer.npu_group_size,
                 bias=bias,
             )
-            print('quant', out)
+            #print('quant', out)
             return out.reshape(out_shape)
         else:
             # fallback: weight is (N, K) bfloat16
-            print('unquant', out)
+            #print('unquant', out)
             out = F.linear(x, layer.weight, bias)
             return out
 
