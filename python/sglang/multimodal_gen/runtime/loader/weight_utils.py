@@ -2,18 +2,20 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/model_loader/weight_utils.py
-"""Utilities for downloading and initializing model weights."""
+"""Utilities for downloading, loading, initializing and verifying model weights."""
+
 import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Generator
+from collections import defaultdict
+from collections.abc import Generator, Iterable
 from pathlib import Path
 
 import filelock
-import huggingface_hub.constants
 import torch
 from safetensors.torch import safe_open
+from torch.distributed.tensor import DTensor
 from tqdm.auto import tqdm
 
 try:
@@ -23,11 +25,7 @@ try:
 except ImportError:
     HAS_RUNAI_MODEL_STREAMER = False
 
-# Disable runai_model_streamer on AMD/ROCm due to global state issues
-# that cause "Streamer is handling previous request" errors
-if torch.version.hip is not None:
-    HAS_RUNAI_MODEL_STREAMER = False
-
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -38,21 +36,6 @@ logger = init_logger(__name__)
 # lock files in the temp directory will be automatically deleted when the
 # system reboots, so users will not complain about annoying lock files
 temp_dir = tempfile.gettempdir()
-
-
-def enable_hf_transfer() -> None:
-    """automatically activates hf_transfer"""
-    if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
-        try:
-            # enable hf hub transfer if available
-            import hf_transfer  # type: ignore # noqa
-
-            huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
-        except ImportError:
-            pass
-
-
-enable_hf_transfer()
 
 
 class DisabledTqdm(tqdm):
@@ -151,16 +134,65 @@ def _validate_safetensors_file(file_path: str) -> bool:
         return False
 
 
+def _raise_if_duplicate_safetensors_keys(hf_weights_files: list[str]) -> None:
+    """Fail fast when multiple safetensors files define the same tensor name. Make sure runtime behavior is deterministic
+
+    Duplicate keys across files are almost always a packaging error for inference:
+    for example shipping both full and fp16 variants, or mixing consolidated and
+    sharded checkpoints. Continuing would make the final loaded value depend on
+    file iteration or streamer delivery order.
+    """
+    if len(hf_weights_files) <= 1:
+        return
+
+    key_to_file: dict[str, str] = {}
+    duplicate_files_by_key: dict[str, set[str]] = defaultdict(set)
+
+    for st_file in hf_weights_files:
+        with safe_open(st_file, framework="pt", device="cpu") as f:
+            for name in f.keys():  # noqa: SIM118
+                previous_file = key_to_file.get(name)
+                if previous_file is None:
+                    key_to_file[name] = st_file
+                    continue
+                if previous_file == st_file:
+                    continue
+                duplicate_files_by_key[name].update((previous_file, st_file))
+
+    if not duplicate_files_by_key:
+        return
+
+    examples = []
+    for key in sorted(duplicate_files_by_key)[:8]:
+        files = ", ".join(
+            sorted(os.path.basename(p) for p in duplicate_files_by_key[key])
+        )
+        examples.append(f"{key} [{files}]")
+
+    raise ValueError(
+        "Duplicate tensor names detected across safetensors files. Refusing to load "
+        "because final weights would depend on file or streamer ordering. "
+        f"Found {len(duplicate_files_by_key)} duplicate tensor name(s). "
+        f"Examples: {examples}. "
+        "This usually means multiple precision variants or consolidated+sharded "
+        "checkpoints were passed together."
+    )
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
-    use_runai_model_streamer: bool = HAS_RUNAI_MODEL_STREAMER,
+    use_runai_model_streamer: bool | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
     device = "cpu" if to_cpu else str(get_local_torch_device())
+    if use_runai_model_streamer is None:
+        use_runai_model_streamer = (
+            HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
+        )
 
     # Validate files before loading
     corrupted_files = [
@@ -198,6 +230,8 @@ def safetensors_weights_iterator(
             "Please retry - the files will be re-downloaded automatically."
         )
 
+    _raise_if_duplicate_safetensors_keys(hf_weights_files)
+
     if use_runai_model_streamer:
         with SafetensorsStreamer() as streamer:
             streamer.stream_files(hf_weights_files)
@@ -219,6 +253,26 @@ def safetensors_weights_iterator(
                     yield name, param
 
 
+def _load_pt_file(bin_file: str, device: str) -> dict:
+    """Load a PyTorch checkpoint file, handling legacy tar format.
+
+    PyTorch 2.6 changed the default of weights_only from False to True.
+    Legacy tar format files cannot be loaded with weights_only=True.
+    This function tries weights_only=True first, then falls back to False
+    for legacy tar format files from trusted sources (HuggingFace Hub).
+    """
+    try:
+        return torch.load(bin_file, map_location=device, weights_only=True)
+    except RuntimeError as e:
+        if "legacy .tar format" in str(e):
+            logger.warning(
+                "Loading %s with weights_only=False (legacy tar format)",
+                os.path.basename(bin_file),
+            )
+            return torch.load(bin_file, map_location=device, weights_only=False)
+        raise
+
+
 def pt_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
@@ -234,7 +288,7 @@ def pt_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        state = torch.load(bin_file, map_location=device, weights_only=True)
+        state = _load_pt_file(bin_file, device)
         yield from state.items()
         del state
 
@@ -320,3 +374,23 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
 
     # If there were no matches, return the untouched param name
     return name
+
+
+def compute_weights_checksum(
+    named_params: Iterable[tuple[str, torch.Tensor]],
+) -> str:
+    """Compute a SHA-256 checksum for a set of (name, tensor) pairs.
+
+    Used to verify the correctness of weight refitting. After a refit,
+    compare the checksum of the in-GPU model weights against the checksum
+    of the on-disk tensors or the tensors in the training engine.
+    """
+    hasher = hashlib.sha256()
+    for name, tensor in sorted(named_params, key=lambda x: x[0]):
+        hasher.update(name.encode())
+        t = tensor.detach()
+        # DTensor doesn't support .numpy(); extract the local tensor.
+        if isinstance(t, DTensor):
+            t = t._local_tensor
+        hasher.update(t.cpu().contiguous().reshape(-1).view(torch.uint8).numpy().data)
+    return hasher.hexdigest()

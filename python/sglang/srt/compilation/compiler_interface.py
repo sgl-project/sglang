@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/compiler_interface.py
 
 import contextlib
@@ -14,6 +16,7 @@ import torch.fx as fx
 
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.inductor_pass import pass_context
+from sglang.srt.utils.common import torch_release
 
 
 class CompilerInterface:
@@ -226,7 +229,7 @@ class InductorAdaptor(CompilerInterface):
         hash_str, file_path = None, None
         from torch._inductor.codecache import FxGraphCache, compiled_fx_graph_hash
 
-        if torch.__version__.startswith("2.5"):
+        if torch_release[:2] == (2, 5):
             original_load = FxGraphCache.load
             original_load_name = "torch._inductor.codecache.FxGraphCache.load"
 
@@ -252,7 +255,7 @@ class InductorAdaptor(CompilerInterface):
             hijacked_compile_fx_inner = (
                 torch._inductor.compile_fx.compile_fx_inner
             )  # noqa
-        elif torch.__version__ >= "2.6":
+        elif torch_release >= (2, 6):
             # function renamed in 2.6
             original_load_name = None
 
@@ -405,7 +408,7 @@ class InductorAdaptor(CompilerInterface):
             # Dynamo metrics context, see method for more details.
             exit_stack.enter_context(self.metrics_context())
 
-            if torch.__version__.startswith("2.5"):
+            if torch_release[:2] == (2, 5):
                 inductor_compiled_graph = FxGraphCache._lookup_graph(
                     hash_str, example_inputs, True, False
                 )
@@ -413,7 +416,7 @@ class InductorAdaptor(CompilerInterface):
                     "Inductor cache lookup failed. Please remove"
                     f"the cache directory and try again."  # noqa
                 )
-            elif torch.__version__ >= "2.6":
+            elif torch_release >= (2, 6):
                 from torch._inductor.output_code import CompiledFxGraphConstantsWithGm
 
                 constants = CompiledFxGraphConstantsWithGm(graph)

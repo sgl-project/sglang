@@ -1,6 +1,6 @@
 [package]
 name = "sgl-model-gateway-python"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2021"
 
 [lib]
@@ -19,10 +19,3 @@ default-features = true
 [features]
 default = ["pyo3/extension-module"]
 vendored-openssl = ["sgl-model-gateway/vendored-openssl"]
-
-[profile.ci]
-inherits = "release"
-opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
-lto = "thin"        # Thin LTO - good balance
-codegen-units = 16  # More parallelization for faster builds
-strip = true

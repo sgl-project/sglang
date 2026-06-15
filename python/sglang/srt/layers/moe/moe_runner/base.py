@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import contextvars
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Tuple, TypeGuard
+from typing import TYPE_CHECKING, Any, Callable, Generator, Optional, Tuple, TypeGuard
 
 import torch
 
-from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    RoutingMethodType,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.triton import (
@@ -22,6 +28,20 @@ if TYPE_CHECKING:
     )
 
 
+_moe_output_buf: contextvars.ContextVar[Optional[torch.Tensor]] = (
+    contextvars.ContextVar("moe_output_buf", default=None)
+)
+
+
+@contextmanager
+def moe_output_buffer_ctx(buf: torch.Tensor) -> Generator[None, None, None]:
+    token = _moe_output_buf.set(buf)
+    try:
+        yield
+    finally:
+        _moe_output_buf.reset(token)
+
+
 @dataclass
 class MoeRunnerConfig:
     # MoE parameters
@@ -33,6 +53,7 @@ class MoeRunnerConfig:
     top_k: Optional[int] = None
     num_fused_shared_experts: Optional[int] = None
     params_dtype: Optional[torch.dtype] = None
+    routing_method_type: Optional[RoutingMethodType] = None
 
     # Runner configuration
     activation: str = "silu"
@@ -43,6 +64,7 @@ class MoeRunnerConfig:
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
+    swiglu_limit: Optional[float] = None
 
 
 @dataclass
@@ -77,7 +99,11 @@ class MoeRunnerCore(ABC):
 
     @abstractmethod
     def run(
-        self, runner_input: RunnerInput, quant_info: MoeQuantInfo, running_state: dict
+        self,
+        runner_input: RunnerInput,
+        quant_info: MoeQuantInfo,
+        running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> RunnerOutput:
         pass
 

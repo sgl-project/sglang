@@ -5,6 +5,7 @@
 # Adapted from transformers: https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/models/clip/modeling_clip.py
 """Minimal implementation of CLIPVisionModel intended to be only used
 within a vision language model."""
+
 from collections.abc import Iterable
 from typing import Optional
 
@@ -230,10 +231,16 @@ class CLIPAttention(nn.Module):
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
 
-            if current_platform.is_rocm():
+            if (
+                current_platform.is_rocm()
+                or current_platform.is_musa()
+                or current_platform.is_xpu()
+            ):
                 # ROCm: Using both is_causal=True and attn_mask causes NaN.
                 # Use is_causal=True alone (padding mask not needed for CLIP
                 # since pooler_output comes from EOS token before padding).
+                # XXX (MUSA): Torch SDPA on MUSA currently does not support
+                # using both `attn_mask` and `is_causal=True` simultaneously.
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
                     query_states,
                     key_states,
@@ -262,7 +269,7 @@ class CLIPAttention(nn.Module):
                     key_states,
                     value_states,
                     attn_mask=attn_mask,
-                    is_causal=True,
+                    is_causal=attention_mask is None,
                     scale=self.scale,
                 )
             attn_output = attn_output.transpose(1, 2)
@@ -447,10 +454,6 @@ class CLIPTextTransformer(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseEncoderOutput:
-        r"""
-        Returns:
-
-        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -589,6 +592,48 @@ class CLIPTextModel(TextEncoder):
                     loaded_params.add(name)
 
         return loaded_params
+
+
+class CLIPTextModelWithProjection(CLIPTextModel):
+    """
+    CLIP text encoder with projection head for pooled_output.
+    """
+
+    def __init__(
+        self,
+        config: CLIPTextConfig,
+    ) -> None:
+        super().__init__(config)
+        self.text_projection = nn.Linear(
+            config.hidden_size, config.projection_dim, bias=False
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_hidden_states: bool | None = None,
+        **kwargs,
+    ) -> BaseEncoderOutput:
+        outputs: BaseEncoderOutput = self.text_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=output_hidden_states,
+        )
+
+        pooled_output = outputs.pooler_output
+        if pooled_output is not None:
+            pooled_output = self.text_projection(pooled_output)
+
+        return BaseEncoderOutput(
+            last_hidden_state=outputs.last_hidden_state,
+            pooler_output=pooled_output,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 class CLIPVisionTransformer(nn.Module):
@@ -756,4 +801,4 @@ class BertModel(CLIPTextModel):
     pass
 
 
-EntryClass = [CLIPTextModel, CLIPVisionModel]
+EntryClass = [CLIPTextModel, CLIPTextModelWithProjection, CLIPVisionModel]

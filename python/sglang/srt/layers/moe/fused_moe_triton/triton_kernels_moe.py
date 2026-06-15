@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/pull/18595/files#diff-f426a6de78c82ffec568eff6811bfbf0043dab5f87f1a8c0cffdbdcb8a81e035
 
 from __future__ import annotations
@@ -5,17 +7,25 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel import gelu_and_mul, silu_and_mul
 from triton_kernels.matmul_ogs import (
     FlexCtx,
     FnSpecs,
     FusedActivation,
+    GatherIndx,
     PrecisionConfig,
+    RoutingData,
+    ScatterIndx,
     matmul_ogs,
 )
 from triton_kernels.numerics import InFlexData
-from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
+
+from sglang.srt.utils import is_cuda
+
+if is_cuda():
+    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+else:
+    from sgl_kernel import gelu_and_mul, silu_and_mul
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -271,7 +281,9 @@ def triton_kernel_fused_experts_with_bias(
     # feature check
     assert inplace is False, "Inplace is not supported in new triton MoE kernel"
 
-    E, _, _ = w1.shape
+    M, K = hidden_states.shape
+    E, _, N = w1.shape
+    n_expts_act = routing_data.n_expts_act
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -287,12 +299,20 @@ def triton_kernel_fused_experts_with_bias(
         w2_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex))
 
     act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
+        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
         (gemm1_alpha, gemm1_clamp_limit),
-        2,
     )
 
-    intermediate_cache = matmul_ogs(
+    intermediate_cache = torch.empty(
+        (1, M * n_expts_act, N // 2),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    output = torch.empty(
+        (1, M, K), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+
+    matmul_ogs(
         hidden_states,
         w1,
         b1,
@@ -301,14 +321,17 @@ def triton_kernel_fused_experts_with_bias(
         precision_config=w1_pcg,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
         fused_activation=act,
+        y=intermediate_cache,
     )
 
-    return matmul_ogs(
-        intermediate_cache,
+    matmul_ogs(
+        intermediate_cache.view(M * n_expts_act, N // 2),
         w2,
         b2,
         routing_data,
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
+        y=output,
     )
+    return output.view(M, K)

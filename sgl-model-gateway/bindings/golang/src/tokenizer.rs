@@ -15,6 +15,11 @@ use smg::tokenizer::{
 
 use super::error::{SglErrorCode, set_error_message, clear_error_message};
 
+#[cfg(target_os = "macos")]
+type BooleanT = libc::boolean_t;
+#[cfg(not(target_os = "macos"))]
+type BooleanT = libc::c_int;
+
 /// Opaque handle for a tokenizer instance
 #[repr(C)]
 pub struct TokenizerHandle {
@@ -69,6 +74,7 @@ pub unsafe extern "C" fn sgl_tokenizer_create_from_file(
 /// # Arguments
 /// * `handle` - Tokenizer handle (must not be null)
 /// * `text` - Input text (null-terminated C string)
+/// * `add_special_tokens` - Whether to add special tokens
 /// * `token_ids_out` - Pointer to receive array of token IDs (must be freed with sgl_free_token_ids)
 /// * `token_count_out` - Pointer to receive token count
 /// * `error_out` - Optional pointer to receive error message
@@ -82,6 +88,7 @@ pub unsafe extern "C" fn sgl_tokenizer_create_from_file(
 pub unsafe extern "C" fn sgl_tokenizer_encode(
     handle: *mut TokenizerHandle,
     text: *const c_char,
+    add_special_tokens: BooleanT,
     token_ids_out: *mut *mut u32,
     token_count_out: *mut usize,
     error_out: *mut *mut c_char,
@@ -99,8 +106,10 @@ pub unsafe extern "C" fn sgl_tokenizer_encode(
         }
     };
 
+    let add_special_tokens_bool = add_special_tokens != 0;
+
     let tokenizer = &(*handle).tokenizer;
-    match tokenizer.encode(text_str) {
+    match tokenizer.encode(text_str, add_special_tokens_bool) {
         Ok(encoding) => {
             let token_ids = encoding.token_ids();
             let count = token_ids.len();

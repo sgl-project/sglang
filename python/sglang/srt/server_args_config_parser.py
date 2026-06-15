@@ -4,6 +4,7 @@ Handles merging of YAML configuration files with command-line arguments.
 """
 
 import argparse
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List
@@ -16,25 +17,37 @@ logger = logging.getLogger(__name__)
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
-    def __init__(self, parser: argparse.ArgumentParser):
+    def __init__(
+        self,
+        parser: argparse.ArgumentParser = None,
+        boolean_actions: List[str] = None,
+    ):
         """Initialize with list of store_true action names."""
         # NOTE: The current code does not support actions other than "store_true" and "store".
-        self.parser = parser
-        self.store_true_actions = [
-            action.dest
-            for action in parser._actions
-            if isinstance(action, argparse._StoreTrueAction)
-        ]
-        self.unsupported_actions = {
-            a.dest: a
-            for a in parser._actions
-            if a.option_strings
-            and not isinstance(a, argparse._StoreTrueAction)
-            and not isinstance(a, argparse._StoreAction)
-            and "--config" not in a.option_strings
-            and "--help" not in a.option_strings
-            and "-h" not in a.option_strings
-        }
+        if parser is not None:
+            self.parser = parser
+            self.store_true_actions = [
+                action.dest
+                for action in parser._actions
+                if isinstance(action, argparse._StoreTrueAction)
+            ]
+            self.unsupported_actions = {
+                a.dest: a
+                for a in parser._actions
+                if a.option_strings
+                and not isinstance(a, argparse._StoreTrueAction)
+                and not isinstance(a, argparse._StoreAction)
+                and "--config" not in a.option_strings
+                and "--help" not in a.option_strings
+                and "-h" not in a.option_strings
+            }
+        elif boolean_actions is not None:
+            # Legacy interface for compatibility
+            self.store_true_actions = boolean_actions
+            self.unsupported_actions = {}
+        else:
+            self.store_true_actions = []
+            self.unsupported_actions = {}
 
     def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
         """
@@ -139,6 +152,8 @@ class ConfigArgumentMerger:
                 self._add_boolean_arg(args, key, value)
             elif isinstance(value, list):
                 self._add_list_arg(args, key, value)
+            elif isinstance(value, dict):
+                self._add_scalar_arg(args, key, json.dumps(value))
             else:
                 self._add_scalar_arg(args, key, value)
 

@@ -21,14 +21,23 @@ and code completion templates, eliminating global state and improving modularity
 import json
 import logging
 import os
-import re
-from typing import Optional
+from typing import Dict, Optional
 
+from sglang.srt.managers.template_detection import (
+    REASONING_PARSER_RULES,
+    TOOL_CALL_PARSER_RULES,
+    ReasoningToggleConfig,
+    build_detection_context,
+    detect_reasoning_pattern,
+    match_rules,
+)
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.parser.code_completion_parser import (
     CompletionTemplate,
     FimPosition,
     completion_template_exists,
     register_completion_template,
+    set_completion_template,
 )
 from sglang.srt.parser.conversation import (
     Conversation,
@@ -56,6 +65,9 @@ class TemplateManager:
         self._completion_template_name: Optional[str] = None
         self._jinja_template_content_format: Optional[str] = "openai"
         self._force_reasoning: bool = False
+        self._reasoning_config: Optional[ReasoningToggleConfig] = None
+        self._suggested_reasoning_parser: Optional[str] = None
+        self._suggested_tool_call_parser: Optional[str] = None
 
     @property
     def chat_template_name(self) -> Optional[str]:
@@ -82,24 +94,45 @@ class TemplateManager:
         """
         return self._force_reasoning
 
-    def _detect_reasoning_pattern(self, template: str) -> bool:
-        """
-        Detect if the chat template contains reasoning/thinking patterns.
-        """
-        if template is None:
-            return False
+    @property
+    def reasoning_config(self) -> Optional[ReasoningToggleConfig]:
+        """Get the reasoning toggle config inferred from chat template."""
+        return self._reasoning_config
 
-        # TODO: remove this hard code the reasoning pattern
-        force_reasoning_pattern = r"<\|im_start\|>assistant\\n<think>\\n"
-        has_reasoning = re.search(force_reasoning_pattern, template) is not None
+    @property
+    def suggested_reasoning_parser(self) -> Optional[str]:
+        """Get the auto-detected reasoning parser name, or None."""
+        return self._suggested_reasoning_parser
 
-        if has_reasoning:
-            logger.info("Detected the force reasoning pattern in chat template.")
+    @property
+    def suggested_tool_call_parser(self) -> Optional[str]:
+        """Get the auto-detected tool-call parser name, or None."""
+        return self._suggested_tool_call_parser
 
-        return has_reasoning
+    def _run_template_detection(self, template, tokenizer) -> None:
+        """Run reasoning pattern and parser detection on a template."""
+        self._force_reasoning, self._reasoning_config = detect_reasoning_pattern(
+            template
+        )
+        # Build context once, reuse for both parser detections (avoids
+        # duplicate tokenizer.get_vocab() calls).
+        ctx = build_detection_context(
+            template, tokenizer, self._reasoning_config, self._force_reasoning
+        )
+        if ctx is None:
+            return
+        self._suggested_reasoning_parser = match_rules(
+            ctx, REASONING_PARSER_RULES, "reasoning parser"
+        )
+        self._suggested_tool_call_parser = match_rules(
+            ctx, TOOL_CALL_PARSER_RULES, "tool-call parser"
+        )
 
     def load_chat_template(
-        self, tokenizer_manager, chat_template_arg: Optional[str], model_path: str
+        self,
+        tokenizer_manager: TokenizerManager,
+        chat_template_arg: Optional[str],
+        model_path: str,
     ) -> None:
         """
         Load a chat template from various sources.
@@ -136,14 +169,22 @@ class TemplateManager:
                         "No chat template found, defaulting to 'string' content format"
                     )
 
-        # Detect reasoning pattern from chat template
+        # Detect reasoning pattern and suggest parser from chat template
         if tokenizer_manager.tokenizer:
-            self._force_reasoning = self._detect_reasoning_pattern(
-                tokenizer_manager.tokenizer.chat_template
-            )
+            template = tokenizer_manager.tokenizer.chat_template
+            self._run_template_detection(template, tokenizer_manager.tokenizer)
+            parts = []
+            if self._reasoning_config:
+                parts.append(f"reasoning_config={self._reasoning_config}")
+            if self._suggested_reasoning_parser:
+                parts.append(f"reasoning_parser={self._suggested_reasoning_parser}")
+            if self._suggested_tool_call_parser:
+                parts.append(f"tool_call_parser={self._suggested_tool_call_parser}")
+            if parts:
+                logger.info(f"Auto-detected template features: {', '.join(parts)}")
 
     def _load_explicit_chat_template(
-        self, tokenizer_manager, chat_template_arg: str
+        self, tokenizer_manager: TokenizerManager, chat_template_arg: str
     ) -> None:
         """Load explicitly specified chat template."""
         logger.info(f"Loading chat template from argument: {chat_template_arg}")
@@ -195,9 +236,11 @@ class TemplateManager:
         else:
             self._completion_template_name = completion_template_arg
 
+        set_completion_template(self._completion_template_name)
+
     def initialize_templates(
         self,
-        tokenizer_manager,
+        tokenizer_manager: TokenizerManager,
         model_path: str,
         chat_template: Optional[str] = None,
         completion_template: Optional[str] = None,
@@ -218,7 +261,9 @@ class TemplateManager:
         if completion_template:
             self.load_completion_template(completion_template)
 
-    def _load_jinja_template(self, tokenizer_manager, template_path: str) -> None:
+    def _load_jinja_template(
+        self, tokenizer_manager: TokenizerManager, template_path: str
+    ) -> None:
         """Load a Jinja template file."""
         with open(template_path, "r") as f:
             chat_template = "".join(f.readlines()).strip("\n")
@@ -288,21 +333,56 @@ class TemplateManager:
             )
         self._completion_template_name = template["name"]
 
-    def _resolve_hf_chat_template(self, tokenizer_manager) -> Optional[str]:
-        """
-        Resolve HuggingFace chat template.
-
-        Returns the chat template string if found, None otherwise.
-        """
+    def _resolve_hf_chat_template(
+        self, tokenizer_manager: TokenizerManager
+    ) -> Optional[str]:
         try:
-            if processor := tokenizer_manager.processor:
-                if hasattr(processor, "chat_template") and processor.chat_template:
-                    return processor.chat_template
-            if tokenizer := tokenizer_manager.tokenizer:
-                if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
-                    return tokenizer.chat_template
-        except Exception as e:
-            logger.debug(f"Error getting chat template: {e}")
+            # Try (mm-)processor first, then tokenizer
+            template = (
+                getattr(tokenizer_manager.processor, "chat_template", None)
+                if tokenizer_manager.processor
+                else None
+            ) or (
+                getattr(tokenizer_manager.tokenizer, "chat_template", None)
+                if tokenizer_manager.tokenizer
+                else None
+            )
 
-        logger.debug("No HuggingFace chat template found")
-        return None
+            if template is None:
+                logger.warning("No HuggingFace chat template found")
+                return None
+
+            # Handle dict templates (multiple named templates)
+            if isinstance(template, dict):
+                return self._select_named_template(template, tokenizer_manager)
+
+            # Single string template
+            return template
+
+        except Exception as e:
+            logger.warning(f"Error getting chat template: {e}")
+            return None
+
+    def _select_named_template(
+        self, templates: Dict[str, str], tokenizer_manager: TokenizerManager
+    ) -> str:
+        if not templates:
+            raise ValueError("Empty templates dict provided")
+
+        available_names = list(templates.keys())
+        logger.info(f"Multiple HuggingFace chat templates available: {available_names}")
+
+        # Use specified template if provided
+        if preferred_name := tokenizer_manager.server_args.hf_chat_template_name:
+            if preferred_name not in templates:
+                raise ValueError(
+                    f"Specified template '{preferred_name}' not found. "
+                    f"Available templates: {available_names}"
+                )
+            logger.info(f"Using specified chat template: '{preferred_name}'")
+            return templates[preferred_name]
+
+        # Fallback: Use first available template
+        first_name = available_names[0]
+        logger.info(f"Using first available template: '{first_name}'")
+        return templates[first_name]
