@@ -499,10 +499,10 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     input_2d = input.view(-1, input.shape[-1])
     backend = _get_flashinfer_groupwise_backend()
-    # TRTLLM backend requires K >= 256 and weight scales in UE8M0/R128c4
-    # packed format. Fall back to triton when scales are plain float32.
+    # Fall back to triton for non-supported formats.
+    # TODO: Check if flashinfer supports other output dtypes besides bf16.
     if backend == "trtllm" and (
-        input_2d.shape[1] < 256 or not getattr(weight_scale, "format_ue8m0", False)
+        input_2d.shape[1] < 256 or input_2d.dtype != torch.bfloat16
     ):
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
@@ -1216,8 +1216,6 @@ def block_quant_dequant(
     block_n, block_k = block_size[0], block_size[1]
     *_, n, k = x_q_block.shape
 
-    # NOTE: This is very memory inefficient, results in *16384 memory requirement for scales
-    # with block_size = [128, 128].
     # ... n_scale k_scale -> ... (n_scale block_n) (k_scale block_k)
     x_scale_repeat = x_s.repeat_interleave(block_n, dim=-2).repeat_interleave(
         block_k, dim=-1
