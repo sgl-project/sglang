@@ -353,8 +353,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
-    # SWA caches make the flat size accessors raise and expose full-pool sizes
-    # via full_*() instead; pick the full-pool view for SWA, flat otherwise.
+    # SWA caches expose full-attention accounting through full_* accessors.
     def _radix_full_evictable(self) -> int:
         if self.scheduler.tp_worker.is_hybrid_swa:
             return self.tree_cache.full_evictable_size()
@@ -530,9 +529,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
         )
-        # Always lock to match aggregated scheduling behavior. SWA locks only
-        # span the sliding window and return a boundary uuid; store it so the
-        # matching dec_lock_ref stops there instead of underflowing toward root.
+        # Keep aggregated scheduling semantics while preserving the SWA lock
+        # boundary needed for the matching dec_lock_ref.
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         return self._build_decode_prefix_match(req, result)
@@ -1435,13 +1433,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 else torch.tensor([-1], dtype=torch.int64, device=device)
             )
             if self._uses_swa_tail_prealloc():
-                # Full-attention layers extend from the (reused) prefix; SWA
-                # layers allocate only the window tail.
+                # Full-attention layers reuse prefix KV; SWA layers allocate
+                # only the live window tail.
                 swa_tail_len = self._swa_tail_len(fill_len)
-                # Tokens before the window have no SWA slot, so mark them
-                # SWA-evicted: cache_(un)finished_req inserts them as tombstones
-                # instead of phantom swa_evictable tokens (else the SWA pool
-                # leaks). window_start (fill_len - swa_tail_len) is page-aligned.
+                # Prefix tokens outside the SWA window have no SWA slot. Mark
+                # them evicted so cache insertion creates tombstones instead of
+                # counting phantom SWA tokens.
                 req.swa_evicted_seqlen = max(
                     req.swa_evicted_seqlen, fill_len - swa_tail_len
                 )

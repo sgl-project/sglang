@@ -840,12 +840,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # return_full_match: repoint by full full-attention residency, not the
-        # SWA-window-safe match. A reused decode-worker prefix can be fully
-        # full-resident but SWA-tombstoned (window slid out + page-aligned key
-        # clips the live remnant below W), collapsing the window-safe match to 0
-        # while the cards to repoint number in the hundreds — which would trip the
-        # assert below. inc_lock_ref's SWA walk already stops at the tombstone.
+        # Repoint by full-attention residency, not the SWA-window-safe match.
+        # A reused prefix can remain full-resident after its SWA window is
+        # tombstoned, so the window-safe match may be shorter than the KV
+        # indices that must be preserved.
         match_result = self.match_prefix(
             MatchPrefixParams(key=radix_key, return_full_match=True)
         )
@@ -906,9 +904,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
-        # Deepest device-resident matched node (owns value[-1]), NOT gated by the
-        # per-component validators, so it reflects full full-attention residency
-        # even when SWA is tombstoned. Used by return_full_match.
+        # Deepest device-resident full-attention node. Component validators can
+        # cap the normal match earlier when SWA is tombstoned.
         full_last_device_node = node
         separate_device_match = self.cache_controller is not None
         if separate_device_match:
@@ -1009,12 +1006,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         if params.return_full_match:
-            # Decode-side dedup/repoint: return the full device-resident match and
-            # the deepest device node, not the SWA-window-safe truncation. On a
-            # reused, tombstoned prefix the full residency exceeds the validator-
-            # capped best_match_device_value_len; sizing the repoint by the latter
-            # would dangle cards. The window-safe length still drives
-            # finalize_match_result below, which this must not perturb.
+            # Decode-side repointing needs all full-attention KV indices. Keep
+            # the window-safe length for component finalization below.
             device_indices = (
                 torch.cat(value) if value else self._empty_match_result.device_indices
             )

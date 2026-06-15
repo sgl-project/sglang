@@ -1,15 +1,8 @@
-"""SWA-path coverage for the decode-side radix cache (unified radix tree).
+"""SWA coverage for decode-side radix cache on gpt-oss-20b.
 
-gpt-oss-20b is a hybrid SWA model: full-attention layers reuse the decode radix
-prefix while the sliding-window state is transferred fresh per turn. SWA +
-decode-side radix cache is supported only via the unified radix tree, so the
-servers launch with SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 (see extra_*_env below);
-without it the decode server rejects the combination.
-
-Reuses the registered decode-radix mixin (multi-turn cache-hit + 2-pass gsm8k).
-gpt-oss-20b is cached on the 8-gpu-h20 CI runners (resolved via
-try_cached_model in the mixin), so this runs in CI alongside the non-SWA
-decode-radix coverage.
+The decode worker reuses full-attention prefix KV while transferring the SWA
+window fresh per request. This path requires the unified radix tree and validates
+both multi-turn cache hits and two-pass GSM8K accuracy.
 """
 
 import unittest
@@ -39,9 +32,8 @@ class TestDisaggregationDecodeRadixCacheSWANixl(
 ):
     transfer_backend_name = "nixl"
     model_name = DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
-    # mxfp4 gpt-oss with the 512-token eval cap truncates reasoning, so absolute
-    # gsm8k accuracy is low (~0.55), hence the lower min score. The second gsm8k
-    # pass hits the decode radix cache (the reuse correctness check).
+    # The 512-token eval cap truncates mxfp4 gpt-oss reasoning, so use a lower
+    # absolute floor while checking that the cached second pass does not regress.
     gsm8k_min_score = 0.45
     # SWA + decode-side radix cache is gated to the unified radix tree.
     extra_prefill_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
