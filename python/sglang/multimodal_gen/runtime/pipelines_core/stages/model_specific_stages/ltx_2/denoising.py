@@ -1537,9 +1537,7 @@ class LTX2DenoisingStage(DenoisingStage):
         step: DenoisingStepState,
     ):
         previous_disabled = self._ltx2_bcg_disabled_for_forward
-        self._ltx2_bcg_disabled_for_forward = previous_disabled or (
-            ctx.is_warmup and ctx.is_ltx23_variant
-        )
+        self._ltx2_bcg_disabled_for_forward = previous_disabled
         try:
             with self._temporary_ltx23_hq_timestep_semantics(
                 step.current_model, ctx.use_ltx23_hq_timestep_semantics
