@@ -385,6 +385,7 @@ pub mod metrics_labels {
     pub const ENDPOINT_RERANK: &str = "rerank";
     pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
     pub const ENDPOINT_CLASSIFY: &str = "classify";
+    pub const ENDPOINT_CLASSIFY_NATIVE: &str = "classify_native";
 
     // Worker types
     pub const WORKER_REGULAR: &str = "regular";

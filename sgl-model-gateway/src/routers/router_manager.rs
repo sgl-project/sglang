@@ -691,6 +691,25 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_classify_native(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            router.route_classify_native(headers, body, model_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for classify request",
+            )
+                .into_response()
+        }
+    }
+
     async fn route_classify(
         &self,
         headers: Option<&HeaderMap>,
