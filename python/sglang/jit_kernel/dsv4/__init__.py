@@ -16,6 +16,7 @@ from .elementwise import (
     fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
     fused_rope_inplace,
+    fused_rope_pack,
 )
 from .gemm import linear_bf16_fp32
 from .moe import (
@@ -37,6 +38,7 @@ __all__ = [
     "fused_norm_rope_inplace",
     "fused_store_cache",
     "fused_rope_inplace",
+    "fused_rope_pack",
     "fused_q_norm_rope",
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",

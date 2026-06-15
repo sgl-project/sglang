@@ -24,6 +24,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
+    fused_rope_pack,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -975,23 +976,36 @@ class MQALayer(nn.Module):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
-        fused_rope_inplace(
-            o[..., -self.qk_rope_head_dim :],
-            None,
-            self.freqs_cis,
-            positions=positions,
-            inverse=True,
-        )
-
-        o = o.view(o.shape[0], self.n_local_groups, -1)
+        if _FP8_WO_A_GEMM and not _is_hip:
+            o = fused_rope_pack(
+                o,
+                self.freqs_cis,
+                positions=positions,
+                num_groups=self.n_local_groups,
+                inverse=True,
+            )
+        else:
+            fused_rope_inplace(
+                o[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+                inverse=True,
+            )
+            o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
 
             T, G, D = o.shape
             R = self.o_lora_rank
+            o_quant = (
+                o.view(T * G, D)
+                if not _is_hip
+                else o.reshape(T * G, D).contiguous()
+            )
             o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                o.reshape(T * G, D).contiguous(),
+                o_quant,
                 group_size=128,
             )
             o_s = deep_gemm.ceil_to_ue8m0(o_s)
