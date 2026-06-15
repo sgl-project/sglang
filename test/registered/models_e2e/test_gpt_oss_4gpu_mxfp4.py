@@ -3,8 +3,8 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.gpt_oss_common import BaseTestGptOss
 
-register_cuda_ci(est_time=220, stage="base-c", runner_config="4-gpu-h100")
-register_cuda_ci(est_time=220, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=152, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=139, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestGptOss4GpuMxfp4(BaseTestGptOss):

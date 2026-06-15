@@ -11,7 +11,7 @@ from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
-register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=81, stage="extra-a", runner_config="1-gpu-small")
 
 
 _CHUNKED_PREFILL_SIZE = 2048

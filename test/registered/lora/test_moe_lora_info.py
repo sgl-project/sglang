@@ -6,7 +6,7 @@ import torch
 from sglang.srt.lora.backend.base_backend import _compute_moe_lora_info
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 
 def _expected_adapter_enabled(

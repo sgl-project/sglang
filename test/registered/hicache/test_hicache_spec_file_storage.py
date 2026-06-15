@@ -17,7 +17,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.hicache_spec_storage_common import HiCacheSpecStorageMixin
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=200, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=155, stage="extra-a", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(is_hip(), "HiCache + EAGLE3 file-storage loadback e2e is CUDA-only.")

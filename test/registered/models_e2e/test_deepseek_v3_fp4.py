@@ -7,7 +7,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 # Per-commit: SymmetricMemory variant only.
 # - TestDeepseekV3FP4 (TRTLLM) archived to test/manual/quant/test_deepseek_v3_fp4_4gpu_trtllm.py
 # - TestDeepseekV3FP4CutlassMoE moved to test_deepseek_v3_fp4_4gpu_extra.py
-register_cuda_ci(est_time=960, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=439, stage="base-c", runner_config="4-gpu-b200")
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 

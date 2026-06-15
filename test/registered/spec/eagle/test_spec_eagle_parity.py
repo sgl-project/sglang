@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_server_kits import SpecParityKit
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
-register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=151, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestEagle3Parity(SpecParityKit, Eagle3Base):

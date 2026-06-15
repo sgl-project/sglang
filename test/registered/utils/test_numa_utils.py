@@ -14,9 +14,9 @@ from sglang.srt.utils.numa_utils import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
-register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cuda_ci(est_time=9, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=6, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestIsNumaAvailable(unittest.TestCase):

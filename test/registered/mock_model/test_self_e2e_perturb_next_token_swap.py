@@ -5,7 +5,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mock_model.perturb_e2e_base import MockModelPerturbE2EBase
 
-register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=43, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestPerturbNextTokenSwap(MockModelPerturbE2EBase):
