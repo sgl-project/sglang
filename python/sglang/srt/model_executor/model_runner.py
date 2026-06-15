@@ -3289,38 +3289,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch_template=forward_batch,
         )
 
+    def _resolve_eager_decode_pdmux(
+        self,
+    ) -> Tuple[Any, contextlib.AbstractContextManager]:
+        """Resolve the (attn_backend, forward_context) the eager decode forward
+        runs under, in one place.
+
+        PDmux is the only thing that diverges from the plain eager decode path:
+        it selects a per-stream attention backend (``decode_attn_backend``) and
+        publishes it to model-layer readers (RadixAttention etc.) via an active
+        ``ForwardContext`` so they dispatch against the right backend for this
+        forward. Non-pdmux uses ``attn_backend`` and the ambient context (no
+        override). Collapsing the scattered ``enable_pdmux`` checks here lets the
+        runner own the pdmux entry later (step 15 Phase 0 prerequisite).
+        """
+        if self.server_args.enable_pdmux:
+            return self.decode_attn_backend, forward_context(
+                ForwardContext(attn_backend=self.decode_attn_backend)
+            )
+        return self.attn_backend, contextlib.nullcontext()
+
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        enable_pdmux = self.server_args.enable_pdmux
         if (
             self.decode_runner is not None
             and getattr(self.decode_runner, "eager", False)
-            and not self.server_args.enable_pdmux
+            and not enable_pdmux
         ):
             # Unified eager decode: DecodeRunner + EagerBackend. The runner's
             # execute() does the registry fill + metadata + live forward via
             # EagerBackend.run — the eager dual of cuda-graph replay.
             return self.decode_runner.execute(forward_batch, pp_proxy_tensors)
 
-        if not self.server_args.enable_pdmux:
+        attn_backend, pdmux_ctx = self._resolve_eager_decode_pdmux()
+        if not enable_pdmux:
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
         # Set extra arguments
-        pdmux_override = False
         if forward_batch.needs_forward_metadata_init():
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 self.model.prepare_forward_batch(forward_batch)
-            if self.server_args.enable_pdmux:
-                self.decode_attn_backend.init_forward_metadata(forward_batch)
-                # PDmux selects a per-stream backend; publish it to model-layer
-                # readers via the active ForwardContext so RadixAttention etc.
-                # dispatch against the right backend for this forward.
-                pdmux_override = True
-            else:
-                self.attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
@@ -3333,21 +3347,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
 
-        def _do_forward():
+        with ctx, pdmux_ctx:
             return self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
             )
-
-        with ctx:
-            if pdmux_override:
-                with forward_context(
-                    ForwardContext(attn_backend=self.decode_attn_backend)
-                ):
-                    return _do_forward()
-            return _do_forward()
 
     def forward_extend(
         self,
