@@ -1,4 +1,6 @@
-"""Unit tests for the streaming-session in-place token-array share protocol
+"""Unit tests for the fill_ids reconstruction-overhead reduction (PR #27965).
+
+Correctness of the streaming-session in-place token-array share protocol
 (`Session.create_req` / `finish_req` / `abort_req`):
 
 - token arrays are extended in place and shared across turns (no per-turn copy);
@@ -6,6 +8,19 @@
   turn that aborted before finishing (mid-turn and first-turn aborts);
 - max_new_tokens overshoot falls back to a fill_ids rebuild instead of
   carrying an inconsistent array.
+
+Performance regression guards for the same feature. These pin the *allocation
+behavior* of the fill_ids path, which a correctness test cannot: the optimized
+and the naive forms emit byte-identical token sequences, so only object
+identity / no-copy assertions tell them apart. Each fails (red) if its
+mechanism is reverted to the O(context)-per-step form:
+
+- `Req._refresh_fill_ids` extends one array in place across decode steps; the
+  old `full_untruncated_fill_ids = origin_input_ids + output_ids` rebuilt (and
+  decref'd) the whole array every step -> a new object each call;
+- `RadixKey(token_ids, limit=...)` caps the logical length by reference; the
+  old call site sliced `full_untruncated_fill_ids[:max_prefix_len]`, copying
+  O(context) tokens for every prefill-batch build.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -16,6 +31,8 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.test_utils import CustomTestCase
@@ -157,6 +174,94 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(len(r2.full_untruncated_fill_ids), 0)  # carry skipped
         r2._refresh_fill_ids()
         self.assertEqual(list(r2.full_untruncated_fill_ids), list(r2.origin_input_ids))
+
+
+def _decode_req(prompt_len):
+    return Req(
+        rid="r",
+        origin_input_text="",
+        origin_input_ids=array("q", range(10, 10 + prompt_len)),
+        sampling_params=SamplingParams(max_new_tokens=4096),
+    )
+
+
+class TestFillIdsReuseAcrossDecode(CustomTestCase):
+
+    def test_refresh_reuses_one_array_across_decode_steps(self):
+        # The headline guard: across a long decode, fill_ids is grown in place,
+        # never reallocated. Old code reallocated origin+output every step.
+        req = _decode_req(prompt_len=64)
+        req._refresh_fill_ids()  # first call materializes the array
+        fill = req.full_untruncated_fill_ids
+
+        # Materialized fill must be its own array, not the origin (extending it
+        # in place would otherwise corrupt origin_input_ids).
+        self.assertIsNot(fill, req.origin_input_ids)
+        origin_len = len(req.origin_input_ids)
+
+        for step in range(256):
+            req.output_ids.append(50_000 + step)
+            req._refresh_fill_ids()
+            self.assertIs(
+                req.full_untruncated_fill_ids,
+                fill,
+                msg=f"fill_ids reallocated at decode step {step}",
+            )
+
+        # Origin untouched; in-place growth produced the correct sequence.
+        self.assertEqual(len(req.origin_input_ids), origin_len)
+        self.assertEqual(
+            list(req.full_untruncated_fill_ids),
+            list(req.origin_input_ids) + list(req.output_ids),
+        )
+
+    def test_refresh_appends_only_the_new_tokens(self):
+        # A partial bake (mix_with_running refreshes mid-decode) leaves some
+        # output already folded in; the next refresh must append only the tail,
+        # still in place.
+        req = _decode_req(prompt_len=8)
+        req.output_ids.extend([1, 2, 3])
+        req._refresh_fill_ids()
+        fill = req.full_untruncated_fill_ids
+        self.assertEqual(list(fill), list(req.origin_input_ids) + [1, 2, 3])
+
+        req.output_ids.extend([4, 5])
+        req._refresh_fill_ids()
+        self.assertIs(req.full_untruncated_fill_ids, fill)
+        self.assertEqual(list(fill), list(req.origin_input_ids) + [1, 2, 3, 4, 5])
+
+
+class TestRadixKeyLimit(CustomTestCase):
+
+    def test_limit_caps_logical_length_by_reference(self):
+        arr = array("q", range(4096))
+        key = RadixKey(arr, limit=10)
+        # Capping must not copy the (potentially huge) backing array.
+        self.assertIs(key.token_ids, arr)
+        self.assertEqual(len(key), 10)
+        self.assertEqual(list(key), list(range(10)))
+
+    def test_uncapped_raw_token_ids_avoids_copy(self):
+        arr = array("q", range(4096))
+        # No limit, or a limit at/above the length, returns the array itself.
+        self.assertIs(RadixKey(arr).raw_token_ids(), arr)
+        self.assertIs(RadixKey(arr, limit=len(arr)).raw_token_ids(), arr)
+        self.assertIs(RadixKey(arr, limit=len(arr) + 100).raw_token_ids(), arr)
+
+    def test_capped_raw_token_ids_copies_only_the_cap(self):
+        arr = array("q", range(4096))
+        raw = RadixKey(arr, limit=10).raw_token_ids()
+        self.assertIsNot(raw, arr)
+        self.assertEqual(list(raw), list(range(10)))
+
+    def test_match_clamps_to_limit(self):
+        # Two keys over identical backing arrays; the capped one must not match
+        # past its limit even though the raw tokens agree further.
+        arr = array("q", range(4096))
+        capped = RadixKey(arr, limit=10)
+        full = RadixKey(arr)
+        self.assertEqual(capped.match(full), 10)
+        self.assertEqual(full.match(capped), 10)
 
 
 if __name__ == "__main__":
