@@ -3574,7 +3574,7 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        server_args = get_global_server_args()
+        server_args = vars(get_global_server_args())
         last_gen_throughput = self.metrics_reporter.last_gen_throughput
         memory_usage = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),

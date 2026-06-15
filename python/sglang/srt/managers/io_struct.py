@@ -51,7 +51,6 @@ from sglang.srt.observability.trace import (
     TraceSpanContext,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 
@@ -1749,7 +1748,7 @@ class GetInternalStateReq(BaseReq, kw_only=True):
 
 
 class GetInternalStateReqOutput(BaseReq, kw_only=True):
-    server_args: ServerArgs
+    server_args: Dict[str, Any]
     last_gen_throughput: float
     memory_usage: Dict[str, Union[float, int]]
     effective_max_running_requests_per_dp: int
@@ -1760,14 +1759,14 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
 # The ServerArgs has a lot of fields with different types
 # let's use object to make it serialize/deserialize via pickle for now
 class SetInternalStateReq(BaseReq, kw_only=True):
-    server_args: Dict[str, object]
+    server_args: Dict[str, Any]
 
 
 # The ServerArgs has a lot of fields with different types
 # let's use object to make it serialize/deserialize via pickle for now
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
-    server_args: Dict[str, object]
+    server_args: Dict[str, Any]
 
 
 class ProfileReqType(Enum):
