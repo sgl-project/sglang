@@ -89,6 +89,7 @@ class FeedForward(nn.Module):
         activation_fn: str = "geglu",
         inner_dim=None,
         bias: bool = True,
+        enable_fused_gelu: bool = True,
     ):
         super().__init__()
         if inner_dim is None:
@@ -100,7 +101,9 @@ class FeedForward(nn.Module):
         if activation_fn == "gelu-approximate":
             # Fused tanh-GELU (cublasLt epilogue); same `proj` checkpoint keys as
             # the diffusers GELU, with a safe fallback for unsupported layers.
-            act_fn = FusedTanhGELU(dim, inner_dim, bias=bias)
+            act_fn = FusedTanhGELU(
+                dim, inner_dim, bias=bias, disable_fused=not enable_fused_gelu
+            )
         elif activation_fn == "geglu":
             act_fn = GEGLU(dim, inner_dim, bias=bias)
         elif activation_fn == "geglu-approximate":
