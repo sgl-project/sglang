@@ -346,6 +346,18 @@ def _pre_permute_deepep_to_aiter(
         running_state["aiter_combine_topk_weights"] = (
             dispatch_output.origin_topk_weights
         )
+        if torch.cuda.is_current_stream_capturing():
+            cap = (
+                dispatch_output.origin_topk_ids.shape[0]
+                * get_moe_expert_parallel_world_size()
+            )
+            cap = cap if cap > 0 else hidden_states.shape[0]
+
+            hidden_states = hidden_states[:cap]
+            if a1_scale is not None:
+                a1_scale = a1_scale[:cap]
+            topk_ids = topk_ids[:cap]
+            topk_weights = topk_weights[:cap]
     else:
         # DeepEP marks invalid topk slots with idx == -1; AITER cannot accept
         # negative ids, so reroute them to the sink slot at index
