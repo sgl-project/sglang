@@ -29,7 +29,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 # ---------------------------------------------------------------------------
 # Parallel topology: sizes + ranks + long-lived group handles, co-located
@@ -238,6 +241,14 @@ class Metrics:
 
 @dataclass(slots=True)
 class RuntimeContext:
+    # Config provenance: the resolved ServerArgs the four subsystems below are
+    # derived FROM (parallel.tp_size, flags.attn.use_mla_backend are projections of
+    # it). It sits at the container root — a sibling-by-position of the subsystem
+    # namespaces, NOT a fifth subsystem and NOT a ".config" kind-bucket. Held BY
+    # REFERENCE (never copied/replaced), so it stays the same live object every
+    # imperative ``server_args.X = ...`` mutates and ``get_global_server_args()``
+    # returns. ``None`` only for hand-built test contexts that don't seed config.
+    server_args: Optional["ServerArgs"] = None
     parallel: ParallelContext = field(default_factory=ParallelContext)
     flags: Flags = field(default_factory=Flags)
     buffers: BufferStore = field(default_factory=BufferStore)
@@ -369,6 +380,13 @@ def reset_context() -> None:
 # ---------------------------------------------------------------------------
 # Flags read / write surface (one getter, one generic setter).
 # ---------------------------------------------------------------------------
+
+
+def get_server_args() -> "ServerArgs":
+    """The config provenance — the live ``ServerArgs`` this context was built from
+    (held by reference). Mirrors ``get_flags()`` / ``get_parallel()``. The legacy
+    ``get_global_server_args()`` is an identity-preserving delegating shim over this."""
+    return get_context().server_args
 
 
 def get_flags() -> Flags:

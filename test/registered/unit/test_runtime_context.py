@@ -20,6 +20,7 @@ from sglang.srt.runtime_context import (
     get_attn_tp_size,
     get_context,
     get_flags,
+    get_server_args,
     get_tp_rank,
     get_tp_size,
     has_context,
@@ -322,6 +323,67 @@ class TestFromModelRunner(unittest.TestCase):
         self.assertEqual(ctx.parallel.attn_tp_size, 2)
         self.assertEqual(ctx.parallel.tp_group, "TPG")
         self.assertTrue(ctx.flags.attn.use_mla_backend)
+
+
+class TestServerArgsShim(unittest.TestCase):
+    """P1b: ctx.server_args root field + the identity-preserving
+    get_global_server_args() delegating shim (context path wins; legacy global is
+    the pre-publish fallback; exact unset-raise message preserved)."""
+
+    def setUp(self):
+        reset_context()
+        self._clear_legacy()
+
+    def tearDown(self):
+        reset_context()
+        self._clear_legacy()
+
+    @staticmethod
+    def _clear_legacy():
+        import sglang.srt.server_args as sa
+
+        sa._global_server_args = None
+
+    def test_shim_returns_context_server_args_by_identity(self):
+        from sglang.srt.server_args import get_global_server_args
+
+        sentinel = object()  # the shim returns it verbatim, no isinstance check
+        set_context(RuntimeContext(server_args=sentinel))
+        self.assertIs(get_global_server_args(), sentinel)
+        self.assertIs(get_server_args(), sentinel)
+        self.assertIs(get_context().server_args, sentinel)
+
+    def test_shim_falls_back_to_legacy_global_when_no_context(self):
+        from sglang.srt.server_args import (
+            get_global_server_args,
+            set_global_server_args_for_scheduler,
+        )
+
+        self.assertFalse(has_context())
+        sentinel = object()
+        set_global_server_args_for_scheduler(sentinel)
+        self.assertIs(get_global_server_args(), sentinel)
+
+    def test_shim_uninit_raises_exact_message(self):
+        from sglang.srt.server_args import get_global_server_args
+
+        with self.assertRaises(ValueError) as cm:
+            get_global_server_args()
+        self.assertEqual(str(cm.exception), "Global server args is not set yet!")
+
+    def test_in_place_mutation_visible_through_both_handles(self):
+        # identity guarantee: writing THROUGH the shim's return value is visible on
+        # ctx.server_args (the same live object) — the basis for keeping the 9+ in-
+        # place ModelRunner mutations working without flipping their call-sites.
+        from types import SimpleNamespace
+
+        from sglang.srt.server_args import get_global_server_args
+
+        sa = SimpleNamespace(use_mla_backend=False)
+        set_context(RuntimeContext(server_args=sa))
+        get_global_server_args().use_mla_backend = True
+        self.assertTrue(get_context().server_args.use_mla_backend)
+        self.assertIs(get_global_server_args(), sa)
 
 
 if __name__ == "__main__":

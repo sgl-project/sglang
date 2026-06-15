@@ -8325,6 +8325,20 @@ set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
 
 
 def get_global_server_args() -> ServerArgs:
+    # Identity-preserving delegating shim (Global Context P1b). When a
+    # RuntimeContext is published, it owns the SAME live ServerArgs object (built
+    # by reference), so this returns ctx.server_args — every in-place mutation
+    # through the returned object stays visible, and the ~336 srt call-sites are
+    # byte-for-byte unchanged. Deferred import: server_args.py is imported very
+    # early, so importing runtime_context lazily avoids any load-order coupling.
+    # The legacy _global_server_args fallback covers the pre-publish window and is
+    # removed in P8 (when the shim returns ctx.server_args unconditionally).
+    from sglang.srt.runtime_context import get_context, has_context
+
+    if has_context():
+        ctx_server_args = get_context().server_args
+        if ctx_server_args is not None:
+            return ctx_server_args
     if _global_server_args is None:
         raise ValueError("Global server args is not set yet!")
 
