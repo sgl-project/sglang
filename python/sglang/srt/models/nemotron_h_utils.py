@@ -57,11 +57,12 @@ def _build_layer_scatter_modes() -> LayerScatterModes:
 
 
 def make_layer_communicator(
-    layer_norm: RMSNorm, *, for_attn: bool
+    layer_norm: RMSNorm, *, for_attn: bool, allow_reduce_scatter: bool = False
 ) -> LayerCommunicator:
     return LayerCommunicator(
         layer_scatter_modes=_build_layer_scatter_modes(),
         input_layernorm=layer_norm if for_attn else nn.Identity(),
         post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
         force_layernorm_before_dp_gather=True,
+        allow_reduce_scatter=allow_reduce_scatter,
     )

@@ -14,6 +14,7 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
@@ -432,7 +433,7 @@ class NGRAMWorker(BaseSpecWorker):
                 predict,
                 accept_lens,
                 accept_index,
-            ) = verify_input.sample(batch, logits_output, vocab_mask)
+            ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
