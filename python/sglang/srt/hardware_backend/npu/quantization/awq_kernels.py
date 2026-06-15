@@ -50,29 +50,27 @@ class AWQAscendLinearKernel:
         npu_ok = (group_size == 0) or (group_size % 32 == 0 and 32 <= group_size < K)
     
         if npu_ok:
-            # ----- NPU path -----
-            # 1) Pack weight with XOR (signed int4)
+            # ----- NPU path (unsigned weight + raw zero point) -----
+            # 1) Pack weight as unsigned nibbles (NO XOR)
             qweight_tmp = torch.zeros_like(raw_qweight)
             for i in range(pack_factor):
                 shift_num = shifts[i] * 4
                 qweight_tmp.bitwise_or_(
                     ((raw_qweight >> shift_num) & 0xF) << (4 * i)
                 )
-            qweight_tmp.bitwise_xor_(0x88888888)
-    
-            # 2) Compute offset = zero_point - 8
+        
+            # 2) Compute offset = zero_point (unsigned)
             zeros_u8 = torch.zeros((num_groups, N), dtype=torch.int8, device=raw_qzeros.device)
             for i in range(pack_factor):
                 shift = shifts[i] * 4
                 nib_z = (raw_qzeros >> shift) & 0xF
                 zeros_u8[:, i::pack_factor] = nib_z.to(torch.int8)
-            offset = (zeros_u8.float() - 8.0).to(layer.scales.dtype)   # (groups, N)
-    
+            offset = zeros_u8.float().to(layer.scales.dtype)   # (groups, N)
+        
             layer.register_parameter("weight", torch.nn.Parameter(qweight_tmp, requires_grad=False))
             layer.register_parameter("zeros", torch.nn.Parameter(offset, requires_grad=False))
             layer.use_npu_matmul = True
             layer.npu_group_size = group_size
-            # scales already registered
         else:
             # ----- Fallback: asymmetric dequantisation -----
             weight_u8 = torch.zeros((K, N), dtype=torch.int8, device=raw_qweight.device)
@@ -111,22 +109,22 @@ class AWQAscendLinearKernel:
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         reshaped_x = x.reshape(-1, x.shape[-1])
-        pack_factor = self.quant_config.pack_factor   # <-- add this line
+        pack_factor = self.quant_config.pack_factor
     
         if layer.use_npu_matmul:
-            qweight = layer.weight          # (K, N//pack_factor) int32, XORed
+            qweight = layer.weight          # (K, N//pack) int32, unsigned
             scales = layer.scales           # (groups, N)
-            offset = layer.zeros            # (groups, N)
+            offset = layer.zeros            # (groups, N) raw zero point
+        
             out_shape = x.shape[:-1] + (qweight.shape[1] * pack_factor,)
-    
             if bias is not None and bias.dtype == torch.bfloat16:
                 bias = bias.float()
-    
+        
             out = torch_npu.npu_weight_quant_batchmatmul(
                 reshaped_x,
                 qweight,
                 antiquant_scale=scales,
-                antiquant_offset=offset,
+                antiquant_offset=offset,           # raw zero point
                 antiquant_group_size=layer.npu_group_size,
                 bias=bias,
             )
