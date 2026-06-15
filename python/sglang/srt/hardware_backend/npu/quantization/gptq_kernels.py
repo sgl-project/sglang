@@ -211,7 +211,7 @@ class GPTQMoEAscendKernel:
                 w13_qweight_tmp.reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1),
                 requires_grad=False,
             )
-            print(torch.ops.npu.get_npu_format(layer.w13_qweight))
+            #print(torch.ops.npu.get_npu_format(layer.w13_qweight))
         # use int8 to store weight by default
         else:
             layer.w13_qweight = torch.nn.Parameter(
