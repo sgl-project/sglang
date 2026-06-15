@@ -373,7 +373,6 @@ class EmbeddingData:
             self.shape = embedding_shape
         else:
             self.shape = list(embedding.shape) if embedding is not None else None
-        self.cached_embedding = None
         self.error_msg = error_msg
         self.error_code = error_code
         # Store additional metadata (e.g., video_timestamps for qwen3_vl)
@@ -403,8 +402,7 @@ class EmbeddingData:
             error_code=self.error_code,
         )
         for key, value in self.__dict__.items():
-            # cached_embedding is a GPU tensor used only by mooncake's in-process
-            if key.startswith("_") or key in ("embedding", "cached_embedding"):
+            if key.startswith("_") or key in ("embedding",):
                 continue
             setattr(new_data, key, value)
         return new_data
@@ -930,67 +928,48 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             self.recv_socket.close()
 
     async def _send_encode_and_rdma_request(self):
+        # Build the per-part (encoder_idx, part_idx, part_req_id) map for /scheduler_receive_meta_dat
         modalities = list(self.num_items_assigned.keys())
-        _, modality_num_parts = calculate_modality_num_parts(
+        total_num_parts, modality_num_parts = calculate_modality_num_parts(
             modalities, self.num_items_assigned
         )
         encode_requests = []
-        # Use the URL list captured at tokenizer time.  TokenizedGenerateReqInput
-        # has no image_data field, so reading recv_req.image_data here would
-        # always return None and produce empty mm_items.
-        mm_data_all = self.recv_req.mm_data_mooncake or []
-
-        total_num_parts = sum(modality_num_parts.values())
         part_idx_offset = 0
         for modality in modalities:
             assigned_nums = self.num_items_assigned[modality]
-            num_parts = modality_num_parts[modality]
-            mm_data_modality = [d for d in mm_data_all if d["modality"] == modality]
-            cum_num_items = 0
             cum_idx = 0
             for idx, assigned_num in enumerate(assigned_nums):
                 if assigned_num == 0:
                     continue
                 part_idx = part_idx_offset + cum_idx
-                part_req_id = create_part_req_id(self.recv_req.rid, part_idx)
                 encode_requests.append(
                     {
                         "encoder_idx": idx,
-                        "mm_items": [
-                            d["url"]
-                            for d in mm_data_modality[
-                                cum_num_items : cum_num_items + assigned_num
-                            ]
-                        ],
-                        "num_parts": total_num_parts,
                         "part_idx": part_idx,
-                        "req_id": part_req_id,
-                        "modality": modality.name,
-                        "prefill_host": self.host_name,
-                        "embedding_port": self.embedding_port,
+                        "req_id": create_part_req_id(self.recv_req.rid, part_idx),
                     }
                 )
                 cum_idx += 1
-                cum_num_items += assigned_num
-            part_idx_offset += num_parts
+            part_idx_offset += modality_num_parts[modality]
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
         ) as session:
-            # Phase 1: POST /encode to all encoder shards in parallel.
+            # Phase 1: pull per-part metadata (nbytes/len/dim) from each encoder shard.
             tasks = [
                 session.post(
-                    f"{self.encoder_urls[r['encoder_idx']]}/encode",
-                    json=r,
+                    f"{self.encoder_urls[r['encoder_idx']]}/scheduler_receive_meta_data",
+                    json={"req_id": r["req_id"], "part_idx": r["part_idx"]},
                 )
                 for r in encode_requests
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-            if not await self._check_encoder_responses(responses, "/encode"):
+            if not await self._check_encoder_responses(
+                responses, "/scheduler_receive_meta_data"
+            ):
                 return
             response_json_list = [await r.json() for r in responses]
 
-            # Sort by part_idx
             embedding_sizes, response_sorted, total_bytes = (
                 _sort_responses_and_compute_total_bytes(
                     response_json_list, total_num_parts
@@ -1046,20 +1025,23 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 buffer_address = 0
 
             # Phase 2 cont: POST /send with RDMA info.
+            encode_requests_by_part = {r["part_idx"]: r for r in encode_requests}
             offset = 0
             send_tasks = []
             for idx in range(total_num_parts):
                 rj = response_sorted[idx]
-                encoder_idx = rj.pop("encoder_idx", None)
                 rj.update(
                     {
+                        "prefill_host": self.host_name,
+                        "embedding_port": self.embedding_port,
                         "session_id": self.embeddings_engine.session_id,
                         "buffer_address": offset + buffer_address,
+                        "receive_count": self.receive_count,
                     }
                 )
                 send_tasks.append(
                     session.post(
-                        f"{self.encoder_urls[encoder_idx]}/send",
+                        f"{self.encoder_urls[encode_requests_by_part[idx]['encoder_idx']]}/send",
                         json=rj,
                     )
                 )
@@ -1711,15 +1693,6 @@ class MMReceiverBase(ABC):
             # Freeze the encoder URL snapshot onto obj so the scheduler
             # subprocess uses the same list when indexing encoder_idx.
             obj.encoder_urls = encode_urls
-
-            # For mooncake, No tokenizer-side thread.
-            # Save mm_data (extracted URL list) onto obj so the scheduler-side
-            # WaitingImageRDMARequest can use it.  TokenizedGenerateReqInput does
-            # NOT carry image_data, so re-reading recv_req.image_data at scheduler
-            # time would always return None.
-            if self.encoder_transfer_backend == "mooncake":
-                obj.mm_data_mooncake = mm_data
-                return
 
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,
