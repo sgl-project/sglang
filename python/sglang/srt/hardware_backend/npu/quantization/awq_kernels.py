@@ -28,14 +28,14 @@ class AWQAscendLinearKernel:
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Original scales are (K // group_size, N) → transpose to (N, K // group_size)
+        # Transpose scales from (num_groups, N) to (N, num_groups)
         layer.scales = torch.nn.Parameter(
             layer.scales.data.transpose(0, 1).contiguous(), requires_grad=False
         )
 
-        # Unpack qweight and qzeros
+        # Unpack qweight and qzeros – keep weight in original (K, N // pack_factor)
         qweight_tmp = torch.zeros_like(layer.qweight.data)   # (K, N // pack_factor) int32
-        qzeros_tmp = layer.qzeros.data
+        qzeros_tmp = layer.qzeros.data                        # (K // group_size, N // pack_factor) int32
         qzeros_list = []
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
 
@@ -48,20 +48,16 @@ class AWQAscendLinearKernel:
 
         qweight_tmp.bitwise_xor_(0x88888888)
 
-        # qzeros unpacking
-        qzeros_tmp = torch.cat(qzeros_list, dim=-1)  # (num_groups * pack_factor, N // pack_factor) ?
-        # After unpacking, each row expands by pack_factor along columns → shape (num_groups, N)
-        qzeros_tmp = qzeros_tmp.reshape(layer.qzeros.shape[0], -1)   # (num_groups, N)
+        # Unpacked zeros shape: (K // group_size, N) after concatenation and reshape
+        qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(layer.qzeros.shape[0], -1)
         qzeros_tmp = -(qzeros_tmp - 8)
         qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
 
-        # Transpose zeros to (N, num_groups) to match scales
+        # Transpose zeros to (N, K // group_size)
         qzeros_tmp = qzeros_tmp.transpose(0, 1).contiguous()
 
         layer.zeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
-
-        # Transpose weight from (K, N // pack_factor) to (N, K // pack_factor)
-        qweight_tmp = qweight_tmp.transpose(0, 1).contiguous()
+        # Weight remains (K, N // pack_factor) – do NOT transpose
         layer.weight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
 
     def apply(
@@ -70,28 +66,26 @@ class AWQAscendLinearKernel:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qweight = layer.weight          # (N, K // pack_factor)
-        scales = layer.scales           # (N, 1) or (N, num_groups)
-        qzeros = layer.zeros            # (N, 1) or (N, num_groups)
+        qweight = layer.weight          # (K, N // pack_factor)
+        scales = layer.scales           # (N, 1) or (N, K // group_size)
+        qzeros = layer.zeros            # (N, 1) or (N, K // group_size)
         pack_factor = self.quant_config.pack_factor
-        out_shape = x.shape[:-1] + (qweight.shape[0],)
+        out_shape = x.shape[:-1] + (qweight.shape[1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        K = qweight.shape[1] * pack_factor   # input features
+        K = qweight.shape[0]            # input features (K) – first dimension
 
         # Derive group_size from scales
         if scales.ndim == 2 and scales.shape[1] == 1:
             group_size = 0                     # per‑channel
         elif scales.ndim == 2:
-            num_groups = scales.shape[1]       # K // group_size
+            num_groups = scales.shape[1]       # = K // group_size
             if K % num_groups != 0:
                 raise RuntimeError(f"K={K} not divisible by scale groups {num_groups}")
             group_size = K // num_groups
-            # NPU constraint: must be multiple of 32, between 32 and K-1
+            # NPU constraint
             if group_size % 32 != 0 or not (32 <= group_size <= K - 1):
-                raise RuntimeError(
-                    f"Derived group_size={group_size} is invalid for NPU"
-                )
+                raise RuntimeError(f"Derived group_size={group_size} is invalid for NPU")
         else:
             raise RuntimeError(f"Unexpected scale shape: {scales.shape}")
 
