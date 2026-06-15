@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -19,6 +21,18 @@ class IntelAMXAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+
+        # full->SWA translated out_cache_loc, computed once per forward (the only
+        # set_kv_buffer is in eager forward_extend; decode writes KV in-kernel).
+        self.use_sliding_window_kv_pool = (
+            isinstance(self.token_to_kv_pool, SWAKVPool)
+            and self.token_to_kv_pool.swa_layer_nums > 0
+        )
+        self.swa_out_cache_loc = None
 
         self.num_head = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -57,6 +71,15 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
         self.forward_metadata = (attn_logits, max_extend_len)
 
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            self.swa_out_cache_loc = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
+        else:
+            self.swa_out_cache_loc = None
+
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
 
@@ -94,6 +117,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks=None,
     ):
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -105,7 +129,12 @@ class IntelAMXAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
         if save_kv_cache and k is not None and v is not None:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            # Cross-attention never writes to the SWA pool, so only thread the
+            # full->SWA location for non-cross-attention layers.
+            swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, KVWriteLoc(cache_loc, swa_loc), k, v
+            )
 
         _, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
@@ -113,9 +142,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             k,
             v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.extend_seq_lens,
@@ -124,7 +153,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
+            layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
+            sinks,
         )
         return o
 
@@ -136,6 +167,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks=None,
     ):
         attn_logits, _ = self.forward_metadata
 
@@ -152,20 +184,22 @@ class IntelAMXAttnBackend(AttentionBackend):
         )
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             k,
             v,
             cache_loc,
             attn_logits,
-            forward_batch.req_to_token_pool.req_to_token,
+            self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
+            layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
+            sinks,
         )
         return o
 

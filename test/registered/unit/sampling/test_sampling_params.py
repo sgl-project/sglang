@@ -1,8 +1,10 @@
 """Unit tests for srt/sampling/sampling_params.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 import unittest
 from unittest.mock import MagicMock
@@ -87,6 +89,18 @@ class TestSamplingParamsVerify(CustomTestCase):
     def test_negative_temperature_raises(self):
         """Test that verify() rejects negative temperature (must be >= 0)."""
         sp = self._make(temperature=-0.5)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_nan_temperature_raises(self):
+        """verify() must reject NaN temperature; the bare < 0.0 check alone lets it through."""
+        sp = self._make(temperature=float("nan"))
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_inf_temperature_raises(self):
+        """verify() must reject non-finite (inf) temperature."""
+        sp = self._make(temperature=float("inf"))
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 

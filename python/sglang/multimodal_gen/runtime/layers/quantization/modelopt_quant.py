@@ -66,6 +66,29 @@ def _prepare_nvfp4_weight_bytes(
     return ((weight >> 4) | (weight << 4)).contiguous()
 
 
+def _swizzled_nvfp4_scales_to_linear(scales: torch.Tensor) -> torch.Tensor:
+    """Convert FlashInfer/CUTLASS-swizzled FP4 scales back to row-major layout."""
+    scale_ndim = scales.ndim
+    if scale_ndim == 2:
+        scales = scales.unsqueeze(0)
+    assert scales.ndim == 3
+
+    B, M, K = scales.shape
+    M_padded = round_up(M, 128)
+    K_padded = round_up(K, 4)
+    if M != M_padded or K != K_padded:
+        padded = torch.zeros(
+            (B, M_padded, K_padded), dtype=scales.dtype, device=scales.device
+        )
+        padded[:B, :M, :K] = scales
+        scales = padded
+
+    linear = scales.reshape(B, M_padded // 128, K_padded // 4, 32, 4, 4)
+    linear = linear.permute(0, 1, 4, 3, 2, 5).contiguous()
+    linear = linear.reshape(B, M_padded, K_padded)[:, :M, :K]
+    return linear.squeeze(0) if scale_ndim == 2 else linear
+
+
 def _require_flashinfer():
     if flashinfer is None:
         raise RuntimeError(
@@ -164,7 +187,7 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         return 89
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "ModelOptFp8Config":
+    def from_config(cls, config: Dict[str, Any]) -> ModelOptFp8Config:
         quant_method = config.get("quant_algo")
         exclude_modules = config.get("ignore")
         if quant_method is None:
@@ -203,6 +226,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         checkpoint_uses_packed_qkv: bool = False,
         swap_weight_nibbles: bool = False,
+        checkpoint_weight_scale_layout: str = "linear",
     ) -> None:
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -214,6 +238,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self.group_size = group_size
         self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
         self.swap_weight_nibbles = swap_weight_nibbles
+        self.checkpoint_weight_scale_layout = checkpoint_weight_scale_layout
 
     @classmethod
     def get_name(cls) -> str:
@@ -311,6 +336,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             packed_modules_mapping=config.get("packed_modules_mapping"),
             checkpoint_uses_packed_qkv=config.get("checkpoint_uses_packed_qkv", False),
             swap_weight_nibbles=swap_weight_nibbles,
+            checkpoint_weight_scale_layout=config.get(
+                "checkpoint_weight_scale_layout", "linear"
+            ),
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -405,7 +433,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):
-    """NVFP4 linear method using CUTLASS FP4 GEMM."""
+    """NVFP4 linear method using the selected FP4 GEMM backend."""
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
@@ -504,13 +532,18 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 self.quant_config, "swap_weight_nibbles", False
             ),
         )
+        scales = layer.weight_scale
+        if (
+            getattr(self.quant_config, "checkpoint_weight_scale_layout", "linear")
+            == "swizzled"
+        ):
+            scales = _swizzled_nvfp4_scales_to_linear(scales)
 
         _, flashinfer_backend = _get_fp4_gemm_op()
         if flashinfer_backend == "trtllm":
             flashinfer_ops = _require_flashinfer()
 
             weight, _ = pad_nvfp4_weight(w_swapped, n_alignment=128, k_alignment=0)
-            scales = layer.weight_scale
             if scales.shape[0] != weight.shape[0]:
                 pad_n = weight.shape[0] - scales.shape[0]
                 scales = torch.nn.functional.pad(scales, (0, 0, 0, pad_n))
@@ -550,7 +583,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.weights_padding_cols = weights_padding_cols
         copy_or_rebind_param(layer, "weight", weight)
 
-        scales = layer.weight_scale
         scale_ndim = scales.ndim
         if scale_ndim == 2:
             scales = scales.unsqueeze(0)

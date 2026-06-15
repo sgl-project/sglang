@@ -21,12 +21,14 @@ from __future__ import annotations
 import copy
 import uuid
 from abc import ABC
+from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Union
 
 import torch
+from pydantic import PlainValidator
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -39,6 +41,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -135,8 +138,13 @@ MultimodalDataInputFormat = Union[
 class GenerateReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can specify either text or input_ids
-    input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # The token ids for text.
+    #
+    # Use C-loop validator to replace Pydantic per-element type check for efficiency.
+    input_ids: Annotated[
+        Optional[Union[List[List[int]], List[int]]],
+        PlainValidator(validate_optional_list_i64_1d_2d),
+    ] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -150,6 +158,15 @@ class GenerateReqInput(BaseReq):
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
+    # Optional per-image hashes the caller has already computed (hex strings,
+    # one per image in `image_data`). When supplied, each MultimodalDataItem's
+    # `hash` is initialised from this list and `set_pad_value` skips the
+    # internal `hash_feature()` recompute, so the resulting `pad_value` is
+    # deterministic from the caller's hash. Intended for external KV routers
+    # that compute their own per-image hash for routing decisions and need
+    # sglang's prefix-cache key to align. When unset, behavior is unchanged
+    # (sglang hashes the processor feature tensor).
+    mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
     # The sampling_params. See descriptions below.
@@ -242,6 +259,9 @@ class GenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # Whether to return prompt token IDs without computing logprobs
+    return_prompt_token_ids: bool = False
+
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
@@ -249,6 +269,10 @@ class GenerateReqInput(BaseReq):
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+    mm_data_mooncake: Optional[List] = None
+    # Snapshot of encoder URLs at the time tokenizer-side computed
+    # ``num_items_assigned``.
+    encoder_urls: Optional[List[str]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -404,6 +428,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
+        self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -573,6 +598,21 @@ class GenerateReqInput(BaseReq):
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
             )
 
+    def _normalize_extra_key(self, num):
+        """Normalize extra_key for batch processing."""
+        if self.extra_key is None:
+            return
+        if isinstance(self.extra_key, str):
+            self.extra_key = [self.extra_key] * num
+        elif isinstance(self.extra_key, list):
+            if len(self.extra_key) != self.batch_size:
+                raise ValueError(
+                    "The length of extra_key should be equal to the batch size."
+                )
+            self.extra_key = self.extra_key * self.parallel_sample_num
+        else:
+            raise ValueError("extra_key should be a list or a string.")
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -689,11 +729,12 @@ class GenerateReqInput(BaseReq):
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
-            extra_key=self.extra_key,
+            extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             received_time=self.received_time,
@@ -712,7 +753,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
-    input_ids: List[int]
+    input_ids: Optional[array[int]]
     # The multimodal inputs
     mm_inputs: object
     # The sampling parameters
@@ -792,6 +833,11 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+    mm_data_mooncake: Optional[List] = None
+    # Encoder URL snapshot frozen at tokenizer-side dispatch time so that
+    # encoder_idx assignments stay consistent in the scheduler subprocess.
+    # Internal IPC only.
+    encoder_urls: Optional[List[str]] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
@@ -876,6 +922,9 @@ class EmbeddingReqInput(BaseReq):
 
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
+
+    # Whether to return prompt token IDs without computing logprobs
+    return_prompt_token_ids: bool = False
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
@@ -983,6 +1032,7 @@ class EmbeddingReqInput(BaseReq):
                 is_cross_encoder_request=True,
                 http_worker_ipc=self.http_worker_ipc,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
+                return_prompt_token_ids=self.return_prompt_token_ids,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
@@ -1012,6 +1062,7 @@ class EmbeddingReqInput(BaseReq):
                 http_worker_ipc=self.http_worker_ipc,
                 received_time=self.received_time,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
+                return_prompt_token_ids=self.return_prompt_token_ids,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
@@ -1027,7 +1078,7 @@ class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
-    input_ids: List[int]
+    input_ids: array[int]
     # The image inputs
     image_inputs: dict
     # The token type ids
@@ -1075,10 +1126,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
     decoded_texts: List[str]
-    decode_ids: List[int]
+    decode_ids: List[array[int]]
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[int]]
+    output_ids: Optional[List[array[int]]]
     # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
@@ -1640,7 +1691,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 @dataclass
 class CheckWeightsReqInput(BaseReq):
-    action: str
+    action: str = "checksum"
 
 
 @dataclass
@@ -1763,6 +1814,7 @@ class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
     log_requests_format: Optional[str] = None
+    log_level: Optional[str] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
@@ -1837,6 +1889,7 @@ class ParseFunctionCallReq(BaseReq):
 class SeparateReasoningReqInput(BaseReq):
     text: str  # The text to parse.
     reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
+    return_blocks: bool = False  # If True, also return segmented reasoning blocks.
 
 
 @dataclass
@@ -2050,6 +2103,14 @@ class GetLoadsReqOutput(BaseReq):
     )
     num_waiting_reqs: int = field(
         metadata={"metric": ("gauge", "Number of waiting requests")}
+    )
+    num_waiting_uncached_tokens: int = field(
+        metadata={
+            "metric": (
+                "gauge",
+                "Number of uncached input tokens waiting for prefill compute",
+            )
+        }
     )
     num_used_tokens: int = field(
         metadata={"metric": ("gauge", "Number of tokens in use")}

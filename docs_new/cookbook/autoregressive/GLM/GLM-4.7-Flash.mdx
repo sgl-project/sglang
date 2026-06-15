@@ -53,7 +53,7 @@ import { GLM47FlashDeployment } from "/src/snippets/autoregressive/glm-47-flash-
 
 ### 3.2 Configuration Tips
 
-For more detailed configuration tips, please refer to [GLM-4.7 Usage](../../../docs/basic_usage/glm45).
+- **EAGLE Speculative Decoding:** Supported for GLM-4.7-Flash. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default; pass `--disable-overlap-schedule` to disable. Enable via the interactive command generator above.
 
 ## 4. Model Invocation
 
@@ -144,6 +144,10 @@ The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
 **Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
 
 #### 4.2.2 Tool Calling
+
+<Note>
+**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm45`. GLM-4.7 and GLM-4.7-Flash use `--tool-call-parser glm47`. All GLM models use `--reasoning-parser glm45` regardless of generation.
+</Note>
 
 GLM-4.7-Flash supports tool calling capabilities. Enable the tool call parser:
 

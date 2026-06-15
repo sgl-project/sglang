@@ -1,10 +1,18 @@
-"""EAGLE3 draft model with MLA attention for Kimi-K2.5.
+"""EAGLE3 / EAGLE3.1 draft model with MLA attention for Kimi-K2.x.
 
 The ``kimi-k2.5-eagle3-mla`` checkpoint pairs an EAGLE3 layout
 (concatenated [embed_norm, hidden_norm] pre-attention input, fc projection
 over the concatenated multi-layer aux hidden states, single decoder layer,
 dense MLP) with DeepSeek-V2 multi-latent attention. Sharing the MLA layout
-with the Kimi-K2.5 target keeps the draft KV cache small.
+with the Kimi-K2.x target keeps the draft KV cache small.
+
+The eagle3.1 variant (e.g. ``kimi-k2.6-eagle3.1-mla``) adds two optional
+config flags on top of the same layout:
+
+* ``fc_norm``: per-chunk RMSNorm applied to each auxiliary hidden state
+  before the fc projection.
+* ``norm_output``: emit post-norm (rather than pre-norm) hidden states as
+  the auxiliary output consumed by the next draft step.
 """
 
 import copy
@@ -25,6 +33,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -191,17 +200,33 @@ class Eagle3MLAModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
+            **get_embedding_tp_kwargs(),
         )
 
         target_hidden_size = (
             getattr(config, "target_hidden_size", None) or config.hidden_size
         )
-        num_fc_input = _get_eagle_aux_layer_count(config)
+        self.num_aux_hidden_states = _get_eagle_aux_layer_count(config)
         self.fc = nn.Linear(
-            target_hidden_size * num_fc_input,
+            target_hidden_size * self.num_aux_hidden_states,
             config.hidden_size,
             bias=getattr(config, "bias", False),
         )
+
+        # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy
+        # `use_aux_norm` flag. Matches the eagle3.1 layout.
+        use_fc_norm = getattr(config, "fc_norm", None) or getattr(
+            config, "use_aux_norm", False
+        )
+        if use_fc_norm:
+            self.fc_norm = nn.ModuleList(
+                [
+                    RMSNorm(target_hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(self.num_aux_hidden_states)
+                ]
+            )
+        else:
+            self.fc_norm = None
 
         if config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
@@ -213,6 +238,9 @@ class Eagle3MLAModel(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Draft decode captures pre-norm hidden by default; eagle3.1 opts for
+        # post-norm via `norm_output: true`.
+        self.norm_output = getattr(config, "norm_output", False)
 
     def forward(
         self,
@@ -230,12 +258,13 @@ class Eagle3MLAModel(nn.Module):
             if (
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 assert embeds is not None
-                embeds = torch.cat(
-                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
-                )
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
             if embeds is None:
                 embeds = self.embed_tokens(input_ids)
         else:
@@ -243,6 +272,12 @@ class Eagle3MLAModel(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            if self.fc_norm is not None:
+                chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
+                hidden_states = torch.cat(
+                    [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                    dim=-1,
+                )
             hidden_states = self.fc(hidden_states)
 
         if hidden_states.shape[0] == 0:
@@ -260,7 +295,8 @@ class Eagle3MLAModel(nn.Module):
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
         )
-        return hidden_states_to_logits, [hidden_states_to_aux]
+        aux = hidden_states_to_logits if self.norm_output else hidden_states_to_aux
+        return hidden_states_to_logits, [aux]
 
 
 class Eagle3DeepseekV2ForCausalLM(nn.Module):
