@@ -101,12 +101,10 @@ If you encounter an error like “Terms of Service have not been accepted” dur
 conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
 conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/
 conda config --set show_channel_urls yes
-
-# Edit the system-level conda config to remove any hardcoded defaults
-vi /root/miniconda3/.condarc
-vi /root/.condarc
+conda config --remove channels defaults
 ```
-Inside /root/miniconda3/.condarc and /root/.condarc, delete or comment out any lines containing defaults or official Anaconda URLs.
+Edit the system-level conda config to remove any hardcoded defaults, e.g. vi ~/miniconda3/.condarc
+
 Then remove the failed environment and recreate it:
 ```bash Command
 conda clean -i
