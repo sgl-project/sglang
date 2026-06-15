@@ -210,6 +210,11 @@ class TreeComponent(ABC):
         is still tombstoned. Default no-op."""
         return None
 
+    def on_became_leaf(self, node: UnifiedTreeNode) -> None:
+        """Called when *node* becomes a device leaf because its only child was
+        deleted. Override to re-apply per-leaf invariants. Default no-op."""
+        return None
+
     def commit_insert_component_data(
         self,
         node: UnifiedTreeNode,
