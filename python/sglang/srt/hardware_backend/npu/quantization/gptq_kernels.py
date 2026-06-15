@@ -205,10 +205,10 @@ class GPTQMoEAscendKernel:
                     .to(torch.int32)
                 ).reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)'''
 
-            w13_qweight_tmp = npu_format_cast(w13_qweight_tmp)
+            w13_qweight_tmp = npu_format_cast(w13_qweight_tmp.transpose(1, 2))
             w13_qweight_tmp = self._pack_to_int32(w13_qweight_tmp)
             layer.w13_qweight = torch.nn.Parameter(
-                w13_qweight_tmp.reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1),
+                w13_qweight_tmp.transpose(1,2),
                 requires_grad=False,
             )
             #print(torch.ops.npu.get_npu_format(layer.w13_qweight))
