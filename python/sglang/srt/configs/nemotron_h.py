@@ -40,6 +40,39 @@ DEFAULT_MTP_LAYERS_BLOCK_TYPE = ["attention", "moe"]
 DEFAULT_MAMBA_CHUNK_SIZE = 256
 
 
+def _build_mamba2_cache_params(config):
+    """Build Mamba2CacheParams from any config exposing mamba fields.
+
+    Works with both sglang's NemotronHConfig (computed @properties) and
+    remote-code configs that define raw mamba fields but lack
+    `mamba_layer_ids` / `mamba2_cache_params` properties.
+    """
+    from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+    if hasattr(config, "mamba_layer_ids") and config.mamba_layer_ids is not None:
+        layers = list(config.mamba_layer_ids)
+    else:
+        pattern = config.hybrid_override_pattern
+        layers = [i for i, ch in enumerate(pattern) if ch == MAMBA]
+
+    n_groups = getattr(config, "n_groups", None)
+    if n_groups is None:
+        n_groups = getattr(config, "n_group", 1)
+
+    shape = Mamba2StateShape.create(
+        tp_world_size=get_attention_tp_size(),
+        intermediate_size=config.mamba_num_heads * config.mamba_head_dim,
+        n_groups=n_groups,
+        num_heads=config.mamba_num_heads,
+        head_dim=config.mamba_head_dim,
+        state_size=config.ssm_state_size,
+        conv_kernel=config.conv_kernel,
+    )
+    return Mamba2CacheParams(
+        shape=shape, layers=layers, dtype=mamba2_state_dtype(config)
+    )
+
+
 class NemotronHConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a
@@ -422,21 +455,7 @@ class NemotronHConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
-
-        shape = Mamba2StateShape.create(
-            tp_world_size=get_attention_tp_size(),
-            intermediate_size=self.mamba_num_heads * self.mamba_head_dim,
-            n_groups=self.n_groups,
-            num_heads=self.mamba_num_heads,
-            head_dim=self.mamba_head_dim,
-            state_size=self.ssm_state_size,
-            conv_kernel=self.conv_kernel,
-        )
-
-        return Mamba2CacheParams(
-            shape=shape, layers=self.mamba_layer_ids, dtype=mamba2_state_dtype(self)
-        )
+        return _build_mamba2_cache_params(self)
 
     @property
     def num_hidden_layers(self) -> int:
