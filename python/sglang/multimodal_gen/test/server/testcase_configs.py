@@ -545,6 +545,15 @@ TI2V_sampling_params = DiffusionSamplingParams(
     direct_url_test=True,
 )
 
+SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=TI2V_sampling_params.prompt,
+    image_path=TI2V_sampling_params.image_path,
+    direct_url_test=True,
+    output_size="384x640",
+    num_frames=17,
+    extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
+)
+
 TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
