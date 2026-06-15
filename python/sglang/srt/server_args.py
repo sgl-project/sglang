@@ -664,6 +664,7 @@ class ServerArgs:
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
     )
+    enable_fused_grouped_gemm_combine: bool = False
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -3764,6 +3765,50 @@ class ServerArgs:
                     "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
                 )
 
+        if self.enable_fused_grouped_gemm_combine:
+            if self.enable_single_batch_overlap:
+                raise ValueError(
+                    "--enable-fused-grouped-gemm-combine is incompatible with "
+                    "--enable-single-batch-overlap."
+                )
+            if not is_cuda():
+                raise ValueError(
+                    "--enable-fused-grouped-gemm-combine currently supports "
+                    "CUDA GPUs only."
+                )
+            if self.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "--enable-fused-grouped-gemm-combine requires "
+                    "--moe-a2a-backend deepep."
+                )
+            if self.moe_runner_backend != "flashinfer_cutedsl":
+                raise ValueError(
+                    "--enable-fused-grouped-gemm-combine requires "
+                    "--moe-runner-backend flashinfer_cutedsl."
+                )
+            if self.deepep_mode != "low_latency":
+                raise ValueError(
+                    "--enable-fused-grouped-gemm-combine requires "
+                    "--deepep-mode low_latency because DeepEP normal/prefill "
+                    "dispatch does not return combine-fusion metadata."
+                )
+            if self.quantization != "modelopt_fp4":
+                raise ValueError(
+                    "--enable-fused-grouped-gemm-combine requires "
+                    "--quantization modelopt_fp4."
+                )
+            if self.deepep_dispatcher_output_dtype not in ("auto", "nvfp4"):
+                raise ValueError(
+                    "--enable-fused-grouped-gemm-combine requires "
+                    "--deepep-dispatcher-output-dtype auto or nvfp4."
+                )
+            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
+                envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
+                logger.warning(
+                    "SGLANG_MOE_NVFP4_DISPATCH is set to True for "
+                    "fused grouped GEMM combine."
+                )
+
         if self.moe_a2a_backend == "mooncake":
             self.ep_size = self.tp_size
             logger.warning(
@@ -6315,6 +6360,14 @@ class ServerArgs:
             choices=["auto", "bf16", "fp8", "int8", "nvfp4"],
             default="auto",
             help="Select DeepEP dispatcher output dtype",
+        )
+        parser.add_argument(
+            "--enable-fused-grouped-gemm-combine",
+            action="store_true",
+            help=(
+                "Enable CUDA FlashInfer CuteDSL down-GEMM plus DeepEP "
+                "low-latency combine fusion for modelopt_fp4 MoE."
+            ),
         )
         parser.add_argument(
             "--ep-num-redundant-experts",

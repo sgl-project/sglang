@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
+    is_fused_grouped_gemm_combine_enabled,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
@@ -66,6 +67,15 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+_FUSED_GROUPED_GEMM_COMBINE_LOGGED_ACTIVE = False
+
+
+@dataclass
+class FusedGroupedGemmCombineArgs:
+    output_tensor: torch.Tensor
+    out_ptrs_tensor: torch.Tensor
+    output_handle: object
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -112,8 +122,29 @@ class DeepEPLLDispatchOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_LL
 
 
+class DeepEPLLFusedCombineDispatchOutput(NamedTuple):
+    """DeepEP low latency output with CUDA fused-combine metadata."""
+
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    masked_m: torch.Tensor
+    expected_m: int
+    recv_topk_weights: torch.Tensor
+    recv_rank_info: torch.Tensor
+    recv_idx_info: torch.Tensor
+    combine_out: torch.Tensor
+    combine_out_ptrs: torch.Tensor
+
+    @property
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.DEEPEP_LL
+
+
 assert isinstance(DeepEPNormalDispatchOutput, DispatchOutput)
 assert isinstance(DeepEPLLDispatchOutput, DispatchOutput)
+assert isinstance(DeepEPLLFusedCombineDispatchOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
@@ -824,6 +855,285 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
 
+def _should_use_cuda_fused_grouped_gemm_combine() -> bool:
+    return (
+        is_fused_grouped_gemm_combine_enabled()
+        and torch.cuda.is_available()
+        and not _is_npu
+        and not is_hip()
+    )
+
+
+class _DeepEPDispatcherImplLowLatencyFusedCombine(_DeepEPDispatcherImplLowLatency):
+    def __init__(self, return_recv_hook: bool, **kwargs):
+        super().__init__(return_recv_hook=return_recv_hook, **kwargs)
+        self._fused_grouped_gemm_combine_active = False
+        self._fused_grouped_gemm_combine_args: dict[
+            tuple[int, int, int, int, torch.dtype], FusedGroupedGemmCombineArgs
+        ] = {}
+
+    def _get_fused_grouped_gemm_combine_args(
+        self, hidden_states: torch.Tensor, buffer
+    ) -> FusedGroupedGemmCombineArgs:
+        if hidden_states.shape[0] > self.num_max_dispatch_tokens_per_rank:
+            raise ValueError(
+                "fused grouped GEMM combine requires the local batch size to be "
+                "less than or equal to "
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK "
+                f"({self.num_max_dispatch_tokens_per_rank}), got "
+                f"{hidden_states.shape[0]}."
+            )
+
+        # FlashInfer's fused-combine path is validated for BF16 output.
+        out_dtype = torch.bfloat16
+        device = hidden_states.device
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        group = getattr(buffer, "group", self.group)
+        cache_key = (
+            id(group),
+            device_index,
+            self.num_max_dispatch_tokens_per_rank,
+            hidden_states.shape[1],
+            out_dtype,
+        )
+        cache = self._fused_grouped_gemm_combine_args
+        if cache_key not in cache:
+            import torch.distributed._symmetric_memory as torch_symmetric_memory
+
+            out = torch_symmetric_memory.empty(
+                (self.num_max_dispatch_tokens_per_rank, hidden_states.shape[1]),
+                dtype=out_dtype,
+                device=device,
+            )
+            out_handle = torch_symmetric_memory.rendezvous(out, group=group)
+            out_ptrs_tensor = torch.tensor(
+                out_handle.buffer_ptrs, dtype=torch.int64, device=device
+            )
+            cache[cache_key] = FusedGroupedGemmCombineArgs(
+                out, out_ptrs_tensor, out_handle
+            )
+        return cache[cache_key]
+
+    def _log_fused_grouped_gemm_combine_active(
+        self, hidden_states: torch.Tensor
+    ) -> None:
+        global _FUSED_GROUPED_GEMM_COMBINE_LOGGED_ACTIVE
+        # Fused combine is a group protocol: zero-local-token ranks still
+        # participate in DeepEP dispatch and FlashInfer barriers so peers do
+        # not mix fused remote writes with normal low_latency_combine.
+        if not _FUSED_GROUPED_GEMM_COMBINE_LOGGED_ACTIVE:
+            _FUSED_GROUPED_GEMM_COMBINE_LOGGED_ACTIVE = True
+            logger.info(
+                "fused grouped GEMM combine active: local_tokens=%s, " "group_size=%s",
+                hidden_states.shape[0],
+                dist.get_world_size(group=self.group),
+            )
+
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        self._fused_grouped_gemm_combine_active = True
+        self._log_fused_grouped_gemm_combine_active(hidden_states)
+
+        buffer = self._get_buffer()
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids = topk_ids.to(torch.int64)
+        expected_m = (
+            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+            + self.num_experts
+        ) // self.num_experts
+
+        fused_combine_args = self._get_fused_grouped_gemm_combine_args(
+            hidden_states, buffer
+        )
+        # FlashInfer's fused-combine writes through DeepEP source metadata.
+        # Clear the whole symmetric buffer so uneven tail batches cannot observe
+        # stale rows from a previous dispatch.
+        fused_combine_args.output_tensor.zero_()
+
+        (
+            hidden_states,
+            masked_m,
+            recv_topk_weights,
+            recv_rank_info,
+            recv_idx_info,
+            event,
+            hook,
+        ) = self._dispatch_core_with_fused_metadata(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+        )
+        return (
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            masked_m,
+            expected_m,
+            recv_topk_weights,
+            recv_rank_info,
+            recv_idx_info,
+            fused_combine_args.output_tensor,
+            fused_combine_args.out_ptrs_tensor,
+            event,
+            hook,
+        )
+
+    def dispatch_b(self, *args):
+        if len(args) == 7:
+            raise RuntimeError(
+                "fused grouped GEMM combine dispatcher received normal "
+                "DeepEP low-latency dispatch state while the fused path is enabled."
+            )
+
+        (
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            masked_m,
+            expected_m,
+            recv_topk_weights,
+            recv_rank_info,
+            recv_idx_info,
+            combine_out,
+            combine_out_ptrs,
+            event,
+            hook,
+        ) = args
+        hook() if self.return_recv_hook else event.current_stream_wait()
+
+        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+            masked_m
+        )
+
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states_scale = None
+
+        return DeepEPLLFusedCombineDispatchOutput(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            masked_m,
+            expected_m,
+            recv_topk_weights,
+            recv_rank_info,
+            recv_idx_info,
+            combine_out,
+            combine_out_ptrs,
+        )
+
+    def _dispatch_core_with_fused_metadata(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+
+        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
+        # to return int32-packed UE8M0 scales that don't feed the flashinfer
+        # cutedsl kernel.
+        fp8_deepgemm_scale_opts = (
+            dict(
+                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+            )
+            if self.use_fp8
+            else dict()
+        )
+        dispatch_kwargs = dict(
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+            topk_weights=topk_weights,
+            **fp8_deepgemm_scale_opts,
+        )
+        if self.use_nvfp4:
+            dispatch_kwargs["use_nvfp4"] = True
+        if input_global_scale is not None:
+            dispatch_kwargs["x_global_scale"] = input_global_scale
+
+        buffer = self._get_buffer()
+        _deepep_precompile_tp_barrier()
+        dispatch_output = buffer.low_latency_dispatch(
+            hidden_states,
+            topk_ids,
+            self.num_max_dispatch_tokens_per_rank,
+            self.num_experts,
+            use_fp8=self.use_fp8,
+            **dispatch_kwargs,
+        )
+        if len(dispatch_output) != 7:
+            self._fused_grouped_gemm_combine_active = False
+            self.packed_recv_count = self.handle = None
+            raise RuntimeError(
+                "fused grouped GEMM combine requires a DeepEP "
+                "low_latency_dispatch implementation that returns "
+                "top-k weights and source-rank metadata."
+            )
+        (
+            packed_recv_hidden,
+            self.packed_recv_count,
+            recv_topk_weights,
+            recv_rank_info,
+            self.handle,
+            event,
+            hook,
+        ) = dispatch_output
+        recv_idx_info = self.handle[0]
+        return (
+            packed_recv_hidden,
+            self.packed_recv_count,
+            recv_topk_weights,
+            recv_rank_info,
+            recv_idx_info,
+            event,
+            hook,
+        )
+
+    def combine_b(self, hidden_states, event, hook):
+        if event is not None:
+            raise RuntimeError(
+                "fused grouped GEMM combine dispatcher reached normal "
+                "DeepEP combine event while the fused path is enabled."
+            )
+
+        overlap_args = self.overlap_args
+        if overlap_args is not None:
+            overlap_args.stream.wait_stream(self.device_module.current_stream())
+
+        hook()
+
+        if overlap_args is not None:
+            self.device_module.current_stream().wait_stream(overlap_args.stream)
+
+        return hidden_states
+
+    def _combine_core(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        if not self._fused_grouped_gemm_combine_active:
+            raise RuntimeError(
+                "fused grouped GEMM combine dispatcher reached normal "
+                "DeepEP combine path while the fused path is enabled."
+            )
+
+        self.packed_recv_count = self.handle = None
+        self._fused_grouped_gemm_combine_active = False
+        return hidden_states[: topk_ids.shape[0], :], None, lambda: None
+
+
 @dataclass
 class _Stage(Enum):
     INITIAL = auto()
@@ -862,7 +1172,12 @@ class DeepEPDispatcher(BaseDispatcher):
         )
 
         if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
+            low_latency_dispatcher_cls = (
+                _DeepEPDispatcherImplLowLatencyFusedCombine
+                if _should_use_cuda_fused_grouped_gemm_combine()
+                else _DeepEPDispatcherImplLowLatency
+            )
+            self._low_latency_dispatcher = low_latency_dispatcher_cls(
                 return_recv_hook=return_recv_hook,
                 **common_kwargs,
             )
