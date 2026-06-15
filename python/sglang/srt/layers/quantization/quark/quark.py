@@ -38,6 +38,45 @@ __all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
 logger = logging.getLogger(__name__)
 
 
+def _dense_fp8_enabled() -> bool:
+    import os
+
+    return os.environ.get("SGLANG_QUARK_DENSE_FP8", "0") == "1"
+
+
+# Only fp8 the BIG dense projections where fp8 GEMM beats tuned bf16 at TP=2
+# (in_proj_qkvz N=10240, GDN out_proj N>=4096, shared_expert.down N=4096).
+# Exclude small-N where bf16 flydsl wins (shared gate_up N=1024, N=512) via the
+# min-N guard, and conv1d/router/gate/lm_head/embed always.
+_DENSE_FP8_ELIGIBLE = (
+    ".in_proj_qkvz",
+    "linear_attn.out_proj",
+    ".shared_expert.down_proj",
+)
+_DENSE_FP8_BLOCKED = (
+    "conv1d",
+    "shared_expert_gate",
+    "mlp.gate",
+    "in_proj_ba",
+    "lm_head",
+    "embed",
+)
+_DENSE_FP8_MIN_N = 2048
+
+
+def _dense_fp8_eligible(prefix: str, layer) -> bool:
+    if any(b in prefix for b in _DENSE_FP8_BLOCKED):
+        return False
+    if not any(e in prefix for e in _DENSE_FP8_ELIGIBLE):
+        return False
+    n = getattr(layer, "output_size_per_partition", None) or getattr(
+        layer, "output_size", None
+    )
+    if n is not None and n < _DENSE_FP8_MIN_N:
+        return False
+    return True
+
+
 class QuarkConfig(QuantizationConfig):
 
     def __init__(
@@ -87,6 +126,16 @@ class QuarkConfig(QuantizationConfig):
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
 
+    def _get_dense_fp8_method(self, prefix: str):
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+
+        cfg = getattr(self, "_dense_fp8_config", None)
+        if cfg is None:
+            cfg = Fp8Config(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+            self._dense_fp8_config = cfg
+        logger.info("[quark] routing excluded dense layer to FP8: %s", prefix)
+        return Fp8LinearMethod(cfg)
+
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.float16, torch.bfloat16]
@@ -118,6 +167,8 @@ class QuarkConfig(QuantizationConfig):
             fused_mapping=self.packed_modules_mapping,
         ):
             if isinstance(layer, LinearBase):
+                if _dense_fp8_enabled() and _dense_fp8_eligible(prefix, layer):
+                    return self._get_dense_fp8_method(prefix)
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)

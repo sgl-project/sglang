@@ -211,6 +211,16 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        # FP8 quant fusion: when down_proj runs as online w8a8 fp8 (TP=2 dense-fp8
+        # path), fuse SiluAndMul + the per-token activation quant into one aiter
+        # kernel (silu_and_mul_quant) and feed the pre-quantized (fp8, scale) tuple
+        # to down_proj, eliminating the standalone quant. Env-gated; default off.
+        self._fp8_silu_fuse = False
+        import os
+
+        if os.environ.get("SGLANG_MLP_FP8_SILU_FUSE", "0") == "1":
+            qm = type(getattr(self.down_proj, "quant_method", None)).__name__
+            self._fp8_silu_fuse = qm == "Fp8LinearMethod"
 
     def forward(
         self,
@@ -219,6 +229,20 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        if self._fp8_silu_fuse and gate_up.shape[0] > 0:
+            import aiter
+            from aiter import dtypes
+
+            M = gate_up.shape[0]
+            N = gate_up.shape[-1] // 2
+            out_fp8 = torch.empty((M, N), dtype=dtypes.fp8, device=gate_up.device)
+            scale = torch.empty((M, 1), dtype=torch.float32, device=gate_up.device)
+            aiter.silu_and_mul_quant(out_fp8, gate_up, scale, N)
+            x, _ = self.down_proj(
+                (out_fp8, scale),
+                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            )
+            return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter

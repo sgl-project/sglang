@@ -1487,6 +1487,26 @@ def apply_fp8_linear(
         )
     output_padding = 17 if pad_output else None
 
+    # Pre-quantized input fast path: `input` is a (fp8_qinput, x_scale) tuple
+    # produced by a fused rmsnorm/silu + per-token-quant kernel upstream. Skips
+    # the standalone activation quant entirely (the fp8-dense quant-fusion path).
+    # aiter per-token / bpreshuffle GEMM only.
+    if isinstance(input, tuple):
+        qinput, x_scale = input
+        qinput_2d = qinput.view(-1, qinput.shape[-1])
+        out_shape = [*qinput.shape[:-1], weight.shape[1]]
+        assert _use_aiter, "prequantized fp8 input requires the aiter w8a8 path"
+        output = gemm_a8w8_bpreshuffle(
+            XQ=qinput_2d,
+            WQ=weight.T,
+            x_scale=x_scale,
+            w_scale=weight_scale,
+            dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            output += bias
+        return _process_scaled_mm_output(output, qinput_2d.shape, out_shape)
+
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
