@@ -99,6 +99,8 @@ class HiCacheNixl(HiCacheStorage):
                 force_clean_all=envs.SGLANG_HICACHE_NIXL_FORCE_CLEAN_ON_START.get(),
                 run_id=os.environ.get("SGLANG_RUN_ID"),
             )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
             self._tenant_key = tenant_key
 
         self.file_manager = (

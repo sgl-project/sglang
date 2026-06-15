@@ -118,6 +118,8 @@ def _collect_cleanup_targets(
                 continue
             if not is_dir or _TENANT_DIR_RE.fullmatch(entry.name) is None:
                 continue
+            if not os.path.exists(os.path.join(entry.path, ".sglang-nixl-tenant")):
+                continue
             if not force_clean_all and entry.name == tenant_key:
                 continue
             targets.append(entry.path)

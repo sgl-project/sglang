@@ -49,9 +49,12 @@ class TestNixlTenantStorage(CustomTestCase):
         """Startup cleanup deletes tenant siblings, not arbitrary base-dir content."""
         current = resolve_tenant_key("model-a", tp_size=8, num_disks=2)
         foreign = resolve_tenant_key("model-b", tp_size=8, num_disks=2)
+        unmarked = resolve_tenant_key("manual-data", tp_size=8, num_disks=2)
 
         for base_dir in self.base_dirs:
             self._write_file(os.path.join(base_dir, foreign, "00", "old"))
+            self._write_file(os.path.join(base_dir, foreign, ".sglang-nixl-tenant"))
+            self._write_file(os.path.join(base_dir, unmarked, "00", "keep"))
             self._write_file(os.path.join(base_dir, "not-a-tenant", "keep"))
 
         tenant_dirs, thread = prepare_tenant_storage_dirs(
@@ -67,6 +70,7 @@ class TestNixlTenantStorage(CustomTestCase):
         self.assertTrue(all(os.path.isdir(path) for path in tenant_dirs))
         for base_dir, tenant_dir in zip(self.base_dirs, tenant_dirs):
             self.assertFalse(os.path.exists(os.path.join(base_dir, foreign)))
+            self.assertTrue(os.path.exists(os.path.join(base_dir, unmarked)))
             self.assertTrue(os.path.exists(os.path.join(base_dir, "not-a-tenant")))
             marker = os.path.join(tenant_dir, ".sglang-nixl-tenant")
             with open(marker) as f:
@@ -77,6 +81,7 @@ class TestNixlTenantStorage(CustomTestCase):
         tenant = resolve_tenant_key("model-a", tp_size=8, num_disks=2)
         for base_dir in self.base_dirs:
             self._write_file(os.path.join(base_dir, tenant, "00", "old"))
+            self._write_file(os.path.join(base_dir, tenant, ".sglang-nixl-tenant"))
 
         tenant_dirs, thread = prepare_tenant_storage_dirs(
             self.base_dirs,
