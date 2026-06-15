@@ -51,6 +51,15 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.flip_state_machine import (
+    ClusterSnapshot,
+    FlipDecision,
+    FlipEvent,
+    FlipState,
+    FlipStateMachine,
+    FlipTransition,
+    SLOThresholdFlipEvaluator,
+)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -529,6 +538,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.init_pd_flip_state_machine()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1168,6 +1178,247 @@ class Scheduler(
                 scheduler=self,
             )
 
+    def init_pd_flip_state_machine(self):
+        if not self.server_args.enable_pd_flip_state_machine:
+            self.pd_flip_state_machine: Optional[FlipStateMachine] = None
+            return
+
+        self.pd_flip_state_machine = FlipStateMachine(
+            evaluator=SLOThresholdFlipEvaluator(
+                slo_threshold=self.server_args.pd_flip_slo_threshold
+            ),
+            prepare_flip=self.prepare_pd_flip,
+            commit_flip=self.commit_pd_flip,
+            min_window_seconds=self.server_args.pd_flip_window_seconds,
+        )
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "PD flip state machine enabled: window=%.3fs, slo_threshold=%.3f, role=%s",
+                self.server_args.pd_flip_window_seconds,
+                self.server_args.pd_flip_slo_threshold,
+                DisaggregationMode.to_engine_type(self.disaggregation_mode.value),
+            )
+
+    def maybe_tick_pd_flip_state_machine(self):
+        if self.pd_flip_state_machine is None:
+            return
+
+        self.refresh_pd_flip_runtime_config()
+        snapshot = self.build_pd_flip_snapshot()
+        server_args = get_global_server_args()
+        if getattr(server_args, "pd_flip_abort", False):
+            event = self.pd_flip_state_machine.abort("external orchestrator abort")
+            setattr(server_args, "pd_flip_abort", False)
+        else:
+            event = self.pd_flip_state_machine.tick(snapshot)
+        self.log_pd_flip_event(event, snapshot)
+
+    def refresh_pd_flip_runtime_config(self):
+        server_args = get_global_server_args()
+        self.pd_flip_state_machine.min_window_seconds = (
+            server_args.pd_flip_window_seconds
+        )
+        evaluator = self.pd_flip_state_machine.evaluator
+        if hasattr(evaluator, "slo_threshold"):
+            evaluator.slo_threshold = server_args.pd_flip_slo_threshold
+
+    def pd_flip_should_reject_new_work(self) -> bool:
+        machine = getattr(self, "pd_flip_state_machine", None)
+        return machine is not None and machine.state in (
+            FlipState.PREPARING,
+            FlipState.FLIPPING,
+        )
+
+    def reject_pd_flip_admission(self, req: Req):
+        error_message = (
+            "PD role flip is draining this worker; retry through the router "
+            "or another worker."
+        )
+        prepare_abort(
+            req,
+            error_message,
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+        self.output_streamer.stream_output(
+            [req], getattr(req, "return_logprob", False)
+        )
+
+    def pd_flip_is_idle_for_commit(self, snapshot: ClusterSnapshot) -> bool:
+        snapshot_idle = (
+            snapshot.waiting_reqs == 0
+            and snapshot.running_reqs == 0
+            and snapshot.prefill_bootstrap_reqs == 0
+            and snapshot.prefill_inflight_reqs == 0
+            and snapshot.decode_prealloc_reqs == 0
+            and snapshot.decode_transfer_reqs == 0
+        )
+        if not snapshot_idle:
+            return False
+
+        is_fully_idle = getattr(self, "is_fully_idle", None)
+        if not callable(is_fully_idle):
+            return True
+        return bool(is_fully_idle())
+
+    def get_pd_flip_internal_state(self) -> Dict[str, Any]:
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        if self.pd_flip_state_machine is None:
+            return {
+                "enabled": False,
+                "current_role": role,
+                "can_hot_switch_in_process": False,
+            }
+
+        status = self.pd_flip_state_machine.status()
+        status["enabled"] = True
+        status["current_role"] = role
+        status["implementation_stage"] = "decision_and_observability"
+        status["role_mutation_wired"] = False
+        status["active_decode_migration_wired"] = False
+        status["requires_process_restart"] = status["direction"] != "none"
+        status["drain_to_idle_required"] = status["direction"] != "none"
+        status["admission_paused"] = self.pd_flip_should_reject_new_work()
+        try:
+            snapshot = self.pd_flip_state_machine.last_snapshot
+            if snapshot is None:
+                snapshot = self.build_pd_flip_snapshot()
+            status["is_idle_for_flip"] = self.pd_flip_is_idle_for_commit(snapshot)
+        except Exception:
+            status["is_idle_for_flip"] = False
+        server_args = get_global_server_args()
+        status["external_prepare_ack"] = getattr(
+            server_args, "pd_flip_prepare_ack", False
+        )
+        status["external_commit_ack"] = getattr(server_args, "pd_flip_commit_ack", False)
+        status["external_abort_requested"] = getattr(server_args, "pd_flip_abort", False)
+        return status
+
+    def build_pd_flip_snapshot(self) -> ClusterSnapshot:
+        role = DisaggregationMode.to_engine_type(self.disaggregation_mode.value)
+        server_args = get_global_server_args()
+        prefill_nodes = server_args.pd_flip_prefill_nodes
+        decode_nodes = server_args.pd_flip_decode_nodes
+        if prefill_nodes is None:
+            prefill_nodes = 1 if role == "prefill" else 0
+        if decode_nodes is None:
+            decode_nodes = 1 if role == "decode" else 0
+
+        kv_total_tokens = getattr(self, "max_total_num_tokens", None)
+        kv_used_tokens = None
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if kv_total_tokens is not None and allocator is not None:
+            try:
+                kv_used_tokens = kv_total_tokens - allocator.available_size()
+            except Exception:
+                kv_used_tokens = None
+
+        return ClusterSnapshot(
+            timestamp=time.monotonic(),
+            role=role,
+            prefill_nodes=prefill_nodes,
+            decode_nodes=decode_nodes,
+            waiting_reqs=len(self.waiting_queue),
+            running_reqs=len(getattr(self.running_batch, "reqs", [])),
+            prefill_bootstrap_reqs=self._pd_flip_queue_len(
+                self.disagg_prefill_bootstrap_queue
+            ),
+            prefill_inflight_reqs=len(self.disagg_prefill_inflight_queue or []),
+            decode_prealloc_reqs=self._pd_flip_queue_len(
+                self.disagg_decode_prealloc_queue
+            ),
+            decode_transfer_reqs=self._pd_flip_queue_len(
+                self.disagg_decode_transfer_queue
+            ),
+            kv_used_tokens=kv_used_tokens,
+            kv_total_tokens=kv_total_tokens,
+            prefill_slo_attainment=server_args.pd_flip_prefill_slo_attainment,
+            decode_slo_attainment=server_args.pd_flip_decode_slo_attainment,
+        )
+
+    def prepare_pd_flip(
+        self, snapshot: ClusterSnapshot, decision: FlipDecision
+    ) -> bool:
+        if self.ps.tp_rank == 0:
+            logger.debug(
+                "PD flip preparing waits for migration: direction=%s reason=%s "
+                "role=%s waiting=%d running=%d prefill_bootstrap=%d "
+                "prefill_inflight=%d decode_prealloc=%d decode_transfer=%d",
+                decision.direction.value,
+                decision.reason,
+                snapshot.role,
+                snapshot.waiting_reqs,
+                snapshot.running_reqs,
+                snapshot.prefill_bootstrap_reqs,
+                snapshot.prefill_inflight_reqs,
+                snapshot.decode_prealloc_reqs,
+                snapshot.decode_transfer_reqs,
+            )
+        # The scheduler event loop is selected from disaggregation_mode at
+        # startup. Keep the node in PREPARING until an external orchestrator
+        # has drained the node, then acks through /set_internal_state.
+        if not self.pd_flip_is_idle_for_commit(snapshot):
+            return False
+
+        server_args = get_global_server_args()
+        ready = bool(getattr(server_args, "pd_flip_prepare_ack", False))
+        if ready:
+            setattr(server_args, "pd_flip_prepare_ack", False)
+        return ready
+
+    def commit_pd_flip(self, snapshot: ClusterSnapshot, decision: FlipDecision) -> bool:
+        if self.ps.tp_rank == 0:
+            logger.debug(
+                "PD flip commit waits for role mutation: direction=%s "
+                "target_prefill_nodes=%s target_decode_nodes=%s.",
+                decision.direction.value,
+                decision.target_prefill_nodes,
+                decision.target_decode_nodes,
+            )
+        if not self.pd_flip_is_idle_for_commit(snapshot):
+            return False
+
+        server_args = get_global_server_args()
+        ready = bool(getattr(server_args, "pd_flip_commit_ack", False))
+        if ready:
+            setattr(server_args, "pd_flip_commit_ack", False)
+        return ready
+
+    def log_pd_flip_event(self, event: FlipEvent, snapshot: ClusterSnapshot):
+        if self.ps.tp_rank != 0 or event.transition == FlipTransition.NONE:
+            return
+        log_fn = (
+            logger.debug
+            if event.transition
+            in (FlipTransition.PREPARING_NOT_READY, FlipTransition.FLIPPING_NOT_READY)
+            else logger.info
+        )
+        log_fn(
+            "PD flip state transition: %s -> %s transition=%s direction=%s "
+            "reason=%s role=%s prefill_nodes=%d decode_nodes=%d kv=%s/%s",
+            event.from_state.value,
+            event.to_state.value,
+            event.transition.value,
+            event.direction.value,
+            event.reason,
+            snapshot.role,
+            snapshot.prefill_nodes,
+            snapshot.decode_nodes,
+            snapshot.kv_used_tokens,
+            snapshot.kv_total_tokens,
+        )
+
+    @staticmethod
+    def _pd_flip_queue_len(queue) -> int:
+        if queue is None:
+            return 0
+        inner_queue = getattr(queue, "queue", None)
+        if inner_queue is not None:
+            return len(inner_queue)
+        try:
+            return len(queue)
+        except TypeError:
+            return 0
+
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
@@ -1551,6 +1802,7 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        self.maybe_tick_pd_flip_state_machine()
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -2041,6 +2293,10 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if self.pd_flip_should_reject_new_work():
+            self.reject_pd_flip_admission(req)
+            return
+
         if self.spec_algorithm.is_dflash():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
@@ -2325,6 +2581,10 @@ class Scheduler(
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
         )
         req.tokenizer = self.tokenizer
+
+        if self.pd_flip_should_reject_new_work():
+            self.reject_pd_flip_admission(req)
+            return
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
@@ -3546,6 +3806,7 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        ret["pd_flip"] = self.get_pd_flip_internal_state()
 
         if (
             not self.spec_algorithm.is_none()
@@ -3571,6 +3832,15 @@ class Scheduler(
                 "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
+                "pd_flip_prefill_slo_attainment",
+                "pd_flip_decode_slo_attainment",
+                "pd_flip_prefill_nodes",
+                "pd_flip_decode_nodes",
+                "pd_flip_slo_threshold",
+                "pd_flip_window_seconds",
+                "pd_flip_prepare_ack",
+                "pd_flip_commit_ack",
+                "pd_flip_abort",
             ]
         )
 

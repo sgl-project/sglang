@@ -22,6 +22,7 @@ ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.12
 ARG MOONCAKE_VERSION=0.3.11.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
+ARG INSTALL_MSCCLPP=1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -36,9 +37,22 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 
 # Replace Ubuntu sources if specified
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+    find /etc/apt -type f \( -name "sources.list" -o -name "*.sources" \) -print0 | \
+    xargs -0 sed -i \
+        -e "s|http://.*archive.ubuntu.com/ubuntu|$UBUNTU_MIRROR|g" \
+        -e "s|http://.*security.ubuntu.com/ubuntu|$UBUNTU_MIRROR|g" \
+        -e "s|http://archive.ubuntu.com/ubuntu|$UBUNTU_MIRROR|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|$UBUNTU_MIRROR|g"; \
 fi
+
+RUN printf '%s\n' \
+    'Acquire::Retries "5";' \
+    'Acquire::http::Timeout "30";' \
+    'Acquire::https::Timeout "30";' \
+    'Acquire::http::Pipeline-Depth "0";' \
+    'Acquire::http::No-Cache "true";' \
+    'Acquire::http::No-Store "true";' \
+    > /etc/apt/apt.conf.d/99sglang-retries
 
 # Python setup (combined with apt update to reduce layers)
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
@@ -445,6 +459,7 @@ ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MOONCAKE_COMPILE_ARG
 ARG MSCCLPP_VERSION
+ARG INSTALL_MSCCLPP
 
 WORKDIR /sgl-workspace
 
@@ -527,21 +542,25 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
-    && case "${CUDA_VERSION}" in \
-           12.*) \
-               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
-               python3 -m pip install "/tmp/mscclpp[cuda12]"; \
-               ;; \
-           13.*) \
-               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
-               python3 -m pip install "/tmp/mscclpp[cuda13]"; \
-               ;; \
-           *) \
-               echo "Unsupported CUDA version for MSCCL++: ${CUDA_VERSION}" && exit 1; \
-               ;; \
-       esac \
-    && rm -rf /tmp/mscclpp
+    if [ "${INSTALL_MSCCLPP}" = "1" ]; then \
+        git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
+        && case "${CUDA_VERSION}" in \
+               12.*) \
+                   CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+                   python3 -m pip install "/tmp/mscclpp[cuda12]"; \
+                   ;; \
+               13.*) \
+                   CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+                   python3 -m pip install "/tmp/mscclpp[cuda13]"; \
+                   ;; \
+               *) \
+                   echo "Unsupported CUDA version for MSCCL++: ${CUDA_VERSION}" && exit 1; \
+                   ;; \
+           esac \
+        && rm -rf /tmp/mscclpp; \
+    else \
+        echo "Skipping MSCCL++ installation because INSTALL_MSCCLPP=${INSTALL_MSCCLPP}"; \
+    fi
 
 # Install essential Python packages (use constraints to prevent conflicts)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -710,6 +729,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
 ARG CUDA_VERSION
 ARG TARGETARCH
 ARG GDRCOPY_VERSION=2.5.1
+ARG UBUNTU_MIRROR
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -718,6 +738,26 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+
+# Replace Ubuntu sources if specified. The runtime stage starts from the CUDA
+# image again, so it does not inherit source-list edits from the base stage.
+RUN if [ -n "$UBUNTU_MIRROR" ]; then \
+    find /etc/apt -type f \( -name "sources.list" -o -name "*.sources" \) -print0 | \
+    xargs -0 sed -i \
+        -e "s|http://.*archive.ubuntu.com/ubuntu|$UBUNTU_MIRROR|g" \
+        -e "s|http://.*security.ubuntu.com/ubuntu|$UBUNTU_MIRROR|g" \
+        -e "s|http://archive.ubuntu.com/ubuntu|$UBUNTU_MIRROR|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|$UBUNTU_MIRROR|g"; \
+fi
+
+RUN printf '%s\n' \
+    'Acquire::Retries "5";' \
+    'Acquire::http::Timeout "30";' \
+    'Acquire::https::Timeout "30";' \
+    'Acquire::http::Pipeline-Depth "0";' \
+    'Acquire::http::No-Cache "true";' \
+    'Acquire::http::No-Store "true";' \
+    > /etc/apt/apt.conf.d/99sglang-retries
 
 # Install runtime dependencies (devel base provides gcc/g++/build tools)
 # Python 3.12 ships in Ubuntu 24.04 main, so no deadsnakes PPA needed.

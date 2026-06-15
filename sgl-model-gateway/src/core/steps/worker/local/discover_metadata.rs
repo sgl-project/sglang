@@ -41,6 +41,91 @@ pub struct ServerInfo {
     pub max_prefill_tokens: Option<usize>,
     pub max_running_requests: Option<usize>,
     pub max_num_reqs: Option<usize>,
+    pub internal_states: Option<Vec<Value>>,
+}
+
+impl ServerInfo {
+    pub fn pd_flip_labels(&self) -> HashMap<String, String> {
+        let mut labels = HashMap::new();
+        let Some(pd_flip) = self
+            .internal_states
+            .as_ref()
+            .and_then(|states| states.iter().find_map(|state| state.get("pd_flip")))
+        else {
+            return labels;
+        };
+
+        if let Some(enabled) = pd_flip.get("enabled").and_then(Value::as_bool) {
+            labels.insert("pd_flip_enabled".to_string(), enabled.to_string());
+        }
+        if let Some(state) = pd_flip.get("state").and_then(Value::as_str) {
+            labels.insert("pd_flip_state".to_string(), state.to_string());
+        }
+        if let Some(current_role) = pd_flip.get("current_role").and_then(Value::as_str) {
+            labels.insert("pd_flip_current_role".to_string(), current_role.to_string());
+        }
+        if let Some(target_role) = pd_flip
+            .get("target_role")
+            .or_else(|| pd_flip.get("requested_role"))
+            .and_then(Value::as_str)
+        {
+            labels.insert("pd_flip_target_role".to_string(), target_role.to_string());
+        }
+        if let Some(router_action) = pd_flip.get("router_action").and_then(Value::as_str) {
+            labels.insert(
+                "pd_flip_router_action".to_string(),
+                router_action.to_string(),
+            );
+        }
+
+        labels
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn server_info_exports_pd_flip_labels_from_internal_state() {
+        let server_info: ServerInfo = serde_json::from_value(json!({
+            "internal_states": [{
+                "pd_flip": {
+                    "enabled": true,
+                    "state": "preparing",
+                    "current_role": "decode",
+                    "target_role": "prefill",
+                    "router_action": "redirect_decode_and_migrate_active_kv"
+                }
+            }]
+        }))
+        .unwrap();
+
+        let labels = server_info.pd_flip_labels();
+
+        assert_eq!(
+            labels.get("pd_flip_enabled").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            labels.get("pd_flip_state").map(String::as_str),
+            Some("preparing")
+        );
+        assert_eq!(
+            labels.get("pd_flip_current_role").map(String::as_str),
+            Some("decode")
+        );
+        assert_eq!(
+            labels.get("pd_flip_target_role").map(String::as_str),
+            Some("prefill")
+        );
+        assert_eq!(
+            labels.get("pd_flip_router_action").map(String::as_str),
+            Some("redirect_decode_and_migrate_active_kv")
+        );
+    }
 }
 
 /// Model information returned from /model_info endpoint.
@@ -281,6 +366,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                 if let Ok(server_info) =
                     get_server_info(&config.url, config.api_key.as_deref()).await
                 {
+                    let pd_flip_labels = server_info.pd_flip_labels();
                     if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
                         labels.insert("model_path".to_string(), model_path);
                     }
@@ -301,6 +387,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     if let Some(disaggregation_mode) = server_info.disaggregation_mode {
                         labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
                     }
+                    labels.extend(pd_flip_labels);
                 }
 
                 // Fetch from /model_info for model-related metadata

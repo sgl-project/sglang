@@ -870,6 +870,16 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
     optimistic_prefill_retries: int = 0
+    enable_pd_flip_state_machine: bool = False
+    pd_flip_window_seconds: float = 1.0
+    pd_flip_slo_threshold: float = 0.9
+    pd_flip_prefill_nodes: Optional[int] = None
+    pd_flip_decode_nodes: Optional[int] = None
+    pd_flip_prefill_slo_attainment: Optional[float] = None
+    pd_flip_decode_slo_attainment: Optional[float] = None
+    pd_flip_prepare_ack: bool = False
+    pd_flip_commit_ack: bool = False
+    pd_flip_abort: bool = False
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -7414,6 +7424,53 @@ class ServerArgs:
             type=int,
             default=ServerArgs.optimistic_prefill_retries,
             help="Number of optimistic prefill retries that will skip the bootstrap wait. ",
+        )
+        parser.add_argument(
+            "--enable-pd-flip-state-machine",
+            action="store_true",
+            default=ServerArgs.enable_pd_flip_state_machine,
+            help="Enable the experimental Janus-style PD flip state machine. "
+            "The first implementation observes local scheduler state and emits "
+            "safe/preparing/flipping transitions; real request/KV migration is "
+            "provided by the flip callbacks.",
+        )
+        parser.add_argument(
+            "--pd-flip-window-seconds",
+            type=float,
+            default=ServerArgs.pd_flip_window_seconds,
+            help="Minimum seconds between PD flip SLO evaluations.",
+        )
+        parser.add_argument(
+            "--pd-flip-slo-threshold",
+            type=float,
+            default=ServerArgs.pd_flip_slo_threshold,
+            help="SLO attainment threshold used by the experimental PD flip evaluator.",
+        )
+        parser.add_argument(
+            "--pd-flip-prefill-nodes",
+            type=int,
+            default=ServerArgs.pd_flip_prefill_nodes,
+            help="Optional cluster prefill node count for PD flip what-if snapshots. "
+            "If unset, the local role contributes one node.",
+        )
+        parser.add_argument(
+            "--pd-flip-decode-nodes",
+            type=int,
+            default=ServerArgs.pd_flip_decode_nodes,
+            help="Optional cluster decode node count for PD flip what-if snapshots. "
+            "If unset, the local role contributes one node.",
+        )
+        parser.add_argument(
+            "--pd-flip-prefill-slo-attainment",
+            type=float,
+            default=ServerArgs.pd_flip_prefill_slo_attainment,
+            help="Optional prefill SLO attainment signal for the experimental PD flip evaluator.",
+        )
+        parser.add_argument(
+            "--pd-flip-decode-slo-attainment",
+            type=float,
+            default=ServerArgs.pd_flip_decode_slo_attainment,
+            help="Optional decode SLO attainment signal for the experimental PD flip evaluator.",
         )
 
         # Encode prefill disaggregation

@@ -833,25 +833,27 @@ impl PDRouter {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
-            request_text,
-            headers,
-            hash_ring.clone(),
-            "prefill",
-        )
-        .await?;
+        let prefill = self
+            .pick_worker_by_policy_arc(
+                &prefill_workers,
+                &*prefill_policy,
+                request_text,
+                headers,
+                hash_ring.clone(),
+                "prefill",
+            )
+            .await?;
 
-        let decode = Self::pick_worker_by_policy_arc(
-            &decode_workers,
-            &*decode_policy,
-            request_text,
-            headers,
-            hash_ring,
-            "decode",
-        )
-        .await?;
+        let decode = self
+            .pick_worker_by_policy_arc(
+                &decode_workers,
+                &*decode_policy,
+                request_text,
+                headers,
+                hash_ring,
+                "decode",
+            )
+            .await?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
@@ -872,6 +874,7 @@ impl PDRouter {
     }
 
     async fn pick_worker_by_policy_arc(
+        &self,
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
@@ -886,11 +889,18 @@ impl PDRouter {
             ));
         }
 
-        let available_workers: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
+        let mut available_workers = Vec::with_capacity(workers.len());
+        for worker in workers.iter().filter(|w| w.is_available()) {
+            if self.worker_is_draining_for_pd_flip(worker).await {
+                warn!(
+                    worker_url = %worker.url(),
+                    worker_type = worker_type,
+                    "Skipping worker while PD flip is preparing or committing"
+                );
+                continue;
+            }
+            available_workers.push(worker.clone());
+        }
 
         if available_workers.is_empty() {
             return Err(format!(
@@ -919,6 +929,94 @@ impl PDRouter {
             })?;
 
         Ok(available_workers[selected_idx].clone())
+    }
+
+    async fn worker_is_draining_for_pd_flip(&self, worker: &Arc<dyn Worker>) -> bool {
+        if Self::is_pd_flip_draining_state(
+            worker
+                .metadata()
+                .labels
+                .get("pd_flip_state")
+                .map(String::as_str),
+        ) {
+            return true;
+        }
+
+        if !worker
+            .metadata()
+            .labels
+            .get("pd_flip_enabled")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        {
+            return false;
+        }
+
+        let url = api_path(worker.url(), "/server_info");
+        let mut request_builder = self.client.get(url);
+        if let Some(api_key) = worker.api_key() {
+            request_builder = request_builder.bearer_auth(api_key);
+        }
+
+        match request_builder.send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<Value>().await {
+                    Ok(server_info) => Self::pd_flip_state_from_server_info(&server_info)
+                        .as_deref()
+                        .is_some_and(|state| Self::is_pd_flip_draining_state(Some(state))),
+                    Err(err) => {
+                        warn!(
+                            worker_url = %worker.url(),
+                            error = %err,
+                            "Failed to parse worker server_info for PD flip state"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(response) => {
+                warn!(
+                    worker_url = %worker.url(),
+                    status = %response.status(),
+                    "Failed to fetch worker server_info for PD flip state"
+                );
+                false
+            }
+            Err(err) => {
+                warn!(
+                    worker_url = %worker.url(),
+                    error = %err,
+                    "Failed to query worker server_info for PD flip state"
+                );
+                false
+            }
+        }
+    }
+
+    fn pd_flip_state_from_server_info(server_info: &Value) -> Option<String> {
+        server_info
+            .get("internal_states")
+            .and_then(Value::as_array)
+            .and_then(|states| {
+                states.iter().find_map(|state| {
+                    state
+                        .get("pd_flip")
+                        .and_then(|pd_flip| pd_flip.get("state"))
+                        .and_then(Value::as_str)
+                })
+            })
+            .or_else(|| {
+                server_info
+                    .get("pd_flip")
+                    .and_then(|pd_flip| pd_flip.get("state"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string)
+    }
+
+    fn is_pd_flip_draining_state(state: Option<&str>) -> bool {
+        state.is_some_and(|state| {
+            state.eq_ignore_ascii_case("preparing") || state.eq_ignore_ascii_case("flipping")
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1550,6 +1648,8 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
     fn create_test_pd_router() -> PDRouter {
@@ -1570,6 +1670,20 @@ mod tests {
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {
         let worker = BasicWorkerBuilder::new(url)
             .worker_type(worker_type)
+            .build();
+        worker.set_healthy(healthy);
+        Box::new(worker)
+    }
+
+    fn create_test_worker_with_labels(
+        url: String,
+        worker_type: WorkerType,
+        healthy: bool,
+        labels: HashMap<String, String>,
+    ) -> Box<dyn Worker> {
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .labels(labels)
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
@@ -1617,6 +1731,190 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_pair_skips_decode_with_pd_flip_preparing_label() {
+        let router = create_test_pd_router();
+
+        let prefill_worker = create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let ready_decode =
+            create_test_worker("http://decode-ready".to_string(), WorkerType::Decode, true);
+        let mut labels = HashMap::new();
+        labels.insert("pd_flip_state".to_string(), "preparing".to_string());
+        let preparing_decode = create_test_worker_with_labels(
+            "http://decode-preparing".to_string(),
+            WorkerType::Decode,
+            true,
+            labels,
+        );
+
+        router.worker_registry.register(Arc::from(prefill_worker));
+        router.worker_registry.register(Arc::from(ready_decode));
+        router.worker_registry.register(Arc::from(preparing_decode));
+
+        let result = router.select_pd_pair(None, None, None).await;
+
+        assert!(result.is_ok());
+        let (_prefill, decode) = result.unwrap();
+        assert_eq!(decode.url(), "http://decode-ready");
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_pair_skips_decode_with_dynamic_pd_flip_preparing_state() {
+        use axum::{routing::get, Json, Router};
+        use tokio::net::TcpListener;
+
+        async fn server_info() -> Json<Value> {
+            Json(json!({
+                "internal_states": [{
+                    "pd_flip": {
+                        "enabled": true,
+                        "state": "preparing",
+                        "requested_role": "prefill"
+                    }
+                }]
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/server_info", get(server_info));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = create_test_pd_router();
+        let prefill_worker = create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let ready_decode =
+            create_test_worker("http://decode-ready".to_string(), WorkerType::Decode, true);
+        let mut labels = HashMap::new();
+        labels.insert("pd_flip_enabled".to_string(), "true".to_string());
+        let dynamic_preparing_decode = create_test_worker_with_labels(
+            format!("http://{}", addr),
+            WorkerType::Decode,
+            true,
+            labels,
+        );
+
+        router.worker_registry.register(Arc::from(prefill_worker));
+        router.worker_registry.register(Arc::from(ready_decode));
+        router
+            .worker_registry
+            .register(Arc::from(dynamic_preparing_decode));
+
+        let result = router.select_pd_pair(None, None, None).await;
+
+        assert!(result.is_ok());
+        let (_prefill, decode) = result.unwrap();
+        assert_eq!(decode.url(), "http://decode-ready");
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_pair_skips_prefill_with_pd_flip_preparing_label() {
+        let router = create_test_pd_router();
+
+        let ready_prefill = create_test_worker(
+            "http://prefill-ready".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let mut labels = HashMap::new();
+        labels.insert("pd_flip_state".to_string(), "preparing".to_string());
+        let preparing_prefill = create_test_worker_with_labels(
+            "http://prefill-preparing".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+            labels,
+        );
+        let decode_worker =
+            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+
+        router
+            .worker_registry
+            .register(Arc::from(preparing_prefill));
+        router.worker_registry.register(Arc::from(ready_prefill));
+        router.worker_registry.register(Arc::from(decode_worker));
+
+        let result = router.select_pd_pair(None, None, None).await;
+
+        assert!(result.is_ok());
+        let (prefill, _decode) = result.unwrap();
+        assert_eq!(prefill.url(), "http://prefill-ready");
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_pair_skips_prefill_with_dynamic_pd_flip_preparing_state() {
+        use axum::{routing::get, Json, Router};
+        use tokio::net::TcpListener;
+
+        async fn server_info() -> Json<Value> {
+            Json(json!({
+                "internal_states": [{
+                    "pd_flip": {
+                        "enabled": true,
+                        "state": "preparing",
+                        "requested_role": "decode"
+                    }
+                }]
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/server_info", get(server_info));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = create_test_pd_router();
+        let ready_prefill = create_test_worker(
+            "http://prefill-ready".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let mut labels = HashMap::new();
+        labels.insert("pd_flip_enabled".to_string(), "true".to_string());
+        let dynamic_preparing_prefill = create_test_worker_with_labels(
+            format!("http://{}", addr),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+            labels,
+        );
+        let decode_worker =
+            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+
+        router
+            .worker_registry
+            .register(Arc::from(dynamic_preparing_prefill));
+        router.worker_registry.register(Arc::from(ready_prefill));
+        router.worker_registry.register(Arc::from(decode_worker));
+
+        let result = router.select_pd_pair(None, None, None).await;
+
+        assert!(result.is_ok());
+        let (prefill, _decode) = result.unwrap();
+        assert_eq!(prefill.url(), "http://prefill-ready");
     }
 
     #[test]
