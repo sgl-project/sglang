@@ -202,7 +202,7 @@ class GPTQMoEAscendKernel:
                 .contiguous(),
                 requires_grad=False,
             )
-            print(torch.ops.npu.get_npu_fromat(layer.w13_qweight))
+            print(torch.ops.npu.get_npu_format(layer.w13_qweight))
         # use int8 to store weight by default
         else:
             layer.w13_qweight = torch.nn.Parameter(
