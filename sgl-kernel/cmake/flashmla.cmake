@@ -1,13 +1,19 @@
-include(FetchContent)
-
 # flash_mla
 FetchContent_Declare(
     repo-flashmla
-    GIT_REPOSITORY https://github.com/sgl-project/FlashMLA
-    GIT_TAG abb54777d4e08c8054c238f59889b52d4e9f0896
-    GIT_SHALLOW OFF
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/df022ebafb88578eab9f0300606ee765608d8b5c.tar.gz
+    URL_HASH SHA256=45992d7de7d051dc897aff33156a2b7515d745fc489008adc7924ab884578d52
 )
 FetchContent_Populate(repo-flashmla)
+
+# flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
+FetchContent_Declare(
+    repo-flashmla-cutlass
+    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz
+    URL_HASH SHA256=9f6c53320a85b4a570975e557918cde65168cd311f081920446c238437347dc6
+    SOURCE_DIR ${repo-flashmla_SOURCE_DIR}/csrc/cutlass
+)
+FetchContent_Populate(repo-flashmla-cutlass)
 
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"

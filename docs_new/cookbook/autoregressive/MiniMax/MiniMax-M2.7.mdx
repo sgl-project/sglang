@@ -1,8 +1,7 @@
 ---
 title: MiniMax-M2.7
 metatags:
-    description: "Deploy MiniMax-M2.7 with SGLang on NVIDIA and AMD GPUs — model self-evolution, professional software engineering, and native agent teams."
-tag: NEW
+    description: "Deploy MiniMax-M2.7 with SGLang on NVIDIA GPUs, AMD GPUs, and Intel Xeon CPUs — model self-evolution, professional software engineering, and native agent teams."
 ---
 
 ## 1. Model Introduction
@@ -25,6 +24,8 @@ For more details, see the [official MiniMax-M2.7 blog post](https://www.minimax.
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
 
 **Docker Images by Hardware Platform:**
 
@@ -138,6 +139,12 @@ import { MiniMaxM27Deployment } from '/src/snippets/autoregressive/minimax-m27-d
 - **2-GPU deployment**: Requires 2× high-memory GPUs (e.g., MI300X, MI325X, MI355X) with TP=2, EP=2
 - **4-GPU deployment**: Requires 4× GPUs (e.g., MI300X, MI325X, MI355X) with TP=4, EP=4
 - **8-GPU deployment**: Requires 8× GPUs (e.g., MI300X, MI325X, MI355X) with TP=8, EP=8
+
+**Hardware Requirements: Intel Xeon CPU**
+
+- It is recommended to run the model service on a Granite Rapids (GNR) AP 2-Socket server.
+
+- For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
