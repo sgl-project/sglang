@@ -351,28 +351,22 @@ def enable_cache_on_transformer(
 
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
 
+    # Custom path: pass a pre-built BlockAdapter, bypassing the registry.
+    # Standard path: let enable_cache discover the registered adapter.
+    target = transformer
     if custom_adapter is not None:
-        # Custom path: pass a pre-built BlockAdapter, bypassing the registry.
+        target = custom_adapter
         logger.info(
             "Enabling cache-dit on %s via custom BlockAdapter (%s).",
             model_name,
             custom_adapter.forward_pattern,
         )
-        cache_dit.enable_cache(
-            custom_adapter,
-            cache_config=cache_config,
-            calibrator_config=calibrator_config,
-            parallelism_config=None,
-        )
-    else:
-        # Standard path: transformer is pre-registered in cache-dit's
-        # BlockAdapterRegister; let enable_cache discover the adapter.
-        cache_dit.enable_cache(
-            transformer,
-            cache_config=cache_config,
-            calibrator_config=calibrator_config,
-            parallelism_config=None,
-        )
+    cache_dit.enable_cache(
+        target,
+        cache_config=cache_config,
+        calibrator_config=calibrator_config,
+        parallelism_config=None,
+    )
 
     if parallelism_config is not None:
         context_manager = getattr(transformer, "_context_manager", None)
