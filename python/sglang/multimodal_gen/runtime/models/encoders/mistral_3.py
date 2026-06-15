@@ -26,6 +26,7 @@ from transformers.masking_utils import (
     create_sliding_window_causal_mask,
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3CausalLMOutputWithPast,
     Mistral3ModelOutputWithPast,
@@ -36,9 +37,9 @@ from transformers.models.mistral.modeling_mistral import (
     MistralRMSNorm,
     MistralRotaryEmbedding,
     apply_rotary_pos_emb,
+    eager_attention_forward,
 )
 
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
@@ -47,10 +48,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loa
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -97,14 +95,6 @@ class MistralAttention(nn.Module):
             bias=False,
             prefix=f"{prefix}.o_proj",
         )
-        self.attn = LocalAttention(
-            self.num_heads,
-            self.head_dim,
-            self.num_key_value_heads,
-            softmax_scale=self.scaling,
-            causal=True,
-            supported_attention_backends={AttentionBackendEnum.TORCH_SDPA},
-        )
         self.is_causal = True
 
     def forward(
@@ -145,34 +135,30 @@ class MistralAttention(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-        attn_mask = None
-        if attention_mask is not None:
-            if attention_mask.dim() == 2:
-                batch_size, q_len = query_states.shape[:2]
-                kv_len = key_states.shape[1]
-                causal_mask = torch.ones(
-                    (q_len, kv_len), device=hidden_states.device, dtype=torch.bool
-                ).tril(diagonal=kv_len - q_len)
-                padding_mask = attention_mask.to(
-                    device=hidden_states.device, dtype=torch.bool
+        attn_implementation = getattr(self.config, "_attn_implementation", None)
+        attention_interface = eager_attention_forward
+        if attn_implementation and attn_implementation != "eager":
+            if hasattr(ALL_ATTENTION_FUNCTIONS, "get_interface"):
+                attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                    attn_implementation, eager_attention_forward
                 )
-                attn_mask = causal_mask[None, None, :, :].expand(
-                    batch_size, 1, q_len, kv_len
-                )
-                attn_mask = attn_mask & padding_mask[:, None, None, -kv_len:]
             else:
-                attn_mask = attention_mask
-
-        attn_output = self.attn(
-            query_states, key_states, value_states, attn_mask=attn_mask
+                attention_interface = ALL_ATTENTION_FUNCTIONS[attn_implementation]
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0,
+            scaling=self.scaling,
+            sliding_window=getattr(self.config, "sliding_window", None),
+            **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output, _ = self.o_proj(attn_output)
-        return attn_output, None
+        return attn_output, attn_weights
 
 
 class MistralDecoderLayer(nn.Module):
@@ -399,7 +385,7 @@ class Mistral3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixi
         "^language_model.lm_head": "lm_head",
     }
     _tied_weights_keys = ["lm_head.weight"]
-    uses_sglang_forward_context = True
+    uses_sglang_forward_context = False
     layerwise_offload_dit_group_enabled = False
     layer_names = ["model.language_model.layers"]
 
