@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 
 class ScriptedContextReqStarter:
-    def __init__(self, ctx: "ScriptedContext") -> None:
+    def __init__(self, ctx: ScriptedContext) -> None:
         self._ctx = ctx
         self._req_counter = 0
 

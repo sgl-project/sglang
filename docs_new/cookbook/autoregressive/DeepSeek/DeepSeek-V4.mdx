@@ -156,7 +156,7 @@ The generator currently picks values on the **conservative** side (mirroring an 
 - `low-latency`: steps=3, draft-tokens=4 → largest win at bs=1.
 - `balanced`: steps=1, draft-tokens=2 → gentler MTP, reduces throughput hit at higher batch.
 - `high-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
-- MTP runs on the v2 speculative path (`SGLANG_ENABLE_SPEC_V2`, enabled by default).
+- MTP runs on the v2 speculative path.
 
 **EPLB + DeepEP Waterfill (Experimental)**
 
