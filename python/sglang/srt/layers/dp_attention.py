@@ -600,10 +600,19 @@ def _dp_gather(
         and forward_batch.dp_padding_mode is not None
         and not forward_batch.dp_padding_mode.is_max_len()
     ):
-        _gatherv_sizes = _dp_gatherv_sizes(forward_batch)
-        # Only take the gatherv path when the per-rank sizes EXACTLY fill the
-        # pre-allocated global buffer (the MoE runs on the whole buffer, so any
-        # unfilled tail = garbage). Otherwise fall back to all_reduce.
+        # The gatherv per-rank sizes MUST sum to the pre-allocated global buffer
+        # (the MoE runs on the whole buffer, so any unfilled tail = garbage).
+        # The buffer was sized from the ceil_align'd global_num_tokens stored via
+        # set_dp_buffer_len (forward_batch_info), so the authoritative sizes are
+        # get_dp_global_num_tokens() — the SAME source the reduce_scatterv combine
+        # uses (symmetric). _dp_gatherv_sizes() reads the raw (un-aligned, and for
+        # the MoE-gather context the logprob-token) counts, which do NOT match the
+        # buffer for prefill steps -> would force an all_reduce fallback.
+        # Prefer the buffer-aligned sizes; fall back to the per-batch sizes only
+        # if they happen to match (e.g. the logits gather path).
+        _gatherv_sizes = get_dp_global_num_tokens()
+        if _gatherv_sizes is None or sum(_gatherv_sizes) != global_tokens.shape[0]:
+            _gatherv_sizes = _dp_gatherv_sizes(forward_batch)
         if _gatherv_sizes is not None and sum(_gatherv_sizes) == global_tokens.shape[0]:
             _dp_gather_via_all_gatherv(
                 global_tokens, local_tokens, forward_batch, is_partial, _gatherv_sizes
