@@ -918,6 +918,7 @@
                 ]
               },
               "docs/hardware-platforms/cpu_server",
+              "docs/hardware-platforms/aws_sagemaker",
               {
                 "group": "Edge & Embedded",
                 "pages": [
