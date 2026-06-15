@@ -17,10 +17,11 @@ from typing import Iterable, Iterator, Optional, Union
 
 
 class TokenArray:
-    __slots__ = ("_data",)
+    __slots__ = ("_data", "_lock_prefix_len")
 
     def __init__(self, data: Optional[array] = None) -> None:
         self._data: array = data if data is not None else array("q")
+        self._lock_prefix_len: int = 0
 
     def __len__(self) -> int:
         return len(self._data)
@@ -43,9 +44,13 @@ class TokenArray:
         self._data.extend(values)
         return self
 
-    def truncate(self, length: int) -> None:
-        del self._data[length:]
+    def truncate(self, length: int) -> TokenArray:
+        if length >= self._lock_prefix_len:
+            del self._data[length:]
+            return self
+        return TokenArray(self._data[:length])
 
     def readonly_prefix_view(self, length: Optional[int]) -> memoryview:
         capped = len(self._data) if length is None else min(length, len(self._data))
+        self._lock_prefix_len = max(self._lock_prefix_len, capped)
         return memoryview(self._data).toreadonly()[:capped]

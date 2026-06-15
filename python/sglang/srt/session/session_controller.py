@@ -148,8 +148,7 @@ class Session:
             input_ids_unpadded = last_req.origin_input_ids_unpadded
             del input_ids_unpadded[self.committed_unpadded_len :]
 
-        carry_fill = last_req.full_untruncated_fill_ids
-        carry_fill.truncate(self.committed_fill_len)
+        carry_fill = last_req.full_untruncated_fill_ids.truncate(self.committed_fill_len)
         baked = len(carry_fill) - len(input_ids)
         if 0 <= baked <= len(out_tail):
             carry_fill.extend(out_tail[baked:])
