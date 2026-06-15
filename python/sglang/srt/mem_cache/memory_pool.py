@@ -393,22 +393,79 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
-                # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
-                intermediate_conv_window_cache = [
-                    torch.zeros(
-                        size=(
-                            num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
-                            conv_shape[0],
-                            conv_shape[1],
-                        ),
-                        dtype=conv_dtype,
-                        device="cuda",
-                    )
-                    for conv_shape in conv_state_shape
-                ]
+                # Cache intermediate conv windows (last K-1 inputs) per draft token
+                # during target verify.
+                #
+                # On CUDA (Triton conv kernel + Triton scatter) we use a
+                # *deduplicated sliding-window* layout: consecutive draft tokens'
+                # (K-1)-wide windows overlap by (K-2), so instead of D separate
+                # [dim, K-1] windows we store one shared [dim, D+K-2] buffer per
+                # (layer, slot) and expose an overlapping `as_strided` view of
+                # logical shape [num_layers, size+1, draft_tokens, dim, K-1] where
+                # step `t`'s window is the slice shared[..., :, t:t+K-1]. This
+                # halves the conv-intermediate footprint (D*(K-1) -> D+K-2 columns)
+                # with no numerical change: both the conv kernel write (idempotent
+                # overlapping stores) and `fused_conv_window_scatter_with_mask`
+                # consume the view through its strides.
+                #
+                # NPU/CPU keep the original dense layout (their conv kernels and
+                # state-scatter paths assume contiguous per-step windows).
+                dedup_conv_window = not _is_npu and not _is_cpu
+                self._intermediate_conv_window_phys = []
+                if dedup_conv_window:
+                    intermediate_conv_window_cache = []
+                    for conv_shape in conv_state_shape:
+                        conv_dim, win = conv_shape  # win == conv_kernel - 1 == K-1
+                        shared_win = (
+                            speculative_num_draft_tokens + win - 1
+                        )  # D + (K-1) - 1
+                        phys = torch.zeros(
+                            size=(
+                                num_mamba_layers,
+                                spec_state_size + 1,
+                                conv_dim,
+                                shared_win,
+                            ),
+                            dtype=conv_dtype,
+                            device="cuda",
+                        )
+                        # view[l, s, step, d, w] = phys[l, s, d, step + w]
+                        view = phys.as_strided(
+                            (
+                                phys.shape[0],
+                                phys.shape[1],
+                                speculative_num_draft_tokens,
+                                conv_dim,
+                                win,
+                            ),
+                            (
+                                phys.stride(0),
+                                phys.stride(1),
+                                phys.stride(3),  # step -> shared-win axis (stride 1)
+                                phys.stride(2),  # dim
+                                phys.stride(3),  # win -> shared-win axis (stride 1)
+                            ),
+                        )
+                        self._intermediate_conv_window_phys.append(phys)
+                        intermediate_conv_window_cache.append(view)
+                else:
+                    # Original dense layout (NPU/CPU): one [dim, K-1] window per
+                    # draft token. Shape: [num_layers, size+1, draft_tokens, dim, K-1]
+                    intermediate_conv_window_cache = [
+                        torch.zeros(
+                            size=(
+                                num_mamba_layers,
+                                spec_state_size + 1,
+                                speculative_num_draft_tokens,
+                                conv_shape[0],
+                                conv_shape[1],
+                            ),
+                            dtype=conv_dtype,
+                            device="cuda",
+                        )
+                        for conv_shape in conv_state_shape
+                    ]
+                    self._intermediate_conv_window_phys = intermediate_conv_window_cache
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -421,7 +478,9 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+                    # Report the deduplicated PHYSICAL conv-window buffers (the view
+                    # over-reports its logical, un-deduplicated size).
+                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)

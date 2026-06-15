@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
     track_mamba_states_if_needed,
 )
@@ -911,7 +912,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             state_indices_tensor,
             last_correct_step_indices,
         )
-        fused_mamba_state_scatter_with_mask(
+        # conv intermediate uses the deduplicated sliding-window (overlapping)
+        # layout, so it needs the strided-read scatter variant.
+        fused_conv_window_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
             state_indices_tensor,
@@ -928,7 +931,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
-            fused_mamba_state_scatter_with_mask(
+            fused_conv_window_scatter_with_mask(
                 conv_states,
                 intermediate_conv_window_cache,
                 mamba_track_indices,
