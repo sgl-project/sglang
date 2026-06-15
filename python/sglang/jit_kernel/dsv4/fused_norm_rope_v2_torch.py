@@ -82,9 +82,18 @@ def _decode_plan_d(plan_d: torch.Tensor):
 
 
 def _cast_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
-    """Encode positive fp32 tensor as UE8M0 (extract biased exponent byte)."""
+    """Encode positive fp32 tensor as UE8M0 (ceil of the biased exponent byte).
+
+    Matches the CUDA kernel (and test_fp4_indexer's _ceil_ue8m0_exp_ref): round the
+    exponent up whenever the mantissa is non-zero, so the decoded inv_scale never
+    under-scales the value. A plain truncation here leaves FlashMLA nope scales one
+    exponent low and the stored fp8 bytes diverge from the JIT path.
+    """
     bits = x.float().clamp(min=1e-38).view(torch.int32)
-    return ((bits >> 23) & 0xFF).to(torch.uint8)
+    exp = (bits >> 23) & 0xFF
+    mant = bits & 0x7FFFFF
+    exp = exp + (mant != 0).to(torch.int32)
+    return exp.clamp(max=0xFF).to(torch.uint8)
 
 
 def _inv_scale_ue8m0(ue8m0: torch.Tensor) -> torch.Tensor:
