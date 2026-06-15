@@ -224,7 +224,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             weight.contiguous(),
             1.0 / weight_scale_2,
             sfLayout=SfLayout.layout_linear,
-            backend="cuda",
+            backend="cute-dsl",
         )
         rows, cols = weight.shape
         weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
