@@ -11,7 +11,7 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 
-from sglang.bench_serving import RequestFuncOutput
+from sglang.bench_serving import RequestFuncOutput, get_auth_headers
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer
 from sglang.test.kits.cache_hit_kit import (
@@ -548,7 +548,9 @@ class WorkloadGenerator:
         heartbeat_input = [1] * input_len
         payload = gen_payload(heartbeat_input, output_len, self.lora_path)
         try:
-            requests.post(self.url, json=payload, timeout=30)
+            requests.post(
+                self.url, json=payload, headers=get_auth_headers(), timeout=30
+            )
         except Exception as e:
             print(f"Heartbeat request failed: {e}")
 
@@ -749,7 +751,7 @@ if __name__ == "__main__":
 
     for rate in request_rates:
         args.request_rate = rate
-        requests.post(flush_cache_url)
+        requests.post(flush_cache_url, headers=get_auth_headers())
         time.sleep(1)
         performance_data = WorkloadGenerator(args).run()
         log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)
