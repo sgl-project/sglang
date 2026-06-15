@@ -763,6 +763,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
+            if quant_algo == "MXFP8":
+                return ModelOptMxfp8LinearMethod()
             return UnquantizedLinearMethod()
 
         if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
@@ -2464,3 +2466,127 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
         return StandardCombineInput(hidden_states=output)
+
+
+class ModelOptMxfp8LinearMethod(LinearMethodBase):
+    """MXFP8 (W8A8 microscaling) linear method for ModelOpt MIXED_PRECISION checkpoints.
+
+    This class is modeled after ModelOptFp4LinearMethod.
+
+    Loads block-32 E4M3 weights with E8M0 per-block scales, as exported by
+    ModelOpt's MXFP8QTensor (weight: float8_e4m3fn [out, in]; weight_scale:
+    uint8 E8M0 biased exponent, bias=127, [out, in/32]). Activations are dynamic
+    microscaling, so there is no stored input_scale.
+
+    The layer will be loaded into torchao's MXTensor, and use dynamic mxfp8
+    quantization for activations. F.linear() will then dispatch to torchao's
+    mx_linear, which in turn will dispatch to mx_mm (aka torch._scaled_mm).
+    E8M0 produced by ModelOpt is identical to torch.float8_e8m0fnu, so it is
+    simply reinterpreted, and then swizzled into the block layout as per the
+    expectations of the kernel (MXDynamicActivationMXWeightConfig).
+    """
+
+    BLOCK = 32
+
+    def __init__(self, quant_config=None):
+        super().__init__()
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        del input_size, output_size
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.params_dtype = params_dtype
+        if input_size_per_partition % self.BLOCK != 0:
+            raise ValueError(
+                "MXFP8 requires in_features divisible by "
+                f"{self.BLOCK}, got {input_size_per_partition}"
+            )
+        # E4M3 weight [out, in]; input_dim/output_dim drive TP sharding. Because
+        # in_per_partition is a multiple of BLOCK, every TP shard boundary is also a
+        # block boundary, so the E8M0 scale (dim 1 = in/BLOCK) shards consistently.
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=torch.float8_e4m3fn,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+        layer.register_parameter(
+            "weight_scale",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // self.BLOCK,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+
+    def process_weights_after_loading(self, layer) -> None:
+        # Wrap the pre-quantized fp8 weight + E8M0 scale as a torchao MXTensor carrying
+        # the dynamic-MXFP8 activation recipe. No bf16 dequant: the weight stays fp8.
+        from torchao.prototype.mx_formats.mx_tensor import (
+            MXTensor,
+            QuantizeTensorToMXKwargs,
+        )
+        from torchao.prototype.mx_formats.config import ScaleCalculationMode
+        from torchao.quantization.quantize_.common.kernel_preference import (
+            KernelPreference,
+        )
+
+        weight = layer.weight.data  # float8_e4m3fn [out, in]
+        # ModelOpt's biased-exponent uint8 E8M0 is bit-identical to float8_e8m0fnu.
+        scale = layer.weight_scale.data.view(torch.float8_e8m0fnu)  # [out, in/BLOCK]
+
+        # Use plain (un-swizzled) scales: torchao's mm dispatch blocks both the weight
+        # scale and the runtime activation scale internally (the is_swizzled_scales=False
+        # branch does `maybe_dtensor_to_blocked(scale)`), so we pass the [out, in/BLOCK]
+        # scale as-is. This avoids replicating torchao's exact swizzled-scale layout
+        # (to_blocked().flatten().view(scale_M, scale_K)), which is easy to get wrong.
+        act_quant_kwargs = QuantizeTensorToMXKwargs(
+            elem_dtype=torch.float8_e4m3fn,
+            block_size=self.BLOCK,
+            kernel_preference=KernelPreference.AUTO,
+            is_swizzled_scales=False,
+            scaling_mode=ScaleCalculationMode.RCEIL,
+        )
+        weight_mx = MXTensor(
+            qdata=weight,
+            scale=scale,
+            elem_dtype=torch.float8_e4m3fn,
+            block_size=self.BLOCK,
+            orig_dtype=torch.bfloat16,
+            kernel_preference=KernelPreference.AUTO,
+            act_quant_kwargs=act_quant_kwargs,
+            is_swizzled_scales=False,
+        )
+        layer.weight = Parameter(weight_mx, requires_grad=False)
+        del layer.weight_scale
+
+    def apply(self, layer, x, bias=None):
+        # F.linear dispatches on the MXTensor weight -> torchao mx_linear, which
+        # dynamically quantizes x to MXFP8 (per act_quant_kwargs) and runs the
+        # block-scaled FP8 GEMM (torch._scaled_mm) -> bf16 output.
+        return torch.nn.functional.linear(x, layer.weight, bias)
