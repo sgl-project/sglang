@@ -248,7 +248,9 @@ class CausalWanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        use_megatron_tp = type(self) is CausalWanTransformerBlock
+        use_megatron_tp = getattr(
+            self, "_use_megatron_tp", type(self) is CausalWanTransformerBlock
+        )
         if use_megatron_tp:
             self.to_q = ColumnParallelLinear(
                 dim,
