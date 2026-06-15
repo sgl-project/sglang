@@ -793,8 +793,8 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
-        self.w13_kernel = NPUW4A16Int4MoEMethod()
-        self.w2_kernel = NPUW4A16Int4MoEMethod()
+        self.w13_kernel = NPUUnquantMoEMethod()
+        self.w2_kernel = NPUUnquantMoEMethod()
 
     def create_weights(
         self,
@@ -951,12 +951,8 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
     ) -> CombineInput:
         backend = self.runner.runner_backend
         quant_info = TorchNpuQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            w13_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            w13_offset=layer.w13_weight_offset,
-            w2_offset=layer.w2_weight_offset,
+            w13_weight=layer.w13_dequant,
+            w2_weight=layer.w2_dequant,
         )
         return self.runner.run(dispatch_output, quant_info)
 
