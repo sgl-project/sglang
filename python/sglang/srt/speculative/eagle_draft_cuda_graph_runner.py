@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -497,7 +496,9 @@ class EAGLEDraftCudaGraphRunner:
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         if forward_batch.sampling_info is not None:
-            self.temperatures[:raw_bs].copy_(forward_batch.sampling_info.temperatures[:raw_bs])
+            self.temperatures[:raw_bs].copy_(
+                forward_batch.sampling_info.temperatures[:raw_bs]
+            )
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

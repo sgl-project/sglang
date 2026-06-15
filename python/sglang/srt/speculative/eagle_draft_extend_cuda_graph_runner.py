@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -110,6 +109,8 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.padded_static_len = -1
 
         # Attention backend
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
         self.num_tokens_per_bs = self.speculative_num_steps + 1
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
@@ -185,9 +186,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.temperatures = torch.ones((sampling_bs, 1), dtype=torch.float)
 
             if self.forward_mode.is_draft_extend_v2():
-                self.repeat_idx = torch.arange(
-                    self.max_bs
-                ).repeat_interleave(self.num_tokens_per_bs)
+                self.repeat_idx = torch.arange(self.max_bs).repeat_interleave(
+                    self.num_tokens_per_bs
+                )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -454,7 +455,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
-            if self.eagle_worker.server_args.speculative_use_rs:
+            if self.eagle_worker.server_args.speculative_use_rejection_sampling:
                 probs = self.eagle_worker._renorm_draft_probs(
                     ret.next_token_logits, forward_batch.sampling_info
                 )
@@ -556,7 +557,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         if forward_batch.sampling_info is not None:
-            self.temperatures[:raw_bs].copy_(forward_batch.sampling_info.temperatures[:raw_bs])
+            self.temperatures[:raw_bs].copy_(
+                forward_batch.sampling_info.temperatures[:raw_bs]
+            )
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
@@ -639,6 +642,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             out.topk_p = out_copy.topk_p[:unpadding_bs]
             out.topk_index = out_copy.topk_index[:unpadding_bs]
-            if self.eagle_worker.server_args.speculative_use_rs:
+            if self.eagle_worker.server_args.speculative_use_rejection_sampling:
                 out.draft_probs = out_copy.draft_probs[:unpadding_bs]
         return out

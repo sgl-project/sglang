@@ -70,6 +70,7 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     record_stream_each,
     record_stream_for_v2_verify,
+    renorm_draft_probs,
     select_top_k_tokens,
 )
 from sglang.srt.utils.async_probe import (
@@ -97,9 +98,6 @@ _is_musa = is_musa()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
-
-if is_cuda():
-    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 
 def _get_plan_stream(
@@ -140,7 +138,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Args for easy access
         self.device = server_args.device
         self.topk = server_args.speculative_eagle_topk
-        if self.server_args.speculative_use_rs:
+        if self.server_args.speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
@@ -409,13 +407,11 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
-        # Run draft
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
             c.with_ops_outside_graph(
                 single_forward_indices=list(range(n_inner)),
                 maybe_inaccurate_forward_batch=forward_batch,
-
             )
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
@@ -435,8 +431,8 @@ class EagleDraftWorker(BaseDraftWorker):
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
-                parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(
-                    forward_batch
+                parent_list, top_scores_index, draft_tokens, draft_probs = (
+                    self.draft_forward(forward_batch)
                 )
 
         if batch.forward_mode.is_idle():
@@ -530,7 +526,7 @@ class EagleDraftWorker(BaseDraftWorker):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
-        if self.server_args.speculative_use_rs:
+        if self.server_args.speculative_use_rejection_sampling:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         # Forward multiple steps
@@ -575,7 +571,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if self.server_args.speculative_use_rs:
+            if self.server_args.speculative_use_rejection_sampling:
                 probs = self._renorm_draft_probs(
                     logits_output.next_token_logits, forward_batch.sampling_info
                 )
@@ -618,7 +614,7 @@ class EagleDraftWorker(BaseDraftWorker):
             parent_list = self._topk1_parents_prealloc[:bs]
             draft_probs = (
                 torch.stack(draft_probs_list, dim=1)
-                if self.server_args.speculative_use_rs
+                if self.server_args.speculative_use_rejection_sampling
                 else None
             )
             return parent_list, top_scores_index, draft_tokens, draft_probs
@@ -629,7 +625,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
-            if self.server_args.speculative_use_rs
+            if self.server_args.speculative_use_rejection_sampling
             else None
         )
         return parent_list, top_scores_index, draft_tokens, draft_probs
@@ -637,10 +633,10 @@ class EagleDraftWorker(BaseDraftWorker):
     def _renorm_draft_probs(
         self, next_token_logits: torch.Tensor, sampling_info=None
     ) -> torch.Tensor:
-        if not self.server_args.speculative_use_rs or not next_token_logits.size(0):
-            return torch.softmax(next_token_logits, dim=-1)
-        return torch.softmax(
-            next_token_logits / sampling_info.temperatures, dim=-1
+        return renorm_draft_probs(
+            next_token_logits,
+            sampling_info,
+            self.server_args.speculative_use_rejection_sampling,
         )
 
     def draft_extend(self):
@@ -718,11 +714,15 @@ class EagleDraftWorker(BaseDraftWorker):
         probs = self._renorm_draft_probs(
             logits_output.next_token_logits, batch.sampling_info
         )
-        if self.server_args.speculative_use_rs:
-            next_draft_input.topk_p, next_draft_input.topk_index = fast_sample(probs, num_samples=1)
+        if self.server_args.speculative_use_rejection_sampling:
+            next_draft_input.topk_p, next_draft_input.topk_index = fast_sample(
+                probs, num_samples=1
+            )
             next_draft_input.draft_probs = probs
         else:
-            next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+            next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
+                probs, self.topk, dim=-1
+            )
         next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
@@ -807,7 +807,7 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
-        if self.server_args.speculative_use_rs:
+        if self.server_args.speculative_use_rejection_sampling:
             probs = self._renorm_draft_probs(
                 draft_logits_output.next_token_logits, batch.sampling_info
             )
@@ -838,7 +838,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
-        if self.server_args.speculative_use_rs:
+        if self.server_args.speculative_use_rejection_sampling:
             next_draft_input.draft_probs = ret_draft_probs
 
 

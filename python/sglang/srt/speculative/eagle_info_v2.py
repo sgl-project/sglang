@@ -434,7 +434,7 @@ class EagleVerifyInputV2Mixin:
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
             draft_probs = (
                 torch.zeros_like(target_probs)
-                if not get_global_server_args().speculative_use_rs
+                if not get_global_server_args().speculative_use_rejection_sampling
                 else self.draft_probs
             )
 
@@ -447,7 +447,7 @@ class EagleVerifyInputV2Mixin:
 
             sampling_fn = (
                 chain_speculative_sampling_triton
-                if get_global_server_args().speculative_use_rs
+                if get_global_server_args().speculative_use_rejection_sampling
                 else tree_speculative_sampling_target_only
             )
             sampling_fn(

@@ -77,9 +77,7 @@ def _gather_spec_extras(
     hidden_states = (
         hidden_states_buf[indices] if hidden_states_buf is not None else None
     )
-    draft_probs = (
-        draft_probs_buf[indices] if draft_probs_buf is not None else None
-    )
+    draft_probs = draft_probs_buf[indices] if draft_probs_buf is not None else None
     return topk_p, topk_index, bonus_tokens, hidden_states, draft_probs
 
 
@@ -187,6 +185,7 @@ class FutureMap:
                 device=self.device,
             )
 
+        self.draft_probs_buf = None
         if draft_input.draft_probs is not None:
             draft_probs0 = draft_input.draft_probs[0]
             self.draft_probs_buf = torch.empty(
@@ -194,20 +193,6 @@ class FutureMap:
                 dtype=draft_probs0.dtype,
                 device=self.device,
             )
-
-    def resolve_future(self, batch: ScheduleBatch):
-        # seq_lens is already real on entry (SB +1 for non-spec;
-        # resolve_seq_lens_cpu pulled from buf for spec_v2). Only resolve
-        # input_ids tokens / spec extras here.
-        if self.spec_algo.is_none():
-            _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
-            if _DEBUG_ASSERT:
-                _assert_nonneg_and_invalidate(
-                    batch.input_ids, self.output_tokens_buf, batch.req_pool_indices
-                )
-        else:
-            self._resolve_spec_extras(batch)
-
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         draft_input: EagleDraftInput = batch.spec_info
@@ -221,7 +206,7 @@ class FutureMap:
         hidden_states_buf = (
             self.hidden_states_buf if spec_need_hidden_states() else None
         )
-        draft_probs_buf = getattr(self, "draft_probs_buf", None)
+        draft_probs_buf = self.draft_probs_buf
         (
             draft_input.topk_p,
             draft_input.topk_index,
@@ -326,5 +311,5 @@ class FutureMap:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
-        if draft_input.draft_probs is not None and hasattr(self, "draft_probs_buf"):
+        if draft_input.draft_probs is not None and self.draft_probs_buf is not None:
             self.draft_probs_buf[indices] = draft_input.draft_probs

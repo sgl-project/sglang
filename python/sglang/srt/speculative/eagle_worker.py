@@ -67,6 +67,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     get_last_loc_large_page_size_large_top_k,
     load_token_map,
+    renorm_draft_probs,
     select_top_k_tokens,
 )
 from sglang.srt.utils import (
@@ -90,11 +91,7 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 
 if is_cuda():
-    from sgl_kernel import (  # noqa: F401
-        segment_packbits,
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
+    from sgl_kernel import segment_packbits  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +113,7 @@ class EAGLEWorker(TpModelWorker):
         # Parse arguments
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
-        if server_args.speculative_use_rs:
+        if server_args.speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
@@ -872,7 +869,7 @@ class EAGLEWorker(TpModelWorker):
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
-        if self.server_args.speculative_use_rs:
+        if self.server_args.speculative_use_rejection_sampling:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         # Forward multiple steps
@@ -918,7 +915,7 @@ class EAGLEWorker(TpModelWorker):
                 logits_output.next_token_logits, forward_batch.sampling_info
             )
 
-            if self.server_args.speculative_use_rs:
+            if self.server_args.speculative_use_rejection_sampling:
                 topk_p, topk_index = fast_sample(probs, num_samples=1)
                 draft_probs_list.append(probs)
             else:
@@ -942,7 +939,7 @@ class EAGLEWorker(TpModelWorker):
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
-            if self.server_args.speculative_use_rs
+            if self.server_args.speculative_use_rejection_sampling
             else None
         )
         return parent_list, top_scores_index, draft_tokens, draft_probs
@@ -1237,7 +1234,7 @@ class EAGLEWorker(TpModelWorker):
             topk_p = logits_output.topk_p
             topk_index = logits_output.topk_index
             hidden_states = logits_output.hidden_states
-            if self.server_args.speculative_use_rs:
+            if self.server_args.speculative_use_rejection_sampling:
                 draft_probs = logits_output.draft_probs
             else:
                 draft_probs = None
@@ -1264,7 +1261,7 @@ class EAGLEWorker(TpModelWorker):
             probs = self._renorm_draft_probs(
                 logits_output.next_token_logits, forward_batch.sampling_info
             )
-            if self.server_args.speculative_use_rs:
+            if self.server_args.speculative_use_rejection_sampling:
                 topk_p, topk_index = fast_sample(probs, num_samples=1)
                 draft_probs = probs
             else:
@@ -1311,7 +1308,7 @@ class EAGLEWorker(TpModelWorker):
         sampling_info=None,
     ):
         probs = self._renorm_draft_probs(logits_output.next_token_logits, sampling_info)
-        if self.server_args.speculative_use_rs:
+        if self.server_args.speculative_use_rejection_sampling:
             draft_input.topk_p, draft_input.topk_index = fast_sample(
                 probs, num_samples=1
             )
@@ -1325,10 +1322,10 @@ class EAGLEWorker(TpModelWorker):
     def _renorm_draft_probs(
         self, next_token_logits: torch.Tensor, sampling_info=None
     ) -> torch.Tensor:
-        if not self.server_args.speculative_use_rs or not next_token_logits.size(0):
-            return torch.softmax(next_token_logits, dim=-1)
-        return torch.softmax(
-            next_token_logits / sampling_info.temperatures, dim=-1
+        return renorm_draft_probs(
+            next_token_logits,
+            sampling_info,
+            self.server_args.speculative_use_rejection_sampling,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

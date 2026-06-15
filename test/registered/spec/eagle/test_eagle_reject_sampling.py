@@ -36,7 +36,7 @@ class TestQwen35EagleRS(CustomTestCase):
             "1",
             "--speculative-num-draft-tokens",
             "4",
-            "--speculative-use-rs",
+            "--speculative-use-rejection-sampling",
             "--mem-fraction-static",
             "0.75",
             "--disable-radix-cache",

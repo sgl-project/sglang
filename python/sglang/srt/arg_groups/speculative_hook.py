@@ -356,13 +356,24 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
-    if server_args.speculative_use_rs:
+    if server_args.speculative_use_rejection_sampling:
         if server_args.speculative_eagle_topk != 1:
             raise ValueError(
-                "--speculative-use-rs requires --speculative-eagle-topk=1."
+                "--speculative-use-rejection-sampling requires --speculative-eagle-topk=1."
+            )
+        if (
+            server_args.speculative_accept_threshold_single != 1.0
+            or server_args.speculative_accept_threshold_acc != 1.0
+        ):
+            raise ValueError(
+                "--speculative-use-rejection-sampling is incompatible with "
+                "--speculative-accept-threshold-single / "
+                "--speculative-accept-threshold-acc; rejection sampling ignores "
+                "the accept thresholds."
             )
         logger.info(
-            "Rejection sampling is enabled for speculative decoding (speculative_use_rs=True)."
+            "Rejection sampling is enabled for speculative decoding "
+            "(speculative_use_rejection_sampling=True)."
         )
 
     if (

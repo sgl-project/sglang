@@ -48,12 +48,11 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
-    fast_sample,
     record_stream_each,
     record_stream_for_v2_verify,
+    renorm_draft_probs,
     select_top_k_tokens,
 )
-from sglang.srt.utils import is_cuda
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -66,9 +65,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-if is_cuda():
-    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 
 def _get_plan_stream(
@@ -109,8 +105,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Args for easy access
         self.device = server_args.device
         self.topk = server_args.speculative_eagle_topk
-        if self.server_args.speculative_use_rs:
-            assert self.topk == 1, "Chain speculative sampling supports only topk=1"
+        if self.server_args.speculative_use_rejection_sampling:
+            raise NotImplementedError(
+                "--speculative-use-rejection-sampling is not supported with "
+                "multi-layer EAGLE (enable_multi_layer_eagle)."
+            )
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -251,7 +250,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         )
 
         # Run draft
-        parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(forward_batch)
+        parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(
+            forward_batch
+        )
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -319,8 +320,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
-        if self.server_args.speculative_use_rs:
-            draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         # Forward multiple steps
         scores = None
@@ -374,16 +373,13 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             batch_size = parents_list[0].shape[0]
             parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
 
-        draft_probs = (
-            torch.stack(draft_probs_list, dim=1)
-            if self.server_args.speculative_use_rs
-            else None
-        )
-        return parent_list, top_scores_index, draft_tokens, draft_probs
+        return parent_list, top_scores_index, draft_tokens, None
 
-    def _renorm_draft_probs(self, next_token_logits, sampling_info):
-        return torch.softmax(
-            next_token_logits / sampling_info.temperatures, dim=-1
+    def _renorm_draft_probs(self, next_token_logits, sampling_info=None):
+        return renorm_draft_probs(
+            next_token_logits,
+            sampling_info,
+            self.server_args.speculative_use_rejection_sampling,
         )
 
     def draft_extend(self):
@@ -456,10 +452,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             probs = self._renorm_draft_probs(
                 output.logits_output.next_token_logits, batch.sampling_info
             )
-            if self.server_args.speculative_use_rs:
-                topk_p, topk_index = fast_sample(probs, num_samples=1)
-            else:
-                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
             # Chain-style: use this step's output hidden_states as next step's input
@@ -562,7 +555,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.logits_output.next_token_logits[select_index],
                     batch.sampling_info,
                 )
-                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1) if not self.server_args.speculative_use_rs else fast_sample(probs, num_samples=1)
+                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
                 # Chain-style: use this step's output hidden_states as next step's input
                 if (
                     self.chain_mtp_hidden_states

@@ -30,6 +30,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleVerifyInputV2Mixin,
 )
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -54,8 +55,6 @@ if is_cuda() or is_musa():
     )
 
 logger = logging.getLogger(__name__)
-
-from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
 
 
 def _draft_runner_of(worker):
@@ -383,7 +382,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 torch.zeros(
                     target_probs.shape, dtype=torch.float32, device=batch.device
                 )
-                if not get_global_server_args().speculative_use_rs
+                if not get_global_server_args().speculative_use_rejection_sampling
                 else self.draft_probs
             )
 
@@ -397,7 +396,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
             sampling_fn = (
                 chain_speculative_sampling_triton
-                if get_global_server_args().speculative_use_rs
+                if get_global_server_args().speculative_use_rejection_sampling
                 else tree_speculative_sampling_target_only
             )
             sampling_fn(
@@ -789,7 +788,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             draft_probs=(
                 torch.empty((0, vocab_size), device=device, dtype=torch.float32)
-                if get_global_server_args().speculative_use_rs
+                if get_global_server_args().speculative_use_rejection_sampling
                 else None
             ),
             capture_hidden_mode=capture_hidden_mode,
