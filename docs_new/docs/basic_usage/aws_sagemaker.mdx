@@ -4,7 +4,7 @@ description: "Deploy SGLang on Amazon SageMaker AI endpoints using the AWS Deep 
 ---
 
 Deploy SGLang on [Amazon SageMaker AI](https://aws.amazon.com/sagemaker/) endpoints using the
-[AWS Deep Learning Container (DLC)](https://github.com/aws/deep-learning-containers) for SGLang.
+[AWS Deep Learning Container (DLC)](https://aws.github.io/deep-learning-containers/sglang/) for SGLang.
 The SageMaker image variant accepts model configuration via environment variables and serves on port 8080.
 
 ## Container image
@@ -16,10 +16,10 @@ Amazon ECR registry (account `763104351884`) in each supported region. For examp
 763104351884.dkr.ecr.us-west-2.amazonaws.com/sglang:server-sagemaker-cuda-v1.0
 ```
 
-The images are also browsable on the
-[Amazon ECR Public Gallery](https://gallery.ecr.aws/deep-learning-containers/sglang).
-For the full list of tags and regions, see the
-[Available DLC Images](https://aws.github.io/deep-learning-containers/reference/available_images/) reference.
+For the full list of image tags, see the
+[Available DLC Images](https://aws.github.io/deep-learning-containers/reference/available_images/) reference,
+and for region-specific account IDs and supported regions, see
+[Region Availability](https://aws.github.io/deep-learning-containers/reference/region_availability/).
 
 ## Specifying the model
 

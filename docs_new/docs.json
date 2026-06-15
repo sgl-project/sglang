@@ -710,7 +710,8 @@
               "docs/basic_usage/ollama_api",
               "docs/basic_usage/offline_engine_api",
               "docs/basic_usage/native_api",
-              "docs/basic_usage/sampling_params"
+              "docs/basic_usage/sampling_params",
+              "docs/basic_usage/aws_sagemaker"
             ]
           },
           {
@@ -918,7 +919,6 @@
                 ]
               },
               "docs/hardware-platforms/cpu_server",
-              "docs/hardware-platforms/aws_sagemaker",
               {
                 "group": "Edge & Embedded",
                 "pages": [
