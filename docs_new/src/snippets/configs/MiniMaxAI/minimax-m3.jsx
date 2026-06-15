@@ -64,11 +64,19 @@ sgl-eval run gsm8k \\
   --model {{MODEL_NAME}} \\
   --temperature 1.0 --top-p 0.95 \\
   --thinking`,
+      gpqa_pct:
+`pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gpqa \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
+  --model {{MODEL_NAME}} \\
+  --temperature 1.0 --top-p 0.95 \\
+  --thinking --n-repeats 4 --max-tokens 40960`,
     },
     numPromptsByConc: { 24: 24, 64: 128 },
   },
 
   accuracyLabels: [
+    ["gpqa_pct", "GPQA Diamond", "%"],
     ["gsm8k_pct", "GSM8K", "%"],
   ],
 
@@ -173,10 +181,12 @@ sgl-eval run gsm8k \\
     },
   },
 
-  // NVIDIA Blackwell: one validated single-node tp4 recipe per family. fa4 +
-  // page 128 + deep_gemm are the M3 SM100 auto-defaults on current main, so this
-  // is also the bare-launch behavior; they engage MiniMax's MSA sparse-attention
-  // kernel when fmha_sm100 is installed (see Configuration Tips), Triton otherwise.
+  // NVIDIA Blackwell: one validated single-node recipe per family — tp4 across
+  // B300 / GB200 / GB300, tp8 on B200. fa4 + page 128 + deep_gemm are the M3
+  // SM100 auto-defaults on current main, so this is also the bare-launch
+  // behavior; they engage MiniMax's MSA sparse-attention kernel (fmha_sm100,
+  // pre-installed in the dev-minimax-m3 images; see Configuration Tips), Triton
+  // fallback otherwise.
   // AMD: tp8. MI350X/MI355X (gfx950) serve MXFP8 natively (backends auto). MI300X/
   // MI325X (gfx942) need --attention-backend aiter + --moe-runner-backend triton,
   // and the MXFP8 weights are auto-converted to block-fp8 at load; the cold-start
@@ -191,12 +201,12 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
-        "--tp 4",
+        "--tp 8",
         "--attention-backend fa4",
         "--page-size 128",
         "--moe-runner-backend deep_gemm",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.75",
+        "--mem-fraction-static 0.65",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
