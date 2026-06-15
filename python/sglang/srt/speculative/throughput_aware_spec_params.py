@@ -40,16 +40,29 @@ class PositionAcceptanceTracker:
         ]
 
     def update(self, accept_lengths: list[int], current_steps: int) -> None:
-        """Update per-position rates from one verify batch (positions 0..current_steps-1)."""
+        """Update per-position rates from one verify batch (positions 0..current_steps-1).
+
+        Single pass over accept_lengths: histogram + suffix counts give
+        p[k] = (#reqs with a > k) / n for all k in O(bs + current_steps).
+        """
         n = len(accept_lengths)
         if n == 0:
             return
 
-        for k in range(min(current_steps, self.max_steps)):
-            # p[k] = fraction of requests that accepted position k
-            # (i.e. had at least k+1 correct drafts)
-            pos_rate = sum(1 for a in accept_lengths if a > k) / n
-            self._windows[k].append(pos_rate)
+        s = min(current_steps, self.max_steps)
+        if s <= 0:
+            return
+
+        # counts[c] = #reqs whose accepted-position count is exactly c (capped at s)
+        counts = [0] * (s + 1)
+        for a in accept_lengths:
+            counts[a if a < s else s] += 1
+
+        # p[k] = (n - sum(counts[0..k])) / n  ==  fraction with a > k
+        cum = 0
+        for k in range(s):
+            cum += counts[k]
+            self._windows[k].append((n - cum) / n)
 
     def clear_positions_above(self, steps: int) -> None:
         """Clear buffers for positions >= *steps* (called on step-count decrease)."""
