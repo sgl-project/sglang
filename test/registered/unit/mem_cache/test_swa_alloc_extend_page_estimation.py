@@ -21,12 +21,18 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 def _make_self(*, page_size: int, full_available: int, swa_available: int):
     full_indices = torch.tensor([10, 11], dtype=torch.int64)
     swa_indices = torch.tensor([20, 21], dtype=torch.int64)
+    full_to_swa_index_mapping = torch.zeros(64, dtype=torch.int64)
 
     def new_pages_available(num_full_pages: int, num_swa_pages: int) -> bool:
         return (
             num_full_pages <= full_available // page_size
             and num_swa_pages <= swa_available // page_size
         )
+
+    def set_full_to_swa_mapping(
+        full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        full_to_swa_index_mapping[full_indices] = swa_indices
 
     return SimpleNamespace(
         page_size=page_size,
@@ -40,7 +46,8 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
         ),
         translate_loc_from_full_to_swa=lambda last_loc: last_loc,
         new_pages_available=new_pages_available,
-        full_to_swa_index_mapping=torch.zeros(64, dtype=torch.int64),
+        set_full_to_swa_mapping=set_full_to_swa_mapping,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
     )
 
 
