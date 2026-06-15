@@ -188,20 +188,21 @@ class GPTQMoEAscendKernel:
 
                 layer.w13_scales.data.abs_()
 
-            layer.w13_qweight = npu_format_cast(layer.w13_qweight)
             layer.w13_qweight = torch.nn.Parameter(
-                torch_npu.npu_convert_weight_to_int4pack(
-                    w13_qweight_tmp.reshape(
-                        layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
+                npu_format_cast(
+                    torch_npu.npu_convert_weight_to_int4pack(
+                        w13_qweight_tmp.reshape(
+                            layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
+                        )
+                        .transpose(-1, -2)
+                        .contiguous()
+                        .reshape(-1, layer.w13_qweight.shape[2])
+                        .to(torch.int32)
                     )
-                    .transpose(-1, -2)
-                    .contiguous()
-                    .reshape(-1, layer.w13_qweight.shape[2])
-                    .to(torch.int32)
+                    .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
+                    .contiguous(),
+                    requires_grad=False,
                 )
-                .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
-                .contiguous(),
-                requires_grad=False,
             )
             import torch_npu
             print(torch_npu.get_npu_fromat_cast(layer.w13_qweight))
