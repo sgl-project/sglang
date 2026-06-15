@@ -3,7 +3,7 @@
 
 use crate::policies::{Policy, SelectionContext};
 use crate::workers::Worker;
-use rand::seq::IteratorRandom;
+use rand::Rng;
 use std::sync::Arc;
 
 #[derive(Debug, Default)]
@@ -20,11 +20,23 @@ impl Policy for PowerOfTwoChoicesPolicy {
         match workers.len() {
             0 => None,
             1 => Some(workers[0].clone()),
-            _ => {
+            n => {
+                // Select two random workers - use offset to guarantee different selection in O(1)
+                // (`IteratorRandom::choose_multiple` is reservoir sampling and walks every worker).
                 let mut rng = rand::thread_rng();
-                let mut chosen = workers.iter().choose_multiple(&mut rng, 2);
-                chosen.sort_by_key(|w| w.active_load());
-                Some(chosen[0].clone())
+                let idx1 = rng.gen_range(0..n);
+                // Pick idx2 from remaining indices: offset by 1 + random from (len-1) to guarantee different
+                let idx2 = (idx1 + 1 + rng.gen_range(0..n - 1)) % n;
+
+                let worker1 = &workers[idx1];
+                let worker2 = &workers[idx2];
+
+                // Select worker with lower load
+                if worker1.active_load() <= worker2.active_load() {
+                    Some(worker1.clone())
+                } else {
+                    Some(worker2.clone())
+                }
             }
         }
     }
