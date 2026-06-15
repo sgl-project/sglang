@@ -25,6 +25,10 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils.dcp_utils import (
+    dcp_enabled,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
@@ -218,6 +222,9 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
     )
+
+    if dcp_enabled():
+        params.page_size = params.page_size * get_attention_dcp_world_size()
 
     tree_cache = create_tree_cache(
         TreeCacheBuildContext(

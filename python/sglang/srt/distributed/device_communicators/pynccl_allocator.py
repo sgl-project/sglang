@@ -324,7 +324,7 @@ class SymmetricMemoryContext:
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
     disabled = (
-        not is_symmetric_memory_enabled()
+        not group_coordinator.is_symmetric_memory_enabled()
         or disabled
         or group_coordinator.world_size == 1
     )

@@ -19,7 +19,13 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.layers.utils.dcp_utils import (
+    get_attention_dcp_rank,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -87,6 +93,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_num_splits = None
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
+
+        # get dcp info
+        self.dcp_world_size = get_attention_dcp_world_size()
+        self.dcp_rank = get_attention_dcp_rank()
 
     def init_forward_metadata_out_graph(
         self,
@@ -327,6 +337,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
+            assert (
+                self.dcp_world_size == 1
+            ), "FlashMLA does not support DCP for FP8 kv cache"
             if layer.k_scale is not None:
                 q_scale = layer.k_scale
                 descale_q = layer.k_scale.reshape(1)
@@ -360,7 +373,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
-            o, _ = flash_mla_with_kvcache(
+            # todo: need check all causal True or False?
+            o, lse = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -372,7 +386,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 causal=True,
             )
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
 
     def forward_extend(
         self,

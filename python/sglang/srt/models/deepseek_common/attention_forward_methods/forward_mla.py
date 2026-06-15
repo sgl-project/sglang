@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -14,6 +15,14 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.layers.utils.dcp_utils import (
+    all_gather_kv_cache_for_mla_extend,
+    all_gather_q_for_mla_decode,
+    cp_lse_ag_out_rs,
+    dcp_enabled,
+    get_attention_dcp_group,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -49,6 +58,7 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.utils import BumpAllocator
 
+logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 if TYPE_CHECKING:
@@ -423,6 +433,32 @@ class DeepseekMLAForwardMixin:
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
+        # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [1, 8, 64], q_nope_out [1, 8, 512] gathered to [1, 64, 64] [1, 64, 512], k_pe [1, 1, 64], k_nope [1, 1, 512], that is to say gather along heads dim, from local_head_num 8 to all_head_num 64
+        if dcp_enabled():
+            if forward_batch.forward_mode.is_decode():
+                # if forward_batch.forward_mode is decode, gather q
+                q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                    q_nope_out=q_nope_out,
+                    q_pe=q_pe,
+                )
+            elif forward_batch.forward_mode.is_extend():
+                # for extend, gather kv
+                all_gather_kv_cache_for_mla_extend(
+                    get_token_to_kv_pool(),
+                    self.attn_mqa,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                    self.kv_lora_rank,
+                    k_nope,
+                    k_pe,
+                )
+            else:
+                logger.warning(
+                    f"not supported forward_mode {forward_batch.forward_mode}"
+                )
+
         return (
             q_pe,
             k_pe,
@@ -527,20 +563,37 @@ class DeepseekMLAForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
-                attn_output = self.attn_mqa(
-                    q_nope_out,
-                    k_nope,
-                    k_nope,
-                    forward_batch,
-                    q_rope=q_pe,
-                    k_rope=k_pe,
-                    **extra_args,
-                    **(
-                        dict(topk_indices=topk_indices)
-                        if topk_indices is not None
-                        else {}
-                    ),
-                )
+                # set return_lse=True to correct attn_output
+                if forward_batch.forward_mode.is_decode() and dcp_enabled():
+                    attn_output, lse = self.attn_mqa_for_dcp_decode(
+                        q_nope_out,
+                        k_nope,
+                        k_nope,
+                        forward_batch,
+                        q_rope=q_pe,
+                        k_rope=k_pe,
+                        **extra_args,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
+                else:
+                    attn_output = self.attn_mqa(
+                        q_nope_out,
+                        k_nope,
+                        k_nope,
+                        forward_batch,
+                        q_rope=q_pe,
+                        k_rope=k_pe,
+                        **extra_args,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
         else:
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
@@ -582,6 +635,16 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+
+        # correct attn_output with respect to lse from other ranks
+        if forward_batch.forward_mode.is_decode() and dcp_enabled():
+            attn_output = attn_output.view(
+                -1,
+                self.num_local_heads * get_attention_dcp_world_size(),
+                self.kv_lora_rank,
+            )
+            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_attention_dcp_group())
+            attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None

@@ -52,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.utils.dcp_utils import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -446,6 +447,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
+
+    # For decode context parallel
+    attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
