@@ -23,6 +23,7 @@ all patches.  It is safe to import multiple times -- patches are idempotent.
 """
 
 import inspect
+import logging
 
 from sglang.srt.utils import logger
 
@@ -64,11 +65,38 @@ def apply_all():
     # v5 general patches
     _ensure_clean_up_tokenization_compat()
     _ensure_is_torch_fx_available_compat()
+    _suppress_diffusers_torchao_safe_globals_warning()
 
     # CI-only: neutralize HF API calls inside tokenizer from_pretrained
     patch_is_base_mistral_in_ci()
 
     logger.debug("transformers compatibility patches applied")
+
+
+class _ExactMessageFilter(logging.Filter):
+    def __init__(self, message: str):
+        super().__init__()
+        self.message = message
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() != self.message
+
+
+def _suppress_diffusers_torchao_safe_globals_warning():
+    warning = (
+        "Unable to import `torchao` Tensor objects. This may affect loading "
+        "checkpoints serialized with `torchao`"
+    )
+    diffusers_torchao_logger = logging.getLogger(
+        "diffusers.quantizers.torchao.torchao_quantizer"
+    )
+    for existing_filter in diffusers_torchao_logger.filters:
+        if (
+            isinstance(existing_filter, _ExactMessageFilter)
+            and existing_filter.message == warning
+        ):
+            return
+    diffusers_torchao_logger.addFilter(_ExactMessageFilter(warning))
 
 
 # ---------------------------------------------------------------------------
