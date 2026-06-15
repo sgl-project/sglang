@@ -21,7 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
-    DecodeRunner,
+    DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
     ShapeKey,
     get_batch_sizes_to_capture,
@@ -65,10 +65,10 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
-class EAGLEDraftExtendCudaGraphRunner(DecodeRunner):
+class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     """EAGLE draft-extend cuda-graph runner.
 
-    Subclasses DecodeRunner to inherit the outer capture
+    Subclasses DecodeCudaGraphRunner to inherit the outer capture
     loop + backend scaffolding. Overrides _prepare_one,
     replay, can_run for EAGLE-specific draft-extend semantics.
     """

@@ -13,7 +13,7 @@
 # ==============================================================================
 """Run the model with NPU graph and torch.compile.
 
-NPUGraphRunner is a thin subclass of DecodeRunner: the
+NPUGraphRunner is a thin subclass of DecodeCudaGraphRunner: the
 factory returns NPUCudaGraphBackend for NPU devices, so all
 capture/replay mechanics live in the backend. This class adds:
   - NPU-specific patch_model monkey-patch for the decode-Full +
@@ -38,7 +38,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.runner import DecodeRunner
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -80,7 +80,7 @@ def patch_model_npu(
         yield model.forward
 
 
-class NPUGraphRunner(DecodeRunner):
+class NPUGraphRunner(DecodeCudaGraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with NPU graph and torch.compile."""
 
     def __init__(

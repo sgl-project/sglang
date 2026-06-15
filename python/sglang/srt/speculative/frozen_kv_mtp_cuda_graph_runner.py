@@ -19,7 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
-    DecodeRunner,
+    DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
     ShapeKey,
     get_batch_sizes_to_capture,
@@ -57,10 +57,10 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
-class FrozenKVMTPCudaGraphRunner(DecodeRunner):
+class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
     """CUDA graph runner for the Frozen-KV MTP recurrent draft-loop step.
 
-    Subclasses DecodeRunner to inherit the outer capture loop
+    Subclasses DecodeCudaGraphRunner to inherit the outer capture loop
     (capture() / _capture_one_stream()), the bucket-padding helper
     (_pad_to_bucket), and the backend-driven capture/replay scaffolding.
     Frozen-KV-MTP-specific bits — the buffer dataclass, the dummy
@@ -70,7 +70,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeRunner):
     the 3-tuple replay output — are overridden.
 
     Like the EAGLE draft runner, it does NOT call
-    DecodeRunner.__init__ (that init sets up decode-only state);
+    DecodeCudaGraphRunner.__init__ (that init sets up decode-only state);
     it sets up its own fields directly while satisfying the parent's
     capture() / backend contract.
     """

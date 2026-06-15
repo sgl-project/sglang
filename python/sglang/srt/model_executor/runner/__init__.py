@@ -6,10 +6,10 @@ delegates capture/replay mechanics to a pluggable
 ExecutionBackend chosen via cuda_graph_config.
 
 Public API:
-  - BaseRunner — abstract base; shared init + bucket
+  - BaseCudaGraphRunner — abstract base; shared init + bucket
     padding + capture-loop scaffolding.
-  - DecodeRunner — concrete decode-phase runner.
-  - PrefillRunner — concrete prefill-phase runner.
+  - DecodeCudaGraphRunner — concrete decode-phase runner.
+  - PrefillCudaGraphRunner — concrete prefill-phase runner.
   - Buffer dataclasses, capture-mode flags, the global memory pool,
     and the DeepEP adapter live in
     sglang.srt.model_executor.runner_utils; they are
@@ -17,16 +17,16 @@ Public API:
     runners that were authored against the legacy public surface.
 """
 
-from sglang.srt.model_executor.runner.base_runner import (  # noqa: F401
-    BaseRunner,
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (  # noqa: F401
+    BaseCudaGraphRunner,
     freeze_gc,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_executor.runner.decode_runner import (
-    DecodeRunner,
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
 )
-from sglang.srt.model_executor.runner.prefill_runner import (  # noqa: F401
-    PrefillRunner,
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (  # noqa: F401
+    PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey  # noqa: F401
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (  # noqa: F401

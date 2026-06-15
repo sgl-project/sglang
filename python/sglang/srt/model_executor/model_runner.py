@@ -166,9 +166,9 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
-    PrefillRunner,
+    PrefillCudaGraphRunner,
 )
-from sglang.srt.model_executor.runner.decode_runner import (
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     _allocate_decode_buffers,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -886,7 +886,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_cublas()
             self.init_attention_backend()
             # Kernel warmup / autotune moved into the Runner lifecycle
-            # (BaseRunner.warmup, run-once, called from decode/prefill prepare()).
+            # (BaseCudaGraphRunner.warmup, run-once, called from decode/prefill prepare()).
             self._pre_initialize_flashinfer_allreduce_workspace()
             if not disable_cuda_graph:
                 self.init_decode_cuda_graph()
@@ -2513,7 +2513,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         buffers / batch_size: the decode runner's already-allocated static
         buffers and its max captured bs, reused for the dummy forward instead
-        of allocating a throwaway set. Always supplied by BaseRunner.warmup
+        of allocating a throwaway set. Always supplied by BaseCudaGraphRunner.warmup
         (which asserts a decode buffer is available before autotune).
         """
         from flashinfer.autotuner import autotune
@@ -2925,8 +2925,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_decode_cuda_graph(self):
         """Capture device graphs."""
-        # decode_runner holds either the cuda-graph DecodeRunner or, when cuda
-        # graph is disabled, the eager DecodeRunner (+ EagerBackend, no capture).
+        # decode_runner holds either the cuda-graph DecodeCudaGraphRunner or, when cuda
+        # graph is disabled, the eager DecodeCudaGraphRunner (+ EagerBackend, no capture).
         # They are mutually exclusive, so one attribute suffices; forward_decode
         # dispatches on decode_runner.eager.
         self.decode_runner = None
@@ -2943,11 +2943,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             Phase.DECODE, Backend.DISABLED
         ):
             # CUDA graph disabled: route eager decode through the unified
-            # DecodeRunner + EagerBackend (no capture; live forward via
+            # DecodeCudaGraphRunner + EagerBackend (no capture; live forward via
             # EagerBackend.run), instead of the bespoke forward_decode path.
-            from sglang.srt.model_executor.runner.decode_runner import DecodeRunner
+            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+                DecodeCudaGraphRunner,
+            )
 
-            self.decode_runner = DecodeRunner(self, eager=True)
+            self.decode_runner = DecodeCudaGraphRunner(self, eager=True)
             return
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
@@ -2971,12 +2973,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             GraphRunnerCls = current_platform.get_graph_runner_cls()
             self.decode_runner = GraphRunnerCls(self)
         else:
-            from sglang.srt.model_executor.runner.decode_runner import (
-                DecodeRunner,
+            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+                DecodeCudaGraphRunner,
             )
 
             graph_runners = defaultdict(
-                lambda: DecodeRunner,
+                lambda: DecodeCudaGraphRunner,
                 {
                     "cpu": CPUGraphRunner,
                     "npu": NPUGraphRunner,
@@ -2993,8 +2995,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         """Initialize piecewise CUDA graph runner."""
-        # prefill_runner holds either the piecewise-cuda-graph PrefillRunner or,
-        # when prefill cuda graph is disabled, the eager PrefillRunner (+
+        # prefill_runner holds either the piecewise-cuda-graph PrefillCudaGraphRunner or,
+        # when prefill cuda graph is disabled, the eager PrefillCudaGraphRunner (+
         # EagerBackend, no capture) for the common GQA language-model case (other
         # gates fall back to the inline eager path). Mutually exclusive, so one
         # attribute suffices; forward_extend dispatches on prefill_runner.eager.
@@ -3005,7 +3007,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(
                 "Prefill CUDA graph disabled (cuda_graph_config resolved "
                 "prefill.backend='disabled'); eager prefill will run through "
-                "PrefillRunner + EagerBackend."
+                "PrefillCudaGraphRunner + EagerBackend."
             )
             # Fall through the gates below (they set attention_layers etc. the
             # eager runner needs); build the eager runner at the construction
@@ -3122,7 +3124,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if prefill_eager:
             # Eager prefill: build the runner with EagerBackend (no capture).
-            self.prefill_runner = PrefillRunner(self, eager=True)
+            self.prefill_runner = PrefillCudaGraphRunner(self, eager=True)
             return
 
         tic = time.perf_counter()
@@ -3131,7 +3133,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        self.prefill_runner = PrefillRunner(self)
+        self.prefill_runner = PrefillCudaGraphRunner(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
@@ -3368,7 +3370,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and getattr(self.decode_runner, "eager", False)
             and not enable_pdmux
         ):
-            # Unified eager decode: DecodeRunner + EagerBackend. The runner's
+            # Unified eager decode: DecodeCudaGraphRunner + EagerBackend. The runner's
             # execute() does the registry fill + metadata + live forward via
             # EagerBackend.run — the eager dual of cuda-graph replay.
             return self.decode_runner.execute(forward_batch, pp_proxy_tensors)
@@ -3445,7 +3447,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ret = self.prefill_runner.execute(forward_batch, **kwargs)
             return (ret, can_run_graph)
 
-        # Unified eager prefill: PrefillRunner + EagerBackend (cuda graph
+        # Unified eager prefill: PrefillCudaGraphRunner + EagerBackend (cuda graph
         # disabled). Routes the common case through the runner lifecycle; the
         # inline eager path below still handles input_embeds / replace_embeds /
         # pdmux / oversize and the non-runner gates.

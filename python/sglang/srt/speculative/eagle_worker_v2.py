@@ -41,7 +41,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.runner import DecodeRunner
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -917,7 +917,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         draft_attn_backend=self._draft_worker.draft_attn_backend,
                         cuda_graph_runner=self._draft_worker.cuda_graph_runner,
                         target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.decode_runner,
+                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
                         draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
@@ -1065,7 +1065,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             target_graph_runner = None
             if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
-                TargetGraphRunnerCls = NPUGraphRunner if _is_npu else DecodeRunner
+                TargetGraphRunnerCls = (
+                    NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
+                )
                 target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
@@ -1130,7 +1132,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Target side
         self._target_worker.model_runner.attn_backend = state.target_attn_backend
-        self._target_worker.model_runner.decode_runner = state.target_graph_runner
+        self._target_worker.model_runner.decode_cuda_graph_runner = (
+            state.target_graph_runner
+        )
 
         # Sync server_args
         self.server_args.speculative_num_steps = state.speculative_num_steps
@@ -1247,7 +1251,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 verify_input,
                 (
-                    self.target_worker.model_runner.decode_runner.bs
+                    self.target_worker.model_runner.decode_cuda_graph_runner.bs
                     if can_run_graph
                     else None
                 ),

@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""DecodeRunner — runs DECODE / TARGET_VERIFY / DLLM_EXTEND under
+"""DecodeCudaGraphRunner — runs DECODE / TARGET_VERIFY / DLLM_EXTEND under
 a pluggable backend.
 
 Backend selection comes from cuda_graph_config.decode:
@@ -68,8 +68,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.runner.base_runner import (
-    BaseRunner,
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    BaseCudaGraphRunner,
     freeze_gc,
     get_batch_sizes_to_capture,
 )
@@ -287,7 +287,7 @@ def _allocate_decode_buffers(
     )
 
 
-class DecodeRunner(BaseRunner):
+class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
     Owns: static input buffers (DecodeInputBuffers), capture-bs list,
@@ -508,7 +508,7 @@ class DecodeRunner(BaseRunner):
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
         flashinfer-autotune dummy forward instead of allocating a throwaway set
-        — see BaseRunner._autotune_buffers / ModelRunner._dummy_run(buffers=).
+        — see BaseCudaGraphRunner._autotune_buffers / ModelRunner._dummy_run(buffers=).
 
         The dummy forward derives its shape from max_bs and must match these
         buffers exactly; _dummy_run asserts that. Every autotune-reachable
@@ -794,7 +794,7 @@ class DecodeRunner(BaseRunner):
 
     def prepare(self) -> None:
         # Warm up + autotune kernels once before capture/reserve (run-once
-        # across the decode + prefill runners; see BaseRunner.warmup).
+        # across the decode + prefill runners; see BaseCudaGraphRunner.warmup).
         self.warmup()
         if self.eager:
             # Eager one-time setup: reserve the per-shape static batches + bind

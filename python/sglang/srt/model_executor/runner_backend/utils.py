@@ -39,8 +39,8 @@ from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend im
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.runner.base_runner import (
-        BaseRunner,
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        BaseCudaGraphRunner,
     )
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = False
 
 
 def resolve_decode_backend(
-    cuda_graph_runner: BaseRunner,
+    cuda_graph_runner: BaseCudaGraphRunner,
 ) -> ExecutionBackend:
     """Pick a backend instance from cuda_graph_config['decode']['backend'].
 
@@ -92,7 +92,7 @@ def resolve_decode_backend(
 
 
 def resolve_prefill_backend(
-    cuda_graph_runner: BaseRunner,
+    cuda_graph_runner: BaseCudaGraphRunner,
 ) -> ExecutionBackend:
     """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
     model_runner = cuda_graph_runner.model_runner

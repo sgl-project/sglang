@@ -337,11 +337,15 @@ def eagle_prepare_for_verify(
 
     # Run attention backend plan and cuda graph preparation
     can_run_graph = bool(
-        target_worker.model_runner.decode_runner
-        and target_worker.model_runner.decode_runner.can_run_graph(verify_forward_batch)
+        target_worker.model_runner.decode_cuda_graph_runner
+        and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
+            verify_forward_batch
+        )
     )
     if can_run_graph:
-        target_worker.model_runner.decode_runner.load_batch(verify_forward_batch)
+        target_worker.model_runner.decode_cuda_graph_runner.load_batch(
+            verify_forward_batch
+        )
         verify_forward_batch.mark_forward_metadata_ready()
     # Non-cuda-graph: defer init to forward_extend, which runs after
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing

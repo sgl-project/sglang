@@ -39,7 +39,9 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.runner.base_runner import BaseRunner
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        BaseCudaGraphRunner,
+    )
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
@@ -52,7 +54,7 @@ class EagerBackend(ExecutionBackend):
     ``forward_fn`` against the per-iteration static batch.
     """
 
-    def __init__(self, cuda_graph_runner: Optional[BaseRunner] = None) -> None:
+    def __init__(self, cuda_graph_runner: Optional[BaseCudaGraphRunner] = None) -> None:
         # No per-shape artifacts to hold; kept for parity with the
         # resolve_*_backend(runner) construction contract.
         self._runner = cuda_graph_runner

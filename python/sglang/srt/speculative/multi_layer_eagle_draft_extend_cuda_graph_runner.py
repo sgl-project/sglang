@@ -45,7 +45,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
-    DecodeRunner,
+    DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
     ShapeKey,
     get_batch_sizes_to_capture,
@@ -97,10 +97,10 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
-class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeRunner):
+class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     """Per-step multi-layer EAGLE draft-extend runner.
 
-    Subclasses DecodeRunner. Shares buffers across steps
+    Subclasses DecodeCudaGraphRunner. Shares buffers across steps
     via the composite MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
     so initialization is split: __init__ does basic field setup,
     init_buffers_and_capture (called by the composite once shared
@@ -617,7 +617,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeRunner):
 class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
     """Composite orchestrator that owns speculative_num_steps per-step
     runners with shared input buffers. Not itself a
-    DecodeRunner — it only routes work to the per-step
+    DecodeCudaGraphRunner — it only routes work to the per-step
     runners.
     """
 

@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""PrefillRunner — runs the EXTEND phase under a pluggable backend.
+"""PrefillCudaGraphRunner — runs the EXTEND phase under a pluggable backend.
 
 Backend selection comes from cuda_graph_config.prefill:
   - "tc_piecewise"     — default, TcPiecewiseCudaGraphBackend: torch.compile
@@ -54,8 +54,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.runner.base_runner import (
-    BaseRunner,
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    BaseCudaGraphRunner,
     freeze_gc,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
@@ -106,7 +106,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-class PrefillRunner(BaseRunner):
+class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """Prefill-phase CUDA graph runner.
 
     Owns: PrefillInputBuffers, capture-num-tokens list, attention layers
@@ -121,7 +121,7 @@ class PrefillRunner(BaseRunner):
         # forward runs live each iteration over a static batch built at the raw
         # token count (no bucket padding), through the same reserve/load/execute
         # lifecycle the cuda-graph path uses. The eager dual of the cuda-graph
-        # PrefillRunner — see _resolve_backend / prepare / load_batch / execute.
+        # PrefillCudaGraphRunner — see _resolve_backend / prepare / load_batch / execute.
         self.eager = eager
         # --- core state ------------------------------------------------
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
@@ -616,7 +616,7 @@ class PrefillRunner(BaseRunner):
 
     def prepare(self) -> None:
         # Warm up + autotune kernels once before capture/reserve (run-once
-        # across the decode + prefill runners; see BaseRunner.warmup).
+        # across the decode + prefill runners; see BaseCudaGraphRunner.warmup).
         self.warmup()
         if self.eager:
             # No capture/compile and no per-shape reservation: eager builds the
@@ -937,5 +937,5 @@ class PrefillRunner(BaseRunner):
             else:
                 assert isinstance(output, PPProxyTensors)
                 raise NotImplementedError(
-                    "PPProxyTensors is not supported in PrefillRunner yet."
+                    "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
                 )

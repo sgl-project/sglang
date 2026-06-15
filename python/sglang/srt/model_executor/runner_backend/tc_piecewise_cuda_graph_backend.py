@@ -51,8 +51,8 @@ from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.runner.base_runner import (
-        BaseRunner,
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        BaseCudaGraphRunner,
     )
     from sglang.srt.server_args import ServerArgs
 
@@ -80,7 +80,7 @@ class TcPiecewiseCudaGraphBackend(ExecutionBackend):
     recomputed at replay outside the compiled callable's sub-graphs.
     """
 
-    def __init__(self, cuda_graph_runner: BaseRunner) -> None:
+    def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
         model_runner = cuda_graph_runner.model_runner
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
@@ -139,7 +139,7 @@ class TcPiecewiseCudaGraphBackend(ExecutionBackend):
             graph_pool=graph_pool,
         )
 
-    def _run_compile_pass(self, cuda_graph_runner: BaseRunner) -> None:
+    def _run_compile_pass(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
         """JIT-activate kernels at the smallest shape, install
         torch.compile, then run one forward per shape inside
         enable_torch_compile_warmup to drive FX / inductor through

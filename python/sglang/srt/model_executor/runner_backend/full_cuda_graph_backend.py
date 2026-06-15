@@ -36,8 +36,8 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.runner.base_runner import (
-        BaseRunner,
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        BaseCudaGraphRunner,
     )
 
 
@@ -48,7 +48,7 @@ class FullCudaGraphBackend(ExecutionBackend):
 
     def __init__(
         self,
-        cuda_graph_runner: BaseRunner,
+        cuda_graph_runner: BaseCudaGraphRunner,
         *,
         enable_memory_saver: bool = False,
     ) -> None:

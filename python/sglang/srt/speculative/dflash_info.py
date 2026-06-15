@@ -72,13 +72,15 @@ class DFlashVerifyInput(SpecInput):
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         can_run_graph = bool(
-            target_worker.model_runner.decode_runner
-            and target_worker.model_runner.decode_runner.can_run_graph(
+            target_worker.model_runner.decode_cuda_graph_runner
+            and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
                 verify_forward_batch
             )
         )
         if can_run_graph:
-            target_worker.model_runner.decode_runner.load_batch(verify_forward_batch)
+            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
+                verify_forward_batch
+            )
         elif not batch.forward_mode.is_idle():
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch

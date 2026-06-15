@@ -107,10 +107,10 @@ def get_batch_sizes_to_capture(
     return capture_bs, compile_bs
 
 
-class BaseRunner(ABC):
+class BaseCudaGraphRunner(ABC):
     """Abstract base for phase-specific cuda-graph runners.
 
-    A subclass (DecodeRunner / PrefillRunner) owns one
+    A subclass (DecodeCudaGraphRunner / PrefillCudaGraphRunner) owns one
     phase and plugs in a ExecutionBackend that handles the
     capture / replay mechanics. The runner orchestrates bucket
     selection, static buffer population, attention metadata init,
