@@ -49,7 +49,12 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
+    eagle_prepare_for_verify,
+    eagle_sample,
+)
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
@@ -253,7 +258,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = draft_input.prepare_for_draft(
+        forward_batch, can_cuda_graph = self.prepare_for_draft(
+            draft_input,
             self.req_to_token_pool,
             batch,
             self.cuda_graph_runner,
@@ -806,7 +812,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = verify_input.prepare_for_verify(
+            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+                verify_input,
                 self.req_to_token_pool,
                 batch,
                 self.target_worker,
@@ -833,7 +840,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 ),
             )
         # NOTE: metadata init is skipped here unconditionally, although
-        # prepare_for_verify only plans when cuda-graph replay_prepare ran.
+        # eagle_prepare_for_verify only plans when cuda-graph replay_prepare ran.
         # eagle_worker_v2 re-inits the non-graph path instead (post-pad); this
         # worker has not adopted that fix, so preserve its behavior verbatim.
         # On NPU with --disable-cuda-graph, non-graph verify needs metadata init
@@ -855,7 +862,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             predict,
             accept_lens,
             accept_index,
-        ) = verify_input.sample(batch, logits_output)
+        ) = eagle_sample(verify_input, batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_lens
 
         if not batch.forward_mode.is_idle():

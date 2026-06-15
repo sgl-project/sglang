@@ -294,8 +294,9 @@ class DSAMockModelRunner(ModelRunner):
         # `kAlignedBatchSize=0U`, which fails to compile. We auto-derive
         # the draft-token count from `case.extend_lens` so the
         # speculative paths produce a non-empty `seqlens_expanded`.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             spec_num_draft_tokens = max(case.extend_lens) if case.extend_lens else 1
         else:
@@ -1463,7 +1464,7 @@ def run_dsa_sparse_speculative_forward_mode_case(
 ) -> None:
     """Run a sparse case with a speculative forward mode (TARGET_VERIFY,
     DRAFT_EXTEND, or DRAFT_EXTEND_V2). DSA dispatches both
-    `is_target_verify()` and `is_draft_extend(include_v2=True)` through
+    `is_target_verify()` and `is_draft_extend_v2()` through
     `dsa_decode_impl` (`dsa_backend.py:1352-1358`), so the kernel
     selection matches plain DECODE but `seqlens_expanded` is computed
     differently per forward mode (`dsa_backend.py:469-529`).
@@ -1472,8 +1473,7 @@ def run_dsa_sparse_speculative_forward_mode_case(
     speculative modes so deep_gemm's `paged_mqa_logits_metadata` JIT
     compiles with a non-zero `kAlignedBatchSize`."""
     if not (
-        case.forward_mode.is_target_verify()
-        or case.forward_mode.is_draft_extend(include_v2=True)
+        case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend_v2()
     ):
         raise ValueError(
             "run_dsa_sparse_speculative_forward_mode_case expects a "
