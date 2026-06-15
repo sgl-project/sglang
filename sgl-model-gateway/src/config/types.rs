@@ -261,6 +261,8 @@ pub enum PolicyConfig {
     #[serde(rename = "cache_aware")]
     CacheAware {
         cache_threshold: f32,
+        #[serde(default)]
+        cache_balance_weight: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
@@ -808,6 +810,7 @@ mod tests {
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
+            cache_balance_weight: 0.0,
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
@@ -829,6 +832,7 @@ mod tests {
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
+            cache_balance_weight: 0.0,
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
@@ -837,6 +841,7 @@ mod tests {
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
         assert!(json.contains("\"cache_threshold\":0.8"));
+        assert!(json.contains("\"cache_balance_weight\":0.0"));
         assert!(json.contains("\"balance_abs_threshold\":10"));
 
         let power_of_two = PolicyConfig::PowerOfTwo {
@@ -851,6 +856,7 @@ mod tests {
     fn test_cache_aware_parameters() {
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.75,
+            cache_balance_weight: 0.25,
             balance_abs_threshold: 20,
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
@@ -860,16 +866,41 @@ mod tests {
         match cache_aware {
             PolicyConfig::CacheAware {
                 cache_threshold,
+                cache_balance_weight,
                 balance_abs_threshold,
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
+                assert!((cache_balance_weight - 0.25).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
                 assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
                 assert_eq!(eviction_interval_secs, 600);
                 assert_eq!(max_tree_size, 5000);
+            }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_deserialize_default_cache_balance_weight() {
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.8,
+            "balance_abs_threshold": 10,
+            "balance_rel_threshold": 1.5,
+            "eviction_interval_secs": 300,
+            "max_tree_size": 1000
+        }"#;
+
+        let cache_aware: PolicyConfig = serde_json::from_str(json).unwrap();
+        match cache_aware {
+            PolicyConfig::CacheAware {
+                cache_balance_weight,
+                ..
+            } => {
+                assert_eq!(cache_balance_weight, 0.0);
             }
             _ => panic!("Expected CacheAware"),
         }
@@ -1253,6 +1284,7 @@ mod tests {
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
+                cache_balance_weight: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
@@ -1283,6 +1315,7 @@ mod tests {
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
+                cache_balance_weight: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
@@ -1339,6 +1372,7 @@ mod tests {
 
         let main_policy = PolicyConfig::CacheAware {
             cache_threshold: 0.7,
+            cache_balance_weight: 0.0,
             balance_abs_threshold: 20,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,

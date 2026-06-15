@@ -57,6 +57,7 @@ class RouterArgs:
     worker_startup_timeout_secs: int = 1800
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
+    cache_balance_weight: float = 0.0
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 60
@@ -306,6 +307,12 @@ class RouterArgs:
             type=float,
             default=RouterArgs.cache_threshold,
             help="Cache threshold (0.0-1.0) for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-balance-weight",
+            type=float,
+            default=RouterArgs.cache_balance_weight,
+            help="Penalty weight for trading cache reuse against shadow-cache balance in cache-aware routing",
         )
         routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",

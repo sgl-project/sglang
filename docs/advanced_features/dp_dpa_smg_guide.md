@@ -292,6 +292,7 @@ python -m sglang_router.launch_router \
     --worker-urls http://worker1:8000 http://worker2:8000 \
     --policy cache_aware \
     --cache-threshold 0.5 \
+    --cache-balance-weight 0.0 \
     --balance-abs-threshold 32 \
     --balance-rel-threshold 1.5 \
     --eviction-interval-secs 120 \

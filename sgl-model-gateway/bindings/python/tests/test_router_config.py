@@ -369,6 +369,7 @@ class TestRouterConfigValidation:
             worker_urls=["http://worker1:8000"],
             policy="cache_aware",
             cache_threshold=0.5,
+            cache_balance_weight=0.25,
         )
 
         # Test that we can access all attributes
@@ -377,6 +378,7 @@ class TestRouterConfigValidation:
         assert hasattr(args, "worker_urls")
         assert hasattr(args, "policy")
         assert hasattr(args, "cache_threshold")
+        assert hasattr(args, "cache_balance_weight")
 
     def test_config_with_none_values(self):
         """Test configuration with None values."""

@@ -736,7 +736,7 @@ Router flags map to these values:
 ## Load Balancing Policies
 - `random`: uniform random worker selection.
 - `round_robin`: sequential rotation with atomic counters.
-- `cache_aware`: maintains a prefix tree of prompts to route repeat traffic and evens load with configurable thresholds (`--cache-threshold`, `--balance-abs-threshold`, `--balance-rel-threshold`, `--eviction-interval`, `--max-tree-size`).
+- `cache_aware`: maintains a prefix tree of prompts to route repeat traffic and evens load with configurable thresholds (`--cache-threshold`, `--cache-balance-weight`, `--balance-abs-threshold`, `--balance-rel-threshold`, `--eviction-interval`, `--max-tree-size`).
 - `power_of_two`: chooses the lighter worker among two random candidates; integrates with `LoadMonitor`.
   Per-model overrides are available in PD mode (`--prefill-policy`, `--decode-policy`) and IGW mode via the worker registry.
 
