@@ -252,7 +252,7 @@ class MinimalA2AAttnOp(DistributedAttention):
                 attn_backend = SageSparseLinearAttentionBackend
             else:
                 attn_backend = SparseLinearAttentionBackend
-        impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
+        impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         local_attn = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
