@@ -911,7 +911,9 @@ class MQALayer(nn.Module):
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
-            q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            # zero-init so uninitialized padded TP heads can't inject NaN into
+            # attention on gfx942 (only [0:n_local_heads] is written below).
+            q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
             if self._attn_sink_local is None:
