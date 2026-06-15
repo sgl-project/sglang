@@ -12,8 +12,7 @@ Large Language Model (LLM) inference comprises two distinct phases: **Prefill** 
 The conventional unified engine, which processes prefill and decode batches together, results in two significant problems:
 
 1. **Prefill Interruption**: Incoming prefill batches frequently interrupt ongoing decode batches, causing substantial delays in token generation.
-2. **DP Attention Imbalance**: In data-parallel (DP) attention, one DP worker may process a prefill batch while another handles a decode batch simultaneously, leading to increased decode latency.JIED
-
+2. **DP Attention Imbalance**: In data-parallel (DP) attention, one DP worker may process a prefill batch while another handles a decode batch simultaneously, leading to increased decode latency.
 PD Disaggregation resolves these by separating the two stages, enabling tailored optimizations for each.
 
 For the design details, please refer to [link](https://docs.google.com/document/d/1rQXJwKd5b9b1aOzLh98mnyMhBMhlxXA5ATZTHoQrwvc/edit?tab=t.0).
