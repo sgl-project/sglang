@@ -97,7 +97,11 @@ class FlashinferDispatcher(BaseDispatcher):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
-
+        self.invalid_token_expert_id = (
+            -1
+            if get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            else self.num_experts
+        )
         # TODO: Can other moe runners use payload_in_workspace too?
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
 
@@ -214,7 +218,7 @@ class FlashinferDispatcher(BaseDispatcher):
             topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
-            invalid_token_expert_id=self.num_experts,
+            invalid_token_expert_id=self.invalid_token_expert_id,
             expert_id_payload_index=expert_id_payload_index,
         )
         if x_sf is not None:

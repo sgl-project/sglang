@@ -970,48 +970,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         runner_config.activation, is_gated=runner_config.is_gated
     )
 
-<<<<<<< HEAD
-=======
-    # Build per-expert clamp-limit tensor from the per-layer scalar.
-    _clamp_val = runner_config.gemm1_clamp_limit
-    if _clamp_val is not None:
-        gemm1_clamp_limit = torch.full(
-            (quant_info.local_num_experts,),
-            _clamp_val,
-            dtype=torch.float32,
-            device=hs_fp4.device,
-        )
-    else:
-        gemm1_clamp_limit = None
-
-    num_tokens = hs_fp4.shape[0]
-    hidden_size = (
-        hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
-    )
-    output_dtype = (
-        hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
-    )
-    _provided = _moe_output_buf.get()
-    _symm_required = is_allocation_symmetric()
-    if (
-        _provided is not None
-        and _provided.shape == (num_tokens, hidden_size)
-        and _provided.dtype == output_dtype
-        and _provided.device == hs_fp4.device
-        and (
-            not _symm_required
-            or not is_symmetric_memory_enabled()
-            or is_tensor_in_symmetric_mempool(_provided)
-        )
-    ):
-        symm_output = _provided
-    else:
-        with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
-            symm_output = torch.empty(
-                num_tokens, hidden_size, dtype=output_dtype, device=hs_fp4.device
-            )
-
->>>>>>> c5de784adc (Support flashinfer_trtllm_routed with flashinfer a2a)
     # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
     if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
         use_routed_topk = True
@@ -1028,12 +986,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hidden_size = (
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
+        output_dtype = (
+            hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
+        )
         _provided = _moe_output_buf.get()
         _symm_required = is_allocation_symmetric()
         if (
             _provided is not None
             and _provided.shape == (num_tokens, hidden_size)
-            and _provided.dtype == hidden_states.dtype
+            and _provided.dtype == output_dtype
             and _provided.device == hs_fp4.device
             and (
                 not _symm_required
@@ -1047,7 +1008,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 symm_output = torch.empty(
                     hs_fp4.shape[0],
                     hidden_size,
-                    dtype=hidden_states.dtype,
+                    dtype=output_dtype,
                     device=hs_fp4.device,
                 )
 
@@ -1337,12 +1298,6 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     )
 
 
-<<<<<<< HEAD
-# Register the experimental experimental_sgl_trtllm MoE fused-func (MoeRunner needs it at
-# build time even for LoRA); gated by the master switch so the upstream path is untouched.
-if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-    from sglang.srt.lora.trtllm_lora_temp import sgl_backend  # noqa: E402,F401
-=======
 @register_fused_func("flashinfer", "flashinfer_trtllm_routed")
 def fused_experts_flashinfer_to_flashinfer_trtllm_routed(
     dispatch_output: FlashinferDispatchOutput,
@@ -1387,4 +1342,9 @@ def fused_experts_flashinfer_to_flashinfer_trtllm_routed(
             f"Unexpected quant_info type for flashinfer a2a + flashinfer_trtllm_routed: {type(quant_info)}"
         )
     return FlashinferCombineInput(hidden_states=result.hidden_states)
->>>>>>> c5de784adc (Support flashinfer_trtllm_routed with flashinfer a2a)
+
+
+# Register the experimental experimental_sgl_trtllm MoE fused-func (MoeRunner needs it at
+# build time even for LoRA); gated by the master switch so the upstream path is untouched.
+if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+    from sglang.srt.lora.trtllm_lora_temp import sgl_backend  # noqa: E402,F401
