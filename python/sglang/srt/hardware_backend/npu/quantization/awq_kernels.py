@@ -63,7 +63,7 @@ class AWQAscendLinearKernel:
 
             qweight_tmp.bitwise_xor_(0x88888888)
         
-            qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
+            qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(raw_qzeros.shape[0], -1)
             qzeros_tmp = -(qzeros_tmp - 8)
             qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
     
