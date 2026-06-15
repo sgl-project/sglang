@@ -112,6 +112,9 @@ class Backend(str, Enum):
         return [backend.value for backend in cls]
 
 
+WARMUP_MODES = ("off", "request", "server")
+
+
 @dataclasses.dataclass
 class ServerArgs(DisaggServerArgsMixin):
     # Model and path configuration (for convenience)
@@ -223,8 +226,20 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_layerwise_nvtx_marker: bool = False
 
     # warmup
+    # `warmup_mode` is the canonical knob: one of WARMUP_MODES
+    #   - "off":     no warmup.
+    #   - "server":  server-based warmup — a synthetic request right after the
+    #                server is ready, before real traffic
+    #   - "request": request-based warmup — warm on the first real request(s).
+    #                This is a BENCHMARK aid
+    # existing consumers keep working) and as deprecated CLI aliases. None means
+    # "derive the mode from the legacy booleans"; _adjust_warmup resolves it.
+    warmup_mode: str | None = None
+
+    # deprecated: warmup and server_warmup
     warmup: bool = False
     server_warmup: bool = False
+
     warmup_resolutions: list[str] = None
     warmup_steps: int = 1
 
@@ -689,15 +704,40 @@ class ServerArgs(DisaggServerArgsMixin):
         return None, None
 
     def _adjust_warmup(self):
+        #   --warmup-mode > --warmup/--server-warmup
+        mode_explicit = self.is_arg_explicitly_set("warmup_mode")
+        legacy_explicit = self.is_arg_explicitly_set(
+            "warmup"
+        ) or self.is_arg_explicitly_set("server_warmup")
+        if self.warmup_mode is not None:
+            if self.warmup_mode not in WARMUP_MODES:
+                raise ValueError(
+                    f"Invalid --warmup-mode {self.warmup_mode!r}; "
+                    f"expected one of {WARMUP_MODES}."
+                )
+            if mode_explicit and legacy_explicit:
+                logger.warning(
+                    "Both --warmup-mode and the deprecated --warmup/--server-warmup "
+                    "were set; --warmup-mode=%s takes precedence.",
+                    self.warmup_mode,
+                )
+            if mode_explicit or not legacy_explicit:
+                self.warmup = self.warmup_mode != "off"
+                self.server_warmup = self.warmup_mode == "server"
+
+        # Explicit resolutions imply warmup is on (request-based).
         if self.warmup_resolutions is not None:
             self.warmup = True
-            self.server_warmup = False
 
         if self.disagg_role != RoleType.MONOLITHIC:
             self.server_warmup = False
 
         if not self.warmup:
             self.server_warmup = False
+
+        self.warmup_mode = (
+            "off" if not self.warmup else "server" if self.server_warmup else "request"
+        )
 
     @staticmethod
     def _require_port(port: int, name: str) -> None:
@@ -1253,17 +1293,31 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # warmup
         parser.add_argument(
+            "--warmup-mode",
+            type=str,
+            choices=list(WARMUP_MODES),
+            default=ServerArgs.warmup_mode,
+            help=(
+                "Warmup mode (canonical knob). One of: "
+                "`off` (no warmup); `request` (request-based: warm on real "
+                "incoming requests); `server` (server-based: a synthetic warmup "
+                "request right after the server is ready, before traffic). "
+                "Takes precedence over the deprecated --warmup/--server-warmup. "
+                "`sglang serve` defaults to `server`; other entrypoints default "
+                "to request-based when warmup is enabled. When enabled, look for "
+                "the line ending with `(with warmup excluded)` for actual "
+                "processing time."
+            ),
+        )
+        parser.add_argument(
             "--warmup",
             action=StoreBoolean,
             default=ServerArgs.warmup,
             help=(
-                "Perform warmup before normal traffic. `sglang serve` runs a "
-                "lightweight server warmup after HTTP is ready; other entrypoints "
-                "use request-based warmup unless `--warmup-resolutions` is "
-                "specified. Recommended to enable when benchmarking to ensure fair "
-                "comparison and best performance. When enabled with "
-                "`--warmup-resolutions` unspecified, look for the line ending with "
-                "`(with warmup excluded)` for actual processing time."
+                "[DEPRECATED: use --warmup-mode] Perform warmup before normal "
+                "traffic. Maps to --warmup-mode request (or server, combined "
+                "with --server-warmup). Recommended when benchmarking for fair "
+                "comparison and best performance."
             ),
         )
         parser.add_argument(
@@ -1271,7 +1325,7 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             nargs="+",
             default=ServerArgs.warmup_resolutions,
-            help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
+            help="Specify explicit warmup resolutions. e.g., `--warmup-resolutions 256x256 720x720`",
         )
         parser.add_argument(
             "--warmup-steps",
@@ -1283,7 +1337,10 @@ class ServerArgs(DisaggServerArgsMixin):
             "--server-warmup",
             action=StoreBoolean,
             default=ServerArgs.server_warmup,
-            help="Send a warmup request after server ready",
+            help=(
+                "[DEPRECATED: use --warmup-mode server] Send a synthetic warmup "
+                "request after the server is ready (server-based warmup)."
+            ),
         )
 
         # layerwise offload

@@ -29,7 +29,10 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
+from sglang.multimodal_gen.runtime.realtime.states import (
+    RealtimeCausalDiTState,
+    get_realtime_causal_dit_state,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -314,7 +317,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         batch: Req,
     ) -> tuple[RealtimeCausalDiTState, bool]:
         if batch.session is not None:
-            state = batch.session.get_or_create_state(RealtimeCausalDiTState)
+            state = get_realtime_causal_dit_state(batch.session)
             return state, True
         return RealtimeCausalDiTState(), False
 
@@ -395,7 +398,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
     def _realtime_causal_progress_bar(self, batch: Req, timesteps: torch.Tensor):
         if batch.session is not None:
             return nullcontext(None)
-        return self.progress_bar(total=len(timesteps))
+        return self.progress_bar(total=len(timesteps), batch=batch)
 
     def _denoise_realtime_causal_chunk(
         self,
@@ -1022,7 +1025,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
             return current_latents
 
         # DMD loop in causal blocks
-        with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
+        with self.progress_bar(
+            total=len(block_sizes) * len(timesteps), batch=batch
+        ) as progress_bar:
             for current_num_frames in block_sizes:
                 current_latents = latents[
                     :, :, start_index : start_index + current_num_frames, :, :

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_vae import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.vae import (
     CausalVaeDecodingStage,
     RealtimeVAEDecodeState,
 )
@@ -22,7 +22,9 @@ def test_realtime_vae_decode_state_clears_model_cache_on_dispose():
 
 
 def test_causal_vae_decoding_stage_keeps_wan_decoder_cache(monkeypatch):
-    from sglang.multimodal_gen.runtime.pipelines_core.stages import realtime_vae
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
+        vae as realtime_vae,
+    )
 
     class _WanVAE:
         def __init__(self):
@@ -104,7 +106,9 @@ def test_causal_vae_decoding_stage_keeps_wan_decoder_cache(monkeypatch):
 
 
 def test_causal_vae_decoding_stage_prefers_native_causal_decode(monkeypatch):
-    from sglang.multimodal_gen.runtime.pipelines_core.stages import realtime_vae
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
+        vae as realtime_vae,
+    )
 
     class _NativeCausalVAE:
         def __init__(self):

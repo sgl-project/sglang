@@ -58,7 +58,7 @@ ${PIP_INSTALL} ${PTA_URL}
 ${UV_PIP_INSTALL} memfabric-zbal==1.1.1
 
 ### Install Triton-Ascend
-${PIP_INSTALL} "https://gitcode.com/Ascend/triton-ascend/releases/download/v3.2.1/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
+${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host triton-ascend.osinfra.cn
 
 
 ### Install sgl-kernel-npu
