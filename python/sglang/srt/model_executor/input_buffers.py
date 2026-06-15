@@ -24,6 +24,14 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     that differ in size get their own allocation — they never reuse or displace
     an existing entry — so the sharing *structure* is independent of
     registration order and no already-captured buffer is ever repointed.
+
+    This pool is process-wide and governs *every* ``share_buffers()`` caller —
+    including graph runners not yet on the registry (the speculative draft /
+    draft-extend / frozen-kv-mtp / multi-layer-eagle runners), which register
+    identically-named ``input_ids`` / ``positions`` / ``out_cache_loc`` /
+    ``mrope_positions``. Cross-runner sharing is safe because those buffers are
+    filled immediately before each replay and the forwards that use them are
+    sequential / mutually exclusive.
     """
     key: _PoolKey = (name, new_buffer.numel(), new_buffer.dtype, new_buffer.device)
     canonical = _forward_input_buffer_pool.get(key, None)
@@ -31,6 +39,31 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
         _forward_input_buffer_pool[key] = new_buffer
         canonical = new_buffer
     return canonical.as_strided(new_buffer.size(), new_buffer.stride())
+
+
+def share_input_buffers_in(obj) -> None:
+    """Pool every tensor buffer on ``obj`` (dataclass / ``SimpleNamespace``)
+    through the process-wide pool, in place. No-op on NPU; recurses into dict /
+    dataclass buffer fields (``pp_proxy_tensors`` / ``ngram_embedding_info``)."""
+    if is_npu():
+        return
+
+    for name, buffer in list(vars(obj).items()):
+        if buffer is None:
+            continue
+        if dataclasses.is_dataclass(buffer):
+            buffer = vars(buffer)
+        if isinstance(buffer, dict):
+            for sub_name, sub_buffer in buffer.items():
+                assert isinstance(
+                    sub_buffer, torch.Tensor
+                ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
+                buffer[sub_name] = share_input_buffer(f"{name}.{sub_name}", sub_buffer)
+        else:
+            assert isinstance(
+                buffer, torch.Tensor
+            ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
+            setattr(obj, name, share_input_buffer(name, buffer))
 
 
 @dataclass

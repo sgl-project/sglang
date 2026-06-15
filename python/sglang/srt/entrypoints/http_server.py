@@ -24,6 +24,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -425,13 +426,77 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 app.include_router(v1_loads_router)
 
 
+def _anthropic_validation_message(raw_errors) -> str:
+    """Render Pydantic-style errors for an Anthropic /v1/messages route.
+
+    Builds a short ``loc: msg`` digest that names the offending fields without
+    leaking file paths or Python internals (the default ``str(exc)`` includes
+    the dispatcher's ``File "/.../http_server.py"`` line).
+    """
+    parts: list[str] = []
+    for err in raw_errors or []:
+        loc = err.get("loc") or ()
+        if loc:
+            loc_str = ".".join(str(p) for p in loc if p not in ("body",))
+        else:
+            loc_str = ""
+        msg = (err.get("msg") or "").strip()
+        if loc_str and msg:
+            parts.append(f"{loc_str}: {msg}")
+        elif msg:
+            parts.append(msg)
+    text = "; ".join(parts) or "Invalid request"
+    if len(text) > 500:
+        text = text[:500] + "…"
+    return text
+
+
+def _anthropic_error_response(*, status_code: int, error_type: str, message: str):
+    """Anthropic-format error envelope: {"type":"error","error":{"type":...,"message":...}}."""
+    return ORJSONResponse(
+        status_code=status_code,
+        content={
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        },
+    )
+
+
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
 
     For /v1/responses, emit OpenAI-style nested error envelope:
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
+    For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
+    if request.url.path.startswith("/v1/messages"):
+        # Map HTTP status to Anthropic error.type; fall back to api_error.
+        anthropic_type = {
+            400: "invalid_request_error",
+            401: "authentication_error",
+            403: "permission_error",
+            404: "not_found_error",
+            413: "request_too_large",
+            422: "invalid_request_error",
+            429: "rate_limit_error",
+            500: "api_error",
+            502: "api_error",
+            503: "overloaded_error",
+            504: "api_error",
+        }.get(exc.status_code, "api_error")
+        # 5xx must never echo upstream detail (may contain stack/PII).
+        message = (
+            "Internal server error"
+            if exc.status_code >= 500
+            else (str(exc.detail) if exc.detail else "Request failed")
+        )
+        return _anthropic_error_response(
+            status_code=exc.status_code,
+            error_type=anthropic_type,
+            message=message,
+        )
+
     # adjust fmt for responses api
     if request.url.path.startswith("/v1/responses"):
         nested_error = {
@@ -458,8 +523,18 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Override FastAPI's default 422 validation error with 400.
 
-    For /v1/responses, emit OpenAI-style nested error envelope; for other endpoints keep legacy format.
+    For /v1/messages, emit Anthropic-style envelope and scrub the message so
+    file paths or Python internals from the default ``str(exc)`` representation
+    never reach the client. For /v1/responses, keep OpenAI-style. Otherwise
+    use the legacy ErrorResponse shape.
     """
+    if request.url.path.startswith("/v1/messages"):
+        return _anthropic_error_response(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            error_type="invalid_request_error",
+            message=_anthropic_validation_message(exc.errors()),
+        )
+
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
@@ -533,7 +608,9 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-    rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+    # uuid keeps rids unique across tokenizer workers (a bare time.time() can
+    # collide and crash the shared DetokenizerManager decode_status).
+    rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
 
     if _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
@@ -726,7 +803,21 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
-                out = {"error": {"message": str(e)}}
+                # A client disconnect also surfaces here. It's a client-side
+                # cancellation, not a server error or bad input -- log it and
+                # stop (the request was already aborted upstream) instead of
+                # emitting a 400.
+                if request is not None and await request.is_disconnected():
+                    logger.info(f"[http_server] Client disconnected: {e}")
+                    return
+                out = {
+                    "error": {
+                        "message": str(e),
+                        "type": "invalid_request_error",
+                        "code": 400,
+                        "retryable": False,
+                    }
+                }
                 logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
@@ -1053,9 +1144,11 @@ async def dump_expert_distribution_record_async():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
-    success, message, num_paused_requests = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
-    )
+    (
+        success,
+        message,
+        num_paused_requests,
+    ) = await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
 
     content = {
         "success": success,
@@ -1079,10 +1172,11 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
 async def init_weights_send_group_for_remote_instance(
     obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
 ):
-    success, message = (
-        await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -1096,10 +1190,11 @@ async def init_weights_send_group_for_remote_instance(
 async def send_weights_to_remote_instance(
     obj: SendWeightsToRemoteInstanceReqInput, request: Request
 ):
-    success, message = (
-        await _global_state.tokenizer_manager.send_weights_to_remote_instance(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -1168,9 +1263,10 @@ async def destroy_weights_update_group(
     obj: DestroyWeightsUpdateGroupReqInput, request: Request
 ):
     """Destroy the parameter update group."""
-    success, message = (
-        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
-    )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -1205,10 +1301,11 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
-    success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.update_weights_from_distributed(
+        obj, request
     )
 
     content = {"success": success, "message": message}
@@ -1463,13 +1560,24 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     parser = ReasoningParser(model_type=obj.reasoning_parser, request=request)
 
     # 2) Call the non-stream parsing method (non-stream)
-    reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+    if getattr(obj, "return_blocks", False):
+        blocks = parser.parse_non_stream_blocks(obj.text)
+        reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
+        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
+        reasoning_text = "".join(reasoning_blocks)
+        normal_text = "".join(text_blocks)
+    else:
+        reasoning_text, normal_text = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
         "reasoning_text": reasoning_text,
         "text": normal_text,
     }
+    if getattr(obj, "return_blocks", False):
+        response_data["reasoning_blocks"] = reasoning_blocks
+        response_data["text_blocks"] = text_blocks
+        response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
 
@@ -1694,12 +1802,11 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 
 
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
-async def v1_responses_request(request: dict, raw_request: Request):
+async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
-    request_obj = ResponsesRequest(**request)
     result = await raw_request.app.state.openai_serving_responses.create_responses(
-        request_obj, raw_request
+        request, raw_request
     )
 
     # Handle streaming responses

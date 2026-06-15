@@ -165,7 +165,7 @@ class DataParallelController:
         self.load_snapshot_reader = create_load_snapshot_reader(
             server_args,
             port_args,
-            caller="dp_controller",
+            caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
 
