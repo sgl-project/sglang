@@ -291,9 +291,28 @@ class NGRAMWorker(BaseSpecWorker):
         return req_drafts, mask
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
-        # Decode-only: extend goes through the plain target forward, and an
-        # IDLE batch must keep its forward_mode instead of being rewritten to
-        # TARGET_VERIFY below (relevant once DP attention support lands).
+        # DP-attention: an idle rank still runs forward_idle and must take part
+        # in every per-layer DP collective in lockstep with active ranks. Give
+        # it a spec_info so ForwardBatch.init_new scales global_num_tokens by
+        # draft_token_num exactly like active ranks (init_new only applies the
+        # coefficient when spec_info is set); keep forward_mode=IDLE so it runs
+        # forward_idle rather than the TARGET_VERIFY rewrite below.
+        #
+        # BUT only when the GLOBAL step is decode/verify. If the global step is
+        # extend (is_extend_in_batch is globally synced across DP ranks), the
+        # active ranks run plain prefill with NO draft_token_num coefficient, so
+        # an idle rank must not apply it either — otherwise its global_num_tokens
+        # (and the resulting MoE DeepEP all-to-all sizing / dense-vs-deepep path)
+        # diverges from the active extend ranks and the DP collective deadlocks.
+        # Mirrors EAGLEWorkerV2's `is_extend() or is_extend_in_batch` dispatch.
+        if batch.forward_mode.is_idle():
+            if not batch.is_extend_in_batch:
+                batch.spec_info = NgramVerifyInput(
+                    draft_token_num=self.draft_token_num,
+                    new_seq_lens=batch.seq_lens,
+                )
+            return
+        # Decode-only: extend goes through the plain target forward.
         if not batch.forward_mode.is_decode():
             return
 
@@ -511,6 +530,29 @@ class NGRAMWorker(BaseSpecWorker):
                     self.ngram_corpus.erase_match_state(list(departed_rids))
                 self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
+
+        elif batch.forward_mode.is_idle():
+            # DP-attention idle rank: run forward_idle so this rank emits the
+            # same per-layer DP collectives as the active ranks' verify
+            # (spec_info set in _prepare_for_speculative_decoding scales
+            # global_num_tokens to match). bs == 0, so the result is empty and
+            # discarded; only well-shaped 0-row tensors must reach the overlap
+            # scheduler (copy_to_cpu / next_draft_input).
+            batch_result = self.target_worker.forward_batch_generation(batch)
+            logits_output, can_run_cuda_graph = (
+                batch_result.logits_output,
+                batch_result.can_run_cuda_graph,
+            )
+            new_seq_lens = batch.seq_lens.clone()
+            next_token_ids = (
+                batch_result.next_token_ids
+                if batch_result.next_token_ids is not None
+                else torch.empty(0, dtype=torch.int64, device=self.device)
+            )
+            accept_tokens = torch.empty(0, dtype=torch.int32, device=self.device)
+
+            if on_publish is not None:
+                on_publish(new_seq_lens)
 
         else:
             batch_result = self.target_worker.forward_batch_generation(batch)

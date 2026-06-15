@@ -405,6 +405,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                # NGRAM/SUFFIX verify is a fixed num_tokens_per_bs target verify
+                # whose global token count is coefficient-scaled by
+                # num_tokens_per_bs exactly like eagle; without dividing it back
+                # under dp-attention it selects graph[bs*K] -> the captured DSA
+                # paged-MQA schedule metadata batch_size mismatches runtime
+                # (deep_gemm asserts _batch_size == batch_size).
+                or self.model_runner.spec_algorithm.is_ngram()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -901,6 +908,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                # NGRAM/SUFFIX: divide back so dp-attention replay selects
+                # graph[bs] not graph[bs*K] (see note in can_run).
+                or self.model_runner.spec_algorithm.is_ngram()
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
