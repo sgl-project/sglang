@@ -688,6 +688,15 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             )
         )
 
+    @patch(
+        "sglang.srt.layers.quantization.modelopt_quant.envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get",
+        return_value=True,
+    )
+    def test_explicit_nvfp4_per_token_activation_false_overrides_env(self, _):
+        config = ModelOptFp4Config(use_per_token_activation=False)
+
+        self.assertFalse(config.use_per_token_activation)
+
     def test_mixed_precision_uses_nvfp4_min_capability(self):
         self.assertEqual(
             ModelOptMixedPrecisionConfig.get_min_capability(),

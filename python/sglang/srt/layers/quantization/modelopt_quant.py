@@ -1252,8 +1252,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             )
         self.group_size = group_size
         self.use_per_token_activation = (
-            use_per_token_activation
-            or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+            if use_per_token_activation is None
+            else use_per_token_activation
         )
 
     @classmethod
