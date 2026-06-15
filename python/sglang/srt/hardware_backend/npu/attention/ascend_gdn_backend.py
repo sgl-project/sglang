@@ -1,4 +1,5 @@
-from typing import Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
 
 import torch
 from sgl_kernel_npu.fla.fused_gdn_gating import (
@@ -10,7 +11,9 @@ from sgl_kernel_npu.mamba.causal_conv1d import (
     causal_conv1d_update_npu,
     causal_conv1d_update_v2,
 )
+import sgl_kernel_npu
 
+from sglang.srt.hardware_backend.npu.utils import device_print
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
@@ -30,6 +33,18 @@ causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
 
 
+@dataclass
+class GDNForwardMetadata:
+    # gdn conv data
+    query_start_loc_cpu_list: Optional[List[int]] = None
+    cache_indices_cpu_list: Optional[List[int]] = None
+
+def to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
+    tensor = tensor.to(torch.int64)
+    if tensor.dim() == 0:
+        return (tensor.item(),)
+    return tuple(tensor.tolist())
+
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
@@ -46,6 +61,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        self.cnt = 0
 
     def prepare_gdn_inputs(
         self,
@@ -114,6 +130,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
+        '''
         conv_states_tmp = conv_states.transpose(1, 2).clone()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -124,6 +141,18 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             conv_state_indices=cache_indices,
         )
         conv_states[:] = conv_states_tmp.transpose(1, 2)
+        '''
+        mixed_qkv = torch.ops.npu.causal_conv1d(
+            mixed_qkv,
+            layer.conv_weights.transpose(0, 1).contiguous(),
+            conv_states=conv_states,
+            bias=layer.bias,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            activation_mode=1,
+            pad_slot_id=-1,
+            run_mode=1,
+        )
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -208,19 +237,40 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 dtype=torch.int32,
                 device=mixed_qkv.device,
             )
-            mixed_qkv = causal_conv1d_update_v2(
-                x=mixed_qkv.view(batch_size, draft_token_num, -1).contiguous(),
-                conv_state=conv_states.contiguous(),
-                weight=layer.conv_weights.transpose(0, 1).contiguous(),
+            '''
+            if self.graph_mode:
+                device_print(mixed_qkv[:,:10])
+                device_print(query_start_loc)
+                device_print(cache_indices)
+                device_print(num_accepted_tokens)
+            else:
+                print(mixed_qkv[:,:10],flush=True)
+                print(query_start_loc,flush=True)
+                print(cache_indices,flush=True)
+                print(num_accepted_tokens,flush=True)
+            '''
+            mixed_qkv = torch.ops.npu.causal_conv1d(
+                mixed_qkv,
+                layer.conv_weights.transpose(0, 1).contiguous(),
+                conv_states=conv_states,
                 bias=layer.bias,
-                activation=layer.activation,
-                conv_state_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
                 num_accepted_tokens=num_accepted_tokens,
+                activation_mode=1,
                 pad_slot_id=-1,
-                validate_data=False,
-            ).view(seq_len, -1)
+                run_mode=1,
+            )
+            '''
+            if self.graph_mode:
+                device_print(mixed_qkv[:,:10])
+                device_print(conv_states[cache_indices,:,:10])
+            else:
+                print(mixed_qkv[:,:10],flush=True)
+                print(conv_states[cache_indices,:,:10],flush=True)
+            '''
         else:
-            mixed_qkv = mixed_qkv.transpose(0, 1)
+            #mixed_qkv = mixed_qkv.transpose(0, 1)
             if (
                 forward_batch.mamba_track_mask is not None
                 and forward_batch.mamba_track_mask.any()
@@ -228,12 +278,27 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 conv_dst = forward_batch.mamba_track_indices
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
-                ].transpose(0, 1)
+                ]#.transpose(0, 1)
                 mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states.transpose(1, 2)[conv_dst[mask_indices]] = mixed_qkv_to_track
+                conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
             kernel_size = layer.conv_weights.shape[-1]
-            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
-            conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()
+            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :].contiguous()
+            #conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()
+
+            '''
+            if self.cnt == 0:
+                inputs_dict = {
+                    'mixed_qkv': mixed_qkv.contiguous(),
+                    'conv_weights': layer.conv_weights.contiguous(),
+                    'bias': layer.bias,
+                    'activation': layer.activation,
+                    'conv_states_tmp': conv_states_tmp,
+                    'has_initial_states': has_initial_states,
+                    'cache_indices': cache_indices,
+                    'query_start_loc': query_start_loc,
+                    'forward_batch.extend_seq_lens_cpu': forward_batch.extend_seq_lens_cpu
+                }
+                torch.save(inputs_dict, '/home/z00842572/dump/named_inputs.pt')
 
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,
@@ -246,9 +311,28 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
+            '''
+            mixed_qkv = torch.ops.npu.causal_conv1d(
+                mixed_qkv,
+                layer.conv_weights.transpose(0, 1).contiguous(),
+                conv_states=conv_states_for_prefill,
+                bias=layer.bias,
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                has_initial_state=has_initial_states,
+                activation_mode=1,
+                pad_slot_id=-1,
+                run_mode=0,
+            )
+            #torch.save(mixed_qkv,f"/home/z00842572/dump/sgl/mixed_qkv_{torch.distributed.get_rank()}_{self.cnt}.pt")
+            #torch.save(conv_states_tmp,f"/home/z00842572/dump/sgl/conv_states_tmp_{torch.distributed.get_rank()}_{self.cnt}.pt")
+            #self.cnt = self.cnt + 1
+            conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
+            '''
             conv_states[:, -(kernel_size - 1) :, :] = conv_states_tmp.transpose(
                 1, 2
             ).contiguous()
+            '''
         if is_target_verify:
             g, beta = fused_gdn_gating_kernel_without_sigmoid(
                 layer.A_log, a, b, layer.dt_bias
