@@ -38,6 +38,11 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
 
@@ -250,8 +255,8 @@ class Mxfp4FlashinferW4A8MoEMethod:
     def apply(
         self,
         layer: Module,
-        dispatch_output: "DispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: DispatchOutput,
+    ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
         topk_output = dispatch_output.topk_output
@@ -264,7 +269,15 @@ class Mxfp4FlashinferW4A8MoEMethod:
 
         x = dispatch_output.hidden_states
         output_dtype = torch.bfloat16
-        out = torch.empty(x.shape[0], x.shape[-1], dtype=output_dtype, device=x.device)
+        # Match the W4A16 FlashInfer MXFP4 path and keep this output allocation
+        # consistent with the symmetric allocator policy used around MoE
+        # dispatch/combine and CP reduce-scatter paths.
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            out = torch.empty(
+                x.shape[0], x.shape[-1], dtype=output_dtype, device=x.device
+            )
 
         # The stateless flashinfer entry point is serving-safe: the grouped GEMM keeps
         # num_groups static (all experts are always passed, empty ones at M=0) and all
