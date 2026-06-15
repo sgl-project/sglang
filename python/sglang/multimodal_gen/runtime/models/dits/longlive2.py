@@ -10,7 +10,10 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
 )
-from sglang.multimodal_gen.runtime.layers.layernorm import tensor_parallel_rms_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNormScaleShift,
+    tensor_parallel_rms_norm,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -19,7 +22,17 @@ from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
     CausalWanTransformerBlock,
 )
 
+
 class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.norm1 = LayerNormScaleShift(
+            self.hidden_dim,
+            eps=self.norm1.eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
+
     def _cross_attn_with_cache(
         self,
         hidden_states: torch.Tensor,
@@ -71,7 +84,6 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         num_frames = temb.shape[1]
-        frame_seqlen = hidden_states.shape[1] // num_frames
         bs, _, _ = hidden_states.shape
         orig_dtype = hidden_states.dtype
         e = self.scale_shift_table + temb.float()
@@ -81,17 +93,7 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
         )
         assert shift_msa.dtype == torch.float32
 
-        norm_hidden_states = (
-            (
-                self.norm1(hidden_states.float()).unflatten(
-                    dim=1, sizes=(num_frames, frame_seqlen)
-                )
-                * (1 + scale_msa)
-                + shift_msa
-            )
-            .flatten(1, 2)
-            .to(orig_dtype)
-        )
+        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
