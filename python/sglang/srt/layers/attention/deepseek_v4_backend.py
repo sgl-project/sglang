@@ -85,7 +85,10 @@ def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
     if forward_batch.forward_mode.is_idle():
         return forward_batch.forward_mode
-    return getattr(forward_batch, "_original_forward_mode", None) or forward_batch.forward_mode
+    return (
+        getattr(forward_batch, "_original_forward_mode", None)
+        or forward_batch.forward_mode
+    )
 
 
 def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
