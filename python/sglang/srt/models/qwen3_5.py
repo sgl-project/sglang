@@ -48,6 +48,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.elementwise import fused_sigmoid_mul
+from sglang.srt.layers.fused_qk_norm_rope_gate import (
+    fused_qk_gemma_rmsnorm_rope_with_gate,
+)
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -91,7 +94,6 @@ from sglang.srt.models.qwen2_moe import (
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
-    fused_qk_gemma_rmsnorm_rope_with_gate,
     fused_qk_gemma_rmsnorm_with_gate,
 )
 from sglang.srt.server_args import get_global_server_args
