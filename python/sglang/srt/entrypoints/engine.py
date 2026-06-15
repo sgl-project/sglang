@@ -585,75 +585,110 @@ class Engine(EngineScoreMixin, EngineBase):
 
     @classmethod
     def _launch_weight_cache_daemons(cls, server_args: ServerArgs):
-        """Launch weight cache daemon processes for each GPU/TP rank.
+        """Launch weight cache daemon processes for this node's PP×TP ranks.
 
         All daemon processes join the same NCCL distributed group so that
         TP-sharded model loading works correctly. Each daemon holds its
         rank's weight shard in GPU memory and serves IPC handles.
         """
         tp_size = server_args.tp_size
-        gpu_ids = list(range(tp_size))
 
-        # Allocate a shared port for daemon distributed group
-        # All daemons must connect to the same init_method to form a process group
-        dist_port = PortArgs.init_new(server_args).nccl_port
-        dist_init_method = NetworkAddress("127.0.0.1", dist_port).to_tcp()
+        pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+            _calculate_rank_ranges(
+                server_args.nnodes,
+                server_args.pp_size,
+                tp_size,
+                server_args.node_rank,
+            )
+        )
 
+        # Build the distributed init method.
+        # For multi-node, use the user-provided dist_init_addr so all nodes
+        # can reach the same rendezvous endpoint.
+        if server_args.dist_init_addr:
+            host, port = server_args.dist_init_addr.rsplit(":", 1)
+            dist_init_method = f"tcp://{host}:{port}"
+        else:
+            dist_port = PortArgs.init_new(server_args).nccl_port
+            dist_init_method = NetworkAddress("127.0.0.1", dist_port).to_tcp()
+
+        num_daemons = len(pp_rank_range) * len(tp_rank_range)
         daemon_procs = []
         logger.info(
-            f"Launching {tp_size} weight cache daemon(s) for model={server_args.model_path}, "
+            f"Launching {num_daemons} weight cache daemon(s) on node "
+            f"{server_args.node_rank} for model={server_args.model_path}, "
+            f"pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
+            f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
             f"dist_init_method={dist_init_method}"
         )
 
-        for gpu_id in gpu_ids:
-            proc = mp.Process(
-                target=run_weight_cache_daemon,
-                kwargs=dict(
-                    model_path=server_args.model_path,
-                    gpu_id=gpu_id,
-                    tp_size=tp_size,
-                    tp_rank=gpu_id,
-                    dp_size=1,
-                    load_format=server_args.load_format,
-                    dtype=server_args.dtype,
-                    quantization=server_args.quantization,
-                    model_loader_extra_config=server_args.model_loader_extra_config,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    dist_init_method=dist_init_method,
-                ),
-                daemon=True,
-                name=f"weight_cache_daemon_gpu{gpu_id}",
-            )
-            proc.start()
-            daemon_procs.append(proc)
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                gpu_id = (
+                    server_args.base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                )
+                proc = mp.Process(
+                    target=run_weight_cache_daemon,
+                    kwargs=dict(
+                        model_path=server_args.model_path,
+                        gpu_id=gpu_id,
+                        tp_size=tp_size,
+                        tp_rank=tp_rank,
+                        pp_size=server_args.pp_size,
+                        pp_rank=pp_rank,
+                        dp_size=1,
+                        load_format=server_args.load_format,
+                        dtype=server_args.dtype,
+                        quantization=server_args.quantization,
+                        model_loader_extra_config=server_args.model_loader_extra_config,
+                        trust_remote_code=server_args.trust_remote_code,
+                        revision=server_args.revision,
+                        dist_init_method=dist_init_method,
+                    ),
+                    daemon=True,
+                    name=f"weight_cache_daemon_gpu{gpu_id}",
+                )
+                proc.start()
+                daemon_procs.append(proc)
 
         # Wait for all daemons to be ready (ready file exists)
         timeout = 1800  # 30 min timeout for large model loading
         check_interval = 2
         elapsed = 0
-        for gpu_id in gpu_ids:
-            ready_path = get_ready_path(gpu_id)
-            while not os.path.exists(ready_path):
-                time.sleep(check_interval)
-                elapsed += check_interval
-                if elapsed > timeout:
-                    raise TimeoutError(
-                        f"Weight cache daemon for gpu={gpu_id} did not become ready "
-                        f"within {timeout}s"
-                    )
-                # Check if daemon process is still alive
-                for p in daemon_procs:
-                    if not p.is_alive():
-                        raise RuntimeError(
-                            f"Weight cache daemon for gpu={gpu_id} exited prematurely "
-                            f"with code {p.exitcode}"
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                global_rank = tp_size * pp_rank + tp_rank
+                ready_path = get_ready_path(global_rank)
+                while not os.path.exists(ready_path):
+                    time.sleep(check_interval)
+                    elapsed += check_interval
+                    if elapsed > timeout:
+                        raise TimeoutError(
+                            f"Weight cache daemon for pp_rank={pp_rank} "
+                            f"tp_rank={tp_rank} did not become ready "
+                            f"within {timeout}s"
                         )
-            logger.info(f"Weight cache daemon for gpu={gpu_id} is ready")
+                    # Check if daemon process is still alive
+                    for p in daemon_procs:
+                        if not p.is_alive():
+                            raise RuntimeError(
+                                f"Weight cache daemon for pp_rank={pp_rank} "
+                                f"tp_rank={tp_rank} exited prematurely "
+                                f"with code {p.exitcode}"
+                            )
+                logger.info(
+                    f"Weight cache daemon for pp_rank={pp_rank} "
+                    f"tp_rank={tp_rank} is ready"
+                )
 
         # Store daemon procs for cleanup
         cls._weight_cache_daemon_procs = daemon_procs
-        logger.info("All weight cache daemons are ready")
+        logger.info(
+            f"All {num_daemons} weight cache daemons on node "
+            f"{server_args.node_rank} are ready"
+        )
 
     @classmethod
     def _launch_scheduler_processes(

@@ -1308,14 +1308,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # If weight cache is enabled, override load format to IPC_CACHE
         if self.server_args.weight_cache_mode != "off":
             self.load_config.load_format = LoadFormat.IPC_CACHE
-            # Compute socket path using gpu_id (not tp_rank) since the daemon
-            # binds its socket based on gpu_id. If the user hasn't specified a
-            # custom socket, derive it from the actual GPU ID.
+            # Compute socket path using global rank (tp_size * pp_rank + tp_rank)
+            # so each daemon has a unique socket even across PP stages and nodes.
             if self.load_config.weight_cache_socket is None:
                 from sglang.srt.weight_cache.protocol import get_socket_path
 
+                global_rank = self.tp_size * self.pp_rank + self.tp_rank
                 self.load_config.weight_cache_socket = get_socket_path(
-                    gpu_id=self.gpu_id
+                    global_rank=global_rank
                 )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(

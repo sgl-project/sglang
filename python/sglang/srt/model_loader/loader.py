@@ -3160,7 +3160,7 @@ def get_model_loader(
         socket_path = (
             load_config.weight_cache_socket
             if load_config.weight_cache_socket
-            else get_socket_path(gpu_id=load_config.tp_rank or 0)
+            else get_socket_path(global_rank=load_config.tp_rank or 0)
         )
         return IpcModelLoader(
             load_config=load_config,

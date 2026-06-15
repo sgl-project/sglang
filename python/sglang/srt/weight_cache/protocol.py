@@ -14,11 +14,12 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# Socket path template for weight cache daemons
-WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_gpu{gpu_id}.sock"
+# Socket path template for weight cache daemons (keyed by global rank
+# = tp_size * pp_rank + tp_rank, so multi-node / multi-PP don't collide)
+WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.sock"
 
 # Ready file template — daemon writes this after loading completes
-WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_gpu{gpu_id}.ready"
+WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.ready"
 
 
 @dataclass
@@ -123,11 +124,17 @@ def _recv_exact(sock, n: int) -> Optional[bytes]:
     return bytes(buf)
 
 
-def get_socket_path(gpu_id: int) -> str:
-    """Get the Unix socket path for a GPU's weight cache daemon."""
-    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(gpu_id=gpu_id)
+def get_socket_path(global_rank: int) -> str:
+    """Get the Unix socket path for a weight cache daemon.
+
+    global_rank = tp_size * pp_rank + tp_rank
+    """
+    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(global_rank=global_rank)
 
 
-def get_ready_path(gpu_id: int) -> str:
-    """Get the ready-file path for a GPU's weight cache daemon."""
-    return WEIGHT_CACHE_READY_TEMPLATE.format(gpu_id=gpu_id)
+def get_ready_path(global_rank: int) -> str:
+    """Get the ready-file path for a weight cache daemon.
+
+    global_rank = tp_size * pp_rank + tp_rank
+    """
+    return WEIGHT_CACHE_READY_TEMPLATE.format(global_rank=global_rank)
