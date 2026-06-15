@@ -80,6 +80,8 @@ import orjson
 import psutil
 import pybase64
 import requests
+import socket
+import ipaddress
 import torch
 import torch.distributed as dist
 import triton
@@ -102,6 +104,89 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+# === Security helpers for media URL/path validation ===
+
+# Private/internal IP ranges that should not be accessed via SSRF
+_BLOCKED_IP_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),  # Link-local / cloud metadata
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),  # IPv6 unique local
+    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
+]
+
+# Allowed base directories for local file access in media handlers.
+# Configurable via SGLANG_ALLOWED_MEDIA_PATHS env var (colon-separated).
+_ALLOWED_MEDIA_PATHS_ENV = os.environ.get("SGLANG_ALLOWED_MEDIA_PATHS", "")
+_ALLOWED_MEDIA_PATHS = (
+    [Path(p).resolve() for p in _ALLOWED_MEDIA_PATHS_ENV.split(":") if p]
+    if _ALLOWED_MEDIA_PATHS_ENV
+    else []
+)
+
+
+def _validate_url_safe(url: str) -> None:
+    """Validate that a URL does not point to internal/private network resources.
+
+    Raises ValueError if the URL resolves to a blocked IP range.
+    """
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"Invalid URL (no hostname): {url}")
+
+    # Resolve hostname to IP(s) and check against blocked ranges
+    try:
+        addr_infos = socket.getaddrinfo(hostname, parsed.port or 80)
+    except socket.gaierror:
+        raise ValueError(f"Cannot resolve hostname: {hostname}")
+
+    for family, _, _, _, sockaddr in addr_infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        for network in _BLOCKED_IP_NETWORKS:
+            if ip in network:
+                raise ValueError(
+                    f"URL resolves to blocked internal address: {hostname} -> {ip}"
+                )
+
+
+def _validate_file_path_safe(file_path: str) -> str:
+    """Validate that a file path is within allowed directories.
+
+    Returns the resolved absolute path if valid.
+    Raises ValueError if path traversal is detected or path is not allowed.
+    """
+    # Strip file:// prefix if present
+    if file_path.startswith("file://"):
+        file_path = unquote(urlparse(file_path).path)
+
+    resolved = Path(file_path).resolve()
+
+    # If no allowed paths configured, block all local file access
+    if not _ALLOWED_MEDIA_PATHS:
+        raise ValueError(
+            f"Local file access is disabled. Set SGLANG_ALLOWED_MEDIA_PATHS "
+            f"environment variable to allow specific directories. "
+            f"Attempted path: {resolved}"
+        )
+
+    # Check if resolved path is under any allowed directory
+    for allowed_dir in _ALLOWED_MEDIA_PATHS:
+        try:
+            resolved.relative_to(allowed_dir)
+            return str(resolved)
+        except ValueError:
+            continue
+
+    raise ValueError(
+        f"File path not within allowed directories: {resolved}. "
+        f"Allowed: {[str(p) for p in _ALLOWED_MEDIA_PATHS]}"
+    )
 
 
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
@@ -796,12 +881,13 @@ def load_audio(
     elif isinstance(audio_file, str) and (
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
+        _validate_url_safe(audio_file)
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         with requests.get(audio_file, timeout=timeout) as response:
             response.raise_for_status()
             source = response.content
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
-        source = unquote(urlparse(audio_file).path)
+        source = _validate_file_path_safe(audio_file)
     elif isinstance(audio_file, str):
         source = audio_file
     else:
@@ -957,6 +1043,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     if isinstance(image_file, bytes):
         return image_file
     if image_file.startswith(("http://", "https://")):
+        _validate_url_safe(image_file)
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
         try:
@@ -966,7 +1053,8 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
             response.close()
         return result
     if image_file.startswith(("file://", "/")):
-        with open(image_file, "rb") as f:
+        safe_path = _validate_file_path_safe(image_file)
+        with open(safe_path, "rb") as f:
             return f.read()
     if isinstance(image_file, str) and image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
@@ -989,6 +1077,7 @@ def _normalize_video_input(
         return video_file
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
+            _validate_url_safe(video_file)
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
             response = requests.get(video_file, stream=True, timeout=timeout)
             response.raise_for_status()
@@ -997,8 +1086,9 @@ def _normalize_video_input(
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
-            return unquote(urlparse(video_file).path)
+            return _validate_file_path_safe(video_file)
         elif os.path.isfile(unquote(urlparse(video_file).path)):
+            _validate_file_path_safe(video_file)
             return video_file
         else:
             return pybase64.b64decode(video_file, validate=True)
