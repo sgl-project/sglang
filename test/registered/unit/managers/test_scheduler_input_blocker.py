@@ -156,8 +156,8 @@ class TestInputBlockerGuardRegion(CustomTestCase):
         with self.assertRaises(ValueError):
             with input_blocker_guard_region(send_to_scheduler):
                 raise ValueError("boom")
-        last_args = send_to_scheduler.send_pyobj.call_args.args
-        self.assertEqual(last_args[0].type, BlockReqType.UNBLOCK)
+        self.assertEqual(send_to_scheduler.send_pyobj.mock_calls,
+                         [unittest.mock.call(_block()), unittest.mock.call(_unblock())])
 
 
 if __name__ == "__main__":
