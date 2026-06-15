@@ -304,6 +304,7 @@ class Gemma4Detector(BaseFormatDetector):
 
         except (ValueError, IndexError, TypeError, KeyError) as e:
             logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
+            self._note_malformed_tool_call(e)
             return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
@@ -425,6 +426,7 @@ class Gemma4Detector(BaseFormatDetector):
 
         except (ValueError, IndexError, TypeError, KeyError) as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
+            self._note_malformed_tool_call(e)
             # Reset parser state to prevent corruption
             self.is_inside_tool_call = False
             self.current_func_name = None

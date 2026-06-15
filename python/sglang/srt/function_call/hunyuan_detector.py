@@ -4,7 +4,6 @@ import re
 from typing import Any, Dict, List, Optional, Set
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -225,16 +224,13 @@ class HunyuanDetector(BaseFormatDetector):
         normal_text = text[:idx].strip() if idx > 0 else ""
 
         tool_indices = self._get_tool_indices(tools)
-        forward_unknown = envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
-
         calls: List[ToolCallItem] = []
         try:
             for function_name, function_args in self.tool_call_regex.findall(text):
                 function_name = function_name.strip()
-                if function_name not in tool_indices and not forward_unknown:
-                    logger.warning(
-                        "Model attempted to call undefined function: %s", function_name
-                    )
+                if function_name not in tool_indices and self._skip_unknown_tool(
+                    function_name
+                ):
                     continue
 
                 arg_dict: Dict[str, Any] = {}
@@ -252,6 +248,7 @@ class HunyuanDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
+            self._note_malformed_tool_call(e)
             return StreamingParseResult(normal_text=text)
 
     # ------------------------------------------------------------------
@@ -270,6 +267,7 @@ class HunyuanDetector(BaseFormatDetector):
             return self._parse_streaming_increment_impl(new_text, tools)
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
+            self._note_malformed_tool_call(e)
             return StreamingParseResult()
 
     def _parse_streaming_increment_impl(
@@ -324,13 +322,17 @@ class HunyuanDetector(BaseFormatDetector):
                     tc_start + len(self.tool_call_start_token) : sep_pos
                 ].strip()
 
-                if (
-                    tool_name not in self._tool_indices
-                    and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                if tool_name not in self._tool_indices and self._skip_unknown_tool(
+                    tool_name
                 ):
-                    logger.warning(
-                        "Model attempted to call undefined function: %s", tool_name
-                    )
+                    end_pos = self._buffer.find(self.tool_call_end_token, sep_pos)
+                    if end_pos == -1:
+                        self._buffer = self._buffer[tc_start:]
+                        break
+                    self._buffer = self._buffer[
+                        end_pos + len(self.tool_call_end_token) :
+                    ]
+                    continue
 
                 self._streaming_tool_name = tool_name
                 self.current_tool_id += 1

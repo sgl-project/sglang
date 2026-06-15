@@ -24,7 +24,6 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -129,12 +128,8 @@ class Lfm2Detector(BaseFormatDetector):
         function_name = call.func.id
 
         # Validate that the function exists in the tools
-        if function_name not in tool_indices:
-            logger.warning(
-                f"Model attempted to call undefined function: {function_name}"
-            )
-            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                return None  # Skip unknown tools (default legacy behavior)
+        if function_name not in tool_indices and self._skip_unknown_tool(function_name):
+            return None  # Skip unknown tools (default legacy behavior)
 
         # Parse arguments
         arguments = {}
@@ -147,6 +142,9 @@ class Lfm2Detector(BaseFormatDetector):
                 arguments[keyword.arg] = self._get_parameter_value(keyword.value)
             except ValueError as e:
                 logger.warning(f"Failed to parse argument {keyword.arg}: {e}")
+                self._note_malformed_tool_call(
+                    e, detail=f"{function_name}.{keyword.arg}"
+                )
                 return None
 
         return ToolCallItem(
@@ -202,9 +200,11 @@ class Lfm2Detector(BaseFormatDetector):
             return calls, ""
 
         except SyntaxError as e:
+            self._note_malformed_tool_call(e, detail=content[:80])
             return [], f"Python syntax error: {e}"
         except Exception as e:
             logger.exception("Unexpected error in pythonic tool call parsing")
+            self._note_malformed_tool_call(e, detail=content[:80])
             return [], f"Unexpected error: {e}"
 
     def _parse_json_content(
@@ -233,6 +233,7 @@ class Lfm2Detector(BaseFormatDetector):
             return calls, ""
 
         except json.JSONDecodeError as e:
+            self._note_malformed_tool_call(e, detail=content[:80])
             return [], f"JSON parse error: {e}"
 
     def _parse_tool_calls_content(

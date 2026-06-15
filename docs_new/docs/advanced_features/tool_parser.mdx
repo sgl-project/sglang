@@ -73,6 +73,16 @@ This guide demonstrates how to use SGLang’s [Function calling](https://platfor
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`minimax-m2`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MiniMax M2 / M2.5 / M2.7</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Parses the MiniMax XML-style tool-call format.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`minimax-m3-nom`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MiniMax M3 NOM</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Parses the namespace-tagged MiniMax M3 NOM format. Use `--reasoning-parser minimax-m3` separately when the model also emits reasoning.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`pythonic`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Llama-3.2 / Llama-3.3 / Llama-4</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Model outputs function calls as Python code. Requires `--tool-call-parser pythonic` and is recommended to use with a specific chat template.</td>
@@ -117,6 +127,34 @@ wait_for_server(f"http://localhost:{port}")
 ```
 
 Note that `--tool-call-parser` defines the parser used to interpret responses.
+
+### Tool parser compatibility mode
+
+Tool-call parsing is strict by default. If a model emits a known deviation from
+the expected wire format, SGLang fails open and returns the affected output as
+normal text instead of returning a partially parsed tool call.
+
+Use `--enable-tool-call-compatibility-mode` when the deployed model is known to
+produce recoverable tool-call deviations, such as malformed per-call JSON,
+unknown tool names, missing close tags in tag-style formats, or truncated
+streaming arguments.
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-7B-Instruct \
+  --tool-call-parser qwen25 \
+  --enable-tool-call-compatibility-mode \
+  --host 0.0.0.0
+```
+
+Compatibility mode applies the parser's known recoveries and records the
+recovery events in the detector's compatibility audit trail. In streaming
+responses, if a parser fails after argument fragments have already been sent,
+SGLang closes the streamed JSON arguments when possible and passes the rest of
+the stream through as normal text.
+
+The setting only affects tool-call parsing. It does not change generation
+constraints from `SGLANG_TOOL_STRICT_LEVEL`.
 
 
 ### Define Tools for Function Call
@@ -442,7 +480,11 @@ def convert_dict_to_tool(tool_dict: dict) -> Tool:
 
 tools = [convert_dict_to_tool(raw_tool) for raw_tool in tools]
 
-parser = FunctionCallParser(tools=tools, tool_call_parser="qwen25")
+parser = FunctionCallParser(
+    tools=tools,
+    tool_call_parser="qwen25",
+    enable_compatibility_mode=True,
+)
 normal_text, calls = parser.parse_non_stream(generated_text)
 
 print_highlight("=== Parsing Result ===")

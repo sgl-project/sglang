@@ -261,6 +261,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
+            self._note_malformed_tool_call(e)
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
@@ -623,6 +624,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     ] = arguments
             except Exception as e:
                 logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
+                self._note_malformed_tool_call(e, detail=func_args_raw[:80])
 
         # Clean buffer
         self._buffer = current_text[match_end_pos:]
@@ -759,6 +761,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
+            self._note_malformed_tool_call(e)
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)

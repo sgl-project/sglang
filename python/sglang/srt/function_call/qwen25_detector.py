@@ -5,6 +5,7 @@ from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.compatibility import CompatibilityEvent
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -62,14 +63,13 @@ class Qwen25Detector(BaseFormatDetector):
         match_result_list = re.findall(pattern, text, re.DOTALL)
         calls = []
         for match_result in match_result_list:
-            try:
-                parsed_call = json.loads(match_result.strip())
-                calls.extend(self.parse_base_json(parsed_call, tools))
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}"
-                )
-                continue
+            block = match_result.strip()
+            with self.compatibility.absorb(
+                CompatibilityEvent.MALFORMED_JSON_DROPPED,
+                json.JSONDecodeError,
+                detail=block[:80],
+            ):
+                calls.extend(self.parse_base_json(json.loads(block), tools))
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(

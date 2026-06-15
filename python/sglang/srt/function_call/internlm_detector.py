@@ -6,7 +6,6 @@ import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -119,16 +118,12 @@ class InternlmDetector(BaseFormatDetector):
 
                     # Validate tool name
                     if not (name and name in tool_indices):
-                        logger.warning(
-                            f"[InternLM Tool Call] Model attempted to call undefined function: {name}, "
-                            f"available_tools={list(tool_indices.keys())}"
-                        )
-                        if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                            continue  # Skip this tool call
+                        if self._skip_unknown_tool(name):
+                            continue
 
                     # Create tool call item and add to list
                     tool_call = ToolCallItem(
-                        tool_index=tool_indices[name],
+                        tool_index=tool_indices.get(name, -1),
                         name=name,
                         parameters=json.dumps(parameters, ensure_ascii=False),
                     )
@@ -138,6 +133,7 @@ class InternlmDetector(BaseFormatDetector):
                     logger.error(
                         f"[InternLM Tool Call] Failed to parse JSON for tool call #{idx+1}: {e}"
                     )
+                    self._note_malformed_tool_call(e, detail=action_json[:80])
                     continue
 
             logger.info(
@@ -150,6 +146,7 @@ class InternlmDetector(BaseFormatDetector):
             logger.error(
                 f"[InternLM Tool Call] Error in detect_and_parse: {e}", exc_info=True
             )
+            self._note_malformed_tool_call(e)
             return StreamingParseResult(normal_text=text, calls=[])
 
     def parse_streaming_increment(

@@ -137,6 +137,9 @@ class OpenAIServingChat(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+        self.enable_tool_call_compatibility_mode = (
+            self.tokenizer_manager.server_args.enable_tool_call_compatibility_mode
+        )
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
         self._reasoning_detector = None
         if self.reasoning_parser:
@@ -588,7 +591,11 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
-                parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                parser = FunctionCallParser(
+                    request.tools,
+                    self.tool_call_parser,
+                    enable_compatibility_mode=self.enable_tool_call_compatibility_mode,
+                )
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
@@ -1409,7 +1416,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # For required/named: only use parser when structural_tag was used
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
-            parser = FunctionCallParser(tools, self.tool_call_parser)
+            parser = FunctionCallParser(
+                tools,
+                self.tool_call_parser,
+                enable_compatibility_mode=self.enable_tool_call_compatibility_mode,
+            )
             should_try_parser = (
                 not is_required or parser.detector.supports_structural_tag()
             )
@@ -1766,26 +1777,29 @@ class OpenAIServingChat(OpenAIServingBase):
                     probe = FunctionCallParser(
                         tools=request.tools,
                         tool_call_parser=self.tool_call_parser,
+                        enable_compatibility_mode=self.enable_tool_call_compatibility_mode,
                     )
                     use_native_parser = probe.detector.supports_structural_tag()
                 if use_native_parser:
                     parser_dict[index] = probe
                 else:
-                    parser_dict[index] = JsonArrayParser()
+                    # The constrained-output JSON parser sits behind the same
+                    # FunctionCallParser boundary as every other detector
+                    # (scope-4 fail-open, streaming latch, compatibility mode).
+                    parser_dict[index] = FunctionCallParser.with_detector(
+                        JsonArrayParser(),
+                        request.tools,
+                        enable_compatibility_mode=self.enable_tool_call_compatibility_mode,
+                    )
             else:
                 parser_dict[index] = FunctionCallParser(
                     tools=request.tools,
                     tool_call_parser=self.tool_call_parser,
+                    enable_compatibility_mode=self.enable_tool_call_compatibility_mode,
                 )
 
         parser = parser_dict[index]
-
-        # Handle both FunctionCallParser and JsonArrayParser
-        if isinstance(parser, JsonArrayParser):
-            result = parser.parse_streaming_increment(delta, request.tools)
-            normal_text, calls = result.normal_text, result.calls
-        else:
-            normal_text, calls = parser.parse_stream_chunk(delta)
+        normal_text, calls = parser.parse_stream_chunk(delta)
 
         # Yield normal text
         if normal_text:
@@ -1868,7 +1882,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _check_for_unstreamed_tool_args(
         self,
-        parser: Union[FunctionCallParser, JsonArrayParser],
+        parser: FunctionCallParser,
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         index: int,
@@ -1878,8 +1892,7 @@ class OpenAIServingChat(OpenAIServingBase):
         when generation finishes. This ensures tool calls are properly completed
         even if the model generates the final arguments in the last chunk.
         """
-        # Get the detector - either from FunctionCallParser or directly if json detector
-        detector = parser.detector if hasattr(parser, "detector") else parser
+        detector = parser.detector
 
         # Only check if we have tool calls and the detector has tracked data
         if (

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
+from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
@@ -208,7 +209,15 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
             start = WHITESPACE.match(input_str, 0).end()
             obj, end = JSONDecoder().raw_decode(input_str, start)
             return obj, end
-        raise
+        if isinstance(e, JSONDecodeError):
+            raise
+        raise MalformedJSON(str(e)) from e
+    except AssertionError as e:
+        # partial_json_parser fails internal asserts on structurally broken
+        # JSON (e.g. "[{}}}]"); normalize to its malformed-input signal so
+        # callers' expected-deviation handling applies instead of treating
+        # model output as an internal error.
+        raise MalformedJSON(str(e)) from e
 
 
 def _is_complete_json(input_str: str) -> bool:
