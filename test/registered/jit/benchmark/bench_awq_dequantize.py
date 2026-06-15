@@ -1,13 +1,8 @@
-import itertools
-
 import torch
-import triton
-import triton.testing
 
 from sglang.jit_kernel.awq_dequantize import awq_dequantize as jit_awq_dequantize
-from sglang.jit_kernel.benchmark.utils import run_benchmark
+from sglang.jit_kernel.benchmark import marker
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
 
 register_cuda_ci(est_time=5, suite="base-b-kernel-benchmark-1-gpu-large")
 
@@ -17,17 +12,6 @@ try:
     AOT_AVAILABLE = True
 except ImportError:
     AOT_AVAILABLE = False
-
-IS_CI = is_in_ci()
-
-if IS_CI:
-    qweight_row_range = [128]
-    qweight_cols_range = [16]
-else:
-    qweight_row_range = [128, 256, 512, 1024, 3584]
-    qweight_cols_range = [16, 32, 64, 128, 448]
-
-configs = list(itertools.product(qweight_row_range, qweight_cols_range))
 
 
 def check_correctness():
@@ -63,30 +47,16 @@ def check_correctness():
     print("Correctness check passed (JIT vs AOT)")
 
 
-if AOT_AVAILABLE:
-    line_vals = ["jit", "aot"]
-    line_names = ["JIT Kernel", "AOT Kernel"]
-    styles = [("blue", "-"), ("green", "-")]
-else:
-    line_vals = ["jit"]
-    line_names = ["JIT Kernel"]
-    styles = [("blue", "-")]
+LINE_VALS = ["jit", "aot"] if AOT_AVAILABLE else ["jit"]
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["qweight_row", "qweight_col"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=line_vals,
-        line_names=line_names,
-        styles=styles,
-        ylabel="us",
-        plot_name="awq-dequantize-jit-vs-aot",
-        args={},
-    )
-)
-def benchmark(qweight_row, qweight_col, provider):
+@marker.parametrize("qweight_row", [128, 256, 512, 1024, 3584], [128])
+@marker.parametrize("qweight_col", [16, 32, 64, 128, 448], [16])
+@marker.benchmark("provider", LINE_VALS, unit="us")
+def benchmark(qweight_row: int, qweight_col: int, provider: str):
+    if provider == "aot" and not AOT_AVAILABLE:
+        marker.skip("sgl_kernel AOT not available")
+
     device = torch.device("cuda")
     qweight = torch.randint(
         0,
@@ -108,15 +78,19 @@ def benchmark(qweight_row, qweight_col, provider):
     )
 
     if provider == "jit":
-        fn = lambda: jit_awq_dequantize(qweight, scales, qzeros)
+        fn = jit_awq_dequantize
     elif provider == "aot":
-        fn = lambda: aot_awq_dequantize(qweight, scales, qzeros)
+        fn = aot_awq_dequantize
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    return run_benchmark(fn)
+    return marker.do_bench(
+        fn,
+        input_args=(qweight, scales, qzeros),
+        graph_clone_args=(0, 1, 2),
+    )
 
 
 if __name__ == "__main__":
     check_correctness()
-    benchmark.run(print_data=True)
+    benchmark.run()

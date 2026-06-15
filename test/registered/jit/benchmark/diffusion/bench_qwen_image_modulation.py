@@ -1,31 +1,23 @@
-from typing import Tuple
-
 import torch
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.diffusion.triton.norm import norm_infer
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
 
 register_cuda_ci(est_time=13, suite="base-b-kernel-benchmark-1-gpu-large")
-
-if is_in_ci():
-    B_RANGE, S_RANGE, D_RANGE = [1], [128], [3072]
-else:
-    B_RANGE, S_RANGE, D_RANGE = [1, 2], [128, 512, 2048], [1024, 1536, 3072]
 
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 EPS = 1e-6
-LINE_VALS = ["split", "fused"]
-LINE_NAMES = ["Triton Norm + Torch Select", "Fused Triton"]
-STYLES = [("red", "-"), ("blue", "--")]
-CONFIG = [(b, s, d) for b in B_RANGE for s in S_RANGE for d in D_RANGE]
+SEP = "=" * 80
+CONFIG = [
+    (b, s, d) for b in (1, 2) for s in (128, 512, 2048) for d in (1024, 1536, 3072)
+]
+CI_CONFIG = [(1, 128, 3072)]
 
 
 def _make_common_inputs(batch_size: int, seq_len: int, hidden_size: int):
@@ -59,22 +51,9 @@ def _apply_select01_modulation(
     return x * (1 + scale) + shift, gate
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["B", "S", "D"],
-        x_vals=CONFIG,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="qwen_image_layernorm_scale_shift_gate_select01",
-        args={},
-    )
-)
-def bench_layernorm_scale_shift_gate_select01(
-    B: int, S: int, D: int, provider: str
-) -> Tuple[float, float, float]:
+@marker.parametrize("B,S,D", CONFIG, CI_CONFIG)
+@marker.benchmark("provider", ["split", "fused"])
+def bench_layernorm_scale_shift_gate_select01(B: int, S: int, D: int, provider: str):
     x, weight, bias, index, scale0, shift0, gate0, scale1, shift1, gate1 = (
         _make_common_inputs(B, S, D)
     )
@@ -110,25 +89,14 @@ def bench_layernorm_scale_shift_gate_select01(
                 eps=EPS,
             )
 
-    return run_benchmark_no_cudagraph(fn)
+    return marker.do_bench(fn)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["B", "S", "D"],
-        x_vals=CONFIG,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="qwen_image_residual_layernorm_scale_shift_gate_select01",
-        args={},
-    )
-)
+@marker.parametrize("B,S,D", CONFIG, CI_CONFIG)
+@marker.benchmark("provider", ["split", "fused"])
 def bench_residual_layernorm_scale_shift_gate_select01(
     B: int, S: int, D: int, provider: str
-) -> Tuple[float, float, float]:
+):
     x, weight, bias, index, scale0, shift0, gate0, scale1, shift1, gate1 = (
         _make_common_inputs(B, S, D)
     )
@@ -169,16 +137,16 @@ def bench_residual_layernorm_scale_shift_gate_select01(
                 eps=EPS,
             )
 
-    return run_benchmark_no_cudagraph(fn)
+    return marker.do_bench(fn)
 
 
 if __name__ == "__main__":
-    print(f"\n{'=' * 80}")
+    print(f"\n{SEP}")
     print("Benchmark: qwen_image layernorm + scale_shift_gate_select01")
-    print(f"{'=' * 80}\n")
-    bench_layernorm_scale_shift_gate_select01.run(print_data=True)
+    print(f"{SEP}\n")
+    bench_layernorm_scale_shift_gate_select01.run()
 
-    print(f"\n{'=' * 80}")
+    print(f"\n{SEP}")
     print("Benchmark: qwen_image residual + layernorm + scale_shift_gate_select01")
-    print(f"{'=' * 80}\n")
-    bench_residual_layernorm_scale_shift_gate_select01.run(print_data=True)
+    print(f"{SEP}\n")
+    bench_residual_layernorm_scale_shift_gate_select01.run()
