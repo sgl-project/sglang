@@ -94,6 +94,26 @@ patches:
 """
 
 
+_PR_REVERT_YAML_28282 = """
+patches:
+  - target: sglang.srt.managers.schedule_policy.PrefillAdder.preempt_to_schedule
+    edits:
+      - match: |
+          num_extend_tokens = req.seqlen - len(req.prefix_indices)
+          min_tokens_to_remove = (
+              num_extend_tokens
+              + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+              - self.rem_total_tokens
+          )
+        replacement: |
+          min_tokens_to_remove = (
+              req.extend_input_len
+              + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+              - self.rem_total_tokens
+          )
+"""
+
+
 _PR_FIX_REVERT_YAML: Dict[int, str] = {
     25015: _PR_REVERT_YAML_25015,
     26329: _PR_REVERT_YAML_26329,
@@ -101,6 +121,7 @@ _PR_FIX_REVERT_YAML: Dict[int, str] = {
     27360: _PR_REVERT_YAML_27360,
     26972: _PR_REVERT_YAML_26972,
     27460: _PR_REVERT_YAML_27460,
+    28282: _PR_REVERT_YAML_28282,
 }
 
 
