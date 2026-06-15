@@ -92,6 +92,18 @@ class TestSamplingParamsVerify(CustomTestCase):
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
+    def test_nan_temperature_raises(self):
+        """verify() must reject NaN temperature; the bare < 0.0 check alone lets it through."""
+        sp = self._make(temperature=float("nan"))
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_inf_temperature_raises(self):
+        """verify() must reject non-finite (inf) temperature."""
+        sp = self._make(temperature=float("inf"))
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
     # --- top_p ---
     def test_top_p_negative_raises(self):
         """Test that verify() rejects negative top_p (valid range is (0, 1])."""
