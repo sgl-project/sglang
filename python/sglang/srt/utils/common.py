@@ -909,7 +909,11 @@ def _load_image(
             logger.warning(
                 f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
             )
-    return Image.open(BytesIO(image_bytes))
+    # Force PIL to decode pixels now, on this worker thread, instead of lazily
+    # on first access back on the event-loop/scheduler thread (mirrors vLLM).
+    img = Image.open(BytesIO(image_bytes))
+    img.load()
+    return img
 
 
 def load_image(
@@ -952,13 +956,55 @@ def load_image(
     return image, image_size
 
 
+_HTTP_SESSION_LOCK = threading.Lock()
+_HTTP_SESSION: Optional[requests.Session] = None
+
+
+def _get_http_session() -> requests.Session:
+    """Process-wide requests.Session with a tuned urllib3 pool + keep-alive.
+
+    The previous code did a fresh requests.get (new TCP+TLS handshake) per image
+    URL with a 3s timeout; under concurrency that serialized fetches and timed
+    out. A shared pooled session reuses connections across image fetches.
+    """
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        with _HTTP_SESSION_LOCK:
+            if _HTTP_SESSION is None:
+                from requests.adapters import HTTPAdapter
+                from urllib3.util.retry import Retry
+
+                s = requests.Session()
+                retry = Retry(
+                    total=2,
+                    connect=2,
+                    read=1,
+                    backoff_factor=0.2,
+                    status_forcelist=[502, 503, 504],
+                    allowed_methods=frozenset(["GET"]),
+                    raise_on_status=False,
+                )
+                adapter = HTTPAdapter(
+                    pool_connections=envs.SGLANG_HTTP_POOL_CONNS.get(),
+                    pool_maxsize=envs.SGLANG_HTTP_POOL_MAXSIZE.get(),
+                    max_retries=retry,
+                )
+                s.mount("http://", adapter)
+                s.mount("https://", adapter)
+                _HTTP_SESSION = s
+    return _HTTP_SESSION
+
+
 def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
     if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
+        connect_timeout = envs.SGLANG_HTTP_CONNECT_TIMEOUT.get()
+        read_timeout = envs.SGLANG_HTTP_READ_TIMEOUT.get()
+        response = _get_http_session().get(
+            image_file, timeout=(connect_timeout, read_timeout)
+        )
         try:
             response.raise_for_status()
             result = response.content

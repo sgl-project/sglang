@@ -658,6 +658,12 @@ class Envs:
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
 
+    # VLM: image URL fetch (shared HTTP session pool)
+    SGLANG_HTTP_POOL_CONNS = EnvInt(64)
+    SGLANG_HTTP_POOL_MAXSIZE = EnvInt(128)
+    SGLANG_HTTP_CONNECT_TIMEOUT = EnvFloat(15.0)
+    SGLANG_HTTP_READ_TIMEOUT = EnvFloat(30.0)
+
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
