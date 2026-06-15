@@ -14,18 +14,22 @@ register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 CORRECTNESS_CASES = get_ci_test_range(
-    full_range=list(
-        itertools.product(
+    full_range=[
+        (num_tokens, num_experts, topk)
+        for num_tokens, num_experts, topk in itertools.product(
             [1, 17, 128],
             [16, 32, 64, 128, 192, 256, 384, 512],
-            [1, 2, 3, 4, 5, 6, 7, 8],
+            [1, 2, 3, 4, 5, 6, 7, 8, 16, 22, 32],
         )
-    ),
+        if topk <= num_experts
+    ],
     ci_range=[
         (1, 16, 3),  # smallest non-power-of-two topk
         (17, 128, 6),  # Nemotron-3-Nano shape that exposed the bug
         (128, 192, 8),  # Hunyuan-3 shape, power-of-two topk sanity case
         (33, 512, 7),  # largest expert-count tier with non-power-of-two topk
+        (17, 512, 22),  # Nemotron-3-Ultra shape, topk > 8
+        (128, 64, 32),  # topk at the warp-size ceiling
     ],
 )
 

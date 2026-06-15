@@ -61,7 +61,7 @@ def grouped_topk(
     Fused sigmoid + bias + top-k + renormalize for MoE routing.
 
     Replaces the naive PyTorch path that uses 3x torch.topk + scatter + masked_fill.
-    Currently supports num_expert_group=1, topk_group=1, num_experts<=512, topk<=8.
+    Currently supports num_expert_group=1, topk_group=1, num_experts<=512, topk<=32.
     """
     num_tokens = scores.shape[0]
 

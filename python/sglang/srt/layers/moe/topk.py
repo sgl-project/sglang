@@ -1331,7 +1331,7 @@ def biased_grouped_topk_gpu(
             and topk_group == 1
             and num_fused_shared_experts == 0
             and num_experts <= 512
-            and topk <= 8
+            and topk <= 32
         ):
             from sglang.jit_kernel.grouped_topk import grouped_topk as jit_grouped_topk
 

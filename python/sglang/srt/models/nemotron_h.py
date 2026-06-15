@@ -521,10 +521,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             hidden_states, residual = self._dp_attn_input(
                 hidden_states, residual, forward_batch
             )
-            if (
-                forward_batch.forward_mode.is_idle()
-                or get_real_num_tokens(hidden_states, forward_batch) == 0
-            ):
+            if get_real_num_tokens(hidden_states, forward_batch) == 0:
                 return torch.zeros_like(hidden_states), residual
 
             output = self._forward_mamba(hidden_states, forward_batch)
