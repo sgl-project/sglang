@@ -487,8 +487,8 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         assert (
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."

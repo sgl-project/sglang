@@ -33,8 +33,8 @@ class _OracleSampler(Sampler):
 
     def forward(
         self,
-        logits_output: "LogitsProcessorOutput",
-        sampling_info: "SamplingBatchInfo",
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
         return_logprob: bool,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],

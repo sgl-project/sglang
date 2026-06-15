@@ -21,7 +21,7 @@ class PostOpsInsideGraphOutputBuffer:
         num_slot_tags: int,
         swa_verify_total_count_shape: tuple[int, ...] | None,
         device: torch.device,
-    ) -> "PostOpsInsideGraphOutputBuffer":
+    ) -> PostOpsInsideGraphOutputBuffer:
         return cls(
             verify_plan_enable=torch.zeros(1, dtype=torch.int32, device=device),
             kernel_run_counters=torch.zeros(
