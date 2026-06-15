@@ -80,6 +80,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    sock_recv,
+    sock_send,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -861,8 +863,8 @@ class Engine(EngineScoreMixin, EngineBase):
         for p in detoken_procs:
             scheduler_init_result.all_child_pids.append(p.pid)
 
-        # Init tokenizer manager first, as the bootstrap server is initialized here
-        if server_args.tokenizer_worker_num == 1:
+        if server_args.tokenizer_worker_num == 1 and not server_args.enable_http2:
+            # Launch a single tokenizer manager without the router
             tokenizer_manager, template_manager = init_tokenizer_manager_func(
                 server_args, port_args
             )
@@ -1223,8 +1225,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def collective_rpc(self, method: str, **kwargs):
         obj = RpcReqInput(method=method, parameters=kwargs)
-        self.send_to_rpc.send_pyobj(obj)
-        recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
+        sock_send(self.send_to_rpc, obj)
+        recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
         assert isinstance(recv_req, RpcReqOutput)
         assert recv_req.success, recv_req.message
 

@@ -411,7 +411,7 @@ def init_process_sgl(
 
     # Get weights from the training engine and update the inference engine.
     names = [parameter_name for parameter_name in update_parameters]
-    dtypes = [torch.bfloat16 if backend == "Engine" else "bfloat16"] * len(names)
+    dtypes = ["bfloat16"] * len(names)
     shapes = [state_dict_key_to_shape[parameter_name] for parameter_name in names]
 
     if pause_generation_mode in ["in_place", "retract"]:

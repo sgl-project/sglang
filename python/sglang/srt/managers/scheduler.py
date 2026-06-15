@@ -145,6 +145,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    sock_send,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_writer
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -1606,7 +1607,7 @@ class Scheduler(
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
                 else:
                     if self.ipc_channels.recv_from_rpc is not None:
-                        self.ipc_channels.recv_from_rpc.send_pyobj(output)
+                        sock_send(self.ipc_channels.recv_from_rpc, output)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -3578,9 +3579,9 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = dict(vars(get_global_server_args()))  # vars returns a ref to obj.__dict__
-        ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
-        ret["memory_usage"] = {
+        server_args = get_global_server_args()
+        last_gen_throughput = self.metrics_reporter.last_gen_throughput
+        memory_usage = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
             "kvcache": round(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
@@ -3588,24 +3589,30 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
-        ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        effective_max_running_requests_per_dp = self.max_running_requests
 
+        avg_spec_accept_length = None
         if (
             not self.spec_algorithm.is_none()
             and self.metrics_reporter.spec_total_num_forward_ct > 0
         ):
-            ret["avg_spec_accept_length"] = (
+            avg_spec_accept_length = (
                 self.metrics_reporter.spec_total_num_accept_tokens
                 / self.metrics_reporter.spec_total_num_forward_ct
             )
 
+        step_time_dict = None
         if RECORD_STEP_TIME:
-            ret["step_time_dict"] = self.metrics_reporter.step_time_dict
+            step_time_dict = self.metrics_reporter.step_time_dict
 
-        # This field is not serializable.
-        ret.pop("model_config", None)
-
-        return GetInternalStateReqOutput(internal_state=ret)
+        return GetInternalStateReqOutput(
+            server_args=server_args,
+            last_gen_throughput=last_gen_throughput,
+            memory_usage=memory_usage,
+            effective_max_running_requests_per_dp=effective_max_running_requests_per_dp,
+            avg_spec_accept_length=avg_spec_accept_length,
+            step_time_dict=step_time_dict,
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
@@ -3679,7 +3686,7 @@ class Scheduler(
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
         barrier()
-        return RpcReqOutput(success, "" if not exec else str(exec))
+        return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
@@ -3897,14 +3904,16 @@ class Scheduler(
         success, message = self.tp_worker.init_weights_send_group_for_remote_instance(
             recv_req
         )
-        return InitWeightsSendGroupForRemoteInstanceReqOutput(success, message)
+        return InitWeightsSendGroupForRemoteInstanceReqOutput(
+            success=success, message=message
+        )
 
     def send_weights_to_remote_instance(
         self, recv_req: SendWeightsToRemoteInstanceReqInput
     ):
         """Send the seed instance weights to the destination instance."""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
-        return SendWeightsToRemoteInstanceReqOutput(success, message)
+        return SendWeightsToRemoteInstanceReqOutput(success=success, message=message)
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time

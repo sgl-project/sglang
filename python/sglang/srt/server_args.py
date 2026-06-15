@@ -571,10 +571,12 @@ class ServerArgs:
     enable_lora: Optional[bool] = None
     enable_lora_overlap_loading: Optional[bool] = None
     max_lora_rank: Optional[int] = None
-    lora_target_modules: Optional[Union[set[str], List[str]]] = None
-    lora_paths: Optional[
-        Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]
-    ] = None
+    lora_target_modules: Optional[List[str]] = (
+        None  # Optional[Union[set[str], List[str]]]
+    )
+    lora_paths: Optional[Any] = (
+        None  # Optional[Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]]
+    )
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_eviction_policy: str = "lru"
@@ -920,10 +922,19 @@ class ServerArgs:
     # For msProbe
     msprobe_dump_config: Optional[str] = None
 
+    # For grpc
+    enable_grpc: bool = False
+
+    # Whether the post-init processing has been completed
+    is_initialized: bool = False
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+        # Avoid re-initialization if already done
+        if self.is_initialized:
+            return
 
         self._maybe_download_model_for_runai()
 
@@ -1081,6 +1092,9 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+        # Finalize initialization.
+        self.is_initialized = True
 
     def _maybe_download_model_for_runai(self):
         if is_runai_obj_uri(self.model_path):
@@ -8412,7 +8426,7 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
-        if server_args.tokenizer_worker_num == 1:
+        if server_args.tokenizer_worker_num == 1 and not server_args.enable_http2:
             tokenizer_worker_ipc_name = None
         else:
             tokenizer_worker_ipc_name = (

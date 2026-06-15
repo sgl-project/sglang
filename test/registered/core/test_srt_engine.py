@@ -121,6 +121,8 @@ class TestSRTEngine(CustomTestCase):
         server_args = ServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         )
+        # reset servre_args initialization from test cases
+        server_args.is_initialized = False
         bench_args = BenchArgs(num_prompts=10)
         result = throughput_test(server_args=server_args, bench_args=bench_args)
         self.assertGreater(result["total_throughput"], 3000)

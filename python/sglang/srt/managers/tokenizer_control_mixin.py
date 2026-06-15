@@ -8,6 +8,8 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
+import msgspec
+import pybase64
 
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
@@ -336,7 +338,7 @@ class TokenizerControlMixin:
         )
         record_shapes = (record_shapes is not False) and env_record_shapes
         req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
+            req_type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
             start_step=start_step,
             num_steps=num_steps,
@@ -353,7 +355,7 @@ class TokenizerControlMixin:
 
     async def stop_profile(self: TokenizerManager):
         self.auto_create_handle_loop()
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
@@ -473,6 +475,12 @@ class TokenizerControlMixin:
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
+
+        serialized_named_tensors = [
+            pybase64.b64decode(data, validate=True) if isinstance(data, str) else data
+            for data in obj.serialized_named_tensors
+        ]
+        obj.serialized_named_tensors = serialized_named_tensors
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -791,8 +799,14 @@ class TokenizerControlMixin:
         responses: List[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
         )
+        results = []
+        for response in responses:
+            res = msgspec.to_builtins(response)
+            server_args = res.pop("server_args", None) or {}
+            res = {k: v for k, v in res.items() if v is not None}
+            results.append(server_args | res)
         # Many DP ranks
-        return [res.internal_state for res in responses]
+        return results
 
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq
@@ -857,7 +871,7 @@ class TokenizerControlMixin:
 
         future = asyncio.Future()
         self.session_futures[obj.session_id] = future
-        self.send_to_scheduler.send_pyobj(obj)
+        await self.send_to_scheduler.async_send_obj(obj)
 
         try:
             return await future
@@ -869,7 +883,7 @@ class TokenizerControlMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        await self.send_to_scheduler.send_pyobj(obj)
+        await self.send_to_scheduler.async_send_obj(obj)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]

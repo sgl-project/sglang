@@ -105,7 +105,7 @@ def _add_admin_routes(app, request_manager):
             record_shapes = (record_shapes is not False) and env_record_shapes
 
             req = ProfileReq(
-                type=ProfileReqType.START_PROFILE,
+                req_type=ProfileReqType.START_PROFILE,
                 output_dir=body.get("output_dir"),
                 start_step=body.get("start_step"),
                 num_steps=body.get("num_steps"),
@@ -134,7 +134,7 @@ def _add_admin_routes(app, request_manager):
 
     async def stop_profile_handler(request):
         try:
-            req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+            req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
             results = await request_manager.send_communicator_req(
                 req, "profile_communicator", timeout=600.0
             )
