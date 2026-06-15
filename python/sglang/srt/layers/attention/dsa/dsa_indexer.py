@@ -1557,8 +1557,12 @@ class Indexer(MultiPlatformOp):
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
         # When weights_proj is LoRA-wrapped, use an eager module call so the
-        # wrapper owns base+delta and no LoRA kernel runs under torch.compile
-        weights_proj_lora = getattr(self.weights_proj, "set_lora", False)
+        # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
+        # Fusion folds weights_proj into wk_weights_proj, so weights_proj is
+        # absent then; short-circuit before touching it.
+        weights_proj_lora = not _use_dsa_indexer_fusion and getattr(
+            self.weights_proj, "set_lora", False
+        )
 
         if (
             _use_dsa_indexer_fusion
