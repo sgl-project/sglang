@@ -1080,7 +1080,9 @@
                   },
                   {
                     "group": "OpenBMB",
+                    "tag": "NEW",
                     "pages": [
+                      "cookbook/autoregressive/OpenBMB/MiniCPM5-1B",
                       "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_6"
                     ]
                   },
