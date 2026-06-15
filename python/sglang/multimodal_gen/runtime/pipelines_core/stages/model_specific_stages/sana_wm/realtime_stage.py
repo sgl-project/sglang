@@ -11,7 +11,7 @@ import torch
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_diffusion import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.base import (
     RealtimeDiffusionStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs

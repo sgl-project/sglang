@@ -270,6 +270,9 @@ class _GenerationStreamAccumulator:
     cached_tokens_details: list = field(
         default_factory=list
     )  # Detailed breakdown by cache source
+    image_tokens: list = field(default_factory=list)
+    audio_tokens: list = field(default_factory=list)
+    video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
@@ -376,6 +379,22 @@ class _GenerationStreamAccumulator:
 
         # Collect detailed cache breakdown if available
         self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+
+        # Multimodal prompt token counts. In disagg decode mode the prefill node
+        # already computed these and transferred them via the metadata buffer
+        # (req.mm_*), so prefer the pre-stored values; otherwise compute them
+        # from the request's multimodal items.
+        if req.mm_image_tokens or req.mm_audio_tokens or req.mm_video_tokens:
+            image_t = req.mm_image_tokens
+            audio_t = req.mm_audio_tokens
+            video_t = req.mm_video_tokens
+        elif req.multimodal_inputs:
+            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
+        else:
+            image_t = audio_t = video_t = 0
+        self.image_tokens.append(image_t)
+        self.audio_tokens.append(audio_t)
+        self.video_tokens.append(video_t)
 
         self.retraction_counts.append(req.retraction_count)
 
@@ -504,6 +523,9 @@ class _GenerationStreamAccumulator:
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
             cached_tokens_details=self.cached_tokens_details,
+            image_tokens=self.image_tokens,
+            audio_tokens=self.audio_tokens,
+            video_tokens=self.video_tokens,
             input_token_logprobs_val=self.input_token_logprobs_val,
             input_token_logprobs_idx=self.input_token_logprobs_idx,
             output_token_logprobs_val=self.output_token_logprobs_val,

@@ -6,6 +6,11 @@ disable-model-invocation: true
 
 # Add a model to the SGLang Cookbook
 
+> Migrating an **existing legacy-template page** (one that imports a monolithic
+> `…/autoregressive/<slug>-deployment.jsx` generator)? Use the
+> `cookbook-migrate-model` skill instead — same target format, but the legacy
+> page (not the user) is the source of truth.
+
 The cookbook is **config-driven**: two shared engines contain NO model-specific code —
 `docs_new/src/snippets/_deployment.jsx` (the 5-dim deploy matrix) and
 `_playground.jsx` (the diff-based override Playground). Adding a model = adding **data**:
@@ -135,7 +140,8 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
    - `supportedHardware` + the EXAMPLE cells: keep your tested families; **delete the
      `mi*` ids + AMD example cell if no AMD recipe**, etc. A GPU not in the shared catalog
      (e.g. RTX PRO 6000) → declare it in `config.hardware` and add its id here.
-   - `playgroundFeatures` axes: delete `megamoe` (non-Blackwell-MoE), `hisparse`
+   - `playgroundFeatures` axes: remove the `megamoe` backend option + the
+     `megamoeQuant` block from the `moe` axis (non-Blackwell-MoE), delete `hisparse`
      (non-DSA), `pdDisagg`/`router` (no PD), the `parsers` axis (no parsers), etc.
    - `quantizations` / `variants`: drop what the model doesn't ship; collapse `variants`
      to single `default` if there's no variant axis (then drop the `variant` half of
