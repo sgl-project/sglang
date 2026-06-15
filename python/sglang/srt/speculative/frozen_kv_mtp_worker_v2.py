@@ -41,7 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseDraftWorker
+from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -77,7 +77,7 @@ from sglang.srt.utils.async_probe import (
 logger = logging.getLogger(__name__)
 
 
-class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
+class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
     """Frozen-KV MTP draft worker.
 
     The assistant reads target KV only. It reuses EAGLE's verify input/output
@@ -130,7 +130,7 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
         with (
             empty_context()
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            # NOTE: call TpModelWorker.__init__ explicitly -- BaseDraftWorker is
+            # NOTE: call TpModelWorker.__init__ explicitly -- EagleDraftWorkerBase is
             # an ABC with no __init__, so cooperative super() would be ambiguous.
             TpModelWorker.__init__(
                 self,
@@ -180,7 +180,7 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        # NOTE: call TpModelWorker explicitly -- BaseDraftWorker precedes it in
+        # NOTE: call TpModelWorker explicitly -- EagleDraftWorkerBase precedes it in
         # the MRO and its alloc_memory_pool is a no-op stub.
         TpModelWorker.alloc_memory_pool(
             self,
@@ -583,7 +583,7 @@ class FrozenKVMTPDraftWorker(BaseDraftWorker, TpModelWorker):
         )
 
     def draft_extend(self):
-        # BaseDraftWorker contract. Frozen has no draft-KV extend forward; the
+        # EagleDraftWorkerBase contract. Frozen has no draft-KV extend forward; the
         # orchestrator calls `_draft_extend_for_{prefill,decode}` directly.
         pass
 

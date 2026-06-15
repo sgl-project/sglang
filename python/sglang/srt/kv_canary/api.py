@@ -39,9 +39,8 @@ def install_canary(
 
     assert not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE), (
         "kv-canary: piecewise cuda graph is not supported by the current "
-        "SingleForwardManager design; set "
-        "--cuda-graph-backend-prefill=disabled (or =breakable) when canary "
-        "is enabled"
+        "SingleForwardManager design; set --cuda-graph-backend-prefill=disabled "
+        "(or =breakable) when canary is enabled"
     )
 
     perturb_config = PerturbConfig.from_env()
