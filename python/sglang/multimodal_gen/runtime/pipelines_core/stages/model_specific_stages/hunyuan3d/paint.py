@@ -164,7 +164,7 @@ class DDIMSolver:
         self.ddim_alpha_cumprods = torch.from_numpy(self.ddim_alpha_cumprods)
         self.ddim_alpha_cumprods_prev = torch.from_numpy(self.ddim_alpha_cumprods_prev)
 
-    def to(self, device: torch.device) -> "DDIMSolver":
+    def to(self, device: torch.device) -> DDIMSolver:
         self.ddim_timesteps = self.ddim_timesteps.to(device)
         self.ddim_alpha_cumprods = self.ddim_alpha_cumprods.to(device)
         self.ddim_alpha_cumprods_prev = self.ddim_alpha_cumprods_prev.to(device)
