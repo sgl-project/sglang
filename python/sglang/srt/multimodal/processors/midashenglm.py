@@ -6,6 +6,7 @@ import torch
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.midashenglm import MiDashengLMModel
 from sglang.srt.multimodal.processors.base_processor import (
+    SGL_USE_CUDA_IPC,
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
@@ -70,7 +71,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             **kwargs,
         )
 
-        if not getattr(self.server_args, "keep_mm_feature_on_device", False):
+        if not SGL_USE_CUDA_IPC:
             for feature_name in ["input_values"]:
                 if feature_name in result:
                     result[feature_name] = result[feature_name].cpu()
