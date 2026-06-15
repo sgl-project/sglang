@@ -648,10 +648,12 @@ class SchedulerBatchResultProcessor:
             # and finish state token-by-token inside the helper (stopping at
             # grammar completion), so the shared reasoning/finish/grammar calls
             # below are skipped for that path.
-            is_spec_v2_grammar = batch.is_spec_v2 and req.grammar is not None
+            is_spec_grammar = (
+                not batch.spec_algorithm.is_none() and req.grammar is not None
+            )
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
-            elif is_spec_v2_grammar:
+            elif is_spec_grammar:
                 next_token_id = self._accept_spec_v2_grammar_tokens(req, next_token_id)
                 next_token_ids[i] = next_token_id
                 new_accepted_len = len(next_token_id)
@@ -659,11 +661,11 @@ class SchedulerBatchResultProcessor:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
-            if not is_spec_v2_grammar:
+            if not is_spec_grammar:
                 self._maybe_update_reasoning_tokens(req, next_token_id)
 
             req.time_stats.set_last_decode_finish_time()
-            if not is_spec_v2_grammar:
+            if not is_spec_grammar:
                 req.update_finish_state(new_accepted_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
@@ -684,7 +686,7 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.grammar is not None:
-                if is_spec_v2_grammar:
+                if is_spec_grammar:
                     # Already advanced token-by-token above; just sync terminal flag.
                     req.grammar.finished = req.finished()
                 else:

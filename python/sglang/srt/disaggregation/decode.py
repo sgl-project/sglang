@@ -1793,26 +1793,6 @@ class SchedulerDisaggregationDecodeMixin:
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
 
-            # Spec V2 grammar decode depends on the grammar state produced by the
-            # previous batch. With overlap scheduling that result is still sitting
-            # in result_queue, so process it now (before run_batch) to advance the
-            # grammar; otherwise the new batch would propose tokens against a stale
-            # grammar and could emit output past grammar completion. Clearing
-            # self.last_batch makes the natural "Process the last batch" block
-            # below skip the duplicate pop without an extra guard.
-            need_grammar_sync = (
-                batch
-                and batch.is_spec_v2
-                and batch.has_grammar
-                and batch.forward_mode.is_decode()
-                and self.last_batch is not None
-                and len(self.result_queue) > 0
-            )
-            if need_grammar_sync:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
-                self.last_batch = None
-
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)

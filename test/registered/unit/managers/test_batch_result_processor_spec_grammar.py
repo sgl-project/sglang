@@ -47,7 +47,6 @@ class _FakeBatch:
     def __init__(self, reqs, return_logprob: bool):
         self.reqs = reqs
         self.return_logprob = return_logprob
-        self.is_spec_v2 = True
         self.spec_algorithm = _FakeSpecAlgorithm()
 
     def batch_size(self) -> int:
@@ -73,7 +72,7 @@ class _TrimmingProcessor(SchedulerBatchResultProcessor):
     def _mamba_prefix_cache_update(self, req, batch, result, i):
         pass
 
-    def _handle_finished_req(self, req, i, logits_output):
+    def _handle_finish_state_updated_req(self, req, batch, result, i, logits_output):
         pass
 
 
