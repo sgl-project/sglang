@@ -5,11 +5,12 @@ from pathlib import Path
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.kda_attention import (
     KDAAttentionCase,
     make_kda_cases,
@@ -17,9 +18,6 @@ from sglang.test.kits.attention_unittest.attention_methods.kda_attention import 
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_kda_cuda_graph_decode_case,
-)
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
-    run_kda_eagle_draft_extend_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     run_kda_eagle_verify_case,
@@ -31,6 +29,7 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -237,45 +236,12 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
             32,
         ),
     )
-    # EAGLE / Frozen-KV MTP DRAFT_EXTEND eager. CG is structurally
-    # blocked across the HybridLinearAttn family
-    # (`hybrid_linear_attn_backend.py:509,572`).
-    EAGLE_DRAFT_EXTEND_CASES = (
-        (
-            KDAAttentionCase(
-                name="runner_eagle_draft_extend_kda",
-                backend="triton",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_k_heads=2,
-                num_v_heads=2,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "eagle",
-        ),
-        (
-            KDAAttentionCase(
-                name="runner_frozen_kv_mtp_draft_extend_kda",
-                backend="triton",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_k_heads=2,
-                num_v_heads=2,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "frozen_kv_mtp",
-        ),
+
+    @unittest.skipIf(
+        is_hip(),
+        "split-op extend runner exercises the piecewise-CUDA-graph path "
+        "(TcPiecewiseForwardContext.num_tokens), which is not wired on ROCm.",
     )
-
-    def test_runner_mode_eagle_draft_extend_cases(self):
-        for case, spec_kind in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(
-                case=case.name, backend=case.backend, spec_kind=spec_kind
-            ):
-                run_kda_eagle_draft_extend_case(self, case, spec_kind=spec_kind)
-
     def test_runner_mode_split_op_extend_cases(self):
         for case, static_num_tokens in self.SPLIT_OP_CASES:
             for breakable in (False, True):

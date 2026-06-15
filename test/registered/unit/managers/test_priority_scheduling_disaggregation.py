@@ -12,9 +12,10 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -106,11 +107,13 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._allocatable_tokens = MagicMock(return_value=1000)
-        queue._pre_alloc = MagicMock(
-            side_effect=lambda req, prefix_indices=None, prefix_len=0: torch.arange(
+
+        def pre_alloc_mock(req, prefix_indices=None, prefix_len=0, total_prefix_len=0):
+            return torch.arange(
                 len(req.origin_input_ids) - prefix_len, dtype=torch.int64
             )
-        )
+
+        queue._pre_alloc = MagicMock(side_effect=pre_alloc_mock)
 
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 100
