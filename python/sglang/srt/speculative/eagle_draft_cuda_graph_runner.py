@@ -115,6 +115,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             else speculative_num_steps
         )
         self.topk = model_runner.server_args.speculative_eagle_topk
+        self.page_size = model_runner.server_args.page_size
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
 
         # Patch_model in parent's capture() needs an attn_backend reference.
@@ -273,6 +274,20 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+
+        # Paged top-k draft replay has no prefix work when every sequence has
+        # zero full KV pages. Use eager draft for that empty page-aligned prefix
+        # edge case instead of replaying the captured graph.
+        if (
+            is_bs_supported
+            and self.topk > 1
+            and self.page_size > 1
+            and not forward_batch.forward_mode.is_idle()
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            seq_lens_cpu = forward_batch.seq_lens_cpu[: forward_batch.batch_size]
+            if ((seq_lens_cpu // self.page_size) == 0).all().item():
+                is_bs_supported = False
 
         return is_bs_supported
 
