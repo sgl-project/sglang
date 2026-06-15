@@ -1,10 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import asyncio
-import base64
 import inspect
 import json
 import os
-import re
 import shutil
 import tempfile
 import time
@@ -30,6 +28,8 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.common import parse_size
+from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
@@ -95,17 +95,6 @@ def temp_dir_if_disabled(
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
-    try:
-        parts = size.lower().replace(" ", "").split("x")
-        if len(parts) != 2:
-            raise ValueError
-        w, h = int(parts[0]), int(parts[1])
-        return w, h
-    except Exception:
-        return None, None
-
-
 def choose_output_image_ext(
     output_format: Optional[str], background: Optional[str]
 ) -> str:
@@ -135,7 +124,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     # parse "WxH" size string if provided
     size = kwargs.pop("size", None)
     if size:
-        w, h = _parse_size(size)
+        w, h = parse_size(size)
         if w is not None:
             # treat None dimensions as unset so parsed size can fill them
             if kwargs.get("width") is None:
@@ -227,7 +216,7 @@ async def _maybe_url_image(
         if prefer_remote_source:
             return img_url
         # encode image base64 url and persist on disk
-        input_path = await _save_base64_image_to_path(img_url, target_path)
+        input_path = save_base64_image_to_path(img_url, target_path)
         return input_path
     else:
         raise ValueError("Unsupported image url format")
@@ -322,46 +311,6 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
         raise Exception(
             f"Failed to download image from URL {image_url}: {str(final_error)}"
         )
-
-
-async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
-    """Decode base64 image data and save to target path."""
-
-    _B64_FMT_HINT = (
-        "Failed to decode base64 image. "
-        "Expected format: `data:[<media-type>];base64,<data>`"
-    )
-
-    # split `data:[<media-type>][;base64],<data>` to media-type base64 data
-    pattern = r"data:(.*?)(;base64)?,(.*)"
-    match = re.match(pattern, base64_data)
-    if not match:
-        raise ValueError(_B64_FMT_HINT)
-    media_type = match.group(1)
-    is_base64 = match.group(2)
-    if not is_base64:
-        raise ValueError(f"{_B64_FMT_HINT} (missing ;base64 marker)")
-    data = match.group(3)
-    if not data:
-        raise ValueError(f"{_B64_FMT_HINT} (empty data payload)")
-    # get ext from url
-    if media_type.startswith("image/"):
-        ext = media_type.split("/")[-1].lower()
-        if ext == "jpeg":
-            ext = "jpg"
-    else:
-        ext = "jpg"
-    target_path = f"{target_path}.{ext}"
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
-    try:
-        image_data = base64.b64decode(data)
-        with open(target_path, "wb") as f:
-            f.write(image_data)
-
-        return target_path
-    except Exception as e:
-        raise Exception(f"Failed to decode base64 image: {str(e)}")
 
 
 async def process_generation_batch(

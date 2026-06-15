@@ -238,6 +238,7 @@ class DSV4AttnMetadata:
             self.c4_topk_lengths_clamp1,
             self.c128_out_loc,
             _,
+            _,
             self.c128_topk_lengths_clamp1,
             self.c128_page_indices,
         ) = _init_compression_metadata_triton(
@@ -411,7 +412,7 @@ class _GraphBucket(enum.Enum):
             return cls.DECODE_OR_IDLE
         if forward_mode.is_target_verify():
             return cls.TARGET_VERIFY
-        if forward_mode.is_draft_extend(include_v2=True):
+        if forward_mode.is_draft_extend_v2():
             return cls.DRAFT_EXTEND
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
@@ -1015,7 +1016,7 @@ class DeepseekV4AttnBackend(
                 and extend_seq_lens is not None
                 and extend_seq_lens_cpu is not None
             )
-            is_draft = forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            is_draft = forward_batch.forward_mode.is_draft_extend_v2()
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -1533,6 +1534,8 @@ class DeepseekV4AttnBackend(
         is_prefill: bool = False,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
+
+        seq_lens_casual = seq_lens_casual.to(torch.int32)
 
         swa_page_indices = self.get_swa_page_indices(
             seq_lens_casual=seq_lens_casual,

@@ -23,7 +23,6 @@ from sglang.test.test_utils import (
 DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 
 DSV4_FLASH_BASE_ENV = {
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_DSV4_FP4_EXPERTS": "0",
 }
 
