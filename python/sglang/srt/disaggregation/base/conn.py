@@ -84,6 +84,8 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Target K/V section count captured before draft pointers are appended.
+    num_target_kv_layers: int
 
 
 class KVPoll:
