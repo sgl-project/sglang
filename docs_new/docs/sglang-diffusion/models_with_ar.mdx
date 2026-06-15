@@ -11,16 +11,40 @@ sglang generate --model-path /path/to/zai-org/GLM-Image/ --prompt "prompt"
 To use SGLang as a backend for the AR model, you need to start the SGLang server with AR model.
 ```bash
 sglang serve --model-path /path/to/zai-org/GLM-Image/vision_language_encoder/ \
---tokenizer-path /path/to/zai-org/GLM-Image/processor/ --enable-multimodal --port port
+--tokenizer-path /path/to/zai-org/GLM-Image/processor/ --enable-multimodal --port ${PORT}
 ```
 And use diffusion as usual with server argument `--srt-encoder-url "http://${HOST}:${PORT}"`
 ```bash
 sglang generate --model-path /path/to/zai-org/GLM-Image/ --prompt "prompt" --srt-encoder-url "http://${HOST}:${PORT}"
 ```
 
+## Support matrix
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "10%"}} />
+    <col style={{width: "45%"}} />
+    <col style={{width: "45%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Transformers backend</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang backend</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-Image</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>T2I, I2I, V2I</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>T2I</td>
+    </tr>
+</tbody>
+</table>
+
 ## Ascend NPU ENV
 
-To run 2 servers on same group on NPU you need to specify env variables
+To run 2 servers on same group of NPU you need to specify env variables
 https://www.hiascend.com/document/detail/zh/canncommercial/850/maintenref/envvar/envref_07_0144.html
 Example:
 First terminal with AR server:
