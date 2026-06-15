@@ -348,6 +348,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
+        self.online_c128_mtp_max_draft_tokens = (
+            mr.server_args.max_speculative_num_draft_tokens or 0
+        )
         if mr.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -382,10 +385,30 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # would need rollback / replay across draft and verify, which the
         # online path doesn't support yet.
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            assert (
-                mr.spec_algorithm.is_none()
-            ), "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode (MTP) yet"
-            logger.info("DSV4 compressed attention: online c128 enabled (ring_size=1)")
+            allow_experimental_online_c128_mtp = (
+                envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+                and mr.spec_algorithm.is_eagle()
+            )
+            assert mr.spec_algorithm.is_none() or allow_experimental_online_c128_mtp, (
+                "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode "
+                "(MTP) yet, except the experimental EAGLE topk=1 path gated by "
+                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
+            )
+            if allow_experimental_online_c128_mtp:
+                assert self.online_c128_mtp_max_draft_tokens > 0, (
+                    "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP requires "
+                    "speculative_num_draft_tokens to be set."
+                )
+                logger.warning(
+                    "DSV4 compressed attention: experimental online c128 + MTP enabled "
+                    f"(EAGLE topk=1 only, "
+                    f"draft_banks={self.online_c128_mtp_max_draft_tokens}). "
+                    "Validate correctness carefully."
+                )
+            else:
+                logger.info(
+                    "DSV4 compressed attention: online c128 enabled (ring_size=1)"
+                )
 
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
@@ -409,6 +432,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
         c128_state_ratio = self.c128_ring_size / self.swa_page_size
+        if c128_online and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+            c128_state_ratio *= 1 + self.online_c128_mtp_max_draft_tokens
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
