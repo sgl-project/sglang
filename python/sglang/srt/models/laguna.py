@@ -241,6 +241,7 @@ class LagunaAttention(nn.Module):
         attention_bias: bool,
         sliding_window_size: int,
         layer_type: str,
+        gating: bool | str = True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -248,6 +249,7 @@ class LagunaAttention(nn.Module):
         self.hidden_size = hidden_size
         self.head_dim = head_dim
         self.layer_id = layer_id
+        self.gate_per_head = gating is True or gating == "per-head"
 
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
@@ -287,11 +289,14 @@ class LagunaAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # Per-head softplus gate (`gating=True` in HF). Shard like Q so the
-        # local output dim matches `num_heads`.
+        g_proj_dim = (
+            self.total_num_heads
+            if self.gate_per_head
+            else self.total_num_heads * self.head_dim
+        )
         self.g_proj = ColumnParallelLinear(
             hidden_size,
-            self.total_num_heads,
+            g_proj_dim,
             bias=False,
             gather_output=False,
             quant_config=None,
@@ -350,9 +355,12 @@ class LagunaAttention(nn.Module):
 
         gate, _ = self.g_proj(hidden_states)
         gate = F.softplus(gate.float()).to(attn_output.dtype)
-        attn_output = attn_output.view(-1, self.num_heads, self.head_dim)
-        attn_output = attn_output * gate.view(-1, self.num_heads, 1)
-        attn_output = attn_output.reshape(-1, self.num_heads * self.head_dim)
+        if self.gate_per_head:
+            attn_output = attn_output.view(-1, self.num_heads, self.head_dim)
+            attn_output = attn_output * gate.view(-1, self.num_heads, 1)
+            attn_output = attn_output.reshape(-1, self.num_heads * self.head_dim)
+        else:
+            attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -401,6 +409,7 @@ class LagunaDecoderLayer(nn.Module):
             # SGLang's window is exclusive; HF's `sliding_window` is inclusive.
             sliding_window_size=config.sliding_window - 1,
             layer_type=layer_type,
+            gating=getattr(config, "gating", True),
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
