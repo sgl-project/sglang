@@ -2686,9 +2686,8 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
-            # The allocatable-slots trigger only batches fresh admissions;
-            # while a chunked prefill is in flight the pass must proceed
-            # regardless, so mark the slot count as not applicable.
+            # N/A while a chunked prefill is in flight: that pass must proceed
+            # regardless, and the trigger only batches fresh admissions anyway.
             num_allocatable_reqs=(
                 num_allocatable_reqs if self.chunked_req is None else None
             ),

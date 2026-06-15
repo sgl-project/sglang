@@ -16,9 +16,8 @@ _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
 logger = logging.getLogger(__name__)
 
-# Sentinel packed into the all-gather when a rank's allocatable-slot count is
-# not applicable this pass (chunked prefill in flight, or the caller did not
-# provide it); large so it never constrains the min() across ranks.
+# Sentinel for "allocatable count not applicable this pass" (chunked prefill in
+# flight, or caller omitted it); large so it never constrains the min().
 _ALLOCATABLE_NA = 1 << 30
 
 
@@ -64,8 +63,7 @@ class PrefillDelayer:
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
         # is explicitly set. Additive with the slot-based trigger.
         self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
-        # Allocatable-slots trigger is opt-in as well: a threshold of 0/1 is a
-        # no-op (a pass with 0 allocatable slots cannot prefill anyway).
+        # Allocatable-slots trigger is opt-in too; a threshold of 0/1 is a no-op.
         self._min_allocatable_reqs = (
             min_allocatable_reqs
             if min_allocatable_reqs is not None and min_allocatable_reqs > 1
@@ -246,10 +244,9 @@ class PrefillDelayer:
                     and global_waiting_queue_max < queue_min_effective
                 )
 
-            # Allocatable-slots trigger: hold new prefills until at least
-            # min_allocatable_reqs request slots are free, so freed slots are
-            # admitted in one batch instead of one request at a time. Targets
-            # workloads where each admission is disproportionately expensive
+            # Allocatable-slots trigger: delay prefill until at least
+            # min_allocatable_reqs slots are free, batching freed slots into one
+            # admission. Targets workloads where each admission is expensive
             # (e.g. speculative decoding with a separate draft prefill pass).
             allocatable_condition = (
                 self._min_allocatable_reqs is not None
