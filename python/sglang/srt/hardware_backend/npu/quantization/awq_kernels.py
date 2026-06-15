@@ -17,6 +17,9 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A16Int4MoEMethod,
+)
 import torch_npu
 
 
@@ -78,6 +81,7 @@ class AWQAscendLinearKernel:
 class AWQAscendMoEKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
+        self.kernel = NPUW4A16Int4MoEMethod()
 
     @staticmethod
     def _register_or_replace_parameter(
@@ -93,20 +97,20 @@ class AWQAscendMoEKernel:
     def _convert_awq_weight_to_npu_layout(self, qweight: torch.Tensor) -> torch.Tensor:
         num_experts, input_size, _ = qweight.shape
         unpacked_weight = (
-            self.w13_kernel._unpack_from_int32(qweight.flatten(0, 1), 4)
+            self.kernel._unpack_from_int32(qweight.flatten(0, 1), 4)
             .view(num_experts, input_size, -1)
             .transpose(1, 2)
             .contiguous()
             .int()
         )
-        return self.w13_kernel._pack_to_int32(unpacked_weight)
+        return self.kernel._pack_to_int32(unpacked_weight)
 
     def _convert_awq_qzeros_to_npu_offset(
         self, qzeros: torch.Tensor, dtype: torch.dtype
     ) -> torch.Tensor:
         num_experts, num_groups, _ = qzeros.shape
         offset = (
-            -self.w13_kernel._unpack_from_int32(qzeros.flatten(0, 1), 4)
+            -self.kernel._unpack_from_int32(qzeros.flatten(0, 1), 4)
             .view(num_experts, num_groups, -1)
             .transpose(1, 2)
             .contiguous()
