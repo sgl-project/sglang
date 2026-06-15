@@ -217,6 +217,7 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        hicache_tree_placement=server_args.hicache_tree_placement,
     )
 
     tree_cache = create_tree_cache(

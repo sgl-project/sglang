@@ -554,3 +554,74 @@ class MambaComponent(TreeComponent):
                 self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
                 self.cache._update_evictable_leaf_sets(x)
             x = x_next
+
+    def build_host_only_backup_transfers(
+        self,
+        *,
+        req: Req,
+        insert_params: InsertParams,
+        values: torch.Tensor,
+        value_start: int,
+    ) -> Optional[list[PoolTransfer]]:
+        if insert_params.mamba_value is None:
+            return None
+        return [
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=insert_params.mamba_value,
+            )
+        ]
+
+    def pop_host_only_device_indices(self, req: Req) -> Optional[torch.Tensor]:
+        parts: list[torch.Tensor] = []
+        mamba_pool_idx = getattr(req, "mamba_pool_idx", None)
+        if mamba_pool_idx is not None:
+            parts.append(mamba_pool_idx.reshape(-1))
+        if self.enable_mamba_extra_buffer:
+            buf = getattr(req, "mamba_ping_pong_track_buffer", None)
+            if buf is None and req.req_pool_idx is not None:
+                buf = self.cache.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                    req.req_pool_idx
+                ]
+            if buf is not None:
+                indices = buf.reshape(-1)
+                parts.append(indices[indices != -1])
+        elif mamba_pool_idx is None:
+            return None
+
+        parts = [part for part in parts if part.numel() > 0]
+        if not parts:
+            return None
+        req.mamba_pool_idx = None
+        req.mamba_ping_pong_track_buffer = None
+        req.mamba_next_track_idx = None
+        req.mamba_last_track_seqlen = None
+        return torch.cat(parts).to(dtype=torch.int64, copy=True)
+
+    def commit_host_only_insert(
+        self,
+        *,
+        node: Optional[UnifiedTreeNode],
+        insert_result: InsertResult,
+        insert_params: InsertParams,
+        transfers: list[PoolTransfer],
+        value_start: int,
+    ) -> list[PoolTransfer]:
+        if not transfers or transfers[0].host_indices is None:
+            return []
+
+        host_indices = transfers[0].host_indices
+        ct = self.component_type
+        if node is None or node.component_data[ct].host_value is not None:
+            insert_result.mamba_exist = True
+            return [PoolTransfer(name=PoolName.MAMBA, host_indices=host_indices)]
+
+        cd = node.component_data[ct]
+        cd.host_value = host_indices.clone()
+        if cd.value is None:
+            host_lru = self.cache.host_lru_lists[ct]
+            if not host_lru.in_list(node):
+                host_lru.insert_mru(node)
+        self.cache._update_evictable_leaf_sets(node)
+        insert_result.mamba_exist = False
+        return []

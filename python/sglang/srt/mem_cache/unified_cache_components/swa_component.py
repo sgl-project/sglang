@@ -798,3 +798,79 @@ class SWAComponent(TreeComponent):
                 )
                 self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
             x = x_next
+
+    def build_host_only_backup_transfers(
+        self,
+        *,
+        req: Req,
+        insert_params: InsertParams,
+        values: torch.Tensor,
+        value_start: int,
+    ) -> Optional[list[PoolTransfer]]:
+        swa_start = max(insert_params.swa_evicted_seqlen - value_start, 0)
+        if swa_start >= len(values):
+            return None
+        swa_value = self._translate_full_to_swa(values[swa_start:])
+        if len(swa_value) == 0:
+            return None
+        return [
+            PoolTransfer(
+                name=PoolName.SWA,
+                device_indices=swa_value.to(torch.int64),
+            )
+        ]
+
+    def commit_host_only_insert(
+        self,
+        *,
+        node: Optional[UnifiedTreeNode],
+        insert_result: InsertResult,
+        insert_params: InsertParams,
+        transfers: list[PoolTransfer],
+        value_start: int,
+    ) -> list[PoolTransfer]:
+        if not transfers or transfers[0].host_indices is None:
+            return []
+
+        host_indices = transfers[0].host_indices
+        if node is None:
+            return [PoolTransfer(name=PoolName.SWA, host_indices=host_indices)]
+
+        transfer_start = max(insert_params.swa_evicted_seqlen, value_start)
+        transfer_end = transfer_start + len(host_indices)
+        node_start = value_start + insert_result.prefix_len
+        keep_start = max(node_start, transfer_start)
+        keep_end = min(node_start + len(node.key), transfer_end)
+
+        if keep_start >= keep_end:
+            return [PoolTransfer(name=PoolName.SWA, host_indices=host_indices)]
+
+        if keep_start > node_start:
+            self.cache._split_node(node.key, node, keep_start - node_start)
+            node_start = keep_start
+
+        if node_start + len(node.key) > keep_end:
+            node = self.cache._split_node(node.key, node, keep_end - node_start)
+
+        offset = node_start - transfer_start
+        keep_len = len(node.key)
+        keep = host_indices[offset : offset + keep_len]
+        if len(keep) != keep_len:
+            raise AssertionError(
+                f"SWA host-only host insert length mismatch: {len(keep)=}, {keep_len=}"
+            )
+
+        release_parts = [
+            host_indices[:offset],
+            host_indices[offset + keep_len :],
+        ]
+        if node.component_data[self.component_type].host_value is None:
+            self._attach_swa_host_value(node, keep)
+        else:
+            release_parts.append(keep)
+
+        return [
+            PoolTransfer(name=PoolName.SWA, host_indices=part)
+            for part in release_parts
+            if part.numel() > 0
+        ]

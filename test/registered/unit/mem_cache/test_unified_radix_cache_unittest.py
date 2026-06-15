@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
     COMPONENT_REGISTRY,
+    HostOnlyBackupPending,
     UnifiedLRUList,
     UnifiedRadixCache,
     UnifiedTreeNode,
@@ -419,6 +420,119 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             )
             canonical_hashes.append(running_hash)
         self.assertNotEqual(canonical_hashes, leaf.hash_value)
+
+
+class TestUnifiedRadixCacheHostOnlyBackup(CustomTestCase):
+    class _FakeController:
+        class _Event:
+            def synchronize(self):
+                pass
+
+        class _HostPool:
+            entry_map = {}
+
+            def __init__(self):
+                self.freed = []
+                self.next_idx = 100
+
+            def free(self, indices):
+                self.freed.append(indices.clone())
+                return len(indices)
+
+            def alloc(self, num_tokens):
+                indices = torch.arange(
+                    self.next_idx,
+                    self.next_idx + num_tokens,
+                    dtype=torch.int64,
+                )
+                self.next_idx += num_tokens
+                return indices
+
+            def available_size(self):
+                return 1 << 20
+
+        def __init__(self):
+            self.mem_pool_host = self._HostPool()
+            self.ack_write_queue = []
+            self.write_policy = "write_through"
+
+        def write(self, device_indices, priority=None, node_id=-1, extra_pools=None):
+            host_indices = self.mem_pool_host.alloc(len(device_indices))
+            self.ack_write_queue.append((self._Event(), self._Event(), [node_id]))
+            return host_indices
+
+    def test_host_only_ack_inserts_host_only_node_and_frees_device(self):
+        cfg = CacheConfig(page_size=1, components=(ComponentType.FULL,), kv_size=16)
+        tree, allocator, _ = build_fixture(cfg)
+        tree.cache_controller = self._FakeController()
+
+        device_indices = allocator.alloc(3)
+        before_free = allocator.available_size()
+        tree.ongoing_host_only_backup[-1] = HostOnlyBackupPending(
+            anchor_node=tree.root_node,
+            suffix_key=RadixKey(array("q", [1, 2, 3])),
+            value_start=0,
+            host_indices=torch.arange(100, 103, dtype=torch.int64),
+            device_indices=device_indices.to(torch.int64),
+            insert_params=InsertParams(),
+            comp_xfers={},
+            mamba_device_indices=None,
+        )
+
+        tree._finish_host_only_backup_ack(-1)
+
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3])))
+        )
+        self.assertEqual(allocator.available_size(), before_free + 3)
+        self.assertEqual(match.host_hit_length, 3)
+        self.assertEqual(match.device_indices.numel(), 0)
+        tree.sanity_check()
+
+    def test_host_only_cache_unfinished_req_inserts_host_tree_only(self):
+        cfg = CacheConfig(page_size=1, components=(ComponentType.FULL,), kv_size=16)
+        tree, allocator, req_to_token_pool = build_fixture(cfg)
+        tree.cache_controller = self._FakeController()
+        tree.hicache_tree_placement = "host_only"
+
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        tokens = array("q", [1, 2, 3])
+        req.origin_input_ids = tokens
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = tokens
+        req.fill_len = len(tokens)
+        kv_indices = allocator.alloc(len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        req.kv_committed_len = len(tokens)
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+
+        avail_before = allocator.available_size()
+        tree.cache_unfinished_req(req)
+
+        self.assertTrue(torch.equal(req.prefix_indices, kv_indices.to(torch.int64)))
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertEqual(req.host_only_cached_len, len(tokens))
+        self.assertIs(req.last_node, tree.root_node)
+        self.assertEqual(allocator.available_size(), avail_before)
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        self.assertEqual(match.device_indices.numel(), 0)
+        self.assertEqual(match.host_hit_length, len(tokens))
+
+        tree.cache_finished_req(req)
+        self.assertEqual(allocator.available_size(), avail_before + len(tokens))
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        self.assertEqual(match.device_indices.numel(), 0)
+        self.assertEqual(match.host_hit_length, len(tokens))
+        tree.sanity_check()
 
 
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):

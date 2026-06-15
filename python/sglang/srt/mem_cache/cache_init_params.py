@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 
@@ -44,6 +44,11 @@ class CacheInitParams:
     chunked_prefill_size: Optional[int] = None
 
     sliding_window_size: Optional[int] = None
+
+    # HiCache tree placement for finished-request prefix-cache entries.
+    # In host_only placement, entries are backed up as host-only tree nodes and
+    # their device slots are released after the D2H copy completes.
+    hicache_tree_placement: Literal["dual_tier", "host_only"] = "dual_tier"
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
