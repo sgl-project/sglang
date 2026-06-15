@@ -9,6 +9,17 @@ namespace {
 //   2. can handle non-contiguous k_extend and v_extend
 //   3. computes attention for prefix and extend separately
 //   4. TODO: apply head dimension blocking to optimize GQA
+//   5. optional tree mask for speculative decoding TARGET_VERIFY (EAGLE topk > 1):
+//      `tree_mask` is a flat [batches * qlen * qlen] bool tensor in
+//      TreeMaskMode::QLEN_ONLY layout, where qlen == extend_seq_lens[bs] ==
+//      max_len_extend (uniform across the batch, equal to draft_token_num).
+//      Row i = query draft token, column j = key draft token; true means query i
+//      may attend key j (each row marks self + ancestors + root). The committed
+//      prefix (stage 1) is implicitly fully visible to every draft token, which
+//      is why the mask only covers the qlen x qlen new-token block; the GPU
+//      FULL_MASK layout carries the prefix columns explicitly but they are
+//      all-true for EAGLE. When tree_mask is absent, stage 2 falls back to the
+//      plain causal mask (correct for non-spec extend and topk == 1 chains).
 //
 
 template <typename scalar_t, typename index_t, int BLOCK_M, int BLOCK_N>
@@ -27,6 +38,7 @@ void extend_attention_kernel_impl(
     const index_t* __restrict__ extend_start_loc,
     const void* __restrict__ buffer,
     const scalar_t* __restrict__ sinks,
+    const bool* __restrict__ tree_mask,
     int batches,
     int num_heads,
     int num_heads_kv,
@@ -107,6 +119,16 @@ void extend_attention_kernel_impl(
 
       if (is_prefix_skipped) {
         TORCH_CHECK(seq_len_prefix == 0, "extend attention: expect seq_len_prefix to be 0, got ", seq_len_prefix);
+      }
+
+      if (tree_mask != nullptr) {
+        // QLEN_ONLY layout assumes a uniform qlen across the batch (TARGET_VERIFY)
+        TORCH_CHECK(
+            seq_len_extend == max_len_extend,
+            "extend attention: tree_mask requires uniform extend_seq_lens, got ",
+            seq_len_extend,
+            " vs ",
+            max_len_extend);
       }
 
       // offset and size in MB
@@ -223,18 +245,38 @@ void extend_attention_kernel_impl(
               /* B     */ Btmp,
               /* C     */ s_i);
 
-          // apply causal mask
-          // [Note] condition to apply causal mask.
-          // Mask any block whose last key (n + n_size - 1) is strictly after the first query position (m), i.e. n +
-          // n_size - 1 > m. The original condition was `num_keys - n <= BLOCK_N` (last n-block only). That was correct
-          // when BLOCK_M <= BLOCK_N/2 because earlier n-blocks were guaranteed to contain only past keys.  With
-          // BLOCK_M=512, BLOCK_N=768:
-          //   BLOCK_M > BLOCK_N/2, so the first n-block can contain future keys.
-          //   Example: m=512 (mb=1), num_keys=1024, first n-block covers keys [0, 768).
-          //   Query row=0 is at position 512, so keys 513..767 are future and must be
-          //   masked — but `num_keys - 0 = 1024 > BLOCK_N` skips masking entirely,
-          //   producing wrong (non-causal) attention for rows 0..254 of this m-block.
-          if (n + n_size - 1 > m) {
+          // apply tree mask (speculative TARGET_VERIFY) or causal mask
+          if (tree_mask != nullptr) {
+            // [Note] tree mask for EAGLE topk > 1 (TreeMaskMode::QLEN_ONLY).
+            // mask[bs][m + row][n + col] == false -> query draft token (m + row)
+            // may not attend key draft token (n + col); set the score to -inf
+            // before softmax. The tree mask subsumes the causal constraint:
+            // ancestors always precede descendants in the draft token ordering,
+            // so permitted keys satisfy j <= i and the causal `num_keys` bound
+            // above remains valid.
+            const bool* __restrict__ mask_base =
+                tree_mask + (static_cast<int64_t>(bs) * seq_len_extend + m) * seq_len_extend + n;
+            for (int row = 0; row < m_size; ++row) {
+              float* __restrict__ row_ptr = s_i + row * BLOCK_N;
+              const bool* __restrict__ mask_ptr = mask_base + static_cast<int64_t>(row) * seq_len_extend;
+              for (int col = 0; col < n_size; ++col) {
+                if (!mask_ptr[col]) {
+                  row_ptr[col] = -std::numeric_limits<float>::infinity();
+                }
+              }
+            }
+          } else if (n + n_size - 1 > m) {
+            // apply causal mask
+            // [Note] condition to apply causal mask.
+            // Mask any block whose last key (n + n_size - 1) is strictly after the first query position (m), i.e. n +
+            // n_size - 1 > m. The original condition was `num_keys - n <= BLOCK_N` (last n-block only). That was
+            // correct when BLOCK_M <= BLOCK_N/2 because earlier n-blocks were guaranteed to contain only past keys.
+            // With BLOCK_M=512, BLOCK_N=768:
+            //   BLOCK_M > BLOCK_N/2, so the first n-block can contain future keys.
+            //   Example: m=512 (mb=1), num_keys=1024, first n-block covers keys [0, 768).
+            //   Query row=0 is at position 512, so keys 513..767 are future and must be
+            //   masked — but `num_keys - 0 = 1024 > BLOCK_N` skips masking entirely,
+            //   producing wrong (non-causal) attention for rows 0..254 of this m-block.
             for (int row = 0; row < m_size; ++row) {
               int last_col = m + row - n;
               // [Note] mask the entire row if last_col < 0.
@@ -333,6 +375,7 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         extend_start_loc.data_ptr<index_t>(),                                              \
         buffer.data_ptr(),                                                                 \
         sinks_tensor.data_ptr<scalar_t>(),                                                 \
+        tree_mask_ptr,                                                                     \
         num_seqs,                                                                          \
         num_heads,                                                                         \
         num_heads_kv,                                                                      \
@@ -377,6 +420,8 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
 // extend_start_loc: [num_seqs]
 // encoder_lens: [num_seqs] int64 or None
 // sinks: [num_heads] or None
+// tree_mask: [num_seqs * max_len_extend * max_len_extend] bool or None
+//   TreeMaskMode::QLEN_ONLY tree mask for speculative TARGET_VERIFY; see [NOTE] 5 above.
 void extend_attention_cpu(
     at::Tensor& q_extend,
     const std::optional<at::Tensor>& k_extend_opt,
@@ -395,7 +440,8 @@ void extend_attention_cpu(
     bool is_cross_attn,
     int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
-    std::optional<at::Tensor> sinks) {
+    std::optional<at::Tensor> sinks,
+    std::optional<at::Tensor> tree_mask) {
   if (!is_cross_attn) {
     TORCH_CHECK(
         k_extend_opt.has_value() && v_extend_opt.has_value(),
@@ -480,6 +526,22 @@ void extend_attention_cpu(
   at::Tensor sinks_tensor = has_sink ? sinks.value() : at::empty({num_heads}, q_extend.options());
   CHECK_DIM(1, sinks_tensor);
   CHECK_EQ(sinks_tensor.size(0), num_heads);
+
+  const bool* tree_mask_ptr = nullptr;
+  if (tree_mask.has_value()) {
+    const at::Tensor& tree_mask_t = tree_mask.value();
+    CHECK_INPUT(tree_mask_t);
+    TORCH_CHECK(
+        tree_mask_t.scalar_type() == at::kBool, "extend: expect tree_mask to be bool, got ", tree_mask_t.scalar_type());
+    TORCH_CHECK(
+        tree_mask_t.numel() == static_cast<int64_t>(num_seqs) * max_len_extend * max_len_extend,
+        "extend: expect tree_mask numel to be num_seqs * max_len_extend^2 = ",
+        static_cast<int64_t>(num_seqs) * max_len_extend * max_len_extend,
+        ", got ",
+        tree_mask_t.numel());
+    TORCH_CHECK(!is_cross_attn, "extend: tree_mask is not supported for cross attention");
+    tree_mask_ptr = tree_mask_t.data_ptr<bool>();
+  }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {

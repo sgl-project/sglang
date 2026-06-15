@@ -13,16 +13,68 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
+    assign_extend_cache_locs_func as _assign_extend_cache_locs_func_triton,
 )
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
 )
+from sglang.srt.utils.common import is_cpu
+
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_info import (
-        EagleDraftInput,
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+if _is_cpu:
+    from sgl_kernel import (
+        assign_extend_cache_locs_cpu,
+        fill_bonus_tokens_cpu,
     )
+
+
+def fill_bonus_tokens_func(accept_tokens, accept_lens, bonus_tokens, accept_stride, bs):
+    if _is_cpu:
+        fill_bonus_tokens_cpu(accept_tokens, accept_lens, bonus_tokens, accept_stride)
+    else:
+        fill_bonus_tokens[(bs,)](
+            accept_tokens, accept_lens, bonus_tokens, accept_stride
+        )
+
+
+def assign_extend_cache_locs_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    device,
+) -> torch.Tensor:
+    if _is_cpu:
+        out_cache_loc = torch.empty(
+            (batch_size * draft_token_num,),
+            dtype=torch.int64,
+            device=device,
+        )
+        assign_extend_cache_locs_cpu(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+        )
+        return out_cache_loc
+    else:
+        return _assign_extend_cache_locs_func_triton(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            batch_size,
+            draft_token_num,
+            device,
+        )
 
 
 @dataclass
