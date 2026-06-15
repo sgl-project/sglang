@@ -7,7 +7,6 @@ tilelang.set_log_level("WARNING")
 
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
 }
 
 if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):

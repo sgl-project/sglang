@@ -264,17 +264,33 @@ def is_config_compatible_with_shape(config: dict, M: int, N: int, K: int) -> boo
     return config_compatibility_error(config, M, N, K) is None
 
 
-def _fast_sm90_candidate_filter(config: dict) -> bool:
-    """Aggressive SM90 shortlist learned from H20 TileLang 0.1.9 tuning runs."""
+def _is_large_base_shape(M: int, N: int, K: int) -> bool:
+    return M >= 48 and (N >= 4096 or K >= 3584)
+
+
+def _fast_sm90_candidate_filter(config: dict, M: int, N: int, K: int) -> bool:
+    """Aggressive SM90 shortlist learned from H20 TileLang tuning runs."""
 
     kernel_type = config["kernel_type"]
-    if config["block_M"] != 64 or config["block_K"] != 128:
+    if config["block_K"] != 128:
         return False
     if config["threads"] != 128 or not config["c_scale_local"]:
         return False
 
     if kernel_type == "base":
+        if _is_large_base_shape(M, N, K):
+            return (
+                not config["a_scale_shm"]
+                and config["block_M"] in (64, 128)
+                and config["block_N"] in (32, 64, 128)
+                and config["num_stages"] in (2, 3)
+            )
+        if config["block_M"] != 64:
+            return False
         return config["block_N"] in (16, 32, 64) and config["num_stages"] in (2, 4)
+
+    if config["block_M"] != 64:
+        return False
     if kernel_type == "swapAB":
         return config["block_N"] == 16 and config["num_stages"] in (2, 4)
     if kernel_type == "splitK_swapAB":
@@ -337,7 +353,9 @@ def generate_candidate_configs(
                     configs.append(normalize_config(candidate, M, N, K))
 
     if search_policy == "fast_sm90":
-        configs = [config for config in configs if _fast_sm90_candidate_filter(config)]
+        configs = [
+            config for config in configs if _fast_sm90_candidate_filter(config, M, N, K)
+        ]
 
     return configs
 
