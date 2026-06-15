@@ -30,7 +30,9 @@ def _eager_fill_padded_rows(x, num_token_non_padded, fill_value):
     return out
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "fused padded-region kernel needs a GPU")
+@unittest.skipUnless(
+    torch.cuda.is_available(), "fused padded-region kernel needs a GPU"
+)
 class TestTopkPaddedRegion(CustomTestCase):
     DEVICE = "cuda"
 
@@ -102,9 +104,7 @@ class TestTopkPaddedRegion(CustomTestCase):
             num_token_non_padded.fill_(n_valid)
             graph.replay()
             torch.cuda.synchronize()
-            expected = _eager_fill_padded_rows(
-                weights, num_token_non_padded, 0.0
-            )
+            expected = _eager_fill_padded_rows(weights, num_token_non_padded, 0.0)
             self.assertTrue(torch.equal(work, expected))
 
     def test_invalid_pad_count_tensor_raises(self):

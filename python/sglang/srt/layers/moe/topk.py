@@ -1169,19 +1169,19 @@ def _fill_padded_rows(
     # Metadata-only checks (no device sync): the kernel reads a single scalar
     # routing count from device memory, so it must be a 1-element integer tensor
     # on the same device as ``x``.
-    assert isinstance(num_token_non_padded, torch.Tensor), (
-        "num_token_non_padded must be a torch.Tensor"
-    )
+    assert isinstance(
+        num_token_non_padded, torch.Tensor
+    ), "num_token_non_padded must be a torch.Tensor"
     assert num_token_non_padded.numel() == 1, (
         "num_token_non_padded must be a single-element tensor, got shape "
         f"{tuple(num_token_non_padded.shape)}"
     )
-    assert not num_token_non_padded.dtype.is_floating_point, (
-        f"num_token_non_padded must be an integer tensor, got {num_token_non_padded.dtype}"
-    )
-    assert num_token_non_padded.device == x.device, (
-        "num_token_non_padded and x must be on the same device"
-    )
+    assert (
+        not num_token_non_padded.dtype.is_floating_point
+    ), f"num_token_non_padded must be an integer tensor, got {num_token_non_padded.dtype}"
+    assert (
+        num_token_non_padded.device == x.device
+    ), "num_token_non_padded and x must be on the same device"
     n_rows, n_cols = x.shape
     _fill_padded_rows_kernel[(n_rows,)](
         x,
