@@ -394,9 +394,17 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
-        )
+        # For now, kernel write-back keeps host indices on CPU only for page_first.
+        # More layouts can use this path once their write-back kernels accept CPU
+        # destination indices.
+        if self.io_backend == "kernel" and self.mem_pool_host.layout == "page_first":
+            host_indices = op.host_indices
+            device_indices = op.device_indices
+            resolved_pool_transfers = op.pool_transfers
+        else:
+            host_indices, device_indices, resolved_pool_transfers = (
+                self.move_hybrid_indices(op)
+            )
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
