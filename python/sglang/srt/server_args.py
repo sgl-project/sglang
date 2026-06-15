@@ -6395,8 +6395,15 @@ class ServerArgs:
         )
         parser.add_argument(
             "--mamba-scheduler-strategy",
-            "--mamba-radix-cache-strategy",
             dest="mamba_radix_cache_strategy",
+            type=str,
+            action=DeprecatedAliasStoreAction,
+            new_flag="--mamba-radix-cache-strategy",
+            default=ServerArgs.mamba_radix_cache_strategy,
+            help="Deprecated alias for --mamba-radix-cache-strategy.",
+        )
+        parser.add_argument(
+            "--mamba-radix-cache-strategy",
             type=str,
             choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
             default=ServerArgs.mamba_radix_cache_strategy,
