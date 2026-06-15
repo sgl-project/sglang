@@ -243,11 +243,27 @@ class UnifiedLRUList:
             return None
         return x
 
+    def get_prev_no_host_lock(self, node: UnifiedTreeNode, check_id: bool = True):
+        """Host-LRU walker: skip nodes whose component host_lock_ref > 0."""
+        if check_id:
+            assert node.id in self.cache
+        pt = self._pt
+        ct = self.component_type
+        x = node.lru_prev[pt]
+        while x.component_data[ct].host_lock_ref > 0:
+            x = x.lru_prev[pt]
+        if x == self.head:
+            return None
+        return x
+
     def get_lru_no_lock(self):
         return self.get_prev_no_lock(self.tail, check_id=False)
 
     def get_leaf_lru_no_lock(self):
         return self.get_prev_leaf_no_lock(self.tail, check_id=False)
+
+    def get_lru_no_host_lock(self):
+        return self.get_prev_no_host_lock(self.tail, check_id=False)
 
 
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
@@ -429,7 +445,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 list[UnifiedTreeNode],
             ],
         ] = {}
-        self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self.ongoing_load_back: dict[
+            int,
+            tuple[UnifiedTreeNode, DecLockRefParams, DecLockRefParams],
+        ] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[
@@ -1601,7 +1620,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
 
         start_time = time.perf_counter()
-
+        host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
         # Build KV transfer
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
             best_match_node, CacheTransferPhase.LOAD_BACK
@@ -1633,6 +1652,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
+            self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
 
         if self.supports_swa():
@@ -1644,6 +1664,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                self.dec_host_lock_ref(best_match_node, host_anchor_params)
                 return False
 
         # Load H→D
@@ -1657,6 +1678,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
+            self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
 
         # Commit: each component gets only its own transfers
@@ -1679,6 +1701,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_load_back[best_match_node.id] = (
             best_match_node,
             self.inc_lock_ref(best_match_node).to_dec_params(),
+            host_anchor_params,
         )
 
         if self.metrics_collector is not None:
@@ -2329,8 +2352,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                node, lock_params = self.ongoing_load_back.pop(ack_id)
+                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
+                self.dec_host_lock_ref(node, host_lock_params)
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
@@ -2780,7 +2804,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 E(
                     f"[Ongoing] write_through node {nid} lock_ref={n.component_data[FCT].lock_ref}"
                 )
-        for nid, (n, _) in self.ongoing_load_back.items():
+        for nid, (n, _, _) in self.ongoing_load_back.items():
             if n not in all_node_set:
                 E(f"[Ongoing] load_back node {nid} not in tree")
             elif n.component_data[FCT].lock_ref <= 0:
