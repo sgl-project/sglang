@@ -60,7 +60,7 @@ class AWQAscendLinearKernel:
         group_size = K // num_groups
 
         # NPU constraint
-        npu_ok = (group_size == 0) or (group_size % 32 == 0 and 32 <= group_size < K)
+        npu_ok = False #(group_size == 0) or (group_size % 32 == 0 and 32 <= group_size < K)
 
         if npu_ok:
             # Use NPU kernel – keep weight, scales, and precomputed group_size
@@ -82,9 +82,6 @@ class AWQAscendLinearKernel:
             # Weight already signed, no zero‑point subtraction
             weight_float = weight_int8.float() * scales_exp.float()
             weight_float = weight_float.t().contiguous().to(torch.bfloat16)
-
-            w = weight_float
-            print(w.min(), w.max(), torch.isinf(w).any())
 
             layer.register_parameter("weight", torch.nn.Parameter(weight_float, requires_grad=False))
             # No need for scales anymore – we can delete them
