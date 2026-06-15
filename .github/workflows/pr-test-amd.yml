@@ -95,6 +95,17 @@ on:
         type: boolean
         default: false
 
+# Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra ->
+# pr-test-amd-extra.yml) declares actions: write / issues: read /
+# pull-requests: read. A called reusable workflow can only use scopes the
+# caller already holds, so without this block the call fails workflow
+# validation ("requesting actions: write... but only allowed ...none").
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
