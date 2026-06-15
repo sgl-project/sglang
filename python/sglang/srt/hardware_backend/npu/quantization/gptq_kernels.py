@@ -58,7 +58,7 @@ def unpack_from_int32(
     return unpacked_weight
 
 class GPTQLinearAscendKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
@@ -126,7 +126,7 @@ class GPTQLinearAscendKernel:
 
 
 class GPTQMoEAscendKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 

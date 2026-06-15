@@ -33,7 +33,7 @@ __all__ = ["GPTQMoEAscendScheme", "GPTQMarlinMoEScheme"]
 
 
 class GPTQMoEAscendScheme(GPTQMoESchemeBase):
-    def __init__(self, quant_config: "GPTQConfig"):
+    def __init__(self, quant_config: GPTQConfig):
         self.quant_config = quant_config
         from sglang.srt.hardware_backend.npu.quantization.gptq_kernels import (
             GPTQMoEAscendKernel,
@@ -172,7 +172,7 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
 
 
 class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
-    def __init__(self, quant_config: "GPTQMarlinConfig"):
+    def __init__(self, quant_config: GPTQMarlinConfig):
         self.quant_config = quant_config
         from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
             GPTQMarlinMoEKernel,
@@ -334,6 +334,6 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
+        dispatch_output: StandardDispatchOutput,
     ):
         return self.kernel.apply(layer, dispatch_output)

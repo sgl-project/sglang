@@ -123,7 +123,7 @@ class PoolTransferResult:
     extra_pool_hit_pages: dict[str, int]
 
     @classmethod
-    def empty(cls) -> "PoolTransferResult":
+    def empty(cls) -> PoolTransferResult:
         return cls(0, {})
 
     def update_kv_hit_pages(self, kv_hit_pages: int) -> None:
@@ -188,7 +188,7 @@ class HiCacheStorage(ABC):
     def batch_get_v2(
         self,
         transfers: List[PoolTransfer],
-        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         """Read data from storage into host memory for each PoolTransfer.
 
@@ -199,7 +199,7 @@ class HiCacheStorage(ABC):
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
-        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         """Write data from host memory to storage for each PoolTransfer.
 
@@ -589,14 +589,14 @@ class HiCacheFile(HiCacheStorage):
     def batch_get_v2(
         self,
         transfers: List[PoolTransfer],
-        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         return self._batch_io_v2(transfers, self._read_page)
 
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
-        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         return self._batch_io_v2(transfers, self._write_page)
 

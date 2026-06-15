@@ -30,7 +30,7 @@ from sglang.srt.layers.moe import (
 )
 
 class AWQAscendLinearKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -85,7 +85,7 @@ class AWQAscendLinearKernel:
 
 
 class AWQAscendMoEKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
         self.w13_kernel = NPUW4A16Int4DynamicMoEMethod()
         self.w2_kernel = NPUW4A16Int4DynamicMoEMethod()

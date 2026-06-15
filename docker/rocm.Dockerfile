@@ -303,7 +303,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 ENV CARGO_BUILD_JOBS=4
 
 # Build and install sgl-model-gateway
-RUN python3 -m pip install --no-cache-dir maturin \
+RUN python3 -m pip install --no-cache-dir "maturin<1.14" \
     && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
            /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
     && grep -E '^smg-' /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \

@@ -671,7 +671,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def forward_npu(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
 
         backend = self.runner.runner_backend
