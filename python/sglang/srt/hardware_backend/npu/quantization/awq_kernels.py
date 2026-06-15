@@ -111,28 +111,34 @@ class AWQAscendLinearKernel:
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         reshaped_x = x.reshape(-1, x.shape[-1])
-
+        pack_factor = self.quant_config.pack_factor   # <-- add this line
+    
         if layer.use_npu_matmul:
-            qweight = layer.weight          # (K, N//pack) int32, XORed
+            qweight = layer.weight          # (K, N//pack_factor) int32, XORed
             scales = layer.scales           # (groups, N)
             offset = layer.zeros            # (groups, N)
             out_shape = x.shape[:-1] + (qweight.shape[1] * pack_factor,)
+    
             if bias is not None and bias.dtype == torch.bfloat16:
                 bias = bias.float()
+    
             out = torch_npu.npu_weight_quant_batchmatmul(
                 reshaped_x,
                 qweight,
                 antiquant_scale=scales,
-                antiquant_offset=offset,           # correct offset
+                antiquant_offset=offset,
                 antiquant_group_size=layer.npu_group_size,
                 bias=bias,
             )
             return out.reshape(out_shape)
         else:
             # fallback: weight is (N, K) bfloat16
-            #print('unquant', out)
-            out = F.linear(x, layer.weight, bias)
-            return out
+            weight = layer.weight   # (N, K)
+            out_shape = x.shape[:-1] + (weight.shape[0],)
+            out = torch.matmul(reshaped_x, weight.t())
+            if bias is not None:
+                out = out + bias.to(out.dtype)
+            return out.reshape(out_shape)
 
 
 class AWQAscendMoEKernel:
