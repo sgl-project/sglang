@@ -3789,14 +3789,6 @@ class Scheduler(
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
 
-        # dLLM requests live in dllm_manager.waiting_queue for their whole
-        # denoising lifetime and are never merged into running_batch. A request
-        # not selected in the current round (e.g. a decode-phase request skipped
-        # while a prefill-phase request is pending) is absent from both
-        # running_batch and cur_batch, so the loop above misses it and its abort
-        # would be silently dropped. Set `to_finish` here too; the request keeps
-        # the same KV cache, and process_batch_result_dllm honors `to_finish` and
-        # releases resources when it next runs. (staging_queue is a subset.)
         if self.dllm_config is not None:
             for req in self.dllm_manager.waiting_queue:
                 if not req.finished() and (
