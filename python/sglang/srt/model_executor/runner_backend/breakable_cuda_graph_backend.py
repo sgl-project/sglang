@@ -82,19 +82,19 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             )
 
     @contextmanager
-    def capture_session(self, stream: torch.cuda.Stream):
+    def record_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
             self._pool = self._device_module.graph_pool_handle()
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
         try:
-            with self.replay_session():
+            with self.run_session():
                 yield
         finally:
             self._capture_stream = None
 
-    def capture_one(
+    def record(
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
@@ -186,15 +186,15 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             f"{type(output)} vs {type(output_buffer)}"
         )
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
 
     @contextmanager
-    def replay_session(self):
+    def run_session(self):
         with enable_breakable_cuda_graph():
             yield
 
-    def replay(
+    def run(
         self,
         shape_key: ShapeKey,
         static_forward_batch: ForwardBatch,

@@ -70,7 +70,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     loop (capture()), bucket-padding helper (_pad_to_bucket),
     and the backend-driven capture/replay scaffolding. EAGLE-specific
     bits — buffer dataclass, dummy ForwardBatch construction in
-    capture_one_shape, replay output unwrap, and can_run — are
+    _prepare_one, replay output unwrap, and can_run_graph — are
     overridden.
 
     EAGLE does not call DecodeCudaGraphRunner.__init__ (that init
@@ -118,7 +118,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
 
         # Patch_model in parent's capture() needs an attn_backend reference.
-        # EAGLE doesn't use it (capture_one_shape calls draft_forward instead),
+        # EAGLE doesn't use it (_prepare_one calls draft_forward instead),
         # but the field must exist.
         self.attn_backend = self.draft_attn_backend
 
@@ -130,7 +130,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
-        # Capture-time globals required by parent's capture_one_shape signature.
+        # Capture-time globals required by parent's _prepare_one signature.
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
@@ -232,14 +232,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Capture
         try:
             with model_capture_mode():
-                self.capture()
+                self.prepare()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        return self.backend.run(shape_key, forward_batch)
 
     # -----------------------------------------------------------------
     # Helpers
@@ -252,9 +252,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         return ShapeKey(size=bs)
 
     # -----------------------------------------------------------------
-    # can_run
+    # can_run_graph
     # -----------------------------------------------------------------
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -266,7 +266,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.batch_size
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, cuda_graph_bs)
+            self.backend.can_run_graph(forward_batch, cuda_graph_bs)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -279,7 +279,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Capture (per-shape)
     # -----------------------------------------------------------------
-    def capture_one_shape(
+    def _prepare_one(
         self,
         size: int,
         forward: Callable,
@@ -406,7 +406,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.mark_forward_metadata_ready()
             self.deepep_adapter.capture(is_extend_in_batch=False)
             shape_key = self._make_graph_key(num_seqs)
-            self.backend.capture_one(
+            self.backend.record(
                 shape_key,
                 run_once,
                 dummies=None,
@@ -422,7 +422,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Replay
     # -----------------------------------------------------------------
-    def replay(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers

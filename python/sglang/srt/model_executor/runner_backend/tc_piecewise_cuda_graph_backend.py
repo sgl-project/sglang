@@ -196,23 +196,23 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 )
 
     @contextmanager
-    def capture_session(self, stream: torch.cuda.Stream):
+    def record_session(self, stream: torch.cuda.Stream):
         self._capture_stream = stream
         try:
-            with self.replay_session():
+            with self.run_session():
                 with set_pcg_capture_stream(stream):
                     yield
         finally:
             self._capture_stream = None
 
-    def capture_one(
+    def record(
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        # Call 1 warms FX state; call 2 captures the cuda graph inside capture_session.
+        # Call 1 warms FX state; call 2 captures the cuda graph inside record_session.
         # See cuda_piecewise_backend.py for the FX backend that drives the capture.
         for _ in range(2):
             self._device_module.synchronize()
@@ -221,17 +221,17 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         # torch.compile manages its per-shape cache internally.
         # _run_compile_pass warms every shape in capture_num_tokens at __init__.
         return True
 
     @contextmanager
-    def replay_session(self):
+    def run_session(self):
         with enable_tc_piecewise_cuda_graph():
             yield
 
-    def replay(
+    def run(
         self,
         shape_key: ShapeKey,
         static_forward_batch: ForwardBatch,

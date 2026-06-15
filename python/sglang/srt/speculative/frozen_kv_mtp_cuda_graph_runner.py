@@ -64,7 +64,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
     (capture() / _capture_one_stream()), the bucket-padding helper
     (_pad_to_bucket), and the backend-driven capture/replay scaffolding.
     Frozen-KV-MTP-specific bits — the buffer dataclass, the dummy
-    ForwardBatch + FrozenKVMTPDraftInput built in capture_one_shape, the
+    ForwardBatch + FrozenKVMTPDraftInput built in _prepare_one, the
     target-KV-pool swap during capture, the worker's frozen-KV metadata
     helpers, the topk*topk bucket math, the expanded-bs bookkeeping, and
     the 3-tuple replay output — are overridden.
@@ -179,7 +179,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
 
         try:
             with model_capture_mode():
-                self.capture()
+                self.prepare()
         except RuntimeError as e:
             raise Exception(
                 f"Capture frozen-KV MTP cuda graph failed: {e}\n"
@@ -190,9 +190,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         return ShapeKey(size=bs)
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        return self.backend.run(shape_key, forward_batch)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = max(forward_batch.global_num_tokens_cpu) // (
                 self.topk * self.topk
@@ -205,7 +205,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
+            self.backend.can_run_graph(
+                forward_batch, self._make_graph_key(cuda_graph_bs)
+            )
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -213,7 +215,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
         return is_bs_supported
 
-    def capture_one_shape(
+    def _prepare_one(
         self,
         size: int,
         forward: Callable,
@@ -321,7 +323,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                 )
                 self.deepep_adapter.capture(is_extend_in_batch=False)
                 shape_key = self._make_graph_key(request_bs)
-                self.backend.capture_one(
+                self.backend.record(
                     shape_key,
                     run_once,
                     dummies=None,
@@ -336,7 +338,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
         return parent_list, top_scores_index, draft_tokens
 
-    def replay(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch):
         self.deepep_adapter.replay()
         buffers = self.buffers
 

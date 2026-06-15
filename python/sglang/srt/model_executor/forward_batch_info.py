@@ -460,7 +460,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Attention planning state. True iff attention metadata for this batch has
     # already been planned outside ModelRunner.forward (multi-step draft
-    # pre-plan, plan-stream replay_prepare, hand-built spec batches), so the
+    # pre-plan, plan-stream load_batch, hand-built spec batches), so the
     # forward path must not plan again. Only such pre-planners may set this —
     # ModelRunner / graph runners never mark after their own planning. The
     # marker is only valid for the planning regime (backend set) it was set
@@ -486,7 +486,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         Call right next to the out-of-forward planning action
         (e.g. ``draft_attn_backend.init_forward_metadata(fb)`` or
-        ``graph_runner.replay_prepare(fb)``). Records the batch shapes so
+        ``graph_runner.load_batch(fb)``). Records the batch shapes so
         staleness is detectable; pass ``replan_equivalent=True`` only when
         a forward-path re-plan is equivalent to the pre-plan (see field
         docs).

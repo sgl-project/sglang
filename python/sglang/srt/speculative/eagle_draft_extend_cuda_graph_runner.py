@@ -69,8 +69,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     """EAGLE draft-extend cuda-graph runner.
 
     Subclasses DecodeCudaGraphRunner to inherit the outer capture
-    loop + backend scaffolding. Overrides capture_one_shape,
-    replay, can_run for EAGLE-specific draft-extend semantics.
+    loop + backend scaffolding. Overrides _prepare_one,
+    replay, can_run_graph for EAGLE-specific draft-extend semantics.
     """
 
     def __init__(
@@ -239,14 +239,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         try:
             with model_capture_mode():
-                self.capture()
+                self.prepare()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        return self.backend.run(shape_key, forward_batch)
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -254,7 +254,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -266,7 +266,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, cuda_graph_bs)
+            self.backend.can_run_graph(forward_batch, cuda_graph_bs)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -276,7 +276,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         return is_bs_supported
 
-    def capture_one_shape(
+    def _prepare_one(
         self,
         size: int,
         forward: Callable,
@@ -415,7 +415,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs)
-                self.backend.capture_one(
+                self.backend.record(
                     shape_key,
                     run_once,
                     dummies=None,
@@ -426,7 +426,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     ),
                 )
 
-    def replay(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
