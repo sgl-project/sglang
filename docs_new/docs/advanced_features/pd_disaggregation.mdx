@@ -173,7 +173,7 @@ The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom me
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**`SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Controls the total number of worker threads for KVCache transfer operations per TP rank</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>A dynamic value calculated by <code>int(0.75 * os.cpu_count()) // 8)</code>, which is limited to be larger than 4 and less than 12 to ensure efficiency and prevent thread race conditions</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>A dynamic value calculated by <code>int(0.75 * os.cpu_count()) // 8</code>, which is limited to be larger than 4 and less than 12 to ensure efficiency and prevent thread race conditions</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**`SGLANG_DISAGGREGATION_QUEUE_SIZE`**</td>
