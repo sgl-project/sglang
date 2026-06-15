@@ -203,13 +203,17 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         )
         if (
             quant_config.use_per_token_activation
-            and not self.enable_flashinfer_trtllm_moe
+            and not (
+                self.enable_flashinfer_trtllm_moe
+                or self._is_cutedsl_v2_standard
+            )
         ):
             raise ValueError(
                 "--quantization nvfp4_online requires online per-token FP32 "
-                "activation scales and supports only flashinfer_trtllm or "
-                "flashinfer_trtllm_routed. Use --quantization modelopt_fp4 "
-                "for per-tensor FP32 activation scales."
+                "activation scales and supports flashinfer_trtllm, "
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl with no A2A "
+                "or FlashInfer A2A. Use --quantization modelopt_fp4 for "
+                "per-tensor FP32 activation scales."
             )
 
     def prepare_weight_loader(self, layer, weight_loader):
@@ -404,7 +408,6 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         pending_fp8_lock = threading.Lock()
         quantization_log_lock = threading.Lock()
         did_log_quantization = False
-
         def log_quantization_start() -> None:
             nonlocal did_log_quantization
             if did_log_quantization:
