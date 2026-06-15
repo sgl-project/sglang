@@ -162,6 +162,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Runtime parameters
         self.backend = backend
+        # Opt-in: route the EAGLE spec-verify through the cuteDSL grouped-Q fold kernel.
+        # The cute-dsl mla_decode kernel packs all ndt verify tokens of a request into one
+        # CTA (grouped-Q / fold_sq) and reads the KV once, vs trtllm-gen's one-CTA-per-token
+        # (KV read x ndt). Default keeps the existing trtllm-gen verify.
+        self._spec_verify_backend = getattr(
+            model_runner.server_args, "speculative_mla_verify_backend", "trtllm-gen"
+        )
+        if self._spec_verify_backend == "cute-dsl":
+            _spec_topk = (
+                getattr(model_runner.server_args, "speculative_eagle_topk", None) or 1
+            )
+            if _spec_topk > 1:
+                logger.warning(
+                    "speculative_mla_verify_backend=cute-dsl is validated for "
+                    "speculative_eagle_topk=1 only; using trtllm-gen for the verify."
+                )
+                self._spec_verify_backend = "trtllm-gen"
         self.scaling = config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
@@ -190,6 +207,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     device=model_runner.device,
                 )
             self.workspace_buffer = global_zero_init_workspace_buffer
+
+        # The spec-verify can dispatch the cute-dsl kernel from a non-cute instance (the
+        # verify runs on the prefill/extend backend); ensure its int8 workspace exists.
+        # (global_cute_dsl_workspace_buffer is already declared global above in this fn.)
+        if self._spec_verify_backend == "cute-dsl" and self.backend != "cute-dsl":
+            if global_cute_dsl_workspace_buffer is None:
+                global_cute_dsl_workspace_buffer = torch.zeros(
+                    self.workspace_size,
+                    dtype=torch.int8,
+                    device=model_runner.device,
+                )
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -632,8 +660,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
+        backend_override: Optional[str] = None,
     ) -> torch.Tensor:
-        """Hook for subclasses to swap the decode/spec-verify kernel."""
+        """Hook for subclasses to swap the decode/spec-verify kernel.
+
+        ``backend_override`` lets a caller (e.g. the spec-verify) pick a different
+        flashinfer MLA backend than this instance's default ``self.backend``.
+        """
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
@@ -647,11 +680,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
-        extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
+        backend = backend_override or self.backend
+        extra_kwargs = {"backend": backend} if backend != "trtllm-gen" else {}
+        workspace_buffer = self.workspace_buffer
+        if backend == "cute-dsl" and self.backend != "cute-dsl":
+            # spec-verify dispatching the cute fold from the prefill/extend instance
+            workspace_buffer = global_cute_dsl_workspace_buffer
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
-            workspace_buffer=self.workspace_buffer,
+            workspace_buffer=workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
@@ -966,6 +1004,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens=metadata.seq_lens_k,
                 max_seq_len=max_seq_len,
                 layer=layer,
+                backend_override=(
+                    self._spec_verify_backend
+                    if forward_batch.forward_mode.is_target_verify()
+                    else None
+                ),
             )
 
             if needs_unpad:

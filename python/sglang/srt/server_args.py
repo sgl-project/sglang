@@ -621,6 +621,7 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
+    speculative_mla_verify_backend: str = "trtllm-gen"
     speculative_draft_attention_backend: Optional[str] = None
     speculative_draft_window_size: Optional[int] = None
     speculative_moe_runner_backend: Optional[str] = None
@@ -6142,6 +6143,17 @@ class ServerArgs:
             choices=["prefill", "decode"],
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             default=ServerArgs.speculative_attention_mode,
+        )
+        parser.add_argument(
+            "--speculative-mla-verify-backend",
+            type=str,
+            choices=["trtllm-gen", "cute-dsl"],
+            default=ServerArgs.speculative_mla_verify_backend,
+            help="flashinfer MLA kernel for the EAGLE spec-verify on the trtllm_mla backend. "
+            "'cute-dsl' uses the grouped-Q fold (groupsTokensHeadsQ) kernel that packs all "
+            "draft tokens of a request into one CTA and reads the KV once (vs trtllm-gen's "
+            "one-CTA-per-token / KV read x num_draft_tokens). Requires a flashinfer build with "
+            "the cute-dsl fold kernel and speculative_eagle_topk=1; otherwise falls back to trtllm-gen.",
         )
         parser.add_argument(
             "--speculative-draft-attention-backend",
