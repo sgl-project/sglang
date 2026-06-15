@@ -173,6 +173,7 @@ class PrefillBootstrapQueue:
             if layer_shard_enabled
             else self.token_to_kv_pool.start_layer
         )
+        kv_args.prefill_num_total_layers = self.scheduler.model_config.num_hidden_layers
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
