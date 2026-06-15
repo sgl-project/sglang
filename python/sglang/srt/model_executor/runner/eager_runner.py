@@ -18,7 +18,8 @@ from __future__ import annotations
 import contextlib
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Tuple, Union
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 import torch
 
@@ -41,7 +42,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, require_mlp_tp_gather
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,8 @@ class EagerRunner(BaseRunner):
             else mr.max_total_num_tokens
         )
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_bs)
+        self._eager_max_bs = max_bs
+        self._eager_num_tokens_per_bs = num_tokens_per_bs
         is_encoder_decoder = mr.model_config.is_encoder_decoder
         self._eager_registry = build_eager_registry(
             device=mr.device,
@@ -118,6 +121,83 @@ class EagerRunner(BaseRunner):
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         self.warmup()
+
+    def _autotune_buffers(self) -> Tuple[Any, int]:
+        """Adapter over the eager registry for the autotune dummy forward; fills
+        in fields the registry omits (logits buffer, pp_proxy, custom_mask)."""
+        mr = self.model_runner
+        reg = self._eager_registry
+        max_bs = self._eager_max_bs
+
+        def _slot(name):
+            return reg.get_slot(name).buffer if reg.has_slot(name) else None
+
+        # num_token_non_padded / global_num_tokens_* are not registered on the
+        # eager registry (build_eager_registry passes enable_num_token_non_padded
+        # =False, register_global_num_tokens=False); _dummy_run writes + reads
+        # them unconditionally, so supply tiny fresh tensors here.
+        num_token_non_padded = torch.zeros((1,), dtype=torch.int32, device=mr.device)
+        global_dim = (
+            mr.server_args.dp_size if require_mlp_tp_gather(mr.server_args) else 1
+        )
+        global_num_tokens_gpu = torch.zeros(
+            (global_dim,), dtype=torch.int32, device=mr.device
+        )
+        global_num_tokens_for_logprob_gpu = torch.zeros(
+            (global_dim,), dtype=torch.int32, device=mr.device
+        )
+
+        # custom_mask: only consumed by create_dummy_verify_input (spec). Size it
+        # like the decode path's custom_mask for a spec target worker.
+        custom_mask: Optional[torch.Tensor] = None
+        if mr.spec_algorithm.is_speculative():
+            num_tokens_per_bs = self._eager_num_tokens_per_bs
+            max_num_token = reg.max_num_tokens
+            seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
+            custom_mask = torch.ones(
+                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+                dtype=torch.bool,
+                device=mr.device,
+            )
+
+        # pp_proxy_tensors: only read when pp_size>1. _dummy_run slices each value
+        # [:pp_hidden_tokens] (pp_hidden_tokens <= num_tokens), so size the first
+        # dim to the registry's token ceiling. Mirror _allocate_decode_buffers'
+        # keys/dtypes (mHC flattens residual into hidden_states of hc_hidden_size).
+        pp_proxy_tensors = None
+        if mr.server_args.pp_size > 1:
+            hidden_size = mr.model_config.hidden_size
+            hc_hidden_size = getattr(mr.model_config, "hc_hidden_size", None)
+            is_mhc = hc_hidden_size is not None
+            hs = hc_hidden_size if is_mhc else hidden_size
+            rows = reg.max_num_tokens
+            pp_proxy_tensors = {
+                "hidden_states": torch.zeros(
+                    (rows, hs), dtype=mr.dtype, device=mr.device
+                ),
+            }
+            if not is_mhc:
+                pp_proxy_tensors["residual"] = torch.zeros(
+                    (rows, hidden_size), dtype=mr.dtype, device=mr.device
+                )
+
+        adapter = SimpleNamespace(
+            input_ids=_slot("input_ids"),
+            positions=_slot("positions"),
+            out_cache_loc=_slot("out_cache_loc"),
+            req_pool_indices=_slot("req_pool_indices"),
+            seq_lens=_slot("seq_lens"),
+            seq_lens_cpu=_slot("seq_lens_cpu"),
+            mrope_positions=_slot("mrope_positions"),
+            encoder_lens=_slot("encoder_lens"),
+            next_token_logits_buffer=None,
+            num_token_non_padded=num_token_non_padded,
+            global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            custom_mask=custom_mask,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        return adapter, max_bs
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         # Eager never runs a cuda graph; callers dispatch on isinstance(...,
