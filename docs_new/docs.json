@@ -855,7 +855,8 @@
                   "cookbook/base/reference/server_arguments"
                 ]
               },
-              "docs/references/post_training_integration"
+              "docs/references/post_training_integration",
+              "docs/references/nightly_precision_regression"
             ]
           }
         ]
