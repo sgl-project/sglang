@@ -509,6 +509,15 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
 
+    # After top-k/top-p/min-p masking a row can sum to zero (degenerate probs or
+    # aggressive thresholds). torch.multinomial then raises "invalid multinomial
+    # distribution (sum of probabilities <= 0)", which is uncaught in the scheduler
+    # subprocess and brings the whole server down. Fall back to the top-1 token
+    # (column 0 of the descending-sorted probs) for any such row.
+    zero_rows = probs_sort.sum(dim=-1) <= 0
+    if zero_rows.any():
+        probs_sort[zero_rows, 0] = 1.0
+
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
     else:
