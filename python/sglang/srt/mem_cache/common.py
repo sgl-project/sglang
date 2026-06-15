@@ -64,6 +64,13 @@ def free_swa_out_of_window_slots(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> None:
+    """
+    释放滑动窗口注意力（SWA, Sliding Window Attention）中超出窗口范围的 Token 槽位。
+
+    对于开启了 Radix Cache 的 SWA 模型，我们需要驱逐那些：
+    1. 已经超出了滑动窗口（Sliding Window）范围，
+    2. 且未被 Radix Tree 缓存锁定的 Token。
+    """
     from sglang.srt.environ import envs
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
