@@ -80,6 +80,7 @@ class QuarkConfig(QuantizationConfig):
         if quant_config is None:
             raise ValueError("Either quant_config or online_scheme must be provided")
 
+        self.online_scheme = online_scheme
         self.quant_config = quant_config
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
@@ -88,20 +89,30 @@ class QuarkConfig(QuantizationConfig):
         self.is_prequantized = is_prequantized
         self.dequantization_config = dequantization_config
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
-        self._quantized_layers = set()
+        self._online_quantized_layers = set()
 
         if isinstance(self.dequantization_config, Fp8Config):
             self.weight_block_size = self.dequantization_config.weight_block_size
 
-    @property
-    def quantized_layers(self) -> tuple[dict[str, int], int]:
+    def log_online_quantization(self) -> None:
+        """
+        Log which layers are using online quantization, as well as a count for each layer type.
+        """
         # Count layers per type (last two parts after ".")
         type_counts: dict[str, int] = {}
-        for name in self._quantized_layers:
+        for name in self._online_quantized_layers:
             parts = name.split(".")
             layer_type = ".".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
             type_counts[layer_type] = type_counts.get(layer_type, 0) + 1
-        return dict(sorted(type_counts.items())), len(self._quantized_layers)
+
+        type_counts = dict(sorted(type_counts.items()))
+        count = len(self._online_quantized_layers)
+
+        type_summary = ", ".join(f"{t}: {c}" for t, c in type_counts.items())
+        logger.info_once(
+            f"Online {self.online_scheme} quantization: "
+            f"quantized {count} layers in total ({type_summary})."
+        )
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
@@ -149,17 +160,17 @@ class QuarkConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
-            self._quantized_layers.add(prefix)
+            self._online_quantized_layers.add(prefix)
             return QuarkLinearMethod(self)
 
         if isinstance(layer, RadixAttention):
-            self._quantized_layers.add(prefix)
+            self._online_quantized_layers.add(prefix)
             return QuarkKVCacheMethod(self)
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            self._quantized_layers.add(prefix)
+            self._online_quantized_layers.add(prefix)
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return QuarkFusedMoEMethod(self)
 
@@ -185,6 +196,7 @@ class QuarkConfig(QuantizationConfig):
                     hf_config=hf_config,
                     is_prequantized=False,
                     dequantization_config=dequantization_config,
+                    online_scheme=config["requantization_method"],
                 )
             else:
                 raise NotImplementedError(
@@ -595,6 +607,9 @@ class QuarkLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
+        if self.quantization_config.online_scheme is not None:
+            self.quantization_config.log_online_quantization()
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -646,6 +661,9 @@ class QuarkFusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+        if self.quantization_config.online_scheme is not None:
+            self.quantization_config.log_online_quantization()
 
     def create_weights(
         self,
