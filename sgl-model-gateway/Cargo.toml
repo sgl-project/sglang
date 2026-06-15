@@ -1,3 +1,7 @@
+[workspace]
+members = ["bindings/python"]
+exclude = ["bindings/golang", "examples"]
+
 [package]
 name = "sgl-model-gateway"
 version = "0.3.2"

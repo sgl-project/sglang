@@ -611,7 +611,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         scheduler = batch.scheduler
         assert scheduler is not None
 
-        boundary_timestep = self._handle_boundary_ratio(server_args, batch, scheduler)
+        boundary_timestep = (
+            self._handle_boundary_ratio(server_args, batch, scheduler)
+            if self.transformer_2 is not None
+            else None
+        )
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
         num_inference_steps = batch.num_inference_steps
@@ -1318,6 +1322,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 target_dtype,
                 seq_len,
                 reserved_frames_mask,
+                server_args.pipeline_config.dit_config.arch_config.patch_size,
             )
         else:
             timestep = t_device.repeat(bsz)
@@ -1370,7 +1375,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
         ):
-            with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
+            with self.progress_bar(
+                total=ctx.num_inference_steps, batch=batch
+            ) as progress_bar:
                 for step_index, t_host in enumerate(timesteps_cpu):
                     # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
                     # use non-integer timesteps keep their precision in markers.

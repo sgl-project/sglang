@@ -27,6 +27,11 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import set_global_server_args_for_scheduler
@@ -308,8 +313,9 @@ class MockDSV4ModelRunner:
         # case's per-request input length (target_verify uses the draft count
         # directly; draft_extend uses the accepted-token count). Non-spec cases
         # leave it at 0 so the backend skips the speculative branches.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             speculative_num_draft_tokens = case.input_lens[0] if case.input_lens else 0
             speculative_eagle_topk = 1
@@ -329,8 +335,18 @@ class MockDSV4ModelRunner:
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             disable_radix_cache=False,
             disaggregation_mode=None,
             dp_size=1,
@@ -1477,8 +1493,8 @@ def run_dsv4_draft_extend_attention_case(
         "`deepseek_v4_backend.py:636-663` and the 'Production-Unsupported' "
         "section in dsv4/README.md."
     )
-    assert case.forward_mode.is_draft_extend(
-        include_v2=True
+    assert (
+        case.forward_mode.is_draft_extend_v2()
     ), f"run_dsv4_draft_extend_attention_case requires DRAFT_EXTEND; got {case.forward_mode}"
     from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
         _make_eagle_draft_extend_input,
