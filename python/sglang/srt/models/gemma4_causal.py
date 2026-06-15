@@ -34,6 +34,7 @@ from sglang.srt.layers.gemma4_fused_ops import (
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
+    gemma_routing_post_topk,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -56,6 +57,9 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -145,7 +149,8 @@ class Gemma4Router(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # RMSNorm without learned weight — pure normalization only
+        # RMSNorm without learned weight — scale is folded into norm weight
+        # after loading so forward is a single fused norm kernel.
         self.norm = Gemma4RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, with_scale=False
         )
@@ -165,18 +170,19 @@ class Gemma4Router(nn.Module):
             quant_config=None,
             prefix=add_prefix("proj", prefix),
         )
-        self._fused_scale: Optional[torch.Tensor] = None
+        self._scale_fused = False
 
     def fuse_scale(self):
-        """Pre-compute scale * root_size. Call after weights are loaded."""
-        self._fused_scale = (self.scale * self.root_size).to(self.scale.dtype)
+        """Fold scale * root_size into norm.weight so forward needs no extra mul."""
+        fused = (self.scale * self.root_size).to(self.norm.weight.dtype)
+        self.norm.weight.data.copy_(fused)
+        self._scale_fused = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns raw router logits [T, E]."""
-        x = self.norm(x)
-        if self._fused_scale is None:
+        if not self._scale_fused:
             self.fuse_scale()
-        x = x * self._fused_scale.to(x.dtype)
+        x = self.norm(x)
         router_logits, _ = self.proj(x)
         return router_logits
 
@@ -230,13 +236,15 @@ class Gemma4MoE(nn.Module):
                 return gemma4_fused_routing(gating_output, per_expert_scale, topk)
 
             topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
-            topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
 
-            # Fold per_expert_scale into routing weights
+            # Fused: softmax + per_expert_scale gather + mul + casts in one kernel
+            if topk_logits.is_cuda or topk_logits.is_xpu:
+                return gemma_routing_post_topk(topk_logits, topk_ids, per_expert_scale)
+
+            topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
             topk_weights = topk_weights * per_expert_scale[topk_ids].to(
                 topk_weights.dtype
             )
-
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
         self.topk = TopK(
@@ -287,7 +295,9 @@ class Gemma4Attention(nn.Module):
 
         layer_type = config.layer_types[layer_id]
         self.sliding_window = (
-            config.sliding_window if layer_type == "sliding_attention" else None
+            get_attention_sliding_window_size(config)
+            if layer_type == "sliding_attention"
+            else -1
         )
 
         self.total_num_heads = config.num_attention_heads
@@ -407,14 +417,15 @@ class Gemma4Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
-        # Preconditions for the fused path: tensors on CUDA, q_norm/k_norm use
-        # the standard norm*weight (scale_shift==0) and v_norm has weight=ones
+        # Preconditions for the fused path: tensors on CUDA or XPU (the kernel
+        # is pure Triton and lowers to both backends), q_norm/k_norm use the
+        # standard norm*weight (scale_shift==0) and v_norm has weight=ones
         # (with_scale=False) — the canonical Gemma4 attention configuration.
         is_kv_shared = (
             self.is_kv_shared_layer and self.kv_shared_layer_index is not None
         )
         can_fuse_qkv_norm = (
-            q.is_cuda
+            (q.is_cuda or q.is_xpu)
             and self.q_norm.scale_shift == 0.0
             and self.k_norm.scale_shift == 0.0
             and not self.v_norm.with_scale
@@ -466,9 +477,22 @@ class Gemma4Attention(nn.Module):
                 v = self.v_norm(v)
 
         # Apply rotary embedding
+        use_fused_kv = False
         if k is not None:
             k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
+            # Fuse RoPE + KV-cache write for non-SWA layers with bf16 cache
+            # DISABLED: causes accuracy regression in launch_server path
+            can_fuse = False
+            if can_fuse:
+                fused_arg = create_fused_set_kv_buffer_arg(
+                    value=v.flatten(-2, -1) if v.dim() == 3 else v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                use_fused_kv = True
+            else:
+                fused_arg = None
+            q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_arg)
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         else:
             # Rotary embedding requires a key input; use zeros since KV is shared from another layer
@@ -481,7 +505,7 @@ class Gemma4Attention(nn.Module):
             k,
             v,
             forward_batch=forward_batch,
-            save_kv_cache=not self.is_kv_shared_layer,
+            save_kv_cache=not self.is_kv_shared_layer and not use_fused_kv,
         )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
@@ -666,7 +690,7 @@ class Gemma4DecoderLayer(nn.Module):
             # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
             if (
                 not self.has_ple
-                and hidden_states_1.is_cuda
+                and (hidden_states_1.is_cuda or hidden_states_1.is_xpu)
                 and hidden_states_1.dim() == 2
             ):
                 norm1 = self.post_feedforward_layernorm_1
@@ -698,7 +722,12 @@ class Gemma4DecoderLayer(nn.Module):
             )
             hidden_states = self.mlp(hidden_states)
 
-        if not self.has_ple and hidden_states.is_cuda and hidden_states.dim() == 2:
+        if (
+            not self.has_ple
+            and self.moe is None
+            and (hidden_states.is_cuda or hidden_states.is_xpu)
+            and hidden_states.dim() == 2
+        ):
             # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel
             norm = self.post_feedforward_layernorm
             hidden_states = gemma_rmsnorm_residual_scalar(

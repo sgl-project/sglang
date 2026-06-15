@@ -23,13 +23,13 @@ __all__ = ["AWQMoEScheme", "AWQAscendMoEScheme"]
 
 
 class AWQMoEScheme(AWQMoESchemeBase):
-    def __init__(self, quant_config: "AWQMarlinConfig"):
+    def __init__(self, quant_config: AWQMarlinConfig):
         self.quant_config = quant_config
         if self.quant_config.weight_bits != 4:
             raise ValueError("AWQMoEScheme only supports 4bit now.")
         self.kernel = self._init_kernel(quant_config)
 
-    def _init_kernel(self, quant_config: "AWQMarlinConfig"):
+    def _init_kernel(self, quant_config: AWQMarlinConfig):
         from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
             AWQMoEKernel,
         )
@@ -137,13 +137,13 @@ class AWQMoEScheme(AWQMoESchemeBase):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
+        dispatch_output: StandardDispatchOutput,
     ):
         return self.kernel.apply(layer, dispatch_output)
 
 
 class AWQAscendMoEScheme(AWQMoEScheme):
-    def _init_kernel(self, quant_config: "AWQConfig"):
+    def _init_kernel(self, quant_config: AWQConfig):
         from sglang.srt.hardware_backend.npu.quantization.awq_kernels import (
             AWQAscendMoEKernel,
         )

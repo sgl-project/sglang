@@ -312,10 +312,24 @@ class MetadataBuffers:
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
+        # counts and slots 4-6 are reused for multimodal prompt token counts
+        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
+        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
         self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
+
+        # Compute multimodal prompt token counts on the prefill node so decode
+        # can report them in usage.
+        if req.multimodal_inputs:
+            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
+        else:
+            image_t = audio_t = video_t = 0
+        self.cached_tokens[req.metadata_buffer_index][4] = image_t
+        self.cached_tokens[req.metadata_buffer_index][5] = audio_t
+        self.cached_tokens[req.metadata_buffer_index][6] = video_t
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -638,6 +652,22 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            # unified_kv: the SWA ring lives in the unified buffers (no separate
+            # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
+            if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
+                token_to_kv_pool, "get_unified_swa_ring_buf_infos"
+            ):
+                ring_ptrs, ring_lens, ring_item_lens = (
+                    token_to_kv_pool.get_unified_swa_ring_buf_infos()
+                )
+                if ring_ptrs:
+                    append_state_component(
+                        kv_args,
+                        StateType.SWA_RING,
+                        ring_ptrs,
+                        ring_lens,
+                        ring_item_lens,
+                    )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()

@@ -48,6 +48,7 @@ Some other notes:
     c4_sparse: means "compressed by 4" but only attend to top-512 tokens.
                all related length will be clipped to 512.
 """
+_LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
 
 def copy_metadata(
@@ -111,7 +112,11 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
+            use_jit_indexer = (
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+            )
+            if use_jit_indexer:
                 from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
@@ -148,7 +153,7 @@ class PagedIndexerMetadata:
     def max_c4_seq_len(self) -> int:
         return self.page_table.shape[1] * self.c4_page_size
 
-    def copy_(self, other: "PagedIndexerMetadata"):
+    def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
             copy_fields = ["page_table", "c4_seq_lens"]
             assign_fields = ["deep_gemm_metadata"]

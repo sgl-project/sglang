@@ -53,7 +53,6 @@ class TestGlm5Nvfp4(unittest.TestCase):
                 + ["--dp-size=4", "--enable-dp-attention"]
                 + MTP_ARGS,
                 variant="TP4+DP4+DPA+MTP",
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
 

@@ -15,7 +15,6 @@ from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.speculative.spec_info import SpecInput
 
 
 @dataclass
@@ -71,8 +70,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        forward_mode: "ForwardMode",
-        spec_info: Optional["SpecInput"],
+        forward_mode: ForwardMode,
     ) -> PrecomputedMetadata:
         """Precompute all shared metadata for multi-step backends.
 
@@ -85,8 +83,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             req_pool_indices: Request pool indices [bs]
             seq_lens: Sequence lengths [bs]
             seq_lens_cpu: Sequence lengths on CPU [bs]
-            forward_mode: Forward mode (decode/target_verify/draft_extend)
-            spec_info: Speculative decoding info (for draft_extend mode)
+            forward_mode: Forward mode (decode/target_verify)
 
         Returns:
             PrecomputedMetadata containing all shared intermediate results
@@ -104,10 +101,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         elif forward_mode.is_target_verify():
             return self._precompute_target_verify_mode(
                 bs, req_pool_indices, seq_lens, seq_lens_cpu
-            )
-        elif forward_mode.is_draft_extend():
-            return self._precompute_draft_extend_mode(
-                bs, req_pool_indices, seq_lens, seq_lens_cpu, spec_info
             )
         else:
             raise ValueError(f"Unsupported forward mode: {forward_mode}")
@@ -242,84 +235,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             seqlens_expanded_size=seqlens_expanded_size,
             max_len=-1,  # Not used in this mode
-            max_seqlen_k=max_seqlen_k,
-            flashmla_metadata=flashmla_metadata,
-        )
-
-    def _precompute_draft_extend_mode(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        spec_info: "SpecInput",
-    ) -> PrecomputedMetadata:
-        """Precompute metadata for draft extend mode."""
-        max_seqlen_k = int(seq_lens_cpu.max().item())
-
-        # Cache seqlens
-        cache_seqlens = seq_lens.to(torch.int32)
-        cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
-
-        # Extend seqlens from spec_info: num_accept_tokens already includes
-        # the bonus token (drafts + 1).
-        extend_seq_lens = spec_info.num_accept_tokens[:bs]
-        extend_seq_lens_cpu = extend_seq_lens.tolist()
-
-        # Page indices (repeated per accept length)
-        page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-        page_indices = torch.repeat_interleave(
-            page_indices, repeats=extend_seq_lens, dim=0
-        ).contiguous()
-
-        # Generate expanded seqlens
-        seqlens_expanded = torch.cat(
-            [
-                torch.arange(
-                    kv_len - qo_len + 1,
-                    kv_len + 1,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                for qo_len, kv_len in zip(
-                    extend_seq_lens_cpu,
-                    seq_lens_cpu.tolist(),
-                    strict=True,
-                )
-            ]
-        )
-
-        # Compute DSA seqlens
-        dsa_cache_seqlens = compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)
-        seqlens_expanded_size = seqlens_expanded.shape[0]
-
-        # DSA cumsum
-        dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
-
-        # Transform page table
-        if self.real_page_size > 1:
-            real_page_table = self._transform_table_1_to_real(page_indices)
-        else:
-            real_page_table = None
-
-        # FlashMLA metadata
-        flashmla_metadata = None
-        if self.dsa_decode_impl == "flashmla_kv":
-            flashmla_metadata = self._compute_flashmla_metadata(
-                cache_seqlens=dsa_cache_seqlens,
-                seq_len_q=1,
-            )
-
-        return PrecomputedMetadata(
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_k=cu_seqlens_k,
-            page_indices=page_indices,
-            real_page_table=real_page_table,
-            seqlens_expanded=seqlens_expanded,
-            dsa_cache_seqlens=dsa_cache_seqlens,
-            dsa_cu_seqlens_k=dsa_cu_seqlens_k,
-            seqlens_expanded_size=seqlens_expanded_size,
-            max_len=max_seqlen_k,
             max_seqlen_k=max_seqlen_k,
             flashmla_metadata=flashmla_metadata,
         )
