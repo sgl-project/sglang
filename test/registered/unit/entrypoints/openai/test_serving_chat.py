@@ -1956,6 +1956,7 @@ class ServingChatTestCase(unittest.TestCase):
             )
         )
         self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
+
     def _make_dsv4_serving_chat(self):
         """Build an OpenAIServingChat wired for the dsv4 custom encoder."""
         from sglang.srt.managers.template_manager import TemplateManager
@@ -1989,7 +1990,7 @@ class ServingChatTestCase(unittest.TestCase):
             messages=[{"role": "user", "content": "Hi?"}],
         )
         with patch.object(envs.SGLANG_DEFAULT_THINKING, "get", return_value=True):
-            serving_chat._apply_jinja_template(req, tools=None, is_multimodal=False)
+            serving_chat._process_messages(req, is_multimodal=False)
 
         # The resolved decision is persisted onto the request...
         self.assertEqual(req.chat_template_kwargs, {"thinking": True})
@@ -2007,26 +2008,46 @@ class ServingChatTestCase(unittest.TestCase):
             messages=[{"role": "user", "content": "Hi?"}],
         )
         with patch.object(envs.SGLANG_DEFAULT_THINKING, "get", return_value=False):
-            serving_chat._apply_jinja_template(req, tools=None, is_multimodal=False)
+            serving_chat._process_messages(req, is_multimodal=False)
 
         self.assertEqual(req.chat_template_kwargs, {"thinking": False})
         self.assertFalse(serving_chat._get_reasoning_from_request(req))
 
     def test_dsv4_explicit_thinking_false_overrides_env_default(self):
-        """An explicit ``thinking=False`` in the request wins over the env."""
+        """An explicit ``thinking=False`` in the request wins over the env, and
+        unrelated keys such as ``reasoning_effort`` are preserved."""
         from sglang.srt.environ import envs
 
         serving_chat = self._make_dsv4_serving_chat()
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
-            chat_template_kwargs={"thinking": False},
+            chat_template_kwargs={"thinking": False, "reasoning_effort": "max"},
         )
         with patch.object(envs.SGLANG_DEFAULT_THINKING, "get", return_value=True):
-            serving_chat._apply_jinja_template(req, tools=None, is_multimodal=False)
+            serving_chat._process_messages(req, is_multimodal=False)
 
-        self.assertEqual(req.chat_template_kwargs, {"thinking": False})
+        self.assertEqual(
+            req.chat_template_kwargs, {"thinking": False, "reasoning_effort": "max"}
+        )
         self.assertFalse(serving_chat._get_reasoning_from_request(req))
+
+    def test_dsv4_default_thinking_drives_parser_with_input_ids(self):
+        """Bypass coverage: even when input_ids skip the prompt encoder, the
+        env-resolved thinking decision still reaches the reasoning parser."""
+        from sglang.srt.environ import envs
+
+        serving_chat = self._make_dsv4_serving_chat()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            input_ids=[1, 2, 3],
+        )
+        with patch.object(envs.SGLANG_DEFAULT_THINKING, "get", return_value=True):
+            serving_chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.chat_template_kwargs, {"thinking": True})
+        self.assertTrue(serving_chat._get_reasoning_from_request(req))
 
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
