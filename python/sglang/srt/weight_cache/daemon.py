@@ -42,6 +42,7 @@ import time
 from typing import Any, Dict, Optional
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.utils import MultiprocessingSerializer
@@ -432,6 +433,8 @@ class WeightCacheDaemon:
 
     def shutdown(self):
         """Release GPU memory and clean up."""
+        if dist.is_initialized():
+            dist.destroy_process_group()
         if self.model is not None:
             del self.model
             self.model = None
