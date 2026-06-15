@@ -90,14 +90,31 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
+            if server_args.enable_shared_mla:
+                from sglang.srt.mem_cache.shared_mla_host_kv_cache import (
+                    SharedMLATokenToKVPoolHost,
+                )
+
+                tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+                tp_size = torch.distributed.get_world_size(group=params.tp_cache_group)
+                self.token_to_kv_pool_host = SharedMLATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+            else:
+                self.token_to_kv_pool_host = MLATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
 
@@ -765,6 +782,10 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
+        # SharedMLA: every rank runs this identically. The host allocator is
+        # deterministic, so all ranks independently compute the same
+        # host_indices; the actual device→slab DMA only happens on the owner
+        # (see backup_from_device_all_layer), the others just bookkeep.
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -827,6 +848,11 @@ class HiRadixCache(RadixCache):
                 node.write_through_pending_id = None
             # DMA confirmed -- block is now on host.
             self._record_store_event(node, medium=StorageMedium.CPU)
+        # SharedMLA: every rank runs write_backup_storage identically so the
+        # host_ref_counter (protect_host) and ongoing_backup bookkeeping stay
+        # mirror-identical across ranks. The actual L3 file write is skipped on
+        # non-owner MLA ranks by the cache controller's native ``backup_skip``
+        # (is_mla_model and tp_rank != 0), which still acks normally.
         if self.enable_storage:
             self.write_backup_storage(lock_node, backup_len)
         if release_lock:
@@ -1394,11 +1420,12 @@ class HiRadixCache(RadixCache):
         min_completed_tokens = completed_tokens_tensor.item()
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
+        page_hashes = hash_value[: min_completed_tokens // self.page_size]
         matched_length = self._insert_helper_host(
             last_host_node,
             fetched_key,
             written_indices,
-            hash_value[: min_completed_tokens // self.page_size],
+            page_hashes,
         )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
@@ -1481,7 +1508,6 @@ class HiRadixCache(RadixCache):
             extra_key=last_host_node.key.extra_key,
             is_bigram=self.is_eagle,
         )
-        # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
         if (
@@ -1509,7 +1535,6 @@ class HiRadixCache(RadixCache):
                     return
             else:
                 last_host_node.release_host()
-                # no sufficient host memory for prefetch
                 return
         operation = self.cache_controller.prefetch(
             req_id,
@@ -1721,6 +1746,7 @@ class HiRadixCache(RadixCache):
         last_host_node, prefetch_key, host_indices, operation = self.ongoing_prefetch[
             rid
         ]
+
         if operation.host_indices is None:
             return
 
