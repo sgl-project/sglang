@@ -66,6 +66,7 @@ _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
+_VAE_DECODE: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
 
@@ -152,6 +153,7 @@ def init_parallel_group_coordinator(
         "tensor",
         "sequence",
         "classifier_free_guidance",
+        "vae_decode",
     ], f"parallel_mode {parallel_mode} is not supported"
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
@@ -169,12 +171,13 @@ def init_parallel_group_coordinator(
             **kwargs,
         )
     else:
-        # fallback to GroupCoordinator
         return GroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
-            group_name="cfg_group",
+            group_name=(
+                "vae_decode_group" if parallel_mode == "vae_decode" else "cfg_group"
+            ),
         )
 
 
@@ -434,6 +437,15 @@ def initialize_model_parallel(
         parallel_mode="tensor",
     )
 
+    global _VAE_DECODE
+    assert _VAE_DECODE is None, "VAE decode parallel group is already initialized"
+    _VAE_DECODE = init_parallel_group_coordinator(
+        group_ranks=rank_generator.get_ranks("tp-sp-pp-cfg"),
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="vae_decode",
+    )
+
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
@@ -537,6 +549,7 @@ def model_parallel_is_initialized() -> bool:
         and _SP is not None
         and _PP is not None
         and _TP is not None
+        and _VAE_DECODE is not None
     )
 
 
@@ -812,6 +825,19 @@ def get_vae_parallel_rank() -> int:
     return torch.distributed.get_rank(group=get_vae_parallel_group())
 
 
+def get_decode_parallel_group_coordinator() -> GroupCoordinator:
+    assert _VAE_DECODE is not None, "VAE decode parallel group is not initialized"
+    return _VAE_DECODE
+
+
+def get_decode_parallel_world_size() -> int:
+    return get_decode_parallel_group_coordinator().world_size
+
+
+def get_decode_parallel_rank() -> int:
+    return get_decode_parallel_group_coordinator().rank_in_group
+
+
 def init_dit_group(
     dit_parallel_size: int,
     backend: str,
@@ -842,9 +868,9 @@ def init_vae_group(
 
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
-    global _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE
+    global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE
 
-    for group in (_TP, _SP, _DP, _CFG, _PP):
+    for group in (_TP, _SP, _DP, _CFG, _PP, _VAE_DECODE):
         if group is not None:
             group.destroy()
 
@@ -852,4 +878,4 @@ def destroy_model_parallel() -> None:
         if group is not None:
             torch.distributed.destroy_process_group(group)
 
-    _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE = (None,) * 7
+    _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE = (None,) * 8

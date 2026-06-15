@@ -65,7 +65,7 @@ def _build_generalized_req_id_per_token(
     if forward_mode.is_target_verify():
         per_req = int(forward_batch.spec_info.draft_token_num)
         result = _expand_uniform(generalized_req_ids_per_row, per_req)
-    elif forward_mode.is_draft_extend(include_v2=True):
+    elif forward_mode.is_draft_extend_v2():
         per_req = int(forward_batch.spec_info.num_tokens_per_req)
         result = _expand_uniform(generalized_req_ids_per_row, per_req)
     elif forward_mode.is_extend():
