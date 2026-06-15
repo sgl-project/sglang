@@ -322,6 +322,10 @@ class EagleDraftExtendInput(SpecInput):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
 
+    # None for draft-extend's idle batch; attention backends fall back to
+    # rebuilding plain metadata from seq_lens when this is None.
+    kv_indptr: torch.Tensor = None
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
 
