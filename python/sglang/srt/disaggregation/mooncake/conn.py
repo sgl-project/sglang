@@ -996,7 +996,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         or rc
                     )
-            elif st in (StateType.SWA, StateType.DSA):
+            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
@@ -1008,16 +1008,22 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
-                if len(src_indices) > len(dst_indices_local):
+                if len(src_indices) != len(dst_indices_local):
+                    # SWA_RING is positional: truncating silently misaligns rows
+                    # and corrupts KV, so fail loud. Paged SWA/DSA tolerate a
+                    # 1-page drift -> keep the lenient truncation below.
+                    if st == StateType.SWA_RING:
+                        raise RuntimeError(
+                            "SWA_RING state index length mismatch: "
+                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                        )
                     logger.warning(
                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
                     )
-                    src_indices = src_indices[: len(dst_indices_local)]
-                elif len(src_indices) < len(dst_indices_local):
-                    logger.warning(
-                        f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
-                    )
-                    dst_indices_local = dst_indices_local[: len(src_indices)]
+                    if len(src_indices) > len(dst_indices_local):
+                        src_indices = src_indices[: len(dst_indices_local)]
+                    else:
+                        dst_indices_local = dst_indices_local[: len(src_indices)]
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
