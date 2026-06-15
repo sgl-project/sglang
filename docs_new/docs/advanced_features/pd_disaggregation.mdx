@@ -458,7 +458,7 @@ export ASCEND_NPU_PHY_ID=xxx
 ```
 
 
-### Mimo Single Node
+### MIMO Single Node
 
 #### prefill
 
@@ -621,12 +621,12 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 # IP set to p first node ip
-export ASCEND_MF_STORE_URL="tcp://141.61.39.231:24670"
+export ASCEND_MF_STORE_URL="tcp://XXXXXX:24670"
 
 # p node IP
-P_IP=('141.61.39.231')
+P_IP=('XXXXX')
 # D node IP
-D_IP=('141.61.39.232')
+D_IP=('XXXXX')
 
 
 # enable mlapo
