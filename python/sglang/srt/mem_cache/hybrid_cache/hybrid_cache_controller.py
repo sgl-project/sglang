@@ -302,8 +302,8 @@ class HybridCacheController(BaseHiCacheController):
                 type(self.storage_backend).__name__,
             )
             return False
-        self.storage_backend.clear()
-        return True
+        result = self.storage_backend.clear()
+        return result is not False
 
     def _init_extra_host_mem_release_queues(self) -> None:
         self.extra_host_mem_release_queues = {}

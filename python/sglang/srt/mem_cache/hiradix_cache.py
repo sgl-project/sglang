@@ -739,7 +739,12 @@ class HiRadixCache(RadixCache):
             try:
                 # Check if the storage backend has a clear method (for nixl backends)
                 if hasattr(self.cache_controller.storage_backend, "clear"):
-                    self.cache_controller.storage_backend.clear()
+                    result = self.cache_controller.storage_backend.clear()
+                    if result is False:
+                        logger.error(
+                            "Hierarchical cache storage backend clear returned False."
+                        )
+                        return False
                     logger.info(
                         "Hierarchical cache storage backend cleared successfully!"
                     )
