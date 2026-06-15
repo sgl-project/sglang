@@ -24,7 +24,9 @@ import torch.nn as nn
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -53,6 +55,8 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             prefix=prefix,
             decoder_layer_type=decoder_layer_type,
         )
+        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
         self.hidden_size = config.hidden_size
         # Currently, we use 3 as len(config.vision_config.deepstack_visual_indexes) is not directly accessible here.
         # This approach follows the original implementation.
@@ -112,6 +116,13 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             deepstack_embeds = self.get_deepstack_embeds(
                 layer_idx - 1, input_deepstack_embeds
             )
+            a2a_backend = get_moe_a2a_backend()
+            # When deepep is enabled, the scatter mode of deepstack_embeds is set to TP_ATTN_FULL, whereas that of residual is SCATTERED.
+            # Therefore, deepstack_embeds must be split in this scenario.
+            if deepstack_embeds is not None and a2a_backend.is_deepep():
+                deepstack_embeds = deepstack_embeds.tensor_split(self.attn_tp_size)[
+                    self.attn_tp_rank
+                ]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
