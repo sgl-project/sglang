@@ -476,6 +476,26 @@ def _align_fp4_moe_weights(
     return padded_w13, padded_w13_scale, padded_w2, padded_w2_scale, padded_intermediate
 
 
+def _compute_g1_scale_c(
+    w2_input_scale_quant: torch.Tensor,
+    g1_alphas: torch.Tensor,
+    g1_alphas_up: torch.Tensor,
+    is_gated: bool,
+) -> torch.Tensor:
+    """TRT-LLM GEMM1-output scale for the up (w3) half.
+
+    TRT-LLM dequantizes the two halves of the fused GEMM1 separately: g1_alphas
+    covers the gate half, this scalar the up half (hence g1_alphas_up). The
+    1/a2_scale factor (w2_input_scale_quant) requantizes GEMM2's input. A shared
+    scale passes g1_alphas as g1_alphas_up and recovers the single-scale value;
+    non-gated (Relu2) has no gate half, so it is just 1/a2_scale per expert.
+    """
+    if is_gated:
+        return (w2_input_scale_quant * g1_alphas_up).to(torch.float32)
+    num_experts = g1_alphas.shape[0]
+    return w2_input_scale_quant.to(torch.float32).expand(num_experts).contiguous()
+
+
 def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     """Prepare FP4 MoE weights/scales for FlashInfer TRT-LLM kernels.
 
@@ -535,18 +555,13 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         layer, "w2_weight_scale", gemm2_scales_fp4_shuffled.contiguous()
     )
 
-    # Compute additional scaling factor needed for TRT-LLM.
-    # For gated (SwiGLU): g1_scale_c = g1_alphas * a2_gscale
-    # For non-gated (Relu2): g1_scale_c = a2_gscale (no gate dequant contribution)
+    # Extra GEMM1-output scalar that TRT-LLM needs (up-half dequant).
     w2_input_scale_quant = cast(torch.Tensor, layer.w2_input_scale_quant)
     g1_alphas = cast(torch.Tensor, layer.g1_alphas)
-    if layer.moe_runner_config.is_gated:
-        g1_scale_c = (w2_input_scale_quant * g1_alphas).to(torch.float32)
-    else:
-        num_experts = g1_alphas.shape[0]
-        g1_scale_c = (
-            w2_input_scale_quant.to(torch.float32).expand(num_experts).contiguous()
-        )
+    g1_alphas_up = cast(torch.Tensor, getattr(layer, "g1_alphas_up", g1_alphas))
+    g1_scale_c = _compute_g1_scale_c(
+        w2_input_scale_quant, g1_alphas, g1_alphas_up, layer.moe_runner_config.is_gated
+    )
     copy_or_rebind_param(layer, "g1_scale_c", g1_scale_c)
 
     # Update intermediate_size_per_partition to reflect any padding applied
