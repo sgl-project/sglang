@@ -93,20 +93,20 @@ class AWQAscendMoEKernel:
     def _convert_awq_weight_to_npu_layout(self, qweight: torch.Tensor) -> torch.Tensor:
         num_experts, input_size, _ = qweight.shape
         unpacked_weight = (
-            self.kernel._unpack_from_int32(qweight.flatten(0, 1), 4)
+            self.w13_kernel._unpack_from_int32(qweight.flatten(0, 1), 4)
             .view(num_experts, input_size, -1)
             .transpose(1, 2)
             .contiguous()
             .int()
         )
-        return self.kernel._pack_to_int32(unpacked_weight)
+        return self.w13_kernel._pack_to_int32(unpacked_weight)
 
     def _convert_awq_qzeros_to_npu_offset(
         self, qzeros: torch.Tensor, dtype: torch.dtype
     ) -> torch.Tensor:
         num_experts, num_groups, _ = qzeros.shape
         offset = (
-            -self.kernel._unpack_from_int32(qzeros.flatten(0, 1), 4)
+            -self.w13_kernel._unpack_from_int32(qzeros.flatten(0, 1), 4)
             .view(num_experts, num_groups, -1)
             .transpose(1, 2)
             .contiguous()
