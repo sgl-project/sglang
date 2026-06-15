@@ -455,7 +455,7 @@ class DynamicGradMode(_DecoratorContextManager):
         else:
             torch.set_grad_enabled(self.prev)
 
-    def clone(self) -> "DynamicGradMode":
+    def clone(self) -> DynamicGradMode:
         r"""
         Create a copy of this class
         """
@@ -2523,8 +2523,18 @@ def kill_itself_when_parent_died():
         PR_SET_PDEATHSIG = 1
         libc = ctypes.CDLL("libc.so.6")
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    elif sys.platform == "darwin":
+        # macOS has no PR_SET_PDEATHSIG equivalent; the MLX backend provides a
+        # kqueue-based watchdog that SIGKILLs this worker once it is orphaned.
+        from sglang.srt.hardware_backend.mlx.parent_watchdog import (
+            start_parent_death_watcher,
+        )
+
+        start_parent_death_watcher()
     else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+        logger.warning(
+            "kill_itself_when_parent_died is only supported on linux and macOS."
+        )
 
 
 class UvicornAccessLogFilter(logging.Filter):
@@ -3671,6 +3681,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "kv_a_proj_with_mqa",
     "q_b_proj",
     "kv_b_proj",
+    "wq_b",
+    "wk",
+    "weights_proj",
     "gate_proj",
     "up_proj",
     "down_proj",

@@ -145,6 +145,12 @@ class RequestStage:
         metrics_is_observed=True,
     )
 
+    # EPD disaggregation Encode process
+    MM_ENCODE = RequestStageConfig(
+        "mm_encode",
+        level=1,
+    )
+
     # disaggregation prefill
     PREFILL_PREPARE = RequestStageConfig(
         "prefill_prepare",
@@ -202,11 +208,6 @@ class RequestStage:
     SPEC_VERIFY = RequestStageConfig(
         "spec_verify",
         level=2,
-    )
-
-    SPEC_DRAFT_EXTEND = RequestStageConfig(
-        "spec_draft_extend",
-        level=3,
     )
 
     # CPU-side run batch
@@ -306,14 +307,34 @@ class ReqTimeStatsBase:
     def __getstate__(self) -> object:
         # The object is propagated to other processes via serialization and deserialization methods,
         # requiring the metric collector to be reconfigured.
+        trace_ctx_state = (
+            self.trace_ctx.__getstate__()
+            if self.trace_ctx.tracing_enable
+            else {"tracing_enable": False}
+        )
         return {
-            "disagg_mode": self.disagg_mode,
+            "disagg_mode": self.disagg_mode.value if self.disagg_mode else None,
             "enable_metrics": False,
-            "trace_ctx": self.trace_ctx,
+            "trace_ctx": trace_ctx_state,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
 
     def __setstate__(self, state: object):
+        # Reconstruct disagg_mode from string value if needed
+        disagg_mode_val = state.get("disagg_mode")
+        if isinstance(disagg_mode_val, str):
+            state["disagg_mode"] = DisaggregationMode(disagg_mode_val)
+
+        # Reconstruct trace_ctx from serialized dict if needed
+        trace_ctx_state = state.get("trace_ctx")
+        if isinstance(trace_ctx_state, dict):
+            if trace_ctx_state.get("tracing_enable"):
+                trace_ctx = object.__new__(TraceReqContext)
+                trace_ctx.__setstate__(trace_ctx_state)
+                state["trace_ctx"] = trace_ctx
+            else:
+                state["trace_ctx"] = TraceNullContext()
+
         for key in state.keys():
             if key.endswith("time"):
                 state[key] = convert_time_cross_thread(
@@ -322,6 +343,12 @@ class ReqTimeStatsBase:
                     global_diff_realtime_monotonic,
                 )
         self.__dict__.update(state)
+
+    def encode_json(self) -> Dict[str, Any]:
+        return self.__getstate__()
+
+    def decode_json(self, state: Dict[str, Any]):
+        self.__setstate__(state)
 
 
 @dataclass
@@ -353,6 +380,13 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
 
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_req_start(convert_time_to_realtime_ns(ts))
+            # Start tokenize span early so that EPD encode dispatch can capture
+            # it as the predecessor span context when serializing trace_ctx.
+            self.trace_ctx.trace_slice_start(
+                RequestStage.TOKENIZE.stage_name,
+                RequestStage.TOKENIZE.level,
+                convert_time_to_realtime_ns(ts),
+            )
 
     def set_finished_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -374,8 +408,13 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         self.tokenize_finish_time = ts
 
-        stage = RequestStage.TOKENIZE
-        self.trace_slice(stage, self.created_time, ts)
+        # tokenize span was started in set_created_time(); end it here.
+        if self.trace_ctx.tracing_enable:
+            self.trace_ctx.trace_slice_end(
+                RequestStage.TOKENIZE.stage_name,
+                RequestStage.TOKENIZE.level,
+                convert_time_to_realtime_ns(ts),
+            )
 
     def set_api_server_dispatch_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -569,7 +608,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # speculative decoding
     spec_draft_start_time: float = 0.0
     spec_verify_start_time: float = 0.0
-    spec_draft_extend_start_time: float = 0.0
 
     # other
     transfer_speed_gb_s: float = 0.0
@@ -634,17 +672,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     "accepted_tokens": num_correct_drafts,
                 },
             )
-
-    def set_spec_draft_extend_start_time(self, ts=None):
-        ts = ts or time.perf_counter()
-        self.spec_draft_extend_start_time = ts
-
-    def set_spec_draft_extend_end_time(self, ts=None):
-        ts = ts or time.perf_counter()
-
-        if self.trace_ctx.tracing_enable:
-            stage = RequestStage.SPEC_DRAFT_EXTEND
-            self.trace_slice(stage, self.spec_draft_extend_start_time, ts)
 
     def set_run_batch_cpu_start_time(self, ts=None, attrs=None):
         ts = ts or time.perf_counter()
@@ -903,7 +930,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             bootstrap_ms = (
                 self.bootstrap_done_time - self.prefill_bootstrap_queue_entry_time
             ) * 1000
-            alloc_ms = (self.wait_queue_entry_time - self.bootstrap_done_time) * 1000
+            if transfer_metric.alloc_latency_s is not None:
+                alloc_ms = transfer_metric.alloc_latency_s * 1000
+            else:
+                alloc_ms = (
+                    max(0.0, self.wait_queue_entry_time - self.bootstrap_done_time)
+                    * 1000
+                )
 
             result["bootstrap_ms"] = bootstrap_ms
             result["alloc_ms"] = alloc_ms
@@ -1133,6 +1166,34 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     @staticmethod
     def format_wallclock(perf_counter_time: float) -> str:
         return f"{convert_time_to_realtime(perf_counter_time):.3f}"
+
+
+@dataclass
+class EncoderReqTimeStats(ReqTimeStatsBase):
+    mm_encode_start_time: float = 0.0
+    mm_encode_end_time: float = 0.0
+
+    def set_mm_encode_start_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.mm_encode_start_time = ts
+        if self.trace_ctx.tracing_enable:
+            self.trace_ctx.rebuild_thread_context()
+            self.trace_ctx.trace_slice_start(
+                RequestStage.MM_ENCODE.stage_name,
+                RequestStage.MM_ENCODE.level,
+                convert_time_to_realtime_ns(ts),
+            )
+
+    def set_mm_encode_end_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.mm_encode_end_time = ts
+        if self.trace_ctx.tracing_enable:
+            self.trace_ctx.trace_slice_end(
+                RequestStage.MM_ENCODE.stage_name,
+                RequestStage.MM_ENCODE.level,
+                convert_time_to_realtime_ns(ts),
+                thread_finish_flag=True,
+            )
 
 
 def set_schedule_time_batch(batch: ScheduleBatch):

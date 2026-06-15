@@ -47,10 +47,11 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
+    ShapeKey,
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
-from sglang.srt.model_executor.runner_backend import FullCudaGraphBackend
+from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -272,10 +273,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
 
-        self.backend = FullCudaGraphBackend(
-            self,
-            enable_memory_saver=self.model_runner.server_args.enable_memory_saver,
-        )
+        self.backend = resolve_decode_backend(self)
 
         try:
             with model_capture_mode():
@@ -285,8 +283,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def _replay_graph(self, shape_key, forward_batch):
+        return self.backend.replay(shape_key, forward_batch)
+
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        return bs
+        return ShapeKey(size=bs)
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -326,16 +327,15 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         hidden_states = buffers.hidden_states[:num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[
-            : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
-        ]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
             global_num_tokens_for_logprob_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
-            global_num_tokens_for_logprob_cpu = [bs]
+            # DRAFT_EXTEND_V2 produces logits for all tokens, not bs (see mlp branch above)
+            global_num_tokens_for_logprob_cpu = [num_tokens]
         else:
             global_num_tokens_cpu = None
 
@@ -588,7 +588,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
-        out = self.backend.replay(shape_key, forward_batch)
+        out = self._replay_graph(shape_key, forward_batch)
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             unpadding_bs = num_tokens

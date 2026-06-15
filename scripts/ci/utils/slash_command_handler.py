@@ -728,6 +728,7 @@ _LEGACY_SUITE_TO_RUNNER_CONFIG = {
     "nightly-8-gpu-common": "8-gpu-h200",
     "nightly-8-gpu-h200": "8-gpu-h200",
     "nightly-kernel-8-gpu-h200": "8-gpu-h200",
+    "nightly-precision-8-gpu-h200": "8-gpu-h200",
     "nightly-8-gpu-h20": "8-gpu-h20",
     "nightly-8-gpu-b200": "8-gpu-b200",
     "weekly-8-gpu-h200": "8-gpu-h200",

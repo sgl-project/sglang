@@ -336,7 +336,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 # fast_mla_decode_plan needs _cached_module from the initial
                 # begin_forward above, so install it only after that call completes.
                 decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
-            elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            elif forward_mode.is_target_verify():
                 prefill_wrapper = BatchMLAPagedAttentionWrapper(
                     self.workspace_buffer,
                     use_cuda_graph=True,
@@ -381,17 +381,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 init_metadata_replay=False,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
-        elif forward_batch.forward_mode.is_draft_extend():
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=False,
-                spec_info=forward_batch.spec_info,
-            )
-            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged, False)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -472,7 +461,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         """
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
-            kv_len_arr_cpu = seq_lens_cpu[:bs]
+            kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32)
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
             )
@@ -493,7 +482,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 **self.fast_decode_kwargs,
             )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
