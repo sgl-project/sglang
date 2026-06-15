@@ -260,8 +260,8 @@ python3 -m sglang.profiler \
   --cpu --gpu &
 ```
 ```bash Command
-# Terminal 2: Wait for "Waiting for N steps" output from Terminal 1, then send requests. 
-# The profiler starts recording once /start_profile is received by the server. 
+# Terminal 2: Wait for "Waiting for N steps" output from Terminal 1, then send requests.
+# The profiler starts recording once /start_profile is received by the server.
 # Requests sent before the server receives /start_profile will not be captured.
 curl http://127.0.0.1:30000/generate \
   -H "Content-Type: application/json" \
@@ -358,7 +358,7 @@ set of supported parameters:
     <tr>
       <td><code>activities</code></td>
       <td>
-        Activity types: CPU, GPU, MEM, RPD. On Ascend NPU, only CPU and GPU are supported. 
+        Activity types: CPU, GPU, MEM, RPD. On Ascend NPU, only CPU and GPU are supported.
         MEM depends on CUDA memory APIs and will be silently ignored. RPD requires ROCm and will cause an error.
       </td>
       <td><code>["CPU", "GPU"]</code></td>
@@ -472,10 +472,10 @@ files — **no need to manually call `analyse()`**:
 </Note>
 
 <Note>
-In a multi-node deployment, each node generates its own trace files. 
-To merge them into a single unified trace, set `"merge_profiles": true` in the `/start_profile` request. 
-However, on Ascend NPU, the merge feature does **not** fully support the `*_ascend_pt` format — merged results may be incomplete or incorrect. 
-It is recommended to view `trace_view.json` on each node individually instead. 
+In a multi-node deployment, each node generates its own trace files.
+To merge them into a single unified trace, set `"merge_profiles": true` in the `/start_profile` request.
+However, on Ascend NPU, the merge feature does **not** fully support the `*_ascend_pt` format — merged results may be incomplete or incorrect.
+It is recommended to view `trace_view.json` on each node individually instead.
 For more details, see [Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling#profiler-trace-merger-for-distributed-traces).
 </Note>
 
