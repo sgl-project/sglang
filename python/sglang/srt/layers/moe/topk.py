@@ -314,7 +314,7 @@ class BypassedTopKOutput(NamedTuple):
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
 
-    def to_standard(self, layer_id: Optional[int] = None) -> "StandardTopKOutput":
+    def to_standard(self, layer_id: Optional[int] = None) -> StandardTopKOutput:
         """Materialize routing tensors. Used by MoE kernels that need explicit
         topk_ids / topk_weights rather than doing routing internally."""
         return select_experts(
@@ -1111,18 +1111,44 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
+def _eplb_remap_enabled() -> bool:
+    # A real logical->physical mapping only exists when EPLB is enabled, the
+    # initial expert placement is non-trivial, or there are redundant physical
+    # experts. Otherwise the map is identity and the remap must be skipped (it is
+    # both unnecessary and not well-defined over the padded region of topk_ids).
+    from sglang.srt.server_args import get_global_server_args
+
+    server_args = get_global_server_args()
+    return (
+        server_args.enable_eplb
+        or server_args.init_expert_location != "trivial"
+        or server_args.ep_num_redundant_experts > 0
+    )
+
+
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
+    fill_value: int = -1,
 ) -> None:
     if num_token_non_padded is None:
         return
     # TODO: let the kernel support other dtypes
-    if _is_cuda and topk_ids.dtype == torch.int32:
+    if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
+        topk_ids[indices >= num_token_non_padded, :] = fill_value
+
+
+def _zero_topk_weights_padded_region(
+    topk_weights: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+):
+    if num_token_non_padded is None:
+        return
+    indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
+    topk_weights[indices >= num_token_non_padded, :] = 0.0
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -1464,7 +1490,7 @@ def _post_process_topk_ids(
     layer_id: int,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
@@ -1474,6 +1500,7 @@ def _post_process_topk_ids(
             layer_id=layer_id,
             topk_indices=topk_ids,
         )
+    recorder_topk_ids = None
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.
@@ -1486,10 +1513,35 @@ def _post_process_topk_ids(
                 routed_cols, expert_location_dispatch_info, num_token_non_padded
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+            # ExpertDistributionRecorder tracks EPLB physical routed experts.
+            # DeepEP dispatch later inserts per-rank shared slots into topk_ids,
+            # so keep the routed physical ids separately for statistics.
+            recorder_topk_ids = routed_cols
         else:
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
+    elif _is_hip:
+        # The logical->physical remap is only meaningful when a real
+        # expert-location mapping exists. With a trivial placement and EPLB off
+        # the map is identity, and indexing it here is both unnecessary and not
+        # well-defined for the dp-attention padded region of topk_ids; skip it.
+        # ``--ep-dispatch-algorithm fake`` is a routing benchmark artifact and
+        # does not by itself require remapping.
+        if _eplb_remap_enabled():
+            # Mask the padded region to a valid in-range id (0) before the
+            # gather so it never indexes the dispatch map out of bounds. -1 is
+            # not used here: the aiter MoE kernels do not handle topk_ids=-1.
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info
+            )
+        # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely, so
+        # padded tokens are neutralized by zeroing their routing weights.
+        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+
+    if recorder_topk_ids is None:
+        recorder_topk_ids = topk_ids
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
@@ -1528,7 +1580,13 @@ def _post_process_topk_ids(
             topk_config,
         )
 
-    return topk_ids, topk_weights
+    if _is_hip:
+        # Shared-expert append/remap can introduce non-zero weights after the
+        # initial HIP padding mask above. Ensure padded tokens leave this helper
+        # with all expert weights zeroed.
+        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+
+    return topk_ids, topk_weights, recorder_topk_ids
 
 
 def select_experts(
@@ -1746,7 +1804,7 @@ def select_experts(
         if k > 0:
             topk_weights = torch.full_like(topk_weights, 1.0 / k)
 
-    topk_ids, topk_weights = _post_process_topk_ids(
+    topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         topk_config=topk_config,
@@ -1756,7 +1814,9 @@ def select_experts(
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    get_global_expert_distribution_recorder().on_select_experts(
+        topk_ids=recorder_topk_ids
+    )
 
     # ===== TO BE REFACTORED ====
     if packed_topk is not None:

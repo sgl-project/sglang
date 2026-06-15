@@ -26,13 +26,15 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
 
 ### 3.1 Basic Configuration
 
-The Qwen3-VL series offers models in various sizes and architectures, optimized for different hardware platforms including NVIDIA and AMD GPUs. The recommended launch configurations vary by hardware and model size.
+The Qwen3-VL series offers models in various sizes and architectures, optimized for different hardware platforms including NVIDIA and AMD GPUs, as well as Intel Xeon CPUs. The recommended launch configurations vary by hardware and model size.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities.
 
@@ -75,6 +77,8 @@ python -m sglang.launch_server \
   --mm-attention-backend fa3 \
   --enable-metrics
 ```
+
+* For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 

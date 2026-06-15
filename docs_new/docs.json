@@ -752,6 +752,7 @@
               "docs/advanced_features/breakable_cuda_graph",
               "docs/advanced_features/piecewise_cuda_graph",
               "docs/advanced_features/sgl_model_gateway",
+              "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
               "docs/advanced_features/checkpoint_engine",
@@ -854,7 +855,8 @@
                   "cookbook/base/reference/server_arguments"
                 ]
               },
-              "docs/references/post_training_integration"
+              "docs/references/post_training_integration",
+              "docs/references/nightly_precision_regression"
             ]
           }
         ]
@@ -884,6 +886,24 @@
                   "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
+                  {
+                    "group": "Best Practice",
+                    "pages": [
+                      "docs/hardware-platforms/ascend-npus/best_practice/deepseek_r1",
+                      "docs/hardware-platforms/ascend-npus/best_practice/deepseek_v3_2",
+                      "docs/hardware-platforms/ascend-npus/best_practice/glm5_1",
+                      "docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6",
+                      "docs/hardware-platforms/ascend-npus/best_practice/minimax_m2_5",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3-8b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_32b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_30b_a3b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_235b_a22b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_5_397b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_6_27b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_6_35b_a3b",
+                      "docs/hardware-platforms/ascend-npus/best_practice/qwen3_next_80b_a3b_instruct"
+                    ]
+                  },
                   "docs/hardware-platforms/ascend-npus/ascend_npu_optimization",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing",
@@ -976,7 +996,14 @@
                   {
                     "group": "Google",
                     "pages": [
-                      "cookbook/autoregressive/Google/Gemma4"
+                      "cookbook/autoregressive/Google/Gemma4",
+                      "cookbook/autoregressive/Google/DiffusionGemma"
+                    ]
+                  },
+                  {
+                    "group": "LiquidAI",
+                    "pages": [
+                      "cookbook/autoregressive/LiquidAI/LFM2.5"
                     ]
                   },
                   {
@@ -988,6 +1015,7 @@
                   {
                     "group": "Moonshotai",
                     "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2",
@@ -997,6 +1025,7 @@
                   {
                     "group": "MiniMax",
                     "pages": [
+                      "cookbook/autoregressive/MiniMax/MiniMax-M3",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2.7",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2.5"
@@ -1115,6 +1144,13 @@
                     ]
                   },
                   {
+                    "group": "Ideogram",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Ideogram/Ideogram4"
+                    ]
+                  },
+                  {
                     "group": "Wan",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
@@ -1158,6 +1194,13 @@
                     "pages": [
                       "cookbook/diffusion/LingBot-World/LingBot-World"
                     ]
+                  },
+                  {
+                    "group": "SANA-WM",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SANA-WM/SANA-WM"
+                    ]
                   }
                 ]
               },
@@ -1190,7 +1233,6 @@
               "docs/sglang-diffusion/installation",
               "docs/sglang-diffusion/compatibility_matrix",
               "docs/sglang-diffusion/disaggregation",
-              "docs/sglang-diffusion/quantization",
               {
                 "group": "Usage",
                 "pages": [
@@ -1204,31 +1246,34 @@
                 "pages": [
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/deployment_cookbook",
-                  "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/attention_backends",
+                  "docs/sglang-diffusion/ring_sp_performance",
+                  "docs/sglang-diffusion/dynamic_batching",
                   {
-                    "group": "Inference Batching",
+                    "group": "Caching Acceleration",
+                    "root": "docs/sglang-diffusion/caching-acceleration",
+                    "tag": "approx",
                     "pages": [
-                      "docs/sglang-diffusion/dynamic_batching"
+                      "docs/sglang-diffusion/cache_dit",
+                      "docs/sglang-diffusion/teacache"
                     ]
                   },
-                  "docs/sglang-diffusion/profiling",
-                  "docs/sglang-diffusion/ci_perf"
-                ]
-              },
-              {
-                "group": "Caching Strategies",
-                "pages": [
-                  "docs/sglang-diffusion/caching-acceleration",
-                  "docs/sglang-diffusion/cache_dit",
-                  "docs/sglang-diffusion/teacache"
+                  "docs/sglang-diffusion/progressive_resolution",
+                  "docs/sglang-diffusion/quantization",
+                  "docs/sglang-diffusion/profiling"
                 ]
               },
               {
                 "group": "References",
                 "pages": [
-                  "docs/sglang-diffusion/environment_variables",
+                  "docs/sglang-diffusion/environment_variables"
+                ]
+              },
+              {
+                "group": "Development",
+                "pages": [
                   "docs/sglang-diffusion/support_new_models",
+                  "docs/sglang-diffusion/ci_perf",
                   "docs/sglang-diffusion/contributing"
                 ]
               }

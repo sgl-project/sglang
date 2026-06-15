@@ -270,6 +270,46 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         )
 
 
+class _BitsAndBytes4BitAdapter(_TransformerQuantAdapter):
+    """Adapter for pre-quantized bitsandbytes 4-bit transformer checkpoints."""
+
+    def __init__(
+        self,
+        *,
+        server_args: ServerArgs,
+        quant_config: Optional[QuantizationConfig],
+    ) -> None:
+        self.server_args = server_args
+        self.quant_config = quant_config
+
+    @staticmethod
+    def _maybe_disable_incompatible_offload_modes(
+        server_args: ServerArgs,
+        quant_config: Optional[QuantizationConfig],
+    ) -> None:
+        if _get_quant_config_name(quant_config) != "bitsandbytes":
+            return
+
+        changed = []
+        if server_args.dit_cpu_offload:
+            server_args.dit_cpu_offload = False
+            changed.append("dit_cpu_offload=False")
+        if server_args.use_fsdp_inference:
+            server_args.use_fsdp_inference = False
+            changed.append("use_fsdp_inference=False")
+        if changed:
+            logger.warning(
+                "Keeping bitsandbytes 4-bit transformer GPU-resident: %s",
+                ", ".join(changed),
+            )
+
+    def prepare(self) -> None:
+        _BitsAndBytes4BitAdapter._maybe_disable_incompatible_offload_modes(
+            server_args=self.server_args,
+            quant_config=self.quant_config,
+        )
+
+
 def resolve_transformer_safetensors_to_load(
     server_args: ServerArgs, component_model_path: str
 ) -> list[str]:
@@ -438,6 +478,10 @@ def _build_transformer_quant_adapters(
             quant_config=quant_config,
         ),
         _ModelOptFp8OffloadAdapter(
+            server_args=server_args,
+            quant_config=quant_config,
+        ),
+        _BitsAndBytes4BitAdapter(
             server_args=server_args,
             quant_config=quant_config,
         ),

@@ -13,7 +13,7 @@ use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
     DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -69,6 +69,26 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
+
+    // ---- sticky-session policy (only used by `--policy sticky`) ----
+    /// Request header carrying the routing key for sticky-session routing.
+    /// Defaults to `x-sgl-routing-key` when `--policy sticky` is set.
+    #[arg(long)]
+    pub routing_key_header: Option<String>,
+    /// Policy used to select a worker for requests with no routing key, and
+    /// to pick the initial worker when a new key is first seen. One of
+    /// `round_robin` / `random` / `power_of_two` / `load_based`. Defaults
+    /// to `round_robin`.
+    #[arg(long, value_enum)]
+    pub sticky_fallback_policy: Option<PolicyKind>,
+    /// Evict a sticky assignment after it has been idle (unreferenced) this
+    /// many seconds. Defaults to 600.
+    #[arg(long)]
+    pub sticky_idle_secs: Option<u64>,
+    /// Wall-clock cadence of the sticky idle-eviction sweep, in seconds.
+    /// Defaults to 60.
+    #[arg(long)]
+    pub sticky_eviction_interval_secs: Option<u64>,
 
     // ---- discovery: static ----
     /// Static worker URLs (space-separated or repeated). Mutually
@@ -145,6 +165,67 @@ impl Cli {
             ));
         }
 
+        let tuned_sticky = self.routing_key_header.is_some()
+            || self.sticky_fallback_policy.is_some()
+            || self.sticky_idle_secs.is_some()
+            || self.sticky_eviction_interval_secs.is_some();
+        if tuned_sticky && self.policy != PolicyKind::Sticky {
+            return Err(anyhow!(
+                "--routing-key-header / --sticky-fallback-policy / --sticky-idle-secs / \
+                 --sticky-eviction-interval-secs require --policy sticky"
+            ));
+        }
+
+        // Build (and validate) the sticky config exactly when the sticky
+        // policy is selected. The header name must parse as an HTTP header
+        // name so a typo fails at startup rather than silently never
+        // matching any request header; the fallback must be a
+        // dependency-free policy the factory can build standalone.
+        let sticky = if self.policy == PolicyKind::Sticky {
+            let d = StickyConfig::default();
+            let header_name = self.routing_key_header.unwrap_or(d.header_name);
+            axum::http::HeaderName::try_from(header_name.as_str()).map_err(|e| {
+                anyhow!("--routing-key-header {header_name:?} is not a valid HTTP header name: {e}")
+            })?;
+            let fallback_policy = self.sticky_fallback_policy.unwrap_or(d.fallback_policy);
+            if matches!(
+                fallback_policy,
+                PolicyKind::Sticky | PolicyKind::CacheAwareZmq
+            ) {
+                return Err(anyhow!(
+                    "--sticky-fallback-policy must be one of round_robin / random / \
+                     power_of_two / load_based; cache_aware_zmq and sticky are not allowed"
+                ));
+            }
+            let idle_secs = self.sticky_idle_secs.unwrap_or(d.idle_secs);
+            let eviction_interval_secs = self
+                .sticky_eviction_interval_secs
+                .unwrap_or(d.eviction_interval_secs);
+            // Reject zero durations: `--sticky-eviction-interval-secs 0` would
+            // panic `tokio::time::interval` at startup, and `--sticky-idle-secs
+            // 0` would evict every assignment on the next sweep (defeating
+            // stickiness entirely). Fail fast with a clear message instead.
+            if eviction_interval_secs == 0 {
+                return Err(anyhow!(
+                    "--sticky-eviction-interval-secs must be greater than 0"
+                ));
+            }
+            if idle_secs == 0 {
+                return Err(anyhow!(
+                    "--sticky-idle-secs must be greater than 0 (0 would evict every \
+                     assignment immediately, defeating sticky routing)"
+                ));
+            }
+            Some(StickyConfig {
+                header_name,
+                fallback_policy,
+                idle_secs,
+                eviction_interval_secs,
+            })
+        } else {
+            None
+        };
+
         let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
             threshold,
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
@@ -185,6 +266,7 @@ impl Cli {
                 policy: self.policy,
                 circuit_breaker,
                 cache_aware,
+                sticky,
             },
             discovery,
             proxy: ProxyConfig {
@@ -720,5 +802,161 @@ mod tests {
         .unwrap();
         assert_eq!(c.proxy.request_timeout_secs, 120);
         assert_eq!(c.active_load.stale_request_timeout_secs, 240);
+    }
+
+    #[test]
+    fn sticky_policy_defaults_header_and_tuning() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "sticky",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.policy, PolicyKind::Sticky);
+        let s = c.model.sticky.expect("sticky config built");
+        assert_eq!(s.header_name, "x-sgl-routing-key");
+        assert_eq!(s.fallback_policy, PolicyKind::RoundRobin);
+        assert_eq!(s.idle_secs, 600);
+        assert_eq!(s.eviction_interval_secs, 60);
+    }
+
+    #[test]
+    fn sticky_flags_override_defaults() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "sticky",
+            "--routing-key-header",
+            "x-session-id",
+            "--sticky-fallback-policy",
+            "load_based",
+            "--sticky-idle-secs",
+            "120",
+            "--sticky-eviction-interval-secs",
+            "15",
+        ]))
+        .unwrap();
+        let s = c.model.sticky.expect("sticky config built");
+        assert_eq!(s.header_name, "x-session-id");
+        assert_eq!(s.fallback_policy, PolicyKind::LoadBased);
+        assert_eq!(s.idle_secs, 120);
+        assert_eq!(s.eviction_interval_secs, 15);
+    }
+
+    #[test]
+    fn non_sticky_policy_leaves_sticky_none() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "round_robin",
+        ]))
+        .unwrap();
+        assert!(c.model.sticky.is_none());
+    }
+
+    #[test]
+    fn rejects_sticky_flags_without_sticky_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--routing-key-header",
+            "x-session-id",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("require --policy sticky"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_invalid_routing_key_header() {
+        // A space is not a legal HTTP header-name character.
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "sticky",
+            "--routing-key-header",
+            "bad header",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a valid HTTP header name"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_cache_aware_zmq_as_sticky_fallback() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "sticky",
+            "--sticky-fallback-policy",
+            "cache_aware_zmq",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--sticky-fallback-policy must be one of"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_sticky_as_sticky_fallback() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "sticky",
+            "--sticky-fallback-policy",
+            "sticky",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--sticky-fallback-policy must be one of"),
+            "got: {err}"
+        );
+    }
+
+    /// A zero eviction interval would panic `tokio::time::interval` at
+    /// startup — reject it at config-build time with a clear message.
+    #[test]
+    fn rejects_zero_sticky_eviction_interval() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "sticky",
+            "--sticky-eviction-interval-secs",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--sticky-eviction-interval-secs must be greater than 0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_sticky_idle() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "sticky",
+            "--sticky-idle-secs",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--sticky-idle-secs must be greater than 0"),
+            "got: {err}"
+        );
     }
 }

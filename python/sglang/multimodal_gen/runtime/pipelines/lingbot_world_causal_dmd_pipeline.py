@@ -15,16 +15,18 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     AuxiliaryConditionEncodingStage,
-    CausalVaeDecodingStage,
     DMDTimestepPreparationStage,
     ImageEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
+    LingBotWorldCausalDMDDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
+    CausalVaeDecodingStage,
     RealtimeChunkLatentPreparationStage,
     RealtimeImageVAEEncodingStage,
     RealtimeInputValidationStage,
     RealtimeTextEncodingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
-    LingBotWorldCausalDMDDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
