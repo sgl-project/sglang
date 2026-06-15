@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.fla.utils import (
 )
 from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
 
-_MERGE_DOT_PRECISION = tl.constexpr("ieee")
+_MERGE_DOT_PRECISION = tl.constexpr("tf32")
 
 
 @triton.heuristics(
