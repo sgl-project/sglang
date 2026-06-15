@@ -313,6 +313,28 @@ class CudaPlatformBase(Platform):
                     "Please install it by following the instructions at "
                     "https://github.com/svg-project/Sparse-VideoGen"
                 ) from e
+        elif selected_backend == AttentionBackendEnum.LITE_ATTENTION:
+            if not cls.is_hopper():
+                raise ValueError(
+                    "LiteAttention requires Hopper GPUs (H100/H200, SM90). "
+                    "Use --attention-backend fa on other hardware."
+                )
+            try:
+                from lite_attention import LiteAttention  # noqa: F401
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.lite_attn import (  # noqa: F401
+                    LiteAttentionBackend,
+                )
+
+                logger.info("Using LiteAttention backend")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.lite_attn.LiteAttentionBackend"
+            except ImportError as e:
+                logger.error("Failed to import LiteAttention backend: %s", str(e))
+                raise ImportError(
+                    "LiteAttention backend is not installed. Clone "
+                    "https://github.com/moonmath-ai/LiteAttention and run "
+                    "`cd hopper && pip install .` (requires CUDA >= 12.8)."
+                ) from e
         elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
             try:
                 from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401
