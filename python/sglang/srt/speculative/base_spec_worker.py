@@ -67,6 +67,17 @@ class BaseSpecWorker(ABC):
         Default returns target only; subclasses extend with draft backends."""
         return (self.target_worker.model_runner.attn_backend,)
 
+    @property
+    def draft_models(self) -> list:
+        """Separately-owned draft model(s) to also load during a distributed
+        weight update. The target's single broadcast materializes every
+        parameter and each model filters to the ones it owns (e.g. MTP/NEXTN
+        layers), so no second collective is issued on the co-located draft.
+        Default empty: workers whose draft shares the target's ModelRunner
+        (e.g. DFLASH) or that have no neural draft weights (e.g. NGRAM) are
+        updated as part of the target."""
+        return []
+
     def clear_cache_pool(self):
         """Default no-op: the allocator and kv cache pool are shared with the
         target worker and cleared by the scheduler."""

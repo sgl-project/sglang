@@ -733,3 +733,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=True,
             finalize_tree_path=False,
         )
+
+    @property
+    def draft_models(self) -> list:
+        """Separately-owned draft models (one per speculative step); each
+        filters the broadcasted weights to the parameters it owns."""
+        return [runner.model for runner in self.draft_runner_list]
