@@ -242,6 +242,7 @@ below — the playground will swap `--moe-a2a-backend deepep` for
 `--moe-a2a-backend megamoe` and add the relevant env vars automatically.
 
 Two variants are exposed:
+
 - **W4A8** — default MegaMoE kernel (FP4 weights, FP8 activations).
 - **W4A4** — adds `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1` and
   `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1` to run the custom W4A4
@@ -249,6 +250,7 @@ Two variants are exposed:
   (~89.5 GPQA on Pro).
 
 Notes:
+
 - MegaMoE is **only supported on Blackwell GPUs** (B200 / B300 / GB200 / GB300). The chip is hidden when the Deploy panel's base cell sits on Hopper (H100 / H200).
 - MegaMoE is **only wired into the `high-throughput` recipe** on Blackwell (per [sgl-project/sglang#26451](https://github.com/sgl-project/sglang/pull/26451)). The chip is hidden on `low-latency` and `balanced` — switch to `high-throughput` to expose it.
 - When running MegaMoE, don't set `--moe-runner-backend` manually.

@@ -17,6 +17,7 @@ This is useful for:
 Hooks are attached once during `ModelRunner.initialize` and run on every forward pass.
 
 ***
+
 ### Configuration overview
 
 Hooks are configured via a `ServerArgs` field:
@@ -55,6 +56,7 @@ In JSON form, a minimal configuration looks like:
   * What configuration to pass into that factory
 
 ***
+
 ### Hook spec schema
 
 Each entry in `forward_hooks` is a JSON object with the following shape:
@@ -147,6 +149,7 @@ The first two cause initialization to fail fast with a descriptive error; the la
 * This lets you parameterize hook behavior from config (e.g. tags, log levels, sampling rates, etc.).
 
 ***
+
 ### Hook lifecycle and behavior
 
 Hooks are registered in `ModelRunner.initialize()`:
@@ -224,6 +227,7 @@ Key points:
 * If a hook factory returns `None`, a warning is logged and that spec is skipped.
 
 ***
+
 ### Writing a hook factory
 
 A hook factory is a regular Python function:
@@ -278,6 +282,7 @@ This will:
 * Append metadata about each call to `HOOK_CALLS`.
 
 ***
+
 ### Summary
 
 * Define `forward_hooks` as a list of specs in `ServerArgs` to turn on the feature.

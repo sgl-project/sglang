@@ -113,7 +113,7 @@ Review the Mintlify [components](https://www.mintlify.com/docs/components) to se
 
 ### Example file structure
 
-```
+```txt
 project/
 ├── docs.json           # Site configuration
 ├── introduction.mdx

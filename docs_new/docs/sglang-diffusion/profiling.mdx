@@ -21,6 +21,7 @@ sglang generate \
 ```
 
 **Parameters:**
+
 - `--profile`: Enable profiling for the denoising stage
 - `--num-profiled-timesteps N`: Number of timesteps to profile after warmup (default: 5)
   - Smaller values reduce trace file size
@@ -40,6 +41,7 @@ sglang generate \
 ```
 
 **Parameters:**
+
 - `--profile-all-stages`: Used with `--profile`, profile all pipeline stages instead of just denoising
 
 ### Output Location
@@ -55,15 +57,16 @@ The exact output file path will be shown in the console output, for example:
 ### View Traces
 
 Load and visualize trace files at:
-- https://ui.perfetto.dev/ (recommended)
+
+- [https://ui.perfetto.dev/](https://ui.perfetto.dev/) (recommended)
 - chrome://tracing (Chrome only)
 
 For large trace files, reduce `--num-profiled-timesteps` or avoid using `--profile-all-stages`.
 
-
 ### `--perf-dump-path` (Stage/Step Timing Dump)
 
 Besides profiler traces, you can also dump a lightweight JSON report that contains:
+
 - stage-level timing breakdown for the full pipeline
 - step-level timing breakdown for the denoising stage (per diffusion step)
 
@@ -123,6 +126,7 @@ nsys profile \
 ```
 
 **Parameters:**
+
 - `--delay N`: Wait N seconds before starting capture (skip initialization overhead)
 - `--duration N`: Capture for N seconds (focus on specific stages)
 - `--force-overwrite`: Overwrite existing output files

@@ -234,7 +234,6 @@ If you use EAGLE with `--speculative-eagle-topk 1` and your acceptance rate vari
 
 You can find the best combinations of these parameters with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py).
 
-
 ### EAGLE-2 Decoding
 
 You can enable EAGLE-2 Decoding by setting `--speculative-algorithm EAGLE` and choosing an appropriate model.
@@ -595,9 +594,11 @@ print(response.choices[0].message.content)
 SGLang provides an **experimental Speculative Decoding V2** implementation that enables an overlap scheduler and uses V2 speculative workers (e.g. `StandaloneWorkerV2`, `EAGLEWorkerV2`).
 
 To enable it, set the environment variable:
+
 - `SGLANG_ENABLE_SPEC_V2=True`
 
 Notes:
+
 - SpecV2 currently only supports `--speculative-eagle-topk 1`. When SpecV2 is enabled, **set `--speculative-eagle-topk 1` explicitly**.
 - If you explicitly set `--speculative-eagle-topk > 1`, the server will error.
 - If you omit `--speculative-eagle-topk`, auto-tuning may pick `topk > 1` for some models (e.g. Llama). This is incompatible with SpecV2 and may not always trigger an immediate config error, so set `--speculative-eagle-topk 1` explicitly.
@@ -642,6 +643,7 @@ print(response.choices[0].message.content)
 SGLang also supports **ngram-based speculative decoding** (no separate draft model). It retrieves draft tokens from an ngram cache built from previously generated tokens, and then verifies them with the target model.
 
 Enable it with:
+
 - `--speculative-algorithm NGRAM`
 
 ### Ngram-specific parameters
@@ -694,6 +696,7 @@ Enable it with:
 </table>
 
 Notes:
+
 - Ngram speculative decoding **only supports CUDA**.
 - It currently **does not support** `--enable-dp-attention`.
 - It disables the overlap scheduler and mixed chunked prefill.

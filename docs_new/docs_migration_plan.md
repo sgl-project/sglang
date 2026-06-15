@@ -90,6 +90,7 @@ Once `sgl-docs` is frozen, this step is no longer needed.
 Current `docs/**` CI workflows will **NOT** trigger for `docs_new/**` changes. This is fine initially since Mintlify has its own GitHub integration for auto-deployment on push to main.
 
 Optional additions later:
+
 - Link checking (lychee) for `docs_new/**/*.mdx`
 - Mintlify broken-link or build validation on PR
 
@@ -105,6 +106,7 @@ Optional additions later:
 | After cutover | Mintlify (new docs) | Keep or remove |
 
 Cutover steps:
+
 1. Confirm `staging.docs.sglang.io` is stable and content-complete
 2. Update DNS: point `docs.sglang.io` CNAME from GitHub Pages to Mintlify (`cname.mintlify.dev`)
 3. Update Mintlify Dashboard custom domain to `docs.sglang.io`

@@ -64,11 +64,13 @@ import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32
 - **Index Cache:** Reuses indexer results across layers for efficiency at negligible accuracy cost. For **GLM-5** specifically, append `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for a better speed/accuracy tradeoff.
 - **HiSparse (experimental):** Reduces per-request GPU memory during long-context decode by offloading KV data to CPU pinned memory. Requires PD disaggregation mode (decode instance only). See [HiSparse Guide](../../../docs/advanced_features/hisparse_guide).
 - **NVFP4 on Blackwell:** Specify `--quantization modelopt_fp4` and `--moe-runner-backend flashinfer_trtllm` (recommended) / `flashinfer_cutlass` / `flashinfer_cutedsl`. Full example:
+
   ```bash
   python -m sglang.launch_server --model nvidia/DeepSeek-V3.2-NVFP4 --tp 4 \
     --quantization modelopt_fp4 --moe-runner-backend flashinfer_trtllm \
     --tool-call-parser deepseekv32 --reasoning-parser deepseek-v3
   ```
+
 - **NCCL timeout:** Slow model loading → add `--dist-timeout 3600`.
 
 ## 4. Model Invocation
@@ -731,7 +733,8 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
 
 - **Test Results**:
   - DeepSeek-V3.2-Exp
-    ```
+
+    ```text
     Accuracy: 0.980
     Invalid: 0.000
     Latency: 19.128 s
@@ -745,14 +748,17 @@ python3 benchmark/gsm8k/bench_sglang.py --num-shots 8 --num-questions 1319 --par
 ```
 
   - 8-shot:
-    ```
+
+    ```text
     Accuracy: 0.956
     Invalid: 0.000
     Latency: 25.109 s
     Output throughput: 5226.235 token/s
     ```
+
   - 20-shot (long-context; stays close to the 8-shot result):
-    ```
+
+    ```text
     Accuracy: 0.956
     Invalid: 0.000
     Latency: 29.545 s
@@ -771,7 +777,8 @@ python3 benchmark/mmlu/bench_sglang.py --nsub 10 --port 30000
 
 - **Test Results**:
   - DeepSeek-V3.2-Exp
-    ```
+
+    ```text
     subject: abstract_algebra, #q:100, acc: 0.780
     subject: anatomy, #q:135, acc: 0.874
     subject: astronomy, #q:152, acc: 0.961
@@ -802,7 +809,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198
 python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --top-p 0.95 --temperature 1.0 --thinking-mode deepseek-v3
 ```
 
-  ```
+  ```text
   Repeat: 8, mean: 0.840
   Scores: ['0.848', '0.808', '0.848', '0.838', '0.879', '0.813', '0.838', '0.848']
   ```
@@ -979,7 +986,6 @@ python3 -m sglang.bench_serving \
 DeepSeek 3.2 can steadily support concurrency up to `1024` and when concurrency is greater than `128`, the TTFT increase sharply:
 
 ![DeepSeek V3.2 Concurrency ISL/OSL=1024/128](https://github.com/user-attachments/assets/d5c9c9fb-44f3-4793-a0fd-f8fa954546f5)
-
 
 Performance record:
 

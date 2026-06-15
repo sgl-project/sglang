@@ -11,6 +11,7 @@ import { Ernie45Deployment } from '/src/snippets/autoregressive/ernie-45-deploym
 The **ERNIE-4.5** series is a family of large language models developed by Baidu. ERNIE (Enhanced Representation through Knowledge Integration) 4.5 represents an advanced version of the ERNIE series, optimized for general-purpose tasks and conversational scenarios.
 
 ERNIE-4.5 delivers advanced features as below:
+
 - **Heterogeneous Modality Structure**: MoE architecture that supports parameter sharing across modalities while allowing dedicated parameters for each individual modality, enhancing multimodal understanding without compromising, and even improving, performance on text-related tasks.
 - **Vision Encoder**: Dedicated adaptive-resolution ViT with 2D RoPE and image packing; for video, adaptive frame sampling and timestamp rendering, supporting both shared and modality-specific visual processing.
 - **Adapter**: Shared modality-bridging module with spatial and temporal compression to align vision to text embedding space, enabling cross-modal understanding without compromising text representations.
@@ -34,6 +35,7 @@ This section provides a progressive guide from quick deployment to performance o
 <Ernie45Deployment />
 
 ## 4. API Usage
+
 For basic API usage and request examples, please refer to:
 
 - [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
@@ -70,6 +72,7 @@ print(response.choices[0].message.content)
 ```
 
 **Output Example:**
+
 ```text Output
 **Artificial Intelligence (AI)** is the simulation of human intelligence processes by machines, particularly computer systems. These processes include **learning** (acquiring information and rules for using the information), **reasoning** (using rules to reach approximate or definite conclusions), and **self-correction**. AI encompasses a wide range of techniques, algorithms, and methodologies designed to enable machines to perform tasks that typically require human intelligence.
 
@@ -175,6 +178,7 @@ python -m sglang.launch_server \
 ```
 
 ##### 5.1.1.1 Low Concurrency (Latency-Optimized)
+
 - Benchmark Command:
 
 ```bash Command
@@ -190,6 +194,7 @@ python -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -230,6 +235,7 @@ Max ITL (ms):                            4.67
 ```
 
 ##### 5.1.1.2 Medium Concurrency (Balanced)
+
 - Benchmark Command:
 
 ```bash Command
@@ -245,6 +251,7 @@ python -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -285,6 +292,7 @@ Max ITL (ms):                            105.01
 ```
 
 ##### 5.1.1.3 High Concurrency (Throughput-Optimized)
+
 - Benchmark Command:
 
 ```bash Command
@@ -300,6 +308,7 @@ python -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -342,7 +351,9 @@ Max ITL (ms):                            185.12
 #### 5.1.2 Reasoning Scenario Benchmark
 
 ##### 5.1.2.1 Low Concurrency
+
 - Benchmark Command:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -356,6 +367,7 @@ python -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -398,6 +410,7 @@ Max ITL (ms):                            7.28
 ##### 5.1.2.2 Medium Concurrency
 
 - Benchmark Command:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -411,6 +424,7 @@ python -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -451,7 +465,9 @@ Max ITL (ms):                            39.94
 ```
 
 ##### 5.1.2.3 High Concurrency
+
 - Benchmark Command:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -465,6 +481,7 @@ python -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -507,6 +524,7 @@ Max ITL (ms):                            74.36
 #### 5.1.3 Summarization Scenario Benchmark
 
 ##### 5.1.3.1 Low Concurrency
+
 - Benchmark Command:
 
 ```bash Command
@@ -522,6 +540,7 @@ python -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -562,6 +581,7 @@ Max ITL (ms):                            5.68
 ```
 
 ##### 5.1.3.2 Medium Concurrency
+
 - Benchmark Command:
 
 ```bash Command
@@ -577,6 +597,7 @@ python -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -619,6 +640,7 @@ Max ITL (ms):                            411.31
 ##### 5.1.3.3 High Concurrency
 
 - Benchmark Command:
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -632,6 +654,7 @@ python -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -688,7 +711,8 @@ python3 benchmark/gsm8k/bench_sglang.py \
 
 - Test Results:
   - ERNIE-4.5-21B-A3B-PT
-  ```
+  
+  ```text
   Accuracy: 0.865
   Invalid: 0.000
   Latency: 21.669 s

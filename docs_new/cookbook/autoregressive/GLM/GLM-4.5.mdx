@@ -348,12 +348,12 @@ For each concurrency level, configure `num_prompts` to simulate realistic user l
 **Scenario 1: Chat (1K/1K) - Most Important**
 
 - **Model Deployment**
+
 ```bash Command
 python -m sglang.launch_server \
   --model zai-org/GLM-4.5 \
   --tp 8
 ```
-
 
 - Low Concurrency (Latency-Optimized)
 
@@ -370,6 +370,7 @@ python -m sglang.bench_serving \
 ```
 
 - Medium Concurrency (Balanced)
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -383,6 +384,7 @@ python -m sglang.bench_serving \
 ```
 
 - High Concurrency (Throughput-Optimized)
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -412,6 +414,7 @@ python -m sglang.bench_serving \
 ```
 
 - Medium Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -425,6 +428,7 @@ python -m sglang.bench_serving \
 ```
 
 - High Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -440,6 +444,7 @@ python -m sglang.bench_serving \
 **Scenario 3: Summarization (8K/1K)**
 
 - Low Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -453,6 +458,7 @@ python -m sglang.bench_serving \
 ```
 
 - Medium Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -466,6 +472,7 @@ python -m sglang.bench_serving \
 ```
 
 - High Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -509,6 +516,7 @@ Document model accuracy on standard benchmarks:
 #### 5.2.1 GSM8K Benchmark
 
 - Benchmark Command
+
 ```bash Command
 python -m sglang.test.few_shot_gsm8k \
   --num-questions 200 \

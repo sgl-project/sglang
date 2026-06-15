@@ -11,6 +11,7 @@ TeaCache (Temporal similarity-based caching) accelerates diffusion inference by 
 ## Overview
 
 TeaCache works by:
+
 1. Tracking the L1 distance between modulated inputs across consecutive timesteps
 2. Accumulating the rescaled L1 distance over steps
 3. When accumulated distance is below a threshold, reusing the cached residual
@@ -40,6 +41,7 @@ accumulated += poly(coefficients)(rel_l1)
 ### CFG Support
 
 For models that support CFG cache separation (Wan, Hunyuan, Z-Image), TeaCache maintains separate caches for positive and negative branches:
+
 - `previous_modulated_input` / `previous_residual` for positive branch
 - `previous_modulated_input_negative` / `previous_residual_negative` for negative branch
 
@@ -136,7 +138,6 @@ TeaCache is built into the following model families:
     </tr>
   </tbody>
 </table>
-
 
 ## References
 

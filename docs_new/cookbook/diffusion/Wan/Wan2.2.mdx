@@ -39,7 +39,7 @@ The Wan2.2 series offers models in various sizes, architectures and input types,
 
 ### 3.2 Configuration Tips
 
-Current supported optimization all listed [here](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
+Current supported optimization all listed [herein](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
@@ -217,6 +217,7 @@ sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
 - `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
 
 #### 4.2.3 Supported LoRA Registry
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "50%"}} />
@@ -240,6 +241,7 @@ sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
   </tbody>
 </table>
 **Example**:
+
 ```shell Command
 sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000 \
     --lora-path Cseti/wan2.2-14B-Arcane_Jinx-lora-v1

@@ -13,6 +13,7 @@ For safety and consistency, the current implementation **strictly requires** the
 If the idle condition is not met, the API will fail fast (HTTP 400) and **will not modify** the current service state.
 
 ***
+
 ## 1. Background and implementation overview
 
 ### 1.1 Architecture / control path
@@ -34,6 +35,7 @@ The control path is:
    - Starts/stops backend background threads at runtime (prefetch/backup)
 
 ***
+
 ## 2. Idle-state requirement (strict)
 
 The Scheduler uses `is_fully_idle()` which checks:
@@ -67,6 +69,7 @@ Currently there is **no automatic partial rollback** across DP ranks (see TODO i
 - If attach fails, immediately call detach (best-effort/idempotent), fix config, then retry attach
 
 ***
+
 ## 3. How to use (HTTP Admin API)
 
 The examples below assume your SGLang HTTP server is at `http://127.0.0.1:30000`.
@@ -87,6 +90,7 @@ Example response:
 ```
 
 ### 3.2 Attach (enable) a storage backend
+
 ```bash Command
 curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
   -H 'Content-Type: application/json' \
@@ -123,6 +127,7 @@ Notes:
 - It **does not automatically delete** data stored in Mooncake/HF3FS (or other remote backends)
 
 ***
+
 ## 4. Behavior and caveats
 
 - **No restart required**: attach/detach switches in-process at runtime

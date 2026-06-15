@@ -352,6 +352,7 @@ autoround.quantize_and_save(quant_path, format=format) # quantize and save
 ```
 
 - VLM quantization
+
 ```py Example
 # for VLMs
 from auto_round import AutoRoundMLLM
@@ -383,11 +384,9 @@ Several limitations currently affect offline quantized model loading in sglang, 
 
     Mixed-bit quantization is not fully supported. Due to vLLM's layer fusion (e.g., QKV fusion), applying different bit-widths to components within the same fused layer can lead to compatibility issues.
 
-
 2. Limited Support for Quantized MoE Models
 
     Quantized MoE models may encounter inference issues due to kernel limitations (e.g., lack of support for mlp.gate layer quantization). please try to skip quantizing these layers to avoid such errors.
-
 
 3. Limited Support for Quantized VLMs
     <Accordion title="Details">
@@ -500,6 +499,7 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
 
 * **FP8 Models:**
     Use `--quantization modelopt_fp8`.
+
     ```bash Command
     python3 -m sglang.launch_server \
         --model-path nvidia/Llama-3.1-8B-Instruct-FP8 \
@@ -509,6 +509,7 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
 
 * **FP4 Models:**
     Use `--quantization modelopt_fp4`.
+
     ```bash Command
     python3 -m sglang.launch_server \
         --model-path nvidia/Llama-3.3-70B-Instruct-NVFP4 \
@@ -521,11 +522,13 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
 If a pre-quantized checkpoint is not available for your model, you can create one using NVIDIA Model Optimizer's `hf_ptq.py` script.
 
 **Why quantize?**
+
 - Reduce VRAM usage
 - Higher throughput and lower latency
 - More flexible deployment (on smaller GPUs)
 
 **What can be quantized?**
+
 - The entire model
 - MLP layers only
 - KV cache
@@ -702,6 +705,7 @@ model_loader.load_model(model_config=model_config, device_config=DeviceConfig())
 - **Production Ready**: Enterprise-grade quantization with NVIDIA support
 
 #### Using [ModelSlim](https://gitcode.com/Ascend/msmodelslim)
+
 MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression tool launched by MindStudio and optimized for Ascend hardware.
 
 - **Installation**
@@ -719,6 +723,7 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     > Note: You can find pre-quantized validated models on [modelscope/Eco-Tech](https://modelscope.cn/models/Eco-Tech).
 
     _Traditional quantification methods require the preparation of calibration data files (```.jsonl``` formats) for calibration in the quantification process._
+
     ```bash Command
     Qwen3-32B/      # floating-point model downloaded from official HF (or modelscope) repo
     msmodelslim/    # msmodelslim repo
@@ -733,7 +738,9 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
       |----- quant_model_description.json # file with description of the quantization methods for each layer (```W4A4_DYNAMIC```, etc.)
       |----- another files (such as config.json, tokenizer.json, etc.)
     ```
+
     Run quantization using one-click quantization (recommended):
+    
     ```bash Command
     msmodelslim quant \
     --model_path ${MODEL_PATH} \
@@ -745,6 +752,7 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     ```
 
 - **Usage Example**
+
     ```bash Command
     python3 -m sglang.launch_server \
     --model-path $PWD/Qwen3-32B-w8a8 \
@@ -765,7 +773,6 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [ ]  ```W8A16``` MoE in progress
     - [ ]  ```KV Cache``` in progress
     - [ ]  ```Attention``` in progress
-
 
 For more detailed examples of quantization of models, as well as information about their support, see the [examples](https://gitcode.com/Ascend/msmodelslim/blob/master/example/README.md) section in ModelSLim repo.
 

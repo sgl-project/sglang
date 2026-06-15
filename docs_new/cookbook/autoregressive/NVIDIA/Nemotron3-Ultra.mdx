@@ -25,10 +25,12 @@ Architecture and key features:
 **Modalities:** Input: text — Output: text
 
 **Supported GPUs:**
+
 - **BF16:** 16×H100, 16×H200, 8×B200/B300
 - **NVFP4:** 4/8×B200/B300, 4×GB200/GB300
 
 Available model variants on HuggingFace:
+
 - [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16)
 - [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4)
 
@@ -43,6 +45,7 @@ docker pull lmsysorg/sglang:dev-nemotron3-ultra
 # CUDA 12
 docker pull lmsysorg/sglang:dev-cu12-nemotron3-ultra
 ```
+
 ## 3. Model Deployment
 
 This section provides a progressive guide from quick deployment to performance tuning.
@@ -127,6 +130,7 @@ print("\n")
 ```
 
 Output:
+
 ```text Output
 Reasoning: The user wants 3 bullet points about SGLang. Let me recall what I know about SGLang — it's a high-performance serving framework for large language models with a focus on structured generation and efficient KV cache reuse...(more tokens)
 
@@ -136,6 +140,7 @@ Content: - **Radix Attention** — SGLang reuses KV cache across requests sharin
 ```
 
 Streaming chat completion:
+
 ```python Example
 from openai import OpenAI
 
@@ -161,6 +166,7 @@ for chunk in stream:
 ```
 
 Output:
+
 ```text Output
 The first 5 prime numbers are:
 **2, 3, 5, 7, 11**.
@@ -214,6 +220,7 @@ print(f"Content: \n{resp.choices[0].message.content[:200]}...")
 ```
 
 Output:
+
 ```text Output
 Reasoning on
 Reasoning:
@@ -285,6 +292,7 @@ print(completion.choices[0].message.tool_calls)
 ```
 
 Output:
+
 ```text Output
 The user is asking where the RadixCache class is defined. I should search the codebase for the symbol "RadixCache" to find the file and line. I'll call search_codebase with that query.
 
@@ -393,6 +401,7 @@ print("Reasoning:", resp["reasoning_content"], "\nContent:", resp["content"])
 ```
 
 Output:
+
 ```text Output
 Reasoning: The user wants a research plan to compare throughput of two MoE serving strategies. I should outline goals, baselines, datasets, metrics (tokens/s, TTFT, ITL, MFU), variables to sweep (TP, batch size, sequence length, concurrency), and statistical handling. Keep it concise since reasoning_budget is 256...
 Content:
@@ -413,6 +422,7 @@ Content:
 ### 5.1 Speed Benchmark
 
 **Test Environment:**
+
 - Hardware: GB200 (4x)
 - Model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
 - Tensor Parallelism: 4
@@ -492,12 +502,14 @@ Max ITL (ms):                            2466.36
 #### 5.2.1 GSM8K Benchmark
 
 **Environment**
+
 - Hardware: GB200 (4x)
 - Model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
 - Tensor Parallelism: 4
 - SGLang Version: main branch
 
 **Launch Model**
+
 ```bash Command
 python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
@@ -507,11 +519,13 @@ python3 -m sglang.launch_server \
 ```
 
 **Run Benchmark**
+
 ```bash Command
 python3 benchmark/gsm8k/bench_sglang.py --port 5000
 ```
 
 **Test Results:**
+
 ```text Output
 Accuracy: 0.970
 Invalid: 0.000
@@ -522,11 +536,13 @@ Output throughput: 745.333 token/s
 #### 5.2.2 MMLU Benchmark
 
 **Run Benchmark**
+
 ```bash Command
 python3 benchmark/mmlu/bench_sglang.py --port 5000
 ```
 
 **Test Results:**
+
 ```text Output
 TBD
 ```

@@ -9,10 +9,7 @@ This notebook provides a quick-start guide to use SGLang in chat completions aft
 - For Embedding Models, see [OpenAI APIs - Embedding](./openai_api_embeddings) and [Encode (embedding model)](./native_api#encode-embedding-model).
 - For Reward Models, see [Classify (reward model)](./native_api#classify-reward-model).
 
-
 ## Launch A Server
-
-
 
 ```python Example
 from sglang.test.doc_patch import launch_server_cmd
@@ -33,9 +30,6 @@ wait_for_server(f"http://localhost:{port}")
 
 ## Using cURL
 
-
-
-
 ```python Example
 import subprocess, json
 
@@ -50,8 +44,6 @@ print_highlight(response)
 ```
 
 ## Using Python Requests
-
-
 
 ```python Example
 import requests
@@ -68,8 +60,6 @@ print_highlight(response.json())
 ```
 
 ## Using OpenAI Python Client
-
-
 
 ```python Example
 import openai
@@ -88,8 +78,6 @@ print_highlight(response)
 ```
 
 ### Streaming
-
-
 
 ```python Example
 import openai
@@ -117,8 +105,6 @@ for chunk in response:
 
 You can also use the native `/generate` endpoint with requests, which provides more flexibility. An API reference is available at [Sampling Parameters](./sampling_params).
 
-
-
 ```python Example
 import requests
 
@@ -135,9 +121,8 @@ response = requests.post(
 
 print_highlight(response.json())
 ```
+
 ### Streaming
-
-
 
 ```python Example
 import requests, json

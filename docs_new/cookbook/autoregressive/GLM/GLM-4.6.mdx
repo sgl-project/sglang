@@ -388,12 +388,12 @@ For each concurrency level, configure `num_prompts` to simulate realistic user l
 **Scenario 1: Chat (1K/1K) - Most Important**
 
 - **Model Deployment**
+
 ```bash Command
 python -m sglang.launch_server \
   --model zai-org/GLM-4.6 \
   --tp 8
 ```
-
 
 - Low Concurrency (Latency-Optimized)
 
@@ -448,8 +448,8 @@ Max ITL (ms):                            25.05
 ==================================================
 ```
 
-
 - Medium Concurrency (Balanced)
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -461,6 +461,7 @@ python -m sglang.bench_serving \
   --max-concurrency 16 \
   --request-rate inf
 ```
+
 ```text Output
 
 ============ Serving Benchmark Result ============
@@ -501,8 +502,8 @@ Max ITL (ms):                            486.54
 ==================================================
 ```
 
-
 - High Concurrency (Throughput-Optimized)
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -569,6 +570,7 @@ python -m sglang.bench_serving \
   --max-concurrency 1 \
   --request-rate inf
 ```
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -609,6 +611,7 @@ Max ITL (ms):                            19.06
 ```
 
 - Medium Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -661,6 +664,7 @@ Max ITL (ms):                            137.19
 ```
 
 - High Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -715,6 +719,7 @@ Max ITL (ms):                            155.65
 **Scenario 3: Summarization (8K/1K)**
 
 - Low
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -726,6 +731,7 @@ python -m sglang.bench_serving \
   --max-concurrency 1 \
   --request-rate inf
 ```
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -766,6 +772,7 @@ Max ITL (ms):                            24.20
 ```
 
 - Medium Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -777,6 +784,7 @@ python -m sglang.bench_serving \
   --max-concurrency 16 \
   --request-rate inf
 ```
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -816,8 +824,8 @@ Max ITL (ms):                            483.14
 ==================================================
 ```
 
-
 - High Concurrency
+
 ```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
@@ -829,6 +837,7 @@ python -m sglang.bench_serving \
   --max-concurrency 64 \
   --request-rate inf
 ```
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -899,6 +908,7 @@ Document model accuracy on standard benchmarks:
 #### 5.2.1 GSM8K Benchmark
 
 - Benchmark Command
+
 ```bash Command
 python -m sglang.test.few_shot_gsm8k \
   --num-questions 200 \
@@ -906,6 +916,7 @@ python -m sglang.test.few_shot_gsm8k \
 ```
 
 - Test Result
+
 ```text Output
 Accuracy: 0.975
 Invalid: 0.000

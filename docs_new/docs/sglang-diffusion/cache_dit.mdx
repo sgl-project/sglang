@@ -130,6 +130,7 @@ parallelism_config:
   tp_size: 2
   attention_backend: native
 ```
+
 Then, apply the 2D parallelism config from yaml. Here `tp_size: 2` means using tensor parallelism with size 2. The `ulysses_size: auto` means that cache-dit will auto detect the `world_size // tp_size` as the ulysses_size.
 
 - 3D Parallelism
@@ -143,6 +144,7 @@ parallelism_config:
   tp_size: 2
   attention_backend: native
 ```
+
 Then, apply the 3D parallelism config from yaml. Here `ulysses_size: 2`, `ring_size: 2`, `tp_size: 2` means using ulysses parallelism with size 2, ring parallelism with size 2 and tensor parallelism with size 2.
 
 - Ulysses Anything Attention
@@ -177,6 +179,7 @@ parallelism_config:
   attention_backend: native
   ulysses_async: true # Now, only support for FLUX.1, Qwen-Image, Ovis-Image and Z-Image.
 ```
+
 Then, apply the config from yaml. Here `ulysses_async: true` means enabling async ulysses CP.
 
 - TE-P and VAE-P
@@ -189,7 +192,6 @@ parallelism_config:
   attention_backend: native
   extra_parallel_modules: ["text_encoder", "vae"]
 ```
-
 
 ### Hybrid Cache and Parallelism
 
@@ -247,6 +249,7 @@ quantize_config: # quantization configuration for transformer modules
     - "embed"
   verbose: false # whether to print verbose logs during quantization
 ```
+
 Then, apply the quantization config from yaml. Please also enable torch.compile for better performance if you are using quantization. For example:
 
 ```bash Command
@@ -287,6 +290,7 @@ quantize_config:
     - "embed"
   verbose: false
 ```
+
 Then, apply the combined cache, parallelism and quantization config from yaml. Please also enable torch.compile for better performance if you are using quantization.
 
 ## Advanced Configuration

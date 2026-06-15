@@ -206,6 +206,7 @@ print(response.choices[0].message.content)
 ```
 
 **Example Output**:
+
 ```text Output
 <think>The user asks: "Who won the World Series in 2020?" That's a simple factual question. The answer: the Los Angeles Dodgers won the 2020 MLB World Series, defeating the Tampa Bay Rays. So answer accordingly.
 
@@ -426,6 +427,7 @@ else:
 ```
 
 **Output Example**:
+
 ```text Output
 Tool Call: get_weather
    Arguments: {"location": "Beijing"}
@@ -470,6 +472,7 @@ print(final_response.choices[0].message.content)
 ```
 
 **Output Example:**
+
 ```text Output
 The weather in Beijing is currently 22°C and sunny.
 ```
@@ -497,6 +500,7 @@ This section uses **industry-standard configurations** for comparable benchmark 
 - Dataset: [GPQA Diamond](https://huggingface.co/datasets/Idavidrein/gpqa) (198 questions)
 - Prompt: `eval/aai/mcq-4choices` (4-choice multiple choice, matching [Artificial Analysis methodology](https://artificialanalysis.ai/methodology/intelligence-benchmarking))
 - Evaluation command:
+
 ```bash Command
 ns prepare_data gpqa
 
@@ -513,6 +517,7 @@ ns eval \
     ++inference.top_p=0.95 \
     ++parse_reasoning=True
 ```
+
 - Test Results:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -547,6 +552,7 @@ ns eval \
 - Dataset: AIME 2025 (30 problems)
 - Prompt: `generic/math` (boxed answer format)
 - Evaluation command:
+
 ```bash Command
 ns prepare_data aime25
 
@@ -562,6 +568,7 @@ ns eval \
     ++inference.top_p=0.95 \
     ++parse_reasoning=True
 ```
+
 - Test Results:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -596,6 +603,7 @@ ns eval \
 - Dataset: [MMLU-Pro](https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro) (12,032 questions, 10-choice)
 - Prompt: `eval/aai/mcq-10choices` (10-choice multiple choice)
 - Evaluation command:
+
 ```bash Command
 ns prepare_data mmlu-pro
 
@@ -611,6 +619,7 @@ ns eval \
     ++inference.temperature=0.0 \
     ++parse_reasoning=True
 ```
+
 - Test Results:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -633,8 +642,10 @@ ns eval \
 > **Note**: The high no-answer rate is due to the 32K token limit being insufficient for M2.7's extended thinking on some questions. A rerun with 120K tokens is expected to improve accuracy significantly.
 
 #### 5.1.4 GSM8K Benchmark
+
 - Benchmark Method: 8-shot Chain-of-Thought, evaluated via OpenAI-compatible API
 - Test Results:
+
 ```text Output
 GSM8K Results (8-shot CoT)
 Model: MiniMaxAI/MiniMax-M2.7
@@ -648,6 +659,7 @@ Accuracy: 92.34%
 #### 5.2.1 Low Concurrency
 
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -658,7 +670,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 10 \
   --max-concurrency 1
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -690,6 +704,7 @@ Median ITL (ms):                         8.02
 #### 5.2.2 High Concurrency
 
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -700,7 +715,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 500 \
   --max-concurrency 100
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang

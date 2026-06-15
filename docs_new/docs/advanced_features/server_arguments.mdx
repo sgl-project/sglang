@@ -53,12 +53,14 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
   ```bash Command
   python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
   ```
+
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e4m3` or `--kv-cache-dtype fp8_e5m2`.
 - To enable deterministic inference and batch invariant operations, add `--enable-deterministic-inference`. More details can be found in [deterministic inference document](./deterministic_inference).
 - If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](../references/custom_chat_template). If the tokenizer has multiple named templates (e.g., 'default', 'tool_use'), you can select one using `--hf-chat-template-name tool_use`.
 - To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
 - (Note: This feature is out of maintenance and might cause error) To enable `torch.compile` acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. By default, the cache path is located at `/tmp/torchinductor_root`, you can customize it using environment variable `TORCHINDUCTOR_CACHE_DIR`. For more details, please refer to [PyTorch official documentation](https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html) and [Enabling cache for torch.compile](../references/torch_compile_cache).
+  
   ```bash Command
   # Node 0
   python -m sglang.launch_server \
@@ -80,6 +82,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 Please consult the documentation below and [server_args.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py) to learn more about the arguments you may provide when launching a server.
 
 ## Model and tokenizer
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -184,6 +187,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## HTTP server
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -252,6 +256,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Quantization and data type
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -344,6 +349,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Memory and scheduling
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -514,6 +520,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Runtime options
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -660,6 +667,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Logging
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -842,6 +850,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## RequestMetricsExporter configuration
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -874,6 +883,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## API related
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -972,6 +982,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Data parallelism
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1004,6 +1015,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Multi-node distributed serving
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1042,6 +1054,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Model override args
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1074,6 +1087,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## LoRA
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1160,6 +1174,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Kernel Backends (Attention, Sampling, Grammar, GEMM)
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1258,6 +1273,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Speculative decoding
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1368,6 +1384,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Ngram speculative decoding
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1418,6 +1435,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Multi-layer Eagle speculative decoding
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1444,6 +1462,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## MoE
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1620,6 +1639,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Mamba Cache
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1670,6 +1690,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Hierarchical cache
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1744,6 +1765,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Hierarchical sparse attention
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1770,6 +1792,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## LMCache
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1802,6 +1825,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Ktransformers
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1891,6 +1915,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Offloading
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1941,6 +1966,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Args for multi-item scoring
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1967,6 +1993,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Optimization/debug options
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2353,6 +2380,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Dynamic batch tokenizer
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2391,6 +2419,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Debug tensor dumps
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2435,6 +2464,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## PD disaggregation
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2497,6 +2527,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Encode prefill disaggregation
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2541,6 +2572,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Custom weight loader
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2615,6 +2647,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## For PD-Multiplexing
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2653,6 +2686,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Configuration file support
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2679,6 +2713,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## For Multi-Modal
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2741,6 +2776,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## For checkpoint decryption
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2779,6 +2815,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Forward hooks
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2805,6 +2842,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## For MindStudio-probe(msProbe) dump
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -2831,6 +2869,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </table>
 
 ## Deprecated arguments
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />

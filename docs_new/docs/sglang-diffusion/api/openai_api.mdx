@@ -271,6 +271,7 @@ curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
 The server supports dynamic loading, merging, and unmerging of LoRA adapters.
 
 **Important Notes:**
+
 - Mutual Exclusion: Only one LoRA configuration can be active per target at a time
 - Switching: To switch LoRAs, deactivate the current LoRA with `unmerge_lora_weights`, then `set` the new one
 - Caching: The server caches loaded LoRA weights in memory. Switching back to a previously loaded LoRA (same path) has little cost
@@ -282,6 +283,7 @@ Loads one or more LoRA adapters and applies them to the model. By default, regul
 **Endpoint:** `POST /v1/set_lora`
 
 **Parameters:**
+
 - `lora_nickname` (string or list of strings, required): A unique identifier for the LoRA adapter(s). Can be a single string or a list of strings for multiple LoRAs
 - `lora_path` (string or list of strings/None, optional): Path to the `.safetensors` file(s) or Hugging Face repo ID(s). Required for the first load; optional if re-activating a cached nickname. If a list, must match the length of `lora_nickname`
 - `target` (string or list of strings, optional): Which transformer(s) to apply the LoRA to. If a list, must match the length of `lora_nickname`. Valid values:
@@ -333,10 +335,10 @@ curl -X POST http://localhost:30010/v1/set_lora \
 
 > [!NOTE]
 > When using multiple LoRAs:
+> 
 > - All list parameters (`lora_nickname`, `lora_path`, `target`, `strength`) must have the same length
 > - If `target` or `strength` is a single value, it will be applied to all LoRAs
 > - Multiple LoRAs applied to the same target are applied in order
-
 
 **Merge LoRA Weights**
 
@@ -348,6 +350,7 @@ Manually merges the currently set LoRA weights into the base model.
 **Endpoint:** `POST /v1/merge_lora_weights`
 
 **Parameters:**
+
 - `target` (string, optional): Which transformer(s) to merge. One of "all" (default), "transformer", "transformer_2", "critic"
 - `strength` (float, optional): LoRA strength for merge, default 1.0. Values < 1.0 reduce the effect, values > 1.0 amplify the effect
 
@@ -358,7 +361,6 @@ curl -X POST http://localhost:30010/v1/merge_lora_weights \
   -H "Content-Type: application/json" \
   -d '{"strength": 0.8}'
 ```
-
 
 **Unmerge LoRA Weights**
 
@@ -408,25 +410,33 @@ curl -sS -X GET "http://localhost:30010/v1/list_loras"
 ```
 
 Notes:
+
 - If LoRA is not enabled for the current pipeline, the server will return an error.
 - `num_lora_layers_with_weights` counts only layers that have LoRA weights applied for the active adapter.
 
 ### Example: Switching LoRAs
 
-1.  Set LoRA A:
+1. Set LoRA A:
+
     ```bash Command
     curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "lora_a", "lora_path": "path/to/A"}'
     ```
-2.  Generate with LoRA A...
-3.  Unmerge LoRA A:
+
+2. Generate with LoRA A...
+
+3. Unmerge LoRA A:
+
     ```bash Command
     curl -X POST http://localhost:30010/v1/unmerge_lora_weights
     ```
-4.  Set LoRA B:
+
+4. Set LoRA B:
+
     ```bash Command
     curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "lora_b", "lora_path": "path/to/B"}'
     ```
-5.  Generate with LoRA B...
+    
+5. Generate with LoRA B...
 
 ### Adjust Output Quality
 

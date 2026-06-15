@@ -97,6 +97,7 @@ print("\n")
 ```
 
 Output:
+
 ```text Output
 Reasoning: Okay, the user is asking for 3 bullet points about SGLang. Let me recall what I know about SGLang. It's a framework for serving large language models, right? Developed by the team at UC Berkeley and others.
 
@@ -108,6 +109,7 @@ Content: - SGLang introduces **Radix Attention**, an innovative attention mechan
 ```
 
 Streaming chat completion:
+
 ```python Example
 from openai import OpenAI
 
@@ -133,6 +135,7 @@ for chunk in stream:
 ```
 
 Output:
+
 ```text Output
 The first 5 prime numbers are:
 **2, 3, 5, 7, 11**.
@@ -193,6 +196,7 @@ print(f"Content: \n{resp.choices[0].message.reasoning_content[:200]}...")
 ```
 
 Output:
+
 ```text Output
 Reasoning on
 Reasoning:
@@ -266,6 +270,7 @@ print(completion.choices[0].message.tool_calls)
 ```
 
 Output:
+
 ```text Output
 The user wants to calculate a 15% tip on a $50 bill. I have a function called calculate_tip that takes bill_total and tip_percentage as parameters. The bill_total is $50, and tip_percentage is 15. I need to call the function with these values. Let me do that.
 
@@ -374,6 +379,7 @@ print("Reasoning:", resp["reasoning_content"], "\nContent:", resp["content"])
 ```
 
 Output:
+
 ```text Output
 Reasoning: Okay, the user wants a haiku about GPUs. Let me recall what a haiku is: a traditional Japanese poem with three lines, 5-7-5 syllable structure. So I need to make sure the syllable count is exact.
 
@@ -394,6 +400,7 @@ Lightning paints the void.
 ### 5.1 Speed Benchmark
 
 **Test Environment:**
+
 - Hardware: H200 (4x)
 - Model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
 - Tensor Parallelism: 4
@@ -473,12 +480,14 @@ Max ITL (ms):                            7181.72
 #### 5.2.1 GSM8K Benchmark
 
 **Environment**
+
 - Hardware: H200 (4x)
 - Model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
 - Tensor Parallelism: 4
 - SGLang Version: main branch
 
 **Launch Model**
+
 ```bash Command
 python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
@@ -488,11 +497,13 @@ python3 -m sglang.launch_server \
 ```
 
 **Run Benchmark**
+
 ```bash Command
 python3 benchmark/gsm8k/bench_sglang.py --port 5000
 ```
 
 **Test Results:**
+
 ```text Output
 Accuracy: 0.950
 Invalid: 0.000
@@ -503,11 +514,13 @@ Output throughput: 996.815 token/s
 #### 5.2.2 MMLU Benchmark
 
 **Run Benchmark**
+
 ```bash Command
 python3 benchmark/mmlu/bench_sglang.py --port 5000
 ```
 
 **Test Results:**
+
 ```text Output
 subject: abstract_algebra, #q:100, acc: 0.730
 subject: anatomy, #q:135, acc: 0.830

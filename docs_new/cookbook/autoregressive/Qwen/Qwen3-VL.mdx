@@ -51,14 +51,17 @@ import { Qwen3VLDeployment } from "/src/snippets/autoregressive/qwen3-vl-deploym
 * **Kernel Tuning** : For MoE Triton kernel tuning on your specific hardware, refer to [fused_moe_triton](https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton).
 
 **Hardware-specific notes:**
+
 - **H100 (FP8):** Use the `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` checkpoint for best memory efficiency.
 - **A100 / H100 (BF16):** Use standard multimodal parameters to manage throughput and GPU memory usage.
 - **H200 / B200:** Runs out of the box, supporting full context length plus concurrent image + video processing.
 
 **Additional multimodal server parameters:**
+
 - `--keep-mm-feature-on-device`: Retain multimodal feature tensors on GPU after processing to avoid device-to-host memory copies, improving performance for high-frequency inference.
 
 **Example with full multimodal optimizations:**
+
 ```bash Command
 SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
 SGLANG_VLM_CACHE_SIZE_MB=0 \

@@ -11,6 +11,7 @@ import { Step35Deployment } from '/src/snippets/autoregressive/step-35-deploymen
 [Step-3.5-Flash](https://huggingface.co/stepfun-ai/Step-3.5-Flash) is StepFun's production-grade reasoning engine built to decouple elite intelligence from heavy compute, and cuts attention cost for low-latency, cost-effective long-context inference—purpose-built for autonomous agents in real-world workflows. The model is available in multiple quantization formats optimized for different hardware platforms.
 
 This generation delivers comprehensive upgrades across the board:
+
 - **Hybrid Attention Architecture**:  Interleaves Sliding Window Attention (SWA) and Global Attention (GA) with a 3:1 ratio and an aggressive 128-token window. This hybrid approach ensures consistent performance across massive datasets or long codebases while significantly reducing the computational overhead typical of standard long-context models.
 - **Sparse Mixture-of-Experts**: Only 11B active parameters out of 196B parameters.
 - **Multi-Layer Multi-Token Prediction (MTP)**: Equipped with a  3-way Multi-Token Prediction (MTP-3). This allows for complex, multi-step reasoning chains with immediate responsiveness.
@@ -20,6 +21,7 @@ This generation delivers comprehensive upgrades across the board:
 Step-3.5-Flash is currently available in SGLang via Docker image install.
 
 ### Docker (NVIDIA)
+
 ```bash Command
 # Pull the docker image
 docker pull lmsysorg/sglang:dev-pr-18084
@@ -33,6 +35,7 @@ docker run -it --gpus all \
 ```
 
 ### Docker (AMD ROCm)
+
 ```bash Command
 # For MI300X/MI325X
 docker pull lmsysorg/sglang:v0.5.9-rocm700-mi30x
@@ -520,7 +523,8 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 - **Results**:
 
   - Step-3.5-Flash
-    ```
+
+    ```text Output
     Accuracy: 0.885
     Invalid: 0.005
     Latency: 9.986 s

@@ -100,6 +100,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 # Start text model server
 sglang serve --model-path /home/weights/Qwen2.5-7B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000 &
 ```
+
 For more details of SGLang server, refer to the [Ascend NPU Quick Start](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start)
 
 #### Execute Accuracy Evaluation
@@ -118,7 +119,7 @@ evalscope eval \
 
 Upon completion, results similar to the following will be displayed:
 
-```
+```text
 +---------------------+-----------+----------+----------+-------+---------+---------+
 | Model               | Dataset   | Metric   | Subset   |   Num |   Score | Cat.0   |
 +=====================+===========+==========+==========+=======+=========+=========+
@@ -235,11 +236,14 @@ ais_bench -h
 ### Configuration File Setup
 
 Each model task, dataset task, and result presentation task corresponds to a configuration file. You need to modify the content of these configuration files before running the command. The paths of these configuration files can be queried by adding `--search` to the original AISBench command. For example:
-```
+
+```text
 ais_bench --models vllm_api_general_chat --datasets gsm8k_gen_0_shot_cot_chat_prompt.py --mode all --dump-eval-details --merge-ds --search
 ```
+
 Executing the query command will yield the following results:
-```
+
+```text
 ╒═════════════╤══════════════════════════════════╤═════════════════════════════════════════════════════════════════════════════════════════════════════════╕
 │ Task Type   │ Task Name                        │ Config File Path                                                                                        │
 ╞═════════════╪══════════════════════════════════╪═════════════════════════════════════════════════════════════════════════════════════════════════════════╡
@@ -248,6 +252,7 @@ Executing the query command will yield the following results:
 │ --datasets  │ gsm8k_gen_0_shot_cot_chat_prompt │ /home/code/benchmark/ais_bench/benchmark/configs/datasets/gsm8k/gsm8k_gen_0_shot_cot_chat_prompt.py │
 ╘═════════════╧══════════════════════════════════╧═════════════════════════════════════════════════════════════════════════════════════════════════════════╛
 ```
+
 For online text models, edit `benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_chat.py`:
 
 ```python
@@ -376,7 +381,7 @@ ais_bench --models vllm_api_general_chat --datasets aime2024_gen_0_shot_chat_pro
 
 After execution, results are saved in `outputs/default/<timestamp>/` with the following structure:
 
-```
+```text
 outputs/default/20250628_151326/
 ├── configs       # Configuration files
 ├── logs          # Execution logs
@@ -462,8 +467,10 @@ For more details, refer to the [AISBench documentation](https://yh-ais-bench-ben
 3. Ensure URL ends with `/v1`, e.g., `http://localhost:30000/v1`
 
 ### EvalScope SSL certificate verification failed
+
 When using EvalScope commands without specifying a dataset or model path, it will attempt to download automatically, which may encounter an SSL certificate verification error:
-```
+
+```bash command
   File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py", line 605, in get
     return self.request("GET", url, **kwargs)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -478,11 +485,14 @@ When using EvalScope commands without specifying a dataset or model path, it wil
 requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/gsm8k (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
 [ERROR] 2026-05-13-02:20:01 (PID:876, Device:-1, RankID:-1) ERR99999 UNKNOWN application exception
 ```
+
 You can navigate to `/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py`, find the `class Session` definition, and set `self.verify` to `False` to resolve this.
 
 ### Download Dataset Error
+
 For this error
-```
+
+```bash command
 root@localhost:/home/# wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
 --2026-05-12 12:08:01--  https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
 Connecting to 141.5.152.215:6688... connected.
@@ -490,8 +500,10 @@ ERROR: cannot verify www.modelscope.cn's certificate, issued by ‘CN=Huawei Web
   Self-signed certificate encountered.
 To connect to www.modelscope.cn insecurely, use `--no-check-certificate'.
 ```
+
 You can add `--no-check-certificate'
-```
+
+```bash command
 wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv --no-check-certificate
 ```
 

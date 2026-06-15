@@ -7,6 +7,7 @@ metatags:
 import { Ministral3Deployment } from '/src/snippets/autoregressive/ministral-3-deployment.jsx';
 
 ## 1. Model Introduction
+
 The largest model in the Ministral 3 family, Ministral 3 14B offers frontier capabilities and performance comparable to its larger Mistral Small 3.2 24B counterpart. A powerful and efficient language model with vision capabilities.
 
 The Ministral 3 14B Instruct model offers the following capabilities:
@@ -36,13 +37,16 @@ This section provides deployment configurations optimized for different hardware
 <Ministral3Deployment />
 
 ### 3.2 Configuration Tips
+
 **Context length vs memory**: Ministral-3 advertises a long context window; if you are memory-constrained, start by lowering --context-length (for example 32768) and increase once things are stable.
 
 **Pre-installation steps**: Adding the following steps after launching the docker
+
 ```shell Command
 pip install mistral-common --upgrade
 pip install transformers==5.0.0.rc0
 ```
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
@@ -55,6 +59,7 @@ For basic API usage and request examples, please refer to:
 ### 4.2 Advanced Usage
 
 #### 4.2.1 Launch the docker
+
 ```shell Command
 docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
 ```
@@ -73,6 +78,7 @@ docker run -d -it --ipc=host --network=host --privileged \
 ```
 
 #### 4.2.2 Launch the server
+
 ```shell Command
 sglang serve \
   --model-path mistralai/Ministral-3-14B-Instruct-2512 \
@@ -102,8 +108,10 @@ sglang serve \
   --trust-remote-code
 ```
 
-#####  Low Concurrency
+#### Low Concurrency
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -117,6 +125,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -157,7 +166,9 @@ Max ITL (ms):                            8.45
 ```
 
 ##### Medium Concurrency
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -169,7 +180,9 @@ python3 -m sglang.bench_serving \
   --max-concurrency 16 \
   --request-rate inf
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -210,7 +223,9 @@ Max ITL (ms):                            888.63
 ```
 
 ##### High Concurrency
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -224,6 +239,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang

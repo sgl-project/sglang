@@ -98,7 +98,7 @@ Breakable CUDA graph extends PyTorch's `torch.cuda.CUDAGraph` by splitting a sin
 
 During capture, the flow is:
 
-```
+```txt
 Begin capture (segment 1)
   ... graphable ops ...
   @eager_on_graph function encountered:
@@ -116,7 +116,7 @@ Each segment is independently instantiated as a CUDA graph executable. The non-g
 
 During replay:
 
-```
+```txt
 For each segment i:
   1. Launch CUDA graph segment i
   2. Run the recorded non-graph function i eagerly
@@ -148,6 +148,7 @@ Some models fork work onto secondary CUDA streams (e.g., for overlapped computat
 When no graph breaks are inserted, breakable CUDA graph has minimal overhead compared to standard CUDA graph — the capture/replay path is nearly identical.
 
 Each graph break adds:
+
 - One `cudaGraphLaunch` call (to replay the segment before the break)
 - One eager Python function call
 - One `cudaStreamBeginCapture` / `cudaStreamEndCapture` pair during capture

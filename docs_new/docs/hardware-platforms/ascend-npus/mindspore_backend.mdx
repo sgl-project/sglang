@@ -1,4 +1,4 @@
-## Introduction
+# Introduction
 
 MindSpore is a high-performance AI framework optimized for Ascend NPUs. This doc guides users to run MindSpore models in SGLang.
 
@@ -28,7 +28,6 @@ cd sgl-mindspore
 pip install -e .
 ```
 </CodeGroup>
-
 
 ## Run Model
 
@@ -108,7 +107,7 @@ python3 -m sglang.launch_server \
 
 ## Troubleshooting
 
-#### Debug Mode
+### Debug Mode
 
 Enable sglang debug logging by log-level argument.
 
@@ -133,7 +132,7 @@ export GLOG_v=0  # DEBUG
 ```
 </CodeGroup>
 
-#### Explicitly select devices
+### Explicitly select devices
 
 Use the following environment variable to explicitly select the devices to use.
 
@@ -143,7 +142,7 @@ export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7  # to set device
 ```
 </CodeGroup>
 
-#### Some communication environment issues
+### Some communication environment issues
 
 In case of some environment with special communication environment, users need set some environment variables.
 
@@ -153,7 +152,7 @@ export MS_ENABLE_LCCL=off # current not support LCCL communication mode in SGLan
 ```
 </CodeGroup>
 
-#### Some dependencies of protobuf
+### Some dependencies of protobuf
 
 In case of some environment with special protobuf version, users need set some environment variables to avoid binary version mismatch.
 
@@ -164,6 +163,7 @@ export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python  # to avoid protobuf binary
 </CodeGroup>
 
 ## Support
+
 For MindSpore-specific issues:
 
 - Refer to the [MindSpore documentation](https://www.mindspore.cn/)

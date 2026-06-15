@@ -14,8 +14,8 @@ loop standardized for optimization.
 
 At its core, the architecture revolves around two key concepts, as highlighted in our [blog post](https://lmsys.org/blog/2025-11-07-sglang-diffusion/#architecture):
 
--   **`ComposedPipeline`**: This class orchestrates a series of `PipelineStage`s to define the complete generation process for a specific model. It acts as the main entry point for a model and manages the data flow between the different stages of the diffusion process.
--   **`PipelineStage`**: Each stage is a modular component that encapsulates a function within the diffusion process. Examples include prompt encoding, the denoising loop, or VAE decoding.
+- **`ComposedPipeline`**: This class orchestrates a series of `PipelineStage`s to define the complete generation process for a specific model. It acts as the main entry point for a model and manages the data flow between the different stages of the diffusion process.
+- **`PipelineStage`**: Each stage is a modular component that encapsulates a function within the diffusion process. Examples include prompt encoding, the denoising loop, or VAE decoding.
 
 ### Two Pipeline Styles
 
@@ -25,7 +25,7 @@ SGLang Diffusion supports two pipeline composition styles. Both are valid; choos
 
 The recommended default for most new models. Uses a three-stage structure:
 
-```
+```txt
 BeforeDenoisingStage (model-specific)  →  DenoisingStage (standard)  →  DecodingStage (standard)
 ```
 
@@ -68,6 +68,7 @@ BeforeDenoisingStage (model-specific)  →  DenoisingStage (standard)  →  Deco
 Uses the framework's fine-grained standard stages (`TextEncodingStage`, `LatentPreparationStage`, `TimestepPreparationStage`, etc.) to build the pipeline by composition. Convenience methods like `add_standard_t2i_stages()` and `add_standard_ti2i_stages()` make this very concise.
 
 This style is appropriate when:
+
 - **The new model's pre-processing can largely reuse existing stages** — e.g., a model that uses standard CLIP/T5 text encoding + standard latent preparation with minimal customization.
 - **A model-specific optimization needs to be extracted as a standalone stage** — e.g., a specialized encoding or conditioning step that benefits from being a separate stage for profiling, parallelism control, or reuse across multiple pipeline variants.
 
@@ -112,18 +113,18 @@ This style is appropriate when:
 
 To add support for a new diffusion model, you will need to define or configure the following components:
 
-1.  **`PipelineConfig`**: A dataclass holding static configurations for your model pipeline — precision settings, model architecture parameters, and callback methods used by the standard `DenoisingStage` and `DecodingStage`. Each model has its own subclass.
+1. **`PipelineConfig`**: A dataclass holding static configurations for your model pipeline — precision settings, model architecture parameters, and callback methods used by the standard `DenoisingStage` and `DecodingStage`. Each model has its own subclass.
 
-2.  **`SamplingParams`**: A dataclass defining runtime generation parameters — `prompt`, `negative_prompt`, `guidance_scale`, `num_inference_steps`, `seed`, `height`, `width`, etc.
+2. **`SamplingParams`**: A dataclass defining runtime generation parameters — `prompt`, `negative_prompt`, `guidance_scale`, `num_inference_steps`, `seed`, `height`, `width`, etc.
 
-3.  **Pre-processing stage(s)**: Either a single model-specific `{Model}BeforeDenoisingStage` (Hybrid style) or a combination of standard stages (Modular style). See [Two Pipeline Styles](#two-pipeline-styles) above.
+3. **Pre-processing stage(s)**: Either a single model-specific `{Model}BeforeDenoisingStage` (Hybrid style) or a combination of standard stages (Modular style). See [Two Pipeline Styles](#two-pipeline-styles) above.
 
-4.  **`ComposedPipeline`**: A class that wires together your pre-processing stage(s) with the standard `DenoisingStage` and `DecodingStage`. See base definitions:
+4. **`ComposedPipeline`**: A class that wires together your pre-processing stage(s) with the standard `DenoisingStage` and `DecodingStage`. See base definitions:
     - [`ComposedPipelineBase`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines_core/composed_pipeline_base.py)
     - [`PipelineStage`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines_core/stages/base.py)
     - [Central registry](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py)
 
-5.  **Modules (model components)**: Each pipeline references modules loaded from the model repository (e.g., Diffusers `model_index.json`):
+5. **Modules (model components)**: Each pipeline references modules loaded from the model repository (e.g., Diffusers `model_index.json`):
     - `text_encoder`: Encodes text prompts into embeddings.
     - `tokenizer`: Tokenizes raw text input for the text encoder(s).
     - `processor`: Preprocesses images and extracts features; often used in image-to-image tasks.
@@ -215,6 +216,7 @@ The following fine-grained stages can be composed to build the pre-processing po
 ### Step 1: Obtain and Study the Reference Implementation
 
 Before writing any code, obtain the model's original implementation or Diffusers pipeline code:
+
 - The model's Diffusers pipeline source (e.g., the `pipeline_*.py` file from the `diffusers` library or HuggingFace repo)
 - Or the model's official reference implementation (e.g., from the model author's GitHub repo)
 - Or the HuggingFace model ID to look up `model_index.json` and the associated pipeline class
@@ -250,6 +252,7 @@ Adapt the model's core components:
 Use SGLang's fused kernels where possible (see `LayerNormScaleShift`, `RMSNormScaleShift`, `apply_qk_norm`, etc.).
 
 **Tensor Parallel (TP) and Sequence Parallel (SP)**: For multi-GPU deployment, it is recommended to add TP/SP support to the DiT model. This can be done incrementally after the single-GPU implementation is verified. Reference implementations:
+
 - **Wan model** (`runtime/models/dits/wanvideo.py`) — Full TP + SP: `ColumnParallelLinear`/`RowParallelLinear` for attention, sequence dimension sharding via `get_sp_world_size()`
 - **Qwen-Image model** (`runtime/models/dits/qwen_image.py`) — SP via `USPAttention` (Ulysses + Ring Attention)
 
@@ -583,6 +586,7 @@ Debug by comparing intermediate tensor values against the Diffusers reference pi
 Before submitting your implementation, verify:
 
 **Common (both styles):**
+
 - [ ] **Pipeline file** at `runtime/pipelines/{model_name}.py` with `EntryClass`
 - [ ] **PipelineConfig** at `configs/pipeline_configs/{model_name}.py`
 - [ ] **SamplingParams** at `configs/sample/{model_name}.py`
@@ -597,5 +601,6 @@ Before submitting your implementation, verify:
 - [ ] **Output quality verified** — generated images/videos are not noise; compared against Diffusers reference output
 
 **Hybrid style only:**
+
 - [ ] **BeforeDenoisingStage** at `stages/model_specific_stages/{model_name}.py`
 - [ ] `BeforeDenoisingStage.forward()` populates all batch fields required by `DenoisingStage`

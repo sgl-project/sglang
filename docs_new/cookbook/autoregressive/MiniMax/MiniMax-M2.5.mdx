@@ -162,7 +162,9 @@ response = client.chat.completions.create(
 
 print(response.choices[0].message.content)
 ```
+
 **Example Output**:
+
 ```text Output
 <think>The user asks: "Who won the world series in 2020?" That is a straightforward factual question. The answer: the Los Angeles Dodgers. They won the 2020 World Series, beating the Tampa Bay Rays. The user is presumably expecting that answer.
 
@@ -179,6 +181,7 @@ No need for any extra. That's it.
 
 The Los Angeles Dodgers won the 2020 World Series, defeating the Tampa Bay Rays in six games.
 ```
+
 ### 4.2 Advanced Usage
 
 #### 4.2.1 Reasoning Parser
@@ -377,6 +380,7 @@ else:
 ```
 
 **Output Example**:
+
 ```text Output
 Tool Call: get_weather
    Arguments: {"location": "Beijing"}
@@ -442,7 +446,9 @@ This section uses **industry-standard configurations** for comparable benchmark 
 - sglang version: 0.5.8
 
 #### 5.1.1 Standard Scenario Benchmark
+
 - Model Deployment Command:
+
 ```shell Command
 sglang serve \
     --model-path MiniMaxAI/MiniMax-M2.5 \
@@ -453,8 +459,11 @@ sglang serve \
     --mem-fraction-static 0.85 \
     --tool-call-parser minimax-m2
 ```
+
 ##### 5.1.1.1 Low Concurrency
+
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -465,7 +474,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 10 \
   --max-concurrency 1
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -505,8 +516,11 @@ P99 ITL (ms):                            10.32
 Max ITL (ms):                            14.46
 ==================================================
 ```
+
 ##### 5.1.1.2 Medium Concurrency
+
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -517,7 +531,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 80 \
   --max-concurrency 16
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -557,8 +573,11 @@ P99 ITL (ms):                            87.99
 Max ITL (ms):                            483.53
 ==================================================
 ```
+
 ##### 5.1.1.3 High Concurrency
+
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -569,7 +588,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 500 \
   --max-concurrency 100
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -609,8 +630,11 @@ P99 ITL (ms):                            118.81
 Max ITL (ms):                            1145.62
 ==================================================
 ```
+
 #### 5.1.2 Summarization Scenario Benchmark
+
 - Model Deployment Command:
+
 ```shell Command
 sglang serve \
     --model-path MiniMaxAI/MiniMax-M2.5 \
@@ -621,8 +645,11 @@ sglang serve \
     --mem-fraction-static 0.85 \
     --tool-call-parser minimax-m2
 ```
+
 ##### 5.1.2.1 Low Concurrency
+
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -633,7 +660,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 10 \
   --max-concurrency 1
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -673,8 +702,11 @@ P99 ITL (ms):                            10.44
 Max ITL (ms):                            14.11
 ==================================================
 ```
+
 ##### 5.1.2.2 Medium Concurrency
+
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -685,7 +717,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 80 \
   --max-concurrency 16
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -725,8 +759,11 @@ P99 ITL (ms):                            105.79
 Max ITL (ms):                            1065.02
 ==================================================
 ```
+
 ##### 5.1.2.3 High Concurrency
+
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -737,7 +774,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 320 \
   --max-concurrency 64
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -789,6 +828,7 @@ Max ITL (ms):                            4649.23
 - sglang version: 0.5.9
 
 - Model Deployment Command:
+
 ```shell Command
 sglang serve \
     --model-path MiniMaxAI/MiniMax-M2.5 \
@@ -799,8 +839,11 @@ sglang serve \
     --mem-fraction-static 0.85 \
     --tool-call-parser minimax-m2
 ```
+
 ##### 5.1.3.1 Low Concurrency
+
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -811,7 +854,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 10 \
   --max-concurrency 1
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -851,8 +896,11 @@ P99 ITL (ms):                            8.16
 Max ITL (ms):                            10.10
 ==================================================
 ```
+
 ##### 5.1.3.2 Medium Concurrency
+
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -863,7 +911,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 80 \
   --max-concurrency 16
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -903,8 +953,11 @@ P99 ITL (ms):                            66.52
 Max ITL (ms):                            107.39
 ==================================================
 ```
+
 ##### 5.1.3.3 High Concurrency
+
 - Benchmark Command:
+
 ```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -915,7 +968,9 @@ python3 -m sglang.bench_serving \
   --num-prompts 500 \
   --max-concurrency 100
 ```
+
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -957,26 +1012,36 @@ Max ITL (ms):                            376.34
 ```
 
 ### 5.2 Accuracy Benchmark
+
 #### 5.2.1 GSM8K Benchmark
+
 - Benchmark Command:
+
 ```shell Command
 python benchmark/gsm8k/bench_sglang.py --port 30000
 ```
+
 - Test Results:
+
 ```text Output
 Accuracy: 0.950
 Invalid: 0.000
 Latency: 18.033 s
 Output throughput: 1130.161 token/s
 ```
+
 #### 5.2.2 MMLU Benchmark
+
 - Benchmark Command:
+
 ```shell Command
 cd benchmark/mmlu
 bash download_data.sh
 python3 bench_sglang.py --port 30000
 ```
+
 - Test Results:
+
 ```text Output
 subject: abstract_algebra, #q:100, acc: 0.620
 subject: anatomy, #q:135, acc: 0.830

@@ -5,10 +5,9 @@ The official documentation and cookbook for [SGLang](https://github.com/sgl-proj
 - **Docs**: Getting started guides, installation, and reference
 - **Cookbook**: Battle-tested recipes for deploying specific models (Qwen, DeepSeek, Llama, GLM, etc.) on various hardware
 
-
 ## Project structure
 
-```
+```txt
 .
 ├── docs.json              # Site configuration (navigation, theme, metadata)
 ├── index.mdx              # Homepage

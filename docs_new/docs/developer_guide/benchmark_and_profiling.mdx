@@ -129,6 +129,7 @@ python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-
 
 - `--profile-prefill-url` and `--profile-decode-url` are **mutually exclusive** - you cannot profile both at the same time
 - Both options support multiple worker URLs for multi-instance setups:
+
   ```bash Command
   # Profile multiple prefill workers
   python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000 http://127.0.0.1:30002
@@ -136,10 +137,12 @@ python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-
   # Profile multiple decode workers
   python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001 http://127.0.0.1:30003
   ```
+
 - Make sure `SGLANG_TORCH_PROFILER_DIR` is set on all worker nodes before starting the servers
 - For more details on setting up PD disaggregation, see [PD Disaggregation Guide](../advanced_features/pd_disaggregation)
 
 ### Profile a server with `sglang.bench_offline_throughput`
+
 ```bash Command
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 
@@ -293,15 +296,20 @@ python -m sglang.profiler \
 #### Output Files
 
 The profile merger generates:
+
 - Individual rank trace files: `&#123;profile_id&#125;-TP-&#123;tp&#125;-DP-&#123;dp&#125;-PP-&#123;pp&#125;-EP-&#123;ep&#125;.trace.json.gz`
 - Merged trace file: `merged-&#123;profile_id&#125;.trace.json.gz`
 
 ### Possible PyTorch bugs
+
 If in any cases you encounter the following error (for example, using qwen 2.5 VL):
+
 ```bash Command
 RuntimeError: !stack.empty() INTERNAL ASSERT FAILED at "/pytorch/torch/csrc/autograd/profiler_python.cpp":983, please report a bug to PyTorch. Python replay stack is empty.
 ```
+
 This is likely a PyTorch Bug reported in [Bug: vLLM Profiler](https://github.com/vllm-project/vllm/issues/18240) and [Bug: torch.profiler.profile](https://github.com/pytorch/pytorch/issues/101632). As a workaround, you may disable `with_stack` with an environment variable such as follows:
+
 ```bash Command
 export SGLANG_PROFILE_WITH_STACK=False
 python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
@@ -311,7 +319,7 @@ python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-I
 
 Trace files can be loaded and visualized from:
 
-1. https://ui.perfetto.dev/ (any browser)
+1. [https://ui.perfetto.dev/](https://ui.perfetto.dev/) (any browser)
 2. chrome://tracing (Chrome browser only)
 
 If browser cannot open trace file due to its large size,
@@ -480,6 +488,7 @@ nsys-ui layerwise_profile.qdrep
 ```
 
 In the Nsight Systems GUI, you'll see:
+
 - **NVTX ranges**: Each layer appears as a labeled range in the timeline with detailed information in the marker metadata
 - **CUDA kernels**: All GPU kernels are shown alongside the layer annotations
 - **Layer hierarchy**: The full module path (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct.model.layers.0.self_attn.qkv_proj`) helps identify specific layers. The prefix uses the full model path from `--model-path`.

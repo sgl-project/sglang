@@ -103,6 +103,7 @@ void test(const tvm::ffi::TensorView k_cache, const tvm::ffi::TensorView v_cache
 ```
 
 Configure the `TensorMatcher` with expected stride, dtype, and device properties before verification.
+
 - If `with_strides` is omitted, the tensor is expected to be contiguous.
 - Template arguments in `with_dtype` restrict the allowed data types.
 - Template arguments in `with_device` restrict the allowed devices.
@@ -113,7 +114,7 @@ A `Symbolic` variable must resolve to the same value across all verifications.
 Use `.unwrap()` to retrieve the matched value after verification.
 
 > Note: `TensorMatcher` is a temporary expression and should not be stored in a variable.
-
+> 
 > Tip: Add `//` at the end of the `TensorMatcher` chain to enforce proper indentation.
 
 #### Kernel Launching

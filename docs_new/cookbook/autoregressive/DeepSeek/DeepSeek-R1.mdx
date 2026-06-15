@@ -91,6 +91,7 @@ DeepSeek-R1 shares the same MoE architecture as DeepSeek-V3, so the same hardwar
 > The official DeepSeek-R1 checkpoint is already in FP8 format — do **not** add `--quantization fp8` when serving it.
 
 **DeepGEMM precompilation (NVIDIA Hopper / Blackwell):** Precompile GEMM kernels to avoid JIT overhead (~10 min):
+
 ```bash
 python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-R1 --tp 8 --trust-remote-code
 ```

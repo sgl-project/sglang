@@ -111,6 +111,7 @@ print(json.dumps(result, indent=2))
 The classification API works with any classification model supported by SGLang, including:
 
 ### Classification Models (Multi-class)
+
 - `LlamaForSequenceClassification` - Multi-class classification
 - `Qwen2ForSequenceClassification` - Multi-class classification
 - `Qwen3ForSequenceClassification` - Multi-class classification
@@ -120,6 +121,7 @@ The classification API works with any classification model supported by SGLang, 
 **Label Mapping**: The API automatically uses the `id2label` mapping from the model's `config.json` file to provide meaningful label names instead of generic class names. If `id2label` is not available, it falls back to `LABEL_0`, `LABEL_1`, etc., or `Class_0`, `Class_1` as a last resort.
 
 ### Reward Models (Single score)
+
 - `InternLM2ForRewardModel` - Single reward score
 - `Qwen2ForRewardModel` - Single reward score
 - `LlamaForSequenceClassificationWithNormal_Weights` - Special reward model
@@ -134,6 +136,7 @@ The API returns appropriate HTTP status codes and error messages:
 - `500 Internal Server Error`: Server-side processing error
 
 Error response format:
+
 ```json Config
 {
   "error": "Error message",

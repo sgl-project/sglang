@@ -5,24 +5,27 @@ metatags:
     description: "SGLang Docker development: VSCode dev container, remote tunnels, debugger setup, nsys profiling."
 ---
 ## Setup VSCode on a Remote Host
+
 (Optional - you can skip this step if you plan to run sglang dev container locally)
 
 1. In the remote host, download `code` from [VSCode](https://code.visualstudio.com/download) and run `code tunnel` in a shell.
 
-Example
-```bash Command
-wget https://vscode.download.prss.microsoft.com/dbazure/download/stable/fabdb6a30b49f79a7aba0f2ad9df9b399473380f/vscode_cli_alpine_x64_cli.tar.gz
-tar xf vscode_cli_alpine_x64_cli.tar.gz
+    Example
 
-# https://code.visualstudio.com/docs/remote/tunnels
-./code tunnel
-```
+       ```bash Command
+       wget https://vscode.download.prss.microsoft.com/dbazure/download/stable/fabdb6a30b49f79a7aba0f2ad9df9b399473380f/vscode_cli_alpine_x64_cli.tar.gz
+       tar xf vscode_cli_alpine_x64_cli.tar.gz
+ 
+       # https://code.visualstudio.com/docs/remote/tunnels
+       ./code tunnel
+       ```
 
 2. In your local machine, press F1 in VSCode and choose "Remote Tunnels: Connect to Tunnel".
 
 ## Setup Docker Container
 
 ### Option 1. Use the default dev container automatically from VSCode
+
 There is a `.devcontainer` folder in the sglang repository root folder to allow VSCode to automatically start up within dev container. You can read more about this VSCode extension in VSCode official document [Developing inside a Container](https://code.visualstudio.com/docs/devcontainers/containers).
 <Frame>
   <img src="https://github.com/user-attachments/assets/6a245da8-2d4d-4ea8-8db1-5a05b3a66f6d" alt="VSCode Dev Container Architecture" />
@@ -31,6 +34,7 @@ There is a `.devcontainer` folder in the sglang repository root folder to allow 
 *Figure 1: Diagram from VSCode official documentation [Developing inside a Container](https://code.visualstudio.com/docs/devcontainers/containers).*
 
 To enable this, you only need to:
+
 1. Start Visual Studio Code and install [VSCode dev container extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers).
 2. Press F1, type and choose "Dev Container: Open Folder in Container.
 3. Input the `sglang` local repo path in your machine and press enter.
@@ -47,7 +51,6 @@ Now when you run `sglang.launch_server` in the VSCode terminal or start debuggin
   <img src="https://github.com/user-attachments/assets/748c85ba-7f8c-465e-8599-2bf7a8dde895" alt="SGLang Server Running in Dev Container" />
 </Frame>
 
-
 ### Option 2. Start up containers manually (advanced)
 
 The following startup command is an example for internal development by the SGLang team. You can **modify or add directory mappings as needed**, especially for model weight downloads, to prevent repeated downloads by different Docker containers.
@@ -62,23 +65,31 @@ The following startup command is an example for internal development by the SGLa
 docker run -itd --shm-size 32g --gpus all -v <volumes-to-mount> --ipc=host --network=host --privileged --name sglang_dev lmsysorg/sglang:dev /bin/zsh
 docker exec -it sglang_dev /bin/zsh
 ```
+
 Some useful volumes to mount are:
+
 1. **Huggingface model cache**: mounting model cache can avoid re-download every time docker restarts. Default location on Linux is `~/.cache/huggingface/`.
 2. **SGLang repository**: code changes in the SGLang local repository will be automatically synced to the .devcontainer.
 
 Example 1: Monting local cache folder `/opt/dlami/nvme/.cache` but not the SGLang repo. Use this when you prefer to manually transfer local code changes to the devcontainer.
+
 ```bash Command
 docker run -itd --shm-size 32g --gpus all -v /opt/dlami/nvme/.cache:/root/.cache --ipc=host --network=host --privileged --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
 docker exec -it sglang_zhyncs /bin/zsh
 ```
+
 Example 2: Mounting both HuggingFace cache and local SGLang repo. Local code changes are automatically synced to the devcontainer as the SGLang is installed in editable mode in the dev image.
+
 ```bash Command
 docker run -itd --shm-size 32g --gpus all -v $HOME/.cache/huggingface/:/root/.cache/huggingface -v $HOME/src/sglang:/sgl-workspace/sglang --ipc=host --network=host --privileged --name sglang_zhyncs lmsysorg/sglang:dev /bin/zsh
 docker exec -it sglang_zhyncs /bin/zsh
 ```
+
 ## Debug SGLang with VSCode Debugger
+
 1. (Create if not exist) open `launch.json` in VSCode.
 2. Add the following config and save. Please note that you can edit the script as needed to apply different parameters or debug a different program (e.g. benchmark script).
+     
      ```JSON Config
        {
           "version": "0.2.0",

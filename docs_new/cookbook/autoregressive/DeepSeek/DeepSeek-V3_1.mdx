@@ -10,8 +10,6 @@ metatags:
 
 **[DeepSeek-V3.1-Terminus](https://huggingface.co/deepseek-ai/DeepSeek-V3.1-Terminus)** is an experimental version designed for general conversations and long-context processing. It features hybrid thinking capabilities, allowing you to toggle between "Think" mode for deliberate reasoning and "Non-Think" mode for faster responses. Recommended for general conversations, long-context processing, and experimental use cases.
 
-
-
 ## 2. SGLang Installation
 
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
@@ -68,9 +66,11 @@ DeepSeek-V3.1 shares the same model architecture as DeepSeek-V3, so the same har
 > The official DeepSeek-V3.1 checkpoint is already in FP8 format — do **not** add `--quantization fp8` when serving it.
 
 **DeepGEMM precompilation (NVIDIA Hopper / Blackwell):** Precompile GEMM kernels before the first server run to avoid JIT overhead (~10 min):
+
 ```bash
 python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3.1 --tp 8 --trust-remote-code
 ```
+
 DeepGEMM is enabled by default on Hopper/Blackwell and can be disabled with `SGLANG_ENABLE_JIT_DEEPGEMM=0`.
 
 **Data Parallelism Attention (`--enable-dp-attention`):** Recommended for high-throughput scenarios with large batch sizes. Reduces KV-cache duplication across TP ranks. Use `--enable-dp-attention --tp 8 --dp 8` on a single 8-GPU node. Not recommended for low-latency, small-batch workloads.

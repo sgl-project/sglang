@@ -9,6 +9,7 @@ import { KimiLinearDeployment } from '/src/snippets/autoregressive/kimi-linear-d
 ## AMD GPU Support
 
 ## 1. Model Introduction
+
 Kimi Linear is a hybrid linear attention architecture that outperforms traditional full attention methods across various contexts, including short, long, and reinforcement learning (RL) scaling regimes. At its core is Kimi Delta Attention (KDA)—a refined version of Gated DeltaNet that introduces a more efficient gating mechanism to optimize the use of finite-state RNN memory.
 
 This generation delivers comprehensive upgrades across the board:
@@ -18,7 +19,7 @@ Hybrid Architecture: A 3:1 KDA-to-global MLA ratio reduces memory usage while ma
 Superior Performance: Outperforms full attention in a variety of tasks, including long-context and RL-style benchmarks on 1.4T token training runs with fair comparisons.
 High Throughput: Achieves up to 6× faster decoding and significantly reduces time per output token (TPOT).
 
-For more details, please refer to the [official Kimi Linear GitHub Repository]: https://github.com/MoonshotAI/Kimi-Linear
+For more details, please refer to the [official Kimi Linear GitHub Repository](https://github.com/MoonshotAI/Kimi-Linear)
 
 ## 2. SGLang Installation
 
@@ -48,6 +49,7 @@ For basic API usage and request examples, please refer to:
 ### 4.2 Advanced Usage
 
 #### 4.2.1 Launch the docker
+
 ```shell Command
 docker pull lmsysorg/sglang:v0.5.7-rocm700-mi30x
 ```
@@ -72,6 +74,7 @@ pip install sentencepiece tiktoken
 ```
 
 #### 4.2.3 Launch the server
+
 ```shell Command
 export SGLANG_ROCM_FUSED_DECODE_MLA=0
 
@@ -83,7 +86,9 @@ SGLANG_ROCM_FUSED_DECODE_MLA=0 python3 -m sglang.launch_server \
 ```
 
 ## 5. Benchmark
+
 ### 5.1 Speed Benchmark
+
 Test Environment:
 
 Hardware: AMD MI300X GPU
@@ -107,6 +112,7 @@ SGLANG_ROCM_FUSED_DECODE_MLA=0 python3 -m sglang.launch_server \
 ### 5.1.1 Low Concurrency (Latency-Optimized)
 
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -120,6 +126,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -160,7 +167,9 @@ Max ITL (ms):                            11.46
 ```
 
 ### 5.1.2 Medium Concurrency (Balanced)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -174,6 +183,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -215,7 +225,9 @@ Max ITL (ms):                            299.89
 ```
 
 ### 5.1.3 High Concurrency (Throughput-Optimized)
+
 - Benchmark Command:
+
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
@@ -229,6 +241,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Test Results:
+
 ```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
@@ -267,6 +280,7 @@ P99 ITL (ms):                            157.80
 Max ITL (ms):                            2481.11
 ==================================================
 ```
+
 ### 5.2 Accuracy Benchmark
 
 #### 5.2.1 GSM8K Benchmark

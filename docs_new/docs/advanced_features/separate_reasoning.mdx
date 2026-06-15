@@ -67,38 +67,41 @@ SGLang supports parsing reasoning content out from "normal" content for reasonin
     </tr>
   </tbody>
 </table>
+
 ### Model-Specific Behaviors
 
 **Apertus 2509:**
+
 - Uses `<|inner_prefix|>` and `<|inner_suffix|>` to delimit reasoning content. For agentic tool use, also specify `--tool-call-parser apertus2509`.
 
 **DeepSeek-R1 Family:**
+
 - DeepSeek-R1: No `<think>` start tag, jumps directly to thinking content
 - DeepSeek-R1-0528: Generates both `<think>` start and `</think>` end tags
 - Both are handled by the same `deepseek-r1` parser
 
 **DeepSeek-V3 Family:**
+
 - DeepSeek-V3.1/V3.2: Hybrid model supporting both thinking and non-thinking modes, use the `deepseek-v3` parser and `thinking` parameter (NOTE: not `enable_thinking`)
 
 **Qwen3 Family:**
+
 - Standard Qwen3 (e.g., Qwen3-2507): Use `qwen3` parser, supports `enable_thinking` in chat templates
 - Qwen3-Thinking (e.g., Qwen3-235B-A22B-Thinking-2507): Use `qwen3` or `qwen3-thinking` parser, always thinks
 
 **Kimi K2:**
+
 - Kimi K2 Thinking: Uses special `◁think▷` and `◁/think▷` tags. For agentic tool use, also specify `--tool-call-parser kimi_k2`.
 
 **GPT OSS:**
-- GPT OSS: Uses special `<|channel|>analysis<|message|>` and `<|end|>` tags
 
+- GPT OSS: Uses special `<|channel|>analysis<|message|>` and `<|end|>` tags
 
 ## Usage
 
 ### Launching the Server
 
-
 Specify the `--reasoning-parser` option.
-
-
 
 ```python Example
 import requests
@@ -115,15 +118,12 @@ wait_for_server(f"http://localhost:{port}")
 
 Note that `--reasoning-parser` defines the parser used to interpret responses.
 
-
 ### OpenAI Compatible API
 
 Using the OpenAI compatible API, the contract follows the [DeepSeek API design](https://api-docs.deepseek.com/guides/reasoning_model) established with the release of DeepSeek-R1:
 
 - `reasoning_content`: The content of the CoT.
 - `content`: The content of the final answer.
-
-
 
 ```python Example
 # Initialize OpenAI-like client
@@ -139,8 +139,6 @@ messages = [
 ```
 
 #### Non-Streaming Request
-
-
 
 ```python Example
 response_non_stream = client.chat.completions.create(
@@ -159,8 +157,6 @@ print_highlight(response_non_stream.choices[0].message.content)
 ```
 
 #### Streaming Request
-
-
 
 ```python Example
 response_stream = client.chat.completions.create(
@@ -188,8 +184,6 @@ print_highlight(content)
 ```
 
 Optionally, you can buffer the reasoning content to the last reasoning chunk (or the first chunk after the reasoning content).
-
-
 
 ```python Example
 response_stream = client.chat.completions.create(
@@ -219,8 +213,6 @@ print_highlight(content)
 The reasoning separation is enable by default when specify .
 **To disable it, set the `separate_reasoning` option to `False` in request.**
 
-
-
 ```python Example
 response_non_stream = client.chat.completions.create(
     model=model_name,
@@ -236,8 +228,6 @@ print_highlight(response_non_stream.choices[0].message.content)
 ```
 
 ### SGLang Native API
-
-
 
 ```python Example
 from transformers import AutoTokenizer
@@ -276,14 +266,11 @@ print_highlight("==== Text ====")
 print_highlight(separate_reasoning_response_json["text"])
 ```
 
-
 ```python Example
 terminate_process(server_process)
 ```
 
 ### Offline Engine API
-
-
 
 ```python Example
 import sglang as sgl
@@ -315,7 +302,6 @@ print_highlight(reasoning_text)
 print_highlight("==== Text ====")
 print_highlight(text)
 ```
-
 
 ```python Example
 llm.shutdown()

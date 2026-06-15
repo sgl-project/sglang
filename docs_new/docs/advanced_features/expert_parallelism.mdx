@@ -8,6 +8,7 @@ Expert Parallelism (EP) in SGLang distributes expert weights across multiple dev
 ## Supported Backends and Selection Guidance
 
 SGLang's EP integrates diverse, highly efficient backends for different use cases, allowing fine-grained control over performance trade-offs. Users specify backends via command-line flags:
+
 - `--moe-a2a-backend`: Selects the backend for all-to-all communication.
 - `--moe-runner-backend`: Selects the backend for MoE computation.
 
@@ -148,6 +149,7 @@ SGLang's EP framework provides modular abstractions for easy integration of cust
 ### Framework Overview
 
 The framework centers on `FusedMoE` as the unified entry point for a single, extensible structure. Key components include:
+
 - **Dispatcher**: Manages dispatch/combine for backends like DeepEP (implements `BaseDispatcher` subclasses).
 - **MoeRunner**: Orchestrates grouped-GEMM execution via `MoeRunnerCore` implementations (e.g., `TritonRunnerCore`).
 - **PermuteMethodPool**: Auto-registers layout conversions (e.g., pre/post-permute via `register_pre_permute` and `register_post_permute` for dynamic modes, or `register_fused_func` for static, torch.compile-compatible fused operations).
@@ -193,6 +195,7 @@ For details, see the [MoE Refactor Roadmap](https://github.com/sgl-project/sglan
 ### Implementing New Backends
 
 To add a new backend:
+
 1. For a new all-to-all dispatcher, implement a `BaseDispatcher` subclass with `dispatch` and `combine` methods.
 2. For a new MoE runner backend, define a `MoeRunnerCore` subclass for core operations (e.g., grouped GEMMs).
 3. Define new input/output formats for the dispatcher or model runner (e.g., `RunnerInput`, `RunnerOutput`).
@@ -231,7 +234,6 @@ Users need to specify `--enable-two-batch-overlap` to unlock up to 2x throughput
 
 SGLang introduces a dispatcher-hook system for Single-Batch Overlap (SBO), enabling the overlap of operations within a single batch—such as shared experts computation with communication—while decentralizing logic to enhance modularity. These hooks execute before and after the `dispatch` and `combine` operations without modifying core MoE modules. This design simplifies interfaces, reduces coupling, and improves extensibility. For implementation details and an example of overlapping shared experts with DeepEP's combine operation, refer to [PR #13327](https://github.com/sgl-project/sglang/pull/13327). Users can set `--enable-single-batch-overlap` to enable this feature.
 
-
 ## Workload Balancer
 
 SGLang integrates the [Expert Parallelism Load Balancer (EPLB)](https://github.com/deepseek-ai/EPLB) from DeepSeek to address routing imbalances in MoE models. By analyzing expert activation statistics, EPLB computes an optimal expert arrangement, strategically placing or replicating experts to minimize GPU utilization variance, reduce idle cycles, and enhance scalability.
@@ -240,13 +242,12 @@ To enable EPLB, use the flags `--enable-eplb`. For optimal performance, increase
 
 For more details, refer to the [EPLB Section in the Large-Scale EP Blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/#expert-parallelism-load-balancer) and the [EPLB Repository](https://github.com/deepseek-ai/eplb).
 
-
 ## EP with Spectulative Decoding
-
 
 When utilizing speculative decoding with MTP on MoE architectures, use the `--speculative-moe-runner-backend` and `--speculative-moe-a2a-backend` arguments to customize the MoE layer behavior for the draft model. While they default to the target model’s settings, users can differentiate them for varying precisions between target and draft models.
 
 For model like `nvidia/DeepSeek-R1-0528-NVFP4-v2`, the target model uses NVFP4 precision while the draft model uses BF16. To apply `flashinfer_trtllm` kernel for target MoE layer while falling back to triton fused MoE kernel for draft MoE layer, users can set the arguments as follows:
+
 ```text Output
 ...
 --moe-runner-backend flashinfer_trtllm \
@@ -254,9 +255,10 @@ For model like `nvidia/DeepSeek-R1-0528-NVFP4-v2`, the target model uses NVFP4 p
 ...
 ```
 
-
 ## Ascend NPU Guidance
+
 ### Guidance on SGLang configuration in Ascend NPU
+
 - `--moe-a2a-backend` only supports `deepep` and `ascend_fuseep` backends,
 
     - `deepep`: The mechanism is consistent with the above description.
@@ -272,6 +274,7 @@ For model like `nvidia/DeepSeek-R1-0528-NVFP4-v2`, the target model uses NVFP4 p
     - In PD Disaggregation Mode, prefill instance sets `--deepep-mode normal`, and decode instance sets `--deepep-mode low_latency`.
 
 ### DeepEP Ascend Introduction
+
 DeepEP Ascend is the adapted version of the DeepEP communication library for Huawei Ascend NPUs, specifically designed for Mixture-of-Experts (MoE) model Expert Parallelism (EP).
 It supports the Ant-moving Function (Split the sequence length into rounds for streaming batch transmission) to optimize the buffer size occupied during collective communication in prefill stage, especially for long sequences.
 
@@ -286,6 +289,7 @@ Ant-moving Function can be enabled for both the dispatch and combine phases via 
 `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS * DEEPEP_NORMAL_LONG_SEQ_ROUND` means input sequence length. When the input sequence length exceeds 8192, it is recommended to enable the ant-moving function in both dispatch and combine phase.
 
 The environment variable `HCCL_BUFFSIZE` is used to configure the buffer size (MB) actually allocated. Its calculation formula is as follows:
+
 ```text Output
 # Enable Ant-moving Function
 HCCL_BUFFSIZE >= 2 * (102MB + 4MB + DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS * (hidden_size + hidden_size + hidden_size) * topk) + PADDING_BUFFSIZE
@@ -293,6 +297,7 @@ HCCL_BUFFSIZE >= 2 * (102MB + 4MB + DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS * (h
 # Disable Ant-moving Function
 HCCL_BUFFSIZE >= 2 * (102MB + 4MB + TOTAL_SEQ_LEN * (hidden_size + hidden_size) * topk) + PADDING_BUFFSIZE
 ```
+
 Wherein the parameters are described as follows:
 
 - `hidden_size`: hidden size in model config.
