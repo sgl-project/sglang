@@ -83,6 +83,9 @@ class AWQAscendLinearKernel:
             weight_float = weight_int8.float() * scales_exp.float()
             weight_float = weight_float.t().contiguous().to(torch.bfloat16)
 
+            w = weight_float
+            print(w.min(), w.max(), torch.isinf(w).any())
+
             layer.register_parameter("weight", torch.nn.Parameter(weight_float, requires_grad=False))
             # No need for scales anymore – we can delete them
             delattr(layer, "scales")
