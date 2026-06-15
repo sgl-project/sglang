@@ -3588,8 +3588,9 @@ class ServerArgs:
 
         if self.moe_runner_backend == "flashinfer_cutedsl":
             assert self.quantization in [
-                "modelopt_fp4"
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4'."
+                "modelopt_fp4",
+                "modelopt_mixed",
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE supports only: 'modelopt_fp4' or 'modelopt_mixed' (NVFP4 experts)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -3628,9 +3629,10 @@ class ServerArgs:
                 "fp8",
                 "mxfp8",
                 "modelopt_fp4",
+                "modelopt_mixed",
                 "nvfp4_online",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -3795,15 +3797,15 @@ class ServerArgs:
             )
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
-                envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
-                logger.warning(
-                    "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
-                )
+            # NOTE: SGLANG_MOE_NVFP4_DISPATCH is intentionally NOT auto-enabled
+            # here. The FP4 (NVFP4) dispatch path is opt-in via the env var; left
+            # unset, Flashinfer MoE A2A dispatches bf16 hidden states and the MoE
+            # runner quantizes after communication.
             assert self.moe_runner_backend in [
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
+                "flashinfer_trtllm_routed",
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size

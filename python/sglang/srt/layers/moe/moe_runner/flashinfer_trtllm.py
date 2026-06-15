@@ -53,6 +53,10 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+        FlashinferDispatchOutput,
+    )
 
 if is_flashinfer_available():
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
@@ -876,7 +880,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     topk_output = dispatch_output.topk_output
 
     # Quantize hidden states to FP4
-    if quant_info.use_per_token_activation:
+    hidden_states_scale = getattr(dispatch_output, "hidden_states_scale", None)
+    if hidden_states_scale is not None:
+        # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
+        # the dispatcher, so pass them through unchanged.
+        per_token_scale = None
+        hs_fp4 = hidden_states
+        hs_scale_linear = hidden_states_scale
+    elif quant_info.use_per_token_activation:
         from flashinfer import SfLayout, nvfp4_quantize
 
         e4m3_max = 448.0
@@ -926,12 +937,17 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hidden_size = (
         hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
     )
+    # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
+    # the MoE output is bf16 rather than the input dtype.
+    output_dtype = (
+        hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
+    )
     _provided = _moe_output_buf.get()
     _symm_required = is_allocation_symmetric()
     if (
         _provided is not None
         and _provided.shape == (num_tokens, hidden_size)
-        and _provided.dtype == hidden_states.dtype
+        and _provided.dtype == output_dtype
         and _provided.device == hs_fp4.device
         and (
             not _symm_required
@@ -943,7 +959,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     else:
         with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
             symm_output = torch.empty(
-                num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
+                num_tokens, hidden_size, dtype=output_dtype, device=hs_fp4.device
             )
 
     # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
@@ -1219,6 +1235,52 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm_routed: {type(quant_info)}"
     )
+
+
+@register_fused_func("flashinfer", "flashinfer_trtllm_routed")
+def fused_experts_flashinfer_to_flashinfer_trtllm_routed(
+    dispatch_output: FlashinferDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> FlashinferCombineInput:
+    """Fused function for flashinfer A2A + flashinfer_trtllm_routed runner.
+
+    FlashinferDispatchOutput and StandardDispatchOutput share the same field
+    layout (hidden_states, hidden_states_scale, topk_output), so the existing
+    FP8/FP4/BF16 implementations work unchanged.  We wrap the returned
+    StandardCombineInput into a FlashinferCombineInput for the FlashinferDispatcher
+    combine path.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+    )
+
+    if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
+        result = fused_experts_none_to_flashinfer_trtllm_fp4(
+            dispatch_output,
+            quant_info,
+            runner_config,
+            use_routed_topk=True,
+        )
+    elif isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
+        result = fused_experts_none_to_flashinfer_trtllm_fp8(
+            dispatch_output,
+            quant_info,
+            runner_config,
+            use_routed_topk=True,
+        )
+    elif isinstance(quant_info, FlashInferTrtllmBf16MoeQuantInfo):
+        result = fused_experts_none_to_flashinfer_trtllm_bf16(
+            dispatch_output,
+            quant_info,
+            runner_config,
+            use_routed_topk=True,
+        )
+    else:
+        raise TypeError(
+            f"Unexpected quant_info type for flashinfer a2a + flashinfer_trtllm_routed: {type(quant_info)}"
+        )
+    return FlashinferCombineInput(hidden_states=result.hidden_states)
 
 
 # Register the experimental experimental_sgl_trtllm MoE fused-func (MoeRunner needs it at
