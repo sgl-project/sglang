@@ -60,7 +60,7 @@ void chunk_gated_delta_rule_kernel_impl(
     const int64_t& global_total_seq_length,
     const int64_t& global_num_chunk,
     const int64_t& buff_size_16bit_per_thread,
-    double eps = 1e-5) {
+    double eps = 1e-6) {
   int64_t gStrideH = 1;
   int64_t gStrideT = v_num_head;
   int64_t bStrideH = 1;
@@ -853,7 +853,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
   double scale = 1 / std::sqrt(head_dim);
   fVec scale_vec = fVec(scale);
   if (use_qk_l2norm_in_kernel) {
-    float eps = 1e-5;
+    float eps = 1e-6;
     at::parallel_for(0, batch_size * seq_len * num_heads, 0, [&](int64_t begin, int64_t end) {
       int64_t bi{0}, si{0}, ni{0};
       data_index_init(begin, bi, batch_size, si, seq_len, ni, num_heads);
@@ -1106,7 +1106,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& cu_seqlens,
     bool head_first,
     bool use_qk_l2norm_in_kernel,
-    double eps = 1e-5) {
+    double eps = 1e-6) {
   TORCH_CHECK(head_first == false, "chunk_gated_delta_rule_cpu does not support head first");
   int64_t B = query.size(0);
   int64_t global_seq_len = query.size(1);

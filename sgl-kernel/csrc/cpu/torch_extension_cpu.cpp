@@ -525,7 +525,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
       "Tensor initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
-      "bool use_qk_l2norm_in_kernel, float eps=1e-5) -> (Tensor, Tensor)");
+      "bool use_qk_l2norm_in_kernel, float eps=1e-6) -> (Tensor, Tensor)");
   m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
 
   // weight prepack
