@@ -28,7 +28,9 @@ class TokenArray:
     def __getitem__(self, idx: Union[int, slice]) -> Union[int, array]:
         return self._data[idx]
 
-    def __setitem__(self, idx: Union[int, slice], values: Union[int, Iterable[int]]) -> None:
+    def __setitem__(
+        self, idx: Union[int, slice], values: Union[int, Iterable[int]]
+    ) -> None:
         self._data[idx] = values
 
     def __iter__(self) -> Iterator[int]:

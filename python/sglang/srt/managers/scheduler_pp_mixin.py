@@ -24,12 +24,12 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.mem_cache.token_array import TokenArray
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.token_array import TokenArray
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,

@@ -63,7 +63,6 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.token_array import TokenArray
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -80,6 +79,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.token_array import TokenArray
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
