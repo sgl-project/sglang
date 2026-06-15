@@ -129,14 +129,6 @@ class GPTQMoEAscendKernel:
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
-    def _pack_to_int32(self, weight: torch.Tensor) -> torch.Tensor:
-        # pack 4 int8 (representing 8 int4) into int32
-        assert weight.shape[-1] % 4 == 0, (
-            f"Last dimension of weight must be divisible by 4 for int8→int32 packing, "
-            f"got shape {weight.shape}"
-        )
-        return weight.contiguous().view(torch.int32)
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
             -1, layer.w13_qzeros.shape[-1]
