@@ -911,8 +911,10 @@ class EAGLEWorker(TpModelWorker):
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = self._renorm_draft_probs(
-                logits_output.next_token_logits, forward_batch.sampling_info
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                forward_batch.sampling_info,
+                self.server_args.speculative_use_rejection_sampling,
             )
 
             if self.server_args.speculative_use_rejection_sampling:
@@ -1258,8 +1260,10 @@ class EAGLEWorker(TpModelWorker):
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             # Non-cuda-graph path: compute topk_p / topk_index inline.
-            probs = self._renorm_draft_probs(
-                logits_output.next_token_logits, forward_batch.sampling_info
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                forward_batch.sampling_info,
+                self.server_args.speculative_use_rejection_sampling,
             )
             if self.server_args.speculative_use_rejection_sampling:
                 topk_p, topk_index = fast_sample(probs, num_samples=1)
@@ -1307,7 +1311,11 @@ class EAGLEWorker(TpModelWorker):
         draft_input: EagleDraftInput,
         sampling_info=None,
     ):
-        probs = self._renorm_draft_probs(logits_output.next_token_logits, sampling_info)
+        probs = renorm_draft_probs(
+            logits_output.next_token_logits,
+            sampling_info,
+            self.server_args.speculative_use_rejection_sampling,
+        )
         if self.server_args.speculative_use_rejection_sampling:
             draft_input.topk_p, draft_input.topk_index = fast_sample(
                 probs, num_samples=1
@@ -1318,15 +1326,6 @@ class EAGLEWorker(TpModelWorker):
                 probs, self.topk, dim=-1
             )
         draft_input.hidden_states = logits_output.hidden_states
-
-    def _renorm_draft_probs(
-        self, next_token_logits: torch.Tensor, sampling_info=None
-    ) -> torch.Tensor:
-        return renorm_draft_probs(
-            next_token_logits,
-            sampling_info,
-            self.server_args.speculative_use_rejection_sampling,
-        )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

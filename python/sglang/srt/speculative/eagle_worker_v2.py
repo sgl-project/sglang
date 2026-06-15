@@ -572,8 +572,10 @@ class EagleDraftWorker(BaseDraftWorker):
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             if self.server_args.speculative_use_rejection_sampling:
-                probs = self._renorm_draft_probs(
-                    logits_output.next_token_logits, forward_batch.sampling_info
+                probs = renorm_draft_probs(
+                    logits_output.next_token_logits,
+                    forward_batch.sampling_info,
+                    self.server_args.speculative_use_rejection_sampling,
                 )
                 topk_p, topk_index = fast_sample(probs, num_samples=1)
                 draft_probs_list.append(probs)
@@ -583,8 +585,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
                 topk_p = torch.ones_like(topk_index, dtype=torch.float32)
             else:
-                probs = self._renorm_draft_probs(
-                    logits_output.next_token_logits, forward_batch.sampling_info
+                probs = renorm_draft_probs(
+                    logits_output.next_token_logits,
+                    forward_batch.sampling_info,
+                    self.server_args.speculative_use_rejection_sampling,
                 )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
@@ -629,15 +633,6 @@ class EagleDraftWorker(BaseDraftWorker):
             else None
         )
         return parent_list, top_scores_index, draft_tokens, draft_probs
-
-    def _renorm_draft_probs(
-        self, next_token_logits: torch.Tensor, sampling_info=None
-    ) -> torch.Tensor:
-        return renorm_draft_probs(
-            next_token_logits,
-            sampling_info,
-            self.server_args.speculative_use_rejection_sampling,
-        )
 
     def draft_extend(self):
         pass
@@ -711,8 +706,10 @@ class EagleDraftWorker(BaseDraftWorker):
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         # Update spec_info for the next draft step
-        probs = self._renorm_draft_probs(
-            logits_output.next_token_logits, batch.sampling_info
+        probs = renorm_draft_probs(
+            logits_output.next_token_logits,
+            batch.sampling_info,
+            self.server_args.speculative_use_rejection_sampling,
         )
         if self.server_args.speculative_use_rejection_sampling:
             next_draft_input.topk_p, next_draft_input.topk_index = fast_sample(
@@ -808,8 +805,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 select_index
             ]
         if self.server_args.speculative_use_rejection_sampling:
-            probs = self._renorm_draft_probs(
-                draft_logits_output.next_token_logits, batch.sampling_info
+            probs = renorm_draft_probs(
+                draft_logits_output.next_token_logits,
+                batch.sampling_info,
+                self.server_args.speculative_use_rejection_sampling,
             )
             ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
             ret_draft_probs = probs
@@ -820,8 +819,10 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
-            probs = self._renorm_draft_probs(
-                draft_logits_output.next_token_logits, batch.sampling_info
+            probs = renorm_draft_probs(
+                draft_logits_output.next_token_logits,
+                batch.sampling_info,
+                self.server_args.speculative_use_rejection_sampling,
             )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None

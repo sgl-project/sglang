@@ -29,7 +29,11 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.speculative.spec_utils import fast_sample, fast_topk
+from sglang.srt.speculative.spec_utils import (
+    fast_sample,
+    fast_topk,
+    renorm_draft_probs,
+)
 from sglang.srt.utils import (
     is_hip,
     require_attn_tp_gather,
@@ -456,8 +460,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch,
             )
             if self.eagle_worker.server_args.speculative_use_rejection_sampling:
-                probs = self.eagle_worker._renorm_draft_probs(
-                    ret.next_token_logits, forward_batch.sampling_info
+                probs = renorm_draft_probs(
+                    ret.next_token_logits,
+                    forward_batch.sampling_info,
+                    self.eagle_worker.server_args.speculative_use_rejection_sampling,
                 )
                 ret.topk_p, ret.topk_index = fast_sample(probs, num_samples=1)
                 ret.draft_probs = probs
