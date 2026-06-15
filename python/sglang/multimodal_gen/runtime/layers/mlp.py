@@ -15,6 +15,7 @@ from diffusers.models.activations import (
 )
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
+from sglang.multimodal_gen.runtime.layers.fused_linear_act import FusedTanhGELU
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -88,6 +89,7 @@ class FeedForward(nn.Module):
         activation_fn: str = "geglu",
         inner_dim=None,
         bias: bool = True,
+        enable_fused_gelu: bool = True,
     ):
         super().__init__()
         if inner_dim is None:
@@ -97,7 +99,11 @@ class FeedForward(nn.Module):
         if activation_fn == "gelu":
             act_fn = GELU(dim, inner_dim, bias=bias)
         if activation_fn == "gelu-approximate":
-            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias)
+            # Fused tanh-GELU (cublasLt epilogue); same `proj` checkpoint keys as
+            # the diffusers GELU, with a safe fallback for unsupported layers.
+            act_fn = FusedTanhGELU(
+                dim, inner_dim, bias=bias, disable_fused=not enable_fused_gelu
+            )
         elif activation_fn == "geglu":
             act_fn = GEGLU(dim, inner_dim, bias=bias)
         elif activation_fn == "geglu-approximate":

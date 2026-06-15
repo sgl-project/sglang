@@ -798,13 +798,20 @@ class FluxTransformerBlock(nn.Module):
                 prefix=f"{prefix}.ff_context" if prefix else "ff_context",
             )
         else:
+            # Quantized FLUX checkpoints have strict image consistency checks;
+            # keep their unquantized FFN layers on the reference GELU path.
+            enable_fused_gelu = quant_config is None
             self.ff = FeedForward(
-                dim=dim, dim_out=dim, activation_fn="gelu-approximate"
+                dim=dim,
+                dim_out=dim,
+                activation_fn="gelu-approximate",
+                enable_fused_gelu=enable_fused_gelu,
             )
             self.ff_context = FeedForward(
                 dim=dim,
                 dim_out=dim,
                 activation_fn="gelu-approximate",
+                enable_fused_gelu=enable_fused_gelu,
             )
 
     def forward(
