@@ -15,7 +15,12 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_local_torch_device,
+    get_tp_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
@@ -35,8 +40,10 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
+    RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -71,6 +78,10 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
     if padded_len % sp_world_size != 0:
         padded_len += sp_world_size - (padded_len % sp_world_size)
     return padded_len // sp_world_size
+
+
+def _tp_world_size() -> int:
+    return get_tp_world_size() if model_parallel_is_initialized() else 1
 
 
 def _get_qkv_projections(
@@ -516,6 +527,13 @@ class QwenImageCrossAttention(nn.Module):
         self.parallel_attention = parallel_attention
         self.added_kv_proj_dim = added_kv_proj_dim
         self.prefix = prefix
+        self.tp_size = _tp_world_size()
+        self.shard_qkv = self.tp_size > 1 and not isinstance(
+            quant_config, NunchakuConfig
+        )
+        self.local_num_heads = (
+            divide(num_heads, self.tp_size) if self.shard_qkv else num_heads
+        )
 
         self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
 
@@ -528,28 +546,32 @@ class QwenImageCrossAttention(nn.Module):
                 dim,
                 [self.inner_dim] * 3,
                 bias=True,
+                gather_output=not self.shard_qkv,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_qkv",
             )
         else:
-            self.to_q = ReplicatedLinear(
+            self.to_q = ColumnParallelLinear(
                 dim,
                 self.inner_dim,
                 bias=True,
+                gather_output=not self.shard_qkv,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_q",
             )
-            self.to_k = ReplicatedLinear(
+            self.to_k = ColumnParallelLinear(
                 dim,
                 self.inner_dim,
                 bias=True,
+                gather_output=not self.shard_qkv,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_k",
             )
-            self.to_v = ReplicatedLinear(
+            self.to_v = ColumnParallelLinear(
                 dim,
                 self.inner_dim,
                 bias=True,
+                gather_output=not self.shard_qkv,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_v",
             )
@@ -565,37 +587,44 @@ class QwenImageCrossAttention(nn.Module):
                     added_kv_proj_dim,
                     [self.inner_dim] * 3,
                     bias=True,
+                    gather_output=not self.shard_qkv,
                     quant_config=quant_config,
                     prefix=f"{prefix}.to_added_qkv",
                 )
             else:
-                self.add_q_proj = ReplicatedLinear(
+                self.add_q_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=True,
+                    gather_output=not self.shard_qkv,
                     quant_config=quant_config,
                     prefix=f"{prefix}.add_q_proj",
                 )
-                self.add_k_proj = ReplicatedLinear(
+                self.add_k_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=True,
+                    gather_output=not self.shard_qkv,
                     quant_config=quant_config,
                     prefix=f"{prefix}.add_k_proj",
                 )
-                self.add_v_proj = ReplicatedLinear(
+                self.add_v_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=True,
+                    gather_output=not self.shard_qkv,
                     quant_config=quant_config,
                     prefix=f"{prefix}.add_v_proj",
                 )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(
+            out_proj_cls = RowParallelLinear if self.shard_qkv else ReplicatedLinear
+            out_proj_kwargs = {"input_is_parallel": True} if self.shard_qkv else {}
+            self.to_add_out = out_proj_cls(
                 self.inner_dim,
                 self.dim,
                 bias=out_bias,
+                **out_proj_kwargs,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_add_out",
             )
@@ -604,11 +633,14 @@ class QwenImageCrossAttention(nn.Module):
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
+            out_proj_cls = RowParallelLinear if self.shard_qkv else ReplicatedLinear
+            out_proj_kwargs = {"input_is_parallel": True} if self.shard_qkv else {}
             self.to_out.append(
-                ReplicatedLinear(
+                out_proj_cls(
                     self.inner_dim,
                     self.dim,
                     bias=out_bias,
+                    **out_proj_kwargs,
                     quant_config=quant_config,
                     prefix=f"{prefix}.to_out.0",
                 )
@@ -621,7 +653,7 @@ class QwenImageCrossAttention(nn.Module):
 
         # Scaled dot product attention
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_num_heads if self.shard_qkv else num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -670,13 +702,14 @@ class QwenImageCrossAttention(nn.Module):
         ) = _get_qkv_projections(self, hidden_states, encoder_hidden_states)
 
         # Reshape for multi-head attention
-        img_query = img_query.unflatten(-1, (self.num_heads, -1))
-        img_key = img_key.unflatten(-1, (self.num_heads, -1))
-        img_value = img_value.unflatten(-1, (self.num_heads, -1))
+        num_heads = self.local_num_heads if self.shard_qkv else self.num_heads
+        img_query = img_query.unflatten(-1, (num_heads, -1))
+        img_key = img_key.unflatten(-1, (num_heads, -1))
+        img_value = img_value.unflatten(-1, (num_heads, -1))
 
-        txt_query = txt_query.unflatten(-1, (self.num_heads, -1))
-        txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
-        txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
+        txt_query = txt_query.unflatten(-1, (num_heads, -1))
+        txt_key = txt_key.unflatten(-1, (num_heads, -1))
+        txt_value = txt_value.unflatten(-1, (num_heads, -1))
 
         img_cache = txt_cache = None
         if image_rotary_emb is not None:
@@ -770,10 +803,11 @@ class QwenImageGELU(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.proj = ReplicatedLinear(
+        self.proj = ColumnParallelLinear(
             dim,
             inner_dim,
             bias=True,
+            gather_output=False,
             quant_config=quant_config,
             prefix=f"{prefix}.proj",
         )
@@ -803,10 +837,11 @@ class QwenImageFeedForward(nn.Module):
                     prefix=f"{prefix}.net.0",
                 ),
                 nn.Dropout(0.0),
-                ReplicatedLinear(
+                RowParallelLinear(
                     inner_dim,
                     dim_out,
                     bias=True,
+                    input_is_parallel=True,
                     quant_config=quant_config,
                     prefix=f"{prefix}.net.2",
                 ),
