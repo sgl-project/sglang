@@ -2791,12 +2791,12 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # FlashInfer's TRTLLM AllReduce Fusion supports SM90/100, enable it by default
-        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
-        # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
-        # trtllm: single-node. mnnvl: single-node on SM90, single- and
-        # multi-node on SM100. auto resolves to mnnvl wherever it is supported
-        # (SM100, or SM90 single-node) and to trtllm otherwise.
+        # Auto-enable FlashInfer AllReduce Fusion on SM100 only, for models with
+        # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
+        # Qwen3/Qwen3Next/Qwen3.5 MoE families). SM90 is not auto-enabled because
+        # auto resolves to mnnvl, which requires a working NVLink multicast fabric
+        # that SM90 nodes do not reliably have; SM90 users can opt in explicitly
+        # via --flashinfer-allreduce-fusion-backend.
         if (
             self.flashinfer_allreduce_fusion_backend is None
             and model_arch
@@ -2815,15 +2815,14 @@ class ServerArgs:
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
             ]
-            and (is_sm90_supported() or is_sm100_supported())
+            and is_sm100_supported()
             and self.tp_size > 1
             and not self.enable_dp_attention
-            and (self.nnodes == 1 or is_sm100_supported())
             and self.moe_a2a_backend == "none"
         ):
             self.flashinfer_allreduce_fusion_backend = "auto"
             logger.info(
-                f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
+                f"Auto-enabling FlashInfer AllReduce Fusion on SM10X for {model_arch}"
             )
 
         # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments
