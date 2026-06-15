@@ -16,10 +16,6 @@ _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
 logger = logging.getLogger(__name__)
 
-# Sentinel for "allocatable count not applicable this pass" (chunked prefill in
-# flight, or caller omitted it); large so it never constrains the min().
-_ALLOCATABLE_NA = 1 << 30
-
 
 @dataclass(frozen=True)
 class _State:
@@ -107,7 +103,7 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len, num_allocatable_reqs.
+        # waiting_queue_len, allocatable_below_threshold.
         self._global_info_buffer = torch.empty(
             (dp_size_dim, attn_tp_size, 6),
             dtype=torch.int64,
@@ -164,6 +160,14 @@ class PrefillDelayer:
             and ((x := self._token_usage_low_watermark) is not None)
             and (token_usage < x)
         )
+        # Local view of the allocatable-slots trigger; gathered as a bool so a
+        # rank where it doesn't apply (chunked prefill in flight, or no count
+        # provided) contributes False without a numeric sentinel.
+        local_allocatable_below = (
+            self._min_allocatable_reqs is not None
+            and num_allocatable_reqs is not None
+            and num_allocatable_reqs < self._min_allocatable_reqs
+        )
 
         # Gather global states
         tp0_info = self._gather_info(
@@ -172,14 +176,14 @@ class PrefillDelayer:
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
-            num_allocatable_reqs=num_allocatable_reqs,
+            local_allocatable_below=local_allocatable_below,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
-        global_num_allocatable_reqs = tp0_info[:, 5]
+        global_allocatable_below = tp0_info[:, 5]
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -248,11 +252,10 @@ class PrefillDelayer:
             # min_allocatable_reqs slots are free, batching freed slots into one
             # admission. Targets workloads where each admission is expensive
             # (e.g. speculative decoding with a separate draft prefill pass).
+            # Fires when any rank is below threshold (min < t == any i < t).
             allocatable_condition = (
-                self._min_allocatable_reqs is not None
-                and global_running_batch_max > 0
-                and int(global_num_allocatable_reqs.min().item())
-                < self._min_allocatable_reqs
+                global_running_batch_max > 0
+                and global_allocatable_below.max().item() > 0
             )
 
             # Wall-clock cap on the adaptive triggers to bound worst-case TTFT.
@@ -336,7 +339,7 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
-        num_allocatable_reqs: Optional[int] = None,
+        local_allocatable_below: bool = False,
     ):
         local_info = torch.tensor(
             [
@@ -345,11 +348,7 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
-                (
-                    _ALLOCATABLE_NA
-                    if num_allocatable_reqs is None
-                    else num_allocatable_reqs
-                ),
+                int(local_allocatable_below),
             ],
             device=self._gather_device,
             dtype=torch.int64,
