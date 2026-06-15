@@ -142,6 +142,41 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             )
         self.whitespace_pattern = whitespace_pattern
 
+    @property
+    def is_support_token_filter(self):
+        return True
+
+    @staticmethod
+    def set_token_filter(
+        vocab_mask: torch.Tensor,
+        token_ids: List[int],
+        batch_idx: int,
+        is_allowed: bool = True,
+        reset_vocab_mask: bool = True,
+    ):
+        row = vocab_mask[batch_idx]
+        if reset_vocab_mask:
+            row.fill_(is_allowed)
+        if not token_ids:
+            return
+        token_ids_tensor = torch.tensor(
+            token_ids, dtype=torch.int64, device=vocab_mask.device
+        )
+        row[token_ids_tensor] = not is_allowed
+
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask.to(device, non_blocking=True)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):
+        logits.masked_fill_(vocab_mask, float("-inf"))
+
     def _compile_regex(self, regex: str) -> BaseGrammarObject:
         try:
             if hasattr(RegexGuide, "from_regex"):
