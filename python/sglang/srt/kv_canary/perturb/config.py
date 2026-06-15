@@ -25,7 +25,7 @@ class PerturbConfig:
     warmup_steps: int
 
     @classmethod
-    def from_env(cls) -> "PerturbConfig":
+    def from_env(cls) -> PerturbConfig:
         real_kv_used_prob = envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB.get()
         real_kv_unused_cache_prob = (
             envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB.get()

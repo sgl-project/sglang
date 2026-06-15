@@ -91,7 +91,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
     def __init__(
         self,
-        model_runner: "ModelRunner",
+        model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
@@ -221,8 +221,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         kv_a: torch.Tensor,
         k_pe: torch.Tensor,
         positions: torch.Tensor,
-        layer: "DeepseekV2AttentionMLA",
-        forward_batch: "ForwardBatch",
+        layer: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build FP8 (Q, K, V) for the FMHA kernel and write FP8 KV cache."""
         kv = layer.kv_b_proj(kv_a)[0]
@@ -278,7 +278,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         max_seq_len: int,
-        layer: "RadixAttention",
+        layer: RadixAttention,
     ) -> torch.Tensor:
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
@@ -308,7 +308,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: "RadixAttention",
+        layer: RadixAttention,
         batch_size: int,
         cum_seq_lens_q: torch.Tensor,
         max_q_len: int,
@@ -342,7 +342,7 @@ class TokenspeedMLAMultiStepDraftBackend(TRTLLMMLAMultiStepDraftBackend):
     """Multi-step draft backend for tokenspeed_mla used by EAGLE."""
 
     def __init__(
-        self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int
+        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
         # Parent populates self.attn_backends with TRT-LLM instances; replace

@@ -23,8 +23,11 @@ def _jit_compress_norm_rope_module(
     head_dim: int,
     rope_dim: int,
     page_size: int,
+    bf16_store: bool = False,
 ) -> Module:
-    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    args = make_cpp_args(
+        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
+    )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
         cuda_wrappers.append(
@@ -339,12 +342,13 @@ def compress_norm_rope_store(
     kvcache: torch.Tensor,
     page_size: int,
     use_fp4: bool = False,
+    bf16_store: bool = False,
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
-        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
     )
     fn = module.forward_fp4 if use_fp4 else module.forward
     fn(

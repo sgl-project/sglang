@@ -853,8 +853,8 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             rks.append(rk)
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks.append(torch.ones((), dtype=h.dtype, device=h.device))
+        rks = torch.stack(rks).to(device=device)
 
         R = []
         b = []
@@ -879,7 +879,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b).to(device=device)
 
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)  # (B, K)
@@ -991,8 +991,8 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             rks.append(rk)
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks.append(torch.ones((), dtype=h.dtype, device=h.device))
+        rks = torch.stack(rks).to(device=device)
 
         R = []
         b = []
@@ -1017,7 +1017,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b).to(device=device)
 
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)
