@@ -181,11 +181,12 @@ sgl-eval run gpqa \\
     },
   },
 
-  // NVIDIA Blackwell: one validated single-node tp4 recipe per family. fa4 +
-  // page 128 + deep_gemm are the M3 SM100 auto-defaults on current main, so this
-  // is also the bare-launch behavior; they engage MiniMax's MSA sparse-attention
-  // kernel (fmha_sm100, pre-installed in the dev-minimax-m3 images; see
-  // Configuration Tips), Triton fallback otherwise.
+  // NVIDIA Blackwell: one validated single-node recipe per family — tp4 across
+  // B300 / GB200 / GB300, tp8 on B200. fa4 + page 128 + deep_gemm are the M3
+  // SM100 auto-defaults on current main, so this is also the bare-launch
+  // behavior; they engage MiniMax's MSA sparse-attention kernel (fmha_sm100,
+  // pre-installed in the dev-minimax-m3 images; see Configuration Tips), Triton
+  // fallback otherwise.
   // AMD: tp8. MI350X/MI355X (gfx950) serve MXFP8 natively (backends auto). MI300X/
   // MI325X (gfx942) need --attention-backend aiter + --moe-runner-backend triton,
   // and the MXFP8 weights are auto-converted to block-fp8 at load; the cold-start
