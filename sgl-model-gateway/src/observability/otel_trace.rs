@@ -10,7 +10,12 @@ use std::{
 
 use anyhow::Result;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
+use opentelemetry::{
+    global,
+    propagation::Extractor,
+    trace::{TraceContextExt, TracerProvider as _},
+    Context as OtelContext, KeyValue,
+};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
@@ -205,6 +210,29 @@ pub fn shutdown_otel() {
         ENABLED.store(false, Ordering::Release);
         eprintln!("[tracing] OpenTelemetry shut down");
     }
+}
+
+/// Extract W3C trace context from HTTP request headers.
+#[inline]
+pub fn extract_trace_context_http(headers: &HeaderMap) -> Option<OtelContext> {
+    struct HeaderExtractor<'a>(&'a HeaderMap);
+
+    impl Extractor for HeaderExtractor<'_> {
+        #[inline]
+        fn get(&self, key: &str) -> Option<&str> {
+            self.0.get(key).and_then(|value| value.to_str().ok())
+        }
+
+        #[inline]
+        fn keys(&self) -> Vec<&str> {
+            self.0.keys().map(HeaderName::as_str).collect()
+        }
+    }
+
+    let context =
+        global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(headers)));
+
+    context.span().span_context().is_valid().then_some(context)
 }
 
 /// Inject W3C trace context headers into an HTTP request.
