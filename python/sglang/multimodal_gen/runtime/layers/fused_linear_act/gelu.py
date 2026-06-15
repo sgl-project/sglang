@@ -1,4 +1,4 @@
-"""Fused linear + tanh-GELU via the cublasLt GELU epilogue.
+"""Fused linear + tanh-GELU kernels via the cublasLt GELU epilogue.
 
 Many diffusion DiT FeedForwards compute ``gelu(linear(x))`` as a standalone GEMM
 followed by a separate, bandwidth-bound GELU kernel over the ``[tokens, 4*dim]``

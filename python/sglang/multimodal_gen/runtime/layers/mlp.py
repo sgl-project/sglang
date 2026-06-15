@@ -15,7 +15,7 @@ from diffusers.models.activations import (
 )
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.layers.fused_gelu import FusedTanhGELU
+from sglang.multimodal_gen.runtime.layers.fused_linear_act import FusedTanhGELU
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
