@@ -2125,10 +2125,10 @@ class GetLoadsReqOutput(BaseReq):
     num_used_tokens: int = field(
         metadata={"metric": ("gauge", "Number of tokens in use")}
     )
-    # num_used_tokens + pending prefill tokens (waiting-queue seqlen, incl.
-    # disagg bootstrap/prealloc/transfer queues). Used for DP balance.
+    # num_used_tokens plus pending tokens not already allocated in the KV pool.
+    # Used for DP balance.
     num_total_tokens: int = field(
-        metadata={"metric": ("gauge", "Used tokens plus pending prefill tokens")}
+        metadata={"metric": ("gauge", "Used tokens plus pending unallocated tokens")}
     )
     max_total_num_tokens: int = field(
         metadata={"metric": ("gauge", "Maximum token capacity")}
