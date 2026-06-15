@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Sequence, Union
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
+from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -18,8 +20,8 @@ if TYPE_CHECKING:
 
 
 def decide_needs_cpu_seq_lens(
-    server_args: "ServerArgs",
-    attn_backends: Sequence["AttentionBackend"],
+    server_args: ServerArgs,
+    attn_backends: Sequence[AttentionBackend],
 ) -> bool:
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
@@ -29,7 +31,11 @@ def decide_needs_cpu_seq_lens(
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
-    if not server_args.disable_piecewise_cuda_graph:
+    cuda_graph_config = server_args.cuda_graph_config
+    if (
+        cuda_graph_config is not None
+        and cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE
+    ):
         # FIXME: support PCG without seq lens cpu value
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
@@ -57,25 +63,6 @@ def _assert_nonneg_and_invalidate(
     Compiled so the reduction + assert + scatter run as one kernel launch."""
     torch._assert_async((values >= 0).all())
     buf[indices] = -1
-
-
-@torch.compile(dynamic=True, disable=_is_npu)
-def _gather_spec_extras(
-    indices: torch.Tensor,
-    topk_p_buf: torch.Tensor,
-    topk_index_buf: torch.Tensor,
-    output_tokens_buf: torch.Tensor,
-    hidden_states_buf: Optional[torch.Tensor],
-):
-    """Compiled gather of spec extras. `hidden_states_buf` is None when the
-    build does not capture hidden states."""
-    topk_p = topk_p_buf[indices]
-    topk_index = topk_index_buf[indices]
-    bonus_tokens = output_tokens_buf[indices]
-    hidden_states = (
-        hidden_states_buf[indices] if hidden_states_buf is not None else None
-    )
-    return topk_p, topk_index, bonus_tokens, hidden_states
 
 
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
@@ -106,8 +93,9 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
                 batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
             )
 
-    # spec_v1 (non-overlap spec) doesn't relay extras; only spec_v2 does.
-    if batch.is_spec_v2:
+    # Only the overlap path relays spec extras through the future_map; the
+    # synchronous (non-overlap) V2 path installs next_draft_input directly.
+    if batch.enable_overlap and not batch.spec_algorithm.is_none():
         future_map._resolve_spec_extras(batch)
 
 
@@ -162,19 +150,44 @@ class FutureMap:
     def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
         self._forward_buf_initialized = True
 
-        topk_p0 = draft_input.topk_p[0]
-        topk_index0 = draft_input.topk_index[0]
-        self.topk_p_buf = torch.empty(
-            (self.req_pool_size, *topk_p0.shape),
-            dtype=topk_p0.dtype,
-            device=self.device,
+        self.need_verified_id = getattr(draft_input, "verified_id", None) is not None
+        self.need_bonus_tokens = getattr(draft_input, "bonus_tokens", None) is not None
+        self.need_topk = self.spec_algo.need_topk()
+        self.need_hidden_states = (
+            spec_need_hidden_states()
+            and getattr(draft_input, "hidden_states", None) is not None
         )
-        self.topk_index_buf = torch.empty(
-            (self.req_pool_size, *topk_index0.shape),
-            dtype=topk_index0.dtype,
-            device=self.device,
-        )
-        if spec_need_hidden_states():
+
+        if self.need_verified_id:
+            verified_id0 = draft_input.verified_id[0]
+            self.verified_id_buf = (
+                torch.full(
+                    (self.req_pool_size, *verified_id0.shape),
+                    -1,
+                    dtype=verified_id0.dtype,
+                    device=self.device,
+                )
+                if _DEBUG_ASSERT
+                else torch.empty(
+                    (self.req_pool_size, *verified_id0.shape),
+                    dtype=verified_id0.dtype,
+                    device=self.device,
+                )
+            )
+        if self.need_topk:
+            topk_p0 = draft_input.topk_p[0]
+            topk_index0 = draft_input.topk_index[0]
+            self.topk_p_buf = torch.empty(
+                (self.req_pool_size, *topk_p0.shape),
+                dtype=topk_p0.dtype,
+                device=self.device,
+            )
+            self.topk_index_buf = torch.empty(
+                (self.req_pool_size, *topk_index0.shape),
+                dtype=topk_index0.dtype,
+                device=self.device,
+            )
+        if self.need_hidden_states:
             hidden_states0 = draft_input.hidden_states[0]
             self.hidden_states_buf = torch.empty(
                 (self.req_pool_size, *hidden_states0.shape),
@@ -183,42 +196,75 @@ class FutureMap:
             )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+        if self.spec_algo.is_ngram():
+            # FIXME: remove once precomputed draft is supported.
+            return
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
+        if self.spec_algo.is_dflash() and getattr(
+            draft_input, "direct_carry_valid", False
+        ):
+            return
         indices = draft_input.future_indices
+        if indices.shape[0] == 0:
+            return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         indices.record_stream(torch.get_device_module(self.device).current_stream())
-        hidden_states_buf = (
-            self.hidden_states_buf if spec_need_hidden_states() else None
-        )
-        (
-            draft_input.topk_p,
-            draft_input.topk_index,
-            draft_input.bonus_tokens,
-            hidden_states,
-        ) = _gather_spec_extras(
-            indices,
-            self.topk_p_buf,
-            self.topk_index_buf,
-            self.output_tokens_buf,
-            hidden_states_buf,
-        )
-        if hidden_states is not None:
-            draft_input.hidden_states = hidden_states
-        if _DEBUG_ASSERT:
-            _assert_nonneg_and_invalidate(
-                draft_input.bonus_tokens, self.output_tokens_buf, indices
+        if self.need_verified_id:
+            draft_input.verified_id = self.verified_id_buf[indices]
+        if self.need_topk:
+            hidden_states_buf = (
+                self.hidden_states_buf if self.need_hidden_states else None
             )
+            (
+                draft_input.topk_p,
+                draft_input.topk_index,
+                bonus_tokens,
+                hidden_states,
+            ) = gather_spec_extras(
+                indices,
+                self.topk_p_buf,
+                self.topk_index_buf,
+                self.output_tokens_buf,
+                hidden_states_buf,
+            )
+            if self.need_bonus_tokens:
+                draft_input.bonus_tokens = bonus_tokens
+            if hidden_states is not None:
+                draft_input.hidden_states = hidden_states
+        elif self.need_bonus_tokens:
+            draft_input.bonus_tokens = self.output_tokens_buf[indices]
+        if self.need_hidden_states and not self.need_topk:
+            draft_input.hidden_states = self.hidden_states_buf[indices]
+        if _DEBUG_ASSERT:
+            if self.need_verified_id:
+                _assert_nonneg_and_invalidate(
+                    draft_input.verified_id, self.verified_id_buf, indices
+                )
+            if self.need_bonus_tokens:
+                _assert_nonneg_and_invalidate(
+                    draft_input.bonus_tokens, self.output_tokens_buf, indices
+                )
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
-        # seq_lens_cpu may be needed on the host for kernel-launch prep (some backends).
-        # Run this D2H on a standalone stream to avoid chain-blocking forward_n ->
-        # prepare_{n+1}: a sync on the schedule stream would inherit its WAR barrier and
-        # stall the host until forward_n ends.
-        fi = batch.spec_info.future_indices if batch.spec_info is not None else None
+        # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
+        # schedule). DFLASH intentionally keeps host-side lengths lagging and
+        # uses its carried KV allocation watermark for planning, so only the GPU
+        # seq_lens is resolved there. Other spec-v2 algorithms still need the CPU
+        # mirror for host planning; use a private D2H stream for those copies.
+        draft_input = batch.spec_info
+        if draft_input is None:
+            return
+        if self.spec_algo.is_dflash() and getattr(
+            draft_input, "direct_carry_valid", False
+        ):
+            batch.seq_lens = draft_input.new_seq_lens
+            return
+
+        fi = draft_input.future_indices
         if fi is None:
             return
         if self.publish_ready is not None:
@@ -228,6 +274,11 @@ class FutureMap:
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        if self.spec_algo.is_dflash():
+            # DFLASH keeps seq_lens_cpu as the lagging committed host view;
+            # planning/reserved host lengths live on DFlashDraftInputV2.
+            return
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
@@ -268,12 +319,15 @@ class FutureMap:
         future_indices: torch.Tensor,
         payload: Union[torch.Tensor, EagleDraftInput],
     ) -> None:
+        if self.spec_algo.is_ngram():
+            # FIXME: remove once precomputed draft is supported.
+            return
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
-        # Dispatch by payload type, not spec_algo: spec_v1 (non-overlap spec)
-        # also passes a token Tensor here.
+        # Dispatch by payload type, not spec_algo: non-spec decode passes a
+        # token Tensor here.
         # FIXME(lsyin): unify this relay path with a dataclass instead of the
         # Tensor / EagleDraftInput type switch.
         if isinstance(payload, torch.Tensor):
@@ -283,14 +337,21 @@ class FutureMap:
         draft_input: EagleDraftInput = payload
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(draft_input)
-        self.output_tokens_buf[indices] = draft_input.bonus_tokens.to(
-            self.output_tokens_buf.dtype
-        )
-        self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
-        self.topk_index_buf[indices] = draft_input.topk_index.to(
-            self.topk_index_buf.dtype
-        )
-        if spec_need_hidden_states():
+        if self.need_verified_id:
+            self.verified_id_buf[indices] = draft_input.verified_id.to(
+                self.verified_id_buf.dtype
+            )
+        if self.need_bonus_tokens:
+            self.output_tokens_buf[indices] = draft_input.bonus_tokens.to(
+                self.output_tokens_buf.dtype
+            )
+
+        if self.need_topk:
+            self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
+            self.topk_index_buf[indices] = draft_input.topk_index.to(
+                self.topk_index_buf.dtype
+            )
+        if self.need_hidden_states:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )

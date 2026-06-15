@@ -18,6 +18,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.i
     Ideogram4DenoisingStage,
     Ideogram4TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
+    ProgressiveDenoisingStageRouter,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.ideogram import (
+    Ideogram4ProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
@@ -115,6 +121,22 @@ class Ideogram4Pipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
     ]
 
+    def _create_denoising_stage(self):
+        transformer = self.get_module("transformer")
+        unconditional_transformer = self.get_module("unconditional_transformer")
+        return ProgressiveDenoisingStageRouter(
+            standard_stage=Ideogram4DenoisingStage(
+                transformer=transformer,
+                unconditional_transformer=unconditional_transformer,
+                pipeline=self,
+            ),
+            progressive_stage_factory=lambda: Ideogram4ProgressiveDenoisingStage(
+                transformer=transformer,
+                unconditional_transformer=unconditional_transformer,
+                pipeline=self,
+            ),
+        )
+
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stage(InputValidationStage())
         self.add_stage_factory(
@@ -128,11 +150,7 @@ class Ideogram4Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_latent_preparation_stage()
         self.add_stage_factory(
             RoleType.DENOISER,
-            lambda: Ideogram4DenoisingStage(
-                transformer=self.get_module("transformer"),
-                unconditional_transformer=self.get_module("unconditional_transformer"),
-                pipeline=self,
-            ),
+            self._create_denoising_stage,
             "ideogram4_denoising_stage",
         )
         self.add_stage_factory(
