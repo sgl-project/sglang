@@ -222,25 +222,26 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
-# Single-stream (ForwardPattern.Pattern_3) transformer models not registered in
-# cache-dit's BlockAdapterRegister, mapped to their block-list attribute name.
-# cache-dit auto-resolves check_forward_pattern and blocks_name, so only the
-# attribute name is model-specific here.
-_SINGLE_STREAM_PATTERN3_BLOCKS_ATTR: dict[str, str] = {
-    "ErnieImageTransformer2DModel": "layers",
+# Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
+# Value: (blocks attr, forward_pattern, has_separate_cfg). forward_pattern must
+# match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
+# uses Pattern_3). has_separate_cfg=True aligns cache-dit's step counter for
+# sequential CFG (two forwards per step); cache-dit auto-resolves the remaining
+# fields.
+_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern, bool]] = {
+    "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3, True),
 }
 
 
 def _build_custom_block_adapter(
     transformer: torch.nn.Module,
 ) -> Optional[BlockAdapter]:
-    """Build a manual BlockAdapter for a single-stream model absent from
-    cache-dit's registry, or None if the class is unknown."""
-    blocks_attr = _SINGLE_STREAM_PATTERN3_BLOCKS_ATTR.get(
-        transformer.__class__.__name__
-    )
-    if blocks_attr is None:
+    """Build a manual BlockAdapter for a model absent from cache-dit's registry,
+    or None if the class is unknown."""
+    spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
+    if spec is None:
         return None
+    blocks_attr, forward_pattern, has_separate_cfg = spec
     blocks = getattr(transformer, blocks_attr, None)
     if blocks is None:
         raise ValueError(
@@ -250,8 +251,8 @@ def _build_custom_block_adapter(
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
-        forward_pattern=ForwardPattern.Pattern_3,
-        has_separate_cfg=True,
+        forward_pattern=forward_pattern,
+        has_separate_cfg=has_separate_cfg,
     )
 
 
@@ -283,8 +284,8 @@ def enable_cache_on_transformer(
         )
 
     # Prefer the standard path (transformer pre-registered in cache-dit). For
-    # single-transformer models absent from the registry, fall back to a manual
-    # BlockAdapter (see _build_custom_block_adapter).
+    # models absent from the registry, fall back to a manual BlockAdapter (see
+    # _build_custom_block_adapter).
     custom_adapter = None
     if not BlockAdapterRegister.is_supported(transformer):
         custom_adapter = _build_custom_block_adapter(transformer)
