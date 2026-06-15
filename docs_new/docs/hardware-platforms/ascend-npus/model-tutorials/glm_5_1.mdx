@@ -28,7 +28,7 @@ v0.5.10 or a later version.
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto`                                     |
 | Quantization                  | `--quantization modelslim`                                                        |
 | Chunked Prefill               | `--chunked-prefill-size 16384 --max-prefill-tokens 280000`                        |
-| NPU Graph                     | `--cuda-graph-bs 16`                                                       |
+| NPU Graph                     | `--cuda-graph-bs 16`                                                              |
 | Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`              |
 | Multistream MoE               | `export SGLANG_NPU_USE_MULTI_STREAM=1`                                            |

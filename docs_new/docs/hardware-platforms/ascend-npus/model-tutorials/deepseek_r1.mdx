@@ -27,7 +27,7 @@ v0.5.10 or a later version.
 | Expert Parallelism            | `--moe-a2a-backend deepep --deepep-mode auto` (`--ep-size` is automatically set to `--tp`)    |
 | PD Disaggregation             | `--disaggregation-mode prefill --disaggregation-transfer-backend ascend`                      |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| NPU Graph                     | `--cuda-graph-bs 4 8 20 21 22`                                                         |
+| NPU Graph                     | `--cuda-graph-bs 4 8 20 21 22`                                                                |
 | Speculative Decoding          | `--speculative-algorithm NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3` |
 | Overlap Schedule              | `export SGLANG_ENABLE_SPEC_V2=1 SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                          |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
