@@ -172,12 +172,6 @@ curl -X POST http://127.0.0.1:30000/start_profile \
     "activities": ["CPU", "GPU"]
   }'
 
-<Note>
-On Ascend NPU, SGLang uses `torch_npu._apply_patches()` to automatically
-redirect PyTorch Profiler's CUDA activity to NPU, so
-`activities: ["CPU", "GPU"]` actually captures NPU operator events.
-</Note>
-
 # Just send workload — no /stop_profile needed
 curl http://127.0.0.1:30000/generate \
   -H "Content-Type: application/json" \
@@ -229,6 +223,12 @@ sending `/stop_profile`.
 `bench_serving --profile` creates a timestamp subdirectory inside
 `--profile-output-dir` (e.g. `<output_dir>/<timestamp>/`). The output path is
 shown in the server log as `Profiling done. Traces are saved to: <path>`.
+</Note>
+
+<Note>
+On Ascend NPU, SGLang uses <code>torch_npu._apply_patches()</code> to automatically
+redirect PyTorch Profiler CUDA activity to NPU, so
+<code>activities: ["CPU", "GPU"]</code> actually captures NPU operator events.
 </Note>
 
 **`bench_serving --profile` parameters:**
