@@ -10,6 +10,8 @@ from sglang.srt.utils.common import get_num_new_pages
 _is_npu = is_npu()
 
 if _is_npu:
+    import torch_npu
+
     from sglang.srt.hardware_backend.npu.allocator_npu import (
         NPUPagedTokenToKVPoolAllocator,
     )
@@ -297,8 +299,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
+            indices_2d = alloc_full_indices.to(torch.int64).unsqueeze(-1)
+            torch_npu.npu_scatter_nd_update_(
+                self.full_to_swa_index_mapping,
+                indices_2d,
+                alloc_swa_indices.to(torch.int64),
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices

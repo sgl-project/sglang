@@ -802,7 +802,7 @@ class CCA(nn.Module):
 
         if forward_batch.forward_mode.is_decode_or_idle():
             return self._forward_decode(hidden_states, forward_batch)
-        # EXTEND / MIXED / DRAFT_EXTEND / DLLM_EXTEND all share the prefill loop.
+        # EXTEND / MIXED / DLLM_EXTEND all share the prefill loop.
         return self._forward_extend(hidden_states, forward_batch)
 
 
