@@ -5,6 +5,7 @@ from array import array
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.mem_cache.token_array import TokenArray
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -60,7 +61,7 @@ class ReqDllmMixin:
             if self.fill_len == 0
             else self.dllm_block_offset + self.dllm_config.block_size
         )
-        self.full_untruncated_fill_ids = (
+        self.full_untruncated_fill_ids = TokenArray(
             self.origin_input_ids
             + self.output_ids
             + array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)

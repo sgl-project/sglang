@@ -56,55 +56,36 @@ if TYPE_CHECKING:
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
-    __slots__ = ("token_ids", "extra_key", "is_bigram", "limit")
+    __slots__ = ("token_ids", "extra_key", "is_bigram")
 
     def __init__(
         self,
-        token_ids: array[int],
+        token_ids: Union[array[int], memoryview],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
-        limit: Optional[int] = None,
     ):
-        # token ids sequence (raw ints in both modes)
+        # token ids sequence (raw ints in both modes); a readonly memoryview lets
+        # the match path pass a non-copying prefix of a growing buffer.
         self.token_ids = token_ids
         # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
-        # Optional cap on raw tokens: behave as if token_ids were sliced to
-        # token_ids[:limit], without the O(n) copy. None = use all tokens.
-        self.limit = limit
-
-    def _raw_len(self) -> int:
-        n = len(self.token_ids)
-        if self.limit is not None and self.limit < n:
-            return self.limit
-        return n
-
-    def raw_token_ids(self) -> array:
-        """token_ids honoring `limit` (copies only when capped)."""
-        n = self._raw_len()
-        t = self.token_ids
-        return t if n == len(t) else t[:n]
 
     def __len__(self) -> int:
-        n = self._raw_len()
         if self.is_bigram:
+            n = len(self.token_ids)
             return n - 1 if n > 0 else 0
-        return n
+        return len(self.token_ids)
 
     # TODO(Jialin): vectorize with numpy without PyLong boxing
     def __iter__(self) -> Iterator:
-        t = self.token_ids
-        n = self._raw_len()
         if self.is_bigram:
-            for i in range(n - 1 if n > 0 else 0):
+            t = self.token_ids
+            for i in range(len(t) - 1):
                 yield (t[i], t[i + 1])
-        elif n == len(t):
-            yield from t
         else:
-            for i in range(n):
-                yield t[i]
+            yield from self.token_ids
 
     def __getitem__(self, idx: Union[int, slice]) -> RadixKey:
         # Normalize int -> 1-element slice so the rest handles one shape.
@@ -159,7 +140,6 @@ class RadixKey:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
-        assert type(t0) is type(t1), (type(t0), type(t1))
         n = min(len(t0), len(t1))
 
         # Exponential search for the first diverging token: gallop in doubling
@@ -186,7 +166,6 @@ class RadixKey:
             matched = max(0, min(matched_tokens - 1, len(self), len(other)))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
-        matched_tokens = min(matched_tokens, len(self), len(other))
         if page_size == 1:
             return matched_tokens
         return (matched_tokens // page_size) * page_size

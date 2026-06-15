@@ -24,6 +24,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.token_array import TokenArray
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -606,7 +607,7 @@ class SchedulerPPMixin:
                     origin_input_ids=input_ids,
                     sampling_params=sampling_params,
                 )
-                req.full_untruncated_fill_ids = req.origin_input_ids
+                req.full_untruncated_fill_ids = TokenArray(req.origin_input_ids[:])
                 req.fill_len = len(req.full_untruncated_fill_ids)
                 req.logprob_start_len = -1
                 req.set_extend_input_len(req.fill_len - len(req.prefix_indices))

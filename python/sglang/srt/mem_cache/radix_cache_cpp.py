@@ -101,7 +101,7 @@ class RadixCacheCpp(BasePrefixCache):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
-            self.tree.match_prefix(key.raw_token_ids())
+            self.tree.match_prefix(key.token_ids)
         )
         return MatchResult(
             device_indices=self._merge_tensor(device_indices_vec),
@@ -226,9 +226,7 @@ class RadixCacheCpp(BasePrefixCache):
 
         # TODO(dark): optimize the `insert` and `match` (e.g. merge into 1 function)
         # The prefix indices need to updated to reuse the kv indices in the pool
-        new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(
-            RadixKey(token_ids, req.extra_key).token_ids
-        )
+        new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(token_ids)
         new_indices = self._merge_tensor(new_indices_vec)
         assert new_prefix_len <= len(new_indices)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import logging
 import threading
+from array import array
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -217,15 +218,16 @@ class LMCRadixCache(RadixCache):
         LMCache has tokens beyond radix. Otherwise releases
         the held read locks and returns the radix-only result.
         """
-        token_ids = key.raw_token_ids()
+        # key.token_ids may be a readonly memoryview over the request's growing
+        # fill buffer; snapshot it into an owned array before retaining it in the
+        # marker, which outlives this match.
+        token_ids = array("q", key.token_ids)
         matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
         if matched <= value.numel():
             # Release the read locks; keep the pending session for end_session.
             self.lmcache_connector.release_pending(req.rid)
             return base_res
 
-        if token_ids is key.token_ids:
-            token_ids = token_ids[:]
         self._mp_load_back_markers[req.rid] = _LMCacheLoadBackMarker(
             key=RadixKey(token_ids, key.extra_key, key.is_bigram),
             value_numel=int(value.numel()),
@@ -258,7 +260,9 @@ class LMCRadixCache(RadixCache):
         if uncached_len == 0:
             return base_res
 
-        token_ids = key.raw_token_ids()
+        # Snapshot a possibly-readonly memoryview into an owned array: the
+        # load_fn closure runs after this match, when the fill buffer may grow.
+        token_ids = array("q", key.token_ids)
         result = self._load_back(
             key=key,
             value_numel=int(value.numel()),

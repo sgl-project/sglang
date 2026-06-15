@@ -77,6 +77,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.token_array import TokenArray
 from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -377,7 +378,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
             origin_input_ids=array("q", tmp_input_ids),
             sampling_params=sampling_params,
         )
-        req.full_untruncated_fill_ids = req.origin_input_ids
+        req.full_untruncated_fill_ids = TokenArray(req.origin_input_ids[:])
         req.fill_len = len(req.full_untruncated_fill_ids)
         req.logprob_start_len = -1
         req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
@@ -424,7 +425,7 @@ def prepare_synthetic_inputs_for_latency_test(
             origin_input_ids=array("q", input_ids[i]),
             sampling_params=sampling_params,
         )
-        req.full_untruncated_fill_ids = req.origin_input_ids
+        req.full_untruncated_fill_ids = TokenArray(req.origin_input_ids[:])
         req.fill_len = len(req.full_untruncated_fill_ids)
         req.logprob_start_len = -1
         req.set_extend_input_len(req.fill_len - len(req.prefix_indices))

@@ -89,6 +89,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.token_array import TokenArray
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -722,7 +723,7 @@ class Req(ReqDllmMixin):
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
         # never mutates this array's length.
-        self.full_untruncated_fill_ids = array("q")
+        self.full_untruncated_fill_ids = TokenArray()
         self.fill_len: int = 0
 
         self.session = session
@@ -1100,22 +1101,18 @@ class Req(ReqDllmMixin):
         """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
         appending only the new output tokens.
 
-        Falls back to a full rebuild when the in-place append is invalid:
-        - aliasing: scheduler_pp_mixin assigns full_untruncated_fill_ids =
-          origin_input_ids directly, so extending in place would write output
-          tokens into the origin;
-        - lengths disagree: fresh req (array still empty), retraction
-          (output_ids reset to empty), or set_finish_with_abort (origin
-          replaced by a 1-token stub).
+        Falls back to a full rebuild when the in-place append is invalid because
+        lengths disagree: fresh req (array still empty), retraction (output_ids
+        reset to empty), or set_finish_with_abort (origin replaced by a 1-token
+        stub).
         """
         n_have_output = len(self.full_untruncated_fill_ids) - len(self.origin_input_ids)
-        if (
-            self.full_untruncated_fill_ids is not self.origin_input_ids
-            and 0 <= n_have_output <= len(self.output_ids)
-        ):
+        if 0 <= n_have_output <= len(self.output_ids):
             self.full_untruncated_fill_ids.extend(self.output_ids[n_have_output:])
         else:
-            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+            self.full_untruncated_fill_ids = TokenArray(
+                self.origin_input_ids + self.output_ids
+            )
 
     def init_next_round_input(
         self,
@@ -1146,16 +1143,18 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        # Pass the full array with a raw-token cap (limit) instead of slicing,
-        # avoiding an O(context) copy per prefill-batch build.
-        token_ids_to_match = self.full_untruncated_fill_ids
+        # Pass a non-copying readonly prefix view (capped to the matchable
+        # length) instead of slicing, avoiding an O(context) copy per
+        # prefill-batch build.
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
+        token_ids_to_match = self.full_untruncated_fill_ids.readonly_prefix_view(
+            key_limit
+        )
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
             token_ids_to_match = array("q")
-            key_limit = None
 
         if tree_cache is not None:
             if cow_mamba is None:
@@ -1165,7 +1164,6 @@ class Req(ReqDllmMixin):
                     key=RadixKey(
                         token_ids=token_ids_to_match,
                         extra_key=self.extra_key,
-                        limit=key_limit,
                     ),
                     req=self,
                     cow_mamba=cow_mamba,

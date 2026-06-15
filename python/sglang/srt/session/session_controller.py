@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from array import array
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.managers.io_struct import (
@@ -150,22 +149,13 @@ class Session:
             del input_ids_unpadded[self.committed_unpadded_len :]
 
         carry_fill = last_req.full_untruncated_fill_ids
-        if (
-            not isinstance(carry_fill, array)
-            or carry_fill is input_ids
-            or carry_fill is input_ids_unpadded
-        ):
-            # Unexpected type or aliased with an origin array (extending it
-            # below would double-append): let _refresh_fill_ids rebuild.
-            carry_fill = None
+        carry_fill.truncate(self.committed_fill_len)
+        baked = len(carry_fill) - len(input_ids)
+        if 0 <= baked <= len(out_tail):
+            carry_fill.extend(out_tail[baked:])
+            carry_fill.extend(new_input_ids)
         else:
-            del carry_fill[self.committed_fill_len :]
-            baked = len(carry_fill) - len(input_ids)
-            if 0 <= baked <= len(out_tail):
-                carry_fill.extend(out_tail[baked:])
-                carry_fill.extend(new_input_ids)
-            else:
-                carry_fill = None
+            carry_fill = None
 
         input_ids.extend(out_tail)
         input_ids.extend(new_input_ids)
