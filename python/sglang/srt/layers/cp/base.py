@@ -258,18 +258,22 @@ def _get_cp_strategy() -> Optional[ContextParallelStrategy]:
 
 def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     """Return the configured CP strategy for runtime dispatch."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_ENABLE_CP_V2.get():
+        return None
     return _get_cp_strategy()
 
 
 def get_cp_strategy_kind() -> ContextParallelStrategyKind:
-    strategy = _get_cp_strategy()
+    strategy = get_cp_strategy()
     if strategy is None:
         return ContextParallelStrategyKind.NONE
     return strategy.kind
 
 
 def is_cp_enabled() -> bool:
-    return _get_cp_strategy() is not None
+    return get_cp_strategy() is not None
 
 
 def is_zigzag() -> bool:

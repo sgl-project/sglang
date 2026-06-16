@@ -117,6 +117,12 @@ from sglang.srt.layers.attention.attention_registry import (
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.cp.utils import (
+    disable_legacy_cp_during_cp_v2,
+    get_cp_strategy,
+    maybe_cp_split_before_forward,
+    maybe_prepare_cp_forward,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_group,
@@ -3308,6 +3314,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.prefill_cuda_graph_runner is not None
             and self.prefill_cuda_graph_runner.can_run(forward_batch)
         )
+        if get_cp_strategy() is not None:
+            can_run_graph = False
         if can_run_graph:
             # TODO: device_timer.wrap is too broad here — it also includes
             # replay_prepare time. Move timing into the prefill cuda graph
@@ -3331,6 +3339,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 self.model.prepare_forward_batch(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
+        maybe_prepare_cp_forward(forward_batch)
+        cp_v2_positions = maybe_cp_split_before_forward(
+            self.model, forward_batch, kwargs
+        )
 
         ctx = (
             self.device_timer.wrap(metadata={"category": "extend"})
@@ -3363,13 +3375,58 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         **kwargs,
                     )
             else:
-                ret = self.model.forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
-                )
+                with disable_legacy_cp_during_cp_v2(forward_batch):
+                    if cp_v2_positions is not None:
+                        ret = self._forward_extend_cp_v2(
+                            forward_batch,
+                            cp_v2_positions,
+                            kwargs,
+                        )
+                    else:
+                        ret = self.model.forward(
+                            forward_batch.input_ids,
+                            forward_batch.positions,
+                            forward_batch,
+                            **kwargs,
+                        )
         return (ret, can_run_graph)
+
+    def _forward_extend_cp_v2(
+        self,
+        forward_batch: ForwardBatch,
+        cp_v2_positions: torch.Tensor,
+        kwargs: dict,
+    ):
+        cp_strategy = get_cp_strategy()
+        assert cp_strategy is not None
+
+        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+        hidden_states = self.model.model(
+            forward_batch.input_ids,
+            cp_v2_positions,
+            forward_batch,
+            input_embeds=kwargs.get("input_embeds"),
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        aux_hidden_states = None
+        if getattr(self.model, "capture_aux_hidden_states", False):
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.model.pp_group.is_last_rank:
+            hidden_states = cp_strategy.gather_hidden_states(
+                hidden_states,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+            return self.model.logits_processor(
+                forward_batch.input_ids,
+                hidden_states,
+                self.model.lm_head,
+                forward_batch,
+                aux_hidden_states,
+            )
+        return hidden_states
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None

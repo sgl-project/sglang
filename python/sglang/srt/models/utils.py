@@ -287,6 +287,9 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `.view(-> 4D NHD)` reshape, and let the rotary forward pass
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
+    if getattr(forward_batch, "cp_v2_active", False):
+        return False
+
     pool = get_token_to_kv_pool()
     return (
         _is_cuda
