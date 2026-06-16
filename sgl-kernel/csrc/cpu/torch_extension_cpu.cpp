@@ -147,7 +147,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& cu_seqlens,
     bool head_first,
     bool use_qk_l2norm_in_kernel,
-    double eps = 1e-5);
+    double eps = 1e-6);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
