@@ -59,6 +59,8 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
 
 - Quantized model `glm5.2_w4a8` can be deployed on 1 Atlas 800 A3 (64G × 16) .
 
+**A3 series**
+
 Run the following script to execute online inference.
 
 ```shell
@@ -113,6 +115,58 @@ python3 -m sglang.launch_server \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --moe-a2a-backend deepep --deepep-mode auto
+```
+
+**A2 series**
+
+Run the following script to execute online inference.
+```shell
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+# cann
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export STREAMS_PER_DEVICE=32
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+export HCCL_BUFFSIZE=1000
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export TRANSFORMERS_VERBOSITY=error
+
+#DEEPEP
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
+MODEL_PATH={"weights path"}
+
+python3 -m sglang.launch_server \
+        --model-path $MODEL_PATH \
+        --attention-backend ascend \
+        --device npu \
+        --tp-size 8 \
+        --nnodes 1 \
+        --dp-size 1 \
+        --enable-dp-attention \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 65536 \
+        --trust-remote-code \
+        --mem-fraction-static 0.9 \
+        --served-model-name glm-5 \
+        --cuda-graph-bs 8 \
+        --max-running-requests 102 \
+        --quantization modelslim \
+        --speculative-draft-model-quantization unquant \
+        --moe-a2a-backend deepep --deepep-mode auto \
+        --load-balance-method round_robin
 ```
 
 ### Multi-node Deployment
