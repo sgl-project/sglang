@@ -21,7 +21,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.custom_op import register_custom_op
 
 # ``torch._addmm_activation`` is the (private but stable) entry point to the
@@ -57,7 +56,7 @@ def fused_linear_gelu_tanh(
 def can_fuse_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
     """Whether ``gelu(linear(x))`` can use the fused cublasLt epilogue.
 
-    Requires the fused API to exist, a Hopper CUDA half-precision input, and an
+    Requires the fused API to exist, a CUDA half-precision input, and an
     unquantized, bias'd, non-output-gathering linear layer (so the local weight
     shard is exactly what the reference forward multiplies -- correct under TP).
     A column-parallel layer that gathers across multiple ranks is excluded
@@ -65,11 +64,6 @@ def can_fuse_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
     no-op gather is fine.
     """
     if not (_HAS_ADDMM_ACTIVATION and x.is_cuda):
-        return False
-    # TODO(BBuf): Re-enable SM100 after B200 SGLang diffusion gets a full
-    # #28050-style mode-selection sweep across diffusion models. For now only
-    # Hopper has a verified fused-GELU speedup.
-    if not current_platform.is_hopper():
         return False
     if x.dtype not in (torch.bfloat16, torch.float16):
         return False
