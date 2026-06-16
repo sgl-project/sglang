@@ -27,7 +27,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
-    call_with_graph_break,
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -1571,9 +1570,12 @@ class Indexer(MultiPlatformOp):
                     (0, self.index_topk), device=x_meta.device, dtype=torch.int32
                 )
             )
-            call_with_graph_break(
-                bcg_dsa_indexer_graph_dispatch,
-                dsa_indexer_graph_dispatch,
+            graph_dispatch = (
+                bcg_dsa_indexer_graph_dispatch
+                if is_in_breakable_cuda_graph()
+                else dsa_indexer_graph_dispatch
+            )
+            graph_dispatch(
                 layer_id=layer_id,
                 x=x,
                 q_lora=q_lora,
@@ -1785,9 +1787,12 @@ class Indexer(MultiPlatformOp):
                         device=q_fp8.device,
                         dtype=torch.int32,
                     )
-                    call_with_graph_break(
-                        bcg_k_cache_and_topk_result,
-                        k_cache_and_topk_result,
+                    k_cache_topk_fn = (
+                        bcg_k_cache_and_topk_result
+                        if is_in_breakable_cuda_graph()
+                        else k_cache_and_topk_result
+                    )
+                    k_cache_topk_fn(
                         layer_id=layer_id,
                         key=key,
                         q_fp8=q_fp8,

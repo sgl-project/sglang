@@ -36,7 +36,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
-    call_with_graph_break,
+    is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -695,9 +695,12 @@ class DeepseekMLAForwardMixin:
                         "llama_4_scaling": llama_4_scaling,
                     }
                 if fusion_plan is not None:
-                    call_with_graph_break(
-                        bcg_mla_bmm_then_unified_attention,
-                        mla_bmm_then_unified_attention,
+                    bmm_attention_fn = (
+                        bcg_mla_bmm_then_unified_attention
+                        if is_in_breakable_cuda_graph()
+                        else mla_bmm_then_unified_attention
+                    )
+                    bmm_attention_fn(
                         fusion_plan.q_nope_t,
                         self.w_kc,
                         fusion_plan.q_nope_out_buf,
