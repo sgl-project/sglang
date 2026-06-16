@@ -19,9 +19,12 @@ from sglang.srt.layers.moe.topk import (
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
+_is_npu = is_npu()
 
 
 class HashTopK(nn.Module):
@@ -171,8 +174,7 @@ class HashTopK(nn.Module):
             )
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
-
-        if is_hip():
+        if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
 
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
