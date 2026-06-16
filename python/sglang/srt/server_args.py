@@ -659,6 +659,9 @@ class ServerArgs:
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
+    flashinfer_allreduce_fusion_backend: Optional[
+        Literal["auto", "trtllm", "mnnvl"]
+    ] = None
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
@@ -1200,6 +1203,17 @@ class ServerArgs:
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
+        # When user passes --enable-flashinfer-allreduce-fusion, enable with auto backend
+        if (
+            self.enable_flashinfer_allreduce_fusion
+            and self.flashinfer_allreduce_fusion_backend is None
+        ):
+            logger.warning(
+                "--enable-flashinfer-allreduce-fusion is deprecated. "
+                "Please use --flashinfer-allreduce-fusion-backend=auto instead."
+            )
+            self.flashinfer_allreduce_fusion_backend = "auto"
+        self.enable_flashinfer_allreduce_fusion = False
         # Deprecated attention-backend alias: "compressed" -> "dsv4".
         for attr in (
             "attention_backend",
@@ -2777,13 +2791,14 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
-        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
-        # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
-        # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
-
+        # Auto-enable FlashInfer AllReduce Fusion on SM100 only, for models with
+        # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
+        # Qwen3/Qwen3Next/Qwen3.5 MoE families). SM90 is not auto-enabled because
+        # auto resolves to mnnvl, which requires a working NVLink multicast fabric
+        # that SM90 nodes do not reliably have; SM90 users can opt in explicitly
+        # via --flashinfer-allreduce-fusion-backend.
         if (
-            not self.enable_flashinfer_allreduce_fusion
+            self.flashinfer_allreduce_fusion_backend is None
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
@@ -2800,20 +2815,19 @@ class ServerArgs:
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
             ]
-            and (is_sm90_supported() or is_sm100_supported())
+            and is_sm100_supported()
             and self.tp_size > 1
             and not self.enable_dp_attention
-            and self.nnodes == 1
             and self.moe_a2a_backend == "none"
         ):
-            self.enable_flashinfer_allreduce_fusion = True
+            self.flashinfer_allreduce_fusion_backend = "auto"
             logger.info(
-                f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
+                f"Auto-enabling FlashInfer AllReduce Fusion on SM10X for {model_arch}"
             )
 
         # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments
         if self.enforce_disable_flashinfer_allreduce_fusion:
-            self.enable_flashinfer_allreduce_fusion = False
+            self.flashinfer_allreduce_fusion_backend = None
             logger.info(
                 "FlashInfer allreduce fusion is forcibly disabled "
                 "via --enforce-disable-flashinfer-allreduce-fusion."
@@ -4402,11 +4416,11 @@ class ServerArgs:
                 )
                 self.enable_aiter_allreduce_fusion = False
 
-            if self.enable_flashinfer_allreduce_fusion:
+            if self.flashinfer_allreduce_fusion_backend is not None:
                 logger.warning(
-                    "Disable --enable-flashinfer-allreduce-fusion because deterministic inference is enabled."
+                    "Disable --flashinfer-allreduce-fusion-backend because deterministic inference is enabled."
                 )
-                self.enable_flashinfer_allreduce_fusion = False
+                self.flashinfer_allreduce_fusion_backend = None
 
             # Check sampling backend
             if self.sampling_backend != "ascend":
@@ -6257,9 +6271,26 @@ class ServerArgs:
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
         parser.add_argument(
+            "--flashinfer-allreduce-fusion-backend",
+            type=str,
+            choices=["auto", "trtllm", "mnnvl"],
+            default=None,
+            help=(
+                "Enable FlashInfer allreduce fusion and choose backend. "
+                "Defaults to auto. "
+                "'auto': choose mnnvl on SM90 single-node systems and "
+                "SM100/SM103 single-node or multi-node systems; choose trtllm otherwise. "
+                "'trtllm': available on single-node systems only. "
+                "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
+                "single-node or multi-node systems via MNNVL fabric. "
+                "Fuses allreduce with Residual + RMSNorm for supported MoE models."
+            ),
+        )
+        parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-            help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+            help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
+            "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
             "--enforce-disable-flashinfer-allreduce-fusion",
