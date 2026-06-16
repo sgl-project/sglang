@@ -10,10 +10,10 @@ from sglang.srt.speculative.eagle_utils import (
     verify_tree_greedy_triton,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
+register_xpu_ci(est_time=8, stage="stage-b", runner_config="1-gpu-xpu")
 
 
 class TestEagleTritonPytorchParity(CustomTestCase):
