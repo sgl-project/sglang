@@ -88,7 +88,7 @@ class PrefillStats:
 
 @dataclass(kw_only=True)
 class SchedulerMetricsReporter:
-    scheduler: "Scheduler"
+    scheduler: Scheduler
     tp_rank: int
     pp_rank: int
     dp_rank: Optional[int]

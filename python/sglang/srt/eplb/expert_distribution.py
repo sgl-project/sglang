@@ -305,7 +305,7 @@ class _SinglePassGatherer(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-    ) -> "_SinglePassGatherer":
+    ) -> _SinglePassGatherer:
         if server_args.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(
                 server_args, expert_location_metadata, rank
@@ -627,13 +627,13 @@ class _Accumulator(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-    ) -> "_Accumulator":
+    ) -> _Accumulator:
         return _Accumulator.get_class(server_args)(
             server_args, expert_location_metadata, rank
         )
 
     @staticmethod
-    def get_class(server_args: ServerArgs) -> Type["_Accumulator"]:
+    def get_class(server_args: ServerArgs) -> Type[_Accumulator]:
         return {
             "stat": _StatAccumulator,
             "stat_approx": _StatAccumulator,
