@@ -151,6 +151,12 @@ class TestModelSlimMiniMaxM3Mapping(unittest.TestCase):
         with _load_modelslim_module() as modelslim:
             quant_config = modelslim.ModelSlimConfig(
                 {
+                    "language_model.model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+                    "language_model.model.layers.0.self_attn.index_q_proj.weight": "FLOAT",
+                    "language_model.model.layers.0.self_attn.index_k_proj.weight": "FLOAT",
+                    "language_model.model.layers.1.mlp.gate_proj.weight": "W8A8_DYNAMIC",
+                    "language_model.model.layers.2.block_sparse_moe.shared_experts.gate_proj.weight": "W8A8_DYNAMIC",
+                    "language_model.model.layers.2.block_sparse_moe.shared_experts.down_proj.weight": "FLOAT",
                     "model.layers.0.self_attn.q_proj.weight": "W8A8",
                     "model.layers.0.self_attn.index_q_proj.weight": "W8A8",
                     "model.layers.1.mlp.gate_proj.weight": "W8A8",
@@ -172,6 +178,18 @@ class TestModelSlimMiniMaxM3Mapping(unittest.TestCase):
                     "model.layers.2.mlp.shared_experts.gate_up_proj",
                     "model.layers.2.block_sparse_moe.shared_experts.gate_proj",
                 ),
+                (
+                    "language_model.model.layers.0.self_attn.qkv_proj",
+                    "language_model.model.layers.0.self_attn.q_proj",
+                ),
+                (
+                    "language_model.model.layers.1.mlp.gate_up_proj",
+                    "language_model.model.layers.1.mlp.gate_proj",
+                ),
+                (
+                    "language_model.model.layers.2.mlp.shared_experts.gate_up_proj",
+                    "language_model.model.layers.2.block_sparse_moe.shared_experts.gate_proj",
+                ),
             ]
             for layer_prefix, expected_quant_prefix in cases:
                 with self.subTest(layer_prefix=layer_prefix):
@@ -183,6 +201,18 @@ class TestModelSlimMiniMaxM3Mapping(unittest.TestCase):
                     self.assertEqual(
                         layer.scheme.kwargs["prefix"], expected_quant_prefix
                     )
+
+            method = quant_config.get_quant_method(
+                _FakeLinearBase(),
+                "language_model.model.layers.0.self_attn.index_qkv_proj",
+            )
+            self.assertIsInstance(method, _FakeUnquantizedLinearMethod)
+
+            method = quant_config.get_quant_method(
+                _FakeLinearBase(),
+                "language_model.model.layers.2.mlp.shared_experts.down_proj",
+            )
+            self.assertIsInstance(method, _FakeUnquantizedLinearMethod)
 
     def test_minimax_m3_moe_prefix_accepts_block_sparse_moe_w_names(self):
         with _load_modelslim_module() as modelslim:

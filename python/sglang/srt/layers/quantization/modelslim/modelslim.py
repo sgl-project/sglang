@@ -53,7 +53,10 @@ _DEFAULT_PACKED_MODULES_MAPPING: Mapping[str, Mapping[str, List[str]]] = {
     "model": {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
-        "index_qkv_proj": ["index_q_proj", "index_k_proj", "index_v_proj"],
+        # MiniMax-M3's sparse index branch has no index_v_proj in current
+        # ModelSlim W8A8 checkpoints; value-enabled checkpoints can still load
+        # index_v_proj weights via the model weight loader when present.
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
     }
 }
 
@@ -327,31 +330,33 @@ class ModelSlimConfig(QuantizationConfig):
     ):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
-        if proj_name in fused_mapping:
-            shard_prefixes = [
-                prefix.replace(proj_name, shard_proj_name)
-                for shard_proj_name in fused_mapping[proj_name]
+        for linear_prefix in self.iter_linear_prefix_aliases(prefix):
+            if proj_name in fused_mapping:
+                shard_prefixes = [
+                    linear_prefix.replace(proj_name, shard_proj_name)
+                    for shard_proj_name in fused_mapping[proj_name]
+                ]
+            else:
+                shard_prefixes = [linear_prefix]
+
+            present_schemes = [
+                self.quant_description[shard_prefix + ".weight"]
+                for shard_prefix in shard_prefixes
+                if shard_prefix + ".weight" in self.quant_description
             ]
+            if not present_schemes:
+                continue
 
-            is_skipped = None
-            for shard_prefix in shard_prefixes:
-                is_shard_skipped = (
-                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
+            is_skipped = present_schemes[0] == "FLOAT"
+            if any((scheme == "FLOAT") != is_skipped for scheme in present_schemes):
+                raise ValueError(
+                    f"Detected some but not all shards of {prefix} "
+                    "are quantized. All shards of fused layers "
+                    "to have the same precision."
                 )
+            return is_skipped
 
-                if is_skipped is None:
-                    is_skipped = is_shard_skipped
-                elif is_shard_skipped != is_skipped:
-                    raise ValueError(
-                        f"Detected some but not all shards of {prefix} "
-                        "are quantized. All shards of fused layers "
-                        "to have the same precision."
-                    )
-        else:
-            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
-
-        assert is_skipped is not None
-        return is_skipped
+        return False
 
     def get_scaled_act_names(self) -> List[str]:
         return []
