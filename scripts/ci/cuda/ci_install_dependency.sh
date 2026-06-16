@@ -56,13 +56,16 @@ configure_environment() {
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
         if [ -n "${GITHUB_ENV:-}" ]; then
-            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV"
-            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV"
-            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV"
+            # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
+            mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
+            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
             touch "$UV_VENV/env.sh"
         fi
         if [ -n "${GITHUB_PATH:-}" ]; then
-            echo "$UV_VENV/bin" >> "$GITHUB_PATH"
+            mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+            echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
         fi
     else
         echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
@@ -115,6 +118,17 @@ kill_existing_processes() {
         echo "ERROR: killall.py detected uncleanable GPU memory. Aborting CI."
         exit 1
     fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+cleanup_stale_shm() {
+    # Reclaim /dev/shm segments leaked by SIGKILLed processes from earlier
+    # jobs; leaked segments accumulate until the tmpfs fills and scheduler
+    # init dies with SIGBUS. Runs right after killall so every dead creator's
+    # segments are reclaimable. The module is dependency-free and runnable by
+    # path, so this works before sglang is installed.
+    SGLANG_IS_IN_CI=true python3 "${REPO_ROOT}/python/sglang/srt/utils/stale_shm_cleanup.py" || true
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -416,11 +430,11 @@ stabilize_flashinfer_jit_paths() {
 
 install_extra_deps() {
     if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
+        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.11.post1"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
-        MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post2"
+        MOONCAKE_PKG="mooncake-transfer-engine==0.3.11.post1"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
@@ -508,6 +522,7 @@ main() {
     configure_environment "$@"
     detect_host
     kill_existing_processes
+    cleanup_stale_shm
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain

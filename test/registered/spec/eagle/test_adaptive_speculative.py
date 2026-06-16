@@ -47,11 +47,13 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(
                 {
-                    "candidate_steps": [1, 3],
-                    "ema_alpha": 1.0,
-                    "warmup_batches": 1,
-                    "update_interval": 1,
-                    "up_hysteresis": 0.0,
+                    "1": {
+                        "candidate_steps": [1, 3],
+                        "ema_alpha": 1.0,
+                        "warmup_batches": 1,
+                        "update_interval": 1,
+                        "up_hysteresis": 0.0,
+                    },
                 },
                 f,
             )
@@ -70,15 +72,10 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                     "EAGLE",
                     "--speculative-draft-model-path",
                     cls.draft_model,
-                    "--speculative-num-steps",
-                    "1",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
-                    "2",
                     "--speculative-adaptive",
                     "--speculative-adaptive-config",
                     cls.adaptive_config_path,
+                    "--enable-metrics",
                     "--skip-server-warmup",
                     "--mem-fraction-static",
                     "0.7",
@@ -99,6 +96,24 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         response = requests.get(self.base_url + "/server_info", timeout=30)
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["internal_states"][0]
+
+    def _scrape_metric(self, name: str, **label_filter) -> float | None:
+        """Return the value of a Prometheus sample line, or None if absent.
+
+        Matches a line whose metric name is exactly *name* (next char is '{'
+        or whitespace) and whose labels include every key=value in
+        *label_filter*.
+        """
+        text = requests.get(self.base_url + "/metrics", timeout=30).text
+        for line in text.splitlines():
+            if line.startswith("#") or not line.startswith(name):
+                continue
+            rest = line[len(name) :]
+            if rest and rest[0] not in "{ ":
+                continue
+            if all(f'{k}="{v}"' in line for k, v in label_filter.items()):
+                return float(line.rsplit(" ", 1)[1])
+        return None
 
     def _generate(self, prompt: str, max_new_tokens: int = 64) -> dict:
         response = requests.post(
@@ -164,6 +179,23 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         server_info = requests.get(self.base_url + "/server_info").json()
         avg_accept_len = server_info["internal_states"][0]["avg_spec_accept_length"]
         print(f"avg_spec_accept_length={avg_accept_len:.4f}")
+
+    def test_adaptive_metrics_exposed(self):
+        """After an upshift, the adaptive current-state gauges are scrapeable."""
+        state = self._drive_upshift()
+        self.assertEqual(state["speculative_num_steps"], 3, f"Never upshifted: {state}")
+        # One more decode so the reporter emits a fresh logging interval.
+        self._generate(HIGH_ACCEPT_PROMPT)
+
+        steps = self._scrape_metric("sglang:spec_num_steps")
+        draft_tokens = self._scrape_metric("sglang:spec_num_draft_tokens")
+
+        self.assertIn(steps, {1.0, 3.0}, "spec_num_steps gauge has unexpected value")
+        self.assertIn(
+            draft_tokens,
+            {2.0, 4.0},
+            "spec_num_draft_tokens gauge has unexpected value",
+        )
 
 
 if __name__ == "__main__":

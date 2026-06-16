@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -88,9 +89,7 @@ def forward_mha_prepare_npu(
         )
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
-        ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-            m.layer_id
-        )
+        ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
         _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
             latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
             m.kv_a_layernorm.weight,
@@ -115,7 +114,7 @@ def forward_mha_prepare_npu(
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
         # this is for model kimi-vl-a3B-instruct
-        forward_batch.token_to_kv_pool.set_kv_buffer(
+        get_token_to_kv_pool().set_kv_buffer(
             m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
         )
 
@@ -404,9 +403,7 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
-    if m.skip_topk:
-        topk_indices = prev_topk_indices
-    else:
+    if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
             hidden_states,
             q_lora,
@@ -416,6 +413,8 @@ def forward_dsa_prepare_npu(
             layer_scatter_modes,
             dynamic_scale,
         )
+    else:
+        topk_indices = prev_topk_indices
 
     return (
         q_pe,
@@ -460,7 +459,7 @@ def forward_dsa_core_npu(
 
     if (
         forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        and not forward_batch.forward_mode.is_draft_extend_v2()
         and not forward_batch.forward_mode.is_target_verify()
     ):
         attn_output = attn_output.transpose(0, 1)

@@ -104,7 +104,11 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
   static_assert(device::kWarpThreads == 32);
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+#ifndef USE_ROCM
+    uint32_t n = __shfl_up_sync(device::kFullMask, val, offset);
+#else
+    uint32_t n = __shfl_up(val, offset, 32);
+#endif
     if (lane_id >= offset) val += n;
   }
   return val;
@@ -115,7 +119,11 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 SGL_DEVICE uint32_t warp_reduce_max_u32(uint32_t val) {
 #pragma unroll
   for (uint32_t mask = 16; mask > 0; mask >>= 1) {
-    val = max(val, __shfl_xor_sync(0xFFFFFFFF, val, mask, 32));
+#ifndef USE_ROCM
+    val = max(val, __shfl_xor_sync(device::kFullMask, val, mask, 32));
+#else
+    val = max(val, __shfl_xor(val, mask, 32));
+#endif
   }
   return val;
 }
@@ -123,7 +131,11 @@ SGL_DEVICE uint32_t warp_reduce_max_u32(uint32_t val) {
 SGL_DEVICE uint32_t warp_reduce_min_u32(uint32_t val) {
 #pragma unroll
   for (uint32_t mask = 16; mask > 0; mask >>= 1) {
-    val = min(val, __shfl_xor_sync(0xFFFFFFFF, val, mask, 32));
+#ifndef USE_ROCM
+    val = min(val, __shfl_xor_sync(device::kFullMask, val, mask, 32));
+#else
+    val = min(val, __shfl_xor(val, mask, 32));
+#endif
   }
   return val;
 }
@@ -191,7 +203,11 @@ __global__ __launch_bounds__(1024, 1)  //
   if (is_mtp_extend) {
     // Path 1: token-driven. Each global token id maps to exactly one (batch_id, j).
     const uint32_t E = s_max_extend;
-    for (uint32_t k = tx; k < num_q; k += block_size) {
+    // num_q is the padded buffer size (graph bucket), not the work size: cap the
+    // loop at the real token count so batch_id = k / E stays < batch_size on an
+    // underfilled replay; Stage D pads [counter, num_q) with invalid.
+    const uint32_t num_real_q = params.batch_size * E;
+    for (uint32_t k = tx; k < num_real_q; k += block_size) {
       const uint32_t batch_id = k / E;
       const uint32_t j = k % E;
       const int32_t pl = s_prefix_len[batch_id];
@@ -452,8 +468,8 @@ inline PrefillPlan plan_compress_prefill(
   auto N = SymbolicSize{"num_q_tokens"};
   auto cpu_or_gpu = SymbolicDevice{};
   auto device_ = SymbolicDevice{};
-  cpu_or_gpu.set_options<kDLCPU, kDLCUDA>();
-  device_.set_options<kDLCUDA>();
+  cpu_or_gpu.set_options<kDLCPU, kDLGPU>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
@@ -499,7 +515,7 @@ inline PrefillPlan plan_compress_prefill(
   constexpr int32_t kMaxMTPDraftTokens = 4;
   const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
 
-  if (cpu_or_gpu.unwrap().device_type == kDLCUDA) {
+  if (cpu_or_gpu.unwrap().device_type == kDLGPU) {
     // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
     // on device, padding to num_q_tokens with invalid; kernel_1 then finalizes the
     // SWA-translated read/write locations. Used for MTP / cuda-graph capture where
@@ -628,7 +644,7 @@ inline tvm::ffi::Tensor plan_compress_decode(
     const int32_t ring_size) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
@@ -691,7 +707,7 @@ inline PrefillPlan plan_compress_prefill_legacy(
     const bool use_cuda_graph) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
@@ -794,7 +810,7 @@ inline tvm::ffi::Tensor plan_compress_decode_legacy(
     const int32_t compress_ratio) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({B})  //
       .with_dtype<RID_T>()
