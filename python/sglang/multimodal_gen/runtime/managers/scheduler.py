@@ -1117,6 +1117,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         req_or_group: Req | list[Req] | None = None,
         is_warmup: bool = False,
     ) -> bool:
+        """Return a continuous-batching result using normal warmup policy."""
         should_not_return = is_warmup
         if (
             is_warmup
@@ -1168,6 +1169,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         active_states: list[DenoisingRequestState],
         denoising_batch: list[DenoisingRequestState],
     ) -> list[DenoisingRequestState]:
+        """Rotate just-run states behind other active requests for fairness."""
         just_ran = {id(state) for state in denoising_batch}
         return [state for state in active_states if id(state) not in just_ran] + [
             state for state in active_states if id(state) in just_ran
@@ -1179,6 +1181,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         active_states: list[DenoisingRequestState],
         pending_groups: dict[str, ContinuousResponseGroup],
     ) -> None:
+        """Move queued requests into the active continuous denoising set."""
         while self.waiting_queue:
             identity, req_or_group, enqueue_time = self.waiting_queue[0]
 
@@ -1230,14 +1233,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 pending_groups[group_id] = group
                 for index, req in enumerate(group_reqs):
                     try:
-                        state = (
-                            continuous_coordinator.prepare_request_for_denoising_steps(
-                                identity=identity,
-                                req=req,
-                                response_group_id=group_id,
-                                response_index=index,
-                                response_group_size=len(group_reqs),
-                            )
+                        state = continuous_coordinator.prepare_request_state(
+                            identity=identity,
+                            req=req,
+                            response_group_id=group_id,
+                            response_index=index,
+                            response_group_size=len(group_reqs),
                         )
                         state.queue_wait_ms = (time.monotonic() - enqueue_time) * 1000.0
                         active_states.append(state)
@@ -1302,7 +1303,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
             self.waiting_queue.popleft()
             try:
-                state = continuous_coordinator.prepare_request_for_denoising_steps(
+                state = continuous_coordinator.prepare_request_state(
                     identity=identity,
                     req=req_or_group,
                 )
@@ -1355,6 +1356,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         state: DenoisingRequestState,
         pending_groups: dict[str, ContinuousResponseGroup],
     ) -> None:
+        """Return a completed continuous request or attach it to its group."""
         output_batch = state.output_batch or OutputBatch(error=state.error)
         if state.response_group_id is None or state.response_group_size <= 1:
             is_warmup = state.req.is_warmup
@@ -1455,10 +1457,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 pending_groups,
             )
 
-            denoising_batch = (
-                continuous_coordinator.select_compatible_requests_for_next_step(
-                    active_states
-                )
+            denoising_batch = continuous_coordinator.select_next_step_batch(
+                active_states
             )
             if not denoising_batch:
                 if self.waiting_queue and self.receiver is not None:

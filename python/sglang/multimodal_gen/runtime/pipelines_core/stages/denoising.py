@@ -1171,6 +1171,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         t_host: torch.Tensor,
         timesteps_cpu: torch.Tensor,
     ) -> DenoisingStepState:
+        """Compatibility wrapper for model-specific denoising subclasses."""
         return self._build_denoising_step_state(
             ctx,
             batch,
@@ -1948,6 +1949,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _merge_step_input_value(
         values: list[Any], *, allow_shared: bool = False, key: str | None = None
     ) -> Any:
+        """Merge one branch kwarg across requests for packed execution."""
         first = values[0]
         if first is None:
             if any(value is not None for value in values):
@@ -2155,6 +2157,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _pack_denoising_step_inputs(
         self, states: list[Any], server_args: ServerArgs
     ) -> PackedDenoisingStepInputs:
+        """Build packed model inputs for selected compatible request steps."""
         first = states[0]
         first_ctx = first.denoising_context
         first_step = first.current_step
@@ -2237,6 +2240,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _run_batched_step_forward_and_update_latents(
         self, packed_inputs: PackedDenoisingStepInputs, server_args: ServerArgs
     ) -> None:
+        """Run one packed forward pass and update each request's scheduler state."""
         use_nvtx = any(
             state.denoising_context.extra.get("use_nvtx", self.current_use_nvtx)
             for state in packed_inputs.states

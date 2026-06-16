@@ -13,8 +13,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_SUPPORTED_CONTINUOUS_ATTENTION_BACKENDS = {"fa", "fa2", "torch_sdpa"}
-
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
         OutputBatch,
@@ -153,7 +151,7 @@ def validate_continuous_batching_config(server_args: Any) -> None:
 
     if pipeline_config.task_type != ModelTaskType.T2I:
         raise ContinuousBatchingError(
-            "continuous batching v1 only supports text-to-image pipelines"
+            "continuous batching currently only supports text-to-image pipelines"
         )
 
     disagg_role = getattr(server_args, "disagg_role", RoleType.MONOLITHIC)
@@ -170,12 +168,12 @@ def validate_continuous_batching_config(server_args: Any) -> None:
 
     if envs.SGLANG_CACHE_DIT_ENABLED or getattr(server_args, "cache_dit_config", None):
         raise ContinuousBatchingError(
-            "continuous batching does not support Cache-DiT in v1"
+            "continuous batching currently does not support Cache-DiT"
         )
 
     if getattr(server_args, "lora_path", None):
         raise ContinuousBatchingError(
-            "continuous batching does not support startup LoRA adapters in v1"
+            "continuous batching currently does not support startup LoRA adapters"
         )
 
     if getattr(server_args, "dit_cpu_offload", False):
@@ -191,25 +189,6 @@ def validate_continuous_batching_config(server_args: Any) -> None:
             "--dit-layerwise-offload/DiT layerwise offload components"
         )
 
-    attention_backend = getattr(server_args, "attention_backend", None)
-    if attention_backend not in {None, "", *_SUPPORTED_CONTINUOUS_ATTENTION_BACKENDS}:
-        raise ContinuousBatchingError(
-            f"continuous batching does not support attention backend {attention_backend!r}"
-        )
-
-    component_backends = (
-        getattr(server_args, "component_attention_backends", None) or {}
-    )
-    if isinstance(component_backends, dict):
-        for component_name, backend in component_backends.items():
-            if "transformer" not in str(component_name):
-                continue
-            if backend not in _SUPPORTED_CONTINUOUS_ATTENTION_BACKENDS:
-                raise ContinuousBatchingError(
-                    "continuous batching does not support attention backend "
-                    f"{backend!r} for component {component_name!r}"
-                )
-
 
 def validate_continuous_batching_request(req: Req, server_args: Any) -> None:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -222,32 +201,32 @@ def validate_continuous_batching_request(req: Req, server_args: Any) -> None:
     pipeline_config = server_args.pipeline_config
     if pipeline_config.task_type != ModelTaskType.T2I:
         raise ContinuousBatchingError(
-            "continuous batching v1 only supports text-to-image pipelines"
+            "continuous batching currently only supports text-to-image pipelines"
         )
 
     if not isinstance(getattr(req, "prompt", None), str):
         raise ContinuousBatchingError(
-            "continuous batching v1 only supports a single text prompt per request"
+            "continuous batching currently only supports a single text prompt per request"
         )
 
     if req.image_path is not None:
         raise ContinuousBatchingError(
-            "continuous batching v1 does not support image-conditioned requests"
+            "continuous batching currently does not support image-conditioned requests"
         )
 
     if getattr(req, "rollout", False):
         raise ContinuousBatchingError(
-            "continuous batching v1 does not support rollout requests"
+            "continuous batching currently does not support rollout requests"
         )
 
     if getattr(req, "enable_teacache", False):
         raise ContinuousBatchingError(
-            "continuous batching v1 does not support TeaCache requests"
+            "continuous batching currently does not support TeaCache requests"
         )
 
     if getattr(req, "return_raw_frames", False):
         raise ContinuousBatchingError(
-            "continuous batching v1 does not support raw-frame streaming responses"
+            "continuous batching currently does not support raw-frame streaming responses"
         )
 
 
@@ -325,6 +304,7 @@ def build_denoising_batch_key(
     denoising_stage: Any,
     server_args: Any,
 ) -> DenoisingBatchKey:
+    """Build the compatibility key used to group denoising steps."""
     req = state.req
     ctx = state.denoising_context
     step = state.current_step
@@ -377,6 +357,8 @@ def build_denoising_batch_key(
 
 
 class ContinuousDenoisingCoordinator:
+    """Coordinates request-local denoising state for continuous batching."""
+
     def __init__(
         self,
         *,
@@ -390,7 +372,7 @@ class ContinuousDenoisingCoordinator:
         self.pipeline = worker.pipeline
         self.denoising_stage = self.pipeline.get_denoising_stage()
 
-    def prepare_request_for_denoising_steps(
+    def prepare_request_state(
         self,
         *,
         identity: bytes | None,
@@ -444,7 +426,7 @@ class ContinuousDenoisingCoordinator:
         )
         return True
 
-    def select_compatible_requests_for_next_step(
+    def select_next_step_batch(
         self,
         active_states: list[DenoisingRequestState],
     ) -> list[DenoisingRequestState]:
@@ -477,6 +459,7 @@ class ContinuousDenoisingCoordinator:
         self,
         states: list[DenoisingRequestState],
     ) -> list[DenoisingRequestState]:
+        """Run one denoising step for selected requests and finish completed ones."""
         if not states:
             return []
 
@@ -540,6 +523,7 @@ class ContinuousDenoisingCoordinator:
         state.set_error_output(error)
 
     def _cleanup_denoising_context(self, ctx: DenoisingContext) -> None:
+        """Clean denoising resources without masking the original failure."""
         try:
             self.denoising_stage.cleanup_denoising_context(ctx)
         except Exception:
