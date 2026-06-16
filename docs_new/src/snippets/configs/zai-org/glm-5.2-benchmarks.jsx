@@ -67,13 +67,14 @@ export const benchmarks = [
   },
   // ---- GB300 + FP8 ----  (4-GPU single node, TP4; measured on the v0.5.13.post1 release image, flush-cache on every run)
   {
+    // EAGLE MTP 5-1-6 (was 3-1-4): accept length ~5.98/6 → +34%/+24% throughput, -28%/-18% TPOT vs 3-1-4.
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.13.post1",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 398, tpot_ms: 3.86, tokens_per_sec_per_gpu: 59 },
+        ttft_ms: 393, tpot_ms: 2.78, tokens_per_sec_per_gpu: 79 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 3637, tpot_ms: 10.36, tokens_per_sec_per_gpu: 275 },
+        ttft_ms: 3201, tpot_ms: 8.53, tokens_per_sec_per_gpu: 341 },
     ],
   },
   {
