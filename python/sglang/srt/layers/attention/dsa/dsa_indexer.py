@@ -540,45 +540,6 @@ class Indexer(MultiPlatformOp):
             and not self.dsa_enable_prefill_cp
         )
 
-    def _forward_cuda_graph_dispatch(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        layer_id: int,
-        return_indices: bool,
-    ) -> Optional[torch.Tensor]:
-        # The split-op dispatch surface is CUDA-only (the is_cuda() gate in
-        # is_graph_dsa_split_op_surface_active), while fused-quant tuple `x` only
-        # arises on ROCm/aiter -- so here `x` is always the plain metadata tensor
-        # and needs no x_meta unpacking.
-        if return_indices:
-            topk_result = torch.full(
-                (x.shape[0], self.index_topk),
-                -1,
-                device=x.device,
-                dtype=torch.int32,
-            )
-        else:
-            topk_result = torch.empty(
-                (0, self.index_topk), device=x.device, dtype=torch.int32
-            )
-        graph_dispatch = (
-            bcg_dsa_indexer_graph_dispatch
-            if is_in_breakable_cuda_graph()
-            else dsa_indexer_graph_dispatch
-        )
-        graph_dispatch(
-            layer_id=layer_id,
-            x=x,
-            q_lora=q_lora,
-            positions=positions,
-            topk_result=topk_result,
-        )
-        return maybe_capture_indexer_topk(
-            layer_id, topk_result if return_indices else None
-        )
-
     def _store_k_cache_and_get_topk_ragged_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1605,12 +1566,35 @@ class Indexer(MultiPlatformOp):
         if self._can_use_graph_dsa_dispatch(forward_batch):
             if weights_proj_lora:
                 raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
-            return self._forward_cuda_graph_dispatch(
-                x,
-                q_lora,
-                positions,
-                layer_id,
-                return_indices,
+            # The split-op dispatch surface is CUDA-only (the is_cuda() gate in
+            # is_graph_dsa_split_op_surface_active), while fused-quant tuple `x`
+            # only arises on ROCm/aiter -- so here `x` is always the plain
+            # metadata tensor and needs no x_meta unpacking.
+            if return_indices:
+                topk_result = torch.full(
+                    (x.shape[0], self.index_topk),
+                    -1,
+                    device=x.device,
+                    dtype=torch.int32,
+                )
+            else:
+                topk_result = torch.empty(
+                    (0, self.index_topk), device=x.device, dtype=torch.int32
+                )
+            graph_dispatch_fn = (
+                bcg_dsa_indexer_graph_dispatch
+                if is_in_breakable_cuda_graph()
+                else dsa_indexer_graph_dispatch
+            )
+            graph_dispatch_fn(
+                layer_id=layer_id,
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                topk_result=topk_result,
+            )
+            return maybe_capture_indexer_topk(
+                layer_id, topk_result if return_indices else None
             )
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
