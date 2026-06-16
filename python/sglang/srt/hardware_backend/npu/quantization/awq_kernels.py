@@ -276,7 +276,7 @@ class AWQAscendMoEKernel:
     
         # Transpose to (E, N, K) for batched matmul
         fp_weight = fp_weight.transpose(-1, -2).contiguous()
-        setattr(layer, f"{prefix}_weight", torch.nn.Parameter(fp_weight, requires_grad=False))
+        setattr(layer, f"{prefix}_qweight", torch.nn.Parameter(fp_weight, requires_grad=False))
 
     def _register_or_replace_parameter(self, layer, name, tensor):
         if hasattr(layer, name):
