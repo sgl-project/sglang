@@ -122,9 +122,8 @@ if _is_cuda:
     from sglang.srt.utils.custom_op import register_custom_op
 
     def _resolve_indexer_split_op_context(layer_id: int):
-        # Shared eager preamble for the indexer split ops. Metadata is fetched
-        # here (inside the op) instead of being passed in, so Dynamo cannot
-        # guard on the forward-metadata identity that changes every graph replay.
+        # Shared preamble for the indexer split ops: resolve the forward batch,
+        # this layer's indexer, and its metadata from the captured forward context.
         forward_context = get_tc_piecewise_forward_context()
         assert forward_context is not None
         assert forward_context.dsa_indexers is not None
