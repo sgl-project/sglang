@@ -2,13 +2,14 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
 
 # Extra: Triton + Flashinfer NGRAM backends + non-overlap (sync V2) variant.
 # Sibling per-commit file (test_spec_ngram.py) keeps the Paged variant.
 register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=400, suite="extra-a-test-1-gpu-large-amd")
 
 
 class TestNgramSpeculativeDecodingTriton(NgramServerBase, GSM8KMixin):
