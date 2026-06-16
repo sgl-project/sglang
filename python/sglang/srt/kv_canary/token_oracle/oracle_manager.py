@@ -36,7 +36,7 @@ class TokenOracleManager:
                 bootstrap_room_ids_int=forward_batch.bootstrap_room_ids_int,
             ),
         )
-        if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+        if forward_batch.forward_mode.is_extend():
             expected_tokens = input_ids
         else:
             expected_tokens = self.oracle.expected_tokens(
