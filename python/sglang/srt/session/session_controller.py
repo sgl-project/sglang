@@ -187,12 +187,11 @@ class Session:
                                 (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
                             ]
 
-            max_new_tokens = last_req.sampling_params.max_new_tokens
             output_len = len(last_req.token_buf) - last_req.origin_input_len
             kept_output_len = (
                 0
                 if session_params.drop_previous_output
-                else min(max_new_tokens, output_len)
+                else min(last_req.sampling_params.max_new_tokens, output_len)
             )
             kept_output = to_array(last_req.output_ids[:kept_output_len])
 
@@ -214,11 +213,10 @@ class Session:
             if session_params.offset and session_params.offset != 0:
                 del input_ids_unpadded[session_params.offset :]
             input_ids_unpadded.extend(req.input_ids)
-
-            input_ids = req.input_ids
         else:
-            input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
+
+        input_ids = req.input_ids
 
         new_req = Req(
             rid=req.rid,
