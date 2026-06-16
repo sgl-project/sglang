@@ -814,10 +814,12 @@ class TestIdeogram4(unittest.TestCase):
         )
         self.assertIsInstance(model.layers[0].attention.o, Ideogram4RowParallelLinear)
         self.assertTrue(model.layers[0].attention.o.input_is_parallel)
-        self.assertFalse(model.layers[0].mlp.w1.gather_output)
-        self.assertFalse(model.layers[0].mlp.w3.gather_output)
-        self.assertIsInstance(model.layers[0].mlp.w2, Ideogram4RowParallelLinear)
-        self.assertTrue(model.layers[0].mlp.w2.input_is_parallel)
+        self.assertFalse(model.layers[0].feed_forward.w1.gather_output)
+        self.assertFalse(model.layers[0].feed_forward.w3.gather_output)
+        self.assertIsInstance(
+            model.layers[0].feed_forward.w2, Ideogram4RowParallelLinear
+        )
+        self.assertTrue(model.layers[0].feed_forward.w2.input_is_parallel)
 
     def test_bitsandbytes_tp_quant_state_uses_local_output_shard(self):
         param = torch.nn.Parameter(
