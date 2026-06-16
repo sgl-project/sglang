@@ -144,8 +144,8 @@ class TritonAttnBackend(AttentionBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        self.dcp_size = model_runner.dcp_size
-        self.dcp_rank = model_runner.dcp_rank
+        self.dcp_size = getattr(model_runner, "dcp_size", 1)
+        self.dcp_rank = getattr(model_runner, "dcp_rank", 0)
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         ) * self.dcp_size
