@@ -2352,7 +2352,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 )
 
         mask = out.get("encoder_hidden_states_mask")
-        if mask is None and seq < bucket:
+        if mask is None:
             mask = torch.ones(
                 ehs_tensor.shape[:2],
                 device=ehs_tensor.device,
@@ -2414,6 +2414,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if not getattr(self.server_args, "enable_breakable_cuda_graph", False):
             return None
         if not isinstance(current_model, nn.Module):
+            return None
+        pipeline_config = getattr(self.server_args, "pipeline_config", None)
+        if not getattr(pipeline_config, "supports_breakable_cuda_graph", True):
+            reason = getattr(
+                pipeline_config,
+                "breakable_cuda_graph_unsupported_reason",
+                None,
+            )
+            logged = getattr(self, "_bcg_unsupported_logged", set())
+            key = type(pipeline_config).__name__
+            if key not in logged:
+                logger.info(
+                    "[Diffusion BCG] disabled for %s: %s",
+                    key,
+                    reason or "pipeline config marks BCG unsupported",
+                )
+                logged.add(key)
+                self._bcg_unsupported_logged = logged
             return None
         if self._bcg_is_hunyuanvideo_transformer(current_model):
             # HunyuanVideo's text stream can replay stale prompt conditioning

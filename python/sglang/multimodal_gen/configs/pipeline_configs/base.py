@@ -244,9 +244,6 @@ class PipelineConfig:
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
 
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig()
-
     def postprocess_image(self, image):
         return image.last_hidden_state
 
@@ -266,6 +263,12 @@ class PipelineConfig:
 
     # DMD parameters
     dmd_denoising_steps: list[int] | None = field(default=None)
+
+    # Breakable CUDA graph support. Model-specific pipeline configs may opt out
+    # when profiling shows graph replay/copy overhead dominates or graph pools
+    # reserve too much memory for the model's shape/segment pattern.
+    supports_breakable_cuda_graph: bool = True
+    breakable_cuda_graph_unsupported_reason: str | None = None
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # return the model-specific config for optimal deployment setting
@@ -310,9 +313,6 @@ class PipelineConfig:
         return image.resize(
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
-
-    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
-        return False
 
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)

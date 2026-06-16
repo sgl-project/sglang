@@ -24,6 +24,7 @@ from sglang.srt.breakable_cuda_graph.breakable_cuda_graph import (  # noqa: F401
     BreakableCUDAGraphCapture,
     break_graph,
     eager_on_graph,
+    get_current_replay_token,
     get_current_stream,
 )
 
@@ -33,4 +34,5 @@ __all__ = [
     "BreakableCUDAGraphCapture",
     "break_graph",
     "get_current_stream",
+    "get_current_replay_token",
 ]

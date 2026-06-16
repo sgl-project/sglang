@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
 from sglang.srt.breakable_cuda_graph import (
     eager_on_graph,
+    get_current_replay_token,
     is_in_breakable_cuda_graph,
 )
 
@@ -95,6 +96,38 @@ def build_varlen_mask_meta(
         "inv_indices": inv_indices,
         "max_seqlen": seq,  # upper bound; FA varlen uses cu_seqlens for actual ranges
     }
+
+
+class DynamicVarlenMaskMeta:
+    """Replay-local builder for varlen attention metadata.
+
+    BCG attention break points capture Python kwargs once. Passing a plain
+    ``attn_mask_meta`` dict would replay stale cu_seqlens/indices when the same
+    graph bucket is reused for a different prompt length. This helper keeps only
+    replay-local metadata and rebuilds it from the current ``attn_mask`` tensor
+    on the first attention block of each graph replay.
+    """
+
+    def __init__(self) -> None:
+        self._cache_key = None
+        self._meta = None
+
+    def resolve(self, attn_mask: torch.Tensor | None) -> dict | None:
+        if attn_mask is None:
+            self._cache_key = None
+            self._meta = None
+            return None
+
+        replay_token = get_current_replay_token()
+        if replay_token is None:
+            cache_key = ("capture", id(attn_mask), tuple(attn_mask.shape))
+        else:
+            cache_key = ("replay", replay_token, tuple(attn_mask.shape))
+
+        if cache_key != self._cache_key:
+            self._meta = build_varlen_mask_meta(attn_mask)
+            self._cache_key = cache_key
+        return self._meta
 
 
 class UlyssesAttention(nn.Module):
@@ -539,6 +572,8 @@ class USPAttention(nn.Module):
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
         if attn_mask is not None:
+            if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
+                attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
             def _prepare_sdpa_mask(
                 mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device

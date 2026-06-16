@@ -805,6 +805,15 @@ class Flux2KleinBasePipelineConfig(Flux2KleinPipelineConfig):
     # Undistilled Klein base model, with guidance embeddings
     should_use_guidance: bool = True
 
+    # BCG is disabled for Flux2 Klein Base: B200 profiling showed same-shape
+    # replay slower than eager (about 13.7s eager vs 16.0s BCG) with only a small
+    # memory increase, so fixed graph overhead dominates for this preset.
+    supports_breakable_cuda_graph: bool = False
+    breakable_cuda_graph_unsupported_reason: str | None = (
+        "Flux2 Klein Base BCG is slower on B200 because graph replay/copy "
+        "overhead outweighs captured-kernel savings."
+    )
+
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         txt_seq_lens = self.require_text_seq_lens(
             batch,

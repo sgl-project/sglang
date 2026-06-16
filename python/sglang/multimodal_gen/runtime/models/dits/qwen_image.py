@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
+    DynamicVarlenMaskMeta,
     USPAttention,
     build_varlen_mask_meta,
 )
@@ -1553,11 +1554,15 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
             joint_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
             block_attention_kwargs["attn_mask"] = joint_mask
-            if not is_in_breakable_cuda_graph():
-                # Precompute varlen metadata once per request so every block reuses
-                # the same cu_seqlens / indices instead of rebuilding. BCG replay
-                # keeps prompt-mask shape fixed but prompt content/length can change,
-                # so dynamic-length varlen indices are intentionally left out.
+            if is_in_breakable_cuda_graph():
+                # Qwen/FireRed BCG buckets text inputs so different prompt
+                # lengths can share a graph. Attention break kwargs are captured
+                # once, so build varlen metadata replay-locally from the current
+                # static mask instead of closing over stale cu_seqlens/indices.
+                block_attention_kwargs["attn_mask_meta"] = DynamicVarlenMaskMeta()
+            else:
+                # Precompute varlen metadata once per request so every block
+                # reuses the same cu_seqlens / indices instead of rebuilding.
                 block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
                     joint_mask
                 )

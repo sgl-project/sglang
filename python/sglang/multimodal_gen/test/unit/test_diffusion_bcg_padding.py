@@ -8,7 +8,17 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
     GlmImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2KleinBasePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.zimage import (
+    ZImagePipelineConfig,
+)
+from sglang.multimodal_gen.runtime.layers.attention import DynamicVarlenMaskMeta
 from sglang.multimodal_gen.runtime.breakable_cuda_graph_runner import (
+    DiffusionBreakableCudaGraphRunner,
+    _CaptureEntry,
     _signature_kwargs,
 )
 from sglang.multimodal_gen.runtime.models.dits.zimage import ZImageTransformer2DModel
@@ -64,7 +74,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             "img_shapes": [[(1, 64, 64)]],
         }
 
-    def test_qwen_prompt_lengths_share_bucket_signature(self):
+    def test_qwen_prompt_lengths_share_bucket_signature_with_dynamic_varlen_meta(self):
         with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "256,512,2048"}):
             short = self.stage._bcg_pad_prompt_kwargs(
                 self._qwen_kwargs(19), current_model=self.qwen_model
@@ -78,6 +88,8 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(short["encoder_hidden_states_mask"].shape, (1, 256))
         self.assertTrue(short["encoder_hidden_states_mask"][0, :19].all())
         self.assertFalse(short["encoder_hidden_states_mask"][0, 19:].any())
+        self.assertTrue(longer["encoder_hidden_states_mask"][0, :47].all())
+        self.assertFalse(longer["encoder_hidden_states_mask"][0, 47:].any())
         self.assertEqual(short["freqs_cis"][1].shape, (256, 128))
         self.assertEqual(short["txt_seq_lens"], [256])
         self.assertEqual(longer["txt_seq_lens"], [256])
@@ -100,6 +112,22 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         )
         self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
 
+    def test_qwen_bucket_boundary_length_keeps_shared_signature(self):
+        with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "256,512,2048"}):
+            almost_full = self.stage._bcg_pad_prompt_kwargs(
+                self._qwen_kwargs(255), current_model=self.qwen_model
+            )
+            full = self.stage._bcg_pad_prompt_kwargs(
+                self._qwen_kwargs(256), current_model=self.qwen_model
+            )
+
+        self.assertEqual(almost_full["encoder_hidden_states"][0].shape[1], 256)
+        self.assertEqual(full["encoder_hidden_states"][0].shape[1], 256)
+        self.assertTrue(full["encoder_hidden_states_mask"].all())
+        self.assertEqual(almost_full["txt_seq_lens"], [256])
+        self.assertEqual(full["txt_seq_lens"], [256])
+        self.assertEqual(_signature_kwargs(almost_full), _signature_kwargs(full))
+
     def test_qwen_prompt_lengths_in_different_buckets_do_not_share_signature(self):
         with patch.dict(os.environ, {"SGLANG_BCG_TEXT_BUCKETS": "256,512,2048"}):
             small = self.stage._bcg_pad_prompt_kwargs(
@@ -112,6 +140,62 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(small["encoder_hidden_states"][0].shape[1], 256)
         self.assertEqual(medium["encoder_hidden_states"][0].shape[1], 512)
         self.assertNotEqual(_signature_kwargs(small), _signature_kwargs(medium))
+
+    def test_qwen_masked_batch_signature_shares_bucket_and_preserves_mask(self):
+        def kwargs(valid_len: int):
+            mask = torch.zeros(1, 64, dtype=torch.bool)
+            mask[:, :valid_len] = True
+            out = self._qwen_kwargs(64)
+            out["encoder_hidden_states_mask"] = mask
+            out["txt_seq_lens"] = [valid_len]
+            return out
+
+        first = self.stage._bcg_pad_prompt_kwargs(
+            kwargs(19), current_model=self.qwen_model
+        )
+        second = self.stage._bcg_pad_prompt_kwargs(
+            kwargs(47), current_model=self.qwen_model
+        )
+
+        self.assertEqual(first["encoder_hidden_states"][0].shape[1], 256)
+        self.assertEqual(first["txt_seq_lens"], [256])
+        self.assertEqual(second["txt_seq_lens"], [256])
+        self.assertTrue(first["encoder_hidden_states_mask"][0, :19].all())
+        self.assertFalse(first["encoder_hidden_states_mask"][0, 19:].any())
+        self.assertTrue(second["encoder_hidden_states_mask"][0, :47].all())
+        self.assertFalse(second["encoder_hidden_states_mask"][0, 47:].any())
+        self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
+
+    def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
+        builder = DynamicVarlenMaskMeta()
+        mask = torch.tensor([[True, True, False, False]])
+        calls = []
+
+        def fake_build(current_mask):
+            calls.append(current_mask.clone())
+            return {"valid": int(current_mask.sum().item())}
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.layer."
+                "build_varlen_mask_meta",
+                side_effect=fake_build,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.layer."
+                "get_current_replay_token",
+                side_effect=[1, 1, 2],
+            ),
+        ):
+            first = builder.resolve(mask)
+            mask[0, 2] = True
+            second = builder.resolve(mask)
+            third = builder.resolve(mask)
+
+        self.assertEqual(first, {"valid": 2})
+        self.assertIs(second, first)
+        self.assertEqual(third, {"valid": 3})
+        self.assertEqual(len(calls), 2)
 
     def test_non_qwen_txt_seq_lens_and_freqs_cis_do_not_take_qwen_path(self):
         kwargs = self._qwen_kwargs(47)
@@ -126,10 +210,34 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(out["txt_seq_lens"], [47])
 
     def test_hunyuanvideo_does_not_create_bcg_runner(self):
-        self.stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+        self.stage.server_args = SimpleNamespace(
+            enable_breakable_cuda_graph=True,
+            pipeline_config=SimpleNamespace(supports_breakable_cuda_graph=True),
+        )
         self.stage._bcg_runners = {}
 
         self.assertIsNone(self.stage._maybe_get_bcg_runner(self.hunyuanvideo_model))
+        self.assertEqual(self.stage._bcg_runners, {})
+
+    def test_pipeline_configs_can_mark_bcg_unsupported(self):
+        for cfg in (
+            SanaPipelineConfig(),
+            ZImagePipelineConfig(),
+            GlmImagePipelineConfig(),
+            Flux2KleinBasePipelineConfig(),
+        ):
+            self.assertFalse(cfg.supports_breakable_cuda_graph, type(cfg).__name__)
+            self.assertIsInstance(cfg.breakable_cuda_graph_unsupported_reason, str)
+            self.assertGreater(len(cfg.breakable_cuda_graph_unsupported_reason), 16)
+
+    def test_unsupported_pipeline_config_does_not_create_bcg_runner(self):
+        self.stage.server_args = SimpleNamespace(
+            enable_breakable_cuda_graph=True,
+            pipeline_config=SanaPipelineConfig(),
+        )
+        self.stage._bcg_runners = {}
+
+        self.assertIsNone(self.stage._maybe_get_bcg_runner(self.qwen_model))
         self.assertEqual(self.stage._bcg_runners, {})
 
     def test_missing_bcg_flag_defaults_disabled(self):
@@ -316,6 +424,58 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(pos["kv_caches_mode"], "read")
         self.assertIn("kv_caches", neg)
         self.assertEqual(neg["kv_caches_mode"], "skip")
+
+    def test_bcg_runner_rejects_too_many_segments(self):
+        runner = object.__new__(DiffusionBreakableCudaGraphRunner)
+        runner.max_segments = 2
+        runner.max_reserved_bytes = 0
+        entry = _CaptureEntry(
+            graph=SimpleNamespace(_break_fns=[], _segments=[object()] * 3),
+            static_kwargs={},
+            static_leaves=[],
+            output=None,
+            num_segments=3,
+        )
+
+        self.assertIn("captured 3 segments", runner._capture_limit_reason(entry))
+
+    def test_bcg_runner_reset_drops_entries_and_marks_disabled(self):
+        runner = object.__new__(DiffusionBreakableCudaGraphRunner)
+        runner.device_module = SimpleNamespace(empty_cache=lambda: None)
+        entry = _CaptureEntry(
+            graph=SimpleNamespace(_break_fns=[lambda: None], _segments=[object()]),
+            static_kwargs={"x": torch.zeros(1)},
+            static_leaves=[torch.zeros(1)],
+            output=torch.zeros(1),
+            num_segments=1,
+        )
+        runner.entries = {("sig",): entry}
+        runner._blocked = {("sig",)}
+
+        runner.reset(disabled_reason="too much memory")
+
+        self.assertEqual(runner.entries, {})
+        self.assertEqual(runner._blocked, set())
+        self.assertEqual(entry.graph._break_fns, [])
+        self.assertEqual(entry.graph._segments, [])
+        self.assertIsNone(entry.output)
+        self.assertEqual(runner._disabled_reason, "too much memory")
+
+    def test_bcg_runner_rejects_reserved_memory_growth(self):
+        runner = object.__new__(DiffusionBreakableCudaGraphRunner)
+        runner.max_segments = 0
+        runner.max_reserved_bytes = 1024
+        runner._reserved_baseline_bytes = 0
+        runner._memory_reserved = lambda: 2048
+        entry = _CaptureEntry(
+            graph=SimpleNamespace(_break_fns=[], _segments=[object()]),
+            static_kwargs={},
+            static_leaves=[],
+            output=None,
+            num_segments=1,
+        )
+
+        self.assertIn("reserved graph memory grew", runner._capture_limit_reason(entry))
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
     BreakableCUDAGraphCapture,
     break_graph,
     eager_on_graph,
+    get_current_replay_token,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (  # noqa: F401
     enable_breakable_cuda_graph,

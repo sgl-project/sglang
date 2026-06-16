@@ -24,6 +24,7 @@ from sglang.srt.breakable_cuda_graph.breakable_cuda_graph import (
     BreakableCUDAGraphCapture,
     break_graph,
     eager_on_graph,
+    get_current_replay_token,
 )
 from sglang.srt.breakable_cuda_graph.context import (
     enable_breakable_cuda_graph,
@@ -35,6 +36,7 @@ __all__ = [
     "BreakableCUDAGraphCapture",
     "break_graph",
     "eager_on_graph",
+    "get_current_replay_token",
     "enable_breakable_cuda_graph",
     "is_in_breakable_cuda_graph",
 ]
