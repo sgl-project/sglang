@@ -180,13 +180,20 @@ class SpecProfilingSession:
         for req in reqs:
             if getattr(req, "req_pool_idx", None) is None:
                 continue
-            # free_mamba_cache needs req_pool_idx; call before pool.free().
-            if (
-                getattr(req, "mamba_pool_idx", None) is not None
-                and hasattr(pool, "free_mamba_cache")
-            ):
-                pool.free_mamba_cache(req)
-            end = max(int(getattr(req, "kv_allocated_len", 0)), int(req.fill_len))
-            kv_indices = pool.req_to_token[req.req_pool_idx, :end]
-            kv_alloc.free(kv_indices)
-            pool.free(req)
+            try:
+                # free_mamba_cache needs req_pool_idx; call before pool.free().
+                if (
+                    getattr(req, "mamba_pool_idx", None) is not None
+                    and hasattr(pool, "free_mamba_cache")
+                ):
+                    pool.free_mamba_cache(req)
+                end = max(int(getattr(req, "kv_allocated_len", 0)), int(req.fill_len))
+                kv_indices = pool.req_to_token[req.req_pool_idx, :end]
+                kv_alloc.free(kv_indices)
+                pool.free(req)
+            except Exception as e:
+                logger.error(
+                    "Failed to free request %s during profiling teardown: %s",
+                    req.rid,
+                    e,
+                )
