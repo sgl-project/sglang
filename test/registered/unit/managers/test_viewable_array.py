@@ -81,6 +81,34 @@ class TestViewableArray(CustomTestCase):
         buf.append(4)
         self.assertEqual(list(snapshot), [1, 2])
 
+    def test_freeze_and_clone_shares_storage_yet_isolates_producer(self):
+        """The clone shares storage but extending it never changes the frozen producer."""
+        producer = ViewableArray([1, 2, 3])
+        clone = producer.freeze_and_clone()
+        self.assertIs(clone._data, producer._data)
+        clone.extend([4, 5])
+        clone.append(6)
+        self.assertEqual(list(clone.readonly_view()), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(list(producer.readonly_view()), [1, 2, 3])
+
+    def test_freeze_and_clone_copy_on_write_when_truncating_into_lock(self):
+        """Truncating below the lock then extending detaches a private copy."""
+        producer = ViewableArray([1, 2, 3, 4])
+        clone = producer.freeze_and_clone()
+        clone.truncate(2)
+        clone.extend([99, 99])
+        self.assertEqual(list(clone.readonly_view()), [1, 2, 99, 99])
+        self.assertEqual(list(producer.readonly_view()), [1, 2, 3, 4])
+        self.assertIsNot(clone._data, producer._data)
+
+    def test_freeze_and_clone_copy_on_write_when_overwriting_lock(self):
+        """Overwriting inside the locked prefix detaches without touching the producer."""
+        producer = ViewableArray([1, 2, 3])
+        clone = producer.freeze_and_clone()
+        clone.overwrite(0, 777)
+        self.assertEqual(list(clone.readonly_view()), [777, 2, 3])
+        self.assertEqual(list(producer.readonly_view()), [1, 2, 3])
+
 
 if __name__ == "__main__":
     unittest.main()
