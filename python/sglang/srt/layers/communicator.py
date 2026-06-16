@@ -175,7 +175,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
-        and get_global_server_args().enable_flashinfer_allreduce_fusion
+        and get_global_server_args().flashinfer_allreduce_fusion_backend is not None
         and not is_flashinfer_allreduce_unavailable()
     )
 
@@ -296,7 +296,6 @@ class AttnTpContext:
             self.allow_input_scattered
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend()
             and forward_batch.input_ids is not None
             and not forward_batch.can_run_tbo
         )

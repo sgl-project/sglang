@@ -406,6 +406,9 @@ class ModelRunnerKVCacheMixin:
                 compression_ratios = self.model_config.compress_ratios
             self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
                 max_num_reqs=self.max_running_requests,
+                # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
+                # past max_running_requests (pre-alloc), so size to the real capacity.
+                num_req_slots=self.req_to_token_pool.req_to_token.shape[0],
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
                 c128_size=self.c128_max_total_num_tokens,
@@ -426,6 +429,9 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 enable_hisparse=self.enable_hisparse,
+                online_mtp_max_draft_tokens=(
+                    self.server_args.max_speculative_num_draft_tokens or 0
+                ),
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:

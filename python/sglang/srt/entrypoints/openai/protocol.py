@@ -177,6 +177,20 @@ class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
     cached_tokens: int = 0
+    # Multimodal prompt token counts (only populated when present in the prompt)
+    image_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
+    video_tokens: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Drop multimodal fields when absent so text-only/cache-only responses
+        # keep the original {"cached_tokens": N} shape.
+        for key in ("image_tokens", "audio_tokens", "video_tokens"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class UsageInfo(BaseModel):
@@ -1320,7 +1334,7 @@ class ResponseTool(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = None
 
     @model_validator(mode="after")
-    def validate_function_tool(self) -> "ResponseTool":
+    def validate_function_tool(self) -> ResponseTool:
         if self.type == "function" and not self.name:
             raise ValueError("Function tools must include a name.")
         return self
