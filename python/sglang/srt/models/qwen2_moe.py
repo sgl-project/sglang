@@ -540,6 +540,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_fused_gate = (
             self.shared_expert_gate is not None
             and not use_intel_amx_backend(self.shared_expert_gate)
+            and not is_npu()
         )
 
         if hidden_states.shape[0] == 0:
