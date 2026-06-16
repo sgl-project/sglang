@@ -433,7 +433,7 @@ class DeepseekMLAForwardMixin:
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
-        # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [1, 8, 64], q_nope_out [1, 8, 512] gathered to [1, 64, 64] [1, 64, 512], k_pe [1, 1, 64], k_nope [1, 1, 512], that is to say gather along heads dim, from local_head_num 8 to all_head_num 64
+        # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if dcp_enabled():
             if forward_batch.forward_mode.is_decode():
                 # if forward_batch.forward_mode is decode, gather q
