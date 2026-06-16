@@ -228,7 +228,7 @@ _enable_pcg_dsv2_dual_stream = (
 if _is_cuda:
 
     @register_custom_op(out_shape="hidden_states")
-    def dsv2_flashinfer_moe_dual_stream_pcg(
+    def dsv2_flashinfer_moe_dual_stream_graph(
         hidden_states: torch.Tensor,
         layer_id: int,
         should_allreduce_fusion: bool,
@@ -850,7 +850,7 @@ class DeepseekV2MoE(nn.Module):
             )
         ]
 
-    def _can_dual_stream_pcg(
+    def _can_dual_stream_graph(
         self, hidden_states: torch.Tensor, server_args=None
     ) -> bool:
         if server_args is None:
@@ -892,8 +892,8 @@ class DeepseekV2MoE(nn.Module):
 
         if not self._enable_a2a_moe:
             server_args = get_global_server_args()
-            if self._can_dual_stream_pcg(hidden_states, server_args):
-                return dsv2_flashinfer_moe_dual_stream_pcg(
+            if self._can_dual_stream_graph(hidden_states, server_args):
+                return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
                     self.layer_id,
                     should_allreduce_fusion,
