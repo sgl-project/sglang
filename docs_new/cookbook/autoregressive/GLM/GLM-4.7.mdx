@@ -124,7 +124,7 @@ Pick a weight format by hardware: **NVFP4** on NVIDIA Blackwell (B200, GB200), *
   </tbody>
 </table>
 
-- **EAGLE Speculative Decoding:** Supported for GLM-4.7. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default (`SGLANG_ENABLE_SPEC_V2=True`); set `SGLANG_ENABLE_SPEC_V2=0` to disable. Enable via the interactive command generator above.
+- **EAGLE Speculative Decoding:** Supported for GLM-4.7. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default; pass `--disable-overlap-schedule` to disable. Enable via the interactive command generator above.
 - **Thinking Budget:** Use `--enable-custom-logit-processor` flag and pass `Glm4MoeThinkingBudgetLogitProcessor` in requests to cap the model's thinking token count (see section 4.2.3).
 
 For general GLM-4.x family launch guidance (AMD ROCm notes and more), see [Launch GLM-4.5 / GLM-4.6 / GLM-4.7 with SGLang](../../../docs/basic_usage/glm45). Per-hardware bench commands and flags are inline in §5.1 below.

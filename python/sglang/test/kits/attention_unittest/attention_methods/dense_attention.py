@@ -327,7 +327,7 @@ class MockModelRunner(ModelRunner):
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()
-            or case.forward_mode.is_draft_extend(include_v2=True)
+            or case.forward_mode.is_draft_extend_v2()
             else 0
         )
         self.server_args = make_mock_server_args(
