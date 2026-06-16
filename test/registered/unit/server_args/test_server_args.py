@@ -15,6 +15,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import _REGISTRY, CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -743,6 +745,37 @@ class TestNgramExternalSamArgs(CustomTestCase):
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+
+class TestCustomSpecAlgoServerArgs(CustomTestCase):
+    def setUp(self):
+        self._registry_snapshot = _REGISTRY.copy()
+        _REGISTRY.clear()
+
+    def tearDown(self):
+        _REGISTRY.clear()
+        _REGISTRY.update(self._registry_snapshot)
+
+    def test_handle_speculative_decoding_invokes_custom_handle_server_args(self):
+        class CustomHandleServerArgs(CustomSpecAlgo):
+            def handle_server_args(self, server_args):
+                server_args.custom_spec_handle_seen = self.name
+                server_args.speculative_num_draft_tokens = 7
+
+        @SpeculativeAlgorithm.register(
+            "MY_HANDLE_ARGS", supports_overlap=True, spec_class=CustomHandleServerArgs
+        )
+        def _factory(server_args):
+            return MagicMock
+
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "my_handle_args"
+
+        handle_speculative_decoding(args)
+
+        self.assertEqual(args.speculative_algorithm, "MY_HANDLE_ARGS")
+        self.assertEqual(args.custom_spec_handle_seen, "MY_HANDLE_ARGS")
+        self.assertEqual(args.speculative_num_draft_tokens, 7)
 
 
 class TestAdaptiveSpecArgs(CustomTestCase):
