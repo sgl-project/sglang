@@ -37,7 +37,7 @@ from sglang.multimodal_gen.runtime.ipc_array import (
 )
 from sglang.multimodal_gen.runtime.managers.continuous_batching import (
     ContinuousBatchingError,
-    ContinuousDenoisingScheduler,
+    ContinuousDenoisingCoordinator,
     ContinuousResponseGroup,
     DenoisingRequestState,
 )
@@ -1030,41 +1030,101 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         output_batch: OutputBatch,
         identity: bytes | None,
         *,
+        req_or_group: Req | list[Req] | None = None,
         is_warmup: bool = False,
     ) -> bool:
+        should_not_return = is_warmup
+        if (
+            is_warmup
+            and req_or_group is not None
+            and should_return_warmup_result(req_or_group)
+        ):
+            output_batch.drop_payload_for_warmup()
+            should_not_return = False
         try:
-            self.return_result(output_batch, identity, is_warmup=is_warmup)
+            self.return_result(
+                output_batch,
+                identity,
+                should_not_return=should_not_return,
+            )
             return True
         except zmq.ZMQError as e:
             logger.error("ZMQ error sending continuous batching reply: %s", e)
             return False
 
+    @staticmethod
+    def _is_continuous_request_group(item: Any) -> bool:
+        return (
+            isinstance(item, list)
+            and item
+            and all(isinstance(req, Req) for req in item)
+        )
+
+    @staticmethod
+    def _continuous_item_is_warmup(item: Any) -> bool:
+        if isinstance(item, Req):
+            return item.is_warmup
+        if Scheduler._is_continuous_request_group(item):
+            return any(req.is_warmup for req in item)
+        return is_warmup_req(item)
+
+    def _validate_continuous_group_reqs(self, group_reqs: list[Req]) -> None:
+        has_warmup = any(req.is_warmup for req in group_reqs)
+        if has_warmup and not all(req.is_warmup for req in group_reqs):
+            raise ContinuousBatchingError(
+                "continuous batching does not support mixed warmup request groups"
+            )
+
+        validate_group_reqs = getattr(self.worker, "_validate_group_forward_reqs", None)
+        if validate_group_reqs is not None:
+            validate_group_reqs(group_reqs)
+
+    @staticmethod
+    def _move_recently_run_states_to_back(
+        active_states: list[DenoisingRequestState],
+        denoising_batch: list[DenoisingRequestState],
+    ) -> list[DenoisingRequestState]:
+        just_ran = {id(state) for state in denoising_batch}
+        return [state for state in active_states if id(state) not in just_ran] + [
+            state for state in active_states if id(state) in just_ran
+        ]
+
     def _admit_waiting_requests_to_continuous_loop(
         self,
-        continuous_scheduler: ContinuousDenoisingScheduler,
+        continuous_coordinator: ContinuousDenoisingCoordinator,
         active_states: list[DenoisingRequestState],
         pending_groups: dict[str, ContinuousResponseGroup],
     ) -> None:
         while self.waiting_queue:
-            if any(state.req.is_warmup for state in active_states):
-                break
-
             identity, req_or_group, enqueue_time = self.waiting_queue[0]
 
-            if (
-                isinstance(req_or_group, list)
-                and req_or_group
-                and all(isinstance(req, Req) for req in req_or_group)
+            if any(state.req.is_warmup for state in active_states) or (
+                active_states and self._continuous_item_is_warmup(req_or_group)
             ):
+                break
+
+            if self._is_continuous_request_group(req_or_group):
                 group_reqs = req_or_group
+                try:
+                    self._validate_continuous_group_reqs(group_reqs)
+                except Exception as e:
+                    self.waiting_queue.popleft()
+                    self._return_continuous_result(
+                        OutputBatch(error=str(e)),
+                        identity,
+                        req_or_group=group_reqs,
+                        is_warmup=self._continuous_item_is_warmup(group_reqs),
+                    )
+                    continue
+
                 reject_reason = self._get_continuous_admission_reject_reason(
                     active_states,
                     group_reqs,
                 )
                 if reject_reason is not None:
-                    self._record_batch_reject_metrics(reject_reason)
                     if active_states:
                         break
+                    self._record_batch_reject_metrics(reject_reason)
                     self.waiting_queue.popleft()
                     self._return_continuous_result(
                         OutputBatch(
@@ -1074,7 +1134,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                             )
                         ),
                         identity,
-                        is_warmup=any(req.is_warmup for req in group_reqs),
+                        req_or_group=group_reqs,
+                        is_warmup=self._continuous_item_is_warmup(group_reqs),
                     )
                     continue
 
@@ -1086,7 +1147,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 for index, req in enumerate(group_reqs):
                     try:
                         state = (
-                            continuous_scheduler.prepare_request_for_denoising_steps(
+                            continuous_coordinator.prepare_request_for_denoising_steps(
                                 identity=identity,
                                 req=req,
                                 response_group_id=group_id,
@@ -1111,15 +1172,23 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                             ),
                         )
                 self._return_response_group_if_complete(group_id, pending_groups)
-                if any(req.is_warmup for req in group_reqs):
+                if self._continuous_item_is_warmup(group_reqs):
                     break
                 continue
 
             if not isinstance(req_or_group, Req):
-                if active_states:
+                if active_states and not isinstance(req_or_group, ShutdownReq):
                     break
                 self.waiting_queue.popleft()
-                result = self._dispatch_single_request(req_or_group)
+                try:
+                    result = self._dispatch_single_request(req_or_group)
+                except Exception as e:
+                    logger.error(
+                        "Error executing control request in continuous scheduler loop: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    result = OutputBatch(error=str(e))
                 self._return_continuous_result(result, identity)
                 if not self._running:
                     break
@@ -1130,22 +1199,26 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 [req_or_group],
             )
             if reject_reason is not None:
-                self._record_batch_reject_metrics(reject_reason)
                 if active_states:
                     break
+                self._record_batch_reject_metrics(reject_reason)
                 self.waiting_queue.popleft()
                 self._return_continuous_result(
                     OutputBatch(
-                        error=f"continuous batching admission rejected request: {reject_reason}"
+                        error=(
+                            "continuous batching admission rejected request: "
+                            f"{reject_reason}"
+                        )
                     ),
                     identity,
+                    req_or_group=req_or_group,
                     is_warmup=req_or_group.is_warmup,
                 )
                 continue
 
             self.waiting_queue.popleft()
             try:
-                state = continuous_scheduler.prepare_request_for_denoising_steps(
+                state = continuous_coordinator.prepare_request_for_denoising_steps(
                     identity=identity,
                     req=req_or_group,
                 )
@@ -1157,6 +1230,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self._return_continuous_result(
                     OutputBatch(error=str(e)),
                     identity,
+                    req_or_group=req_or_group,
                     is_warmup=req_or_group.is_warmup,
                 )
             except Exception as e:
@@ -1168,6 +1242,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self._return_continuous_result(
                     OutputBatch(error=f"continuous batching admission failed: {e}"),
                     identity,
+                    req_or_group=req_or_group,
                     is_warmup=req_or_group.is_warmup,
                 )
 
@@ -1181,10 +1256,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return False
 
         merged = group.merge_outputs(self.worker)
-        self._log_warmup_result(merged, group.is_warmup)
+        self._log_warmup_result(merged, group.reqs, group.is_warmup)
         self._return_continuous_result(
             merged,
             group.identity,
+            req_or_group=group.reqs,
             is_warmup=group.is_warmup,
         )
         del pending_groups[group_id]
@@ -1198,10 +1274,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         output_batch = state.output_batch or OutputBatch(error=state.error)
         if state.response_group_id is None or state.response_group_size <= 1:
             is_warmup = state.req.is_warmup
-            self._log_warmup_result(output_batch, is_warmup)
+            self._log_warmup_result(output_batch, state.req, is_warmup)
             self._return_continuous_result(
                 output_batch,
                 state.identity,
+                req_or_group=state.req,
                 is_warmup=is_warmup,
             )
             return
@@ -1230,11 +1307,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             queued_count = sum(
                 1 for _, item, _ in self.waiting_queue if isinstance(item, Req)
             )
-        elif (
-            isinstance(req_or_group, list)
-            and req_or_group
-            and all(isinstance(req, Req) for req in req_or_group)
-        ):
+        elif self._is_continuous_request_group(req_or_group):
             queued_count = len(req_or_group)
         else:
             return False
@@ -1248,7 +1321,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             self._batching_max_size,
             self._batching_delay_s * 1000.0,
         )
-        continuous_scheduler = ContinuousDenoisingScheduler(
+        continuous_coordinator = ContinuousDenoisingCoordinator(
             worker=self.worker,
             server_args=self.server_args,
             batching_max_size=self._batching_max_size,
@@ -1293,13 +1366,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 continue
 
             self._admit_waiting_requests_to_continuous_loop(
-                continuous_scheduler,
+                continuous_coordinator,
                 active_states,
                 pending_groups,
             )
 
             denoising_batch = (
-                continuous_scheduler.select_compatible_requests_for_next_step(
+                continuous_coordinator.select_compatible_requests_for_next_step(
                     active_states
                 )
             )
@@ -1314,7 +1387,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
             try:
                 completed = (
-                    continuous_scheduler.run_selected_steps_and_advance_requests(
+                    continuous_coordinator.run_selected_steps_and_advance_requests(
                         denoising_batch
                     )
                 )
@@ -1343,18 +1416,37 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
                 completed = []
                 for state in denoising_batch:
-                    continuous_scheduler.fail_request(
+                    continuous_coordinator.fail_request(
                         state,
                         f"Continuous denoising failed: {e}",
                     )
                     completed.append(state)
 
             for state in completed:
-                self._return_completed_request_state(state, pending_groups)
+                try:
+                    self._return_completed_request_state(state, pending_groups)
+                except Exception as e:
+                    logger.error(
+                        "Error returning continuous batching result for request %s: %s",
+                        state.request_id,
+                        e,
+                        exc_info=True,
+                    )
+                    self._return_continuous_result(
+                        OutputBatch(error=f"continuous batching response failed: {e}"),
+                        state.identity,
+                        req_or_group=state.req,
+                        is_warmup=state.req.is_warmup,
+                    )
 
             active_states = [state for state in active_states if not state.is_complete]
+            if len(active_states) > 1:
+                active_states = self._move_recently_run_states_to_back(
+                    active_states,
+                    denoising_batch,
+                )
             self._admit_waiting_requests_to_continuous_loop(
-                continuous_scheduler,
+                continuous_coordinator,
                 active_states,
                 pending_groups,
             )

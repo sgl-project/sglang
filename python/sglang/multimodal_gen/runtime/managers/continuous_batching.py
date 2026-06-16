@@ -8,15 +8,21 @@ from typing import TYPE_CHECKING, Any
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    clone_scheduler_runtime,
-)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+_SUPPORTED_CONTINUOUS_ATTENTION_BACKENDS = {"fa", "fa2", "torch_sdpa"}
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
         OutputBatch,
         Req,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+        DenoisingContext,
+        DenoisingStepState,
     )
 
 
@@ -24,7 +30,7 @@ class ContinuousBatchingError(ValueError):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DenoisingBatchKey:
     pipeline_config_type: str
     model_phase: str
@@ -54,16 +60,16 @@ class DenoisingBatchKey:
     target_dtype: str
 
 
-@dataclass
+@dataclass(slots=True)
 class DenoisingRequestState:
-    req: "Req"
+    req: Req
     identity: bytes | None
-    denoising_context: Any
+    denoising_context: DenoisingContext
     request_id: str = ""
-    denoising_batch_key: DenoisingBatchKey | None = None
+    step_batch_key: DenoisingBatchKey | None = None
     step_index: int = 0
-    current_step: Any | None = None
-    output_batch: "OutputBatch | None" = None
+    current_step: DenoisingStepState | None = None
+    output_batch: OutputBatch | None = None
     error: str | None = None
     response_group_id: str | None = None
     response_index: int = 0
@@ -102,10 +108,10 @@ class DenoisingRequestState:
         self.completed_time_s = time.monotonic()
 
 
-@dataclass
+@dataclass(slots=True)
 class ContinuousResponseGroup:
     identity: bytes | None
-    reqs: list["Req"]
+    reqs: list[Req]
     outputs: list[Any | None] = field(init=False)
     is_warmup: bool = field(init=False)
 
@@ -135,6 +141,14 @@ def validate_continuous_batching_config(server_args: Any) -> None:
         raise ContinuousBatchingError(
             "continuous batching is only supported by pipelines that explicitly "
             "opt in via supports_continuous_batching()"
+        )
+
+    backend = getattr(server_args, "backend", None)
+    backend_value = str(getattr(backend, "value", backend)).lower()
+    if backend_value == "diffusers":
+        raise ContinuousBatchingError(
+            "continuous batching requires the native composed pipeline backend; "
+            "use --backend sglang"
         )
 
     if pipeline_config.task_type != ModelTaskType.T2I:
@@ -169,14 +183,16 @@ def validate_continuous_batching_config(server_args: Any) -> None:
             "continuous batching requires a GPU-resident DiT; disable --dit-cpu-offload"
         )
 
-    if getattr(server_args, "dit_layerwise_offload", False):
+    if getattr(server_args, "dit_layerwise_offload", False) or getattr(
+        server_args, "is_dit_layerwise_offload_selected", False
+    ):
         raise ContinuousBatchingError(
-            "continuous batching requires a GPU-resident DiT; disable --dit-layerwise-offload"
+            "continuous batching requires a GPU-resident DiT; disable "
+            "--dit-layerwise-offload/DiT layerwise offload components"
         )
 
-    allowed_attention_backends = {"fa", "fa2", "torch_sdpa"}
     attention_backend = getattr(server_args, "attention_backend", None)
-    if attention_backend not in {None, "", *allowed_attention_backends}:
+    if attention_backend not in {None, "", *_SUPPORTED_CONTINUOUS_ATTENTION_BACKENDS}:
         raise ContinuousBatchingError(
             f"continuous batching does not support attention backend {attention_backend!r}"
         )
@@ -188,14 +204,14 @@ def validate_continuous_batching_config(server_args: Any) -> None:
         for component_name, backend in component_backends.items():
             if "transformer" not in str(component_name):
                 continue
-            if backend not in allowed_attention_backends:
+            if backend not in _SUPPORTED_CONTINUOUS_ATTENTION_BACKENDS:
                 raise ContinuousBatchingError(
                     "continuous batching does not support attention backend "
                     f"{backend!r} for component {component_name!r}"
                 )
 
 
-def validate_continuous_batching_request(req: "Req", server_args: Any) -> None:
+def validate_continuous_batching_request(req: Req, server_args: Any) -> None:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
     if not isinstance(req, Req):
@@ -229,6 +245,11 @@ def validate_continuous_batching_request(req: "Req", server_args: Any) -> None:
             "continuous batching v1 does not support TeaCache requests"
         )
 
+    if getattr(req, "return_raw_frames", False):
+        raise ContinuousBatchingError(
+            "continuous batching v1 does not support raw-frame streaming responses"
+        )
+
 
 def _shape_of(value: Any) -> tuple[int, ...] | None:
     shape = getattr(value, "shape", None)
@@ -241,6 +262,13 @@ def _shape_suffix_of(value: Any) -> tuple[int, ...] | None:
     shape = _shape_of(value)
     if shape is None:
         return None
+    return shape[1:]
+
+
+def _shape_suffix_from_sequence(value: Any) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    shape = tuple(int(dim) for dim in value)
     return shape[1:]
 
 
@@ -258,10 +286,8 @@ def _attention_backend_name(stage: Any) -> str | None:
     backend = getattr(stage, "attn_backend", None)
     if backend is None:
         return None
-    try:
-        enum_value = backend.get_enum()
-    except Exception:
-        enum_value = None
+    get_enum = getattr(backend, "get_enum", None)
+    enum_value = get_enum() if callable(get_enum) else None
     if isinstance(enum_value, AttentionBackendEnum):
         return enum_value.name
     return type(backend).__name__
@@ -270,27 +296,28 @@ def _attention_backend_name(stage: Any) -> str | None:
 def _to_hashable_signature(value: Any) -> Any:
     import torch
 
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, torch.Tensor):
-        return ("tensor", tuple(value.shape), str(value.dtype), str(value.device))
-    if is_dataclass(value):
-        return (
-            type(value).__name__,
-            tuple(
-                (item.name, _to_hashable_signature(getattr(value, item.name)))
-                for item in fields(value)
-            ),
-        )
-    if isinstance(value, dict):
-        return tuple(
-            sorted(
-                (str(key), _to_hashable_signature(item)) for key, item in value.items()
+    def convert(item: Any) -> Any:
+        if item is None or isinstance(item, (str, int, float, bool)):
+            return item
+        if isinstance(item, torch.Tensor):
+            return ("tensor", tuple(item.shape), str(item.dtype), str(item.device))
+        if is_dataclass(item):
+            return (
+                type(item).__name__,
+                tuple(
+                    (field.name, convert(getattr(item, field.name)))
+                    for field in fields(item)
+                ),
             )
-        )
-    if isinstance(value, (list, tuple)):
-        return tuple(_to_hashable_signature(item) for item in value)
-    return type(value).__name__
+        if isinstance(item, dict):
+            return tuple(
+                sorted((str(key), convert(value)) for key, value in item.items())
+            )
+        if isinstance(item, (list, tuple)):
+            return tuple(convert(value) for value in item)
+        return type(item).__name__
+
+    return convert(value)
 
 
 def build_denoising_batch_key(
@@ -304,19 +331,13 @@ def build_denoising_batch_key(
     if step is None:
         raise ValueError("state.current_step must be prepared before key building")
 
-    import torch
-
     scheduler = ctx.scheduler
     cfg_policy = ctx.cfg_policy
     branches = tuple(branch.name for branch in getattr(cfg_policy, "branches", ()))
     attn_metadata = getattr(step, "attn_metadata", None)
-    raw_latent_shape = getattr(req, "raw_latent_shape", None)
-    if isinstance(raw_latent_shape, torch.Size):
-        raw_latent_shape = tuple(int(dim) for dim in raw_latent_shape)
-    elif raw_latent_shape is not None:
-        raw_latent_shape = tuple(int(dim) for dim in raw_latent_shape)
-    if raw_latent_shape is not None:
-        raw_latent_shape = raw_latent_shape[1:]
+    raw_latent_shape = _shape_suffix_from_sequence(
+        getattr(req, "raw_latent_shape", None)
+    )
 
     return DenoisingBatchKey(
         pipeline_config_type=type(server_args.pipeline_config).__name__,
@@ -355,7 +376,7 @@ def build_denoising_batch_key(
     )
 
 
-class ContinuousDenoisingScheduler:
+class ContinuousDenoisingCoordinator:
     def __init__(
         self,
         *,
@@ -373,7 +394,7 @@ class ContinuousDenoisingScheduler:
         self,
         *,
         identity: bytes | None,
-        req: "Req",
+        req: Req,
         response_group_id: str | None = None,
         response_index: int = 0,
         response_group_size: int = 1,
@@ -381,8 +402,6 @@ class ContinuousDenoisingScheduler:
         validate_continuous_batching_request(req, self.server_args)
 
         prepared_req = self.pipeline.run_stages_before_denoising(req, self.server_args)
-        if prepared_req.scheduler is not None:
-            prepared_req.scheduler = clone_scheduler_runtime(prepared_req.scheduler)
         ctx = self.denoising_stage.prepare_denoising_context(
             prepared_req,
             self.server_args,
@@ -398,16 +417,19 @@ class ContinuousDenoisingScheduler:
                 response_index=response_index,
                 response_group_size=response_group_size,
             )
-            self.prepare_next_denoising_step(state)
+            if not self.prepare_next_denoising_step(state):
+                raise ContinuousBatchingError(
+                    "continuous batching requires at least one denoising timestep"
+                )
             return state
         except Exception:
-            self.denoising_stage.close_denoising_progress(ctx)
+            self._cleanup_denoising_context(ctx)
             raise
 
     def prepare_next_denoising_step(self, state: DenoisingRequestState) -> bool:
         if state.step_index >= state.num_timesteps:
             state.current_step = None
-            state.denoising_batch_key = None
+            state.step_batch_key = None
             return False
         state.current_step = self.denoising_stage.prepare_denoising_step_state(
             state.denoising_context,
@@ -415,7 +437,7 @@ class ContinuousDenoisingScheduler:
             self.server_args,
             state.step_index,
         )
-        state.denoising_batch_key = build_denoising_batch_key(
+        state.step_batch_key = build_denoising_batch_key(
             state,
             self.denoising_stage,
             self.server_args,
@@ -432,7 +454,7 @@ class ContinuousDenoisingScheduler:
                 continue
             if state.current_step is None:
                 self.prepare_next_denoising_step(state)
-            first_key = state.denoising_batch_key
+            first_key = state.step_batch_key
             break
         if first_key is None:
             return []
@@ -440,7 +462,7 @@ class ContinuousDenoisingScheduler:
         selected = [
             state
             for state in active_states
-            if not state.is_complete and state.denoising_batch_key == first_key
+            if not state.is_complete and state.step_batch_key == first_key
         ]
         selected = selected[: self.batching_max_size]
         can_pack_selected = self.denoising_stage.can_run_steps_in_one_forward_pass(
@@ -454,8 +476,6 @@ class ContinuousDenoisingScheduler:
     def run_selected_steps_and_advance_requests(
         self,
         states: list[DenoisingRequestState],
-        *,
-        build_output: bool = True,
     ) -> list[DenoisingRequestState]:
         if not states:
             return []
@@ -469,16 +489,25 @@ class ContinuousDenoisingScheduler:
         for state in states:
             state.step_index += 1
             if state.step_index >= state.num_timesteps:
-                if build_output:
-                    self.finish_request_and_build_output(state)
-                else:
-                    self.finish_request(state)
+                try:
+                    self._finish_request_and_build_output(state)
+                except Exception as e:
+                    logger.error(
+                        "Error completing continuous batching request %s: %s",
+                        state.request_id,
+                        e,
+                        exc_info=True,
+                    )
+                    self._cleanup_denoising_context(state.denoising_context)
+                    state.set_error_output(
+                        f"continuous batching completion failed: {e}"
+                    )
                 completed.append(state)
             else:
                 self.prepare_next_denoising_step(state)
         return completed
 
-    def finish_request(self, state: DenoisingRequestState) -> None:
+    def _finish_denoising_context(self, state: DenoisingRequestState) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
             OutputBatch,
         )
@@ -491,27 +520,38 @@ class ContinuousDenoisingScheduler:
         state.output_batch = OutputBatch()
         state.completed_time_s = time.monotonic()
 
-    def finish_request_and_build_output(self, state: DenoisingRequestState) -> None:
+    def _finish_request_and_build_output(self, state: DenoisingRequestState) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
             OutputBatch,
         )
 
-        self.finish_request(state)
+        self._finish_denoising_context(state)
         result = self.pipeline.run_stages_after_denoising(state.req, self.server_args)
         output_batch = self.worker._to_output_batch(result)
         if not isinstance(output_batch, OutputBatch):
-            output_batch = OutputBatch(error=f"Unexpected output: {type(result)}")
+            output_batch = OutputBatch(
+                error=f"Unexpected output batch: {type(output_batch).__name__}"
+            )
         self._prepare_output_for_return(state, output_batch)
         state.output_batch = output_batch
 
     def fail_request(self, state: DenoisingRequestState, error: str) -> None:
-        self.denoising_stage.close_denoising_progress(state.denoising_context)
+        self._cleanup_denoising_context(state.denoising_context)
         state.set_error_output(error)
+
+    def _cleanup_denoising_context(self, ctx: DenoisingContext) -> None:
+        try:
+            self.denoising_stage.cleanup_denoising_context(ctx)
+        except Exception:
+            logger.debug(
+                "Ignoring continuous batching cleanup failure",
+                exc_info=True,
+            )
 
     def _prepare_output_for_return(
         self,
         state: DenoisingRequestState,
-        output_batch: "OutputBatch",
+        output_batch: OutputBatch,
     ) -> None:
         import torch
 
