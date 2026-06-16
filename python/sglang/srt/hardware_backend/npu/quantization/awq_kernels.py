@@ -141,57 +141,57 @@ class AWQAscendMoEKernel:
         self.w2_kernel = NPUW4A16Int4MoEMethod()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-            w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
-            w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
-            w13_qzeros_list = []
-            w2_qzeros_list = []
-            shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-            for i in range(0, self.quant_config.pack_factor):
-                shift_num = shifts[i] * 4
-                w13_qzeros_list.append(
-                    (layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-                )
-                w2_qzeros_list.append(
-                    (layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-                )
-                w13_qweight_tmp.bitwise_or_(
-                    ((layer.w13_qweight.data >> shift_num) * (2 ** (4 * i)))
-                    & (0xF << (4 * i))
-                )
-                w2_qweight_tmp.bitwise_or_(
-                    ((layer.w2_qweight.data >> shift_num) * (2 ** (4 * i)))
-                    & (0xF << (4 * i))
-                )
-    
-            w13_qweight_tmp.bitwise_xor_(0x88888888)
-            w2_qweight_tmp.bitwise_xor_(0x88888888)
-    
-            w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
-                layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
+        w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
+        w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
+        w13_qzeros_list = []
+        w2_qzeros_list = []
+        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+        for i in range(0, self.quant_config.pack_factor):
+            shift_num = shifts[i] * 4
+            w13_qzeros_list.append(
+                (layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
             )
-            w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
-            w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
-            w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
-                layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
+            w2_qzeros_list.append(
+                (layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
             )
-            w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
-            w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
-    
-            layer.register_parameter(
-                "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
+            w13_qweight_tmp.bitwise_or_(
+                ((layer.w13_qweight.data >> shift_num) * (2 ** (4 * i)))
+                & (0xF << (4 * i))
             )
-            layer.register_parameter(
-                "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
+            w2_qweight_tmp.bitwise_or_(
+                ((layer.w2_qweight.data >> shift_num) * (2 ** (4 * i)))
+                & (0xF << (4 * i))
             )
-            layer.register_parameter(
-                "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
-            )
-            layer.register_parameter(
-                "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
-            )
-    
-            # Optionally clear NPU cache to reclaim memory
-            torch.npu.empty_cache()
+
+        w13_qweight_tmp.bitwise_xor_(0x88888888)
+        w2_qweight_tmp.bitwise_xor_(0x88888888)
+
+        w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
+            layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
+        )
+        w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
+        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
+        w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
+            layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
+        )
+        w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
+        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+
+        layer.register_parameter(
+            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
+        )
+        layer.register_parameter(
+            "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
+        )
+        layer.register_parameter(
+            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
+        )
+        layer.register_parameter(
+            "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
+        )
+
+        # Optionally clear NPU cache to reclaim memory
+        torch.npu.empty_cache()
     
         # Set dispatcher output dtype for w13
         if hasattr(layer, "dispatcher"):
