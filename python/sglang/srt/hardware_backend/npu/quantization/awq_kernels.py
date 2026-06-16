@@ -47,7 +47,7 @@ class AWQAscendLinearKernel:
         group_size = K // num_groups
     
         # NPU constraint
-        npu_ok = (group_size == 0) or (group_size % 32 == 0 and 32 <= group_size < K)
+        npu_ok = False #(group_size == 0) or (group_size % 32 == 0 and 32 <= group_size < K)
     
         if npu_ok:
             # ----- NPU path (unsigned weight + raw zero point) -----
