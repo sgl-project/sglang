@@ -135,18 +135,19 @@ class AWQAscendLinearKernel:
 
 
 class AWQAscendMoEKernel:
-    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None, use_unquantized: bool = False):
         self.quant_config = quant_config
-        self.w13_kernel = NPUW4A16Int4MoEMethod()
-        self.w2_kernel = NPUW4A16Int4MoEMethod()
+        self.use_unquantized = use_unquantized
+        # Only keep the quant kernel if needed
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # ----- 1. Quantized path (as before) -----
         w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
         w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
         w13_qzeros_list = []
         w2_qzeros_list = []
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-        for i in range(0, self.quant_config.pack_factor):
+        for i in range(self.quant_config.pack_factor):
             shift_num = shifts[i] * 4
             w13_qzeros_list.append(
                 (layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
@@ -178,21 +179,84 @@ class AWQAscendMoEKernel:
         w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
 
         layer.register_parameter(
-            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
             "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
         )
         layer.register_parameter(
-            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
+            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
         )
         layer.register_parameter(
             "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
         )
+        layer.register_parameter(
+            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
+        )
 
-        # Optionally clear NPU cache to reclaim memory
+        # ----- 2. Unquantized path: dequantize to FP -----
+        if True:
+            self._dequantize_and_store(layer, prefix="w13")
+            self._dequantize_and_store(layer, prefix="w2")
+            if hasattr(layer, "w13_scales"):
+                delattr(layer, "w13_scales")
+            if hasattr(layer, "w2_scales"):
+                delattr(layer, "w2_scales")
+            if hasattr(layer, "w13_qzeros"):
+                delattr(layer, "w13_qzeros")
+            if hasattr(layer, "w2_qzeros"):
+                delattr(layer, "w2_qzeros")
+            if hasattr(layer, "w13_qweight"):
+                delattr(layer, "w13_qweight")
+            if hasattr(layer, "w2_qweight"):
+                delattr(layer, "w2_qweight")
+
         torch.npu.empty_cache()
-    
-        # Set dispatcher output dtype for w13
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
+    def _dequantize_and_store(self, layer: torch.nn.Module, prefix: str):
+        """Dequantize the AWQ weights for one expert group (w13 or w2) and store FP tensors."""
+        qweight = getattr(layer, f"{prefix}_qweight").data          # (E, K, N_packed)
+        qzeros  = getattr(layer, f"{prefix}_qzeros").data           # (E, groups, N_packed)
+        scales  = getattr(layer, f"{prefix}_scales").data           # (E, groups, N)
+
+        E, K, N_packed = qweight.shape
+        N = N_packed * 8
+        groups = scales.shape[1]
+        group_size = K // groups
+        assert K % groups == 0, f"K={K} not divisible by groups={groups}"
+
+        # Pre-allocate FP weight: we need shape (E, N, K) for easy matmul
+        fp_weight = torch.empty((E, N, K), dtype=torch.bfloat16, device=qweight.device)
+
+        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+
+        # Process each expert
+        for e in range(E):
+            # Unpack weight nibbles to int8 (shape (K, N))
+            qw_e = qweight[e]                          # (K, N_packed)
+            w_int8 = torch.empty((K, N), dtype=torch.int8, device=qweight.device)
+            for i, s in enumerate(shifts):
+                nib = (qw_e >> (s * 4)) & 0xF
+                signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
+                w_int8[:, i::8] = signed
+
+            # Unpack zeros to int8 (shape (groups, N))
+            qz_e = qzeros[e]                           # (groups, N_packed)
+            z_int8 = torch.empty((groups, N), dtype=torch.int8, device=qweight.device)
+            for i, s in enumerate(shifts):
+                nib = (qz_e >> (s * 4)) & 0xF
+                signed = torch.where(nib >= 8, nib - 16, nib).to(torch.int8)
+                z_int8[:, i::8] = signed
+
+            # Expand zero and scale to (K, N)
+            z_exp = z_int8.repeat_interleave(group_size, dim=0)   # (K, N)
+            s_exp = scales[e].repeat_interleave(group_size, dim=0) # (K, N)
+
+            # Dequantize: (w_int8 - z_exp) * s_exp, cast to bfloat16
+            w_fp = ((w_int8.float() - z_exp.float()) * s_exp.float()).to(torch.bfloat16)
+            fp_weight[e] = w_fp  # (N, K) after transpose? Actually w_int8 is (K, N), we want (N, K)
+
+        # Transpose each expert's weight to (N, K) for matmul
+        fp_weight = fp_weight.transpose(-1, -2).contiguous()  # (E, N, K)
+
+        # Register as parameter
+        setattr(layer, f"{prefix}_weight", torch.nn.Parameter(fp_weight, requires_grad=False))
