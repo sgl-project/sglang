@@ -98,7 +98,8 @@ template <bool kIsStatic, bool kSkipQuant, typename DType>
 void per_tensor_quant_fp8_impl(
     tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
   using namespace host;
-  static_assert(!(kIsStatic && kSkipQuant),
+  static_assert(
+      !(kIsStatic && kSkipQuant),
       "kIsStatic+kSkipQuant=no work. Use per_tensor_absmax_fp8 for absmax-only "
       "or per_tensor_quant_fp8<is_static=true> for static-scale quant.");
 
@@ -145,8 +146,7 @@ void per_tensor_quant_fp8_impl(
 }
 
 template <bool kIsStatic, typename DType>
-void per_tensor_quant_fp8(
-    tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
+void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
   per_tensor_quant_fp8_impl<kIsStatic, /*kSkipQuant=*/false, DType>(input, output_q, output_s);
 }
 
@@ -154,7 +154,9 @@ void per_tensor_quant_fp8(
 template <typename DType>
 void per_tensor_absmax_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output_s) {
   per_tensor_quant_fp8_impl<
-      /*kIsStatic=*/false, /*kSkipQuant=*/true, DType>(input, output_s, output_s);
+      /*kIsStatic=*/false,
+      /*kSkipQuant=*/true,
+      DType>(input, output_s, output_s);
 }
 
 }  // namespace
