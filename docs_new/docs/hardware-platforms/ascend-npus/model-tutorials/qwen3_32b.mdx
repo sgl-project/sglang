@@ -24,7 +24,6 @@ version.
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 4`                                                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| Chunked Prefill               | `--chunked-prefill-size -1 --max-prefill-tokens 16384`                                        |
 | NPU Graph                     | `--cuda-graph-bs 1 4 8 16`                                                                    |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 --speculative-draft-model-path <draft-model-path> --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                   |
