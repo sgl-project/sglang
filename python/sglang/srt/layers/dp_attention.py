@@ -524,7 +524,7 @@ def _dp_gather_via_all_gather(
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
-# Variable-length DP-MoE gather (ATOM PR #930 style): instead of padding every
+# Variable-length DP-MoE gather (reference https://github.com/ROCm/ATOM/pull/930): instead of padding every
 # rank to max_len (all_gather) or all-reducing a sum_len zero-buffer (all_reduce),
 # gather exactly sum(per-rank tokens) via all_gatherv. Env-gated; only the simple
 # tp_size==dp_size (attn_tp_size==1) case is supported for now (e.g. tp8dp8).

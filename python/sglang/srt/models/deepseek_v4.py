@@ -1474,7 +1474,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_attention_tp_size() > 1
             and not get_moe_a2a_backend().is_none()
         )
-        # ATOM-style symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
+        # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
         # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
         # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
         # the post-experts reduce is a SUM. reduce_scatterv does that sum+scatter
@@ -1528,8 +1528,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # SUM the TP-sharded per-rank partial expert outputs AND scatter
                 # each rank its own token slice, in one op. Correct because the
                 # MoE-internal all_reduce was skipped (use_reduce_scatter above).
-                # This is the symmetric inverse of the all_gatherv gather (ATOM
-                # PR #930 / forward_impl_graph reduce_scatterv).
+                # This is the symmetric inverse of the all_gatherv gather.
                 get_tp_group().reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
