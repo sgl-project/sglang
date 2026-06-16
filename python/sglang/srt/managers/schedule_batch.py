@@ -719,9 +719,8 @@ class Req(ReqDllmMixin):
         # Before image padding
         if origin_input_ids_unpadded:
             self.origin_input_ids_unpadded = origin_input_ids_unpadded
-        elif isinstance(origin_input_ids, ViewableArray):
-            self.origin_input_ids_unpadded = origin_input_ids.materialize()
         else:
+            assert not isinstance(origin_input_ids, ViewableArray)
             self.origin_input_ids_unpadded = origin_input_ids
         self.fill_len: int = 0
 
