@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -37,9 +38,10 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import Compone
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -177,10 +179,8 @@ def create_bench_cache(
 
     # --- KV pool + allocator ---
     if has_swa:
-        from sglang.srt.mem_cache.swa_memory_pool import (
-            SWAKVPool,
-            SWATokenToKVPoolAllocator,
-        )
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         pool = SWAKVPool(
             size=kv_size,
@@ -247,7 +247,7 @@ def create_bench_cache(
         req = Req(
             rid=_rid[0],
             origin_input_text="",
-            origin_input_ids=[],
+            origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
         _rid[0] += 1
@@ -638,7 +638,8 @@ def bench_cache_finished(
         req = env.make_req()
         req.origin_input_ids = array("q", seq)
         req.output_ids = array("q")
-        req.fill_ids = array("q", seq)
+        req.full_untruncated_fill_ids = array("q", seq)
+        req.fill_len = len(req.full_untruncated_fill_ids)
         req.last_node = node
         req.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)
@@ -691,9 +692,11 @@ def run_all_benchmarks(
     if benchmarks is None or "all" in benchmarks:
         benchmarks = list(ALL_BENCHMARKS.keys())
 
-    set_global_server_args_for_scheduler(
-        ServerArgs(model_path="dummy", page_size=page_size)
-    )
+    server_args = ServerArgs(model_path="dummy", page_size=page_size)
+    # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
+    # loads the HF config for self.model_path — impossible for the dummy model.
+    server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, page_size)
+    set_global_server_args_for_scheduler(server_args)
 
     impl_name = (tree_cls or UnifiedRadixCache).__name__
     results = []
@@ -780,9 +783,11 @@ class _BenchSuite:
 
     @classmethod
     def setUpClass(cls):
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=cls.bench_cfg["page_size"])
-        )
+        page_size = cls.bench_cfg["page_size"]
+        server_args = ServerArgs(model_path="dummy", page_size=page_size)
+        # See run_all_benchmarks for why _mamba_cache_chunk_size is preset.
+        server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, page_size)
+        set_global_server_args_for_scheduler(server_args)
 
     def _run(self, bench_fn):
         cfg = self.bench_cfg

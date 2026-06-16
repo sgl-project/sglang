@@ -522,6 +522,11 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
       <td>Paged allocator class</td>
     </tr>
     <tr>
+      <td><code>get_quantization_config(quantization)</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Return hardware-specific quantization config for the specific quantization scheme, raise an error if not supported or return None to use the default config.</td>
+    </tr>
+    <tr>
       <td><code>get_piecewise_backend_cls()</code></td>
       <td><code>raise NotImplementedError</code></td>
       <td>Piecewise compilation backend class</td>

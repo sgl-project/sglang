@@ -12,10 +12,7 @@ from sglang.multimodal_gen.runtime.launch_server import (
     dispatch_launch,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
-
-logger = init_logger(__name__)
 
 
 def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
@@ -32,10 +29,10 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
 
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the serve command."""
-    server_args = ServerArgs.from_cli_args(args, unknown_args)
-    if not server_args.is_arg_explicitly_set("warmup"):
-        server_args.warmup = True
-        logger.info("Warmup is enabled by default for sglang serve.")
+    # use server-based warmup for production
+    server_args = ServerArgs.from_cli_args(
+        args, unknown_args, default_args={"warmup_mode": "server"}
+    )
 
     dispatch_launch(server_args)
 

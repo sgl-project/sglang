@@ -185,7 +185,24 @@ def gemm_nt_bf16bf16f32(
         deep_gemm.bf16_gemm_nt(lhs, rhs, out)
 
 
+def tf32_hc_prenorm_gemm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_splits: Optional[int],
+):
+    if x.shape[0] == 0:
+        return
+    deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
+
+
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+    # deep_gemm.set_pdl can initialize CUDA state, so run it only after the
+    # scheduler/TP worker has been forked and assigned a GPU.
+    if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
+        deep_gemm.set_pdl(True)
+
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 
