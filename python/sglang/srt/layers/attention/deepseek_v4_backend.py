@@ -1113,7 +1113,8 @@ class DeepseekV4AttnBackend(
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
-        max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
+        if max_seq_len_override is None:
+            max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
         max_seq_len = (
             int(seq_lens_cpu.max().item())
             if max_seq_len_override is None
