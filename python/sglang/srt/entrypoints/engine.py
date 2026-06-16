@@ -1252,6 +1252,11 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
+    # Route torch.distributed collectives through PyTorch TorchComms by default. It is a no-op unless the
+    # torchcomms package is installed (torch's _use_torchcomms_enabled() also
+    # checks availability); export TORCH_DISTRIBUTED_USE_TORCHCOMMS=0 to opt out.
+    os.environ.setdefault("TORCH_DISTRIBUTED_USE_TORCHCOMMS", "1")
+
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels
         os.environ["TRTLLM_ENABLE_PDL"] = "1"

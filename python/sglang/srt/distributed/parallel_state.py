@@ -43,6 +43,15 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
+try:
+    # Predicate for whether torch.distributed is routed through TorchComms.
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
+
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
@@ -78,6 +87,129 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
+
+def _device_backend_str(torch_distributed_backend) -> str:
+    """Normalize a backend to the ``"<device>:<backend>"`` form required by
+    ``split_group``'s ``backend`` filter (TorchComms path).
+
+    Accepts a bare backend name (e.g. ``"nccl"``) or an already device-prefixed
+    string (e.g. ``"cuda:nccl"``), returning a single device-qualified backend.
+    """
+    backend_str = str(torch_distributed_backend)
+    if ":" in backend_str:
+        return backend_str
+    if is_cuda_alike():
+        device = "cuda"
+    elif _is_npu:
+        device = "npu"
+    elif _is_xpu:
+        device = "xpu"
+    elif _is_musa:
+        device = "musa"
+    else:
+        device = "cpu"
+    return f"{device}:{backend_str}"
+
+
+def _seed_torchcomm_master_port(rank: int) -> None:
+    """Agree on a free MASTER_PORT for the nccl-lazy per-peer comm bootstrap
+    store (TorchComms StoreManager), broadcast via the world store, so it never
+    collides with the random c10d rendezvous port. No-op if MASTER_PORT is
+    already set (e.g. by an env:// launcher). Must be called after the world
+    process group is initialized.
+    """
+    import socket
+
+    from torch.distributed.distributed_c10d import _get_default_store
+
+    if os.environ.get("MASTER_PORT"):
+        return
+    store = _get_default_store()
+    key = "sglang_torchcomm_master_port"
+    if rank == 0:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        store.set(key, str(port))
+    else:
+        store.wait([key])
+        port = int(store.get(key).decode())
+    os.environ["MASTER_PORT"] = str(port)
+
+
+def _build_lazy_device_group(ranks, device):
+    """Build a TorchComms ``nccl-lazy``-backed device ProcessGroup over ``ranks``
+    (a subset of the world), bypassing ``split_group``.
+
+    Used for the pipeline-parallel group so its point-to-point send/recv get a
+    per-peer 2-rank comm + stream (matching c10d ProcessGroupNCCL), which lets
+    sglang's default PP send/recv loop run over TorchComms without the
+    consolidated single-exchange rewrite. ``split_group`` cannot produce a lazy
+    child (it splits the parent's comm), so the comm + ProcessGroup are
+    constructed manually, mirroring ``_new_process_group_helper``.
+
+    The comm bootstrap is collective over ``ranks`` only, so the caller MUST
+    invoke this only on ranks that are members of ``ranks``.
+
+    Teardown: the returned PG is destroyed via the normal
+    ``GroupCoordinator.destroy()`` -> ``torch.distributed.destroy_process_group``
+    path (called from ``destroy_model_parallel``), which finalizes the comm while
+    CUDA is still alive. Skipping that destroy and relying on interpreter atexit
+    can SIGSEGV (comm finalize after CUDA teardown).
+    """
+    import torch.distributed.distributed_c10d as c10d
+    from torch.distributed import PrefixStore, ProcessGroup
+    from torchcomms import new_comm
+
+    try:
+        from torchcomms._comms import _BackendWrapper
+    except Exception:
+        from torchcomms._backend_wrapper import _BackendWrapper
+
+    gsize = len(ranks)
+    group_local_rank = ranks.index(torch.distributed.get_rank())
+    tag = "pp_lazy_" + "_".join(map(str, ranks))
+    store = PrefixStore(f"{tag}/", c10d._get_default_store())
+
+    # TorchComms' bootstrap reads world rank/size from TORCHCOMM_RANK/SIZE; seed
+    # the SUBGROUP-local values just around new_comm (single-threaded here).
+    saved = (os.environ.get("TORCHCOMM_RANK"), os.environ.get("TORCHCOMM_SIZE"))
+    os.environ["TORCHCOMM_RANK"] = str(group_local_rank)
+    os.environ["TORCHCOMM_SIZE"] = str(gsize)
+    try:
+        comm = new_comm(
+            "nccl-lazy", device, store=PrefixStore("comm/", store), name=tag
+        )
+    finally:
+        for key, value in zip(("TORCHCOMM_RANK", "TORCHCOMM_SIZE"), saved):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    backend_class = _BackendWrapper(comm)
+    pg = ProcessGroup(PrefixStore("pg/", store), group_local_rank, gsize)
+    backend_type = ProcessGroup.BackendType.CUSTOM
+    pg._set_default_backend(backend_type)
+    pg._register_backend(device, backend_type, backend_class)
+    pg._set_group_name(tag)
+    try:
+        pg.bound_device_id = device
+    except Exception:
+        pass
+
+    # Register in torch's group bookkeeping so dist.send/recv rank translation
+    # and the world-group-map checks succeed (mirrors _new_process_group_helper).
+    c10d._register_process_group(tag, pg)
+    c10d._world.pg_map[pg] = ("cuda:nccl-lazy", store)
+    c10d._world.pg_names[pg] = tag
+    c10d._world.pg_backend_config[pg] = "cuda:nccl-lazy"
+    c10d._world.pg_group_ranks[pg] = {g: i for i, g in enumerate(ranks)}
+    c10d._world.pg_to_tag[pg] = f"user:{tag}"
+    c10d._world.tags_to_pg.setdefault(f"user:{tag}", []).append(pg)
+    return pg
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -315,6 +447,31 @@ class GroupCoordinator:
                     backend="mooncake-cpu",
                     pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
                     timeout=subgroup_timeout,
+                )
+            elif _use_torchcomms_enabled():
+                device_backend_str = _device_backend_str(torch_distributed_backend)
+                if group_name == "pp":
+                    # Pipeline parallel: build the device group as a standalone
+                    # nccl-lazy comm (per-peer comm + stream, like
+                    # ProcessGroupNCCL) so the default PP send/recv loop works
+                    # over TorchComms.
+                    # split_group cannot produce a lazy child, so it is built
+                    # manually and only on member ranks.
+                    device_group = (
+                        _build_lazy_device_group(ranks, self.device)
+                        if self.rank in ranks
+                        else None
+                    )
+                else:
+                    device_group = torch.distributed.new_group(
+                        ranks,
+                        backend=device_backend_str,
+                        timeout=subgroup_timeout,
+                    )
+                cpu_group = torch.distributed.new_group(
+                    ranks,
+                    backend=f"cpu:gloo,{device_backend_str}",
+                    timeout=gloo_timeout,
                 )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
@@ -1805,24 +1962,56 @@ def init_distributed_environment(
 
         _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
 
-        if backend == "mooncake":
-            from mooncake.ep import MooncakeBackendOptions
-
-            # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
-            active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
-            pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
+        if _use_torchcomms_enabled() and is_cuda_alike() and backend != "gloo":
+            # TorchComms creates the TP/PP subgroups via split_group, which can
+            # only select per-device backends already present on the world PG.
+            tc_local_rank = local_rank
+            if tc_local_rank == -1:
+                tc_local_rank = (
+                    int(os.environ.get("LOCAL_RANK", "0"))
+                    if distributed_init_method == "env://"
+                    else rank
+                )
+            os.environ.setdefault("TORCHCOMM_RANK", str(rank))
+            os.environ.setdefault("TORCHCOMM_SIZE", str(world_size))
+            # The nccl-lazy backend used for the PP group creates per-peer comms
+            # lazily; their bootstrap store (TorchComms StoreManager) reads
+            # MASTER_ADDR/MASTER_PORT
+            if "MASTER_ADDR" not in os.environ:
+                try:
+                    os.environ["MASTER_ADDR"] = distributed_init_method.split("://", 1)[
+                        1
+                    ].rsplit(":", 1)[0]
+                except (IndexError, ValueError):
+                    pass
+            torch.distributed.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank,
+                timeout=timeout,
+                device_id=torch.device(f"cuda:{tc_local_rank}"),
+            )
+            _seed_torchcomm_master_port(rank)
         else:
-            pg_options = get_torch_distributed_pg_options()
+            if backend == "mooncake":
+                from mooncake.ep import MooncakeBackendOptions
 
-        # this backend is used for WORLD
-        torch.distributed.init_process_group(
-            backend=backend,
-            init_method=distributed_init_method,
-            world_size=world_size,
-            rank=rank,
-            timeout=timeout,
-            pg_options=pg_options,
-        )
+                # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
+                active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
+                pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
+            else:
+                pg_options = get_torch_distributed_pg_options()
+
+            # this backend is used for WORLD
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank,
+                timeout=timeout,
+                pg_options=pg_options,
+            )
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":
@@ -2176,7 +2365,11 @@ def create_custom_parallel_group(
     my_new_group = None
 
     for g_ranks in unique_groups:
-        group = torch.distributed.new_group(ranks=g_ranks, backend=backend)
+        if _use_torchcomms_enabled() and ":" not in str(backend):
+            tc_backend = f"cpu:gloo,{_device_backend_str('nccl')}"
+            group = torch.distributed.new_group(ranks=g_ranks, backend=tc_backend)
+        else:
+            group = torch.distributed.new_group(ranks=g_ranks, backend=backend)
 
         if set(g_ranks) == set(local_config):
             my_new_group = group
