@@ -109,7 +109,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
 
-    def test_pd_decode_radix_cache_rejects_unknown_backend(self):
+    def test_pd_decode_radix_cache_rejects_fake_backend(self):
         with self.assertRaises(ValueError) as context:
             ServerArgs(
                 model_path="dummy",
@@ -118,8 +118,32 @@ class TestLoadBalanceMethod(unittest.TestCase):
                 disaggregation_transfer_backend="fake",
             )
 
-        self.assertIn("('nixl', 'mooncake', 'mori')", str(context.exception))
-        self.assertIn("'fake'", str(context.exception))
+        self.assertIn(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with --disaggregation-transfer-backend fake",
+            str(context.exception),
+        )
+
+    def test_pd_decode_radix_cache_allows_ascend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="ascend",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake_tcp",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+        self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
 
 class TestContextParallelServerArgs(CustomTestCase):
@@ -597,6 +621,14 @@ class TestHiCacheArgs(unittest.TestCase):
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
             {
+                "name": "default_kernel_page_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
                 "name": "kernel_with_page_first_direct",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -636,8 +668,9 @@ class TestHiCacheArgs(unittest.TestCase):
                     "attention_backend": "triton",
                     "decode_attention_backend": "fa3",
                 },
-                "expected_io_backend": "direct",
-                "expected_mem_layout": "page_first_direct",
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+                "expected_decode_backend": "fa3",
             },
         ]
 
@@ -649,13 +682,10 @@ class TestHiCacheArgs(unittest.TestCase):
                     args,
                     expected_io_backend=case["expected_io_backend"],
                     expected_mem_layout=case["expected_mem_layout"],
+                    expected_decode_backend=case.get("expected_decode_backend"),
                 )
 
-    @patch.object(ServerArgs, "use_mla_backend", return_value=False)
-    @patch("sglang.srt.server_args.is_flashinfer_available", return_value=False)
-    def test_decode_attention_backend_with_implicit_fa3(
-        self, _mock_flashinfer, _mock_use_mla_backend
-    ):
+    def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_io_backend="kernel",
@@ -665,7 +695,9 @@ class TestHiCacheArgs(unittest.TestCase):
 
         args._handle_hicache()
 
-        self.assertEqual(args.decode_attention_backend, "triton")
+        self.assertEqual(args.hicache_io_backend, "kernel")
+        self.assertEqual(args.hicache_mem_layout, "page_first")
+        self.assertIsNone(args.decode_attention_backend)
 
 
 class TestNgramExternalSamArgs(CustomTestCase):
