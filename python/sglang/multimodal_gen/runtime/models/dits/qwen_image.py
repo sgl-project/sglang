@@ -1101,31 +1101,6 @@ class QwenImageTransformerBlock(nn.Module):
                 gate[:actual_batch],
                 gate[actual_batch : 2 * actual_batch],
             )
-            if is_in_breakable_cuda_graph():
-                selector = index.to(dtype=torch.bool, device=x.device).unsqueeze(-1)
-                shift_result = torch.where(
-                    selector, shift1.unsqueeze(1), shift0.unsqueeze(1)
-                )
-                scale_result = torch.where(
-                    selector, scale1.unsqueeze(1), scale0.unsqueeze(1)
-                )
-                gate_result = torch.where(
-                    selector, gate1.unsqueeze(1), gate0.unsqueeze(1)
-                )
-                if is_scale_residual:
-                    x, residual_out = self._scale_residual_norm_scale_shift(
-                        norm_module,
-                        residual=residual_x,
-                        x=x,
-                        gate=gate_x,
-                        shift=shift_result,
-                        scale=scale_result,
-                    )
-                    return x, residual_out, gate_result
-                x = self._norm_scale_shift(
-                    norm_module, x=x, shift=shift_result, scale=scale_result
-                )
-                return x, gate_result
             if is_scale_residual:
                 x, residual_out, gate_result = self.fused_res_ln_ss_gate_select01(
                     x,
