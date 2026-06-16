@@ -19,7 +19,7 @@ from typing import Any, Dict, List
 
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import (
     MOE_BASE_MODEL_PATH,
     MOE_LORA_PATH,
@@ -33,7 +33,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=200, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=200, suite="extra-a-test-2-gpu-large-amd")
 
 LOGPROB_THRESHOLD = 5e-04
 MAX_NEW_TOKENS = 10

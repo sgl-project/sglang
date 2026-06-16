@@ -47,9 +47,10 @@ PER_COMMIT_SUITES = {
         # (mirror of CUDA extra-a; tests stay tagged per-commit but only
         # dispatch when the PR carries the `run-ci-extra` label). 1-gpu-small
         # carries the mock-model / kv_canary *unit* tests; 1-/2-gpu-large
-        # carry the lora / spec / quant model e2e tests that pass on ROCm.
-        # The canary *e2e* tests still need the canary JIT kernel ported to
-        # ROCm before they can be onboarded.
+        # carry the subset of lora/spec/quant model e2e tests validated to
+        # pass on mi325 (fp8kv-triton, gemma4-mtp-31b). The rest of the CUDA
+        # extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
+        # kernels, OOM, or accuracy regressions) and stay CUDA-only for now.
         "extra-a-test-1-gpu-small-amd",
         "extra-a-test-1-gpu-large-amd",
         "extra-a-test-2-gpu-large-amd",
